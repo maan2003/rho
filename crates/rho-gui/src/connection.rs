@@ -15,8 +15,8 @@ use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, UiAgentSummary,
-    UiProject, WorkspaceInfo, read_frame, write_frame,
+    AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
+    read_frame, write_frame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -95,9 +95,7 @@ pub enum ConnEvent {
     },
     DeskResyncRequired,
     Ready {
-        agents: Vec<UiAgentSummary>,
-        iris_agent: Option<AgentId>,
-        projects: Vec<UiProject>,
+        agents: Vec<rho_ui_proto::story::UiAgentHead>,
         auth: rho_ui_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
@@ -106,7 +104,6 @@ pub enum ConnEvent {
     AgentCreated {
         agent_id: AgentId,
     },
-    AgentSubscribed(AgentId),
     AgentUnloaded {
         agent_id: AgentId,
         reason: rho_ui_proto::AgentUnloadReason,
@@ -118,14 +115,17 @@ pub enum ConnEvent {
         allocation: Option<AgentFrameAllocation>,
     },
     TurnCancelled,
-    AgentAttention {
+    /// A run of one agent's story, from the daemon's answer to
+    /// `AgentLogs` or from the follow that comes after it.
+    AgentStory {
         agent_id: AgentId,
-        attention: rho_ui_proto::UiAttention,
-        facts: rho_ui_proto::UiAgentFacts,
+        from: rho_ui_proto::story::UiStoryPos,
+        events: Vec<rho_ui_proto::story::UiStoryEvent>,
     },
-    AgentTurnReport {
-        agent_id: AgentId,
-        report: rho_ui_proto::UiTurnReport,
+    /// An agent's head changed, or this connection is out of step and the
+    /// daemon is saying where the story stands.
+    AgentHead {
+        head: rho_ui_proto::story::UiAgentHead,
     },
     ChatGptUsage {
         used_percent: f64,
@@ -754,10 +754,11 @@ impl Connection {
         std::mem::take(&mut *self.sent.lock().unwrap())
     }
 
-    pub fn focus_agent(&self, agent_id: Option<AgentId>) {
-        if self.iroh {
-            self.send(ClientMessage::AgentStreamFocus { agent_id });
-        }
+    /// The agents whose live frames this connection wants: every open
+    /// pane, replaced wholesale. Everything durable is on the story
+    /// regardless, so this only decides who streams.
+    pub fn focus_agents(&self, agent_ids: Vec<AgentId>) {
+        self.send(ClientMessage::AgentStreamFocus { agent_ids });
     }
 
     /// Dials a dedicated terminal stream for an agent and runs the
@@ -1032,8 +1033,8 @@ fn replay_safe(message: &ClientMessage) -> bool {
         message,
         ClientMessage::Ping
             | ClientMessage::Subscribe
-            | ClientMessage::SubscribeAgent { .. }
             | ClientMessage::AgentStreamFocus { .. }
+            | ClientMessage::AgentLogs { .. }
             | ClientMessage::GitTransportRegister
             | ClientMessage::ShellList { .. }
             | ClientMessage::ChatGptUsage
@@ -1041,8 +1042,6 @@ fn replay_safe(message: &ClientMessage) -> bool {
             | ClientMessage::AgentUsage { .. }
             | ClientMessage::GlobalUsage { .. }
             | ClientMessage::AgentCostDistribution { .. }
-            | ClientMessage::SubscribeAgents { .. }
-            | ClientMessage::UnsubscribeAgents { .. }
     )
 }
 
@@ -1108,10 +1107,7 @@ async fn run(
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
         agents,
-        iris_agent,
-        projects,
         auth,
-        view_config: _,
         machine_seed,
         agent_counter,
     } = message
@@ -1121,8 +1117,6 @@ async fn run(
     if events
         .unbounded_send(ConnEvent::Ready {
             agents,
-            iris_agent,
-            projects,
             auth,
             machine_seed,
             agent_counter,
@@ -1242,25 +1236,17 @@ async fn run(
             ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
             ServerMessage::Ready {
                 agents,
-                iris_agent,
-                projects,
                 auth,
-                view_config: _,
                 machine_seed,
                 agent_counter,
             } => Some(ConnEvent::Ready {
                 agents,
-                iris_agent,
-                projects,
                 auth,
                 machine_seed,
                 agent_counter,
             }),
             ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
             ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
-            ServerMessage::AgentSubscribed { agent_id } => {
-                Some(ConnEvent::AgentSubscribed(agent_id))
-            }
             ServerMessage::AgentUnloaded { agent_id, reason } => {
                 Some(ConnEvent::AgentUnloaded { agent_id, reason })
             }
@@ -1270,18 +1256,16 @@ async fn run(
                 allocation: None,
             }),
             ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
-            ServerMessage::AgentAttention {
+            ServerMessage::AgentStory {
                 agent_id,
-                attention,
-                facts,
-            } => Some(ConnEvent::AgentAttention {
+                from,
+                events,
+            } => Some(ConnEvent::AgentStory {
                 agent_id,
-                attention,
-                facts,
+                from,
+                events,
             }),
-            ServerMessage::AgentTurnReport { agent_id, report } => {
-                Some(ConnEvent::AgentTurnReport { agent_id, report })
-            }
+            ServerMessage::AgentHead { head } => Some(ConnEvent::AgentHead { head }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::ChatGptUsage {
                 used_percent,
@@ -2095,8 +2079,17 @@ mod tests {
             .block_on(async {
                 let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
                 commands_tx
-                    .unbounded_send(ClientMessage::ViewConfigSet {
-                        data: vec![0; rho_ui_proto::MAX_FRAME_LEN + 1],
+                    .unbounded_send(ClientMessage::SendUserMessage {
+                        agent_id: rho_ui_proto::AgentId::from_counter(
+                            1,
+                            &rho_ui_proto::AgentIdDomain(0),
+                        )
+                        .unwrap(),
+                        content: vec![rho_core::ContentPart::Image {
+                            media_type: "image/png".to_owned(),
+                            data: vec![0; rho_ui_proto::MAX_FRAME_LEN + 1],
+                        }],
+                        delivery: rho_core::MessageDelivery::NextRequest,
                     })
                     .unwrap();
                 commands_tx.unbounded_send(ClientMessage::Ping).unwrap();

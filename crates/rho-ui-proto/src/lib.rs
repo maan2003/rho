@@ -26,6 +26,7 @@ pub mod remote;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
 pub mod shell;
+pub mod story;
 pub mod term;
 pub mod workspace;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -38,9 +39,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/8";
+pub const IROH_ALPN: &[u8] = b"rho/ui/9";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP8";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP9";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,9 +149,6 @@ pub enum ClientMessage {
         start: StartMode,
         content: Option<Vec<ContentPart>>,
     },
-    SubscribeAgent {
-        agent_id: AgentId,
-    },
     SendUserMessage {
         agent_id: AgentId,
         content: Vec<ContentPart>,
@@ -159,10 +157,6 @@ pub enum ClientMessage {
     CompactAgent {
         agent_id: AgentId,
         delivery: MessageDelivery,
-    },
-    RenameAgent {
-        agent_id: AgentId,
-        name: String,
     },
     ChangeAgentRole {
         agent_id: AgentId,
@@ -178,38 +172,10 @@ pub enum ClientMessage {
     ContinueTurn {
         agent_id: AgentId,
     },
-    /// Adds or removes one free-form label on an agent.
-    AgentLabel {
-        agent_id: AgentId,
-        label: String,
-        add: bool,
-    },
-    /// Replaces the stored client view configuration; the daemon keeps the
-    /// bytes opaque and hands them back on [`ServerMessage::Ready`].
-    ViewConfigSet {
-        data: Vec<u8>,
-    },
     /// Enables or disables one provider account namespace on this host.
     SetAuthAccountEnabled {
         name: String,
         enabled: bool,
-    },
-    /// The user's verdict on an agent's last finished turn. Attention is
-    /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
-    /// replying, landing, or hiding do.
-    SetAgentDisposition {
-        agent_id: AgentId,
-        disposition: AgentDisposition,
-    },
-    /// Registers a project, or updates it if `path` is already registered.
-    /// `name` defaults to the path's basename.
-    ProjectSet {
-        path: Utf8PathBuf,
-        name: Option<String>,
-        description: String,
-    },
-    ProjectRemove {
-        path: Utf8PathBuf,
     },
     AcquireLandLease {
         repo: Utf8PathBuf,
@@ -273,10 +239,20 @@ pub enum ClientMessage {
     RealtimeOpen {
         offer_sdp: String,
     },
-    /// Selects the high-weight agent state stream on an iroh connection.
-    /// Ignored on transports that carry agent state in the control session.
+    /// The agents whose live frames this connection wants: the ones on
+    /// screen. Everything durable arrives as story events regardless, so
+    /// this only decides who streams partial text and tools in flight.
+    /// Replaces the set wholesale; an empty set asks for none.
     AgentStreamFocus {
-        agent_id: Option<AgentId>,
+        agent_ids: Vec<AgentId>,
+    },
+    /// The client's version vector, sent once after [`ServerMessage::Ready`]:
+    /// one position per agent whose story it already holds. The daemon
+    /// answers [`ServerMessage::AgentStory`] for everything past it, and
+    /// from zero for agents the client has never seen, then follows: every
+    /// new story event on any agent is pushed on this connection.
+    AgentLogs {
+        known: Vec<(AgentId, story::UiStoryPos)>,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -402,15 +378,6 @@ pub enum ClientMessage {
     VisualizationGet {
         id: String,
     },
-    /// Subscribe this UI connection to state snapshots and updates for these
-    /// agents. Loading the backing runtime, when necessary, is daemon policy.
-    SubscribeAgents {
-        agent_ids: Vec<AgentId>,
-    },
-    /// Stop state updates for these agents on this UI connection.
-    UnsubscribeAgents {
-        agent_ids: Vec<AgentId>,
-    },
     /// Loads parent-side contents from the immutable operation returned by
     /// [`ClientMessage::DiffSnapshot`]. Replies are bounded and never
     /// snapshot the live working copy.
@@ -513,9 +480,6 @@ pub enum McpAgentToolRequest {
         advisor_id: String,
         message: String,
     },
-    Wait {
-        timeout_seconds: Option<u64>,
-    },
 }
 
 /// One spawn `workdirs` entry, passed through as the tool surface received
@@ -540,7 +504,7 @@ pub struct McpAgentToolResponse {
 pub enum StartMode {
     /// A fresh workspace in `repo` with a new change on top of the revset.
     /// Clients resolve agent targets to `<workspace name>@` themselves
-    /// (workspace names arrive on [`UiAgentSummary`]).
+    /// (workspace names arrive on [`story::UiAgentHead`]).
     NewOn { repo: Utf8PathBuf, revset: String },
     /// A fresh restricted workspace in `repo` on top of the revset.
     Sandbox { repo: Utf8PathBuf, revset: String },
@@ -553,7 +517,7 @@ pub enum StartMode {
 /// Whose workspace [`StartMode::Join`] joins.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum JoinTarget {
-    /// A known workspace, sent back verbatim from [`UiAgentSummary`].
+    /// A known workspace, sent back verbatim from [`story::UiAgentHead`].
     Workspace(WorkspaceInfo),
     /// The user's own checkout of `repo`.
     User { repo: Utf8PathBuf },
@@ -602,17 +566,10 @@ pub enum ServerMessage {
     },
     DeskResyncRequired,
     Ready {
-        agents: Vec<UiAgentSummary>,
-        /// The daemon's hidden Iris coordinator, when it has been created.
-        /// Kept separate from `agents` so clients can render Iris as a
-        /// synthetic surface without admitting it to ordinary agent lists.
-        #[senax(default)]
-        iris_agent: Option<AgentId>,
-        projects: Vec<UiProject>,
+        /// Every agent's head: the agents list, so a title, a role or a
+        /// workdir never waits on a log.
+        agents: Vec<story::UiAgentHead>,
         auth: AuthState,
-        /// The client-owned view configuration blob, verbatim from the last
-        /// [`ClientMessage::ViewConfigSet`] (empty if never set).
-        view_config: Vec<u8>,
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
@@ -639,24 +596,20 @@ pub enum ServerMessage {
     AgentCreated {
         agent_id: AgentId,
     },
-    AgentSubscribed {
-        agent_id: AgentId,
-    },
     TurnCancelled {
         agent_id: AgentId,
     },
-    /// An agent's attention level changed; broadcast to every connection so
-    /// rails stay truthful without loading the agent.
-    AgentAttention {
+    /// A run of one agent's story, in position order starting at `from`:
+    /// the answer to [`ClientMessage::AgentLogs`], and afterwards one
+    /// event at a time as the story grows.
+    AgentStory {
         agent_id: AgentId,
-        attention: UiAttention,
-        facts: UiAgentFacts,
+        from: story::UiStoryPos,
+        events: Vec<story::UiStoryEvent>,
     },
-    /// The turn-report one-shot classified an agent's finished turn.
-    /// Broadcast so rails can split pending rows into needs-you and FYI.
-    AgentTurnReport {
-        agent_id: AgentId,
-        report: UiTurnReport,
+    /// An agent's head changed, or an agent was created.
+    AgentHead {
+        head: story::UiAgentHead,
     },
     LandLeaseQueued {
         repo: Utf8PathBuf,
@@ -886,106 +839,6 @@ pub struct AgentCostSeries {
     pub agent_id: AgentId,
     pub model: String,
     pub buckets: Vec<AgentUsageBucket>,
-}
-
-/// Enough about an agent to list and label it without loading it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiAgentSummary {
-    pub agent_id: AgentId,
-    /// The agent that spawned this one. The GUI uses parent edges to
-    /// present delegated work inline beneath its parent.
-    pub parent_agent: Option<AgentId>,
-    pub display_name: Option<String>,
-    pub created_at: rho_core::UnixMs,
-    pub updated_at: rho_core::UnixMs,
-    /// The opinionated configuration represented by this agent's pinned session
-    /// profile.
-    pub role: AgentRole,
-    /// Where the agent works. Clients resolve start targets against this
-    /// themselves: "on top of agent" is the revset `<ws-id>@`, and
-    /// joining sends the info back verbatim.
-    pub workspace: WorkspaceInfo,
-    /// Attention level at summary time; kept current afterwards by
-    /// [`ServerMessage::AgentAttention`].
-    pub attention: UiAttention,
-    /// When the agent last finished a turn (creation time if it never ran).
-    /// Recency tiebreak for rail sorting; clients keep it current from
-    /// Working broadcasts.
-    pub last_active: rho_core::UnixMs,
-    /// Durable/runtime facts from which clients may derive attention policy.
-    #[senax(default)]
-    pub facts: UiAgentFacts,
-    /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
-    /// immediately instead of waiting out the rail's idle window.
-    pub hidden: bool,
-    /// Durable verdict used by Desk bindings to distinguish replies from
-    /// restaffing without hidden identity state.
-    pub disposition: AgentDisposition,
-    /// One-line snippet of the user's last message; empty if none yet.
-    /// What the work is about, for summaries and naming.
-    #[senax(default)]
-    pub last_user_message_text: String,
-    /// Durable, model-derived current activity. `None` means the agent is
-    /// idle or the sidecar has not produced a label yet.
-    #[senax(default)]
-    pub activity: Option<String>,
-    /// Model-derived classification of the last finished turn; kept current
-    /// afterwards by [`ServerMessage::AgentTurnReport`]. `None` until the
-    /// one-shot lands or after the user re-engages.
-    #[senax(default)]
-    pub turn_report: Option<UiTurnReport>,
-    /// Free-form markers ("pin", …); semantics live in the client's view
-    /// layer.
-    pub labels: Vec<String>,
-}
-
-/// Uninterpreted facts about an agent's user/turn chronology.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiAgentFacts {
-    pub turn_running: bool,
-    pub last_turn_ended: Option<rho_core::UnixMs>,
-    pub last_user_message_at: rho_core::UnixMs,
-    /// Model-produced hint about the last turn. It may affect presentation
-    /// pace, but must not decide whether a reply is owed.
-    pub needs_you_hint: bool,
-}
-
-/// What a finished turn asks of the user, derived by a small model from the
-/// turn's final message. `needs_you` splits the Pending lamp in two: a lit
-/// row that wants engagement versus a dim, dismissable FYI.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiTurnReport {
-    pub needs_you: bool,
-    /// Activity-shaped few-word label of the turn's outcome.
-    pub summary: String,
-}
-
-/// How urgently an agent wants the user, in ascending order — the rail's
-/// whole vocabulary for "which agent needs my focus". Derived by the daemon
-/// from agent state × the persisted disposition; never sent finer-grained
-/// than this (Streaming vs ToolCalling is transcript detail, not attention).
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack,
-)]
-pub enum UiAttention {
-    /// Done, snoozed, never finished a turn, or an unengaged sub-agent
-    /// (whose turns are its parent's court, not the user's).
-    #[default]
-    Quiet,
-    /// A turn is running; the agent's court.
-    Working,
-    /// A turn finished and awaits the user's disposition.
-    Pending,
-    /// Blocked on the user: the turn errored or stopped unfinished.
-    NeedsInput,
-}
-
-/// A registered project available for agent routing, keyed by path.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiProject {
-    pub path: Utf8PathBuf,
-    pub name: String,
-    pub description: String,
 }
 
 /// Daemon-wide authentication settings presented by a GUI host.
@@ -1290,7 +1143,7 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP7"[..];
+        let mut old = &b"RUP8"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -1477,14 +1330,11 @@ mod tests {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
         for message in [
             ClientMessage::AgentStreamFocus {
-                agent_id: Some(agent_id),
-            },
-            ClientMessage::AgentStreamFocus { agent_id: None },
-            ClientMessage::SubscribeAgents {
                 agent_ids: vec![agent_id],
             },
-            ClientMessage::UnsubscribeAgents {
-                agent_ids: vec![agent_id],
+            ClientMessage::AgentStreamFocus { agent_ids: vec![] },
+            ClientMessage::AgentLogs {
+                known: vec![(agent_id, story::UiStoryPos(9))],
             },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();

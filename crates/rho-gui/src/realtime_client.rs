@@ -37,7 +37,7 @@ where
     D: FnOnce(String) -> F,
     F: Future<Output = anyhow::Result<RealtimeChannel>>,
 {
-    tracing::info!("starting Iris realtime session");
+    tracing::info!("starting realtime voice session");
     let (channel_tx, channel_rx) = tokio::sync::oneshot::channel();
     let connecting = RtcSession::connect(move |offer_sdp| async move {
         let channel = dial(offer_sdp.into_string()).await?;

@@ -11,10 +11,10 @@
 
 use std::time::Duration;
 
+use rho_agent_tools::ToolHaste;
 use rho_core::UnixMs;
 
-use crate::tool::ToolHaste;
-use crate::{Phase, Standing, ToolCallAnswer};
+use super::{Phase, Standing, ToolCallAnswer};
 
 /// One source, whether or not it has anything to say.
 ///

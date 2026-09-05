@@ -278,11 +278,14 @@ pub struct HostPath {
     pub path: Utf8PathBuf,
 }
 
-/// A registered project, with the daemon that offers it.
+/// A registered workdir, with the daemon that offers it. A project is a
+/// label carrying a `Project` fact in the store; nothing on the wire
+/// carries one (`AGENT-LOG-DESIGN.md`).
 #[derive(Clone)]
 struct HostProject {
     host: HostId,
-    project: rho_ui_proto::UiProject,
+    name: String,
+    path: camino::Utf8PathBuf,
 }
 
 #[derive(Clone)]
@@ -541,12 +544,6 @@ pub struct Workspace {
     browser_metadata_subscription: Option<gpui::Subscription>,
     /// Unreferenced browser pages waiting out the Desk edit grace period.
     browser_page_gc: HashMap<rho_browser::PageId, Task<()>>,
-    /// Read-only document shown when the synthetic Iris row is targeted.
-    iris_preview: Entity<editor::Editor>,
-    /// Each daemon's hidden persisted Iris coordinator. These identities stay
-    /// outside the ordinary registry so Iris never enters agent/workstream
-    /// lists, but still route transcript subscriptions to the owning host.
-    iris_agents: HashMap<HostId, AgentId>,
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
     zulip: Option<Entity<rho_zulip::session::Session>>,
@@ -590,13 +587,11 @@ pub struct Workspace {
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
     realtime_input_muted: Option<tokio::sync::watch::Sender<bool>>,
-    iris_input_muted: bool,
-    iris_session_enabled: bool,
-    /// The daemon running the voice session. Iris delegates to an agent by
-    /// id, and an id from another daemon means nothing there, so the session
-    /// binds to one host; selecting an agent elsewhere leaves it without
-    /// context rather than sending a foreign id.
-    iris_host: Option<HostId>,
+    voice_input_muted: bool,
+    voice_session_enabled: bool,
+    /// The daemon running the voice session; the session is torn down with
+    /// that host.
+    voice_host: Option<HostId>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
     _keystroke_subscription: gpui::Subscription,
@@ -642,16 +637,24 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_agent_subscribed(&mut self, agent_id: AgentId) {
-        self.registry.mark_known(agent_id);
-    }
-
-    fn apply_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
+    fn apply_attention(&mut self, agent_id: AgentId, attention: rho_registry::Attention) {
         self.registry.set_attention(agent_id, attention);
     }
 
-    fn apply_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) {
-        self.registry.set_turn_report(agent_id, report);
+    /// The workdirs this daemon offers: the labels in its store that carry
+    /// a `Project`.
+    fn refresh_workdirs(&mut self, host: HostId) {
+        self.workdirs.retain(|workdir| workdir.host != host);
+        self.workdirs.extend(
+            self.desk_cells
+                .projects(host)
+                .into_iter()
+                .map(|(name, project)| HostProject {
+                    host,
+                    name,
+                    path: project.path,
+                }),
+        );
     }
 
     fn apply_ready(
@@ -659,32 +662,66 @@ impl Workspace {
         host: HostId,
         machine_seed: u64,
         agent_counter: u64,
-        agents: Vec<rho_ui_proto::UiAgentSummary>,
-        iris_agent: Option<AgentId>,
+        agents: Vec<rho_ui_proto::story::UiAgentHead>,
     ) -> (bool, Option<Vec<AgentId>>) {
         let first_ready = self.ready_hosts.insert(host);
+        let live = agents
+            .iter()
+            .map(|head| head.agent_id)
+            .collect::<HashSet<_>>();
+        let departed = self
+            .registry
+            .known_story_positions(host)
+            .into_iter()
+            .map(|(agent_id, _)| agent_id)
+            .filter(|agent_id| !live.contains(agent_id))
+            .collect::<Vec<_>>();
+        crate::mirror::forget(departed);
+        let name = self.registry.host_name(host).to_owned();
+        for head in &agents {
+            crate::mirror::write_head(&name, head.clone());
+        }
+        self.registry
+            .set_host_data(host, machine_seed, agent_counter, agents);
         let initial = first_ready.then(|| {
             recent_agent_roots(
-                &agents,
+                self.registry.summaries(),
                 self.registry.selected_agent().copied(),
                 INITIAL_AGENT_SUBSCRIPTIONS,
             )
         });
-        self.registry
-            .set_host_data(host, machine_seed, agent_counter, agents);
-        match iris_agent {
-            Some(agent_id) => {
-                self.iris_agents.insert(host, agent_id);
-            }
-            None => {
-                self.iris_agents.remove(&host);
-            }
-        }
         (first_ready, initial)
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
         self.registry.note_agent_created(host, agent_id);
+    }
+
+    /// Shows an agent's transcript from the story the client already holds,
+    /// for a reader who opened it before any frame arrived, or with the
+    /// daemon down. The daemon's first frame on subscribing is a snapshot,
+    /// so the live transcript replaces this whole and nothing merges.
+    fn seed_transcript_from_story(&mut self, agent_id: AgentId) -> bool {
+        // A state with no blocks is what a disconnect leaves behind: it
+        // shows nothing, so the story is strictly better than it.
+        if self
+            .store
+            .get(&agent_id)
+            .is_some_and(|state| !state.blocks.is_empty())
+        {
+            return false;
+        }
+        let events = crate::mirror::read_story(agent_id);
+        if events.is_empty() {
+            return false;
+        }
+        let state =
+            rho_registry::story_view::story_transcript(rho_ui_proto::story::UiStoryPos(0), &events);
+        self.store.apply(
+            agent_id,
+            rho_ui_proto::remote::AgentRemoteFrame::Snapshot(state),
+        );
+        true
     }
 
     fn apply_frame_state(
@@ -892,17 +929,6 @@ impl Workspace {
         .detach();
 
         let dashboard = crate::dashboard::Dashboard::new(window, cx);
-        let iris_buffer = cx.new(|cx| {
-            let mut buffer = language::Buffer::local("iris\n\nlistening", cx);
-            buffer.set_capability(language::Capability::Read, cx);
-            buffer
-        });
-        let iris_preview = cx.new(|cx| {
-            let mut editor = editor::Editor::for_buffer(iris_buffer, None, window, cx);
-            crate::editor_config::configure_preview(&mut editor, window, cx);
-            editor.set_read_only(true);
-            editor
-        });
         // The preview follows the dashboard cursor: any local selection
         // change while the dashboard is focused re-aims the surface.
         let dashboard_subscription = cx.subscribe_in(
@@ -952,7 +978,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        let keystroke_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+        let keystroke_subscription = cx.observe_keystrokes(|this, event, _window, _cx| {
             if this.desk_semantic_paste_target.is_some()
                 && !event.keystroke.key.eq_ignore_ascii_case("p")
                 && !matches!(
@@ -962,26 +988,26 @@ impl Workspace {
             {
                 this.desk_semantic_paste_target = None;
             }
+            tracing::debug!(
+                key = %event.keystroke.key,
+                shift = event.keystroke.modifiers.shift,
+                control = event.keystroke.modifiers.control,
+                alt = event.keystroke.modifiers.alt,
+                platform = event.keystroke.modifiers.platform,
+                shift_down = this.shift_down_at.is_some(),
+                "keystroke"
+            );
             // A key arriving while `shift` is down means it was being held
-            // for that key, so it was never a tap.
-            if event.keystroke.key == "shift"
+            // for that key, so it was never a tap. `shift`'s own keystroke
+            // is not such a key and never decides anything: a platform may
+            // deliver it before it updates the modifier state, and deciding
+            // here opened the menu on every press. Only modifiers-changed
+            // decides a tap.
+            let bare_shift = event.keystroke.key == "shift"
                 && !event.keystroke.modifiers.control
                 && !event.keystroke.modifiers.alt
-                && !event.keystroke.modifiers.platform
-            {
-                if event.keystroke.modifiers.shift {
-                    // Shift is still down: the release decides.
-                    this.shift_down_at
-                        .get_or_insert_with(std::time::Instant::now);
-                } else {
-                    // Shift is already back up by the time its own keystroke
-                    // arrives, so press and release collapsed into this one
-                    // event and the tap is complete. A virtual keyboard that
-                    // types the modifier as a plain key looks like this.
-                    this.shift_down_at = None;
-                    this.shift_tapped(window, cx);
-                }
-            } else {
+                && !event.keystroke.modifiers.platform;
+            if !bare_shift {
                 this.shift_down_at = None;
                 this.last_shift_tap = None;
             }
@@ -1072,8 +1098,6 @@ impl Workspace {
             browser_pages: HashSet::new(),
             browser_metadata_subscription: None,
             browser_page_gc: HashMap::new(),
-            iris_preview,
-            iris_agents: HashMap::new(),
             zulip: None,
             slack: None,
             slack_degraded: None,
@@ -1095,9 +1119,9 @@ impl Workspace {
             realtime_task: None,
             realtime_stop: None,
             realtime_input_muted: None,
-            iris_input_muted: false,
-            iris_session_enabled: false,
-            iris_host: None,
+            voice_input_muted: false,
+            voice_session_enabled: false,
+            voice_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _keystroke_subscription: keystroke_subscription,
@@ -1107,6 +1131,7 @@ impl Workspace {
         for spec in specs {
             this.attach_host(spec, cx);
         }
+        this.restore_mirror();
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         this.overview_open = false;
@@ -1132,6 +1157,33 @@ impl Workspace {
         host
     }
 
+    /// What the last session heard about every agent, read back before any
+    /// daemon answers. The rails are then whole from the first frame, and
+    /// the `AgentLogs` this client sends on `Ready` asks only for what came
+    /// after. A row whose host is no longer attached is dropped: it belongs
+    /// to a daemon this session does not have.
+    fn restore_mirror(&mut self) {
+        let hosts = self
+            .registry
+            .hosts()
+            .map(|(host, name)| (name.to_owned(), host))
+            .collect::<HashMap<_, _>>();
+        for (agent_id, mirrored) in crate::mirror::load() {
+            let Some(&host) = hosts.get(&mirrored.host) else {
+                continue;
+            };
+            self.registry.set_head(host, mirrored.head);
+            self.registry.tell_story(
+                agent_id,
+                rho_ui_proto::story::UiStoryPos(0),
+                &mirrored.story,
+            );
+            if let Some(attention) = mirrored.attention {
+                self.registry.set_attention(agent_id, attention);
+            }
+        }
+    }
+
     /// Forgets a daemon: its transcripts, surfaces, and cached projects go
     /// with it, and its connection is torn down by the drop.
     pub(crate) fn detach_host(
@@ -1140,22 +1192,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut departed = self
+        let departed = self
             .registry
             .known_agents()
             .copied()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect::<Vec<_>>();
-        if let Some(agent_id) = self.iris_agents.remove(&host) {
-            departed.push(agent_id);
-        }
         let contexts = departed
             .iter()
             .copied()
             .map(ContextId::Agent)
             .collect::<HashSet<_>>();
-        if self.iris_host == Some(host) {
-            self.stop_iris();
+        if self.voice_host == Some(host) {
+            self.stop_voice();
         }
         self.hosts.detach(host);
         self.ready_hosts.remove(&host);
@@ -1192,11 +1241,7 @@ impl Workspace {
     /// The daemon an agent lives on. `None` only before its first summary or
     /// creation notice has landed.
     fn host_of(&self, agent_id: AgentId) -> Option<HostId> {
-        self.registry.host_of_agent(agent_id).or_else(|| {
-            self.iris_agents
-                .iter()
-                .find_map(|(host, iris_id)| (*iris_id == agent_id).then_some(*host))
-        })
+        self.registry.host_of_agent(agent_id)
     }
 
     fn connection_for(&self, agent_id: AgentId) -> Option<&Connection> {
@@ -1755,12 +1800,9 @@ impl Workspace {
 
     fn mark_agent_prompt_sent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let sent_at = now_ms();
-        let mut facts = self.registry.agent_facts(agent_id);
-        // Optimistically retire the completed card. The user's own reply must
-        // never become the action that chimes back at them while daemon state
-        // is making its round trip.
-        facts.last_user_message_at = rho_core::UnixMs(sent_at);
-        self.registry.set_agent_facts(agent_id, facts);
+        // The story's own `UserMessage` arrives on the round trip; until
+        // then this is what keeps the user's own reply from chiming back
+        // at them.
         self.agent_last_interaction.insert(agent_id, sent_at as i64);
         self.invalidate_dealer_signals(cx);
     }
@@ -1994,21 +2036,22 @@ impl Workspace {
             }
             ConnEvent::Ready {
                 agents,
-                iris_agent,
-                projects: workdirs,
                 auth,
                 machine_seed,
                 agent_counter,
             } => {
                 let reconnecting = self.replay_hosts.remove(&host);
                 let (first_ready, initial_subscriptions) =
-                    self.apply_ready(host, machine_seed, agent_counter, agents, iris_agent);
+                    self.apply_ready(host, machine_seed, agent_counter, agents);
                 self.prune_contexts();
-                self.workdirs.retain(|workdir| workdir.host != host);
-                self.workdirs.extend(
-                    workdirs
-                        .into_iter()
-                        .map(|project| HostProject { host, project }),
+                self.refresh_workdirs(host);
+                // Ask for every story event this client lacks. The daemon
+                // answers with the gap and then follows.
+                self.hosts.send(
+                    host,
+                    ClientMessage::AgentLogs {
+                        known: self.registry.known_story_positions(host),
+                    },
                 );
                 if let Some(entry) = self.hosts.get_mut(host) {
                     entry.auth = Some(auth);
@@ -2035,7 +2078,7 @@ impl Workspace {
                 if let Some(agent_ids) = agent_ids
                     && !agent_ids.is_empty()
                 {
-                    self.set_initial_subscriptions(host, agent_ids, cx);
+                    self.set_initial_subscriptions(agent_ids, cx);
                 }
                 self.update_statuses(cx);
                 self.dashboard_cursor_moved(window, cx);
@@ -2060,12 +2103,12 @@ impl Workspace {
             }
             ConnEvent::AgentCreated { agent_id } => {
                 self.note_agent_created(host, agent_id);
-                if let Some((filing_host, parent)) = self.pending_agent_filing.take()
+                if let Some((filing_host, area)) = self.pending_agent_filing.take()
                     && filing_host == host
                 {
                     let writes = vec![rho_desk::cells::CellWrite {
                         id: rho_desk::cells::Id::Agent(agent_id),
-                        property: rho_desk::cells::Property::Parent(Some(parent)),
+                        property: filing_property(area),
                     }];
                     self.apply_desk_writes(host, writes, None, window, cx);
                 }
@@ -2089,10 +2132,6 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::AgentSubscribed(agent_id) => {
-                self.apply_agent_subscribed(agent_id);
-                cx.notify();
-            }
             ConnEvent::AgentUnloaded { agent_id, reason } => {
                 if !self.apply_agent_unloaded(agent_id, reason, cx) {
                     return;
@@ -2109,21 +2148,32 @@ impl Workspace {
                 self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
                 drop(allocation);
             }
-            ConnEvent::AgentAttention {
+            ConnEvent::AgentStory {
                 agent_id,
-                attention,
-                facts,
+                from,
+                events,
             } => {
-                self.registry.set_agent_facts(agent_id, facts);
-                self.apply_attention(agent_id, attention);
+                crate::mirror::write_story(agent_id, from, events.clone());
+                self.registry.tell_story(agent_id, from, &events);
+                // The story is a source of rows, not only of facts: an agent
+                // that has just asked for the user is on the map for its own
+                // sake, so the tree the dealer reads has to be made again.
+                self.sync_tree_dashboard(host, window, cx);
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
-            ConnEvent::AgentTurnReport { agent_id, report } => {
-                let mut facts = self.registry.agent_facts(agent_id);
-                facts.needs_you_hint = report.needs_you;
-                self.registry.set_agent_facts(agent_id, facts);
-                self.apply_turn_report(agent_id, report);
+            ConnEvent::AgentHead { head } => {
+                let agent_id = head.agent_id;
+                crate::mirror::write_head(self.registry.host_name(host), head.clone());
+                self.registry.set_head(host, head);
+                // A head past what this client holds is the daemon saying
+                // the follow skipped a run; ask for exactly that gap.
+                let gaps = self.registry.story_gaps(host);
+                if gaps.iter().any(|(id, _)| *id == agent_id) {
+                    self.hosts
+                        .send(host, ClientMessage::AgentLogs { known: gaps });
+                }
+                self.sync_tree_dashboard(host, window, cx);
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
@@ -2283,8 +2333,8 @@ impl Workspace {
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                 }
-                if self.iris_host == Some(host) {
-                    self.stop_iris();
+                if self.voice_host == Some(host) {
+                    self.stop_voice();
                 }
                 self.update_statuses(cx);
                 cx.notify();
@@ -2509,6 +2559,41 @@ impl Workspace {
         self.agent_cost_usage.values().cloned().collect()
     }
 
+    /// Enter with the cursor in one of the draft's header rows: the draft is
+    /// one message however many rows it has, so this sends it. In the body,
+    /// where the prompt's own insert-mode enter lives, the key stays vim's
+    /// motion and is passed straight on.
+    fn submit_from_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let in_field = self
+            .focused_draft_editor()
+            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx));
+        if in_field {
+            self.submit_prompt(&SubmitPrompt, window, cx);
+        } else if let Ok(action) = cx.build_action("vim::NextLineStart", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    /// `ctrl-u` on a header row: the row is emptied and the cursor stays in
+    /// it, ready to type. In the body the key is vim's own scroll.
+    fn clear_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let in_field = self
+            .focused_draft_editor()
+            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx));
+        if !in_field {
+            if let Ok(action) = cx.build_action("vim::ScrollUp", None) {
+                window.dispatch_action(action, cx);
+            }
+            return;
+        }
+        let Some(editor) = self.focused_draft_editor() else {
+            return;
+        };
+        self.draft_model
+            .update(cx, |view, cx| view.clear_field(&editor, window, cx));
+        self.enter_insert_mode(window, cx);
+    }
+
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
         if let SurfaceView::Shell { model, .. } = &self.active_pane().surface.view {
             model.clone().update(cx, |model, cx| model.submit(cx));
@@ -2551,20 +2636,20 @@ impl Workspace {
 
     fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
         if self.realtime_task.is_some() {
-            self.iris_input_muted = !self.iris_input_muted;
+            self.voice_input_muted = !self.voice_input_muted;
             if let Some(input_muted) = &self.realtime_input_muted {
-                input_muted.send_replace(self.iris_input_muted);
+                input_muted.send_replace(self.voice_input_muted);
             }
-            let message = match self.iris_input_muted {
-                true => "Iris microphone muted",
-                false => "Iris microphone unmuted",
+            let message = match self.voice_input_muted {
+                true => "voice microphone muted",
+                false => "voice microphone unmuted",
             };
             self.notice_on(None, message, StyleClass::SystemInfo, cx);
             return;
         }
-        self.iris_input_muted = false;
-        // Voice follows what the user is looking at: start Iris on the
-        // selected agent's daemon, so its delegations land where the work is.
+        self.voice_input_muted = false;
+        // Voice follows what the user is looking at: start on the selected
+        // agent's daemon.
         let host = self
             .registry
             .selected_agent()
@@ -2572,83 +2657,51 @@ impl Workspace {
             .and_then(|agent_id| self.host_of(agent_id))
             .filter(|host| self.hosts.is_online(*host))
             .or_else(|| self.hosts.primary());
-        self.start_iris(host, cx);
+        self.start_voice(host, cx);
     }
 
-    pub(crate) fn cmd_end_iris(&mut self, cx: &mut Context<Self>) {
-        self.iris_session_enabled = false;
+    pub(crate) fn cmd_end_voice(&mut self, cx: &mut Context<Self>) {
+        self.voice_session_enabled = false;
         if self.realtime_task.is_some() {
-            self.stop_iris();
-            self.notice_on(None, "ending Iris session…", StyleClass::SystemInfo, cx);
+            self.stop_voice();
+            self.notice_on(None, "ending voice session…", StyleClass::SystemInfo, cx);
         } else {
-            self.notice_on(None, "Iris is not active", StyleClass::SystemInfo, cx);
+            self.notice_on(None, "voice is not active", StyleClass::SystemInfo, cx);
         }
     }
 
-    fn stop_iris(&mut self) {
+    fn stop_voice(&mut self) {
         if let Some(stop) = self.realtime_stop.take() {
             let _ = stop.send(());
         }
     }
 
-    /// Moves the voice session to another daemon: Iris delegates by agent id,
-    /// and an id minted on one daemon means nothing on another, so the
-    /// session is torn down and reopened rather than re-pointed.
-    pub(crate) fn cmd_iris_follow_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(host) = self
-            .registry
-            .selected_agent()
-            .copied()
-            .and_then(|agent_id| self.host_of(agent_id))
-        else {
+    fn start_voice(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
+        if self.realtime_task.is_some() {
+            return;
+        }
+        let Some(host) = host.or(self.voice_host).or_else(|| self.hosts.primary()) else {
             self.notice_on(
                 None,
-                "iris: no agent selected to follow",
+                "voice: no daemon attached",
                 StyleClass::SystemInfo,
                 cx,
             );
             return;
         };
-        if self.iris_host == Some(host) {
-            return;
-        }
-        let name = self.host_label(host);
-        if self.realtime_task.is_some() {
-            // The restart path in `start_iris` reopens on `iris_host`.
-            self.iris_host = Some(host);
-            self.stop_iris();
-        } else {
-            self.start_iris(Some(host), cx);
-        }
-        self.notice_on(
-            None,
-            &format!("moving Iris to {name}…"),
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    fn start_iris(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
-        if self.realtime_task.is_some() {
-            return;
-        }
-        let Some(host) = host.or(self.iris_host).or_else(|| self.hosts.primary()) else {
-            self.notice_on(None, "iris: no daemon attached", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.iris_host = Some(host);
-        self.iris_session_enabled = true;
+        self.voice_host = Some(host);
+        self.voice_session_enabled = true;
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.iris_input_muted);
+        let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice_input_muted);
         let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
         self.realtime_stop = Some(stop);
         self.realtime_input_muted = Some(input_muted);
         let starting = match self.hosts.len() > 1 {
-            true => format!("starting Iris on {}…", self.host_label(host)),
-            false => "starting Iris…".to_owned(),
+            true => format!("starting voice on {}…", self.host_label(host)),
+            false => "starting voice…".to_owned(),
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
@@ -2666,13 +2719,13 @@ impl Workspace {
                 this.realtime_stop = None;
                 this.realtime_input_muted = None;
                 let message = match result {
-                    Ok(()) => "Iris stopped listening".to_owned(),
-                    Err(error) => format!("Iris failed: {error:#}"),
+                    Ok(()) => "voice stopped listening".to_owned(),
+                    Err(error) => format!("voice failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                let host = this.iris_host.filter(|host| this.hosts.is_online(*host));
-                if host.is_some() && this.iris_session_enabled {
-                    this.start_iris(host, cx);
+                let host = this.voice_host.filter(|host| this.hosts.is_online(*host));
+                if host.is_some() && this.voice_session_enabled {
+                    this.start_voice(host, cx);
                 }
             });
         }));
@@ -3381,17 +3434,17 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let disposition = if hide {
-            rho_ui_proto::AgentDisposition::Hidden
+        let verdict = if hide {
+            crate::desk_view::DeskVerdict::Mute
         } else {
-            rho_ui_proto::AgentDisposition::Done
+            crate::desk_view::DeskVerdict::Done
         };
         let targets = self.subject(window, cx).agents;
         let hid_open_agent = self
             .registry
             .selected_agent()
             .is_some_and(|agent_id| targets.contains(agent_id));
-        let sent = self.set_agent_disposition(targets, "done", disposition, cx);
+        let sent = self.deal_agents(targets, "done", verdict, window, cx);
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
         if hide && sent && hid_open_agent {
@@ -3561,18 +3614,22 @@ impl Workspace {
     pub(crate) fn cmd_agent_snooze(
         &mut self,
         duration_ms: u64,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.require_connected(cx) {
             return;
         }
-        let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
+        let until = rho_desk::cells::Timestamp {
+            unix_ms: now_ms().saturating_add(duration_ms) as i64,
+            precision: rho_desk::cells::TimestampPrecision::Minute,
+        };
         let targets = self.subject(window, cx).agents;
-        self.set_agent_disposition(
+        self.deal_agents(
             targets,
             "snooze",
-            rho_ui_proto::AgentDisposition::Snoozed { until },
+            crate::desk_view::DeskVerdict::Defer { until },
+            window,
             cx,
         );
     }
@@ -3582,6 +3639,7 @@ impl Workspace {
         path: String,
         name: Option<String>,
         description: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.require_connected(cx) {
@@ -3594,25 +3652,59 @@ impl Workspace {
                 return;
             }
         };
-        self.hosts.send(
+        // A project is a label carrying a workdir. The name the user gave
+        // is the label's path; the description was the daemon's and has no
+        // fact to live in.
+        let _ = description;
+        let path_name = name.unwrap_or_else(|| {
+            workdir
+                .path
+                .file_name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| workdir.path.to_string())
+        });
+        let seed = self.registry.host_machine_seed(workdir.host);
+        let Some(writes) = self.desk_cells.project_writes(
             workdir.host,
-            ClientMessage::ProjectSet {
+            &path_name,
+            Some(rho_desk::cells::Project {
+                host: seed,
                 path: workdir.path,
-                name,
-                description,
-            },
-        );
+            }),
+        ) else {
+            return;
+        };
+        self.apply_desk_writes(workdir.host, writes, None, window, cx);
+        self.refresh_workdirs(workdir.host);
     }
 
-    pub(crate) fn cmd_project_remove(&mut self, path: String, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_project_remove(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.require_connected(cx) {
             return;
         }
         match self.registered_workdir(&path) {
-            Some(workdir) => self.hosts.send(
-                workdir.host,
-                ClientMessage::ProjectRemove { path: workdir.path },
-            ),
+            Some(workdir) => {
+                let Some(name) = self
+                    .workdirs
+                    .iter()
+                    .find(|candidate| {
+                        candidate.host == workdir.host && candidate.path == workdir.path
+                    })
+                    .map(|candidate| candidate.name.clone())
+                else {
+                    return;
+                };
+                let Some(writes) = self.desk_cells.project_writes(workdir.host, &name, None) else {
+                    return;
+                };
+                self.apply_desk_writes(workdir.host, writes, None, window, cx);
+                self.refresh_workdirs(workdir.host);
+            }
             None => {
                 let message = format!("no registered project `{path}`");
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -4171,46 +4263,40 @@ impl Workspace {
     /// has just come up. The LRU is shared across hosts — it bounds this
     /// client's memory, not any one daemon's — so a newly attached host adds
     /// its warm set rather than resetting everyone else's.
-    fn set_initial_subscriptions(
-        &mut self,
-        host: HostId,
-        agent_ids: Vec<AgentId>,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>, cx: &mut Context<Self>) {
         for agent_id in &agent_ids {
             let (_, evicted) = self.subscriptions.touch(*agent_id);
             if let Some(evicted) = evicted {
-                self.send_to_agent(
-                    evicted,
-                    ClientMessage::UnsubscribeAgents {
-                        agent_ids: vec![evicted],
-                    },
-                );
                 self.release_agent_view_cache(evicted, cx);
             }
         }
-        self.hosts
-            .send(host, ClientMessage::SubscribeAgents { agent_ids });
+        self.send_agent_focus();
     }
 
     fn subscribe_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(evicted) = evicted {
-            self.send_to_agent(
-                evicted,
-                ClientMessage::UnsubscribeAgents {
-                    agent_ids: vec![evicted],
-                },
-            );
             self.release_agent_view_cache(evicted, cx);
         }
-        if subscribe {
-            self.send_to_agent(
-                agent_id,
-                ClientMessage::SubscribeAgents {
-                    agent_ids: vec![agent_id],
-                },
-            );
+        if subscribe || evicted.is_some() {
+            self.send_agent_focus();
+        }
+    }
+
+    /// Tells every host which of its agents this client wants live frames
+    /// for: the whole subscription set, replaced. Nothing durable travels
+    /// on it, so a set that lags by one frame costs nothing.
+    fn send_agent_focus(&mut self) {
+        let mut by_host: HashMap<HostId, Vec<AgentId>> = HashMap::new();
+        for agent_id in self.subscriptions.iter() {
+            if let Some(host) = self.registry.host_of_agent(agent_id) {
+                by_host.entry(host).or_default().push(agent_id);
+            }
+        }
+        for host in self.hosts.ids() {
+            let agent_ids = by_host.remove(&host).unwrap_or_default();
+            self.hosts
+                .send(host, ClientMessage::AgentStreamFocus { agent_ids });
         }
     }
 
@@ -4256,7 +4342,7 @@ impl Workspace {
     /// with a conversation open is the normal way to work, and taking the
     /// tab's agent there would act on something the user is not looking at.
     ///
-    /// Rows that name nobody — Iris, the draft, the rail tail — fall through
+    /// Rows that name nobody — the draft, the rail tail — fall through
     /// to the open agent, so a chord from the dashboard still lands.
     pub(crate) fn subject(&self, window: &Window, cx: &mut Context<Self>) -> Subject {
         use crate::dashboard::RowTarget;
@@ -4310,13 +4396,16 @@ impl Workspace {
         agent
     }
 
-    /// Sends one verdict per agent of the row. All of them live on the same
-    /// daemon, so one online check covers the batch.
-    fn set_agent_disposition(
+    /// One verdict per agent of the row, written into the store like any
+    /// other verdict: the cursor lands on where the agent's story stands,
+    /// so what it said before the press is handled and what it says after
+    /// is not.
+    fn deal_agents(
         &mut self,
         targets: Vec<AgentId>,
         command: &str,
-        disposition: rho_ui_proto::AgentDisposition,
+        verdict: crate::desk_view::DeskVerdict,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(&first) = targets.first() else {
@@ -4324,14 +4413,8 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return false;
         };
-        if !self.require_agent_online(first, cx) {
+        let Some(host) = self.registry.host_of_agent(first) else {
             return false;
-        }
-        // Every verdict but a lapsed snooze puts the row down.
-        let quieting = match disposition {
-            rho_ui_proto::AgentDisposition::Done | rho_ui_proto::AgentDisposition::Hidden => true,
-            rho_ui_proto::AgentDisposition::Snoozed { until } => until.0 > now_ms(),
-            rho_ui_proto::AgentDisposition::Pending => false,
         };
         // Name what the press covered. A verdict is otherwise the one action
         // whose success looks exactly like a key that did nothing, which is
@@ -4342,22 +4425,15 @@ impl Workspace {
         };
         self.echo(&format!("{command}: {subject}"), StyleClass::SystemInfo, cx);
         for agent_id in targets {
-            self.send_to_agent(
-                agent_id,
-                ClientMessage::SetAgentDisposition {
-                    agent_id,
-                    disposition,
-                },
-            );
-            // Show the verdict now rather than waiting for the round trip.
-            // A still-working agent keeps its lamp: the daemon reads
-            // attention off the live runtime first, so predicting quiet
-            // there would flicker.
-            if quieting && self.registry.attention(agent_id) != rho_ui_proto::UiAttention::Working {
-                self.registry
-                    .expect_attention(agent_id, rho_ui_proto::UiAttention::Quiet);
-            }
+            let id = rho_desk::cells::Id::Agent(agent_id);
+            let Some((writes, verdict_entry)) =
+                self.desk_cells.verdict_writes(host, &id, verdict.clone())
+            else {
+                continue;
+            };
+            self.apply_desk_writes(host, writes, Some(verdict_entry), window, cx);
         }
+        self.refresh_desk_sources(host, cx);
         self.invalidate_dealer_signals(cx);
         cx.notify();
         true
@@ -4374,10 +4450,24 @@ impl Workspace {
         }
     }
 
-    /// Shift-Tab in the draft: with the cursor in the start field, cycle its
-    /// mode (on top of ↔ join); anywhere else, cycle fields like Tab. On agent
-    /// views it does nothing.
+    /// Shift-Tab in the draft walks the rows the other way round, the way
+    /// it does in every form. It used to cycle the value under the cursor
+    /// instead, so from a field the only way back was forwards through all
+    /// of them; the values have `ctrl-tab` now. On agent views it does
+    /// nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.registry.selected_agent().is_none()
+            && let Some(editor) = self.focused_draft_editor()
+        {
+            self.draft_model
+                .update(cx, |view, cx| view.toggle_field_back(&editor, window, cx));
+        }
+    }
+
+    /// Ctrl-Tab cycles the value the cursor is on: the role, or the start
+    /// field's mode (on top of → join → sandbox). Elsewhere in the draft it
+    /// does nothing, there being no value to cycle.
+    fn cycle_draft_value(&mut self, cx: &mut Context<Self>) {
         if self.registry.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
@@ -4387,8 +4477,6 @@ impl Workspace {
                     view.set_role_text(next, cx);
                 } else if view.cursor_in_start_field(&editor, cx) {
                     view.cycle_start_mode(cx);
-                } else {
-                    view.toggle_field(&editor, window, cx);
                 }
             });
         }
@@ -4417,7 +4505,7 @@ impl Workspace {
             .or_else(|| {
                 self.workdirs.first().map(|workdir| HostPath {
                     host: workdir.host,
-                    path: workdir.project.path.clone(),
+                    path: workdir.path.clone(),
                 })
             })
     }
@@ -4438,10 +4526,8 @@ impl Workspace {
         let name = self
             .workdirs
             .iter()
-            .find(|candidate| {
-                candidate.host == workdir.host && candidate.project.path == workdir.path
-            })
-            .map(|candidate| candidate.project.name.clone());
+            .find(|candidate| candidate.host == workdir.host && candidate.path == workdir.path)
+            .map(|candidate| candidate.name.clone());
         match name {
             Some(name) => self.qualify(workdir.host, &name),
             None if self.hosts.len() > 1 => {
@@ -4459,12 +4545,12 @@ impl Workspace {
             .iter()
             .map(|workdir| {
                 (
-                    self.qualify(workdir.host, &workdir.project.name),
+                    self.qualify(workdir.host, &workdir.name),
                     match self.hosts.len() > 1 {
                         true => {
-                            format!("{}:{}", self.host_label(workdir.host), workdir.project.path)
+                            format!("{}:{}", self.host_label(workdir.host), workdir.path)
                         }
-                        false => workdir.project.path.to_string(),
+                        false => workdir.path.to_string(),
                     },
                 )
             })
@@ -4477,18 +4563,17 @@ impl Workspace {
     fn registered_workdir(&self, argument: &str) -> Option<HostPath> {
         let workdir = |candidate: &HostProject| HostPath {
             host: candidate.host,
-            path: candidate.project.path.clone(),
+            path: candidate.path.clone(),
         };
         if let Some(exact) = self.workdirs.iter().find(|candidate| {
-            self.qualify(candidate.host, &candidate.project.name) == argument
-                || candidate.project.path == argument
+            self.qualify(candidate.host, &candidate.name) == argument || candidate.path == argument
         }) {
             return Some(workdir(exact));
         }
         let mut bare = self
             .workdirs
             .iter()
-            .filter(|candidate| candidate.project.name == argument);
+            .filter(|candidate| candidate.name == argument);
         let first = bare.next()?;
         bare.next().is_none().then(|| workdir(first))
     }
@@ -4864,8 +4949,6 @@ impl Workspace {
         {
             self.dashboard_web_preview = None;
         }
-        self.hosts
-            .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -4890,14 +4973,8 @@ impl Workspace {
         self.observe_browser_metadata(&model, window, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
-        self.hosts.focus_agent(None);
         self.dashboard_web_preview = Some((id, view));
         cx.notify();
-    }
-
-    fn current_iris_agent(&self) -> Option<AgentId> {
-        let host = self.iris_host.or_else(|| self.hosts.primary())?;
-        self.iris_agents.get(&host).copied()
     }
 
     fn select_agent_inner(
@@ -4944,8 +5021,9 @@ impl Workspace {
         if focus {
             self.focus_active_surface(window, cx);
         }
-        self.hosts
-            .focus_agent(agent_id.and_then(|agent_id| Some((self.host_of(agent_id)?, agent_id))));
+        if let Some(agent_id) = agent_id {
+            self.subscribe_agent(agent_id, cx);
+        }
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -4995,7 +5073,6 @@ impl Workspace {
         {
             self.dashboard_web_preview = None;
         }
-        self.hosts.focus_agent(None);
         cx.notify();
     }
 
@@ -5771,7 +5848,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<AgentModel> {
+        // Every route to a transcript comes through here, so this is where
+        // the story stands in until a frame arrives.
+        let told = self.seed_transcript_from_story(*agent_id);
         let (view, _) = self.ensure_agent_model(*agent_id, window, cx);
+        // Seeding the store is not showing it: a view that already exists
+        // (the daemon answers for every agent on connecting, with nothing
+        // loaded) renders what it last synced, which was a blank page.
+        if told {
+            self.sync_agent_model(*agent_id, &view, FrameSummary::everything(), false, cx);
+        }
         if view.read(cx).initial_load_ready()
             && let (Some(summary), Some(state)) = (
                 self.pending_syncs.remove(agent_id),
@@ -6112,6 +6198,14 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn card_target_for_test(
+        &self,
+        card: crate::dashboard::DealCardId,
+    ) -> crate::dashboard::CardTarget {
+        self.dashboard.card_target(card)
+    }
+
+    #[cfg(test)]
     pub(crate) fn seek_deal_card_for_test(
         &mut self,
         wanted: fn(crate::dashboard::DealCardKind) -> bool,
@@ -6216,17 +6310,39 @@ impl Workspace {
     /// thread's conversation is the mirror's, and a copy could only go
     /// stale.
     fn refresh_desk_sources(&mut self, host: HostId, cx: &Context<Self>) {
+        /// The story's positions and the store's are the same number; the
+        /// two crates just name it themselves.
+        fn story_pos(pos: rho_ui_proto::story::UiStoryPos) -> rho_desk::cells::StoryPos {
+            rho_desk::cells::StoryPos(pos.0)
+        }
+
+        for (agent_id, hidden, labels) in self.desk_cells.agent_filing(host) {
+            self.registry.set_agent_filing(agent_id, hidden, labels);
+        }
         let agents = self
             .registry
             .known_agents()
             .copied()
             .filter(|agent| self.registry.host_of_agent(*agent) == Some(host))
             .filter(|agent| !self.registry.agent_hidden(*agent))
-            .map(|agent| crate::desk_view::AgentSource {
-                agent,
-                spawned_by: self.registry.agent_parent(agent),
-                workdir: self.registry.working_directory(agent),
-                open: self.registry.attention(agent) >= rho_ui_proto::UiAttention::Pending,
+            .map(|agent| {
+                let digest = self.registry.agent_digest(agent);
+                crate::desk_view::AgentSource {
+                    agent,
+                    spawned_by: self.registry.agent_parent(agent),
+                    workdir: self.registry.working_directory(agent),
+                    newest: digest
+                        .map(|digest| story_pos(digest.newest))
+                        .unwrap_or_default(),
+                    turn_running: digest.is_some_and(|digest| digest.turn_running),
+                    errored: digest.and_then(|digest| digest.errored).map(story_pos),
+                    wants: digest.and_then(|digest| {
+                        digest
+                            .wants
+                            .as_ref()
+                            .map(|wants| (wants.want, story_pos(wants.at)))
+                    }),
+                }
             })
             .collect::<Vec<_>>();
         // The Slack mirror lives on this client, and its conversations are
@@ -6272,6 +6388,12 @@ impl Workspace {
             pages,
         };
         self.desk_cells.set_sources(host, sources);
+        // The card is the one place attention is decided; the registry is
+        // where every rail reads the answer.
+        for (agent_id, attention) in self.desk_cells.agent_attentions(host) {
+            crate::mirror::write_attention(agent_id, attention);
+            self.registry.set_attention(agent_id, attention);
+        }
     }
 
     /// One verdict, applied the way the dealer applies it, for a test that
@@ -7157,6 +7279,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let modifiers = event.modifiers;
+        tracing::debug!(
+            shift = modifiers.shift,
+            control = modifiers.control,
+            alt = modifiers.alt,
+            platform = modifiers.platform,
+            held_ms = self.shift_down_at.map(|down| down.elapsed().as_millis()),
+            "modifiers changed"
+        );
         if modifiers.shift {
             // Down. Only `shift` on its own can still become a tap: with
             // another modifier already held this is a chord being built.
@@ -7424,7 +7554,7 @@ impl Workspace {
                 };
                 let name = tokens.next().map(str::to_owned);
                 let description = tokens.collect::<Vec<_>>().join(" ");
-                workspace.cmd_project_add(path.to_owned(), name, description, cx);
+                workspace.cmd_project_add(path.to_owned(), name, description, _window, cx);
             },
         );
         self.open_prompt("project path [name]:", complete, on_submit, window, cx);
@@ -7453,7 +7583,7 @@ impl Workspace {
              cx: &mut Context<Workspace>| {
                 let path = input.trim().to_owned();
                 if !path.is_empty() {
-                    workspace.cmd_project_remove(path, cx);
+                    workspace.cmd_project_remove(path, _window, cx);
                 }
             },
         );
@@ -7511,8 +7641,7 @@ impl Workspace {
                 });
                 self.registry.select_agent(agent_id);
                 self.active_context = self.context_for_agent(agent_id);
-                self.hosts
-                    .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
+                self.subscribe_agent(agent_id, cx);
                 self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
             }
             // A thread is a conversation: the deal view is the conversation
@@ -7637,6 +7766,31 @@ impl Workspace {
         )
     }
 
+    /// The node a card in view is about: the row the map's cursor is on,
+    /// the row Home's cursor is on, or the thing the surface in view stands
+    /// for. A surface that stands for nothing — a draft, the message log, a
+    /// picker, a list — has no card at all. Falling through to the context
+    /// the way filing does made those surfaces borrow whichever card the
+    /// map's cursor had left behind: they wore its label and its why, and a
+    /// verdict pressed over them landed on it.
+    fn card_target(&mut self, cx: &mut Context<Self>) -> Option<(HostId, rho_desk::cells::Id)> {
+        // The map is the overlay in front, so its cursor row is what the
+        // reader is on even when Home is the surface underneath with a
+        // cursor of its own on some other card.
+        if self.overview_open {
+            return self
+                .dashboard
+                .tree_node_at_cursor(cx)
+                .or_else(|| self.context_area(cx));
+        }
+        // Home is a list of cards, so its cursor names one the same way the
+        // map's does.
+        if self.home_in_view() {
+            return self.context_area(cx);
+        }
+        self.surface_node()
+    }
+
     /// The card the reader is on: the one behind the surface in view, or
     /// the row under Home's or the map's cursor. When the ranking holds no
     /// card for that node the node itself is the card, because reading a
@@ -7645,7 +7799,7 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<crate::dashboard::DealCard> {
-        let (host, node_id) = self.label_target(cx)?;
+        let (host, node_id) = self.card_target(cx)?;
         let hand = self.hand(cx);
         hand.card(&crate::dashboard::DealCardId {
             host,
@@ -7663,7 +7817,10 @@ impl Workspace {
         !self.overview_open && self.active_pane().surface.key == SurfaceKey::Home
     }
 
-    /// The card a surface in view stands for, which is nothing on Home.
+    /// The card a surface in view stands for, which is nothing on Home:
+    /// Home's cursor names a card to act on, but Home itself is a list, not
+    /// the card. Everything else follows [`Self::card_target`], so a draft,
+    /// the message log and every other list or log stand for no card.
     pub(crate) fn open_card_in_view(
         &mut self,
         cx: &mut Context<Self>,
@@ -8111,7 +8268,16 @@ impl Workspace {
         else {
             return false;
         };
-        let echo = format!("{verb}: {}", card.breadcrumb);
+        // A verdict names the card it took, not the place the card was
+        // filed. The breadcrumb is the path above an agent's card, so `done`
+        // over an agent under a label said the label's name and never the
+        // agent's, and two agents in one label read identically.
+        let subject = card
+            .agent_id
+            .map(|agent_id| self.registry.agent_human_name(agent_id))
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| card.breadcrumb.clone());
+        let echo = format!("{verb}: {subject}");
         // A todo hangs a note under the card. Empty, it comes back in a week
         // reading only `defer …`, so it is given the card's own words.
         let todo_note = match &applied.1 {
@@ -8214,7 +8380,7 @@ impl Workspace {
         match self.workdirs.as_slice() {
             [workdir] => Some(HostPath {
                 host: workdir.host,
-                path: workdir.project.path.clone(),
+                path: workdir.path.clone(),
             }),
             _ => None,
         }
@@ -8479,6 +8645,38 @@ impl Workspace {
                 }
             });
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn draft_model_for_test(&self) -> Entity<crate::draft_view::DraftModel> {
+        self.draft_model.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_in_draft_field_for_test(&self, cx: &mut Context<Self>) -> bool {
+        self.focused_draft_editor()
+            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_a_field(&editor, cx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_in_draft_start_field_for_test(&self, cx: &mut Context<Self>) -> bool {
+        self.focused_draft_editor()
+            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_start_field(&editor, cx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_in_draft_role_field_for_test(&self, cx: &mut Context<Self>) -> bool {
+        self.focused_draft_editor()
+            .is_some_and(|editor| self.draft_model.read(cx).cursor_in_role_field(&editor, cx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_from_draft_field_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_from_draft_field(window, cx);
     }
 
     #[cfg(test)]
@@ -8933,25 +9131,12 @@ impl Workspace {
         container.child(dashboard).into_any_element()
     }
 
-    /// The Iris document or selected agent preview editor.
+    /// The selected agent's preview editor.
     fn selected_preview_editor(
         &mut self,
-        iris: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<editor::Editor>> {
-        if iris {
-            let Some(agent_id) = self.current_iris_agent() else {
-                return Some(self.iris_preview.clone());
-            };
-            if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
-                self.subscribe_agent(agent_id, cx);
-            }
-            let model = self.materialize_model(&agent_id, window, cx);
-            self.hosts
-                .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
-            return Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
-        }
         let agent_id = self.dashboard_preview?;
         let model = self.models.get(&agent_id)?.clone();
         Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
@@ -8959,7 +9144,6 @@ impl Workspace {
 
     fn selected_preview(
         &mut self,
-        iris: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
@@ -8972,14 +9156,13 @@ impl Workspace {
                     .into_any_element(),
             );
         }
-        self.selected_preview_editor(iris, window, cx)
-            .map(|editor| {
-                div()
-                    .size_full()
-                    .overflow_hidden()
-                    .child(editor)
-                    .into_any_element()
-            })
+        self.selected_preview_editor(window, cx).map(|editor| {
+            div()
+                .size_full()
+                .overflow_hidden()
+                .child(editor)
+                .into_any_element()
+        })
     }
 
     fn render_deal_why(
@@ -9275,10 +9458,17 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        // The label is about whatever is in view: with a card behind the
-        // surface it says which card and why, with the map open it is the
-        // map's own breadcrumb.
-        if let Some(card) = self.open_card_in_view(cx) {
+        // An echo is the answer to the key just pressed, so it takes the
+        // line for its two seconds. The card's why used to win, and every
+        // refusal behind a card went unsaid — a new agent with nowhere to
+        // run said nothing at all.
+        let echo = self.echo.as_ref().map(|echo| echo.text().to_owned());
+        // Otherwise the label is about whatever is in view: with a card
+        // behind the surface it says which card and why, with the map open
+        // it is the map's own breadcrumb.
+        if let Some(card) = self.open_card_in_view(cx)
+            && echo.is_none()
+        {
             return self.render_deal_why(&card, text_style, window, cx);
         }
         let path = if self.overview_open {
@@ -9312,12 +9502,12 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
-        let left = self.echo.as_ref().map_or_else(
+        let left = echo.map_or_else(
             || self.render_status_path(&Self::truncate_outline_path(&path), cx),
             |echo| {
                 div()
                     .text_color(cx.theme().status().info)
-                    .child(echo.text().to_owned())
+                    .child(echo)
                     .into_any_element()
             },
         );
@@ -9360,10 +9550,9 @@ impl Workspace {
             let visible_surfaces = focused_surface.bit();
             crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
         }
-        let iris = false;
         self.sync_diff_visibility(!home, cx);
         let web_preview_visible = self.dashboard_web_preview.is_some();
-        let show_surface = !home || iris || self.dashboard_preview.is_some() || web_preview_visible;
+        let show_surface = !home || self.dashboard_preview.is_some() || web_preview_visible;
         let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
         // Same hairline the rail uses against the preview.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
@@ -9372,9 +9561,7 @@ impl Workspace {
             (text_style.font_size.to_pixels(window.rem_size()) * 0.85).into();
         preview_text_style.line_height =
             (text_style.line_height_in_pixels(window.rem_size()) * 0.85).into();
-        let preview = home
-            .then(|| self.selected_preview(iris, window, cx))
-            .flatten();
+        let preview = home.then(|| self.selected_preview(window, cx)).flatten();
         let surface = show_surface.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
             // Home mode uses a narrow preview card with the original top
@@ -9470,6 +9657,7 @@ impl Workspace {
         match &surface.view {
             SurfaceView::Draft { editor, .. } => div()
                 .id("rho-surface-draft")
+                .key_context("RhoDraft")
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -9683,9 +9871,8 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-gemini" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Gemini,
         }),
-        "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, eng-gemini, or pm"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, or eng-gemini"
         )),
     }
 }
@@ -9757,8 +9944,6 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
             ..
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-mini",
-        AgentRole::Iris => "eng-mini",
     }
 }
 
@@ -9771,14 +9956,6 @@ struct RoleLabel {
 #[cfg(test)]
 fn agent_role_label(config: AgentRole) -> RoleLabel {
     match config {
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => RoleLabel {
-            text: "pm".to_owned(),
-            family: RoleFamily::Deep,
-        },
-        AgentRole::Iris => RoleLabel {
-            text: "iris".to_owned(),
-            family: RoleFamily::Deep,
-        },
         AgentRole::Advisor { intelligence } => RoleLabel {
             text: match intelligence {
                 AdvisorIntelligence::Medium => "advisor",
@@ -10287,6 +10464,19 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
                 this.cycle_draft_group(window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::DraftValueCycle, _window, cx| {
+                    this.cycle_draft_value(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DraftFieldSubmit, window, cx| {
+                    this.submit_from_draft_field(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::DraftFieldClear, window, cx| {
+                this.clear_draft_field(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
                 this.focus_rail(window, cx);
             }))
@@ -10436,6 +10626,20 @@ impl Render for Workspace {
     }
 }
 
+/// How a new agent is filed into the area it was made in. A label is the
+/// other axis: filing into one is being labelled, not being reparented
+/// under it. Written as a parent, the agent went in and the map still drew
+/// it at the root with the label it was made in left empty.
+pub(crate) fn filing_property(area: rho_desk::cells::Id) -> rho_desk::cells::Property {
+    match area {
+        label @ rho_desk::cells::Id::Label(_) => rho_desk::cells::Property::Labeled {
+            label,
+            present: true,
+        },
+        parent => rho_desk::cells::Property::Parent(Some(parent)),
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10482,7 +10686,6 @@ mod tests {
                 intelligence: EngineerIntelligence::Low,
             }
         );
-        assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::pm());
         assert_eq!(
             parse_agent_role("eng-gemini").unwrap(),
             AgentRole::Engineer {
@@ -10496,8 +10699,8 @@ mod tests {
 
     #[test]
     fn labels_agent_role() {
-        let label = agent_role_label(AgentRole::pm());
-        assert_eq!(label.text, "pm");
+        let label = agent_role_label(AgentRole::default());
+        assert_eq!(label.text, "eng");
     }
 
     #[test]

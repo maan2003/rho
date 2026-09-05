@@ -174,16 +174,9 @@ impl Hosts {
         }
     }
 
-    /// Points every host's transport priority at the focused agent: its own
-    /// host promotes that stream, the others drop back to background
-    /// weights.
-    pub fn focus_agent(&self, focused: Option<(HostId, rho_ui_proto::AgentId)>) {
-        for host in &self.hosts {
-            let agent_id = focused
-                .filter(|(owner, _)| *owner == host.id)
-                .map(|(_, agent_id)| agent_id);
-            host.connection.focus_agent(agent_id);
-        }
+    /// Every host id, in the order they were added.
+    pub fn ids(&self) -> Vec<HostId> {
+        self.hosts.iter().map(|host| host.id).collect()
     }
 
     pub fn set_status(&mut self, host: HostId, status: HostStatus) {

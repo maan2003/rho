@@ -1,54 +1,47 @@
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
-use std::num::NonZeroU64;
-use std::sync::{Arc, RwLock};
+//! Rho's agents: the runtime loop (`agent`), the Claude Code runtime
+//! (`claude`), the log both write into (`db`, `story`), and the pool that
+//! keeps them running (`pool`).
+//!
+//! This file holds what the runtimes and their readers share: the raw log's
+//! event type, the queued input it records, the state a reader sees, and
+//! the text helpers both runtimes tell the story with.
 
-use async_stream::stream;
-use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
-use futures::{Stream, StreamExt};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::num::NonZeroU64;
+use std::sync::Arc;
+
 use rho_core::{
-    ApplyPatchMetadata, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent,
-    InferenceRequest, InferenceResponseItem, PendingInferenceResponse, ProviderResponseId,
-    StreamingContextItem, StreamingContextItemState, ToolCall, ToolCallId, ToolExecutionContext,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolResultMetadata, ToolSpec, ToolUpdate, UnixMs,
+    ApplyPatchMetadata, ContentPart, ContextBlock, InferenceResponseItem, PendingInferenceResponse,
+    ProviderResponseId, ToolCall, ToolCallId, ToolResult, ToolSpec, ToolUpdate, UnixMs,
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
-use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
-use rho_web_search::WebSearchTools;
-use rho_workspaces::{Repo, View, Workspace};
+use rho_workspaces::{Repo, Workspace, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
-use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
-    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
+    AgentEventPos, AgentId, AgentPresentationUpdate, AgentRole, AgentRuntime, AgentSpawnedBy,
+    AgentWriteTxnExt as _, ClaudeRewind, SessionBinding, UnixMillis,
 };
-use crate::lazy::Lazy;
-use crate::multi_agent_tools::MultiAgentTools;
-use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
-pub mod agent2;
+pub mod agent;
 mod claude;
+pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
 pub use claude::{backfill_last_turn_ended_from_claude_messages, last_assistant_message_at};
-#[cfg(feature = "code-mode")]
-mod code_mode;
+
 pub mod db;
 mod image_tool;
-pub mod iris_tools;
 mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod presentation;
+pub mod story;
+pub mod story_backfill;
+pub mod story_fixture;
+#[cfg(test)]
+mod story_sizing;
 pub mod system_prompt;
-
-#[cfg(feature = "code-mode")]
-type CodeModeSession = rho_code_mode::CodeModeSession;
-#[cfg(not(feature = "code-mode"))]
-struct CodeModeSession;
 
 const PRESENTATION_SOURCE_TAIL_BYTES: usize = 12 * 1024;
 
@@ -59,89 +52,191 @@ pub struct RenderedAgentSurface {
     pub tools: Arc<[ToolSpec]>,
 }
 
-pub fn render_agent_surface(
-    view: Arc<View>,
-    role: db::AgentRole,
-) -> anyhow::Result<RenderedAgentSurface> {
-    let binding = role.session_profile()?;
-    if binding.claude_model().is_some() {
-        return Ok(RenderedAgentSurface {
-            system_prompt: system_prompt::claude_prompt(Some(view.as_ref()), None, role),
-            tools: Arc::from([]),
-        });
-    }
-    let profile = binding
-        .deep_config()
-        .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
-    let function_tools_only = binding.deep_model() == Some(InferenceModel::Gemini37FlashLow);
-    let code_mode = cfg!(feature = "code-mode") && profile.code_mode;
-    let shell_tools = ShellTools::new(
-        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        Arc::clone(&view),
-    );
-    let agent_tools_enabled = true;
-    Ok(RenderedAgentSurface {
-        system_prompt: system_prompt::prompt(view.as_ref(), None, code_mode, role, &[]),
-        tools: agent_tool_specs(
-            &shell_tools,
-            agent_tools_enabled,
-            code_mode,
-            function_tools_only,
-            role,
-        ),
-    })
-}
-
-/// An agent timeline event. Some events fold into model context; future
-/// runtime-only events, like tool output chunks, can live here without becoming
-/// inference input.
+/// One event of an agent's raw log.
+///
+/// The Rho runtime writes `Accepted`, `QueueCleared`, `Sent` and `Replied`;
+/// the head's config events are written by the store on the agent's behalf.
+/// The rest are what earlier runtimes wrote and are decoded only, so a log
+/// from before the current loop still replays (`agent::replay`).
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
+    /// An input entered a queue: user text, mail, or a `/compact`. It becomes
+    /// context when a later `Sent` carries it.
+    Accepted(QueuedInput),
+    /// A boundary: every source was drained into `blocks`, they were appended
+    /// to history, and a request went out carrying all of it.
+    ///
+    /// One event rather than an append and a start, because it was always one
+    /// thing — and because the drain, the append and the send cannot come
+    /// apart even in a crash. `blocks` can be empty: a retry or a resume
+    /// sends with nothing pending, which is a fact worth being able to write
+    /// down.
+    Sent {
+        blocks: Cow<'a, [ContextBlock]>,
+    },
+    /// The model answered, and the request is over.
+    Replied {
+        blocks: Cow<'a, [ContextBlock]>,
+        /// Context-window occupancy after this response (all input plus
+        /// output tokens), or `None` when it compacted or usage was missing.
+        context_used: Option<u64>,
+    },
+    /// All queued items were dropped (cancel).
+    QueueCleared,
+
+    // -- what the previous Rho loop wrote; decoded, never written ------------
     InferenceResponse {
         items: Cow<'a, [InferenceResponseItem]>,
         provider_response_id: Option<ProviderResponseId>,
-        /// Context-window occupancy reported with this response (all input
-        /// plus output tokens). `None` in events persisted before this field
-        /// existed, or when the provider omitted usage.
         context_used: Option<u64>,
     },
     ToolResult {
         result: Cow<'a, ToolResult>,
     },
-    /// An input entered the agent's queue. It only becomes model context
-    /// when a later `Dequeued` boundary delivers it, so the pending queue
-    /// survives restarts.
     Queued(QueuedItem),
-    /// The loop reached `boundary` and delivered the eligible lanes into
-    /// model context. Only written when at least one item was delivered.
     Dequeued {
-        boundary: MessageDelivery,
+        boundary: LegacyDelivery,
     },
-    /// All queued items were dropped (cancel).
-    QueueCleared,
-    /// A model-derived presentation cache update. It never becomes inference
-    /// context; it is retained as history so caches can be rebuilt after a
-    /// native lineage fork.
+    /// Once the presentation's own record; the story carries it now.
     PresentationUpdated {
         update: AgentPresentationUpdate,
     },
+
+    // -- the runtimes' shared config log --------------------------------------
     /// A text-only message confirmed in Claude Code's external transcript.
-    /// It gives the shared Luna presentation sidecar a durable, rewindable
+    /// It gives the shared presentation sidecar a durable, rewindable
     /// source without treating Claude's protocol state as native inference.
     ClaudePresentationSource {
         source_id: uuid::Uuid,
         speaker: PresentationSpeaker,
         text: Cow<'a, str>,
     },
+    /// The agent coming into being: the first event of every agent's log,
+    /// and the base the head's config is folded from. A spawn name given
+    /// here is why no title is generated for that agent.
+    Created {
+        role: AgentRole,
+        binding: SessionBinding,
+        runtime: AgentRuntime,
+        workdirs: Vec<WorkspaceInfo>,
+        spawned_by: AgentSpawnedBy,
+        spawn_name: Option<String>,
+        created_at: rho_core::UnixMs,
+    },
+    RoleChanged {
+        role: AgentRole,
+        /// `None` when only the role moved and the session binding stands.
+        binding: Option<SessionBinding>,
+    },
+    WorkdirAdded {
+        workdir: WorkspaceInfo,
+    },
+    /// The runtime itself changing under the agent: a Claude rewind before
+    /// and after its destination transcript is verified, or a new prompt
+    /// cache key for the Rho runtime.
+    RuntimeRebound {
+        change: RuntimeChange,
+    },
 }
 
-/// Stable identity for an accepted user input in an agent's persisted event
-/// log.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AgentInputId {
-    pub agent_id: AgentId,
-    pub event_pos: AgentEventPos,
+impl AgentEvent<'_> {
+    /// Whether this is a message the user typed, in either generation of
+    /// the log: what a rewind counts turns by.
+    pub fn is_user_message(&self) -> bool {
+        match self {
+            Self::Accepted(QueuedInput {
+                source: MessageSender::User,
+                kind: InputKind::Message { .. },
+                ..
+            }) => true,
+            Self::Queued(QueuedItem {
+                kind:
+                    QueuedItemKind::UserMessage {
+                        sender: MessageSender::User,
+                        ..
+                    },
+                ..
+            }) => true,
+            _ => false,
+        }
+    }
 }
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum RuntimeChange {
+    /// A message-only Claude rewind whose destination transcript has not
+    /// been materialized and verified yet; `None` withdraws one. The old
+    /// runtime stays authoritative until it is confirmed.
+    ClaudeRewindPending(Option<ClaudeRewind>),
+    /// The rewind landed: this session is the runtime now.
+    ClaudeRewound {
+        session_id: uuid::Uuid,
+    },
+    PromptCacheKey(rho_inference::PromptCacheKey),
+}
+
+/// One input waiting to reach the model. Persisted verbatim inside
+/// [`AgentEvent::Accepted`], so the live queue and the log share one shape.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct QueuedInput {
+    pub source: MessageSender,
+    pub kind: InputKind,
+    pub delivery: MessageDelivery,
+    pub at: UnixMs,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum InputKind {
+    Message {
+        content: Vec<ContentPart>,
+    },
+    /// The user explicitly asked to compact. Automatic compaction is not an
+    /// input at all — it happens while building a request.
+    Compaction,
+}
+
+/// What the previous loop queued. Decoded from old logs only.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct QueuedItem {
+    pub kind: QueuedItemKind,
+    pub delivery: LegacyDelivery,
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum QueuedItemKind {
+    UserMessage {
+        sender: MessageSender,
+        content: Arc<Vec<ContentPart>>,
+        #[senax(default)]
+        source_id: Option<InputSourceId>,
+    },
+    Compaction,
+    ToolUpdate(ToolUpdate),
+}
+
+/// The delivery lanes the previous loop had. `NextTurn` no longer exists
+/// live; old rows that name it still have to decode, and replay reads it
+/// as `NextRequest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum LegacyDelivery {
+    Immediate,
+    NextRequest,
+    NextTurn,
+}
+
+impl From<LegacyDelivery> for MessageDelivery {
+    fn from(delivery: LegacyDelivery) -> Self {
+        match delivery {
+            LegacyDelivery::Immediate => Self::Immediate,
+            LegacyDelivery::NextRequest | LegacyDelivery::NextTurn => Self::NextRequest,
+        }
+    }
+}
+
+/// Opaque tag the previous loop stored for the surface that submitted an
+/// input. Kept so old rows decode; nothing reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub struct InputSourceId(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum PresentationSpeaker {
@@ -150,43 +245,14 @@ pub enum PresentationSpeaker {
     Assistant,
 }
 
-/// A text-only, durably committed native transcript source for Luna.
+/// A text-only, durably committed transcript source for the presentation
+/// sidecar.
 #[derive(Clone, Debug)]
 pub struct PresentationSource {
     pub agent_id: AgentId,
     pub through: AgentEventPos,
     pub speaker: PresentationSpeaker,
     pub text: String,
-}
-
-/// Opaque tag for the surface that submitted an input.
-///
-/// Consumers may compare private source values or honor the internal-routing
-/// bit, but should not infer a user-visible platform identity from the value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
-pub struct InputSourceId(u64);
-
-impl InputSourceId {
-    pub fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// Allocate a process-local source id shared by external integrations.
-    pub fn fresh() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-    }
-
-    /// Allocate an input source for integration-to-agent control messages
-    /// that should not be mirrored verbatim onto external chat surfaces.
-    pub fn fresh_internal() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self((1_u64 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-    }
-
-    pub fn is_internal(self) -> bool {
-        self.0 & (1_u64 << 63) != 0
-    }
 }
 
 /// Live runtime state of an agent turn.
@@ -197,59 +263,26 @@ pub struct AgentState {
     /// replace this with a compacted transcript snapshot when the provider
     /// rewrites history.
     pub blocks: Vec<Arc<ContextBlock>>,
-    /// Inputs waiting to enter model context. Persisted as
-    /// `AgentEvent::Queued` at enqueue and replayed on load, so the pending
-    /// queue survives restarts; delivery boundaries are marked by
-    /// `AgentEvent::Dequeued`.
+    /// Inputs waiting to enter model context, in arrival order.
     pub queued_inputs: InputQueues,
     pub kind: AgentStateKind,
     /// Tokens occupying the model's context window after the latest
     /// response (all input, cached or not, plus that response's output).
-    /// Restored on load from the event log (Rho runtime) or the session
-    /// transcript (Claude runtime); `None` until the agent's first response
-    /// reports usage.
+    /// `None` until the agent's first response reports usage.
     pub context_used: Option<u64>,
     /// Cumulative provider-reported usage across this agent's requests.
     pub total_usage: db::AgentUsageBucket,
     pub usage_provider: db::AgentUsageModel,
 }
 
-/// One input waiting in the agent's queue. Persisted verbatim inside
-/// `AgentEvent::Queued`, so the live queue and the log share one shape.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct QueuedItem {
-    pub kind: QueuedItemKind,
-    pub delivery: MessageDelivery,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum QueuedItemKind {
-    // content is Arc'd because the queue rides AgentState, which is cloned a lot
-    UserMessage {
-        sender: MessageSender,
-        content: Arc<Vec<ContentPart>>,
-        #[senax(default)]
-        source_id: Option<InputSourceId>,
-    },
-    Compaction,
-    /// An out-of-band extra output for an in-flight tool call (code-mode
-    /// `notify(...)`). Rides the queue for persistence/replay, delivers at the
-    /// next request boundary, and never starts a turn: leftovers alone are
-    /// dropped at turn completion.
-    ToolUpdate(ToolUpdate),
-}
-
-/// Pending inputs in arrival order. Delivery filters by eligibility at the
-/// boundary: `NextTurn` items wait for the turn to end, while later
-/// deliverable items may enter context earlier. Replay applies the same
-/// boundary filters, so the live loop and event log agree.
+/// Pending inputs in arrival order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputQueues {
-    items: Vec<QueuedItem>,
+    items: Vec<QueuedInput>,
 }
 
 impl InputQueues {
-    pub fn push(&mut self, item: QueuedItem) {
+    pub fn push(&mut self, item: QueuedInput) {
         self.items.push(item);
     }
 
@@ -265,45 +298,19 @@ impl InputQueues {
         self.items.clear();
     }
 
-    fn eligible(item: &QueuedItem, boundary: MessageDelivery) -> bool {
-        boundary == MessageDelivery::NextTurn || item.delivery != MessageDelivery::NextTurn
-    }
-
-    /// How many pending items would deliver at `boundary`.
-    pub fn deliverable(&self, boundary: MessageDelivery) -> usize {
-        self.items
-            .iter()
-            .filter(|item| Self::eligible(item, boundary))
-            .count()
-    }
-
     /// Pending items in arrival order, for rendering.
-    pub fn iter(&self) -> impl Iterator<Item = &QueuedItem> {
+    pub fn iter(&self) -> impl Iterator<Item = &QueuedInput> {
         self.items.iter()
     }
 
     /// Remove the first pending item matching `pred`.
-    pub fn remove_first(&mut self, pred: impl FnMut(&QueuedItem) -> bool) -> Option<QueuedItem> {
+    pub fn remove_first(&mut self, pred: impl FnMut(&QueuedInput) -> bool) -> Option<QueuedInput> {
         let pos = self.items.iter().position(pred)?;
         Some(self.items.remove(pos))
     }
 
-    pub fn retain(&mut self, pred: impl FnMut(&QueuedItem) -> bool) {
+    pub fn retain(&mut self, pred: impl FnMut(&QueuedInput) -> bool) {
         self.items.retain(pred);
-    }
-
-    /// Remove and return the items eligible at `boundary`, in arrival order.
-    /// `NextTurn` (the turn is over) delivers everything; earlier boundaries
-    /// hold `NextTurn` items back.
-    pub fn drain(&mut self, boundary: MessageDelivery) -> Vec<QueuedItem> {
-        if boundary == MessageDelivery::NextTurn {
-            return std::mem::take(&mut self.items);
-        }
-        let (drained, held) = std::mem::take(&mut self.items)
-            .into_iter()
-            .partition(|item| Self::eligible(item, boundary));
-        self.items = held;
-        drained
     }
 }
 
@@ -314,32 +321,56 @@ pub enum AgentStateKind {
         pending_response: PendingInferenceResponse,
         previous_attempt: Option<FailedInferenceResponse>,
     },
-    // we are now calling tools now
-    // Note: in future we might add ToolCallingWhileStreaming state for proactive execution while
-    // streaming
+    /// Calls are running, or the model asked to be left alone until
+    /// `waiting`.
     ToolCalling {
         previews: BTreeMap<ToolCallId, ToolPreview>,
-        // Results of the calls that have finished so far.
-        // Communication of tool calls is done out of band; tools may persist
-        // richer execution updates separately.
+        /// Results of the calls that have finished so far. The Rho runtime
+        /// reports results through its blocks; this is for runtimes that
+        /// hold them back.
         results: Vec<ToolResult>,
-        // This batch's armed `wait` call, if any. The loop resolves it
-        // itself (deliverable input arrives, or the deadline passes); this
-        // clears back to None when it does.
-        waiting: Option<WaitState>,
+        /// When the model's `wait` runs out, if it asked for one.
+        waiting: Option<UnixMs>,
     },
-    // Restored from an event log that ended after a tool-calling response.
+    /// Loaded from a log that ended with calls nobody answered: the next
+    /// request owes them placeholder results and a note.
     UnfinishedTurn {
-        // Can be empty: the restored turn may have answered every tool call, but
-        // still stopped before rho observed a final assistant response.
         outstanding_calls: Arc<[ToolCall]>,
-        // Completed tool calls restored for this unfinished turn but not yet
-        // committed into model context.
-        completed_tool_calls: Arc<[ToolResult]>,
     },
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
     Idle,
+}
+
+/// Tells the story that a turn started or stopped. Both runtimes cross
+/// the same edge (working, then not working), and the head's
+/// `turn_running` is the fold of the two events.
+pub(crate) async fn tell_turn_boundary(
+    db: &RhoDb,
+    agent_id: AgentId,
+    previous: &AgentStateKind,
+    current: &AgentStateKind,
+    attempt_started: bool,
+) {
+    let now = UnixMillis::now();
+    let event = if !previous.is_working() && current.is_working() {
+        story::StoryEvent::TurnStarted { at: now }
+    } else if execution_settled(previous, current, attempt_started) {
+        story::StoryEvent::TurnEnded {
+            outcome: match current {
+                AgentStateKind::Error(failed) => story::TurnOutcome::Errored {
+                    message: failed.error.to_string(),
+                },
+                _ => story::TurnOutcome::Completed,
+            },
+            at: now,
+        }
+    } else {
+        return;
+    };
+    let mut write = db.write().await;
+    write.append_agent_story(agent_id, &event);
+    write.commit();
 }
 
 /// A reliable state-machine transition that returns execution to the user's
@@ -361,165 +392,6 @@ impl AgentStateKind {
     }
 }
 
-struct RestoreToolTurn {
-    outstanding_calls: Vec<ToolCall>,
-    completed_tool_calls: Vec<ToolResult>,
-}
-
-/// The context block a queued input becomes at delivery.
-fn delivered_block(item: QueuedItem) -> ContextBlock {
-    match item.kind {
-        QueuedItemKind::UserMessage {
-            sender, content, ..
-        } => ContextBlock::UserMessage {
-            sender,
-            content: Arc::try_unwrap(content).unwrap_or_else(|content| (*content).clone()),
-        },
-        QueuedItemKind::Compaction => ContextBlock::CompactionTrigger,
-        QueuedItemKind::ToolUpdate(update) => ContextBlock::ToolUpdate(update),
-    }
-}
-
-struct RestoredAgent {
-    blocks: Vec<Arc<ContextBlock>>,
-    kind: AgentStateKind,
-    context_used: Option<u64>,
-    queued_inputs: InputQueues,
-}
-
-impl Default for RestoredAgent {
-    /// A fresh agent: nothing restored, idle.
-    fn default() -> Self {
-        Self {
-            blocks: Vec::new(),
-            kind: AgentStateKind::Idle,
-            context_used: None,
-            queued_inputs: InputQueues::default(),
-        }
-    }
-}
-
-fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
-    let mut blocks = Vec::new();
-    let mut turn: Option<RestoreToolTurn> = None;
-    let mut context_used = None;
-    let mut queue = InputQueues::default();
-    let commit_finished_turn =
-        |turn: &mut Option<RestoreToolTurn>, blocks: &mut Vec<Arc<ContextBlock>>| {
-            let Some(turn) = turn.take() else {
-                return;
-            };
-            if !turn.completed_tool_calls.is_empty() {
-                blocks.push(Arc::new(ContextBlock::ToolResults {
-                    results: turn.completed_tool_calls,
-                }));
-            }
-        };
-    for event in events {
-        match event {
-            AgentEvent::InferenceResponse {
-                items,
-                provider_response_id,
-                context_used: response_context_used,
-            } => {
-                let compacted = items
-                    .iter()
-                    .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
-                if compacted {
-                    // Compaction response usage describes the old, full input,
-                    // not the newly compacted context.
-                    context_used = None;
-                } else if response_context_used.is_some() {
-                    context_used = response_context_used;
-                }
-                commit_finished_turn(&mut turn, &mut blocks);
-                let outstanding_calls = items
-                    .iter()
-                    .filter_map(|item| match item {
-                        InferenceResponseItem::ToolCall {
-                            id,
-                            name,
-                            tool_type,
-                            arguments,
-                            ..
-                        } => Some(ToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            tool_type: *tool_type,
-                            arguments: arguments.clone(),
-                        }),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if !outstanding_calls.is_empty() {
-                    turn = Some(RestoreToolTurn {
-                        outstanding_calls,
-                        completed_tool_calls: Vec::new(),
-                    });
-                }
-                blocks.push(Arc::new(ContextBlock::InferenceResponse {
-                    items: items.into_owned(),
-                    provider_response_id,
-                }));
-            }
-            AgentEvent::ToolResult { result } => {
-                let Some(turn) = &mut turn else {
-                    unreachable!("tool result restored without a preceding tool call");
-                };
-                turn.outstanding_calls
-                    .retain(|call| call.id != result.call_id);
-                turn.completed_tool_calls.push(result.into_owned());
-            }
-            AgentEvent::Queued(item) => queue.push(item),
-            AgentEvent::Dequeued { boundary } => {
-                // A mid-turn (`NextRequest`) delivery point means the tool
-                // batch committed and a new request went out: flush the batch
-                // block but keep the turn open so an interrupted log still
-                // restores as an unfinished turn.
-                let keep_mid_turn = boundary == MessageDelivery::NextRequest && turn.is_some();
-                commit_finished_turn(&mut turn, &mut blocks);
-                if keep_mid_turn {
-                    turn = Some(RestoreToolTurn {
-                        outstanding_calls: Vec::new(),
-                        completed_tool_calls: Vec::new(),
-                    });
-                }
-                for item in queue.drain(boundary) {
-                    blocks.push(Arc::new(delivered_block(item)));
-                }
-            }
-            AgentEvent::QueueCleared => queue.clear(),
-            AgentEvent::PresentationUpdated { .. }
-            | AgentEvent::ClaudePresentationSource { .. } => {}
-        }
-    }
-    let kind = match turn {
-        None => AgentStateKind::Idle,
-        Some(RestoreToolTurn {
-            outstanding_calls,
-            completed_tool_calls,
-        }) => AgentStateKind::UnfinishedTurn {
-            outstanding_calls: outstanding_calls.into(),
-            completed_tool_calls: completed_tool_calls.into(),
-        },
-    };
-    RestoredAgent {
-        blocks,
-        kind,
-        context_used,
-        queued_inputs: queue,
-    }
-}
-
-/// An armed `wait` tool call. Everything else about the call (arguments,
-/// start time, tool type) lives in its entry in the batch's previews.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct WaitState {
-    pub call_id: ToolCallId,
-    /// Wall-clock deadline.
-    pub until: UnixMs,
-}
-
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ToolPreview {
     pub call: ToolCall,
@@ -538,14 +410,6 @@ pub struct FailedInferenceResponse {
     pub partial_response: PendingInferenceResponse,
     pub attempt_count: NonZeroU64,
     pub error: Arc<String>,
-}
-
-/// Cheap handle for observing and controlling the agent loop.
-#[derive(Clone)]
-pub struct Agent {
-    state: Arc<RwLock<AgentState>>,
-    control: mpsc::UnboundedSender<AgentControl>,
-    notify: Arc<Notify>,
 }
 
 /// Where one of a new agent's workdirs comes from. Agents start from a
@@ -590,2037 +454,6 @@ pub(crate) async fn materialize_workdirs(
     Ok(entries)
 }
 
-impl Agent {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create(
-        db: RhoDb,
-        inference: Inference,
-        mode: SessionBinding,
-        role: db::AgentRole,
-        display_name: Option<String>,
-        start: Vec<StartWorkdir>,
-        parent: Option<AgentId>,
-        // A dead Weak (e.g. `Weak::default()`) means no pool: the
-        // multi-agent tools are not offered.
-        pool: std::sync::Weak<pool::AgentPool>,
-    ) -> anyhow::Result<(AgentId, Self)> {
-        let prompt_cache_key = PromptCacheKey::generate();
-        let config = mode
-            .deep_config()
-            .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
-        let model = mode.deep_model().expect("deep config implies a deep model");
-        // One transaction spans agent id allocation and the record write.
-        // jj owns repository-local managed workspace id allocation; a failed
-        // multi-repo creation may leave an unreachable checkout for jj GC.
-        let mut write = db.write().await;
-        let agent_id = write.alloc_agent_id();
-        let entries = materialize_workdirs(start).await?;
-        let view = View::new(entries.clone())?;
-        let now = UnixMillis::now();
-        let next_event = write.create_agent(
-            now,
-            agent_id,
-            display_name,
-            entries
-                .iter()
-                .map(|workspace| workspace.info().clone())
-                .collect(),
-            mode,
-            AgentRuntime::Rho { prompt_cache_key },
-            parent,
-        );
-        write.set_agent_role(agent_id, role);
-        write.commit();
-        let agent = Self::new(
-            db,
-            inference,
-            config,
-            model,
-            role,
-            prompt_cache_key,
-            agent_id,
-            next_event,
-            Arc::new(Lazy::ready(view)),
-            parent,
-            pool,
-            RestoredAgent::default(),
-        );
-        Ok((agent_id, agent))
-    }
-
-    pub fn load(
-        db: RhoDb,
-        inference: Inference,
-        agent_id: AgentId,
-        view: Arc<View>,
-        pool: std::sync::Weak<pool::AgentPool>,
-    ) -> Self {
-        Self::load_lazy(db, inference, agent_id, Arc::new(Lazy::ready(view)), pool)
-    }
-
-    pub(crate) fn load_lazy(
-        db: RhoDb,
-        inference: Inference,
-        agent_id: AgentId,
-        view: Arc<Lazy<Arc<View>>>,
-        // A dead Weak (e.g. `Weak::default()`) means no pool: the
-        // multi-agent tools are not offered.
-        pool: std::sync::Weak<pool::AgentPool>,
-    ) -> Self {
-        let record = db.read().get_agent(agent_id);
-        let (next_event, events) = db.read().agent_events(agent_id);
-        let restored = restore_events(events);
-        let AgentRuntime::Rho { prompt_cache_key } = record.runtime else {
-            panic!("cannot load Claude agent with the Rho agent runtime");
-        };
-        let config = record
-            .binding
-            .deep_config()
-            .expect("Rho runtime stored with non-Rho agent mode");
-        let model = record
-            .binding
-            .deep_model()
-            .expect("Rho runtime stored with non-Rho agent mode");
-        // The record, not the caller, is the source of truth for the parent
-        // edge of an existing agent.
-        Self::new(
-            db,
-            inference,
-            config,
-            model,
-            record.role,
-            prompt_cache_key,
-            agent_id,
-            next_event,
-            view,
-            record.parent_agent,
-            pool,
-            restored,
-        )
-    }
-
-    /// Shared tail of [`Self::create`] and [`Self::load`]: wire the session,
-    /// tools, and (possibly restored) state into a running loop.
-    #[expect(clippy::too_many_arguments)]
-    fn new(
-        db: RhoDb,
-        inference: Inference,
-        config: InferenceProfile,
-        model: InferenceModel,
-        role: db::AgentRole,
-        prompt_cache_key: PromptCacheKey,
-        agent_id: AgentId,
-        next_event: AgentEventPos,
-        view: Arc<Lazy<Arc<View>>>,
-        parent: Option<AgentId>,
-        pool: std::sync::Weak<pool::AgentPool>,
-        restored: RestoredAgent,
-    ) -> Self {
-        // Role policy wins over persisted profiles created before PM code mode
-        // was disabled.
-        let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
-        let function_tools_only = model == InferenceModel::Gemini37FlashLow;
-        let web_search = WebSearchTools::new(inference.clone(), agent_id.encoded().to_owned());
-        let inference_session = inference.deep_session(config, model, prompt_cache_key);
-        let iris_tools = (role == db::AgentRole::Iris).then(|| {
-            pool.upgrade()
-                .and_then(|pool| pool.iris_tool_host())
-                .expect("Iris role requires the daemon Iris tool host")
-        });
-        let multi_agent = (role != db::AgentRole::Iris)
-            .then(|| pool.upgrade())
-            .flatten()
-            .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
-        let agent_tools_enabled = true;
-        let projects = db
-            .read()
-            .list_projects()
-            .into_iter()
-            .map(|(path, project)| (path, project.description))
-            .collect::<Vec<_>>();
-        let pool_events = pool;
-        let (control, control_rx) = mpsc::unbounded_channel();
-        let execution_control = control.downgrade();
-        let execution = Arc::new(Lazy::new({
-            let view = Arc::clone(&view);
-            let multi_agent = multi_agent.clone();
-            let web_search = web_search.clone();
-            let control = execution_control.clone();
-            move || {
-                let view = Arc::clone(&view);
-                let multi_agent = multi_agent.clone();
-                let web_search = web_search.clone();
-                let control = control.clone();
-                let projects = projects.clone();
-                async move {
-                    let view = Arc::clone(view.get().await?);
-                    Ok(ExecutionContext::new(
-                        view,
-                        role,
-                        agent_id,
-                        web_search,
-                        code_mode_enabled,
-                        function_tools_only,
-                        agent_tools_enabled,
-                        multi_agent.as_ref(),
-                        &projects,
-                        control,
-                    ))
-                }
-            }
-        }));
-        let total_usage = db.read().agent_usage_total(agent_id);
-        let last_presentation_source = {
-            let records = db
-                .read()
-                .agent_presentation_source_tail(agent_id, PRESENTATION_SOURCE_TAIL_BYTES);
-            presentation_sources(agent_id, &records)
-                .last()
-                .map(|source| source.through)
-        };
-        let state = Arc::new(RwLock::new(AgentState {
-            blocks: restored.blocks,
-            queued_inputs: restored.queued_inputs,
-            kind: restored.kind,
-            context_used: restored.context_used,
-            total_usage,
-            usage_provider: match model {
-                db::InferenceModel::Gpt56Terra => db::AgentUsageModel::TERRA,
-                db::InferenceModel::Gpt56Luna => db::AgentUsageModel::LUNA,
-                db::InferenceModel::Gemini37FlashLow => db::AgentUsageModel::GEMINI,
-                _ => db::AgentUsageModel::GPT,
-            },
-        }));
-        let notify = Arc::new(Notify::new());
-        let presentation_session = Arc::new(tokio::sync::Mutex::new(presentation::Session::new(
-            inference,
-        )));
-        let agent_loop = AgentLoop {
-            inference_session,
-            presentation_session,
-            model,
-            auto_compaction_in_flight: false,
-            pending_tools: FuturesUnordered::new(),
-            state: Arc::clone(&state),
-            notify: Arc::clone(&notify),
-            control_rx,
-            control: control.downgrade(),
-            execution,
-            persistence: AgentPersistence {
-                db,
-                agent_id,
-                next_event,
-            },
-            multi_agent,
-            agent_tools_enabled,
-            iris_tools,
-            pool_events,
-            execution_generation: 0,
-            last_presentation_source,
-            presentation: PresentationState {
-                watches: 0,
-                dirty: false,
-                generation: 0,
-                last_started: None,
-                task: None,
-            },
-        };
-        tokio::spawn(agent_loop.run());
-        Self {
-            state,
-            control,
-            notify,
-        }
-    }
-
-    pub fn state(&self) -> AgentState {
-        self.state.read().expect("poison").clone()
-    }
-
-    pub fn blocks(&self) -> Vec<Arc<ContextBlock>> {
-        self.state().blocks
-    }
-
-    /// Send a message. If the agent is busy it queues and enters model context
-    /// at the point `delivery` names; otherwise it starts a turn immediately.
-    pub fn send_user_message(&self, text: impl Into<String>, delivery: MessageDelivery) {
-        self.send_user_message_with_source(text, delivery, None);
-    }
-
-    pub fn send_user_content(&self, content: Vec<ContentPart>, delivery: MessageDelivery) {
-        self.send_user_content_with_source(content, delivery, None);
-    }
-
-    /// Send user input and wait until the serialized runtime loop has durably
-    /// queued it and moved persisted attention into the agent's court.
-    pub async fn send_user_content_accepted(
-        &self,
-        content: Vec<ContentPart>,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-    ) -> anyhow::Result<()> {
-        let (accepted, reply) = oneshot::channel();
-        self.control
-            .send(AgentControl::UserMessage {
-                sender: MessageSender::User,
-                content,
-                delivery,
-                source_id,
-                accepted: Some(accepted),
-            })
-            .map_err(|_| anyhow::anyhow!("agent stopped before accepting user input"))?;
-        reply
-            .await
-            .map_err(|_| anyhow::anyhow!("agent stopped before accepting user input"))
-    }
-
-    pub fn send_user_content_with_source(
-        &self,
-        content: Vec<ContentPart>,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-    ) {
-        let _ = self.control.send(AgentControl::UserMessage {
-            sender: MessageSender::User,
-            content,
-            delivery,
-            source_id,
-            accepted: None,
-        });
-    }
-
-    pub fn send_user_message_with_source(
-        &self,
-        text: impl Into<String>,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-    ) {
-        self.send_user_content_with_source(
-            vec![ContentPart::Text { text: text.into() }],
-            delivery,
-            source_id,
-        );
-    }
-
-    /// Deliver mail from another agent. Enters context as a
-    /// [`ContextBlock::UserMessage`] whose [`MessageSender`] identifies the
-    /// agent.
-    pub fn send_agent_message(
-        &self,
-        sender: AgentId,
-        text: impl Into<String>,
-        delivery: MessageDelivery,
-    ) {
-        let _ = self.control.send(AgentControl::UserMessage {
-            sender: MessageSender::Agent { id: sender },
-            content: vec![ContentPart::Text { text: text.into() }],
-            delivery,
-            source_id: None,
-            accepted: None,
-        });
-    }
-
-    /// Deliver agent mail and wait until the loop has durably queued it.
-    pub async fn send_agent_message_accepted(
-        &self,
-        sender: AgentId,
-        text: impl Into<String>,
-        delivery: MessageDelivery,
-    ) -> anyhow::Result<()> {
-        let (accepted, reply) = oneshot::channel();
-        self.control
-            .send(AgentControl::UserMessage {
-                sender: MessageSender::Agent { id: sender },
-                content: vec![ContentPart::Text { text: text.into() }],
-                delivery,
-                source_id: None,
-                accepted: Some(accepted),
-            })
-            .map_err(|_| anyhow::anyhow!("agent stopped before accepting mail"))?;
-        reply
-            .await
-            .map_err(|_| anyhow::anyhow!("agent stopped before accepting mail"))
-    }
-
-    pub fn compact(&self, delivery: MessageDelivery) {
-        let _ = self.control.send(AgentControl::Compact { delivery });
-    }
-
-    /// Stop the current turn and drop all queued inputs.
-    pub fn cancel(&self) {
-        let _ = self.control.send(AgentControl::Cancel);
-    }
-
-    pub fn continue_unfinished(&self) {
-        let _ = self.control.send(AgentControl::ContinueUnfinished);
-    }
-
-    pub fn set_deep_config(&self, config: InferenceProfile, model: InferenceModel) {
-        let _ = self
-            .control
-            .send(AgentControl::SetDeepConfig(config, model));
-    }
-
-    pub async fn change_role(&self, role: db::AgentRole) -> anyhow::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control
-            .send(AgentControl::ChangeRole { role, reply })
-            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?
-    }
-
-    pub fn change_prompt_cache_key(&self) {
-        let _ = self.control.send(AgentControl::ChangePromptCacheKey(
-            PromptCacheKey::generate(),
-        ));
-    }
-
-    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
-        let (reply, result) = oneshot::channel();
-        self.control
-            .send(AgentControl::Rewind { turns, reply })
-            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?
-    }
-
-    /// Keep the agent-owned Luna sidecar alive until the returned lease drops.
-    pub(crate) fn watch_presentation(&self) -> presentation::Watch {
-        let _ = self
-            .control
-            .send(AgentControl::PresentationWatch { watching: true });
-        let control = self.control.clone();
-        presentation::Watch::new(move || {
-            let _ = control.send(AgentControl::PresentationWatch { watching: false });
-        })
-    }
-
-    pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
-        let state = Arc::clone(&self.state);
-        let notify = Arc::clone(&self.notify);
-        stream! {
-            loop {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-
-                let snapshot = state.read().expect("poison").clone();
-                yield snapshot;
-
-                notified.await;
-            }
-        }
-    }
-}
-
-/// Arm the batch's single wait slot from a `wait` tool call. Errors
-/// (duplicate wait, bad arguments) become ordinary error tool results.
-fn arm_wait(
-    waiting: &mut Option<WaitState>,
-    call: &ToolCall,
-    started_at: UnixMs,
-) -> anyhow::Result<()> {
-    if waiting.is_some() {
-        anyhow::bail!("a wait is already in progress in this tool batch");
-    }
-    let timeout_seconds = multi_agent_tools::parse_wait_timeout(&call.arguments)?;
-    *waiting = Some(WaitState {
-        call_id: call.id.clone(),
-        until: UnixMs(started_at.0 + timeout_seconds * 1000),
-    });
-    Ok(())
-}
-
-/// Runs one `exec` or `wait` call against the code-mode session.
-#[cfg(feature = "code-mode")]
-async fn code_mode_tool_body(
-    session: &CodeModeSession,
-    call: &ToolCall,
-    context: ToolExecutionContext,
-) -> ToolOutput {
-    if call.name.as_str() == rho_code_mode::EXEC_TOOL_NAME {
-        return session
-            .execute_with_context(call.id.clone(), &call.arguments, context)
-            .await;
-    }
-    match serde_json::from_str::<rho_code_mode::WaitArgs>(&call.arguments) {
-        Ok(args) => session.wait(args).await,
-        Err(error) => ToolOutput {
-            images: std::sync::Arc::new(Vec::new()),
-            output: Arc::new(format!("invalid wait arguments: {error}")),
-            status: ToolOutputStatus::Error,
-        },
-    }
-}
-
-/// An error outcome for a call that never ran.
-fn error_tool_result(call: &ToolCall, started_at: UnixMs, error: anyhow::Error) -> ToolResult {
-    ToolResult {
-        call_id: call.id.clone(),
-        tool_type: call.tool_type,
-        body: ToolOutput {
-            images: std::sync::Arc::new(Vec::new()),
-            output: Arc::new(error.to_string()),
-            status: ToolOutputStatus::Error,
-        },
-        started_at,
-        finished_at: UnixMs::now(),
-        metadata: None,
-    }
-}
-
-fn agent_tool_specs(
-    shell_tools: &ShellTools,
-    multi_agent: bool,
-    code_mode: bool,
-    function_tools_only: bool,
-    role: db::AgentRole,
-) -> Arc<[ToolSpec]> {
-    if role == db::AgentRole::Iris {
-        return iris_tools::specs().into();
-    }
-    #[cfg(feature = "code-mode")]
-    if code_mode {
-        return code_mode::tool_specs(shell_tools, multi_agent.then_some(role)).into();
-    }
-    #[cfg(not(feature = "code-mode"))]
-    let _ = code_mode;
-    let mut specs = if role.is_pm() {
-        Vec::new()
-    } else {
-        shell_tools.specs()
-    };
-    if function_tools_only {
-        specs
-            .retain(|tool| tool.tool_type == rho_core::ToolType::Function && tool.format.is_none());
-    }
-    if multi_agent {
-        specs.extend(multi_agent_tools::agent_tool_specs(role));
-    }
-    specs.push(image_tool::ImageTools::spec());
-    if !function_tools_only {
-        specs.push(rho_web_search::web_search_spec());
-    }
-    specs.into()
-}
-
-/// Starts the code-mode V8 session when enabled; on failure the agent falls
-/// back to the direct tool surface rather than dying.
-#[cfg(feature = "code-mode")]
-fn start_code_mode(
-    enabled: bool,
-    shell_tools: &ShellTools,
-    image_tools: &image_tool::ImageTools,
-    multi_agent: Option<&MultiAgentTools>,
-    web_search: &WebSearchTools,
-    control: mpsc::WeakUnboundedSender<AgentControl>,
-) -> Option<Arc<CodeModeSession>> {
-    if !enabled {
-        return None;
-    }
-    match code_mode::start_session(shell_tools, image_tools, multi_agent, web_search, control) {
-        Ok(session) => Some(Arc::new(session)),
-        Err(error) => {
-            eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
-            None
-        }
-    }
-}
-
-#[cfg(not(feature = "code-mode"))]
-fn start_code_mode(
-    _enabled: bool,
-    _shell_tools: &ShellTools,
-    _image_tools: &image_tool::ImageTools,
-    _multi_agent: Option<&MultiAgentTools>,
-    _web_search: &WebSearchTools,
-    _control: mpsc::WeakUnboundedSender<AgentControl>,
-) -> Option<Arc<CodeModeSession>> {
-    None
-}
-
-struct AgentPersistence {
-    db: RhoDb,
-    agent_id: AgentId,
-    next_event: AgentEventPos,
-}
-
-enum AgentControl {
-    UserMessage {
-        sender: MessageSender,
-        content: Vec<ContentPart>,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-        accepted: Option<oneshot::Sender<()>>,
-    },
-    Compact {
-        delivery: MessageDelivery,
-    },
-    /// An extra output for an in-flight tool call (code-mode `notify(...)`).
-    /// Dropped when no turn is active, matching Codex.
-    #[cfg(feature = "code-mode")]
-    ToolUpdate(ToolUpdate),
-    SetDeepConfig(InferenceProfile, InferenceModel),
-    ChangeRole {
-        role: db::AgentRole,
-        reply: oneshot::Sender<anyhow::Result<()>>,
-    },
-    ChangePromptCacheKey(PromptCacheKey),
-    Rewind {
-        turns: u32,
-        reply: oneshot::Sender<anyhow::Result<()>>,
-    },
-    PresentationWatch {
-        watching: bool,
-    },
-    PresentationStarted {
-        generation: u64,
-        acknowledged: oneshot::Sender<bool>,
-    },
-    PresentationFinished {
-        generation: u64,
-        result: Result<Option<AgentPresentationUpdate>, String>,
-    },
-    Cancel,
-    ContinueUnfinished,
-}
-
-struct AgentLoop {
-    inference_session: InferenceSession,
-    /// The agent's one persistent Luna session, shared by activity updates
-    /// and turn reports so both keep one prompt prefix warm.
-    presentation_session: Arc<tokio::sync::Mutex<presentation::Session>>,
-    model: InferenceModel,
-    /// The active request includes a trigger injected by the automatic
-    /// context-occupancy policy. A compaction-only response must continue the
-    /// interrupted turn; a manually requested compaction remains standalone.
-    auto_compaction_in_flight: bool,
-    /// The tool calls from the current `ToolCalling` turn, running
-    /// concurrently. Empty in every other state. Driven as a `select!` arm
-    /// alongside the provider stream.
-    pending_tools: FuturesUnordered<BoxFuture<'static, ToolResult>>,
-    state: Arc<RwLock<AgentState>>,
-    notify: Arc<Notify>,
-    control_rx: mpsc::UnboundedReceiver<AgentControl>,
-    control: mpsc::WeakUnboundedSender<AgentControl>,
-    execution: Arc<Lazy<ExecutionContext>>,
-    persistence: AgentPersistence,
-    /// Present on pooled agents: identity + `Weak` pool handle for the
-    /// built-in spawn/send/wait tools and parent result/error mail.
-    multi_agent: Option<MultiAgentTools>,
-    /// False for Advisor: retain parent-mail/team identity without exposing or
-    /// dispatching agent-management tools.
-    agent_tools_enabled: bool,
-    /// Stateful host for the built-in Iris role's global control tools.
-    iris_tools: Option<iris_tools::SharedIrisToolHost>,
-    pool_events: std::sync::Weak<pool::AgentPool>,
-    /// Incremented inside the serialized loop whenever a provider attempt is
-    /// started, including attempts that fail before publishing Working.
-    execution_generation: u64,
-    /// The newest text source in the selected lineage, used to clear stale
-    /// activity when the turn returns control to the user.
-    last_presentation_source: Option<AgentEventPos>,
-    presentation: PresentationState,
-}
-
-/// Scheduler state is intentionally local to the serialized agent loop: it
-/// observes committed native sources, owns cancellation, and is the only path
-/// that can persist a Luna result.
-struct PresentationState {
-    watches: usize,
-    dirty: bool,
-    generation: u64,
-    last_started: Option<tokio::time::Instant>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for AgentLoop {
-    fn drop(&mut self) {
-        if let Some(task) = self.presentation.task.take() {
-            task.abort();
-        }
-    }
-}
-
-struct ExecutionContext {
-    view: Arc<View>,
-    system_prompt: Arc<str>,
-    shell_tools: ShellTools,
-    image_tools: image_tool::ImageTools,
-    web_search: WebSearchTools,
-    web_search_enabled: bool,
-    tool_specs: Arc<[ToolSpec]>,
-    #[cfg(feature = "code-mode")]
-    code_mode: Option<Arc<CodeModeSession>>,
-}
-
-impl ExecutionContext {
-    #[expect(clippy::too_many_arguments)]
-    fn new(
-        view: Arc<View>,
-        role: db::AgentRole,
-        agent_id: AgentId,
-        web_search: WebSearchTools,
-        code_mode_enabled: bool,
-        function_tools_only: bool,
-        agent_tools_enabled: bool,
-        multi_agent: Option<&MultiAgentTools>,
-        projects: &[(camino::Utf8PathBuf, String)],
-        control: mpsc::WeakUnboundedSender<AgentControl>,
-    ) -> Self {
-        let shell_tools = ShellTools::new(
-            std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-            Arc::clone(&view),
-        )
-        .with_env("RHO_AGENT_ID", agent_id.encoded());
-        let image_tools = image_tool::ImageTools::new(Arc::clone(&view));
-        let code_mode = start_code_mode(
-            code_mode_enabled,
-            &shell_tools,
-            &image_tools,
-            agent_tools_enabled.then_some(()).and(multi_agent),
-            &web_search,
-            control,
-        );
-        let tool_specs = agent_tool_specs(
-            &shell_tools,
-            multi_agent.is_some() && agent_tools_enabled,
-            code_mode.is_some(),
-            function_tools_only,
-            role,
-        );
-        let system_prompt = system_prompt::prompt(
-            view.as_ref(),
-            multi_agent,
-            code_mode.is_some(),
-            role,
-            projects,
-        );
-        Self {
-            view,
-            system_prompt,
-            shell_tools,
-            image_tools,
-            web_search,
-            web_search_enabled: !function_tools_only,
-            tool_specs,
-            #[cfg(feature = "code-mode")]
-            code_mode,
-        }
-    }
-}
-
-impl AgentLoop {
-    async fn change_role(
-        &mut self,
-        state: &AgentState,
-        requested: db::AgentRole,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(&state.kind, AgentStateKind::Idle | AgentStateKind::Error(_)),
-            "role changes are only available while idle or errored; cancel the turn first"
-        );
-        anyhow::ensure!(
-            state.queued_inputs.is_empty(),
-            "role changes are not available with queued inputs"
-        );
-        anyhow::ensure!(
-            self.pending_tools.is_empty() && !self.inference_session.has_active_request(),
-            "role changes are not available while work is running"
-        );
-
-        let requested = match requested {
-            db::AgentRole::Engineer { intelligence }
-            | db::AgentRole::WorkflowEngineer { intelligence, .. } => intelligence,
-            _ => anyhow::bail!("role changes currently support only engineer roles"),
-        };
-        anyhow::ensure!(
-            matches!(
-                requested,
-                db::EngineerIntelligence::Low
-                    | db::EngineerIntelligence::Cheap
-                    | db::EngineerIntelligence::Medium
-                    | db::EngineerIntelligence::High
-            ),
-            "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
-        );
-
-        let current = self
-            .persistence
-            .db
-            .read()
-            .get_agent(self.persistence.agent_id)
-            .role;
-        let role = match current {
-            db::AgentRole::Engineer {
-                intelligence:
-                    db::EngineerIntelligence::Low
-                    | db::EngineerIntelligence::Cheap
-                    | db::EngineerIntelligence::Medium
-                    | db::EngineerIntelligence::High,
-            } => db::AgentRole::Engineer {
-                intelligence: requested,
-            },
-            db::AgentRole::WorkflowEngineer {
-                intelligence:
-                    db::EngineerIntelligence::Low
-                    | db::EngineerIntelligence::Medium
-                    | db::EngineerIntelligence::High,
-                workflow,
-            } => db::AgentRole::WorkflowEngineer {
-                intelligence: requested,
-                workflow,
-            },
-            _ => anyhow::bail!(
-                "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
-            ),
-        };
-        if role == current {
-            return Ok(());
-        }
-
-        let binding = role.session_profile()?;
-        let config = binding
-            .deep_config()
-            .ok_or_else(|| anyhow::anyhow!("role change would leave the Rho runtime"))?;
-        let model = binding
-            .deep_model()
-            .ok_or_else(|| anyhow::anyhow!("role change has no Rho model"))?;
-        anyhow::ensure!(
-            self.inference_session.set_deep_config(config, model),
-            "agent does not have a configurable inference session"
-        );
-        let mut write = self.persistence.db.write().await;
-        write.set_agent_profile(self.persistence.agent_id, role, binding);
-        write.commit();
-        self.model = model;
-        Ok(())
-    }
-
-    /// Drive the agent through one user turn: stream the provider response, run
-    /// whatever tools the model calls, feed the results back, and repeat until
-    /// it answers without calling tools (→ `Idle`) or the turn fails for good
-    /// (→ `Error`). The whole state machine lives in this one loop on purpose.
-    ///
-    /// Messages arriving mid-turn queue instead of interrupting: the
-    /// `NextRequest` lane drains right before each mid-turn inference request,
-    /// the `NextTurn` lane when the turn completes (a non-empty queue then
-    /// starts the next turn instead of going `Idle`). On `Error` the queue is
-    /// held — no automatic retry — until the user sends another message or
-    /// continues (drains everything), or cancels (drops everything).
-    async fn run(mut self) {
-        loop {
-            let mut state = self.state.read().expect("poison").clone();
-            let previous_kind = state.kind.clone();
-            let previous_execution_generation = self.execution_generation;
-            // Disabled arms still evaluate their expression, so give
-            // `sleep_until` a zero deadline when no wait is armed; the guard
-            // keeps it from being polled.
-            let armed_wait = match &state.kind {
-                AgentStateKind::ToolCalling {
-                    waiting: Some(wait),
-                    ..
-                } => Some(wait.clone()),
-                _ => None,
-            };
-            let wait_deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_millis(
-                    armed_wait
-                        .as_ref()
-                        .map(|wait| wait.until.0.saturating_sub(UnixMs::now().0))
-                        .unwrap_or(0),
-                );
-
-            tokio::select! {
-                biased;
-                control = self.control_rx.recv() => {
-                    let Some(control) = control else {
-                        return;
-                    };
-                    match control {
-                        AgentControl::UserMessage {
-                            sender,
-                            content,
-                            delivery,
-                            source_id,
-                            accepted,
-                        } => {
-                            self.enqueue_message(
-                                &mut state,
-                                sender,
-                                content,
-                                delivery,
-                                source_id,
-                                accepted,
-                            )
-                            .await;
-                        }
-                        AgentControl::Compact { delivery } => {
-                            let item = QueuedItem {
-                                kind: QueuedItemKind::Compaction,
-                                delivery,
-                            };
-                            self.persist_event(AgentEvent::Queued(item.clone())).await;
-                            state.queued_inputs.push(item);
-                            match &state.kind {
-                                AgentStateKind::Idle | AgentStateKind::Error(_) => {
-                                    assert!(!self.inference_session.has_active_request());
-                                    assert!(self.pending_tools.is_empty());
-                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
-                                        .await;
-                                    self.start_request(&mut state, None).await;
-                                }
-                                AgentStateKind::ApiStreaming { .. }
-                                | AgentStateKind::ToolCalling { .. }
-                                | AgentStateKind::UnfinishedTurn { .. } => {}
-                            }
-                            self.maybe_resolve_wait(&mut state).await;
-                        }
-                        #[cfg(feature = "code-mode")]
-                        AgentControl::ToolUpdate(update) => {
-                            // Only meaningful mid-turn: the call it annotates
-                            // must reach the provider in this turn's timeline.
-                            // With no active turn the update is dropped
-                            // (Codex: notify fails with "no active turn").
-                            if matches!(
-                                state.kind,
-                                AgentStateKind::ApiStreaming { .. }
-                                    | AgentStateKind::ToolCalling { .. }
-                            ) {
-                                let item = QueuedItem {
-                                    kind: QueuedItemKind::ToolUpdate(update),
-                                    delivery: MessageDelivery::NextRequest,
-                                };
-                                self.persist_event(AgentEvent::Queued(item.clone())).await;
-                                state.queued_inputs.push(item);
-                            }
-                        }
-                        AgentControl::Cancel => {
-                            self.inference_session.abort();
-                            self.pending_tools.clear();
-                            if !state.queued_inputs.is_empty() {
-                                self.persist_event(AgentEvent::QueueCleared).await;
-                                state.queued_inputs.clear();
-                            }
-
-                            state.kind = AgentStateKind::Idle;
-                        }
-                        AgentControl::ContinueUnfinished => {
-                            assert!(!self.inference_session.has_active_request());
-                            assert!(self.pending_tools.is_empty());
-                            match std::mem::replace(&mut state.kind, AgentStateKind::Idle) {
-                                AgentStateKind::UnfinishedTurn {
-                                    outstanding_calls,
-                                    completed_tool_calls,
-                                } => {
-                                    let mut results =
-                                        completed_tool_calls.iter().cloned().collect::<Vec<_>>();
-                                    for call in outstanding_calls.iter() {
-                                        let result = interrupted_tool_result(call);
-                                        self.persist_event(AgentEvent::ToolResult {
-                                            result: Cow::Borrowed(&result),
-                                        })
-                                        .await;
-                                        results.push(result);
-                                    }
-                                    if !results.is_empty() {
-                                        state.blocks.push(Arc::new(ContextBlock::ToolResults {
-                                            results,
-                                        }));
-                                    }
-                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
-                                        .await;
-                                    self.start_request(&mut state, None).await;
-                                }
-                                AgentStateKind::Error(previous_attempt) => {
-                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
-                                        .await;
-                                    self.start_request(&mut state, Some(previous_attempt)).await;
-                                }
-                                // Idle with restored mail: continue delivers it.
-                                AgentStateKind::Idle if !state.queued_inputs.is_empty() => {
-                                    self.deliver_queued(&mut state, MessageDelivery::NextTurn)
-                                        .await;
-                                    self.start_request(&mut state, None).await;
-                                }
-                                other => {
-                                    state.kind = other;
-                                    continue;
-                                }
-                            }
-                        }
-                        AgentControl::SetDeepConfig(config, model) => {
-                            let _ = self.inference_session.set_deep_config(config, model);
-                            self.model = model;
-                        }
-                        AgentControl::ChangeRole { role, reply } => {
-                            let result = self.change_role(&state, role).await;
-                            let _ = reply.send(result);
-                        }
-                        AgentControl::ChangePromptCacheKey(prompt_cache_key) => {
-                            let mut write = self.persistence.db.write().await;
-                            write.set_agent_prompt_cache_key(
-                                self.persistence.agent_id,
-                                prompt_cache_key,
-                            );
-                            write.commit();
-                            self.inference_session.set_prompt_cache_key(prompt_cache_key);
-                        }
-                        AgentControl::PresentationWatch { watching } => {
-                            if watching {
-                                let first_watch = self.presentation.watches == 0;
-                                self.presentation.watches += 1;
-                                if first_watch {
-                                    self.presentation.dirty = true;
-                                    self.schedule_presentation();
-                                }
-                            } else {
-                                self.presentation.watches = self.presentation.watches.saturating_sub(1);
-                                if self.presentation.watches == 0 {
-                                    if let Some(task) = self.presentation.task.take() {
-                                        task.abort();
-                                    }
-                                    self.presentation.generation = self.presentation.generation.wrapping_add(1);
-                                    self.presentation.dirty = false;
-                                    // A new UI observation is a fresh lease: its first
-                                    // proposal should not inherit a departed viewer's delay.
-                                    self.presentation.last_started = None;
-                                }
-                            }
-                        }
-                        AgentControl::PresentationStarted { generation, acknowledged } => {
-                            let accepted = self.presentation.generation == generation
-                                && self.presentation.watches > 0
-                                && self.presentation.task.is_some();
-                            if accepted {
-                                // Sources observed before this boundary are in the durable
-                                // snapshot about to be read; only later sources need another
-                                // coalesced request.
-                                self.presentation.dirty = false;
-                                self.presentation.last_started = Some(tokio::time::Instant::now());
-                            }
-                            let _ = acknowledged.send(accepted);
-                        }
-                        AgentControl::PresentationFinished { generation, result } => {
-                            if self.presentation.generation != generation {
-                                continue;
-                            }
-                            self.presentation.task = None;
-                            match result {
-                                Ok(Some(update)) => {
-                                    // A newer native source already has a coalesced request
-                                    // pending. Never let this older snapshot overwrite the
-                                    // durable cache in the meantime.
-                                    if self.last_presentation_source != Some(update.through) {
-                                        self.schedule_presentation();
-                                        continue;
-                                    }
-                                    let _ = self.persist_presentation(update).await;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    eprintln!("rho-agent: presentation generation failed: {error}");
-                                }
-                            }
-                            self.schedule_presentation();
-                        }
-                        AgentControl::Rewind { turns, reply } => {
-                            let result = if turns == 0 {
-                                Err(anyhow::anyhow!(":rewind turns must be greater than zero"))
-                            } else if !matches!(
-                                state.kind,
-                                AgentStateKind::Idle | AgentStateKind::Error(_)
-                            ) {
-                                Err(anyhow::anyhow!(
-                                    ":rewind is only available while idle or errored; use :cancel first"
-                                ))
-                            } else if !state.queued_inputs.is_empty() {
-                                Err(anyhow::anyhow!(
-                                    ":rewind is not available with queued inputs"
-                                ))
-                            } else if !self.pending_tools.is_empty()
-                                || self.inference_session.has_active_request()
-                            {
-                                Err(anyhow::anyhow!(
-                                    ":rewind is not available while work is running"
-                                ))
-                            } else {
-                                let db = self.persistence.db.clone();
-                                let agent_id = self.persistence.agent_id;
-                                let cursor = {
-                                    let (_, records) = db.read().agent_event_records(agent_id);
-                                    let user_positions = records
-                                        .iter()
-                                        .filter_map(|(pos, event)| {
-                                            matches!(
-                                                event,
-                                                AgentEvent::Queued(QueuedItem {
-                                                    kind: QueuedItemKind::UserMessage {
-                                                        sender: MessageSender::User,
-                                                        ..
-                                                    },
-                                                    ..
-                                                })
-                                            )
-                                            .then_some(*pos)
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if user_positions.is_empty() {
-                                        None
-                                    } else {
-                                        let index = user_positions
-                                            .len()
-                                            .saturating_sub(turns as usize);
-                                        Some(user_positions[index])
-                                    }
-                                };
-                                match cursor {
-                                    None => Err(anyhow::anyhow!("nothing to rewind")),
-                                    Some(cursor) => {
-                                        let mut write = db.write().await;
-                                        let next_event = write.fork_agent_lineage(
-                                            UnixMillis::now(),
-                                            agent_id,
-                                            cursor,
-                                        );
-                                        let cache = write.rebuild_agent_presentation_cache(
-                                            UnixMillis::now(),
-                                            agent_id,
-                                        );
-                                        write.commit();
-
-                                        let (loaded_next_event, events) =
-                                            db.read().agent_events(agent_id);
-                                        debug_assert_eq!(loaded_next_event, next_event);
-                                        let restored = restore_events(events);
-                                        state.blocks = restored.blocks;
-                                        state.kind = restored.kind;
-                                        state.context_used = restored.context_used;
-                                        state.queued_inputs = restored.queued_inputs;
-                                        self.inference_session.abort();
-                                        self.persistence.next_event = next_event;
-                                        let records = db.read().agent_presentation_source_tail(
-                                            agent_id,
-                                            PRESENTATION_SOURCE_TAIL_BYTES,
-                                        );
-                                        self.last_presentation_source =
-                                            presentation_sources(agent_id, &records)
-                                                .last()
-                                                .map(|source| source.through);
-                                        self.reset_presentation();
-                                        self.schedule_presentation();
-                                        if let Some(pool) = self.pool_events.upgrade() {
-                                            pool.publish_presentation_changed(
-                                                agent_id,
-                                                cache.generated_title,
-                                                cache.activity,
-                                            );
-                                        }
-                                        Ok(())
-                                    }
-                                }
-                            };
-                            let _ = reply.send(result);
-                        }
-                    }
-                }
-                update = self.inference_session.run() => {
-                    let AgentStateKind::ApiStreaming {
-                        mut pending_response,
-                        previous_attempt,
-                    } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
-                    else {
-                        unreachable!("provider streamed outside ApiStreaming");
-                    };
-
-                    match update {
-                        InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response,
-                                previous_attempt,
-                            };
-                        }
-                        InferenceEvent::ContextItem { index, event } => {
-                            let finished = matches!(&event, ContextItemEvent::Finish);
-                            pending_response.apply(index, event);
-                            if finished
-                                && let Some((phase, text)) = completed_assistant_item(
-                                    &pending_response,
-                                    index,
-                                )
-                                && let Some(pool) = self.pool_events.upgrade()
-                            {
-                                pool.publish_completed_assistant_item(
-                                    AgentAssistantItemCompleted {
-                                        agent_id: self.persistence.agent_id,
-                                        phase,
-                                        text,
-                                    },
-                                );
-                            }
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response,
-                                previous_attempt,
-                            };
-                        }
-                        InferenceEvent::TemporaryFailure { error, retrying_at: _ } => {
-                            let attempt_count = previous_attempt
-                                .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response: PendingInferenceResponse::default(),
-                                previous_attempt: Some(FailedInferenceResponse {
-                                    attempt_count,
-                                    partial_response: pending_response,
-                                    error: Arc::new(error.to_string()),
-                                }),
-                            };
-                        }
-                        InferenceEvent::Failed { error } => {
-                            self.auto_compaction_in_flight = false;
-                            let attempt_count = previous_attempt
-                                .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
-                            if let Some(pool) = self.pool_events.upgrade() {
-                                pool.publish_failed_turn(
-                                    self.persistence.agent_id,
-                                    error.to_string(),
-                                )
-                                .await;
-                            }
-                            state.kind = AgentStateKind::Error(FailedInferenceResponse {
-                                partial_response: pending_response,
-                                attempt_count,
-                                error: Arc::new(error.to_string()),
-                            });
-                        }
-                        InferenceEvent::Finished {
-                            usage,
-                            provider_response_id,
-                        } => {
-                            let auto_compaction_in_flight =
-                                std::mem::take(&mut self.auto_compaction_in_flight);
-                            match pending_response.finish() {
-                            Err(error) => {
-                                let attempt_count = previous_attempt
-                                    .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
-                                if let Some(pool) = self.pool_events.upgrade() {
-                                    pool.publish_failed_turn(
-                                        self.persistence.agent_id,
-                                        error.to_string(),
-                                    )
-                                    .await;
-                                }
-                                state.kind = AgentStateKind::Error(FailedInferenceResponse {
-                                    partial_response: pending_response,
-                                    attempt_count,
-                                    error: Arc::new(error.to_string()),
-                                });
-                            }
-                            Ok(items) => {
-                                let compacted = items.iter().any(|item| {
-                                    matches!(item, InferenceResponseItem::Compaction { .. })
-                                });
-                                let context_used = if compacted {
-                                    None
-                                } else {
-                                    usage
-                                        .as_ref()
-                                        .map(|usage| usage.input_tokens + usage.output_tokens)
-                                };
-                                if compacted {
-                                    state.context_used = None;
-                                } else if context_used.is_some() {
-                                    state.context_used = context_used;
-                                }
-                                let calls: Vec<ToolCall> = items
-                                    .iter()
-                                    .filter_map(|item| match item {
-                                        InferenceResponseItem::ToolCall {
-                                            id,
-                                            name,
-                                            tool_type,
-                                            arguments,
-                                            ..
-                                        } => Some(ToolCall {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            tool_type: *tool_type,
-                                            arguments: arguments.clone(),
-                                        }),
-                                        _ => None,
-                                    })
-                                    .collect();
-                                let final_text = calls.is_empty().then(|| final_answer_text(&items));
-                                let response_pos = self.persist_event(AgentEvent::InferenceResponse {
-                                    items: Cow::Borrowed(&items),
-                                    provider_response_id: provider_response_id.clone(),
-                                    context_used,
-                                })
-                                .await;
-                                let text = assistant_text(&items);
-                                if !text.trim().is_empty() {
-                                    self.presentation_source_committed(response_pos);
-                                }
-                                if let Some(usage) = &usage {
-                                    let turn_usage = db::AgentUsageBucket {
-                                            input_tokens: usage
-                                                .input_tokens
-                                                .saturating_sub(usage.cached_input_tokens)
-                                                .saturating_sub(usage.cache_write_input_tokens),
-                                            cache_read_tokens: usage.cached_input_tokens,
-                                            cache_write_tokens: usage.cache_write_input_tokens,
-                                            output_tokens: usage.output_tokens,
-                                            requests: 1,
-                                            ..db::AgentUsageBucket::default()
-                                        };
-                                    state.total_usage.add(&turn_usage);
-                                    if let Some(pool) = self.pool_events.upgrade() {
-                                        pool.record_agent_usage(
-                                            self.persistence.agent_id,
-                                            turn_usage,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
-                                    items,
-                                    provider_response_id,
-                                }));
-                                let continue_after_compaction =
-                                    compacted && auto_compaction_in_flight;
-                                if continue_after_compaction {
-                                    self.deliver_queued(
-                                        &mut state,
-                                        MessageDelivery::NextRequest,
-                                    )
-                                    .await;
-                                    self.start_request(&mut state, None).await;
-                                } else if calls.is_empty() {
-                                    let final_text = final_text.unwrap_or_default();
-                                    if let Some(pool) = self.pool_events.upgrade() {
-                                        pool.publish_completed_turn(AgentTurnCompleted {
-                                            agent_id: self.persistence.agent_id,
-                                            final_answer: final_text.clone(),
-                                        })
-                                        .await;
-                                    }
-                                    presentation::spawn_turn_report(
-                                        self.persistence.db.clone(),
-                                        self.pool_events.clone(),
-                                        Arc::clone(&self.presentation_session),
-                                        self.persistence.agent_id,
-                                        &final_text,
-                                    );
-                                    // Turn complete: commit the checkout's
-                                    // state so the user's jj view follows the
-                                    // agent's work (fire-and-forget).
-                                    let view = Arc::clone(
-                                        &self
-                                            .execution
-                                            .get_if_ready()
-                                            .expect("turn has an execution context")
-                                            .view,
-                                    );
-                                    tokio::spawn(async move {
-                                        if let Err(error) = view.snapshot().await {
-                                            eprintln!("rho-agent: snapshot failed: {error:#}");
-                                        }
-                                    });
-                                    // Leftover tool updates alone must not
-                                    // start a turn: with nothing else queued,
-                                    // drop them (persisted, so replay ends
-                                    // with the same empty queue). Alongside
-                                    // real inputs they deliver as usual.
-                                    if state
-                                        .queued_inputs
-                                        .iter()
-                                        .all(|item| matches!(item.kind, QueuedItemKind::ToolUpdate(_)))
-                                    {
-                                        if !state.queued_inputs.is_empty() {
-                                            self.persist_event(AgentEvent::QueueCleared).await;
-                                            state.queued_inputs.clear();
-                                        }
-                                        state.kind = AgentStateKind::Idle;
-                                    } else {
-                                        self.deliver_queued(&mut state, MessageDelivery::NextTurn)
-                                            .await;
-                                        self.start_request(&mut state, None).await;
-                                    }
-                                } else {
-                                    let mut previews = BTreeMap::new();
-                                    let mut waiting = None;
-                                    let tool_context = ToolExecutionContext {
-                                        model: Arc::from(self.model.as_str()),
-                                        input: state.blocks.clone().into(),
-                                        max_output_tokens: Some(10_000),
-                                    };
-                                    for call in calls {
-                                        let started_at = UnixMs::now();
-                                        let execution = self
-                                            .execution
-                                            .get_if_ready()
-                                            .expect("tool call has an execution context");
-                                        let preview_metadata = execution
-                                            .shell_tools
-                                            .preview_metadata(&call)
-                                            .map(tool_preview_metadata);
-                                        previews.insert(
-                                            call.id.clone(),
-                                            ToolPreview {
-                                                call: call.clone(),
-                                                started_at,
-                                                metadata: preview_metadata,
-                                            },
-                                        );
-                                        // In code mode, `exec` and `wait` go
-                                        // to the V8 session; `wait` means the
-                                        // cell wait there, so the multi-agent
-                                        // wait arm below never sees it.
-                                        #[cfg(feature = "code-mode")]
-                                        if let Some(session) = &execution.code_mode
-                                            && (call.name.as_str()
-                                                == rho_code_mode::EXEC_TOOL_NAME
-                                                || call.name.as_str()
-                                                    == rho_code_mode::WAIT_TOOL_NAME)
-                                        {
-                                            let session = Arc::clone(session);
-                                            let context = tool_context.clone();
-                                            self.pending_tools.push(Box::pin(async move {
-                                                let body = code_mode_tool_body(
-                                                    &session, &call, context,
-                                                ).await;
-                                                ToolResult {
-                                                    call_id: call.id.clone(),
-                                                    tool_type: call.tool_type,
-                                                    body,
-                                                    started_at,
-                                                    finished_at: UnixMs::now(),
-                                                    metadata: None,
-                                                }
-                                            }));
-                                            continue;
-                                        }
-                                        // `wait` is resolved by the loop
-                                        // itself, not run as a future: arm it
-                                        // (or fail it in place) and move on.
-                                        if self.agent_tools_enabled
-                                            && self.multi_agent.is_some()
-                                            && call.name.as_str()
-                                                == multi_agent_tools::WAIT_TOOL_NAME
-                                        {
-                                            if let Err(error) =
-                                                arm_wait(&mut waiting, &call, started_at)
-                                            {
-                                                self.pending_tools.push(Box::pin(
-                                                    std::future::ready(error_tool_result(
-                                                        &call, started_at, error,
-                                                    )),
-                                                ));
-                                            }
-                                            continue;
-                                        }
-                                        let shell_tools = execution.shell_tools.clone();
-                                        let image_tools = (call.name.as_str()
-                                            == image_tool::VIEW_IMAGE_TOOL_NAME)
-                                            .then(|| execution.image_tools.clone());
-                                        let web_search = (execution.web_search_enabled
-                                            && call.name.as_str()
-                                                == rho_web_search::WEB_SEARCH_TOOL_NAME)
-                                            .then(|| execution.web_search.clone());
-                                        let context = tool_context.clone();
-                                        let agent_tools = (self.agent_tools_enabled
-                                            && multi_agent_tools::is_agent_tool(call.name.as_str()))
-                                            .then(|| self.multi_agent.clone())
-                                            .flatten();
-                                        let iris_tools = iris_tools::is_tool(call.name.as_str())
-                                            .then(|| self.iris_tools.clone())
-                                            .flatten();
-                                        let iris_role = self.iris_tools.is_some();
-                                        self.pending_tools.push(Box::pin(async move {
-                                            let call_id = call.id.clone();
-                                            let tool_type = call.tool_type;
-                                            let (body, metadata) = if let Some(web_search) = web_search {
-                                                (web_search.call(call, context).await, None)
-                                            } else if let Some(image_tools) = image_tools {
-                                                (image_tools.call(call).await, None)
-                                            } else if let Some(iris_tools) = iris_tools {
-                                                (iris_tools.call(call).await, None)
-                                            } else if let Some(tools) = agent_tools {
-                                                (multi_agent_tools::call_agent_tool(tools, call).await, None)
-                                            } else if iris_role {
-                                                (ToolOutput {
-            images: std::sync::Arc::new(Vec::new()),
-                                                    output: Arc::new("unsupported Iris tool".to_owned()),
-                                                    status: ToolOutputStatus::Error,
-                                                }, None)
-                                            } else {
-                                                let output =
-                                                    shell_tools.call_with_metadata(call).await;
-                                                (output.body, output.metadata)
-                                            };
-                                            let finished_at = UnixMs::now();
-                                            ToolResult {
-                                                call_id,
-                                                tool_type,
-                                                body,
-                                                started_at,
-                                                finished_at,
-                                                metadata,
-                                            }
-                                        }));
-                                    }
-                                    state.kind = AgentStateKind::ToolCalling {
-                                        previews,
-                                        results: Vec::new(),
-                                        waiting,
-                                    };
-                                    // A wait armed over an already-pending
-                                    // queue resolves right away.
-                                    self.maybe_resolve_wait(&mut state).await;
-                                }
-                            }
-                        }},
-                    }
-                }
-                Some(result) = self.pending_tools.next() => {
-                    self.finish_tool_call(&mut state, result).await;
-                }
-                _ = tokio::time::sleep_until(wait_deadline), if armed_wait.is_some() => {
-                    self.resolve_wait(
-                        &mut state,
-                        "Wait timed out.".to_owned(),
-                    )
-                    .await;
-                }
-            }
-            if execution_settled(
-                &previous_kind,
-                &state.kind,
-                self.execution_generation != previous_execution_generation,
-            ) {
-                // The activity throttle coalesces within a turn; the next
-                // turn's first update should not inherit this one's spacing.
-                self.presentation.last_started = None;
-                if let Some(pool) = self.pool_events.upgrade() {
-                    pool.settle_turn(self.persistence.agent_id).await;
-                }
-            }
-            *self.state.write().expect("poison") = state.clone();
-            self.notify.notify_waiters();
-        }
-    }
-
-    async fn persist_event(&mut self, event: AgentEvent<'_>) -> AgentEventPos {
-        let persistence = &mut self.persistence;
-        let event_pos = persistence.next_event;
-        let mut write = persistence.db.write().await;
-        persistence.next_event = write.append_agent_event(persistence.next_event, &event);
-        write.commit();
-        event_pos
-    }
-
-    async fn persist_presentation(
-        &mut self,
-        update: AgentPresentationUpdate,
-    ) -> Option<AgentPresentationCache> {
-        let persistence = &mut self.persistence;
-        let mut write = persistence.db.write().await;
-        let cache =
-            write.apply_agent_presentation(UnixMillis::now(), persistence.agent_id, &update)?;
-        let event_pos = persistence.next_event;
-        write.append_agent_presentation_history(event_pos, &update);
-        persistence.next_event = write.append_agent_event(
-            persistence.next_event,
-            &AgentEvent::PresentationUpdated {
-                update: update.clone(),
-            },
-        );
-        write.commit();
-        if let Some(pool) = self.pool_events.upgrade() {
-            pool.publish_presentation_changed(
-                persistence.agent_id,
-                cache.generated_title.clone(),
-                cache.activity.clone(),
-            );
-        }
-        Some(cache)
-    }
-
-    fn presentation_source_committed(&mut self, through: AgentEventPos) {
-        self.last_presentation_source = Some(through);
-        self.presentation.dirty = true;
-        self.schedule_presentation();
-    }
-
-    fn reset_presentation(&mut self) {
-        if let Some(task) = self.presentation.task.take() {
-            task.abort();
-        }
-        self.presentation.generation = self.presentation.generation.wrapping_add(1);
-        self.presentation.last_started = None;
-        self.presentation.dirty = self.presentation.watches > 0;
-    }
-
-    fn schedule_presentation(&mut self) {
-        if self.presentation.watches == 0
-            || !self.presentation.dirty
-            || self.presentation.task.is_some()
-        {
-            return;
-        }
-        self.presentation.dirty = false;
-        self.presentation.generation = self.presentation.generation.wrapping_add(1);
-        let generation = self.presentation.generation;
-        let now = tokio::time::Instant::now();
-        let delay = self
-            .presentation
-            .last_started
-            .and_then(|started| presentation::MIN_INTERVAL.checked_sub(now.duration_since(started)))
-            .unwrap_or_default();
-        let db = self.persistence.db.clone();
-        let session = Arc::clone(&self.presentation_session);
-        let agent_id = self.persistence.agent_id;
-        let control = self.control.clone();
-        self.presentation.task = Some(tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let result = if !presentation::has_input(&db, agent_id) {
-                Ok(None)
-            } else {
-                match presentation::acquire_request().await {
-                    Ok(permit) => {
-                        let (acknowledged, accepted) = oneshot::channel();
-                        let Some(control) = control.upgrade() else {
-                            return;
-                        };
-                        if control
-                            .send(AgentControl::PresentationStarted {
-                                generation,
-                                acknowledged,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                        drop(control);
-                        if !accepted.await.unwrap_or(false) {
-                            return;
-                        }
-                        presentation::generate(db, session, agent_id, permit)
-                            .await
-                            .map_err(|error| format!("{error:#}"))
-                    }
-                    Err(error) => Err(format!("{error:#}")),
-                }
-            };
-            if let Some(control) = control.upgrade() {
-                let _ = control.send(AgentControl::PresentationFinished { generation, result });
-            }
-        }));
-    }
-
-    /// Persist and queue an incoming message (user input or agent mail),
-    /// waking the agent if it is idle.
-    async fn enqueue_message(
-        &mut self,
-        state: &mut AgentState,
-        sender: MessageSender,
-        content: Vec<ContentPart>,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-        accepted: Option<oneshot::Sender<()>>,
-    ) {
-        let content = Arc::new(content);
-        let item = QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender,
-                content: Arc::clone(&content),
-                source_id,
-            },
-            delivery,
-        };
-        let event_pos = self.persist_event(AgentEvent::Queued(item.clone())).await;
-        if sender == MessageSender::User {
-            let mut write = self.persistence.db.write().await;
-            write.record_agent_user_message(
-                UnixMs::now(),
-                self.persistence.agent_id,
-                &rho_core::text_content(&content),
-            );
-            write.commit();
-        }
-        if let Some(pool) = self.pool_events.upgrade() {
-            pool.publish_accepted_input(AgentInputAccepted {
-                input_id: AgentInputId {
-                    agent_id: self.persistence.agent_id,
-                    event_pos,
-                },
-                sender,
-                content: (*content).clone(),
-                delivery,
-                source_id,
-            });
-        }
-        if !rho_core::text_content(&content).trim().is_empty() {
-            self.presentation_source_committed(event_pos);
-        }
-        state.queued_inputs.push(item);
-        if let Some(accepted) = accepted {
-            let _ = accepted.send(());
-        }
-        self.wake_for_queued(state).await;
-        self.yield_code_mode_wait_for_queued(state);
-        // An armed wait counts any deliverable arrival.
-        self.maybe_resolve_wait(state).await;
-    }
-
-    /// Fold a finished tool call into the current batch; when the batch is
-    /// done (no running tools, no armed wait) commit the results and continue
-    /// the turn.
-    async fn finish_tool_call(&mut self, state: &mut AgentState, result: ToolResult) {
-        let AgentStateKind::ToolCalling {
-            mut previews,
-            mut results,
-            waiting,
-        } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
-        else {
-            unreachable!("tool finished outside a tool batch");
-        };
-        previews.remove(&result.call_id);
-        results.push(result);
-        if self.pending_tools.is_empty() && waiting.is_none() {
-            for result in &results {
-                self.persist_event(AgentEvent::ToolResult {
-                    result: Cow::Borrowed(result),
-                })
-                .await;
-            }
-            state
-                .blocks
-                .push(Arc::new(ContextBlock::ToolResults { results }));
-            self.deliver_queued(state, MessageDelivery::NextRequest)
-                .await;
-            self.start_request(state, None).await;
-        } else {
-            state.kind = AgentStateKind::ToolCalling {
-                previews,
-                results,
-                waiting,
-            };
-        }
-    }
-
-    /// Resolve the armed `wait` with `body`, folding it into the batch like
-    /// any other tool result.
-    async fn resolve_wait(&mut self, state: &mut AgentState, body: String) {
-        let AgentStateKind::ToolCalling {
-            previews, waiting, ..
-        } = &mut state.kind
-        else {
-            return;
-        };
-        let Some(wait) = waiting.take() else { return };
-        let preview = previews
-            .get(&wait.call_id)
-            .expect("armed wait has a preview");
-        let result = ToolResult {
-            call_id: wait.call_id.clone(),
-            tool_type: preview.call.tool_type,
-            body: ToolOutput {
-                images: std::sync::Arc::new(Vec::new()),
-                output: Arc::new(body),
-                status: ToolOutputStatus::Success,
-            },
-            started_at: preview.started_at,
-            finished_at: UnixMs::now(),
-            metadata: None,
-        };
-        self.finish_tool_call(state, result).await;
-    }
-
-    /// Resolve an armed `wait` when the queue holds anything the batch's
-    /// `NextRequest` boundary will actually deliver (`NextTurn` items wait
-    /// for the turn to end, so they must not complete a wait).
-    async fn maybe_resolve_wait(&mut self, state: &mut AgentState) {
-        if !matches!(
-            &state.kind,
-            AgentStateKind::ToolCalling {
-                waiting: Some(_),
-                ..
-            }
-        ) {
-            return;
-        }
-        let pending = state
-            .queued_inputs
-            .deliverable(MessageDelivery::NextRequest);
-        if pending == 0 {
-            return;
-        }
-        self.resolve_wait(state, "Wait completed.".to_owned()).await;
-    }
-
-    /// Code-mode `wait` is a normal pending tool future, not the loop-armed
-    /// multi-agent wait. When deliverable input arrives mid-turn, ask the
-    /// observed cell to yield so the tool batch can finish and the queued input
-    /// can enter the next request promptly.
-    fn yield_code_mode_wait_for_queued(&self, state: &AgentState) {
-        #[cfg(not(feature = "code-mode"))]
-        {
-            let _ = state;
-        }
-        #[cfg(feature = "code-mode")]
-        {
-            let Some(session) = self
-                .execution
-                .get_if_ready()
-                .and_then(|execution| execution.code_mode.as_ref())
-            else {
-                return;
-            };
-            if !should_yield_code_mode_wait_for_queued(state) {
-                return;
-            }
-            session.request_yield();
-        }
-    }
-
-    /// Move queued inputs into model context at a delivery boundary.
-    /// `boundary` is the point the loop has reached: `NextRequest` (about to
-    /// issue a mid-turn inference request) delivers everything but the
-    /// `NextTurn` lane; `NextTurn` (the turn is over) delivers all lanes.
-    /// Inputs were persisted at enqueue, so delivery writes only the
-    /// `Dequeued` boundary marker (when anything delivered), which replay
-    /// re-executes.
-    async fn deliver_queued(&mut self, state: &mut AgentState, boundary: MessageDelivery) {
-        let delivered = state.queued_inputs.drain(boundary);
-        if delivered.is_empty() {
-            return;
-        }
-        self.persist_event(AgentEvent::Dequeued { boundary }).await;
-        for item in delivered {
-            state.blocks.push(Arc::new(delivered_block(item)));
-        }
-    }
-
-    /// Start a turn to deliver queued messages when no turn is in flight.
-    /// Busy states leave the queue for the in-turn delivery points; an
-    /// unfinished restored turn is interrupted first.
-    async fn wake_for_queued(&mut self, state: &mut AgentState) {
-        match &state.kind {
-            // Busy: the message waits in the queue for its delivery point.
-            AgentStateKind::ApiStreaming { .. } | AgentStateKind::ToolCalling { .. } => {}
-            // No turn in flight: deliver everything now (including messages
-            // held through an Error).
-            AgentStateKind::Idle | AgentStateKind::Error(_) => {
-                assert!(!self.inference_session.has_active_request());
-                assert!(self.pending_tools.is_empty());
-                self.deliver_queued(state, MessageDelivery::NextTurn).await;
-                self.start_request(state, None).await;
-            }
-            AgentStateKind::UnfinishedTurn { .. } => {
-                assert!(!self.inference_session.has_active_request());
-                assert!(self.pending_tools.is_empty());
-                let AgentStateKind::UnfinishedTurn {
-                    outstanding_calls,
-                    completed_tool_calls,
-                } = std::mem::replace(&mut state.kind, AgentStateKind::Idle)
-                else {
-                    unreachable!("checked unfinished turn");
-                };
-                let mut results = completed_tool_calls.iter().cloned().collect::<Vec<_>>();
-                for call in outstanding_calls.iter() {
-                    let result = interrupted_tool_result(call);
-                    self.persist_event(AgentEvent::ToolResult {
-                        result: Cow::Borrowed(&result),
-                    })
-                    .await;
-                    results.push(result);
-                }
-                if !results.is_empty() {
-                    state
-                        .blocks
-                        .push(Arc::new(ContextBlock::ToolResults { results }));
-                }
-                self.deliver_queued(state, MessageDelivery::NextTurn).await;
-                self.start_request(state, None).await;
-            }
-        }
-    }
-
-    async fn start_request(
-        &mut self,
-        state: &mut AgentState,
-        previous_attempt: Option<FailedInferenceResponse>,
-    ) {
-        self.execution_generation = self.execution_generation.wrapping_add(1);
-        let auto_compacting =
-            should_auto_compact(state, self.inference_session.auto_compact_token_limit());
-        if auto_compacting {
-            // `start_request` is reached from a tool turn only after the
-            // complete result batch has been appended, so the wire-level
-            // tail ordering is call -> result -> compaction trigger.
-            let item = QueuedItem {
-                kind: QueuedItemKind::Compaction,
-                delivery: MessageDelivery::NextRequest,
-            };
-            self.persist_event(AgentEvent::Queued(item.clone())).await;
-            state.queued_inputs.push(item);
-            self.deliver_queued(state, MessageDelivery::NextRequest)
-                .await;
-        }
-        self.auto_compaction_in_flight = auto_compacting;
-        if self.send_request(state).await {
-            state.kind = AgentStateKind::ApiStreaming {
-                pending_response: PendingInferenceResponse::default(),
-                previous_attempt,
-            };
-        } else {
-            self.auto_compaction_in_flight = false;
-        }
-    }
-
-    async fn send_request(&mut self, state: &mut AgentState) -> bool {
-        let execution = match self.execution.get().await {
-            Ok(execution) => execution,
-            Err(error) => {
-                let error = format!("failed to initialize agent execution: {error:#}");
-                if let Some(pool) = self.pool_events.upgrade() {
-                    pool.publish_failed_turn(self.persistence.agent_id, error.clone())
-                        .await;
-                }
-                state.kind = AgentStateKind::Error(FailedInferenceResponse {
-                    partial_response: PendingInferenceResponse::default(),
-                    attempt_count: NonZeroU64::MIN,
-                    error: Arc::new(error),
-                });
-                return false;
-            }
-        };
-        self.inference_session.request(InferenceRequest {
-            instructions: Arc::clone(&execution.system_prompt),
-            input: state.blocks.clone(),
-            agent_id_labels: self.agent_id_labels(&state.blocks),
-            tools: Arc::clone(&execution.tool_specs),
-        });
-        true
-    }
-
-    fn agent_id_labels(
-        &self,
-        blocks: &[Arc<ContextBlock>],
-    ) -> std::collections::BTreeMap<AgentId, Arc<str>> {
-        let Some(tools) = &self.multi_agent else {
-            return std::collections::BTreeMap::new();
-        };
-        blocks
-            .iter()
-            .filter_map(|block| match &**block {
-                ContextBlock::UserMessage {
-                    sender: MessageSender::Agent { id },
-                    ..
-                } => Some((*id, Arc::from(tools.display_id(*id)))),
-                _ => None,
-            })
-            .collect()
-    }
-}
-
-fn should_auto_compact(state: &AgentState, token_limit: Option<u64>) -> bool {
-    let limit_reached = state
-        .context_used
-        .zip(token_limit)
-        .is_some_and(|(used, limit)| used >= limit);
-    if !limit_reached || has_unanswered_tool_calls(&state.blocks) {
-        return false;
-    }
-
-    // A delivered manual trigger already covers this request. Only the most
-    // recent response or trigger matters; older triggers remain in the
-    // append-only transcript after their compaction response arrives.
-    !state
-        .blocks
-        .iter()
-        .rev()
-        .find_map(|block| match &**block {
-            ContextBlock::CompactionTrigger => Some(true),
-            ContextBlock::InferenceResponse { .. } => Some(false),
-            ContextBlock::UserMessage { .. }
-            | ContextBlock::ToolResults { .. }
-            | ContextBlock::ToolUpdate(_) => None,
-        })
-        .unwrap_or(false)
-}
-
-fn has_unanswered_tool_calls(blocks: &[Arc<ContextBlock>]) -> bool {
-    let mut outstanding = HashSet::new();
-    for block in blocks {
-        match &**block {
-            ContextBlock::InferenceResponse { items, .. } => {
-                for item in items {
-                    match item {
-                        // Earlier calls are represented inside the opaque
-                        // compacted context and no longer need local results.
-                        InferenceResponseItem::Compaction { .. } => outstanding.clear(),
-                        InferenceResponseItem::ToolCall { id, .. } => {
-                            outstanding.insert(id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            ContextBlock::ToolResults { results } => {
-                for result in results {
-                    outstanding.remove(&result.call_id);
-                }
-            }
-            ContextBlock::UserMessage { .. }
-            | ContextBlock::ToolUpdate(_)
-            | ContextBlock::CompactionTrigger => {}
-        }
-    }
-    !outstanding.is_empty()
-}
-
-#[cfg(feature = "code-mode")]
-fn should_yield_code_mode_wait_for_queued(state: &AgentState) -> bool {
-    let AgentStateKind::ToolCalling { previews, .. } = &state.kind else {
-        return false;
-    };
-    previews
-        .values()
-        .any(|preview| preview.call.name.as_str() == rho_code_mode::WAIT_TOOL_NAME)
-        && state
-            .queued_inputs
-            .deliverable(MessageDelivery::NextRequest)
-            > 0
-}
-
-/// The turn's answer for reporting to a parent agent: final-channel text,
-/// falling back to all assistant text when the model skipped phases.
-fn completed_assistant_item(
-    response: &PendingInferenceResponse,
-    index: usize,
-) -> Option<(rho_core::MessagePhase, String)> {
-    let StreamingContextItemState::Finished(StreamingContextItem::AssistantMessage {
-        content,
-        phase,
-        ..
-    }) = response.items.get(index)?
-    else {
-        return None;
-    };
-    Some((
-        phase.unwrap_or(rho_core::MessagePhase::FinalAnswer),
-        content
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n"),
-    ))
-}
-
 pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     let text_of = |want_final: bool| {
         items
@@ -2648,7 +481,7 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     }
 }
 
-fn assistant_text(items: &[InferenceResponseItem]) -> String {
+pub(crate) fn assistant_text(items: &[InferenceResponseItem]) -> String {
     items
         .iter()
         .filter_map(|item| match item {
@@ -2668,538 +501,77 @@ fn assistant_text(items: &[InferenceResponseItem]) -> String {
         .join("\n")
 }
 
+/// The text a reply carries, if any. A `Replied` event holds one response
+/// block; anything else in it is not the model speaking.
+fn replied_text(blocks: &[ContextBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContextBlock::InferenceResponse { items, .. } => Some(assistant_text(items)),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn presentation_sources(
     agent_id: AgentId,
     records: &[(AgentEventPos, AgentEvent<'static>)],
 ) -> Vec<PresentationSource> {
+    let found = |through: &AgentEventPos, speaker, text: String| {
+        (!text.trim().is_empty()).then_some(PresentationSource {
+            agent_id,
+            through: *through,
+            speaker,
+            text,
+        })
+    };
+    let speaker_of = |sender: &MessageSender| match sender {
+        MessageSender::User => PresentationSpeaker::User,
+        MessageSender::Agent { .. } => PresentationSpeaker::Agent,
+    };
     records
         .iter()
         .filter_map(|(through, event)| match event {
+            AgentEvent::Accepted(QueuedInput {
+                source,
+                kind: InputKind::Message { content },
+                ..
+            }) => found(through, speaker_of(source), rho_core::text_content(content)),
+            AgentEvent::Replied { blocks, .. } => found(
+                through,
+                PresentationSpeaker::Assistant,
+                replied_text(blocks),
+            ),
             AgentEvent::Queued(QueuedItem {
                 kind:
                     QueuedItemKind::UserMessage {
                         sender, content, ..
                     },
                 ..
-            }) => {
-                let text = rho_core::text_content(content);
-                (!text.trim().is_empty()).then_some(PresentationSource {
-                    agent_id,
-                    through: *through,
-                    speaker: match sender {
-                        MessageSender::User => PresentationSpeaker::User,
-                        MessageSender::Agent { .. } => PresentationSpeaker::Agent,
-                    },
-                    text,
-                })
+            }) => found(through, speaker_of(sender), rho_core::text_content(content)),
+            AgentEvent::InferenceResponse { items, .. } => found(
+                through,
+                PresentationSpeaker::Assistant,
+                assistant_text(items),
+            ),
+            AgentEvent::ClaudePresentationSource { speaker, text, .. } => {
+                found(through, *speaker, text.to_string())
             }
-            AgentEvent::InferenceResponse { items, .. } => {
-                let text = assistant_text(items);
-                (!text.trim().is_empty()).then_some(PresentationSource {
-                    agent_id,
-                    through: *through,
-                    speaker: PresentationSpeaker::Assistant,
-                    text,
-                })
-            }
-            AgentEvent::ClaudePresentationSource { speaker, text, .. } => (!text.trim().is_empty())
-                .then_some(PresentationSource {
-                    agent_id,
-                    through: *through,
-                    speaker: *speaker,
-                    text: text.to_string(),
-                }),
-            AgentEvent::ToolResult { .. }
+            AgentEvent::Accepted(_)
+            | AgentEvent::Sent { .. }
+            | AgentEvent::ToolResult { .. }
             | AgentEvent::Queued(_)
             | AgentEvent::Dequeued { .. }
             | AgentEvent::QueueCleared
-            | AgentEvent::PresentationUpdated { .. } => None,
+            | AgentEvent::PresentationUpdated { .. }
+            | AgentEvent::Created { .. }
+            | AgentEvent::RoleChanged { .. }
+            | AgentEvent::WorkdirAdded { .. }
+            | AgentEvent::RuntimeRebound { .. } => None,
         })
         .collect()
-}
-
-/// Receive mail when this agent has a mailbox; never resolves otherwise, and
-/// resolves `None` when the pool re-registered the route (agent reloaded).
-fn tool_preview_metadata(metadata: ToolResultMetadata) -> ToolPreviewMetadata {
-    match metadata {
-        ToolResultMetadata::ApplyPatch(metadata) => ToolPreviewMetadata::ApplyPatch(metadata),
-    }
-}
-
-fn interrupted_tool_result(call: &ToolCall) -> ToolResult {
-    let now = UnixMs::now();
-    ToolResult {
-        call_id: call.id.clone(),
-        tool_type: call.tool_type,
-        body: ToolOutput {
-            images: std::sync::Arc::new(Vec::new()),
-            output: Arc::new(
-                "Tool execution was interrupted by a daemon restart. It may have completed \
-                 partially."
-                    .to_owned(),
-            ),
-            status: ToolOutputStatus::Error,
-        },
-        started_at: now,
-        finished_at: now,
-        metadata: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::AgentIdDomain;
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-    struct AgentTestProviderSpecificData {
-        item_id: String,
-    }
-
-    impl senax_encoder::TaggedSenax for AgentTestProviderSpecificData {
-        const TAG: &'static str = "rho-agent-test.provider-data";
-    }
-
-    fn test_provider_specific_data() -> Box<dyn rho_core::ProviderSpecificData> {
-        Box::new(AgentTestProviderSpecificData {
-            item_id: "agent_test_item".to_owned(),
-        })
-    }
-
-    fn agent_id(counter: u64) -> AgentId {
-        AgentId::from_counter(counter, &AgentIdDomain(7)).expect("counter fits")
-    }
-
-    fn text_parts(text: &str) -> Vec<ContentPart> {
-        vec![ContentPart::Text {
-            text: text.to_owned(),
-        }]
-    }
-
-    #[test]
-    fn settlement_tracks_runtime_ownership_not_snapshot_timing() {
-        let working = AgentStateKind::ApiStreaming {
-            pending_response: PendingInferenceResponse::default(),
-            previous_attempt: None,
-        };
-        let successor_working = AgentStateKind::ApiStreaming {
-            pending_response: PendingInferenceResponse::default(),
-            previous_attempt: None,
-        };
-        let error = AgentStateKind::Error(FailedInferenceResponse {
-            partial_response: PendingInferenceResponse::default(),
-            attempt_count: NonZeroU64::MIN,
-            error: Arc::new("failed".to_owned()),
-        });
-
-        assert!(execution_settled(&working, &AgentStateKind::Idle, false));
-        assert!(!execution_settled(&working, &successor_working, true));
-        assert!(execution_settled(&AgentStateKind::Idle, &error, true));
-        assert!(execution_settled(&error, &error, true));
-        assert!(!execution_settled(&error, &AgentStateKind::Idle, false));
-    }
-
-    fn queued_event(
-        sender: MessageSender,
-        text: &str,
-        delivery: MessageDelivery,
-    ) -> AgentEvent<'static> {
-        AgentEvent::Queued(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender,
-                content: Arc::new(text_parts(text)),
-                source_id: None,
-            },
-            delivery,
-        })
-    }
-
-    fn response_event(items: Vec<InferenceResponseItem>) -> AgentEvent<'static> {
-        AgentEvent::InferenceResponse {
-            items: Cow::Owned(items),
-            provider_response_id: None,
-            context_used: None,
-        }
-    }
-
-    fn tool_call(id: &str) -> InferenceResponseItem {
-        InferenceResponseItem::ToolCall {
-            provider_specific: test_provider_specific_data(),
-            id: ToolCallId::try_from(id).unwrap(),
-            name: ToolName::try_from("shell_command").unwrap(),
-            tool_type: rho_core::ToolType::Function,
-            arguments: String::new(),
-        }
-    }
-
-    fn compaction_item() -> InferenceResponseItem {
-        InferenceResponseItem::Compaction {
-            provider_specific: test_provider_specific_data(),
-        }
-    }
-
-    fn tool_result(id: &str) -> AgentEvent<'static> {
-        AgentEvent::ToolResult {
-            result: Cow::Owned(ToolResult {
-                call_id: ToolCallId::try_from(id).unwrap(),
-                tool_type: rho_core::ToolType::Function,
-                body: ToolOutput {
-                    images: std::sync::Arc::new(Vec::new()),
-                    output: Arc::new("ok".to_owned()),
-                    status: ToolOutputStatus::Success,
-                },
-                started_at: UnixMs(0),
-                finished_at: UnixMs(0),
-                metadata: None,
-            }),
-        }
-    }
-
-    use rho_core::ToolName;
-
-    #[test]
-    fn dequeue_at_next_turn_delivers_user_and_agent_mail() {
-        let restored = restore_events(vec![
-            queued_event(MessageSender::User, "hi", MessageDelivery::Immediate),
-            queued_event(
-                MessageSender::Agent { id: agent_id(1) },
-                "done",
-                MessageDelivery::NextRequest,
-            ),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextTurn,
-            },
-        ]);
-        assert_eq!(
-            restored.blocks.len(),
-            2,
-            "both lanes deliver at a turn boundary"
-        );
-        assert_eq!(
-            *restored.blocks[0],
-            ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content: text_parts("hi")
-            }
-        );
-        assert_eq!(
-            *restored.blocks[1],
-            ContextBlock::UserMessage {
-                sender: MessageSender::Agent { id: agent_id(1) },
-                content: text_parts("done")
-            }
-        );
-        assert!(restored.queued_inputs.is_empty());
-        assert_eq!(restored.kind, AgentStateKind::Idle);
-    }
-
-    #[test]
-    fn next_turn_lane_held_at_mid_turn_boundary() {
-        let restored = restore_events(vec![
-            queued_event(MessageSender::User, "steer", MessageDelivery::NextRequest),
-            queued_event(MessageSender::User, "later", MessageDelivery::NextTurn),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
-            },
-        ]);
-        assert_eq!(restored.blocks.len(), 1);
-        assert_eq!(restored.queued_inputs.len(), 1);
-        let held = restored.queued_inputs.iter().next().expect("held item");
-        assert_eq!(held.delivery, MessageDelivery::NextTurn);
-    }
-
-    #[test]
-    fn queued_tool_update_replays_into_context() {
-        let update = ToolUpdate {
-            call_id: ToolCallId::try_from("exec-1").unwrap(),
-            tool_type: rho_core::ToolType::Custom,
-            output: Arc::new("progress".to_owned()),
-            at: UnixMs(0),
-        };
-        let restored = restore_events(vec![
-            AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::ToolUpdate(update.clone()),
-                delivery: MessageDelivery::NextRequest,
-            }),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
-            },
-        ]);
-        assert_eq!(*restored.blocks[0], ContextBlock::ToolUpdate(update));
-        assert!(restored.queued_inputs.is_empty());
-    }
-
-    #[test]
-    fn undelivered_queue_survives_restore() {
-        let restored = restore_events(vec![queued_event(
-            MessageSender::Agent { id: agent_id(2) },
-            "pending mail",
-            MessageDelivery::NextRequest,
-        )]);
-        assert!(restored.blocks.is_empty());
-        assert_eq!(restored.queued_inputs.len(), 1);
-        let pending = restored.queued_inputs.iter().next().expect("pending item");
-        assert_eq!(
-            pending.kind,
-            QueuedItemKind::UserMessage {
-                sender: MessageSender::Agent { id: agent_id(2) },
-                content: Arc::new(text_parts("pending mail")),
-                source_id: None,
-            }
-        );
-    }
-
-    #[test]
-    fn image_queue_survives_restore_and_delivery() {
-        let content = vec![ContentPart::Image {
-            media_type: "image/webp".to_owned(),
-            data: vec![1, 2, 3, 4],
-        }];
-        let restored = restore_events(vec![
-            AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::UserMessage {
-                    sender: MessageSender::User,
-                    content: Arc::new(content.clone()),
-                    source_id: None,
-                },
-                delivery: MessageDelivery::NextRequest,
-            }),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
-            },
-        ]);
-        assert_eq!(
-            restored.blocks[0].as_ref(),
-            &ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content,
-            }
-        );
-    }
-
-    #[test]
-    fn drain_preserves_arrival_order_across_deliveries() {
-        let item = |text: &str, delivery| QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::User,
-                content: Arc::new(text_parts(text)),
-                source_id: None,
-            },
-            delivery,
-        };
-        let text = |item: &QueuedItem| match &item.kind {
-            QueuedItemKind::UserMessage { content, .. } => {
-                let ContentPart::Text { text } = &content[0] else {
-                    panic!("expected text content")
-                };
-                text.clone()
-            }
-            QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_) => unreachable!(),
-        };
-        let mut queue = InputQueues::default();
-        queue.push(item("steer", MessageDelivery::NextRequest));
-        queue.push(item("later", MessageDelivery::NextTurn));
-        queue.push(item("mail", MessageDelivery::NextRequest));
-        queue.push(item("steer2", MessageDelivery::Immediate));
-
-        assert_eq!(queue.deliverable(MessageDelivery::NextRequest), 3);
-        let drained = queue.drain(MessageDelivery::NextRequest);
-        assert_eq!(
-            drained.iter().map(text).collect::<Vec<_>>(),
-            ["steer", "mail", "steer2"],
-            "arrival order holds, NextTurn is held back"
-        );
-        assert_eq!(
-            queue
-                .drain(MessageDelivery::NextTurn)
-                .iter()
-                .map(text)
-                .collect::<Vec<_>>(),
-            ["later"]
-        );
-        assert!(queue.is_empty());
-    }
-
-    fn tool_calling_state_with_queue(queue: InputQueues) -> AgentState {
-        let call = ToolCall {
-            id: ToolCallId::try_from("wait-1").unwrap(),
-            name: ToolName::try_from(rho_code_mode::WAIT_TOOL_NAME).unwrap(),
-            tool_type: rho_core::ToolType::Function,
-            arguments: "{}".to_owned(),
-        };
-        let mut previews = BTreeMap::new();
-        previews.insert(
-            call.id.clone(),
-            ToolPreview {
-                call,
-                started_at: UnixMs(0),
-                metadata: None,
-            },
-        );
-        AgentState {
-            blocks: Vec::new(),
-            queued_inputs: queue,
-            kind: AgentStateKind::ToolCalling {
-                previews,
-                results: Vec::new(),
-                waiting: None,
-            },
-            context_used: None,
-            total_usage: db::AgentUsageBucket::default(),
-            usage_provider: db::AgentUsageModel::GPT,
-        }
-    }
-
-    #[test]
-    fn code_mode_wait_yields_for_queued_user_message() {
-        let mut queue = InputQueues::default();
-        queue.push(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::User,
-                content: Arc::new(text_parts("steer")),
-                source_id: None,
-            },
-            delivery: MessageDelivery::NextRequest,
-        });
-
-        assert!(should_yield_code_mode_wait_for_queued(
-            &tool_calling_state_with_queue(queue)
-        ));
-    }
-
-    #[test]
-    fn code_mode_wait_yields_for_queued_agent_mail() {
-        let mut queue = InputQueues::default();
-        queue.push(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::Agent { id: agent_id(3) },
-                content: Arc::new(text_parts("done")),
-                source_id: None,
-            },
-            delivery: MessageDelivery::NextRequest,
-        });
-
-        assert!(should_yield_code_mode_wait_for_queued(
-            &tool_calling_state_with_queue(queue)
-        ));
-    }
-
-    #[test]
-    fn code_mode_wait_does_not_yield_for_next_turn_message() {
-        let mut queue = InputQueues::default();
-        queue.push(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: MessageSender::User,
-                content: Arc::new(text_parts("later")),
-                source_id: None,
-            },
-            delivery: MessageDelivery::NextTurn,
-        });
-
-        assert!(!should_yield_code_mode_wait_for_queued(
-            &tool_calling_state_with_queue(queue)
-        ));
-    }
-
-    #[test]
-    fn queue_cleared_drops_pending_messages() {
-        let restored = restore_events(vec![
-            queued_event(MessageSender::User, "dropped", MessageDelivery::NextTurn),
-            AgentEvent::QueueCleared,
-        ]);
-        assert!(restored.blocks.is_empty());
-        assert!(restored.queued_inputs.is_empty());
-    }
-
-    #[test]
-    fn compaction_response_clears_restored_context_usage() {
-        let restored = restore_events(vec![
-            AgentEvent::InferenceResponse {
-                items: Cow::Owned(Vec::new()),
-                provider_response_id: None,
-                context_used: Some(230_000),
-            },
-            AgentEvent::InferenceResponse {
-                items: Cow::Owned(vec![compaction_item()]),
-                provider_response_id: None,
-                context_used: Some(240_000),
-            },
-        ]);
-
-        assert_eq!(restored.context_used, None);
-    }
-
-    #[test]
-    fn auto_compaction_respects_threshold_and_manual_trigger() {
-        let mut state = AgentState {
-            blocks: Vec::new(),
-            queued_inputs: InputQueues::default(),
-            kind: AgentStateKind::Idle,
-            context_used: Some(232_560),
-            total_usage: db::AgentUsageBucket::default(),
-            usage_provider: db::AgentUsageModel::GPT,
-        };
-        assert!(should_auto_compact(&state, Some(232_560)));
-        assert!(!should_auto_compact(&state, Some(232_561)));
-
-        state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
-            items: vec![tool_call("c1")],
-            provider_response_id: None,
-        }));
-        assert!(has_unanswered_tool_calls(&state.blocks));
-        assert!(!should_auto_compact(&state, Some(232_560)));
-
-        let AgentEvent::ToolResult { result } = tool_result("c1") else {
-            unreachable!()
-        };
-        state.blocks.push(Arc::new(ContextBlock::ToolResults {
-            results: vec![result.into_owned()],
-        }));
-        assert!(!has_unanswered_tool_calls(&state.blocks));
-        assert!(should_auto_compact(&state, Some(232_560)));
-
-        state.blocks.push(Arc::new(ContextBlock::CompactionTrigger));
-        assert!(!should_auto_compact(&state, Some(232_560)));
-
-        state.blocks.push(Arc::new(ContextBlock::InferenceResponse {
-            items: Vec::new(),
-            provider_response_id: None,
-        }));
-        assert!(should_auto_compact(&state, Some(232_560)));
-    }
-
-    #[test]
-    fn mid_turn_dequeue_keeps_turn_unfinished() {
-        let restored = restore_events(vec![
-            queued_event(MessageSender::User, "start", MessageDelivery::Immediate),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextTurn,
-            },
-            response_event(vec![tool_call("c1")]),
-            tool_result("c1"),
-            queued_event(MessageSender::User, "steer", MessageDelivery::NextRequest),
-            AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
-            },
-        ]);
-        // The tool batch committed and the steer landed, but the turn's next
-        // response never arrived: restore must offer continue.
-        assert_eq!(
-            restored.kind,
-            AgentStateKind::UnfinishedTurn {
-                outstanding_calls: Vec::new().into(),
-                completed_tool_calls: Vec::new().into(),
-            }
-        );
-        let last = restored.blocks.last().expect("delivered steer block");
-        assert_eq!(
-            **last,
-            ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content: text_parts("steer")
-            }
-        );
-    }
 }
 
 #[cfg(test)]
@@ -3210,26 +582,39 @@ mod encoding_tests {
     use crate::db::AgentIdDomain;
 
     #[test]
-    fn queue_events_roundtrip_through_senax() {
+    fn log_events_roundtrip_through_senax() {
         let events = vec![
-            AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::UserMessage {
-                    sender: MessageSender::Agent {
-                        id: AgentId::from_counter(3, &AgentIdDomain(9)).unwrap(),
-                    },
-                    content: Arc::new(vec![ContentPart::Text {
+            AgentEvent::Accepted(QueuedInput {
+                source: MessageSender::Agent {
+                    id: AgentId::from_counter(3, &AgentIdDomain(9)).unwrap(),
+                },
+                kind: InputKind::Message {
+                    content: vec![ContentPart::Text {
                         text: "mail".to_owned(),
-                    }]),
-                    source_id: Some(InputSourceId::from_raw(42)),
+                    }],
                 },
                 delivery: MessageDelivery::NextRequest,
+                at: UnixMs(7),
             }),
+            AgentEvent::Accepted(QueuedInput {
+                source: MessageSender::User,
+                kind: InputKind::Compaction,
+                delivery: MessageDelivery::NextRequest,
+                at: UnixMs(8),
+            }),
+            AgentEvent::Sent {
+                blocks: Cow::Owned(vec![ContextBlock::CompactionTrigger]),
+            },
+            AgentEvent::Replied {
+                blocks: Cow::Owned(Vec::new()),
+                context_used: Some(12),
+            },
             AgentEvent::Queued(QueuedItem {
                 kind: QueuedItemKind::Compaction,
-                delivery: MessageDelivery::NextTurn,
+                delivery: LegacyDelivery::NextTurn,
             }),
             AgentEvent::Dequeued {
-                boundary: MessageDelivery::NextRequest,
+                boundary: LegacyDelivery::NextRequest,
             },
             AgentEvent::QueueCleared,
             AgentEvent::ClaudePresentationSource {

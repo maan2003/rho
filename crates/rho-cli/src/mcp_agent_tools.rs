@@ -80,7 +80,7 @@ async fn handle_request(
             "serverInfo": {"name": "rho-agent-tools", "version": env!("CARGO_PKG_VERSION")},
         })),
         "tools/list" => Ok(json!({
-            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::pm())
+            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::default())
                 .into_iter()
                 .map(|tool| json!({
                     "name": tool.name.as_str(),
@@ -152,12 +152,6 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
         multi_agent_tools::ASK_ADVISOR_TOOL_NAME => Ok(McpAgentToolRequest::AskAdvisor {
             message: serde_json::from_value::<AdvisorArgs>(arguments)?.message,
         }),
-        multi_agent_tools::WAIT_TOOL_NAME => {
-            let args: WaitArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::Wait {
-                timeout_seconds: args.timeout_seconds,
-            })
-        }
         _ => anyhow::bail!("unsupported tool: {name}"),
     }
 }
@@ -200,9 +194,4 @@ struct InterruptArgs {
 #[derive(Deserialize)]
 struct AdvisorArgs {
     message: String,
-}
-
-#[derive(Deserialize)]
-struct WaitArgs {
-    timeout_seconds: Option<u64>,
 }

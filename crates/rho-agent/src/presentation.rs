@@ -19,12 +19,13 @@ use rho_core::{
 };
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::db::{
     AgentDisposition, AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _,
-    AgentRole, AgentWriteTxnExt as _, PresentationField, TurnReport,
+    AgentWriteTxnExt as _, PresentationField, TurnReport,
 };
+use crate::story::{AgentWant, StoryEvent};
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
 };
@@ -78,6 +79,194 @@ impl Watch {
         Self {
             release: Some(Box::new(release)),
         }
+    }
+}
+
+/// What the sidecar's background task tells its owning loop. A loop that
+/// gets one of these hands it to [`Sidecar`] on its own thread of control,
+/// so completion can never race the loop's own source commits.
+pub(crate) enum SidecarMessage {
+    /// A watcher came or went.
+    Watch { watching: bool },
+    /// The task is about to read the durable tail; `acknowledged` says
+    /// whether that generation is still wanted.
+    Started {
+        generation: u64,
+        acknowledged: oneshot::Sender<bool>,
+    },
+    Finished {
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    },
+}
+
+/// The scheduling half of the sidecar, owned by a runtime loop: when a
+/// generation runs, coalescing, throttling, and which durable source the
+/// last request read. The loop persists what comes back.
+pub(crate) struct Sidecar {
+    session: Arc<TokioMutex<Session>>,
+    watches: usize,
+    dirty: bool,
+    generation: u64,
+    last_started: Option<tokio::time::Instant>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// The newest source committed, so a late result for an older one is
+    /// never allowed to overwrite the cache.
+    last_source: Option<AgentEventPos>,
+}
+
+impl Sidecar {
+    pub(crate) fn new(inference: Inference, last_source: Option<AgentEventPos>) -> Self {
+        Self {
+            session: Arc::new(TokioMutex::new(Session::new(inference))),
+            watches: 0,
+            dirty: false,
+            generation: 0,
+            last_started: None,
+            task: None,
+            last_source,
+        }
+    }
+
+    /// The loop-owned session, shared with turn reports so both request
+    /// kinds keep one prompt prefix warm.
+    pub(crate) fn session(&self) -> Arc<TokioMutex<Session>> {
+        Arc::clone(&self.session)
+    }
+
+    /// A source landed durably at `through`. Follow with [`Self::schedule`].
+    pub(crate) fn source_committed(&mut self, through: AgentEventPos) {
+        self.last_source = Some(through);
+        self.dirty = true;
+    }
+
+    /// Returns whether a schedule is now due.
+    pub(crate) fn watch(&mut self, watching: bool) -> bool {
+        if watching {
+            self.watches += 1;
+            if self.watches == 1 {
+                self.dirty = true;
+                return true;
+            }
+            false
+        } else {
+            self.watches = self.watches.saturating_sub(1);
+            if self.watches == 0
+                && let Some(task) = self.task.take()
+            {
+                task.abort();
+            }
+            false
+        }
+    }
+
+    /// Whether `generation` may go ahead and read the durable snapshot.
+    pub(crate) fn started(&mut self, generation: u64) -> bool {
+        let accepted = self.generation == generation && self.watches > 0 && self.task.is_some();
+        if accepted {
+            // Sources observed before this boundary are in the durable
+            // snapshot about to be read; only later sources need another
+            // coalesced request.
+            self.dirty = false;
+            self.last_started = Some(tokio::time::Instant::now());
+        }
+        accepted
+    }
+
+    /// A generation finished. `None` when it was not the current one and
+    /// there is nothing to do; otherwise the update to persist, if any,
+    /// and the caller schedules again afterwards.
+    pub(crate) fn finished(
+        &mut self,
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    ) -> Option<Option<AgentPresentationUpdate>> {
+        if self.generation != generation {
+            return None;
+        }
+        self.task = None;
+        Some(match result {
+            // A newer source already has a coalesced request pending; this
+            // older snapshot must not overwrite the cache meanwhile.
+            Ok(Some(update)) if self.last_source != Some(update.through) => None,
+            Ok(update) => update,
+            Err(error) => {
+                eprintln!("rho-agent: presentation generation failed: {error}");
+                None
+            }
+        })
+    }
+
+    /// Forget any request in flight: the lineage moved under it.
+    pub(crate) fn reset(&mut self, last_source: Option<AgentEventPos>) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.last_started = None;
+        self.dirty = self.watches > 0;
+        self.last_source = last_source;
+    }
+
+    /// The turn ended: the next turn's first update should not inherit
+    /// this one's throttle spacing.
+    pub(crate) fn turn_settled(&mut self) {
+        self.last_started = None;
+    }
+
+    pub(crate) fn abort(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    /// Start a generation if one is wanted and none is running. `deliver`
+    /// hands the task's messages back to the owning loop and says whether
+    /// the loop is still there.
+    pub(crate) fn schedule(
+        &mut self,
+        db: RhoDb,
+        agent_id: AgentId,
+        deliver: impl Fn(SidecarMessage) -> bool + Send + Sync + 'static,
+    ) {
+        if self.watches == 0 || !self.dirty || self.task.is_some() {
+            return;
+        }
+        self.dirty = false;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let now = tokio::time::Instant::now();
+        let delay = self
+            .last_started
+            .and_then(|started| MIN_INTERVAL.checked_sub(now.duration_since(started)))
+            .unwrap_or_default();
+        let session = Arc::clone(&self.session);
+        self.task = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = if !has_input(&db, agent_id) {
+                Ok(None)
+            } else {
+                match acquire_request().await {
+                    Ok(permit) => {
+                        let (acknowledged, accepted) = oneshot::channel();
+                        if !deliver(SidecarMessage::Started {
+                            generation,
+                            acknowledged,
+                        }) {
+                            return;
+                        }
+                        if !accepted.await.unwrap_or(false) {
+                            return;
+                        }
+                        generate(db, session, agent_id, permit)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            deliver(SidecarMessage::Finished { generation, result });
+        }));
     }
 }
 
@@ -147,15 +336,9 @@ pub(crate) fn spawn_turn_report(
         return;
     }
     // Sub-agent turns are the parent's court unless the user has personally
-    // messaged the agent, and Iris is not a rail row; neither gets a report.
-    let record = db.read().get_agent(agent_id);
-    if (record.parent_agent.is_some() && !record.user_interacted)
-        || record.role == AgentRole::Iris
-        || record
-            .labels
-            .iter()
-            .any(|label| label == crate::iris_tools::LABEL)
-    {
+    // messaged the agent; those get no report.
+    let attention = db.read().agent_attention(agent_id);
+    if attention.parent_agent.is_some() && !attention.user_interacted {
         return;
     }
     tokio::spawn(async move {
@@ -180,7 +363,7 @@ pub(crate) fn spawn_turn_report(
         // resurface this row, summary and all. A Done row keeps showing its
         // settled summary, so a raced ack persists too; only Hidden means
         // the user does not want the row at all.
-        match db.read().get_agent(agent_id).disposition {
+        match db.read().agent_attention(agent_id).disposition {
             AgentDisposition::Pending
             | AgentDisposition::Snoozed { .. }
             | AgentDisposition::Done => {}
@@ -189,6 +372,21 @@ pub(crate) fn spawn_turn_report(
         {
             let mut write = db.write().await;
             write.record_agent_turn_report(agent_id, &report);
+            // Until the reply's own tag is parsed (`AGENT-WANTS-DESIGN.md`),
+            // this classification is what the story has to say about what
+            // the turn asks of the person.
+            write.append_agent_story(
+                agent_id,
+                &StoryEvent::Wants {
+                    want: if report.needs_you {
+                        AgentWant::Ask
+                    } else {
+                        AgentWant::Show
+                    },
+                    summary: (!report.summary.is_empty()).then(|| report.summary.clone()),
+                    at: rho_core::UnixMs::now(),
+                },
+            );
             write.commit();
         }
         if let Some(pool) = pool.upgrade() {
@@ -209,10 +407,12 @@ fn presentation_context(db: &RhoDb, agent_id: AgentId) -> (Seed, Vec<Presentatio
     (
         Seed {
             title: record
-                .display_name
+                .config
+                .spawn_name
+                .clone()
                 .map(|title| (title, true))
-                .or_else(|| record.generated_title.map(|title| (title, false))),
-            activity: record.activity,
+                .or_else(|| record.generated_title.clone().map(|title| (title, false))),
+            activity: record.activity.clone(),
         },
         presentation_sources(agent_id, &records),
     )

@@ -40,9 +40,13 @@ Per agent the daemon keeps:
   Rho runtime and from the Claude stream for the Claude runtime. It is
   what clients mirror. No tool output, no diffs, no raw model exchange.
 - **The head**: the daemon's cache of the fold over both logs: story
-  position, current config, generated title, activity, usage totals,
-  whether a turn is running. Rebuilt from the logs if lost; never the
-  source of anything.
+  position, current config, current lineage, generated title, activity,
+  usage totals, whether a turn is running. Rebuilt from the logs if
+  lost; never the source of anything. A field joins the head only once
+  the logs can rebuild it: `turn_running` in slice B (with
+  `TurnStarted`/`TurnEnded`), `usage_total` in slice C (with `Cost`);
+  until then usage is read from the existing totals table so there is
+  one number.
 
 There is no `AgentRecord`. There is no `agent_presentation_events`
 table: a generated title or activity is a story event
@@ -65,17 +69,22 @@ stores it only as `spawned_by`).
 | record field | goes to |
 | --- | --- |
 | role, runtime, workdirs, spawned_by, created_at, binding | `Created` and the config events |
-| display_name, labels, parent_agent | already store facts (`Name`, `Labeled`, `Parent`); dropped |
+| display_name | `Created.spawn_name` (it was also what `RenameAgent` wrote, so no agent loses its name; a given name still beats a generated title; the store's `Name` overrides both) |
+| labels, parent_agent | already store facts (`Labeled`, `Parent`); dropped |
 | generated_title, activity | story events; head caches the latest |
-| updated_at, last_turn_ended, last_user_message, last_user_message_text | derived by the client from the story tail |
-| disposition, turn_report, user_interacted | the client's attention cache (below); the daemon no longer has an opinion |
+| updated_at, last_turn_ended, last_user_message, last_user_message_text, disposition, turn_report, user_interacted | slice A: a transitional table named for its deletion (`agent_attention_until_slice_b`), because raw events carry no wall clock and these are judgements; slice B: the times become a fold over story events (every `StoryEvent` has `at`), the judgements become the client's attention cache and the table is deleted |
 | claude_rewind | a raw event (`RuntimeRebound` pending, then confirmed) |
 | current_lineage | the head |
 
 `projects` goes too: a project is `Project { host, path }` on a label
 (`STORE-DESIGN.md`), and `ProjectSet`, `ProjectRemove`, and
 `Ready.projects` leave the wire. `view_config` goes: it is a client
-setting and lives in the GUI's own db.
+setting and lives in the GUI's own db. Both wait for slice B, because
+the user's project paths were never converted and the Workdir field's
+completions read them: in B the GUI converts `Ready.projects` once into
+labels carrying `Project { host, path }` (the user's own data, written by
+their GUI, not the daemon) and moves view_config into its own db, and
+only then does the daemon drop the tables.
 
 ### The story events
 
@@ -94,8 +103,20 @@ person wrote or the model said:
 - `HistoryUnavailableBefore` — the first event of a migrated Claude agent whose session file is gone
 
 Rewind is an appended `Rewound { to }`; positions never go backwards
-and the client hides its view past `to`. A projected segment is
+and the client hides its view past `to`. The daemon finds `to` through
+a side table of its own, `agent_story_source: (AgentId, StoryPos) →
+AgentEventPos`, written for the events told from the raw log, so the
+event clients copy carries no raw position. A projected segment is
 `(AgentId, StoryPos)` and "since" means the same on both sides.
+
+`Reply` is whole for both runtimes. Rho replies always were; Claude
+replies had been capped at 1024 bytes because the only durable copy rho
+kept was the mirror that feeds the title sidecar, deliberately capped so
+Claude's transcript would not become a second unbounded local copy. The
+story is that copy now, by decision (5 Sep): 105 Claude agents made
+25 MiB with the cap on, and a reply is bounded by the model's output
+limit. The sidecar mirror keeps its cap. Not told yet: Claude
+compactions, because the stream has no mapping for them.
 
 Tool output, diffs, reasoning, and the raw exchange stay on the host
 and are fetched on demand when the user opens that call:
@@ -105,8 +126,9 @@ for that call, from the raw log, no runtime loaded.
 ### The wire is log replication plus one focus stream
 
 - `Ready` carries every agent's head: `UiAgentHead { agent_id, story_pos,
-  config, title, activity, usage_total, turn_running }`. That is the
-  agents list; a title or a cost total never waits on a log.
+  role, runtime_kind, workdirs, spawned_by, parent, spawn_name,
+  generated_title, activity, turn_running, created_at }`. That is the
+  agents list; a title or a workdir never waits on a log.
 - `AgentLogs { known: Vec<(AgentId, StoryPos)> }`, sent once after
   `Ready`: the client's version vector, one position per agent it holds.
   The daemon answers with `AgentStory { agent_id, from: StoryPos, events }`
@@ -134,6 +156,51 @@ for that call, from the raw log, no runtime loaded.
 
 Every wire change here bumps the epoch and the iroh ALPN, so an old GUI
 fails to connect rather than to decode.
+
+### Where the wire shape met the code (b8os, 5 Sep; all accepted)
+
+- Live frames are a set, not one agent: `AgentStreamFocus { agent_ids }`
+  replaces `SubscribeAgents` / `UnsubscribeAgents` (a split shows two
+  agent panes) as well as the singular subscribe.
+- `Wants` has a producer from day one: `StoryEvent::Wants { want, summary,
+  at }` written by the Luna turn-report sidecar that exists today
+  (`report_needs_you` → `Ask`, `report_fyi` → `Show`); `AgentWant` is
+  named after the tags in `AGENT-WANTS-DESIGN.md` so the tag parser
+  replaces the producer later without a client change. Without this,
+  deleting the turn report would have left Home nothing to rank agents
+  on (131 agents carried a report on the copy).
+- Hidden and snoozed are the user's verdicts and live only in the
+  transitional table: a one-time daemon conversion writes them into the
+  desk store as verdict-log entries on the agent id (hidden →
+  `State::Muted`, snoozed → `DeferUntil`; 151 and 379 on the copy),
+  counts printed on the migrating start, the table dropped after, the
+  conversion code deleted after the user's restart. This is the one
+  case of the daemon writing to the store, and it is a migration of the
+  user's own data, like store slice 1.
+- Offline, a `ToolCall` shows its one line and no result until slice D;
+  the live frame still has results for a focused agent.
+- `StoryEvent` is a daemon type; the wire carries `UiStoryEvent`, a twin
+  converted in the daemon the way `UiBlock` and `AgentUsageBucket` are,
+  because `rho-ui-proto` builds for wasm and does not depend on
+  `rho-agent`.
+- `AgentUsage` and the global usage requests stay until slice C, or
+  Home's cost column would go blank in between.
+- The parent id was nowhere in the log: `Created` carries a spawned-by
+  kind, and the 2349 parent ids lived only in the transitional table,
+  which the GUI nests delegated work on and the daemon routes mail by.
+  `StoryEvent::Parented { parent, at }` is told at creation (and once
+  for migrated agents by the backfill), the head folds it, `UiAgentHead`
+  carries it. The spawner is a source fact the daemon owns and is never
+  written into the store; the store's `Parent` is the user's filing and
+  wins in the view: an agent shows under its store `Parent` if any, else
+  under its spawner from the head, else at the root, one rule in
+  `desk_view`.
+- `usage_total` is not in `UiAgentHead` until slice C: folded from `Cost`
+  it would read zero for all history while the usage tables still hold
+  the truth.
+- The transitional table comes off the wire in this slice and is deleted
+  in the landing after the restart, with the conversion code that reads
+  it.
 
 ### The client mirrors the story and decides attention
 
@@ -164,16 +231,26 @@ the daemon go. Quota observations from providers stay a daemon request.
 
 ### Migration, once
 
-On first start of the slice A build, for every `AgentRecord`: append
-`Created` from its fields as a new first raw event on its current
-lineage (positioned before the existing events by seq, which means a
-new lineage whose parent is the record's lineage at seq 0; b8os proves
-the ordering on a copy), fold the record into the head, and drop the
-`agents` table. On first start of the slice B build, for every agent:
-build the story from the raw log (Rho runtime) or from the Claude
-session file named by the runtime (Claude runtime), or write
-`HistoryUnavailableBefore` when that file is gone, and drop
-`agent_presentation_events`. Each migration runs once on the user's
+On first start of the slice A build, for every `AgentRecord`: write
+`Created` from its fields as the agent's new root lineage (one event at
+seq 0, the old root's parent pointer set to it, so the replay is
+`Created` then the old events unchanged and every existing position and
+fork stays valid; b8os proves this byte-for-byte on a copy), fold the
+record into the head and the transitional table, and drop the `agents`
+table. The slice B build backfills the story in the
+background rather than at start: sizing on a copy (b8os, 5 Sep) put the
+whole history at about 843k story events and 350 MiB for 2823 agents,
+not large, but decoding a million raw events and parsing 553 MiB of
+Claude transcripts would block a restart for tens of minutes. So the
+daemon starts and serves as before; each head says whether its story
+is built; a background job builds agents most recently touched first,
+one agent per transaction, resumable across restarts; an agent loaded
+before its turn (a turn, a subscribe) is built synchronously first so
+live writes never land ahead of history; the 76 Claude agents whose
+session file is gone get `HistoryUnavailableBefore` at once. Whole
+history, no cutoff (a 30-day cut would have kept 60% of the events for
+52% of the agents, which buys little). `agent_presentation_events` is
+dropped once every agent is built. Each migration runs once on the user's
 real daemon after b8os has run it on a read-only copy of that store and
 reported the counts; the migration code is deleted in the next landing
 after the user has restarted on it (the standing rule; `desk_migration.rs`
@@ -182,23 +259,133 @@ from store slice 1 is deleted in slice A for the same reason).
 ## Slices, in landing order
 
 A. **Config in the log, no record.** `Created` and the config events,
-   the head table, the `agents` table gone, `projects` and `view_config`
-   tables gone with their messages, `desk_migration.rs` gone, the
-   record→log migration. Daemon change; the GUI keeps `UiAgentSummary`
-   for now, filled from the head, so no epoch bump. Lands with a
-   profile upgrade and a restart.
+   the head table, the transitional attention table, the `agents` table
+   gone, `desk_migration.rs` gone, the record→log migration. Daemon
+   change; the GUI keeps `UiAgentSummary` for now, filled from the head,
+   so no epoch bump; `projects` and `view_config` stay until B. Lands
+   with a profile upgrade and a restart. Found on the way (b8os, 5 Sep):
+   the record table's recorded redb type name is the old module path, so
+   the migration reads it through `SenAs`, the same escape hatch store
+   slice 1 needed; the unit tests could not see it because they write
+   and read from one module, which is why every daemon migration runs
+   on a copy of the user's store first.
+   Landed 5 Sep (088e88e3, daemon only). On a copy of the user's real
+   store: 2823 agents, 2645 with a spawn name, 105 Claude runtimes, 2
+   pending Claude rewinds; after migration every agent replays as
+   `Created` followed by its old events equal value by value, no
+   position changed. The store held 0 agent `Name` facts, so
+   `Created.spawn_name` carrying the record's display_name is what kept
+   2645 agents named. `create_agent` now takes the role, so no log opens
+   with a pointless `RoleChanged`; `append_agent_event` steps past an
+   occupied position so a config event mid-turn is not overwritten.
+   Migration files (`record_to_log_migration.rs`, `record_to_log_proof.rs`,
+   the `AGENT_DB_MIGRATIONS` entry) come out once the user has restarted.
 B. **The story log and its replication.** `StoryEvent`, the story
    table written live for both runtimes, `Ready` heads, `AgentLogs` /
    `AgentStory` / `AgentHead`, the GUI mirror, attention derived on the
    client, `AgentHandledThrough(StoryPos)`, the deletions listed under
-   the wire, the story migration. Daemon and GUI, epoch bump. The
+   the wire, the one-time conversion of projects into `Project`
+   labels and of view_config into the GUI's db, the transitional
+   attention table deleted, the story migration. Daemon and GUI, epoch bump. The
    biggest slice; b8os may land the daemon half writing the story table
    first, behind no wire change, then the wire and GUI half.
+   Daemon half landed (b8os, 5 Sep): the story is written live for both
+   runtimes, `Titled`/`Activity` replace `agent_presentation_events` as
+   the source with the head caching the latest, `turn_running` is the
+   fold over `TurnStarted`/`TurnEnded`, `Cost` is told per model
+   response, and a rewind tells `Rewound { to }` using a daemon-only
+   `agent_story_source` index of which raw event each story event came
+   from. The backfill runs in the background rather than holding a
+   restart: `story_built` on the head, most-recently-touched agents
+   first, one transaction each, resumable, and a load builds its own
+   agent's story first. On a copy of the user's store it built 2823
+   agents and 629k events in 17 s while the daemon answered an agent
+   list in 25-62 ms. Known gap: a Claude compaction is not told, because
+   the stream carries no event this can be mapped from; a Rho one is
+   (`Compacted`).
+   Wire and GUI half, change one (b8os, 5 Sep): epoch RUP9, ALPN
+   `rho/ui/9`. `Ready` carries `UiAgentHead` only; `AgentLogs` /
+   `AgentStory` / `AgentHead` and the connection-wide follow replace the
+   per-agent subscription, with `AgentStreamFocus` left as the whole
+   focus set, replaced wholesale rather than added to one agent at a
+   time. The follow keeps a per-agent cursor per connection: an event in
+   step goes as `AgentStory`, one past the cursor as `AgentHead` so the
+   client re-asks with `AgentLogs`, and broadcast lag falls back to
+   `Ready`. That makes lag and the background backfill self-healing with
+   no new message. Attention is decided in one function, `agent_card` in
+   `desk_view`, beside the Slack card, and pushed into the registry so
+   every rail reads one answer.
+   Three places the shape did not survive contact:
+   - The spawner's id lived only in the transitional attention table, so
+     the story learns it: `Parented { parent, at }`, written at creation,
+     inserted after `Created` by the backfill, and told once for
+     already-built stories. It folds into `AgentHead.parent`.
+   - Publishing a story event needed every `append_agent_story` call
+     site to carry a channel. Instead rho-db grew two small mechanisms:
+     one type-erased observer slot per database, and an after-commit
+     effect queue, so the append publishes itself once the transaction
+     is durable and never while the write lock is held.
+   - The projects conversion could not be the GUI's: `Ready.projects`
+     is gone in the same epoch, so there is nothing client-side left to
+     convert from. It is a daemon conversion like the dispositions one,
+     writing one label per project with `Name` and `Project { host, path
+     }`, the label id derived from the path so a second run recognises
+     it. A project's description is dropped; nothing read it.
+   Change two is the redb mirror in place of the in-memory fold, the
+   transcript surface rendering from it with the live frame layered on,
+   and then the daemon dropping `projects`, `view_config` and the
+   transitional attention table.
+   The mirror is `agent-mirror.redb` in the client state directory:
+   the head with the name of the host it was heard from, one row per
+   story event keyed agent then position, and the attention the card
+   decided. It is written on the events that carry those things and
+   read back before any daemon answers, so `AgentLogs` on `Ready` asks
+   only for what came after. Two rules keep it honest: a row whose host
+   is not attached this session is dropped, because host ids are handed
+   out in attach order and mean nothing across a restart; and a story
+   that is not contiguous from position zero is thrown away and asked
+   for again rather than folded with a hole in it.
+   A card also stopped needing a note. Filing is the user's labelling
+   and placement, never a precondition: an agent whose story ends
+   asking for the user is a card whether or not anyone filed it, ranked
+   at the root with no breadcrumb, with its store node consulted only
+   for the user's own verdict on it (muted, deferred) when there is
+   one. That is what lets Home rank from the mirror alone.
+   Opening such a card reads the agent from the card's own id
+   rather than from a node, which is what was wrong the first time: a
+   card with nothing filed behind it opened an empty page.
+   The transcript reads the mirror too. Opening an agent shows the
+   story folded into blocks straight away instead of waiting on a
+   load, and shows it with the daemon down. Subscribing makes the
+   daemon send a snapshot first, so the live transcript replaces the
+   story-made one whole and nothing is merged. What the story does not
+   carry it does not invent: a tool call is its name and its one line,
+   never its output, and the status is never `Streaming`, because a
+   turn that was running when the client last heard is the daemon's to
+   report again. Bodies come on demand in slice D.
+   `view_config` moved nowhere: nothing had read it since July, so the
+   table is deleted rather than mirrored.
+   Home is not offline yet, and this change does not claim it. The
+   Desk's rows still come from the daemon by `DeskSync` every session,
+   so a cold client has agents and no notes, no filing and no
+   breadcrumbs. The client's own copy of the store is the `rho-sync`
+   direction in `STORE-DESIGN.md` and gets its own slice after this
+   one; offline Home is claimed when that lands.
 C. **Usage from the mirror.** Graphs read `Cost` events; the usage
    requests and tables go. Daemon and GUI, epoch bump.
 D. **On-demand detail.** `AgentDetail` for tool bodies and diffs from
    the raw log; the transcript surface reads the mirror and fetches
    bodies when a call is opened.
+E. **The Desk mirror.** Found while proving change two on the rig
+   (b8os, 5 Sep): the agent mirror alone gives a cold GUI heads, stories
+   and attention, but the store's cells, frontier and bodies arrive by
+   `DeskSync` every session and are not kept, so nothing offline has a
+   note, a label or a breadcrumb to hang a card on. The client keeping
+   its own copy of the store is the client half of store sync
+   (`STORE-DESIGN.md`, rho-sync direction) and gets its own design; the
+   frontier and body snapshots must come back exactly or the next sync
+   is wrong. Offline Home is claimed only when this lands, not with B.
+   Designed as `STORE-DESIGN.md` slice 5, "The client keeps the store".
 
 Each slice lands on its own with the tests of the slices before it
 green; each daemon slice is proven on a read-only copy of the user's
@@ -206,8 +393,10 @@ store before the user restarts.
 
 ## Not in this document
 
-`rho-agent2` is an isolated experimental harness with its own specs
-under `crates/rho-agent2/specs/`; nothing here touches it. Store sync
+The Rho runtime loop itself (`crates/rho-agent/src/agent/`, specs under
+`crates/rho-agent/specs/`): it is the sole writer of a Rho agent's raw
+log, in `Accepted`, `Sent` and `Replied` events, and tells the story
+beside each one; how it decides when to send is its own business. Store sync
 (`rho-sync`) and the capability pass (transports, telemetry,
 visualizations, Iris, realtime, terminal and shell) stay as Directions
 in `STORE-DESIGN.md`.
@@ -218,6 +407,12 @@ in `STORE-DESIGN.md`.
 - A story event carrying tool output or a raw model message.
 - The daemon computing whether an agent wants the user.
 - A per-agent subscription reappearing on the wire.
+- A source that adds rows but only refreshes facts: a story event or a
+  page's metadata makes a row exist, so the tree the dealer reads has to
+  be made again, not only the sources under it.
+- A surface borrowing a card it does not stand for: a why or a label
+  read on a list, a log or a picker belongs to whatever the map's
+  cursor last left behind, and a verdict pressed there takes it.
 - A migration file still present after the user has restarted on it.
 
 ## What done means

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use rho_core::{ContentPart, ToolType, UnknownProviderSpecificData};
+use rho_core::ToolType;
 
-use super::*;
-use crate::boundary::{
+use super::boundary::{
     DEFAULT_WAIT, MAIL_BURST, MAIL_PATIENCE, PROGRESS_PATIENCE, TOOL_PATIENCE, USER_PATIENCE,
 };
+use super::*;
 
 fn call(id: &str) -> ToolCall {
     ToolCall {
@@ -13,42 +13,6 @@ fn call(id: &str) -> ToolCall {
         name: ToolName::try_from("shell").unwrap(),
         tool_type: ToolType::Function,
         arguments: "{}".to_owned(),
-    }
-}
-
-/// A turn in which the model made exactly these calls.
-fn called_blocks(ids: &[&str]) -> Vec<ContextBlock> {
-    vec![ContextBlock::InferenceResponse {
-        items: ids
-            .iter()
-            .map(|id| InferenceResponseItem::ToolCall {
-                provider_specific: Box::new(UnknownProviderSpecificData {
-                    tag: "test".to_owned(),
-                }),
-                id: ToolCallId::try_from(*id).unwrap(),
-                name: ToolName::try_from("shell").unwrap(),
-                tool_type: ToolType::Function,
-                arguments: "{}".to_owned(),
-            })
-            .collect(),
-        provider_response_id: None,
-    }]
-}
-
-fn user_input(delivery: Delivery, at: u64) -> QueuedInput {
-    user_message("hello", delivery, at)
-}
-
-fn user_message(text: &str, delivery: Delivery, at: u64) -> QueuedInput {
-    QueuedInput {
-        source: InputSource::User,
-        kind: InputKind::Message {
-            content: vec![ContentPart::Text {
-                text: text.to_owned(),
-            }],
-        },
-        delivery,
-        at: UnixMs(at),
     }
 }
 
@@ -964,121 +928,6 @@ fn the_waits_rank_people_above_peers_above_machines() {
     // A peer's beat has to fit inside its patience, or nothing would ever
     // collapse into one request.
     assert!(MAIL_BURST < MAIL_PATIENCE);
-}
-
-// -- storage ----------------------------------------------------------------
-
-async fn new_agent(store: &Store) -> (AgentId, EventPos) {
-    let (id, at, _) = store
-        .create_agent(
-            InferenceProfile::default(),
-            crate::db::PersistedModel::Gpt56Sol,
-            PromptCacheKey::generate(),
-        )
-        .await;
-    (id, at)
-}
-
-#[tokio::test]
-async fn events_round_trip_through_the_store() {
-    let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path().join("agent2.redb"));
-    let (id, mut at) = new_agent(&store).await;
-
-    let written = [
-        AgentEvent::Queued(user_input(Delivery::Interrupt, 10)),
-        AgentEvent::Sent {
-            blocks: Cow::Owned(called_blocks(&["call-1"])),
-        },
-        AgentEvent::Replied {
-            blocks: Cow::Owned(Vec::new()),
-            context_used: Some(1_234),
-        },
-    ];
-    for event in &written {
-        at = store.append(at, event).await;
-    }
-
-    let (loaded, next, events) = store.load(id).unwrap();
-    assert!(matches!(loaded.model, crate::db::PersistedModel::Gpt56Sol));
-    assert_eq!(next, at, "and the log carries on where it left off");
-    assert_eq!(
-        events, written,
-        "every event survives the encoder verbatim, in the order it was written"
-    );
-}
-
-#[tokio::test]
-async fn a_log_is_read_back_in_order_and_only_its_own() {
-    // Loading is a range over `(lineage, seq)`, so both of these are redb's
-    // ordering rather than a counted loop's: a sequence past a byte boundary,
-    // and where one agent's branch stops.
-    let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path().join("agent2.redb"));
-    let (id, mut at) = new_agent(&store).await;
-    let (other, elsewhere) = new_agent(&store).await;
-
-    for sequence in 0..300 {
-        let event = AgentEvent::Replied {
-            blocks: Cow::Owned(Vec::new()),
-            context_used: Some(sequence),
-        };
-        at = store.append(at, &event).await;
-    }
-    store.append(elsewhere, &AgentEvent::QueueCleared).await;
-
-    assert_eq!(counted(&store, id), (0..300).collect::<Vec<_>>());
-    assert_eq!(store.load(other).unwrap().2.len(), 1);
-}
-
-//  lineage   seq   boundary
-//  1         0..3  "a" "b" "c"
-//  2         0..1  forked at 1, so it inherits "a" and adds "d"
-#[tokio::test]
-async fn a_fork_inherits_its_parent_up_to_the_branch_point_and_no_further() {
-    // Rewinding is a new branch rather than a hole: what the agent walked away
-    // from is still in the log, and still readable by whoever remembers it.
-    let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path().join("agent2.redb"));
-    let (id, at) = new_agent(&store).await;
-
-    let mut positions = vec![at];
-    for sequence in 0..3 {
-        let event = AgentEvent::Replied {
-            blocks: Cow::Owned(Vec::new()),
-            context_used: Some(sequence),
-        };
-        positions.push(store.append(*positions.last().unwrap(), &event).await);
-    }
-    assert_eq!(counted(&store, id), vec![0, 1, 2]);
-
-    // Branch after the first event; the second and third are left behind.
-    let branch = store.fork(id, positions[1]).await;
-    let event = AgentEvent::Replied {
-        blocks: Cow::Owned(Vec::new()),
-        context_used: Some(9),
-    };
-    store.append(branch, &event).await;
-    assert_eq!(counted(&store, id), vec![0, 9]);
-
-    // ...and a branch off a branch inherits the whole path back to the root.
-    let (_, next, _) = store.load(id).unwrap();
-    store.fork(id, next).await;
-    assert_eq!(counted(&store, id), vec![0, 9]);
-}
-
-/// The agent's history as the numbers its events were stamped with.
-fn counted(store: &Store, id: AgentId) -> Vec<u64> {
-    store
-        .load(id)
-        .unwrap()
-        .2
-        .iter()
-        .map(|event| match event {
-            AgentEvent::Replied { context_used, .. } => context_used.unwrap(),
-            other => panic!("unexpected event: {other:?}"),
-        })
-        .collect()
 }
 
 // -- tool plumbing ----------------------------------------------------------

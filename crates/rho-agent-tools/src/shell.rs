@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rho_agent2::{SourceWaker, Tool, ToolHaste, ToolSession};
 use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
 use rho_tool_shell::{
     APPLY_PATCH_TOOL_NAME, BoundedOutput, EXEC_COMMAND_TOOL_NAME, ProcessEvent, ShellTools,
@@ -23,7 +22,9 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Notify;
 
-use crate::{Finished, OneShot, output, stands_on_its_own};
+use crate::{
+    Finished, OneShot, SourceWaker, Tool, ToolHaste, ToolSession, output, stands_on_its_own,
+};
 
 /// One of the three shell tools. They share the session table, so a process
 /// started by one `exec_command` call can be typed into by `write_stdin`.

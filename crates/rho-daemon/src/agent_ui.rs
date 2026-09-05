@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rho_agent::{AgentState, AgentStateKind, QueuedItem, QueuedItemKind};
+use rho_agent::{AgentState, AgentStateKind, InputKind, QueuedInput};
 use rho_core::{
     ApplyPatchMetadata, ContextBlock, InferenceResponseItem, MessageSender, StreamingContextItem,
     StreamingContextItemState, ToolFileStatus, ToolResultMetadata, text_content,
@@ -17,30 +17,24 @@ pub(crate) fn project_agent_state(state: &AgentState) -> UiAgentState {
     merge_active_tool_state(&mut blocks, &state.kind);
     blocks.extend(in_flight_blocks(&state.kind));
     blocks.extend(state.queued_inputs.iter().map(|input| match input {
-        QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender, content, ..
-            },
+        QueuedInput {
+            source,
+            kind: InputKind::Message { content },
             delivery,
+            ..
         } => UiBlock::QueuedMessage {
             text: text_content(content),
             delivery: *delivery,
-            sender: match sender {
+            sender: match source {
                 MessageSender::User => None,
                 MessageSender::Agent { id } => Some(*id),
             },
         },
-        QueuedItem {
-            kind: QueuedItemKind::Compaction,
+        QueuedInput {
+            kind: InputKind::Compaction,
             ..
         } => UiBlock::Notice {
             text: "compacting context".to_owned(),
-        },
-        QueuedItem {
-            kind: QueuedItemKind::ToolUpdate(update),
-            ..
-        } => UiBlock::Notice {
-            text: format!("tool update: {}", update.output),
         },
     }));
     UiAgentState {
@@ -212,9 +206,9 @@ fn ui_block_from_response_item(item: &InferenceResponseItem) -> Option<UiBlock> 
 fn ui_status(kind: &AgentStateKind) -> UiAgentStatus {
     match kind {
         AgentStateKind::ApiStreaming { .. } => UiAgentStatus::Streaming,
-        AgentStateKind::ToolCalling { waiting, .. } => UiAgentStatus::ToolCalling {
-            waiting: waiting.as_ref().map(|wait| wait.until),
-        },
+        AgentStateKind::ToolCalling { waiting, .. } => {
+            UiAgentStatus::ToolCalling { waiting: *waiting }
+        }
         AgentStateKind::UnfinishedTurn {
             outstanding_calls, ..
         } => UiAgentStatus::UnfinishedTurn {

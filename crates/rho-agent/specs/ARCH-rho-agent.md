@@ -1,4 +1,4 @@
-# ARCH-rho-agent2: rho-agent2 harness
+# ARCH-rho-agent: the Rho runtime loop
 
 An agent harness built around one question, asked after every event: *should the
 next request start now?*
@@ -8,7 +8,7 @@ next request start now?*
 One `Agent` task owns all mutable state and runs a single loop — ask the
 question, act on the answer, wait for the next event — until the last handle is
 dropped. `AgentHandle` is the only outside view: commands in over an unbounded
-channel, state out as a published `AgentSnapshot`.
+channel, state out as a published `AgentState`.
 
 Everything that produces transcript blocks is a **source**: the user queue, the
 mail queue, and one entry per called tool. A source accumulates on its own and

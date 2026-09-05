@@ -105,7 +105,7 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
         }
         UiBlock::QueuedMessage { delivery, .. } => match delivery {
             MessageDelivery::Immediate => BlockKind::User,
-            MessageDelivery::NextRequest | MessageDelivery::NextTurn => BlockKind::QueuedUser,
+            MessageDelivery::NextRequest => BlockKind::QueuedUser,
         },
         UiBlock::AgentMessage { .. } => BlockKind::User,
     }
@@ -323,8 +323,7 @@ pub fn render_block_with_agent_labels(
             ));
             let label = match delivery {
                 MessageDelivery::Immediate => None,
-                MessageDelivery::NextRequest => Some(" (steering)"),
-                MessageDelivery::NextTurn => Some(" (queued)"),
+                MessageDelivery::NextRequest => Some(" (queued)"),
             };
             if let Some(label) = label {
                 inlay = Some(InlaySpec {
@@ -847,14 +846,6 @@ mod tests {
             block_kind(&UiBlock::QueuedMessage {
                 text: "later".to_owned(),
                 delivery: MessageDelivery::NextRequest,
-                sender: None,
-            }),
-            BlockKind::QueuedUser
-        );
-        assert_eq!(
-            block_kind(&UiBlock::QueuedMessage {
-                text: "later".to_owned(),
-                delivery: MessageDelivery::NextTurn,
                 sender: None,
             }),
             BlockKind::QueuedUser

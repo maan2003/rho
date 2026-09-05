@@ -17,15 +17,15 @@ use rho_inference::Inference;
 use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
-use crate::agent2::Agent2Runtime;
+use crate::agent::AgentHandle;
 use crate::claude::ClaudeAgent;
 use crate::db::{
     AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
-    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWorkflow,
-    AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
+    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
+    EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkdir};
+use crate::{AgentState, MessageDelivery, StartWorkdir};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -51,16 +51,9 @@ pub struct AgentPool {
     /// Synchronously pre-arms daemon-owned observation before a newly loaded
     /// runtime is returned to callers that may immediately start work.
     activation_observer: std::sync::RwLock<Option<Arc<ActivationObserver>>>,
-    /// Fires when a loaded agent completes a turn with a final answer.
-    completed_turns: broadcast::Sender<AgentTurnCompleted>,
-    /// Fires once for each fully-finished assistant message item.
-    completed_assistant_items: broadcast::Sender<AgentAssistantItemCompleted>,
-    /// Fires after a user input has been durably accepted into an agent log.
-    accepted_inputs: broadcast::Sender<AgentInputAccepted>,
     presentation_changes: broadcast::Sender<AgentPresentationChanged>,
     turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
-    iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -74,28 +67,12 @@ pub struct AgentCreated {
 
 pub type ActivationObserver = dyn Fn(AgentId, RunningAgent) -> BoxFuture<'static, ()> + Send + Sync;
 
-/// Broadcast when an agent completes a turn.
+/// An agent completed a turn: its final answer is mailed to whoever
+/// subscribed to its responses.
 #[derive(Clone, Debug)]
 pub struct AgentTurnCompleted {
     pub agent_id: AgentId,
     pub final_answer: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentAssistantItemCompleted {
-    pub agent_id: AgentId,
-    pub phase: rho_core::MessagePhase,
-    pub text: String,
-}
-
-/// Broadcast when a user input is accepted into an agent.
-#[derive(Clone, Debug)]
-pub struct AgentInputAccepted {
-    pub input_id: AgentInputId,
-    pub sender: rho_core::MessageSender,
-    pub content: Vec<rho_core::ContentPart>,
-    pub delivery: MessageDelivery,
-    pub source_id: Option<InputSourceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,36 +87,6 @@ pub struct AgentPresentationChanged {
 pub struct AgentTurnReported {
     pub agent_id: AgentId,
     pub report: crate::db::TurnReport,
-}
-
-/// One agent used as the execution backend for another agent runtime.
-///
-/// The caller owns provider-specific request correlation. This handle only
-/// supplies generic agent input and structured final-output delivery.
-pub struct DelegationBackend {
-    agent_id: AgentId,
-    agent: RunningAgent,
-    source_id: InputSourceId,
-    completed: broadcast::Receiver<AgentTurnCompleted>,
-}
-
-impl DelegationBackend {
-    pub fn submit(&self, text: String) {
-        self.agent.send_user_message_with_source(
-            text,
-            MessageDelivery::Immediate,
-            Some(self.source_id),
-        );
-    }
-
-    pub async fn next_final(&mut self) -> anyhow::Result<String> {
-        loop {
-            let completed = self.completed.recv().await?;
-            if completed.agent_id == self.agent_id {
-                return Ok(completed.final_answer);
-            }
-        }
-    }
 }
 
 /// One entry of a spawned child's working set.
@@ -183,13 +130,9 @@ impl AgentPool {
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             activation_observer: std::sync::RwLock::new(None),
-            completed_turns: broadcast::channel(64).0,
-            completed_assistant_items: broadcast::channel(64).0,
-            accepted_inputs: broadcast::channel(64).0,
             presentation_changes: broadcast::channel(64).0,
             turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
-            iris_tool_host: std::sync::RwLock::new(None),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -207,14 +150,6 @@ impl AgentPool {
         pool
     }
 
-    pub fn set_iris_tool_host(&self, host: crate::iris_tools::SharedIrisToolHost) {
-        *self.iris_tool_host.write().expect("poison") = Some(host);
-    }
-
-    pub(crate) fn iris_tool_host(&self) -> Option<crate::iris_tools::SharedIrisToolHost> {
-        self.iris_tool_host.read().expect("poison").clone()
-    }
-
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
         self.created.subscribe()
     }
@@ -228,16 +163,6 @@ impl AgentPool {
         if let Some(observer) = observer {
             observer(agent_id, agent).await;
         }
-    }
-
-    pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
-        self.completed_turns.subscribe()
-    }
-
-    pub fn subscribe_completed_assistant_items(
-        &self,
-    ) -> broadcast::Receiver<AgentAssistantItemCompleted> {
-        self.completed_assistant_items.subscribe()
     }
 
     pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
@@ -267,25 +192,6 @@ impl AgentPool {
             .and_then(RunningAgent::watch_presentation)
     }
 
-    pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
-        self.accepted_inputs.subscribe()
-    }
-
-    /// Load an agent as a generic delegated-work backend.
-    pub async fn delegation_backend(
-        self: &Arc<Self>,
-        agent_id: AgentId,
-    ) -> anyhow::Result<DelegationBackend> {
-        let completed = self.subscribe_completed_turns();
-        let (_, agent, _) = self.load(agent_id).await?;
-        Ok(DelegationBackend {
-            agent_id,
-            agent,
-            source_id: InputSourceId::fresh_internal(),
-            completed,
-        })
-    }
-
     pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
         self.flush_agent_usage(Some(completed.agent_id)).await;
         self.deliver_response(
@@ -297,7 +203,6 @@ impl AgentPool {
             },
         )
         .await;
-        let _ = self.completed_turns.send(completed);
     }
 
     pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
@@ -350,20 +255,12 @@ impl AgentPool {
     /// parent's court unless the user has personally engaged the agent.
     pub async fn settle_turn(&self, agent_id: AgentId) {
         self.flush_agent_usage(Some(agent_id)).await;
-        let record = self.db.read().get_agent(agent_id);
-        if record.parent_agent.is_none() || record.user_interacted {
+        let attention = self.db.read().agent_attention(agent_id);
+        if attention.parent_agent.is_none() || attention.user_interacted {
             let mut write = self.db.write().await;
             write.record_agent_turn_end(crate::db::UnixMillis::now(), agent_id);
             write.commit();
         }
-    }
-
-    pub(crate) fn publish_completed_assistant_item(&self, item: AgentAssistantItemCompleted) {
-        let _ = self.completed_assistant_items.send(item);
-    }
-
-    pub fn publish_accepted_input(&self, accepted: AgentInputAccepted) {
-        let _ = self.accepted_inputs.send(accepted);
     }
 
     pub(crate) fn publish_presentation_changed(
@@ -386,6 +283,19 @@ impl AgentPool {
     pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
         let now = rho_core::UnixMs::now().0;
         usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
+        // What a model response cost, told once, so the graphs can read the
+        // story instead of a usage table (`AGENT-LOG-DESIGN.md`, slice C).
+        {
+            let mut write = self.db.write().await;
+            write.append_agent_story(
+                agent_id,
+                &crate::story::StoryEvent::Cost {
+                    usage: usage.clone(),
+                    at: rho_core::UnixMs(now),
+                },
+            );
+            write.commit();
+        }
         let mut pending = self.usage.lock().await;
         pending
             .entry((agent_id, usage.bucket_start_ms))
@@ -461,38 +371,21 @@ impl AgentPool {
             | SessionBinding::ResponsesSol(_)
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
-            | SessionBinding::CoordinatorTerra(_)
-            | SessionBinding::CoordinatorSol(_)
             | SessionBinding::AdvisorSol(_)
             | SessionBinding::AdvisorTerra(_)
             | SessionBinding::AntigravityFlashLow(_) => {
-                if crate::agent2::enabled() && config != AgentRole::Iris {
-                    let (agent_id, agent) = Agent2Runtime::create(
-                        self.db.clone(),
-                        self.inference.clone(),
-                        mode,
-                        config,
-                        display_name,
-                        start,
-                        parent,
-                        Arc::downgrade(self),
-                    )
-                    .await?;
-                    (agent_id, RunningAgent::Rho2(agent))
-                } else {
-                    let (agent_id, agent) = Agent::create(
-                        self.db.clone(),
-                        self.inference.clone(),
-                        mode,
-                        config,
-                        display_name,
-                        start,
-                        parent,
-                        Arc::downgrade(self),
-                    )
-                    .await?;
-                    (agent_id, RunningAgent::Rho(agent))
-                }
+                let (agent_id, agent) = AgentHandle::create(
+                    self.db.clone(),
+                    self.inference.clone(),
+                    mode,
+                    config,
+                    display_name,
+                    start,
+                    parent,
+                    Arc::downgrade(self),
+                )
+                .await?;
+                (agent_id, RunningAgent::Rho(agent))
             }
             SessionBinding::ClaudeFable { .. }
             | SessionBinding::ClaudeOpus { .. }
@@ -513,13 +406,11 @@ impl AgentPool {
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
         self.observe_activation(agent_id, agent.clone()).await;
-        if config != AgentRole::Iris {
-            let _ = self.created.send(AgentCreated {
-                agent_id,
-                agent: agent.clone(),
-                parent,
-            });
-        }
+        let _ = self.created.send(AgentCreated {
+            agent_id,
+            agent: agent.clone(),
+            parent,
+        });
         Ok((agent_id, agent))
     }
 
@@ -539,7 +430,7 @@ impl AgentPool {
         let (parent_workdirs, parent_role) = {
             let read = self.db.read();
             let record = read.get_agent(parent);
-            (record.workdirs, record.role)
+            (record.config.workdirs, record.config.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -633,13 +524,14 @@ impl AgentPool {
                 if depth > MAX_SPAWN_DEPTH {
                     anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
                 }
-                cursor = read.get_agent(id).parent_agent;
+                cursor = read.agent_attention(id).parent_agent;
             }
             read.list_agents()
                 .into_iter()
-                .filter(|(_, record)| {
-                    record.parent_agent == Some(parent)
-                        && record.disposition != AgentDisposition::Hidden
+                .map(|(id, _)| (id, read.agent_attention(id)))
+                .filter(|(_, attention)| {
+                    attention.parent_agent == Some(parent)
+                        && attention.disposition != AgentDisposition::Hidden
                 })
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>()
@@ -671,7 +563,7 @@ impl AgentPool {
         let (_, agent, _) = self.load(to).await?;
         let sender_label = self.agent_handle(from);
         if matches!(
-            self.db.read().get_agent(from).role,
+            self.db.read().get_agent(from).config.role,
             AgentRole::Advisor { .. }
         ) {
             body.push_str(&format!(
@@ -715,7 +607,7 @@ impl AgentPool {
     }
 
     pub fn agent_handle(&self, agent_id: AgentId) -> String {
-        let role = self.db.read().get_agent(agent_id).role;
+        let role = self.db.read().get_agent(agent_id).config.role;
         format!(
             "{}-{}",
             role.handle_prefix(),
@@ -810,16 +702,22 @@ impl AgentPool {
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
             return Ok((agent_id, agent, false));
         }
+        // A load reads this agent's log anyway, and the runtime is about
+        // to append to its story: its history has to be in there first.
+        crate::story_backfill::ensure_story(&self.db, agent_id).await;
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.workdirs.clone());
-        let agent = match record.runtime {
-            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
-                self.db.clone(),
-                self.inference.clone(),
-                agent_id,
-                view,
-                Arc::downgrade(self),
-            )),
+        let view = self.lazy_view(agent_id, record.config.workdirs.clone());
+        let agent = match record.config.runtime {
+            AgentRuntime::Rho { .. } => RunningAgent::Rho(
+                AgentHandle::load(
+                    self.db.clone(),
+                    self.inference.clone(),
+                    agent_id,
+                    view,
+                    Arc::downgrade(self),
+                )
+                .await?,
+            ),
             AgentRuntime::Claude { .. } => {
                 let agent = ClaudeAgent::load(
                     self.db.clone(),
@@ -831,16 +729,6 @@ impl AgentPool {
                 .await?;
                 RunningAgent::Claude(agent)
             }
-            AgentRuntime::Rho2 { .. } => RunningAgent::Rho2(
-                Agent2Runtime::load(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    agent_id,
-                    view,
-                    Arc::downgrade(self),
-                )
-                .await?,
-            ),
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
         self.observe_activation(agent_id, agent.clone()).await;
@@ -898,33 +786,14 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
         },
-        (
-            AgentRole::WorkflowPM {
-                workflow: AgentWorkflow::PrFriendly,
-            },
-            AgentRole::Engineer { intelligence, .. },
-        ) => AgentRole::WorkflowEngineer {
-            intelligence,
-            workflow: AgentWorkflow::PrFriendly,
-        },
-        (
-            AgentRole::WorkflowPM {
-                workflow: AgentWorkflow::PrFriendly,
-            },
-            AgentRole::WorkflowEngineer { intelligence, .. },
-        ) => AgentRole::WorkflowEngineer {
-            intelligence,
-            workflow: AgentWorkflow::PrFriendly,
-        },
         (_, child) => child,
     }
 }
 
 #[derive(Clone)]
 pub enum RunningAgent {
-    Rho(Agent),
+    Rho(AgentHandle),
     Claude(ClaudeAgent),
-    Rho2(Agent2Runtime),
 }
 
 impl RunningAgent {
@@ -932,7 +801,6 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => Some(agent.watch_presentation()),
             Self::Claude(agent) => Some(agent.watch_presentation()),
-            Self::Rho2(_) => None,
         }
     }
 
@@ -940,12 +808,16 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.state(),
             Self::Claude(agent) => agent.state(),
-            Self::Rho2(agent) => agent.state(),
         }
     }
 
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        self.send_user_message_with_source(text, delivery, None);
+        match self {
+            Self::Rho(agent) => agent.send_user_message(text, delivery),
+            // The Claude CLI does its own mid-turn steering; there is no
+            // lane choice to forward.
+            Self::Claude(agent) => agent.send_user_message(text),
+        }
     }
 
     pub fn send_user_content(
@@ -956,41 +828,18 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.send_user_content(content, delivery),
             Self::Claude(agent) => agent.send_user_content(content),
-            Self::Rho2(agent) => agent.send_user_content(content, delivery),
         }
     }
 
+    /// Send user input and return once the agent has durably queued it.
     pub async fn send_user_content_accepted(
         &self,
         content: Vec<rho_core::ContentPart>,
         delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Rho(agent) => {
-                agent
-                    .send_user_content_accepted(content, delivery, source_id)
-                    .await
-            }
+            Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await,
             Self::Claude(agent) => agent.send_user_content_accepted(content).await,
-            Self::Rho2(agent) => agent.send_user_content_accepted(content, delivery).await,
-        }
-    }
-
-    pub fn send_user_message_with_source(
-        &self,
-        text: String,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-    ) {
-        match self {
-            Self::Rho(agent) => agent.send_user_message_with_source(text, delivery, source_id),
-            // The Claude CLI does its own mid-turn steering; there is no
-            // lane choice to forward.
-            Self::Claude(agent) => agent.send_user_message(text),
-            Self::Rho2(agent) => {
-                agent.send_user_content(vec![rho_core::ContentPart::Text { text }], delivery)
-            }
         }
     }
 
@@ -1000,16 +849,15 @@ impl RunningAgent {
         sender: AgentId,
         sender_label: String,
         body: String,
-        delivery: MessageDelivery,
+        _delivery: MessageDelivery,
     ) {
         match self {
-            Self::Rho(agent) => agent.send_agent_message(sender, body, delivery),
+            Self::Rho(agent) => agent.send_agent_message(sender, body),
             // Claude has no agent-mail lane; mail arrives as a labeled user
             // message.
             Self::Claude(agent) => agent.send_user_message(format!(
                 "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
             )),
-            Self::Rho2(agent) => agent.send_agent_message(sender, body),
         }
     }
 
@@ -1018,14 +866,10 @@ impl RunningAgent {
         sender: AgentId,
         sender_label: String,
         body: String,
-        delivery: MessageDelivery,
+        _delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Rho(agent) => {
-                agent
-                    .send_agent_message_accepted(sender, body, delivery)
-                    .await
-            }
+            Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await,
             Self::Claude(agent) => {
                 agent
                     .send_agent_message_accepted(format!(
@@ -1033,24 +877,13 @@ impl RunningAgent {
                     ))
                     .await
             }
-            Self::Rho2(agent) => agent.send_agent_message_accepted(sender, body).await,
         }
     }
 
-    pub fn compact(&self, delivery: MessageDelivery) -> anyhow::Result<()> {
+    pub fn compact(&self) {
         match self {
-            Self::Claude(agent) => {
-                agent.compact();
-                Ok(())
-            }
-            Self::Rho(agent) => {
-                agent.compact(delivery);
-                Ok(())
-            }
-            Self::Rho2(agent) => {
-                agent.compact();
-                Ok(())
-            }
+            Self::Claude(agent) => agent.compact(),
+            Self::Rho(agent) => agent.compact(),
         }
     }
 
@@ -1058,57 +891,21 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.cancel(),
             Self::Claude(agent) => agent.cancel(),
-            Self::Rho2(agent) => agent.cancel(),
         }
     }
 
-    pub fn continue_unfinished(&self) {
+    /// Retry after a failure, or resume a turn a restart interrupted.
+    pub fn retry(&self) {
         match self {
-            Self::Rho(agent) => agent.continue_unfinished(),
+            Self::Rho(agent) => agent.retry(),
             Self::Claude(_) => {}
-            Self::Rho2(agent) => agent.retry(),
-        }
-    }
-
-    pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
-        match self {
-            Self::Claude(agent) => agent.wait_for_input(timeout).await,
-            Self::Rho(_) | Self::Rho2(_) => {
-                let deadline = tokio::time::Instant::now() + timeout;
-                loop {
-                    if !self.state().queued_inputs.is_empty() {
-                        return true;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-            }
-        }
-    }
-
-    pub fn set_deep_config(
-        &self,
-        config: InferenceProfile,
-        model: InferenceModel,
-    ) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => {
-                agent.set_deep_config(config, model);
-                Ok(())
-            }
-            Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
-            Self::Rho2(_) => anyhow::bail!("profile changes are not available on rho-agent2 yet"),
         }
     }
 
     pub async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
         match self {
             Self::Claude(agent) => agent.set_effort(effort).await,
-            Self::Rho(_) | Self::Rho2(_) => {
-                anyhow::bail!("cannot apply Claude effort to Rho agent")
-            }
+            Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
         }
     }
 
@@ -1116,7 +913,6 @@ impl RunningAgent {
         match self {
             Self::Claude(agent) => agent.change_role(role).await,
             Self::Rho(agent) => agent.change_role(role).await,
-            Self::Rho2(_) => anyhow::bail!("role changes are not available on rho-agent2 yet"),
         }
     }
 
@@ -1126,9 +922,7 @@ impl RunningAgent {
                 agent.change_prompt_cache_key();
                 Ok(())
             }
-            Self::Claude(_) | Self::Rho2(_) => {
-                anyhow::bail!("prompt cache keys are only available for Rho agents")
-            }
+            Self::Claude(_) => anyhow::bail!("prompt cache keys are only available for Rho agents"),
         }
     }
 
@@ -1136,7 +930,6 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.rewind(turns).await,
             Self::Claude(agent) => agent.rewind(turns).await,
-            Self::Rho2(_) => anyhow::bail!("rewind is not available on rho-agent2 yet"),
         }
     }
 
@@ -1144,7 +937,6 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.subscribe().boxed(),
             Self::Claude(agent) => agent.subscribe().boxed(),
-            Self::Rho2(agent) => agent.subscribe().boxed(),
         }
     }
 }
@@ -1155,18 +947,10 @@ mod tests {
     use crate::db::{AgentWorkflow, EngineerIntelligence};
 
     #[test]
-    fn github_workflow_only_flows_from_pm_to_engineer() {
+    fn github_workflow_does_not_flow_to_children() {
         let engineer = AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         };
-        let pr_pm = AgentRole::WorkflowPM {
-            workflow: AgentWorkflow::PrFriendly,
-        };
-        assert_eq!(
-            child_role(pr_pm, engineer).workflow(),
-            AgentWorkflow::PrFriendly
-        );
-
         let pr_engineer = AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Medium,
             workflow: AgentWorkflow::PrFriendly,

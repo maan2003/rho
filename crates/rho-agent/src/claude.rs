@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -29,11 +28,11 @@ use crate::db::{
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
-    AgentEvent, AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery,
-    PresentationSpeaker, QueuedItem, QueuedItemKind, StartWorkdir, system_prompt,
+    AgentEvent, AgentState, AgentStateKind, FailedInferenceResponse, InputKind, InputQueues,
+    MessageDelivery, PresentationSpeaker, QueuedInput, StartWorkdir, system_prompt,
 };
 
-mod projection;
+pub(crate) mod projection;
 
 use projection::{
     ClaudeStreamItem, assistant_message_to_block, assistant_presentation_source,
@@ -76,9 +75,6 @@ pub struct ClaudeAgent {
     state: Arc<RwLock<AgentState>>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     notify: Arc<Notify>,
-    input_seq: Arc<AtomicU64>,
-    wait_baseline_seq: Arc<AtomicU64>,
-    input_notify: Arc<Notify>,
 }
 
 impl ClaudeAgent {
@@ -112,11 +108,11 @@ impl ClaudeAgent {
                 .iter()
                 .map(|workspace| workspace.info().clone())
                 .collect(),
+            role,
             mode,
             AgentRuntime::Claude { session_id },
             parent,
         );
-        write.set_agent_role(agent_id, role);
         write.commit();
 
         let pool_events = pool.clone();
@@ -166,20 +162,21 @@ impl ClaudeAgent {
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
-        let AgentRuntime::Claude { session_id } = record.runtime else {
+        let parent_agent = db.read().agent_attention(agent_id).parent_agent;
+        let AgentRuntime::Claude { session_id } = record.config.runtime else {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
-        let model = record
-            .binding
-            .claude_model()
-            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
-        let effort = record
-            .binding
-            .claude_effort()
-            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
+        let model =
+            record.config.binding.claude_model().ok_or_else(|| {
+                anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
+            })?;
+        let effort =
+            record.config.binding.claude_effort().ok_or_else(|| {
+                anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
+            })?;
         let primary_repo = record.primary_workdir().repo().to_owned();
         let (session_id, messages, start_mode, pending_rewind, context_used) = if let Some(rewind) =
-            record.claude_rewind
+            record.config.claude_rewind
         {
             let resumed = rho_claude::read_session_messages_by_id(
                 rewind.session_id,
@@ -293,9 +290,9 @@ impl ClaudeAgent {
             start_mode,
             pending_rewind,
             pool.upgrade()
-                .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
+                .map(|_| MultiAgentTools::new(pool, agent_id, parent_agent)),
             pool_events,
-            record.role,
+            record.config.role,
             next_event,
             known_presentation_sources,
         ))
@@ -321,9 +318,6 @@ impl ClaudeAgent {
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
-        let input_seq = Arc::new(AtomicU64::new(0));
-        let wait_baseline_seq = Arc::new(AtomicU64::new(0));
-        let input_notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
         let last_presentation_source = {
             let records = db
@@ -356,8 +350,6 @@ impl ClaudeAgent {
             execution_generation: 0,
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
-            wait_baseline_seq: Arc::clone(&wait_baseline_seq),
-            input_notify: Arc::clone(&input_notify),
             control_rx,
             presentation_control: control.downgrade(),
             multi_agent,
@@ -373,9 +365,6 @@ impl ClaudeAgent {
             state,
             control,
             notify,
-            input_seq,
-            wait_baseline_seq,
-            input_notify,
         }
     }
 
@@ -388,12 +377,9 @@ impl ClaudeAgent {
     }
 
     pub fn send_user_content(&self, content: Vec<ContentPart>) {
-        let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let uuid = Uuid::new_v4().to_string();
-        self.input_notify.notify_waiters();
         let _ = self.control.send(ClaudeControl::UserMessage {
             content,
-            seq,
             uuid,
             user: true,
             accepted: None,
@@ -419,14 +405,11 @@ impl ClaudeAgent {
         content: Vec<ContentPart>,
         user: bool,
     ) -> anyhow::Result<()> {
-        let seq = self.input_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let uuid = Uuid::new_v4().to_string();
         let (accepted, reply) = oneshot::channel();
-        self.input_notify.notify_waiters();
         self.control
             .send(ClaudeControl::UserMessage {
                 content,
-                seq,
                 uuid,
                 user,
                 accepted: Some(accepted),
@@ -435,23 +418,6 @@ impl ClaudeAgent {
         reply
             .await
             .map_err(|_| anyhow::anyhow!("Claude agent stopped before accepting mail"))?
-    }
-
-    pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
-        tokio::time::timeout(timeout, async {
-            loop {
-                let notified = self.input_notify.notified();
-                let baseline = self.wait_baseline_seq.load(Ordering::Acquire);
-                let current = self.input_seq.load(Ordering::Acquire);
-                if baseline != 0 && current != baseline {
-                    self.wait_baseline_seq.store(current, Ordering::Release);
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .is_ok()
     }
 
     pub fn compact(&self) {
@@ -533,7 +499,6 @@ enum ClaudeStartMode {
 enum ClaudeControl {
     UserMessage {
         content: Vec<ContentPart>,
-        seq: u64,
         uuid: String,
         user: bool,
         accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
@@ -590,8 +555,6 @@ struct ClaudeLoop {
     execution_generation: u64,
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
-    wait_baseline_seq: Arc<AtomicU64>,
-    input_notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
     presentation_control: mpsc::WeakUnboundedSender<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
@@ -622,15 +585,26 @@ impl Drop for ClaudeLoop {
 
 struct ClaudeTurn {
     uuid: String,
-    input_seq: u64,
     content: Arc<Vec<ContentPart>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 struct ClaudePresentationSource {
     source_id: Uuid,
     speaker: PresentationSpeaker,
+    /// The capped mirror text, which is what the raw event holds.
     text: String,
+    /// The same message uncapped, for the story. Not part of identity:
+    /// a persisted event only ever carries the capped text.
+    whole: String,
+}
+
+impl PartialEq for ClaudePresentationSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_id == other.source_id
+            && self.speaker == other.speaker
+            && self.text == other.text
+    }
 }
 
 struct ClaudePresentationReconciliation {
@@ -638,7 +612,6 @@ struct ClaudePresentationReconciliation {
     persisted: Vec<(AgentEventPos, ClaudePresentationSource)>,
     common: usize,
     next_event: AgentEventPos,
-    previous_cache: AgentPresentationCache,
 }
 
 fn claude_presentation_sources(
@@ -648,12 +621,13 @@ fn claude_presentation_sources(
         .iter()
         .filter_map(|message| presentation_source(message).transpose())
         .filter_map(|source| match source {
-            Ok((source_id, speaker, text)) => crate::presentation::canonical_source_text(&text)
+            Ok((source_id, speaker, whole)) => crate::presentation::canonical_source_text(&whole)
                 .map(|text| {
                     Ok(ClaudePresentationSource {
                         source_id,
                         speaker,
                         text,
+                        whole: whole.trim().to_owned(),
                     })
                 }),
             Err(error) => Some(Err(error)),
@@ -672,11 +646,6 @@ fn prepare_claude_presentation_reconciliation(
 ) -> anyhow::Result<ClaudePresentationReconciliation> {
     let sources = claude_presentation_sources(messages)?;
     let read = db.read();
-    let record = read.get_agent(agent_id);
-    let previous_cache = AgentPresentationCache {
-        generated_title: record.generated_title,
-        activity: record.activity,
-    };
     let (next_event, records) = read.agent_event_records(agent_id);
     let persisted = records
         .iter()
@@ -691,6 +660,7 @@ fn prepare_claude_presentation_reconciliation(
                     source_id: *source_id,
                     speaker: *speaker,
                     text: text.to_string(),
+                    whole: text.to_string(),
                 },
             )),
             _ => None,
@@ -706,7 +676,6 @@ fn prepare_claude_presentation_reconciliation(
         persisted,
         common,
         next_event,
-        previous_cache,
     })
 }
 
@@ -717,24 +686,26 @@ impl ClaudePresentationReconciliation {
         now: UnixMillis,
         agent_id: AgentId,
     ) -> (AgentEventPos, Option<AgentPresentationCache>) {
-        let (mut next_event, rebuilt_cache) = if self.common < self.persisted.len() {
-            let next = write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0);
-            let cache = write.rebuild_agent_presentation_cache(now, agent_id);
-            (next, (cache != self.previous_cache).then_some(cache))
+        // A rewind forks the raw lineage, but the story is append-only:
+        // the title and activity it already told still stand.
+        let mut next_event = if self.common < self.persisted.len() {
+            write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0)
         } else {
-            (self.next_event, None)
+            self.next_event
         };
         for source in self.sources.iter().skip(self.common) {
-            next_event = write.append_agent_event(
-                next_event,
-                &AgentEvent::ClaudePresentationSource {
-                    source_id: source.source_id,
-                    speaker: source.speaker,
-                    text: Cow::Borrowed(&source.text),
-                },
-            );
+            let event = AgentEvent::ClaudePresentationSource {
+                source_id: source.source_id,
+                speaker: source.speaker,
+                text: Cow::Borrowed(&source.text),
+            };
+            let told_from = next_event;
+            next_event = write.append_agent_event(next_event, &event);
+            for told in crate::story::from_claude_source(source.speaker, &source.whole, now) {
+                write.append_agent_story_from(agent_id, &told, told_from);
+            }
         }
-        (next_event, rebuilt_cache)
+        (next_event, None)
     }
 
     fn state(
@@ -839,6 +810,14 @@ impl ClaudeLoop {
                 self.handle_control(control).await;
             }
             let kind = self.state.read().expect("poison").kind.clone();
+            crate::tell_turn_boundary(
+                &self.db,
+                self.agent_id,
+                &initial_kind,
+                &kind,
+                self.execution_generation != initial_execution_generation,
+            )
+            .await;
             if crate::execution_settled(
                 &initial_kind,
                 &kind,
@@ -861,7 +840,6 @@ impl ClaudeLoop {
         match control {
             ClaudeControl::UserMessage {
                 content,
-                seq,
                 uuid,
                 user,
                 accepted,
@@ -901,20 +879,19 @@ impl ClaudeLoop {
                 let content = Arc::new(content);
                 self.queued_turns.push_back(ClaudeTurn {
                     uuid: uuid.clone(),
-                    input_seq: seq,
                     content: Arc::clone(&content),
                 });
                 self.state
                     .write()
                     .expect("poison")
                     .queued_inputs
-                    .push(QueuedItem {
-                        kind: QueuedItemKind::UserMessage {
-                            sender: crate::MessageSender::User,
-                            content: Arc::clone(&content),
-                            source_id: None,
+                    .push(QueuedInput {
+                        source: crate::MessageSender::User,
+                        kind: InputKind::Message {
+                            content: (*content).clone(),
                         },
                         delivery,
+                        at: rho_core::UnixMs::now(),
                     });
                 self.notify.notify_waiters();
                 // A turn-opening send starts the turn now: waiting for the
@@ -1041,8 +1018,6 @@ impl ClaudeLoop {
     ) -> Option<AgentPresentationCache> {
         let mut write = self.db.write().await;
         let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update)?;
-        let event_pos = self.next_event;
-        write.append_agent_presentation_history(event_pos, &update);
         self.next_event = write.append_agent_event(
             self.next_event,
             &AgentEvent::PresentationUpdated {
@@ -1066,6 +1041,7 @@ impl ClaudeLoop {
         speaker: PresentationSpeaker,
         text: String,
     ) {
+        let whole = text.trim().to_owned();
         let Some(text) = crate::presentation::canonical_source_text(&text) else {
             return;
         };
@@ -1073,15 +1049,20 @@ impl ClaudeLoop {
             return;
         }
         let event_pos = self.next_event;
+        let now = UnixMillis::now();
         let mut write = self.db.write().await;
-        self.next_event = write.append_agent_event(
-            self.next_event,
-            &AgentEvent::ClaudePresentationSource {
-                source_id,
-                speaker,
-                text: Cow::Borrowed(&text),
-            },
-        );
+        let event = AgentEvent::ClaudePresentationSource {
+            source_id,
+            speaker,
+            text: Cow::Borrowed(&text),
+        };
+        self.next_event = write.append_agent_event(self.next_event, &event);
+        // The story carries the whole message: for a Claude agent it is
+        // the durable copy a reader gets. The mirror event above stays
+        // capped because Luna's prompt is what it is for.
+        for told in crate::story::from_claude_source(speaker, &whole, now) {
+            write.append_agent_story_from(self.agent_id, &told, event_pos);
+        }
         write.commit();
         self.last_presentation_source = Some(event_pos);
         self.presentation.dirty = true;
@@ -1485,20 +1466,14 @@ impl ClaudeLoop {
     fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
         if let ContextBlock::UserMessage { content, .. } = &*block {
             let mut state = self.state.write().expect("poison");
-            let matched = state.queued_inputs.remove_first(|queued| match queued {
-                QueuedItem {
-                    kind:
-                        QueuedItemKind::UserMessage {
-                            content: queued, ..
-                        },
-                    ..
-                } => queued_user_content_matches(queued, content),
-                // Claude agents never queue tool updates.
-                QueuedItem {
-                    kind: QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_),
-                    ..
-                } => false,
-            });
+            let matched = state
+                .queued_inputs
+                .remove_first(|queued| match &queued.kind {
+                    InputKind::Message { content: queued } => {
+                        queued_user_content_matches(queued, content)
+                    }
+                    InputKind::Compaction => false,
+                });
             if matched.is_some() {
                 state.blocks.push(block);
                 drop(state);
@@ -1764,8 +1739,6 @@ impl ClaudeLoop {
                     .expect("index came from position");
 
                 if message.state == "completed" {
-                    self.wait_baseline_seq
-                        .store(turn.input_seq, Ordering::Release);
                     if let Some(source_id) = Uuid::parse_str(&message.command_uuid).ok()
                         && let Some((source_id, speaker, text)) =
                             queued_user_presentation_source(source_id, &turn.content)
@@ -1780,15 +1753,11 @@ impl ClaudeLoop {
                         .write()
                         .expect("poison")
                         .queued_inputs
-                        .remove_first(|queued| match queued {
-                            QueuedItem {
-                                kind: QueuedItemKind::UserMessage { content, .. },
-                                ..
-                            } => **content == *turn.content,
-                            _ => false,
+                        .remove_first(|queued| match &queued.kind {
+                            InputKind::Message { content } => *content == *turn.content,
+                            InputKind::Compaction => false,
                         });
                 }
-                self.input_notify.notify_waiters();
                 self.notify.notify_waiters();
 
                 // Claude emits `completed` after the command's result. If a
@@ -1808,7 +1777,28 @@ impl ClaudeLoop {
         }
     }
 
-    async fn persist_inference_block(&self, _block: &Arc<ContextBlock>) {}
+    /// The calls a Claude turn made, told as they stream. The reply text
+    /// is not told here: the durable mirror
+    /// (`persist_presentation_source`) is the one place it comes from, so
+    /// a message is never told twice.
+    async fn persist_inference_block(&self, block: &Arc<ContextBlock>) {
+        let ContextBlock::InferenceResponse { items, .. } = block.as_ref() else {
+            return;
+        };
+        let now = UnixMillis::now();
+        let told = crate::story::from_inference_items(items, now)
+            .into_iter()
+            .filter(|event| !matches!(event, crate::story::StoryEvent::Reply { .. }))
+            .collect::<Vec<_>>();
+        if told.is_empty() {
+            return;
+        }
+        let mut write = self.db.write().await;
+        for event in &told {
+            write.append_agent_story(self.agent_id, event);
+        }
+        write.commit();
+    }
 
     async fn complete_rewind(&mut self) -> anyhow::Result<()> {
         if !self.pending_rewind {
@@ -1882,8 +1872,6 @@ impl ClaudeLoop {
             .queued_turns
             .remove(index)
             .expect("index came from position");
-        self.wait_baseline_seq
-            .store(turn.input_seq, Ordering::Release);
 
         if let Some((source_id, speaker, text)) = source_id
             .and_then(|source_id| queued_user_presentation_source(source_id, &turn.content))
@@ -1896,7 +1884,6 @@ impl ClaudeLoop {
         promote_queued_user_message(&mut state, &turn.content);
         drop(state);
 
-        self.input_notify.notify_waiters();
         self.notify.notify_waiters();
         true
     }
@@ -2045,28 +2032,16 @@ fn merge_usage(
 }
 
 fn remove_compact_commands(inputs: &mut InputQueues) {
-    inputs.retain(|input| match input {
-        QueuedItem {
-            kind: QueuedItemKind::UserMessage { content, .. },
-            ..
-        } => !is_compact_command(content),
-        QueuedItem {
-            kind: QueuedItemKind::Compaction | QueuedItemKind::ToolUpdate(_),
-            ..
-        } => true,
+    inputs.retain(|input| match &input.kind {
+        InputKind::Message { content } => !is_compact_command(content),
+        InputKind::Compaction => true,
     });
 }
 
 fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) -> bool {
-    let matched = state.queued_inputs.remove_first(|queued| {
-        matches!(
-            queued,
-            QueuedItem {
-                kind: QueuedItemKind::UserMessage { .. },
-                ..
-            }
-        )
-    });
+    let matched = state
+        .queued_inputs
+        .remove_first(|queued| matches!(queued.kind, InputKind::Message { .. }));
     if matched.is_none() {
         return false;
     }
@@ -2174,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_record_is_backfilled_from_transcript_ground_truth() {
         let (_temp, db, agent_id) = presentation_test_agent().await;
-        assert_eq!(db.read().get_agent(agent_id).last_turn_ended, None);
+        assert_eq!(db.read().agent_attention(agent_id).last_turn_ended, None);
         let messages = [rho_claude::SessionMessage {
             kind: rho_claude::SessionMessageKind::Assistant,
             uuid: Uuid::new_v4(),
@@ -2192,7 +2167,7 @@ mod tests {
             .unwrap()
             .timestamp_millis() as u64;
         assert_eq!(
-            db.read().get_agent(agent_id).last_turn_ended,
+            db.read().agent_attention(agent_id).last_turn_ended,
             Some(rho_core::UnixMs(expected))
         );
     }
@@ -2211,6 +2186,7 @@ mod tests {
                 repo: "/home/user/src/rho".into(),
                 id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
             }],
+            crate::db::AgentRole::default(),
             SessionBinding::ResponsesSol(crate::db::InferenceProfile::default()),
             AgentRuntime::Rho {
                 prompt_cache_key: PromptCacheKey::generate(),
@@ -2278,7 +2254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_divergence_rebuilds_cache_and_discards_stale_updates() {
+    async fn reconciliation_divergence_keeps_the_story_and_discards_stale_updates() {
         let (_temp, db, agent_id) = presentation_test_agent().await;
         let first = presentation_message(
             rho_claude::SessionMessageKind::User,
@@ -2324,7 +2300,6 @@ mod tests {
                 .apply_agent_presentation(rho_core::UnixMs(2), agent_id, &update)
                 .is_some()
         );
-        write.append_agent_presentation_history(next, &update);
         write.append_agent_event(
             next,
             &AgentEvent::PresentationUpdated {
@@ -2337,8 +2312,12 @@ mod tests {
             reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
                 .await
                 .unwrap();
-        assert_eq!(rebuilt, Some(AgentPresentationCache::default()));
-        assert!(db.read().agent_presentation_updates(agent_id).is_empty());
+        // A fork does not unsay what the story told: the title stands.
+        assert!(rebuilt.is_none());
+        assert_eq!(
+            db.read().agent_presentation_cache(agent_id).generated_title,
+            Some("discarded-title".to_owned())
+        );
         let mut write = db.write().await;
         assert!(
             write
@@ -2398,13 +2377,13 @@ mod tests {
             total_usage: crate::db::AgentUsageBucket::default(),
             usage_provider: crate::db::AgentUsageModel::FABLE,
         };
-        state.queued_inputs.push(QueuedItem {
-            kind: QueuedItemKind::UserMessage {
-                sender: crate::MessageSender::User,
-                content: text("claude-normalized text"),
-                source_id: None,
+        state.queued_inputs.push(QueuedInput {
+            source: crate::MessageSender::User,
+            kind: InputKind::Message {
+                content: (*text("claude-normalized text")).clone(),
             },
             delivery: MessageDelivery::Immediate,
+            at: rho_core::UnixMs(0),
         });
         let turn_content = vec![ContentPart::Text {
             text: "original text".to_owned(),

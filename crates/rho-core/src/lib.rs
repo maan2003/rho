@@ -70,8 +70,25 @@ pub enum AgentDisposition {
     Hidden,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum AgentRole {
+    Engineer {
+        intelligence: EngineerIntelligence,
+    },
+    Advisor {
+        intelligence: AdvisorIntelligence,
+    },
+    WorkflowEngineer {
+        intelligence: EngineerIntelligence,
+        workflow: AgentWorkflow,
+    },
+}
+
+/// The role as rows wrote it before the PM and Iris roles were retired.
+/// Variant ids come from the variant names, so this decodes what
+/// `AgentRole` used to; a retired role folds into the nearest live one.
+#[derive(Decode)]
+enum StoredAgentRole {
     Engineer {
         intelligence: EngineerIntelligence,
     },
@@ -86,8 +103,28 @@ pub enum AgentRole {
     WorkflowPM {
         workflow: AgentWorkflow,
     },
-    /// Built-in hidden coordinator for Rho's global Iris voice surface.
     Iris,
+}
+
+impl senax_encoder::Decoder for AgentRole {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        Ok(match StoredAgentRole::decode(reader)? {
+            StoredAgentRole::Engineer { intelligence } => Self::Engineer { intelligence },
+            StoredAgentRole::Advisor { intelligence } => Self::Advisor { intelligence },
+            StoredAgentRole::WorkflowEngineer {
+                intelligence,
+                workflow,
+            } => Self::WorkflowEngineer {
+                intelligence,
+                workflow,
+            },
+            StoredAgentRole::PM | StoredAgentRole::Iris => Self::default(),
+            StoredAgentRole::WorkflowPM { workflow } => Self::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Medium,
+                workflow,
+            },
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -126,21 +163,11 @@ impl Default for AgentRole {
 }
 
 impl AgentRole {
-    pub fn pm() -> Self {
-        Self::PM
-    }
-
     pub fn workflow(self) -> AgentWorkflow {
         match self {
-            Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
-            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } | Self::Iris => {
-                AgentWorkflow::Default
-            }
+            Self::WorkflowEngineer { workflow, .. } => workflow,
+            Self::Engineer { .. } | Self::Advisor { .. } => AgentWorkflow::Default,
         }
-    }
-
-    pub fn is_pm(self) -> bool {
-        matches!(self, Self::PM | Self::WorkflowPM { .. } | Self::Iris)
     }
 
     pub fn is_engineer(self) -> bool {
@@ -150,9 +177,7 @@ impl AgentRole {
     pub fn handle_prefix(self) -> &'static str {
         match self {
             Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
-            Self::PM | Self::WorkflowPM { .. } => "pm",
             Self::Advisor { .. } => "adv",
-            Self::Iris => "iris",
         }
     }
 }
@@ -172,8 +197,6 @@ pub enum MessageDelivery {
     Immediate,
     /// Enter at the next inference-request boundary.
     NextRequest,
-    /// Wait for the current turn to finish, then start a new turn.
-    NextTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

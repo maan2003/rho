@@ -1,4 +1,4 @@
-//! The real tools as `rho-agent2` sources.
+//! What a tool is to the agent loop, and the real tools in that shape.
 //!
 //! A process or a script is a [`ToolSession`]: it holds its output until the
 //! core asks, says how urgent that output is, and is answered whenever the
@@ -10,17 +10,18 @@ mod code_mode;
 mod shell;
 #[cfg(test)]
 mod tests;
+mod tool;
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 pub use code_mode::CodeModeTool;
 use futures::future::BoxFuture;
-use rho_agent2::{SourceWaker, Tool, ToolHaste, ToolSession};
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs};
 use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;
 pub use shell::ShellTool;
+pub use tool::{SourceWaker, Tool, ToolHaste, ToolSession};
 
 /// A tool whose whole answer is one future. Usable directly by the model or
 /// from a code-mode script, which is why it is not a [`Tool`] itself.

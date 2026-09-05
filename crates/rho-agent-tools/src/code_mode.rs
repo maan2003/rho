@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use rho_agent2::{SourceWaker, Tool, ToolHaste, ToolSession};
 use rho_code_mode::{
     CellHandle, CellOutcome, CellWatcher, CodeModeSession, NestedTool, NestedToolOutput,
     ToolDispatcher,
@@ -22,7 +21,7 @@ use rho_core::{
 use rho_tool_shell::{BoundedOutput, ShellTools, decode_output_lossy};
 use tokio::sync::Notify;
 
-use crate::{Finished, FutureTool};
+use crate::{Finished, FutureTool, SourceWaker, Tool, ToolHaste, ToolSession};
 
 pub struct CodeModeTool {
     session: Arc<CodeModeSession>,

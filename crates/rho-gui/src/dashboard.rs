@@ -20,7 +20,8 @@ use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec};
 use multi_buffer::{MultiBuffer, MultiBufferRow};
 pub use rho_desk::cells::SlackUnit;
-use rho_ui_proto::{AgentId, UiAttention};
+use rho_registry::Attention as UiAttention;
+use rho_ui_proto::AgentId;
 use text::{Bias, BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
 
@@ -229,7 +230,7 @@ pub enum CardCursor {
     /// The newest message in the unit, which is what a Slack verdict writes.
     Slack(rho_desk::cells::SlackTs),
     /// The agent's own chronology and what it is asking for.
-    Agent(rho_ui_proto::UiAgentFacts, rho_ui_proto::UiAttention),
+    Agent(rho_registry::AgentFacts, rho_registry::Attention),
     /// The dated mark the card stands on.
     Desk(DeskMark, rho_desk::cells::Timestamp),
 }
@@ -462,6 +463,10 @@ impl Dashboard {
             .collect::<HashMap<_, _>>();
         let mut ranked = Vec::new();
         let mut order = 0usize;
+        // Filing decides where a card is shown, never whether it exists, so
+        // an agent reached through a note is only skipped by the pass below
+        // to keep it from being carded twice.
+        let mut carded = HashSet::new();
         for (host, source) in &self.tree_hosts {
             let nodes = source
                 .nodes
@@ -491,7 +496,7 @@ impl Dashboard {
                     .nodes
                     .iter()
                     .filter(|node| node.parent == Some(heading.id.clone()))
-                    .filter_map(|node| Some((node.id.clone(), node.agent()?)))
+                    .filter_map(|node| node.agent())
                     .collect::<Vec<_>>();
                 for (mark, at) in desk_marks(heading) {
                     let priority =
@@ -513,7 +518,7 @@ impl Dashboard {
                             priority,
                             host: *host,
                             topic_node_id: heading.id.clone(),
-                            agent_id: bindings.first().map(|(_, id)| *id),
+                            agent_id: bindings.first().copied(),
                             agent_tag: None,
                             breadcrumb: breadcrumb.clone(),
                             room: room.clone(),
@@ -527,7 +532,7 @@ impl Dashboard {
                 // mark not being ripe yet. With marks as fields the same
                 // gate is the note being deferred, which is checked above.
                 {
-                    for (machine_node_id, root_agent) in bindings {
+                    for root_agent in bindings {
                         let mut agents = vec![root_agent];
                         let mut cursor = 0;
                         while cursor < agents.len() {
@@ -544,37 +549,31 @@ impl Dashboard {
                             let Some(agent) = by_agent.get(&agent_id).copied() else {
                                 continue;
                             };
-                            let Some(ended) = agent.facts.last_turn_ended else {
-                                continue;
-                            };
-                            if agent.facts.turn_running || ended <= agent.facts.last_user_message_at
-                            {
-                                continue;
-                            }
-                            let wait_days = reply_wait_days(ended, now);
-                            let (base_priority, label) = if agent.facts.needs_you_hint {
-                                (
-                                    blocked_reply_priority(wait_days),
-                                    format!("waiting on reply · {}", age_label(wait_days)),
-                                )
-                            } else {
-                                (
-                                    fyi_reply_priority(wait_days),
-                                    format!("finished · {} ago", age_label(wait_days)),
-                                )
-                            };
-                            let recency_bonus =
-                                agent_interactions.get(&agent_id).map_or(0.0, |last| {
-                                    let elapsed = (now.timestamp_millis() - *last)
-                                        .clamp(0, AGENT_RECENCY_WINDOW_MS);
-                                    let remaining =
-                                        1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
-                                    AGENT_RECENCY_BONUS * remaining * remaining
-                                });
-                            let priority = base_priority + recency_bonus;
-                            if priority <= DEAL_QUEUE_FLOOR {
+                            // The user's verdict on the agent closes its
+                            // card wherever the card is shown; being
+                            // reached through a note does not exempt it.
+                            if agent_node_closed(source, agent_id, now) {
+                                carded.insert(agent_id);
                                 continue;
                             }
+                            let Some((priority, label)) =
+                                agent_card_facts(agent, now, agent_interactions)
+                            else {
+                                continue;
+                            };
+                            carded.insert(agent_id);
+                            // Every agent is its own topic. Taking the
+                            // note as the topic made two agents filed
+                            // under one note compete for a single card,
+                            // so all but the loudest disappeared from
+                            // Home; a spawned child with no row of its
+                            // own shared its parent's identity as well.
+                            let node_id = source
+                                .nodes
+                                .iter()
+                                .find(|node| node.agent() == Some(agent_id))
+                                .map(|node| node.id.clone())
+                                .unwrap_or(rho_desk::cells::Id::Agent(agent_id));
                             ranked.push(RankedDealCard {
                                 priority,
                                 virtual_reply: true,
@@ -584,7 +583,7 @@ impl Dashboard {
                                     label,
                                     priority,
                                     host: *host,
-                                    topic_node_id: heading.id.clone(),
+                                    topic_node_id: node_id.clone(),
                                     agent_id: Some(agent_id),
                                     agent_tag: None,
                                     breadcrumb: breadcrumb.clone(),
@@ -593,7 +592,7 @@ impl Dashboard {
                                     skipped: false,
                                     identity: DealCardId {
                                         host: *host,
-                                        node_id: machine_node_id.clone(),
+                                        node_id,
                                     },
                                 },
                             });
@@ -648,6 +647,59 @@ impl Dashboard {
                 });
                 order += 1;
             }
+        }
+        // An agent nobody filed is a card all the same: what makes one is
+        // the agent asking for the user, and filing is only the user's own
+        // labelling and placement. This is also the whole of Home before a
+        // daemon answers, when the client has its mirror of the agents and
+        // no Desk yet: the card ranks at the root, with no breadcrumb.
+        for agent in &facts {
+            if carded.contains(&agent.agent_id) {
+                continue;
+            }
+            let node = self.tree_hosts.get(&agent.host).and_then(|source| {
+                source
+                    .nodes
+                    .iter()
+                    .find(|node| node.agent() == Some(agent.agent_id))
+            });
+            // A handled, muted or deferred agent is the user's verdict on
+            // this very card; without a Desk there is no verdict to read.
+            if node.is_some_and(|node| node_closed(node, now)) {
+                order += 1;
+                continue;
+            }
+            let Some((priority, label)) = agent_card_facts(agent, now, agent_interactions) else {
+                order += 1;
+                continue;
+            };
+            let node_id = node
+                .map(|node| node.id.clone())
+                .unwrap_or(rho_desk::cells::Id::Agent(agent.agent_id));
+            let identity = DealCardId {
+                host: agent.host,
+                node_id: node_id.clone(),
+            };
+            ranked.push(RankedDealCard {
+                priority,
+                virtual_reply: true,
+                order,
+                cursor: CardCursor::Agent(agent.facts, agent.attention),
+                card: DealCard {
+                    label,
+                    priority,
+                    host: agent.host,
+                    topic_node_id: node_id,
+                    agent_id: Some(agent.agent_id),
+                    agent_tag: None,
+                    breadcrumb: String::new(),
+                    room: None,
+                    kind: DealCardKind::Agent,
+                    skipped: false,
+                    identity,
+                },
+            });
+            order += 1;
         }
         // One winning card per topic; a virtual reply wins an exact tie.
         let mut by_topic = HashMap::new();
@@ -946,7 +998,13 @@ impl Dashboard {
             .get(&card.host)
             .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
         else {
-            return CardTarget::Missing;
+            // An unfiled agent is a card with no node behind it, and it
+            // still opens its transcript: the id says which agent, and
+            // filing was never what made it openable.
+            return match card.node_id {
+                rho_desk::cells::Id::Agent(agent_id) => CardTarget::Agent(agent_id),
+                _ => CardTarget::Missing,
+            };
         };
         match &node.id {
             rho_desk::cells::Id::Agent(_) => {
@@ -2043,8 +2101,8 @@ pub struct DealAgentFacts {
     pub parent: Option<AgentId>,
     pub host: HostId,
     pub heading: String,
-    pub facts: rho_ui_proto::UiAgentFacts,
-    pub attention: rho_ui_proto::UiAttention,
+    pub facts: rho_registry::AgentFacts,
+    pub attention: rho_registry::Attention,
 }
 
 fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
@@ -2068,6 +2126,59 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
             })
         })
         .collect()
+}
+
+/// What an agent's card says and how loudly, or `None` when the agent is
+/// not asking anything of the user: no finished turn, a turn in flight, or
+/// the user has spoken since it finished.
+/// The names an agent answers to besides its title: its tag, and the last
+/// thing the user said to it.
+fn agent_aka(registry: &AgentRegistry, agent_id: AgentId, title: &str) -> Vec<String> {
+    let mut aka = vec![registry.agent_id_label(agent_id)];
+    if let Some(said) = registry.agent_last_user_message(agent_id)
+        && said != title
+    {
+        aka.push(said.to_owned());
+    }
+    aka
+}
+
+fn agent_card_facts(
+    agent: &DealAgentFacts,
+    now: chrono::DateTime<chrono::FixedOffset>,
+    agent_interactions: &HashMap<AgentId, i64>,
+) -> Option<(f64, String)> {
+    let ended = agent.facts.last_turn_ended?;
+    if agent.facts.turn_running || ended <= agent.facts.last_user_message_at {
+        return None;
+    }
+    let wait_days = reply_wait_days(ended, now);
+    // A dead turn is not an FYI: reading it as one gave it a decaying
+    // priority and the word "finished", so a crashed agent quietly aged
+    // out of Home. Only the user can start it again.
+    let (base_priority, label) = if agent.facts.errored {
+        (
+            blocked_reply_priority(wait_days),
+            format!("errored · {} ago", age_label(wait_days)),
+        )
+    } else if agent.facts.needs_you_hint {
+        (
+            blocked_reply_priority(wait_days),
+            format!("waiting on reply · {}", age_label(wait_days)),
+        )
+    } else {
+        (
+            fyi_reply_priority(wait_days),
+            format!("finished · {} ago", age_label(wait_days)),
+        )
+    };
+    let recency_bonus = agent_interactions.get(&agent.agent_id).map_or(0.0, |last| {
+        let elapsed = (now.timestamp_millis() - *last).clamp(0, AGENT_RECENCY_WINDOW_MS);
+        let remaining = 1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
+        AGENT_RECENCY_BONUS * remaining * remaining
+    });
+    let priority = base_priority + recency_bonus;
+    (priority > DEAL_QUEUE_FLOOR).then_some((priority, label))
 }
 
 fn reply_wait_days(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {
@@ -2138,6 +2249,29 @@ fn desk_marks(node: &crate::desk_view::DeskNode) -> Vec<(DeskMark, rho_desk::cel
 
 /// Whether a node is still waiting for its date, which hides it and every
 /// card under it.
+/// Whether the user has already dealt with a node: handled through what
+/// the story told, muted, or snoozed to a time still ahead.
+fn node_closed(
+    node: &crate::desk_view::DeskNode,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    node.state != rho_desk::cells::State::Open || desk_deferred(node, now.naive_local())
+}
+
+/// The same question for an agent reached through a note, which knows the
+/// agent id but not which row stands for it.
+fn agent_node_closed(
+    source: &TreeHostSource,
+    agent_id: AgentId,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    source
+        .nodes
+        .iter()
+        .find(|node| node.agent() == Some(agent_id))
+        .is_some_and(|node| node_closed(node, now))
+}
+
 fn desk_deferred(node: &crate::desk_view::DeskNode, now: chrono::NaiveDateTime) -> bool {
     node.defer_until
         .and_then(|at| desk_elapsed(at, now))
@@ -2481,6 +2615,7 @@ impl Dashboard {
                         }
                         FindCandidate {
                             labels: labelled(&breadcrumb),
+                            aka: Vec::new(),
                             path: breadcrumb.clone(),
                             kind: "topic",
                             target: FindTarget::Topic {
@@ -2506,6 +2641,7 @@ impl Dashboard {
                             .unwrap_or_else(|| registry.agent_human_name(agent_id));
                         FindCandidate {
                             labels: labelled(&title),
+                            aka: agent_aka(registry, agent_id, &title),
                             path: under(title.clone()),
                             kind: "agent",
                             target: FindTarget::Agent(agent_id),
@@ -2523,6 +2659,7 @@ impl Dashboard {
                         };
                         FindCandidate {
                             labels: labelled(&title),
+                            aka: Vec::new(),
                             path: under(title),
                             kind: "page",
                             target: FindTarget::Page(page_id),
@@ -2533,6 +2670,30 @@ impl Dashboard {
                 };
                 candidates.push(candidate);
             }
+        }
+        // An agent nobody filed is findable all the same: filing says where
+        // a thing sits, and the finder is for the ones the reader cannot
+        // point at.
+        let filed = self
+            .tree_hosts
+            .values()
+            .flat_map(|source| source.nodes.iter().filter_map(|node| node.agent()))
+            .collect::<std::collections::HashSet<_>>();
+        for agent_id in registry.known_agents().copied() {
+            if filed.contains(&agent_id) || registry.agent_hidden(agent_id) {
+                continue;
+            }
+            let title = registry.agent_human_name(agent_id);
+            candidates.push(crate::find::FindCandidate {
+                labels: Vec::new(),
+                aka: agent_aka(registry, agent_id, &title),
+                path: title,
+                kind: "agent",
+                target: crate::find::FindTarget::Agent(agent_id),
+                recency: registry
+                    .agent_last_active(agent_id)
+                    .map_or(0, |active| active.0 as i64),
+            });
         }
         candidates
     }

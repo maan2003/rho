@@ -11,11 +11,7 @@ pub fn prompt(
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
     role: AgentRole,
-    projects: &[(camino::Utf8PathBuf, String)],
 ) -> Arc<str> {
-    if role == AgentRole::Iris {
-        return crate::iris_tools::PROMPT.into();
-    }
     let entries = view.entries();
     let workdirs = entries
         .iter()
@@ -24,9 +20,7 @@ pub fn prompt(
             kind: WorkdirKind::of(workspace),
         })
         .collect::<Vec<_>>();
-    let (agents_md, skills) = if role.is_pm() {
-        (String::new(), String::new())
-    } else {
+    let (agents_md, skills) = {
         let (agents_files, skills) = merged_context(entries);
         let skills = skills
             .into_iter()
@@ -61,25 +55,17 @@ pub fn prompt(
 
 Complete your independent analysis and return it to your parent through your \
 final response. You may use `message_agent` to request context from any known \
-agent and `wait_agent` when blocked on a reply.
+agent and `wait` when blocked on a reply.
 "
             );
         }
-        let ownership = if role.is_pm() {
-            "You were started directly and own coordination of the user's outcome."
-        } else {
-            match tools.spawned_by() {
-                AgentSpawnedBy::Direct => {
-                    "You were started directly and own the user's technical outcome."
-                }
-                AgentSpawnedBy::PM => {
-                    "You were spawned by a PM. Own the assigned technical outcome; your final \
-                 response is mailed to that PM."
-                }
-                AgentSpawnedBy::Engineer => {
-                    "You were spawned by another Engineer. Own the bounded assignment in the \
+        let ownership = match tools.spawned_by() {
+            AgentSpawnedBy::Direct => {
+                "You were started directly and own the user's technical outcome."
+            }
+            AgentSpawnedBy::Engineer => {
+                "You were spawned by another Engineer. Own the bounded assignment in the \
                  parent message; your final response is mailed to that Engineer."
-                }
             }
         };
         format!(
@@ -116,10 +102,7 @@ request.
         } => PR_FRIENDLY_ENGINEER_PROMPT,
         AgentRole::Engineer { .. }
         | AgentRole::WorkflowEngineer { .. }
-        | AgentRole::PM
-        | AgentRole::WorkflowPM { .. }
         | AgentRole::Advisor { .. } => "",
-        AgentRole::Iris => unreachable!("Iris prompt returned above"),
     };
     let base_prompt = if matches!(role, AgentRole::Advisor { .. }) {
         ADVISOR_BASE_PROMPT
@@ -128,32 +111,10 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     let workspace = render_workspace_prompt(&workdirs);
-    if role.is_pm() {
-        let projects = render_projects_prompt(projects);
-        return format!("{PM_BASE_PROMPT}{workflow_prompt}{projects}{agents_md}{skills}{code_mode}{team_context}")
-            .into();
-    }
-    format!("{base_prompt}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{workflow_prompt}{workspace}{environment}")
+    format!("{base_prompt}{agents_md}{skills}{code_mode}{TOOL_RESULTS_PROMPT}{team_context}{role_prompt}{workflow_prompt}{workspace}{environment}")
         .into()
 }
 
-fn render_projects_prompt(projects: &[(camino::Utf8PathBuf, String)]) -> String {
-    if projects.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(
-        "## Projects\n\nRegistered projects available for routing technical work:\n\n",
-    );
-    for (path, description) in projects {
-        out.push_str(&format!("- Path: {path}\n  Description: {description}\n"));
-    }
-    out.push('\n');
-    out
-}
-
-/// Rho orchestration guidance for Claude Code. Claude supplies its own agent
-/// prompt and project discovery, so this contains only Rho team identity,
-/// workspace context, and the one Claude-backed specialized role.
 pub fn claude_prompt(
     view: Option<&rho_workspaces::View>,
     multi_agent: Option<&MultiAgentTools>,
@@ -183,12 +144,8 @@ pub fn claude_prompt(
             workflow: AgentWorkflow::PrFriendly,
             ..
         } => PR_FRIENDLY_ENGINEER_PROMPT,
-        AgentRole::Engineer { .. }
-        | AgentRole::WorkflowEngineer { .. }
-        | AgentRole::PM
-        | AgentRole::WorkflowPM { .. } => "",
+        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
-        AgentRole::Iris => crate::iris_tools::PROMPT,
     };
     let workspace = view
         .filter(|_| role.is_engineer() || matches!(role, AgentRole::Advisor { .. }))
@@ -268,38 +225,6 @@ fn merged_context(
     }
     (agents_files, skills)
 }
-
-const PM_BASE_PROMPT: &str = "You are Rho's user-facing project manager. Always \
-delegate technical requests to an Engineer; do not decide that a technical request \
-is too small or otherwise unsuitable for delegation. Handle nontechnical \
-conversation directly and communicate status. \
-Do not inspect or modify repositories yourself.
-
-For a follow-up or continuation of an existing task, use `message_agent` to \
-send it to that task's responsible Engineer when that remains the best owner. \
-Use judgment rather than reusing an Engineer mechanically. Use `spawn_engineer` \
-when a technical task has no suitable responsible Engineer, when a fresh or \
-independent assignment is warranted, or when the user requests or suggests \
-another Engineer. In both spawned assignments and follow-up \
-messages, pass the user's instructions exactly, verbatim, and in full. Do not editorialize, \
-paraphrase, summarize, reinterpret, expand, or omit them. If clarification or \
-context is necessary, append it only after the verbatim instructions under an \
-`Additional context from PM:` heading. Use `message_agent` to exchange other \
-context or steer work, and use `interrupt_engineer` \
-only when a turn must be stopped.
-
-The intended asynchronous flow is: delegate the technical request, briefly \
-acknowledge the delegation or report useful status to the user, then end your \
-turn. Do not poll or wait. Engineer mail will wake you and start the next \
-request automatically; then relay the Engineer's report to the user through \
-the active user-facing surface.
-
-Track task ownership and relay Engineer reports faithfully. You may format \
-reports for clarity, but do not alter their substance, add unsupported technical \
-conclusions, or hide uncertainty, failed checks, or unresolved work. Never claim \
-work is complete before the responsible Engineer reports it.
-
-";
 
 const ADVISOR_BASE_PROMPT: &str = r#"You are the Advisor — an expert engineering advisor called when the requesting Engineer needs deeper reasoning than it can provide itself. You give high-quality technical guidance, code reviews, architectural advice, and strategic planning for software engineering tasks.
 
@@ -389,7 +314,7 @@ Use provided context first; reach for tools only when they materially improve ac
 - For recent-history questions, start with the narrowest relevant log or show command before reading whole files.
 - Use `web__run` only when local information is insufficient or a current authoritative external reference is necessary.
 - Construct paths from the working directory or workspace root shown in the environment section. Never invent placeholder roots such as `/workspace`, `/repo`, or `/project`; inspect the environment when a path is unknown.
-- Use `message_agent` to request genuinely missing context from a known agent and `wait_agent` when blocked on its reply. Do not use messaging as a substitute for evidence available in the workspace.
+- Use `message_agent` to request genuinely missing context from a known agent and `wait` when blocked on its reply. Do not use messaging as a substitute for evidence available in the workspace.
 
 ## Response format
 
@@ -455,8 +380,20 @@ const CODE_MODE_PROMPT: &str = "## Code Mode
 Your tool surface is code mode: the `exec` tool runs JavaScript, and every \
 other capability is an async function under `tools.*` inside your scripts \
 (see the `exec` tool description for signatures). Top-level variables persist \
-across `exec` calls. The `wait` tool resumes or terminates running exec \
-cells; it does not wait for anything else.
+across `exec` calls. A cell that is still running when you are next called \
+keeps running; what it prints later reaches you on the same call.
+
+";
+
+const TOOL_RESULTS_PROMPT: &str = "## How tool results arrive
+
+Every tool call is answered with its finished result, however long it takes; you never \
+poll. A command that is still running when something else needs your attention is \
+answered with what it has printed so far and a session ID, and everything it prints later \
+arrives on that same call by itself. If you have nothing to do until something happens, \
+call `wait` with the number of seconds you can afford to be left alone: anything ending, a \
+user message or mail wakes you sooner, so a long interval costs nothing and a short one \
+costs a request.
 
 ";
 
@@ -784,15 +721,6 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
-    #[test]
-    fn project_prompt_omits_ui_name() {
-        let prompt =
-            render_projects_prompt(&[(Utf8PathBuf::from("/repo/rho"), "Agent runtime".to_owned())]);
-        assert!(prompt.contains("Path: /repo/rho"));
-        assert!(prompt.contains("Description: Agent runtime"));
-        assert!(!prompt.contains("name"));
-    }
-
     fn workdir(path: &str, kind: WorkdirKind) -> WorkdirPrompt {
         WorkdirPrompt {
             path: path.to_owned(),
@@ -844,19 +772,7 @@ mod tests {
 
     #[test]
     fn role_guidance_is_separate_from_the_base_prompt() {
-        assert!(!BASE_PROMPT.contains("## PM"));
         assert!(!BASE_PROMPT.contains("## Advisor"));
-        assert!(PM_BASE_PROMPT.contains("Do not inspect or modify"));
-        assert!(PM_BASE_PROMPT.contains("Always delegate technical requests"));
-        assert!(PM_BASE_PROMPT.contains("Use judgment"));
-        assert!(PM_BASE_PROMPT.contains("user requests or suggests"));
-        assert!(PM_BASE_PROMPT.contains("The intended asynchronous flow"));
-        assert!(PM_BASE_PROMPT.contains("Do not poll or wait"));
-        assert!(PM_BASE_PROMPT.contains("exactly, verbatim, and in full"));
-        assert!(PM_BASE_PROMPT.contains("Additional context from PM:"));
-        assert!(PM_BASE_PROMPT.contains("relay Engineer reports faithfully"));
-        assert!(PM_BASE_PROMPT.contains("failed checks, or unresolved work"));
-        assert!(PM_BASE_PROMPT.contains("Never claim work is complete"));
         assert!(ADVISOR_PROMPT.contains("advisory only"));
         for section in [
             "## Read before you advise",
@@ -911,13 +827,6 @@ mod tests {
                 workflow: AgentWorkflow::PrFriendly,
             },
         );
-        let pm = claude_prompt(
-            None,
-            None,
-            AgentRole::WorkflowPM {
-                workflow: AgentWorkflow::PrFriendly,
-            },
-        );
         let default_engineer = claude_prompt(
             None,
             None,
@@ -928,8 +837,6 @@ mod tests {
 
         assert!(engineer.contains("## Design Alignment"));
         assert!(engineer.contains("## GitHub Workflow"));
-        assert!(!pm.contains("## Design Alignment"));
-        assert!(pm.contains("## GitHub Workflow"));
         assert!(!default_engineer.contains("## Design Alignment"));
     }
 

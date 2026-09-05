@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent2::{SourceWaker, Tool, ToolHaste, ToolSession};
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools, WRITE_STDIN_TOOL_NAME};
 use rho_workspaces::PathOverrides;
 use serde_json::json;
 use tokio::sync::Notify;
 
-use crate::{ShellTool, tools};
+use crate::{ShellTool, SourceWaker, Tool, ToolHaste, ToolSession, tools};
 
 fn shell() -> ShellTools {
     ShellTools::in_directory(

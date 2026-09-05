@@ -51,12 +51,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
   parsing, polling cadence, and retry policy. The daemon only consumes parsed
   snapshots and persists them through its existing quota store.
-- `rho-agent2` is an isolated experimental harness with only native inference,
-  durable transcript/queue state, pull-based tool and peer-mail scheduling,
-  streaming observation, and cancellation. It intentionally has no code mode,
-  workspace/context discovery, collaboration, Claude runtime, or CLI/daemon/UI
-  integration. Its architecture and governing decisions are recorded under
-  `crates/rho-agent2/specs/`.
+- `rho-agent`'s runtime loop (`src/agent/`) is built around one decision,
+  asked after every event: should the next request start now? Tools, peer
+  mail and user input are pull-based sources it drains at that boundary; the
+  model paces its own check-ins with a core-owned `wait` tool. Its
+  architecture and governing decisions are recorded under
+  `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
+  shape that loop consumes.
 - `rho-workspaces` owns checkout materialization and filesystem views. A
   `Workspace` is one materialized checkout (a stable jj-managed bcachefs
   subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a
@@ -415,14 +416,14 @@ workspace-relative symbols and snapshot scope follow the spawning agent.
 Sandboxed parents create only sandboxed child workdirs;
 detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
-use `ask_advisor` to create an advisory session; PMs cannot. `message_agent` is
+use `ask_advisor` to create an advisory session. `message_agent` is
 an unrestricted bidirectional
 mail bus for any known role-prefixed handle, including Advisor context requests;
-`wait_agent` waits for incoming mail. Each agent record stores whether it was
-created directly, by a PM, or by an Engineer so prompt ownership context is an
-immutable creation-time fact rather than inferred later. Advisors retain normal
-shell/patch capabilities plus messaging/waiting but cannot spawn or interrupt.
-User-facing handles remain `eng-*`, `pm-*`, and `adv-*` over `AgentId`.
+an agent waits for mail with its loop's own `wait` tool. Each agent record
+stores whether it was created directly or by an Engineer so prompt ownership
+context is an immutable creation-time fact rather than inferred later. Advisors
+retain normal shell/patch capabilities plus messaging but cannot spawn or
+interrupt. User-facing handles remain `eng-*` and `adv-*` over `AgentId`.
 Mail delivery is an internal daemon operation, not a UI protocol lifecycle.
 It activates a parked recipient when necessary and awaits a per-delivery
 acceptance channel. Native Rho acknowledges after its queued event is committed;
@@ -435,27 +436,15 @@ fast mode, and direct tools instead of code mode. Engineers spawned by an
 parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
 `advisor-cheap` Advisors; `advisor-cheap` uses GPT-5.6 Terra with xhigh
 reasoning.
-PMs run with the normal direct tool surface (never code mode), coordinate
-exclusively through collaboration tools, and do not receive shell command,
-process-input, or patch tools. Their prompts omit repository `AGENTS.md` content
-and skills as well as the working-directory Environment section; technical
-requests are delegated to Engineers carrying the user's instructions verbatim.
-PMs use judgment when routing follow-ups: they may reuse the responsible
-Engineer, but spawn a fresh one when warranted or requested or suggested by the
-user.
-PMs do not receive `wait_agent`: they end their turn after delegation and agent
-mail wakes them for the next request. Their prompt states this asynchronous
-delegate, acknowledge, end-turn, wake-on-mail, and relay flow explicitly.
 
 The database also stores a global project registry, distinct from each agent's
 fixed execution `workdirs`. Projects are keyed by local repository path and
-carry a UI-only name plus a description. PM prompts receive only project paths
-and descriptions so they can route Engineers without repository access of
-their own; UI clients retain names for display and selection.
+carry a UI-only name plus a description; UI clients use the names for display
+and selection.
 
 `AgentRole` also carries a persistence-compatible workflow distinction:
-existing Engineer/PM variants are the default workflow, while appended
-workflow-bearing Engineer/PM variants carry `AgentWorkflow`. The
+the existing Engineer variants are the default workflow, while appended
+workflow-bearing Engineer variants carry `AgentWorkflow`. The
 `AgentWorkflow::PrFriendly` marker activates `github-workflow` guidance
 without changing the visible role label or model binding.
 

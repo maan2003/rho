@@ -114,6 +114,14 @@ pub struct Timestamp {
     pub precision: TimestampPrecision,
 }
 
+/// A position in one agent's story: what the log calls the same thing
+/// (`AGENT-LOG-DESIGN.md`). Held here so a verdict on an agent can say how
+/// far it went without this crate knowing what a story event is.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
+)]
+pub struct StoryPos(pub u64);
+
 /// A Slack timestamp: its message ordering as well as its time.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
 pub struct SlackTs(pub String);
@@ -173,6 +181,10 @@ pub enum Property {
     /// with. The cursor is per source, at that source's own position, so
     /// an agent's will sit beside this one rather than share it.
     SlackHandledThrough(SlackTs),
+    /// The agent verdict cursor: everything the agent's story told up to
+    /// this position has been dealt with. A story position, which only
+    /// grows, so a rewind cannot make a handled card open again.
+    AgentHandledThrough(StoryPos),
     /// What the newest message was when the user snoozed the unit. A
     /// snooze does not move the cursor, so this is the only way to tell a
     /// message that arrived during the snooze from one that was already
@@ -196,6 +208,7 @@ pub enum PropertyKey {
     Deadline,
     PaceDays,
     SlackHandledThrough,
+    AgentHandledThrough,
     SlackSnoozedAt,
     Deleted,
     CreatedAt,
@@ -229,6 +242,7 @@ impl Property {
             Property::Deadline(_) => PropertyKey::Deadline,
             Property::PaceDays(_) => PropertyKey::PaceDays,
             Property::SlackHandledThrough(_) => PropertyKey::SlackHandledThrough,
+            Property::AgentHandledThrough(_) => PropertyKey::AgentHandledThrough,
             Property::SlackSnoozedAt(_) => PropertyKey::SlackSnoozedAt,
             Property::Deleted(_) => PropertyKey::Deleted,
             Property::CreatedAt(_) => PropertyKey::CreatedAt,
@@ -291,6 +305,7 @@ impl PropertyKey {
             PropertyKey::SlackHandledThrough => {
                 Some(Property::SlackHandledThrough(SlackTs(String::new())))
             }
+            PropertyKey::AgentHandledThrough => Some(Property::AgentHandledThrough(StoryPos(0))),
             PropertyKey::SlackSnoozedAt => Some(Property::SlackSnoozedAt(SlackTs(String::new()))),
             PropertyKey::Name | PropertyKey::CreatedAt => None,
         }
@@ -408,6 +423,29 @@ pub struct SlackVerdict {
     pub newest: SlackTs,
 }
 
+/// Where an agent's story stood when a verdict was made. Like a Slack
+/// unit's newest message, this is not in the store, so the caller brings
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentVerdict {
+    pub newest: StoryPos,
+}
+
+/// The agent facts a verdict entry claims, read back out of its changes,
+/// so a checker can rebuild the same shape the writer built.
+pub fn agent_verdict(id: &Id, changes: &[FactChange]) -> Option<AgentVerdict> {
+    if !matches!(id, Id::Agent(_)) {
+        return None;
+    }
+    changes
+        .iter()
+        .filter(|change| &change.id == id)
+        .find_map(|change| match change.after.as_ref()? {
+            Property::AgentHandledThrough(pos) => Some(AgentVerdict { newest: *pos }),
+            _ => None,
+        })
+}
+
 /// The Slack facts a verdict entry claims, read back out of its changes,
 /// so a checker can rebuild the same shape the writer built.
 pub fn slack_verdict(id: &Id, changes: &[FactChange]) -> Option<SlackVerdict> {
@@ -431,6 +469,7 @@ pub fn verdict_changes(
     before: &dyn Fn(&PropertyKey) -> Option<Property>,
     cadence: Option<TodoCadence>,
     slack: Option<SlackVerdict>,
+    agent: Option<AgentVerdict>,
 ) -> Result<Vec<FactChange>, String> {
     let change = |after: Property| FactChange {
         id: id.clone(),
@@ -456,17 +495,24 @@ pub fn verdict_changes(
     // something from them past the cursor", and a history page cannot make
     // that true again.
     if let Id::Slack(_) = id {
-        let slack = slack.ok_or("a verdict on a Slack unit needs its newest message")?;
-        let handled = || change(Property::SlackHandledThrough(slack.newest.clone()));
+        // Only a verdict that moves the cursor needs one. Filing says where
+        // a unit lives and says nothing about what is read, so demanding a
+        // cursor here refused every `f` on a Slack card.
+        let cursor = || {
+            slack
+                .clone()
+                .ok_or_else(|| "a verdict on a Slack unit needs its newest message".to_owned())
+        };
+        let handled = || Ok::<_, String>(change(Property::SlackHandledThrough(cursor()?.newest)));
         return match verdict {
-            Verdict::Done => Ok(vec![handled()]),
+            Verdict::Done => Ok(vec![handled()?]),
             // Mute is done plus a state, because done alone is only "up to
             // here" and the next message would be past it. The state is what
             // keeps the unit quiet however much arrives; opening it clears
             // the state, and the silence rho asks Slack for (a thread
             // unfollowed, a conversation marked read) is the caller's to
             // send, so following the thread again still brings the card back.
-            Verdict::Mute => Ok(vec![handled(), change(Property::State(State::Muted))]),
+            Verdict::Mute => Ok(vec![handled()?, change(Property::State(State::Muted))]),
             // The cursor stays where it is, so the messages the user has not
             // handled are still theirs when the snooze ends. What is
             // recorded is where the unit stood, which is what makes a reply
@@ -474,7 +520,7 @@ pub fn verdict_changes(
             Verdict::Defer { until } => Ok(vec![
                 change(Property::DeferUntil(Some(*until))),
                 change(Property::PaceDays(0)),
-                change(Property::SlackSnoozedAt(slack.newest.clone())),
+                change(Property::SlackSnoozedAt(cursor()?.newest)),
             ]),
             Verdict::File { parent } => one(Property::Parent(Some(parent.clone()))),
             // Handled above: a label is the same cell on every kind of id.
@@ -488,7 +534,49 @@ pub fn verdict_changes(
                     after: Some(after),
                 };
                 Ok(vec![
-                    handled(),
+                    handled()?,
+                    fresh(Property::Deleted(true), Property::Deleted(false)),
+                    fresh(
+                        Property::DeferUntil(None),
+                        Property::DeferUntil(Some(cadence.defer_until)),
+                    ),
+                    fresh(Property::PaceDays(0), Property::PaceDays(cadence.pace_days)),
+                ])
+            }
+        };
+    }
+    // An agent closes the same way a Slack unit does, at its own source's
+    // position: what the card asks is whether the story has told anything
+    // new past the cursor, and a rewind cannot make that true again
+    // because positions only grow.
+    if let Id::Agent(_) = id {
+        // As with a Slack unit: only what moves the cursor needs one, so
+        // filing an agent under a note works whether or not the caller has
+        // its story position.
+        let cursor =
+            || agent.ok_or_else(|| "a verdict on an agent needs its story position".to_owned());
+        let handled = || Ok::<_, String>(change(Property::AgentHandledThrough(cursor()?.newest)));
+        return match verdict {
+            Verdict::Done => Ok(vec![handled()?]),
+            Verdict::Mute => Ok(vec![handled()?, change(Property::State(State::Muted))]),
+            // The cursor stays put, so what the agent said while the user
+            // was away is still theirs when the snooze ends.
+            Verdict::Defer { until } => Ok(vec![
+                change(Property::DeferUntil(Some(*until))),
+                change(Property::PaceDays(0)),
+            ]),
+            Verdict::File { parent } => one(Property::Parent(Some(parent.clone()))),
+            Verdict::Label { .. } => unreachable!(),
+            Verdict::Todo { note } => {
+                let cadence = cadence.ok_or("a todo verdict needs its cadence")?;
+                let fresh = |before: Property, after: Property| FactChange {
+                    id: note.clone(),
+                    key: after.key(),
+                    before: Some(before),
+                    after: Some(after),
+                };
+                Ok(vec![
+                    handled()?,
                     fresh(Property::Deleted(true), Property::Deleted(false)),
                     fresh(
                         Property::DeferUntil(None),
@@ -614,6 +702,8 @@ pub struct Facts {
     pub deadline: Option<Timestamp>,
     pub pace_days: u32,
     pub slack_handled_through: Option<SlackTs>,
+    /// How far the user has dealt with this agent's story.
+    pub agent_handled_through: Option<StoryPos>,
     pub slack_snoozed_at: Option<SlackTs>,
     pub deleted: bool,
     pub created_at: Option<Timestamp>,
@@ -633,6 +723,7 @@ impl Facts {
             || self.deadline.is_some()
             || self.pace_days != 0
             || self.slack_handled_through.is_some()
+            || self.agent_handled_through.is_some()
             || self.created_at.is_some()
     }
 }
@@ -884,6 +975,7 @@ impl Store {
                 Property::Deadline(at) => facts.deadline = *at,
                 Property::PaceDays(days) => facts.pace_days = *days,
                 Property::SlackHandledThrough(ts) => facts.slack_handled_through = Some(ts.clone()),
+                Property::AgentHandledThrough(pos) => facts.agent_handled_through = Some(*pos),
                 Property::SlackSnoozedAt(ts) => facts.slack_snoozed_at = Some(ts.clone()),
                 Property::Deleted(deleted) => facts.deleted = *deleted,
                 Property::CreatedAt(at) => facts.created_at = Some(*at),
@@ -926,6 +1018,8 @@ fn wins(new: &Cell, old: &Cell) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rho_core::AgentIdDomain;
+
     use super::*;
 
     fn device(byte: u8) -> DeviceId {
@@ -959,6 +1053,35 @@ mod tests {
             cells,
             verdicts: vec![],
             version: Version::new(),
+        }
+    }
+
+    /// Filing says where a thing lives, not what has been read, so it is
+    /// the one verdict a Slack unit and an agent can take without a cursor.
+    /// Requiring one here refused every `f` on a Slack or agent card.
+    #[test]
+    fn filing_needs_no_cursor() {
+        let parent = note(3);
+        let verdict = Verdict::File {
+            parent: parent.clone(),
+        };
+        for id in [
+            Id::Slack(SlackUnit {
+                workspace: "acme".to_owned(),
+                channel: "C1".to_owned(),
+                thread: None,
+            }),
+            Id::Agent(AgentId::from_counter(1, &AgentIdDomain(7)).expect("agent id")),
+        ] {
+            let changes = verdict_changes(&id, &verdict, &|_| None, None, None, None)
+                .expect("filing takes no cursor");
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.after.clone())
+                    .collect::<Vec<_>>(),
+                vec![Some(Property::Parent(Some(parent.clone())))]
+            );
         }
     }
 
@@ -1212,6 +1335,7 @@ mod tests {
             &|key| store.property(&note(1), key).cloned(),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(changes[0].before, Some(Property::State(State::Open)));
@@ -1238,6 +1362,7 @@ mod tests {
                 Some(SlackVerdict {
                     newest: newest.clone(),
                 }),
+                None,
             )
             .unwrap()
         };
@@ -1288,7 +1413,7 @@ mod tests {
         // A verdict on a unit whose newest message nobody supplied is a
         // verdict that would write an empty cursor, so it is refused.
         assert!(
-            verdict_changes(&unit, &Verdict::Done, &|_| None, None, None).is_err(),
+            verdict_changes(&unit, &Verdict::Done, &|_| None, None, None, None).is_err(),
             "a cursor cannot be invented"
         );
     }

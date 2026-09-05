@@ -64,6 +64,22 @@ impl AgentStore {
     pub fn apply(&mut self, agent_id: AgentId, frame: AgentRemoteFrame) -> FrameSummary {
         let state = self.states.entry(agent_id).or_insert_with(empty_state);
         let old_status = state.status;
+        // A snapshot with no blocks says the daemon has nothing loaded for
+        // this agent, never that the agent said nothing. Letting it through
+        // wiped a transcript read from the story and left the reader with a
+        // blank page and a composer.
+        if let AgentRemoteFrame::Snapshot(fresh) = &frame
+            && fresh.blocks.is_empty()
+            && !state.blocks.is_empty()
+        {
+            state.status = fresh.status;
+            state.context_used = fresh.context_used;
+            state.usage = fresh.usage.clone();
+            return FrameSummary {
+                first_changed_block: None,
+                incremental: None,
+            };
+        }
         let mut summary = summarize(&frame);
         frame.apply_diff(state);
         // Elision gives the last fold in an open turn a limited visible tail,
@@ -181,6 +197,27 @@ mod tests {
             context_used: None,
             usage: None,
         }
+    }
+
+    /// The daemon sends a snapshot with no blocks for an agent it has not
+    /// loaded. The story the client read is better than that, so it stays.
+    #[test]
+    fn an_empty_snapshot_does_not_wipe_a_told_transcript() {
+        let agent_id = AgentId::from_counter(7, &rho_ui_proto::AgentIdDomain(0)).expect("agent id");
+        let mut store = AgentStore::default();
+        let mut told = empty_state();
+        told.blocks = vec![UiBlock::Notice {
+            text: "read from the story".to_owned(),
+        }];
+        store.apply(agent_id, AgentRemoteFrame::Snapshot(told));
+
+        let mut nothing = empty_state();
+        nothing.status = UiAgentStatus::Unloaded;
+        store.apply(agent_id, AgentRemoteFrame::Snapshot(nothing));
+
+        let state = store.get(&agent_id).expect("the agent has a state");
+        assert_eq!(state.blocks.len(), 1, "the told blocks stayed");
+        assert_eq!(state.status, UiAgentStatus::Unloaded, "the status is taken");
     }
 
     #[test]

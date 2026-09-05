@@ -67,9 +67,9 @@ pub(crate) struct DeskCellStore {
 }
 
 impl DeskCellStore {
-    pub(crate) async fn new(db: RhoDb, machine_seed: u64) -> Result<Self, String> {
+    pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
-        initialize(&mut write, machine_seed)?;
+        initialize(&mut write)?;
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -213,6 +213,212 @@ impl DeskCellStore {
         write.open_table(META).insert(&(), SenValue::owned(meta));
         write.commit();
         Ok(namespace)
+    }
+
+    /// Moves the user's filed and snoozed agents out of the transitional
+    /// attention table and into the store, where every other verdict of
+    /// theirs lives: hidden becomes `Mute`, snoozed becomes `Defer`. One
+    /// verdict entry per agent, authored by the daemon's own device.
+    ///
+    /// Once: an agent that already carries the fact is skipped, so a second
+    /// run writes nothing. Deleted with the table it reads
+    /// (`AGENT-LOG-DESIGN.md`).
+    pub(crate) async fn convert_agent_dispositions(
+        &self,
+        agents: &[(rho_core::AgentId, rho_core::AgentDisposition, u64)],
+    ) -> Result<(usize, usize), String> {
+        let mut write = self.db.write().await;
+        let mut meta = load_meta_from_write(&mut write)?;
+        let snapshot = read_snapshot_from_write(&mut write)?;
+        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let (mut muted, mut deferred) = (0, 0);
+        for (agent_id, disposition, story_pos) in agents {
+            let id = Id::Agent(*agent_id);
+            let verdict = match disposition {
+                rho_core::AgentDisposition::Hidden => {
+                    if store.property(&id, &PropertyKey::State).is_some() {
+                        continue;
+                    }
+                    muted += 1;
+                    rho_desk::cells::Verdict::Mute
+                }
+                rho_core::AgentDisposition::Snoozed { until } => {
+                    if store.property(&id, &PropertyKey::DeferUntil).is_some() {
+                        continue;
+                    }
+                    deferred += 1;
+                    rho_desk::cells::Verdict::Defer {
+                        until: rho_desk::cells::Timestamp {
+                            unix_ms: until.0 as i64,
+                            precision: rho_desk::cells::TimestampPrecision::Minute,
+                        },
+                    }
+                }
+                rho_core::AgentDisposition::Pending | rho_core::AgentDisposition::Done => continue,
+            };
+            let before = |key: &PropertyKey| store.property(&id, key).cloned();
+            // A verdict on an agent is written at its story position, the
+            // same as one the user gives today; without it the conversion
+            // is rejected and the disposition is silently left behind.
+            let agent_verdict = rho_desk::cells::AgentVerdict {
+                newest: rho_desk::cells::StoryPos(*story_pos),
+            };
+            let changes = rho_desk::cells::verdict_changes(
+                &id,
+                &verdict,
+                &before,
+                None,
+                None,
+                Some(agent_verdict),
+            )?;
+            for change in &changes {
+                if let Some(after) = change.after.clone() {
+                    store.write(change.id.clone(), after)?;
+                }
+            }
+            store.append_verdict(id, verdict, changes)?;
+        }
+        if muted == 0 && deferred == 0 {
+            return Ok((0, 0));
+        }
+        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
+        meta.frontier = store.version().clone();
+        write
+            .open_table(META)
+            .insert(&(), SenValue::borrowed(&meta));
+        write.commit();
+        Ok((muted, deferred))
+    }
+
+    /// Moves the registered projects out of their own table and into the
+    /// store, where the client reads them: one label per project, carrying
+    /// its name and the workdir it stands for. The label's id is derived
+    /// from the path, so a second run recognises what the first wrote.
+    ///
+    /// Once, like every conversion: a project that already has its label is
+    /// skipped. Deleted with the table it reads (`AGENT-LOG-DESIGN.md`).
+    /// The workdirs the user has filed as projects: the labels that carry
+    /// a `Project`, name and path. Iris routes by these; the daemon's old
+    /// `projects` table is gone.
+    pub(crate) fn projects(&self) -> Vec<(camino::Utf8PathBuf, String)> {
+        let read = self.db.read();
+        let meta = read.open_table(META);
+        let Some(daemon_device) = meta
+            .get(&())
+            .map(|meta| meta.value().as_ref().daemon_device)
+        else {
+            return Vec::new();
+        };
+        let Ok(snapshot) = read_snapshot(&read) else {
+            return Vec::new();
+        };
+        let Ok(store) = Store::from_snapshot(daemon_device, snapshot) else {
+            return Vec::new();
+        };
+        let mut projects = store
+            .all_facts()
+            .into_iter()
+            .filter(|(id, _)| matches!(id, Id::Label(_)))
+            .filter_map(|(_, facts)| Some((facts.project?.path, facts.name?)))
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.1.cmp(&right.1));
+        projects
+    }
+
+    pub(crate) async fn convert_projects(
+        &self,
+        machine_seed: u64,
+        projects: &[(camino::Utf8PathBuf, rho_agent::db::ProjectRecord)],
+    ) -> Result<usize, String> {
+        let mut write = self.db.write().await;
+        let mut meta = load_meta_from_write(&mut write)?;
+        let snapshot = read_snapshot_from_write(&mut write)?;
+        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let mut written = 0;
+        for (path, record) in projects {
+            let id = Id::Label(project_label_id(path));
+            if store.property(&id, &PropertyKey::Project).is_some() {
+                continue;
+            }
+            written += 1;
+            store.write(
+                id.clone(),
+                rho_desk::cells::Property::Name(record.name.clone()),
+            )?;
+            store.write(
+                id.clone(),
+                rho_desk::cells::Property::Project(Some(rho_desk::cells::Project {
+                    host: machine_seed,
+                    path: path.clone(),
+                })),
+            )?;
+            store.write(
+                id,
+                rho_desk::cells::Property::CreatedAt(rho_desk::cells::Timestamp {
+                    unix_ms: record.created_at.0 as i64,
+                    precision: rho_desk::cells::TimestampPrecision::Millisecond,
+                }),
+            )?;
+        }
+        if written == 0 {
+            return Ok(0);
+        }
+        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
+        meta.frontier = store.version().clone();
+        write
+            .open_table(META)
+            .insert(&(), SenValue::borrowed(&meta));
+        write.commit();
+        Ok(written)
+    }
+
+    /// Files a set of agents under one note, for a rig fixture: Home ranks
+    /// agents through the note they sit under, so seeded agents nobody
+    /// filed would never reach the queue.
+    ///
+    /// Writes as the daemon's own device, like the conversions. Never runs
+    /// on its own; only `rho debug seed-agents` calls it.
+    pub(crate) async fn seed_desk_rows(
+        &self,
+        note_text: &str,
+        agents: &[rho_core::AgentId],
+    ) -> Result<Id, String> {
+        let mut write = self.db.write().await;
+        let mut meta = load_meta_from_write(&mut write)?;
+        let snapshot = read_snapshot_from_write(&mut write)?;
+        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        let created_at = rho_desk::cells::Timestamp {
+            unix_ms: rho_core::UnixMs::now().0 as i64,
+            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+        };
+        let note = Id::Note(rho_desk::cells::Uuid(*uuid::Uuid::new_v4().as_bytes()));
+        store.write(note.clone(), Property::Parent(None))?;
+        store.write(note.clone(), Property::CreatedAt(created_at))?;
+        for agent_id in agents {
+            let id = Id::Agent(*agent_id);
+            store.write(id.clone(), Property::Parent(Some(note.clone())))?;
+            store.write(id, Property::CreatedAt(created_at))?;
+        }
+        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
+        meta.frontier = store.version().clone();
+        write
+            .open_table(META)
+            .insert(&(), SenValue::borrowed(&meta));
+        // The note's title is the first line of its body, so the fixture
+        // writes one the way an edit would.
+        let buffer_id = text::BufferId::new(1).map_err(|error| error.to_string())?;
+        let mut buffer = text::Buffer::new(text::ReplicaId::new(1), buffer_id, "");
+        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, note_text)]));
+        write.open_table(BODIES).insert(
+            SenValue::borrowed(&note),
+            SenValue::owned(BodySnapshot {
+                id: note.clone(),
+                operations: vec![operation],
+                transactions: Vec::new(),
+            }),
+        );
+        write.commit();
+        Ok(note)
     }
 
     pub(crate) async fn apply_mutation(
@@ -544,6 +750,7 @@ fn validate_verdict_shape(
         },
         rho_desk::cells::todo_cadence(changes),
         rho_desk::cells::slack_verdict(verdict_id, changes),
+        rho_desk::cells::agent_verdict(verdict_id, changes),
     )?;
     let sorted = |mut changes: Vec<rho_desk::cells::FactChange>| {
         changes.sort_by(|left, right| (&left.id, &left.key).cmp(&(&right.id, &right.key)));
@@ -569,11 +776,10 @@ fn validate_verdict_shape(
 }
 
 /// Opens the cell tables, making the empty state on a database that has
-/// none, and converting node cells to fact cells the one time there are
-/// any. The native-tree V1 conversion that used to run here is gone: it
-/// ran once on every daemon it was ever going to run on.
-pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), String> {
-    let mut meta = match write.open_table(META).get(&()) {
+/// none. The conversions that used to run here are gone: each ran once on
+/// every daemon it was ever going to run on.
+pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
+    let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
             let daemon_device = DeviceId(*uuid::Uuid::new_v4().as_bytes());
@@ -588,24 +794,6 @@ pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), 
     write.open_table(CELLS);
     write.open_table(VERDICTS);
     write.open_table(BODIES);
-    if let Some((cells, verdicts, bodies, report)) =
-        crate::desk_migration::migrate(write, meta.daemon_device, machine_seed)?
-    {
-        // The converted cells keep the stamps they were written with, so
-        // the frontier already covers them and peers still sync from the
-        // version they know.
-        for (device, version) in crate::desk_migration::frontier(&cells, &verdicts) {
-            let entry = meta.frontier.entry(device).or_insert(0);
-            *entry = (*entry).max(version);
-        }
-        let snapshot = Snapshot {
-            cells,
-            verdicts,
-            version: meta.frontier.clone(),
-        };
-        persist_snapshot(write, &snapshot, bodies)?;
-        tracing::info!("{}", report.line());
-    }
     write.open_table(META).insert(&(), SenValue::owned(meta));
     Ok(())
 }
@@ -757,6 +945,73 @@ fn persist_snapshot(
     Ok(())
 }
 
+/// Throwaway counts over a copy of the user's store, for the questions the
+/// landing has to answer. Deleted with the conversion code.
+#[cfg(test)]
+mod copy_counts {
+    use rho_agent::db::AgentReadTxnExt;
+    use rho_db::RhoDb;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs a copy of a real daemon store in RHO_PROOF_DB"]
+    async fn counts_what_the_store_holds_for_agents() {
+        let path = std::env::var("RHO_PROOF_DB").expect("RHO_PROOF_DB must name a copy");
+        let db = RhoDb::open(&path);
+        let snapshot = read_snapshot(&db.read()).expect("snapshot");
+        let store =
+            Store::from_snapshot(rho_desk::cells::DeviceId([0; 16]), snapshot).expect("store");
+
+        let mut deferred_agents = 0usize;
+        let mut noded_agents = std::collections::HashSet::new();
+        for (id, facts) in store.all_facts() {
+            let Id::Agent(agent_id) = id else { continue };
+            if facts.defer_until.is_some() {
+                deferred_agents += 1;
+            }
+            // What "has a store node" means for the dealer: the user's own
+            // filing, or a name, or a label.
+            if facts.parent.is_some()
+                || facts.filed
+                || facts.name.is_some()
+                || !facts.labels.is_empty()
+            {
+                noded_agents.insert(agent_id);
+            }
+        }
+
+        let week_ago = rho_core::UnixMs(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64)
+                - 7 * 24 * 60 * 60 * 1000,
+        );
+        let (mut recent, mut recent_without_node) = (0usize, 0usize);
+        for (agent_id, _) in db.read().list_agents() {
+            let attention = db.read().agent_attention(agent_id);
+            let last = attention
+                .last_turn_ended
+                .unwrap_or(attention.last_user_message)
+                .max(attention.last_user_message);
+            if last.0 < week_ago.0 {
+                continue;
+            }
+            recent += 1;
+            if !noded_agents.contains(&agent_id) {
+                recent_without_node += 1;
+            }
+        }
+        println!(
+            "store: {deferred_agents} agents carry defer_until, {} carry a node; \
+             {recent} agents had a turn in the last 7 days, {recent_without_node} of them \
+             have no node",
+            noded_agents.len()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rho_db::RhoDb;
@@ -771,7 +1026,7 @@ mod tests {
         let path = directory.path().join("rho.redb");
         let db = RhoDb::open(path);
         // RhoDb owns the open file after the temporary directory handle drops.
-        DeskCellStore::new(db, 42).await.unwrap()
+        DeskCellStore::new(db).await.unwrap()
     }
 
     fn at(unix_ms: i64) -> Timestamp {
@@ -1305,7 +1560,7 @@ mod tests {
     async fn a_row_this_build_cannot_read_is_skipped_rather_than_fatal() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
-        let store = DeskCellStore::new(db.clone(), 42).await.unwrap();
+        let store = DeskCellStore::new(db.clone()).await.unwrap();
         let device = DeviceId([19; 16]);
         let id = seed_note(&store, device).await;
 
@@ -1497,4 +1752,14 @@ mod tests {
                 .is_err()
         );
     }
+}
+
+/// A project's label id, derived from its path so the conversion is
+/// recognisable on a second run rather than duplicated.
+fn project_label_id(path: &camino::Utf8Path) -> rho_desk::cells::Uuid {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(path.as_str().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    rho_desk::cells::Uuid(bytes)
 }

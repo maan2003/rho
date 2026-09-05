@@ -459,6 +459,39 @@ else is built on. The transient lands after slice 2.
    under the thing it labels keeps the root row, or nothing would reach
    it). Screens: `br-12-burst.png`, `br-26-map-filed.png`.
 
+5. **The client keeps the store.** Decided 5 Sep, after slice B of
+   `AGENT-LOG-DESIGN.md` showed that a cold GUI has agents but nothing
+   to hang them on: the store's cells, verdicts, version and note bodies
+   arrive by `DeskSync` every session and are kept nowhere on the client.
+   The GUI keeps its own copy per host, on disk, beside the agent mirror
+   (`crates/rho-gui/src/mirror.rs`, host by name, a doubted row dropped
+   and asked for again): the confirmed `Store` (cells, verdicts, version)
+   and every `BodySnapshot`'s operations and transactions, written by the
+   same off-thread writer, replayed before any daemon answers, so Home,
+   the map, Find and note bodies read from disk first and `DeskSync`
+   asks with the real `known` version for the delta only. Two things
+   the wire must give for that to hold: bodies since a version, not whole
+   bodies on every sync (the client sends what it holds per body, the
+   daemon answers with the operations it lacks; b8os finds the smallest
+   honest shape), and pending mutations that survive a restart: the
+   `pending` queue and any unsent text operations are on disk too and go
+   out on connect in order, which is what makes a verdict or a note edit
+   taken offline real rather than lost. That queue exposes one daemon
+   rule to relax: a stamp today may not jump more than one past the
+   daemon's global maximum, which an offline batch does by design; the
+   rule becomes per device (a device's own versions strictly increase),
+   which is all the CRDT needs. Namespaces for the text replica stay the
+   daemon's per connection; operations kept from an earlier session keep
+   the replica id they were made under. What this is not yet: encrypted,
+   or a log the daemon cannot read. It is the device's copy that the
+   rho-sync direction above turns into a device log later; the store
+   interface from slice 1 is unchanged, so that swap stays a swap.
+   Offline Home is claimed when this lands (the agent mirror alone gives
+   heads and stories, `AGENT-LOG-DESIGN.md` slice E). Rig proof: GUI
+   started with no daemon shows Home with breadcrumbs, the map with
+   labels, a note body; a verdict and a note edit taken offline arrive
+   at the daemon on reconnect and a second GUI sees them.
+
 Each slice lands on its own with the tests of the slices before it green.
 
 ## Symptoms to watch for

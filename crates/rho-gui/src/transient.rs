@@ -699,14 +699,11 @@ pub fn root_menu() -> Transient {
         })
         .item(
             "m",
-            "iris microphone · mute/unmute",
+            "voice microphone · mute/unmute",
             |workspace, window, cx| {
                 workspace.cmd_voice(window, cx);
             },
         )
-        .item("shift-m", "iris follow selection", |workspace, _, cx| {
-            workspace.cmd_iris_follow_selection(cx);
-        })
         .item_when(
             Subject::has_agent,
             "a",
@@ -728,6 +725,12 @@ pub fn root_menu() -> Transient {
         })
         .item("b", "switch buffer…", |workspace, window, cx| {
             workspace.open_buffer_picker(window, cx);
+        })
+        // The echo area keeps two seconds; the log keeps everything it
+        // said. Reachable by no key at all until now, which made every
+        // notice that scrolled past unrecoverable.
+        .item("l", "message log", |workspace, window, cx| {
+            workspace.cmd_messages(window, cx);
         })
         .item("k", "surface back", |workspace, window, cx| {
             workspace.cmd_surface_back(window, cx);
@@ -877,13 +880,13 @@ fn input_menu() -> Transient {
     Transient::new("input")
         .item(
             "m",
-            "iris microphone · mute/unmute",
+            "voice microphone · mute/unmute",
             |workspace, window, cx| {
                 workspace.cmd_voice(window, cx);
             },
         )
-        .item("e", "iris session · end", |workspace, _, cx| {
-            workspace.cmd_end_iris(cx);
+        .item("e", "voice session · end", |workspace, _, cx| {
+            workspace.cmd_end_voice(cx);
         })
         .item("p", "paste clipboard", |workspace, window, cx| {
             workspace.cmd_paste_prompt(window, cx);

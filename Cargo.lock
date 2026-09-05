@@ -13602,8 +13602,7 @@ dependencies = [
  "rand 0.8.7",
  "redb",
  "redb-derive",
- "rho-agent2",
- "rho-agent2-tools",
+ "rho-agent-tools",
  "rho-claude",
  "rho-code-mode",
  "rho-context-config",
@@ -13623,34 +13622,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-agent2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "bytes",
- "futures 0.3.33",
- "prefix-id",
- "rand 0.8.7",
- "redb",
- "redb-derive",
- "rho-core",
- "rho-db",
- "rho-inference",
- "senax-encoder",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "rho-agent2-tools"
+name = "rho-agent-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.33",
- "rho-agent2",
  "rho-code-mode",
  "rho-core",
  "rho-tool-shell",
@@ -13921,8 +13897,10 @@ dependencies = [
  "octo-types",
  "org-element",
  "path",
+ "prefix-id",
  "project",
  "redb",
+ "redb-derive",
  "release_channel",
  "rho-browser",
  "rho-core",
@@ -14045,6 +14023,7 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rho-agent",
+ "rho-core",
  "rho-db",
  "rustls",
  "senax-encoder",

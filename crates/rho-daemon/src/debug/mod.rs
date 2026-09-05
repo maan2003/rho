@@ -33,6 +33,19 @@ enum DebugCommand {
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
+    /// Write a few agents with whole stories into a database, for driving
+    /// a rig by hand. Refuses the daemon's own database: `--db-path` must
+    /// name the rig's.
+    SeedAgents,
+    /// Tell one more turn on a seeded agent, so a rig can watch a card
+    /// come back. Refuses the daemon's own database, like `seed-agents`.
+    NudgeAgent {
+        /// The agent's id, or any prefix of it.
+        agent: String,
+        /// Whether the new turn asks the user for something.
+        #[arg(long)]
+        asks: bool,
+    },
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
@@ -46,8 +59,81 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Agents => print_agents(args.db_path).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
         DebugCommand::Context => print_context(args.db_path).await,
+        DebugCommand::SeedAgents => seed_agents(args.db_path).await,
+        DebugCommand::NudgeAgent { agent, asks } => nudge_agent(args.db_path, &agent, asks).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
+}
+
+/// The fixture, written straight into the named database. The daemon must
+/// not be running on it: redb takes the lock, and a daemon that already
+/// read its heads would not see these.
+async fn seed_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    use rho_agent::story_fixture::Situation;
+
+    let path = db_path.context(
+        "seed-agents needs --db-path: it writes agents, and never into the daemon's own database",
+    )?;
+    if default_db_path().is_ok_and(|daemon| daemon == path) {
+        anyhow::bail!(
+            "refusing to seed the daemon's own database at {}",
+            path.display()
+        );
+    }
+    let db = RhoDb::open(&path);
+    let seeded = rho_agent::story_fixture::seed(
+        &db,
+        &[
+            ("the deploy", Situation::Asking),
+            ("release notes", Situation::Showing),
+            ("flaky test", Situation::Errored),
+            ("index rebuild", Situation::Working),
+            ("changelog", Situation::Quiet),
+        ],
+    )
+    .await;
+    // Home ranks an agent through the note it is filed under, so the
+    // fixture files them too.
+    let desk = crate::desk_cells::DeskCellStore::new(db)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    desk.seed_desk_rows("rig agents", &seeded)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "seeded {} agents into {}, filed under one note",
+        seeded.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+async fn nudge_agent(db_path: Option<PathBuf>, agent: &str, asks: bool) -> anyhow::Result<()> {
+    let path =
+        db_path.context("nudge-agent needs --db-path: the rig's database, never the daemon's")?;
+    if default_db_path().is_ok_and(|daemon| daemon == path) {
+        anyhow::bail!(
+            "refusing to write the daemon's own database at {}",
+            path.display()
+        );
+    }
+    let db = RhoDb::open(&path);
+    let read = db.read();
+    let agent_id = read
+        .list_agents()
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| id.encoded().starts_with(agent) || format!("{id:?}").contains(agent))
+        .with_context(|| format!("no agent matching `{agent}`"))?;
+    drop(read);
+    rho_agent::story_fixture::nudge(
+        &db,
+        agent_id,
+        asks.then_some(rho_agent::story::AgentWant::Ask),
+    )
+    .await;
+    println!("told one more turn on {}", agent_id.encoded());
+    Ok(())
 }
 
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
@@ -119,7 +205,6 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-gemini" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Gemini,
         },
-        "pm" => AgentRole::pm(),
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
@@ -173,40 +258,31 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     for (agent_id, agent) in agents {
         writeln!(output)?;
         writeln!(output, "{agent_id:?}")?;
-        if let Some(name) = &agent.display_name {
+        if let Some(name) = agent.title() {
             writeln!(output, "  name: {name}")?;
         }
-        if let Some(parent) = agent.parent_agent {
-            writeln!(output, "  parent: {parent:?}")?;
-        }
-        if !agent.labels.is_empty() {
-            writeln!(output, "  labels: {}", agent.labels.join(", "))?;
-        }
+        writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
-            "  disposition: {}",
-            disposition_name(agent.disposition)
+            "  story: head {:?}, {} events told",
+            agent.story_pos,
+            read.agent_story(agent_id, Default::default()).len()
         )?;
-        writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
-        writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
             "  workdirs: {}",
             agent
+                .config
                 .workdirs
                 .iter()
                 .map(workspace_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
                 writeln!(output, "  runtime: rho")?;
                 writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
-            }
-            AgentRuntime::Rho2 { core } => {
-                writeln!(output, "  runtime: rho-agent2")?;
-                writeln!(output, "  core: {core:?}")?;
             }
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
@@ -243,9 +319,9 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         writeln!(
             output,
             "{agent_id:?} ({})",
-            agent.display_name.as_deref().unwrap_or("unnamed")
+            agent.title().unwrap_or("unnamed")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { .. } => {
                 let (_, events) = read.agent_events(agent_id);
                 let mut context_used = None;
@@ -269,10 +345,6 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                     events.len()
                 )?;
                 writeln!(output, "  restored context_used: {context_used:?}")?;
-            }
-            AgentRuntime::Rho2 { core } => {
-                writeln!(output, "  runtime: rho-agent2")?;
-                writeln!(output, "  core: {core:?}")?;
             }
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
@@ -343,6 +415,19 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
+    // Slice B drops these on the start that no longer needs them; a
+    // migration check is the place that says whether they are still there.
+    for table in ["projects", "view_config", "agent_attention_until_slice_b"] {
+        writeln!(
+            output,
+            "table {table}: {}",
+            if read.has_table(table) {
+                "present"
+            } else {
+                "dropped"
+            }
+        )?;
+    }
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }
@@ -355,21 +440,9 @@ async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
-    use rho_agent::db::AgentDisposition;
-    match disposition {
-        AgentDisposition::Pending => "pending".to_owned(),
-        AgentDisposition::Done => "done".to_owned(),
-        AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
-        AgentDisposition::Hidden => "hidden".to_owned(),
-    }
-}
-
 fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => "pm".to_owned(),
-        AgentRole::Iris => "iris".to_owned(),
         AgentRole::Advisor { intelligence } => format!(
             "advisor {}",
             match intelligence {
