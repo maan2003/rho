@@ -200,7 +200,7 @@ impl AgentUsageBucket {
 
 fn usage_model(record: &AgentRecord) -> AgentUsageModel {
     match record.runtime {
-        AgentRuntime::Rho { .. } => match record.binding.deep_model() {
+        AgentRuntime::Rho { .. } | AgentRuntime::Rho2 { .. } => match record.binding.deep_model() {
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
             Some(InferenceModel::Gemini37FlashLow) => AgentUsageModel::GEMINI,
@@ -399,8 +399,17 @@ impl AgentRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum AgentRuntime {
-    Rho { prompt_cache_key: PromptCacheKey },
-    Claude { session_id: Uuid },
+    Rho {
+        prompt_cache_key: PromptCacheKey,
+    },
+    Claude {
+        session_id: Uuid,
+    },
+    /// The `rho-agent2` loop, whose own record and event log live under
+    /// `core` in the same database.
+    Rho2 {
+        core: AgentId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

@@ -20,11 +20,13 @@ use std::time::Duration;
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall, ToolCallId, ToolName,
-    ToolOutput, ToolOutputStatus, ToolResult, ToolUpdate, UnixMs,
+    ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType, ToolUpdate, UnixMs,
 };
 use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use senax_encoder::{Decode, Encode};
+use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::boundary::{Boundary, ModelAsked, ModelTurn, SourceKind, boundary};
@@ -33,6 +35,90 @@ use crate::db::{AgentEvent, EventPos};
 use crate::preview::text_of;
 pub use crate::preview::{PendingItem, Preview};
 pub use crate::tool::{SourceWaker, Tool, ToolHaste, ToolSession};
+
+// -- the one tool the core answers itself -----------------------------------
+
+/// The model's way of naming how long to be left alone. It is the only call
+/// whose argument the core reads, because `boundary` is the only thing it is
+/// for: `DECISION-model-sets-the-pace`. No session is spawned for it; the
+/// answer is written at the next drain, whenever the boundary comes.
+pub const WAIT_TOOL_NAME: &str = "wait";
+/// Longer than this and the model has stopped pacing and started sleeping.
+const MAX_WAIT: Duration = Duration::from_secs(3600);
+
+fn wait_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: ToolName::try_from(WAIT_TOOL_NAME).expect("a valid tool name"),
+        tool_type: ToolType::Function,
+        description: "Ask to be left alone for a while. Anything a running call ends with, a \
+                      user message, or mail wakes you sooner, so a long interval costs nothing \
+                      and a short one costs a request: prefer this over polling. Returns with \
+                      whatever your other calls have to show by then."
+            .to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["seconds"],
+            "properties": {
+                "seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WAIT.as_secs(),
+                    "description": "How long to wait if nothing happens first."
+                }
+            }
+        }),
+        format: None,
+    }
+}
+
+/// What a `wait` call asked for, and what to tell the model in reply. No
+/// interval means the call could not be read, and the reply says so.
+fn read_wait(arguments: &str) -> (Option<Duration>, ToolOutput) {
+    #[derive(Deserialize)]
+    struct Args {
+        seconds: u64,
+    }
+    let reply = |status, text: String| ToolOutput {
+        images: Arc::new(Vec::new()),
+        output: Arc::new(text),
+        status,
+    };
+    match serde_json::from_str::<Args>(arguments) {
+        Ok(Args { seconds }) if seconds > 0 => {
+            let interval = Duration::from_secs(seconds).min(MAX_WAIT);
+            (
+                Some(interval),
+                reply(
+                    ToolOutputStatus::Success,
+                    format!("Waited up to {}s.", interval.as_secs()),
+                ),
+            )
+        }
+        _ => (
+            None,
+            reply(
+                ToolOutputStatus::Error,
+                "wait takes {\"seconds\": N} with N at least 1".to_owned(),
+            ),
+        ),
+    }
+}
+
+/// What the model's calls say about being looked in on: the longest interval
+/// any `wait` among them named, or only that there were calls.
+fn asked_of(calls: &[ToolCall]) -> ModelAsked {
+    let longest = calls
+        .iter()
+        .filter(|call| call.name.as_str() == WAIT_TOOL_NAME)
+        .filter_map(|call| read_wait(&call.arguments).0)
+        .max();
+    match longest {
+        Some(interval) => ModelAsked::Wait(interval),
+        None if calls.is_empty() => ModelAsked::Nothing,
+        None => ModelAsked::Calls,
+    }
+}
 
 // -- what is waiting to reach the model -------------------------------------
 //
@@ -165,6 +251,7 @@ impl AgentHandle {
                 user: Vec::new(),
                 mail: Vec::new(),
                 tools: BTreeMap::new(),
+                wait_answers: Vec::new(),
                 registry: tools
                     .into_iter()
                     .map(|tool| (tool.spec().name, tool))
@@ -313,6 +400,7 @@ impl AgentHandle {
                 user,
                 mail,
                 tools: BTreeMap::new(),
+                wait_answers: Vec::new(),
                 registry: tools
                     .into_iter()
                     .map(|tool| (tool.spec().name, tool))
@@ -343,13 +431,13 @@ impl AgentHandle {
     }
 
     pub async fn send_user_message(&self, text: impl Into<String>, delivery: Delivery) -> bool {
-        self.send_input(
-            InputKind::Message {
-                content: vec![ContentPart::Text { text: text.into() }],
-            },
-            delivery,
-        )
-        .await
+        self.send_user_content(vec![ContentPart::Text { text: text.into() }], delivery)
+            .await
+    }
+
+    pub async fn send_user_content(&self, content: Vec<ContentPart>, delivery: Delivery) -> bool {
+        self.send_input(InputKind::Message { content }, delivery)
+            .await
     }
 
     pub async fn compact(&self) -> bool {
@@ -574,6 +662,9 @@ struct Agent {
     mail: Vec<MailItem>,
     /// One entry per call the model has made and nothing has answered.
     tools: BTreeMap<ToolCallId, RunningTool>,
+    /// Replies to `wait` calls, written when the call is made and delivered
+    /// with the next drain like any other result.
+    wait_answers: Vec<ToolResult>,
 
     /// The tools the model may call, keyed by the name it calls them by.
     registry: BTreeMap<ToolName, Arc<dyn Tool>>,
@@ -861,7 +952,7 @@ impl Agent {
         // first contribution becomes its `ToolResult` and every later one a
         // `ToolUpdate`, because a provider accepts exactly one result per call
         // id: `REQ-provider-transcript-protocol`.
-        let mut results: Vec<ToolResult> = Vec::new();
+        let mut results: Vec<ToolResult> = std::mem::take(&mut self.wait_answers);
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
             // Whatever the tool is reporting: a request that leaves one call
@@ -987,7 +1078,12 @@ impl Agent {
             instructions: Arc::clone(&self.instructions),
             input: self.history.clone(),
             agent_id_labels: Default::default(),
-            tools: self.registry.values().map(|tool| tool.spec()).collect(),
+            tools: self
+                .registry
+                .values()
+                .map(|tool| tool.spec())
+                .chain(std::iter::once(wait_tool_spec()))
+                .collect(),
         });
         self.phase = Phase::Requesting(InFlight {
             compaction_owes_reply: owes_reply,
@@ -1055,17 +1151,29 @@ impl Agent {
         };
 
         // A turn that issues no calls buys no further look-in: whatever is
-        // still running speaks for itself. `ModelAsked::Wait` arrives with the
-        // tool that names an interval.
+        // still running speaks for itself. A `wait` among the calls names the
+        // interval instead.
         self.turn = Some(ModelTurn {
             spoke_at: now,
-            asked: match calls.is_empty() {
-                false => ModelAsked::Calls,
-                true => ModelAsked::Nothing,
-            },
+            asked: asked_of(&calls),
         });
         for call in calls {
-            self.spawn_tool(call, now);
+            if call.name.as_str() == WAIT_TOOL_NAME {
+                // Answered here, not run: there is nothing to run. The reply
+                // reaches the model with the next drain, which is when the
+                // wait is over by definition.
+                let (_, body) = read_wait(&call.arguments);
+                self.wait_answers.push(ToolResult {
+                    call_id: call.id,
+                    tool_type: call.tool_type,
+                    body,
+                    started_at: now,
+                    finished_at: now,
+                    metadata: None,
+                });
+            } else {
+                self.spawn_tool(call, now);
+            }
         }
 
         self.phase = Phase::Idle {

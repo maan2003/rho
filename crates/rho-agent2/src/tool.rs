@@ -60,7 +60,9 @@ pub enum ToolHaste {
 pub struct SourceWaker(Arc<Notify>);
 
 impl SourceWaker {
-    pub(crate) fn new(notify: Arc<Notify>) -> Self {
+    /// The core makes these for its tools; a test or an adapter may make its
+    /// own over any `Notify` it wants to watch.
+    pub fn new(notify: Arc<Notify>) -> Self {
         Self(notify)
     }
 

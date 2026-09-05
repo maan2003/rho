@@ -384,6 +384,8 @@ fn only_a_typed_message_can_interrupt_an_in_flight_request() {
 //  200               exit                          hold — two still to come
 //  3000                        exit                hold — one still to come
 //  3100                                  exit      SEND — nothing more is due
+//  10200                                           (had they not:
+// TOOL_PATIENCE)
 #[test]
 fn one_round_of_parallel_calls_arrives_in_one_request() {
     // Three shells called together; the quick one finishes while the others
@@ -392,8 +394,8 @@ fn one_round_of_parallel_calls_arrives_in_one_request() {
     let waiting = ask(vec![ended_call(200), silent_call(), silent_call()]);
     assert_eq!(
         waiting.recheck(UnixMs(200)),
-        Some(UnixMs(millis(DEFAULT_WAIT))),
-        "the model's own interval comes first, so nothing goes out alone"
+        Some(UnixMs(200 + millis(TOOL_PATIENCE))),
+        "a finished result waits for its siblings, but only so long"
     );
 
     // ...and the moment the last one lands they all go, without sitting out
@@ -411,22 +413,23 @@ fn one_round_of_parallel_calls_arrives_in_one_request() {
 //  ms      model        rg a      rg b      boundary
 //  0       calls both   call      call      hold
 //  200                  exit                hold — b might still speak
-//  10000                                    SEND — the model's own interval
+//  10200                                    SEND — TOOL_PATIENCE, not the
+//                                           model's interval, which is later
 //
-//  ...and with the model having asked for longer:
+//  ...and the same with the model having asked for longer:
 //  0       wait(300)
 //  10200                                    SEND — but not a whole wait
 #[test]
 fn a_call_that_never_speaks_does_not_hold_a_finished_sibling_forever() {
+    // A finished result will not wait forever for a sibling, and this is the
+    // number that says so; the model's own check-in is further off.
     let schedule = ask(vec![ended_call(200), silent_call()]);
     assert_eq!(
         schedule.recheck(UnixMs(200)),
-        Some(UnixMs(millis(DEFAULT_WAIT)))
+        Some(UnixMs(200 + millis(TOOL_PATIENCE)))
     );
 
-    // TOOL_PATIENCE is only visible once the model has asked to be left alone
-    // for longer than it: a finished result still will not wait forever, and
-    // this is the number that says so.
+    // Asking to be left alone for longer does not change that.
     let patient = schedule.waiting(300);
     let give_up_at = 200 + millis(TOOL_PATIENCE);
     assert!(matches!(
@@ -475,8 +478,8 @@ fn a_call_that_has_already_answered_does_not_hold_up_one_that_has_not() {
     let still_on_it = ask(vec![silent_call(), ended_call(2_000)]);
     assert_eq!(
         still_on_it.recheck(UnixMs(2_000)),
-        Some(UnixMs(millis(DEFAULT_WAIT))),
-        "waiting for it, until the model is looked in on"
+        Some(UnixMs(2_000 + millis(TOOL_PATIENCE))),
+        "waiting for it, but only TOOL_PATIENCE"
     );
 }
 
@@ -588,14 +591,14 @@ fn a_call_that_ends_or_stands_alone_interrupts_a_wait() {
 //  0       calls dev    call           hold
 //  1000    wait(300)                   hold
 //  5000                 "GET /"        hold — nobody asked for this
-//  65000                               SEND — but not for a whole wait, either
-//  301000                              (the wait's own end, had it got there)
+//  305000                              SEND — but not for a whole wait, either
+//  601000                              (the wait's own end, had it got there)
 #[test]
-fn a_wait_is_worth_at_most_a_minute_of_quiet_while_a_tool_is_talking() {
+fn a_wait_is_worth_at_most_five_minutes_of_quiet_while_a_tool_is_talking() {
     // The one number a tool's plain output still buys. It cannot fire while the
     // model is being looked in on every DEFAULT_WAIT, so it only bites once the
-    // model has asked for a longer interval than a minute.
-    let schedule = ask(vec![partial_call(5_000)]).replied(1_000).waiting(300);
+    // model has asked for a longer interval than PROGRESS_PATIENCE.
+    let schedule = ask(vec![partial_call(5_000)]).replied(1_000).waiting(600);
     assert_eq!(
         schedule.recheck(UnixMs(5_000)),
         Some(UnixMs(5_000 + millis(PROGRESS_PATIENCE)))
@@ -606,9 +609,56 @@ fn a_wait_is_worth_at_most_a_minute_of_quiet_while_a_tool_is_talking() {
     );
 
     // With nothing to show, the wait runs its full length.
-    let quiet = ask(vec![silent_call()]).replied(1_000).waiting(300);
-    assert_eq!(quiet.recheck(UnixMs(5_000)), Some(UnixMs(301_000)));
-    assert_eq!(quiet.boundary(UnixMs(301_000)), Boundary::Now);
+    let quiet = ask(vec![silent_call()]).replied(1_000).waiting(600);
+    assert_eq!(quiet.recheck(UnixMs(5_000)), Some(UnixMs(601_000)));
+    assert_eq!(quiet.boundary(UnixMs(601_000)), Boundary::Now);
+}
+
+// -- the wait tool ----------------------------------------------------------
+
+#[test]
+fn a_wait_call_names_the_interval_and_is_answered_on_the_spot() {
+    let (interval, answer) = read_wait(r#"{"seconds": 90}"#);
+    assert_eq!(interval, Some(Duration::from_secs(90)));
+    assert_eq!(answer.status, ToolOutputStatus::Success);
+    assert!(answer.output.contains("90"), "{}", answer.output);
+}
+
+#[test]
+fn a_wait_call_is_bounded_and_a_bad_one_is_an_error_not_a_pace() {
+    let (interval, _) = read_wait(r#"{"seconds": 86400}"#);
+    assert_eq!(interval, Some(MAX_WAIT));
+    for arguments in [r#"{"seconds": 0}"#, "{}", "not json"] {
+        let (interval, answer) = read_wait(arguments);
+        assert_eq!(interval, None, "{arguments}");
+        assert_eq!(answer.status, ToolOutputStatus::Error, "{arguments}");
+    }
+}
+
+#[test]
+fn the_longest_wait_in_a_turn_sets_the_pace() {
+    let calls = [
+        (WAIT_TOOL_NAME, r#"{"seconds": 30}"#),
+        ("shell", "{}"),
+        (WAIT_TOOL_NAME, r#"{"seconds": 300}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (name, arguments))| ToolCall {
+        id: ToolCallId::try_from(format!("c{i}").as_str()).unwrap(),
+        name: ToolName::try_from(name).unwrap(),
+        tool_type: ToolType::Function,
+        arguments: arguments.to_owned(),
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(asked_of(&calls), ModelAsked::Wait(Duration::from_secs(300)));
+    assert_eq!(asked_of(&calls[1..2]), ModelAsked::Calls);
+    assert_eq!(asked_of(&[]), ModelAsked::Nothing);
+    // A wait the core could not read is a call like any other: the model
+    // gets the error at the ordinary check-in and can try again.
+    let mut bad = calls[..1].to_vec();
+    bad[0].arguments = "{}".to_owned();
+    assert_eq!(asked_of(&bad), ModelAsked::Calls);
 }
 
 //  ms      model        npm run dev          user    boundary

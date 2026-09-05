@@ -66,7 +66,7 @@ pub(crate) const TOOL_PATIENCE: Duration = Duration::from_secs(10);
 /// nothing about it is urgent. A build log is worth more whole than in pieces,
 /// and a log nobody asked for is worth very little — but neither is worth
 /// leaving unsent forever.
-pub(crate) const PROGRESS_PATIENCE: Duration = Duration::from_secs(60);
+pub(crate) const PROGRESS_PATIENCE: Duration = Duration::from_secs(300);
 /// How long the model is left alone with its calls when it did not say.
 ///
 /// The one number here the model can overrule: it is what
@@ -78,7 +78,12 @@ pub(crate) const PROGRESS_PATIENCE: Duration = Duration::from_secs(60);
 /// the model asking to be woken, and it is honoured whether or not anything
 /// arrived, because an empty request is how the model finds out there is
 /// nothing to see and asks for longer next time.
-pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(10);
+///
+/// Long, because a check-in is a whole request against a context that is
+/// mostly cache, and because a call ending wakes the core anyway: the only
+/// thing a long default costs is staleness in the rare turn where nothing ends
+/// and the model did not say how long it could wait.
+pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(120);
 
 /// What the model's latest turn settled: when it spoke, and whether it wants to
 /// be looked in on.
@@ -107,11 +112,8 @@ pub(crate) enum ModelAsked {
     Calls,
     /// An interval the model named for itself. Honoured with nothing running,
     /// because a model with nothing to do asking to be woken later is the whole
-    /// point of it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the tool that names an interval is not built yet")
-    )]
+    /// point of it. Named through `wait`, the one tool the core answers
+    /// itself.
     Wait(Duration),
 }
 

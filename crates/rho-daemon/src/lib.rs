@@ -2617,7 +2617,7 @@ async fn handle_message(
             agents.pool.flush_agent_usage(Some(agent_id)).await;
             let read = agents.db.read();
             let model = match read.get_agent(agent_id).runtime {
-                AgentRuntime::Rho { .. } => "gpt-5.6-sol",
+                AgentRuntime::Rho { .. } | AgentRuntime::Rho2 { .. } => "gpt-5.6-sol",
                 AgentRuntime::Claude { .. } => "claude-fable-5",
             };
             let buckets = read

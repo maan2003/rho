@@ -139,6 +139,11 @@ impl CellShared {
         }
     }
 
+    pub(crate) fn has_new_output(&self) -> bool {
+        let output = self.output.lock().unwrap();
+        output.items.len() > output.consumed
+    }
+
     /// Returns output items appended since the previous drain.
     pub(crate) fn drain_new_output(&self) -> Vec<CellOutput> {
         let mut output = self.output.lock().unwrap();

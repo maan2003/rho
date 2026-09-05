@@ -50,7 +50,9 @@ knows about another, or about the clock.
 Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A
 registry type would have been that map with pass-through methods, so there is
-not one. The core says exactly one thing to a running tool — `cancel`, meaning
+not one. `wait` is the one tool the core supplies itself: its argument is the
+interval `boundary` reads and nothing else, so no session is spawned for it and
+the core writes its reply at the next drain. The core says exactly one thing to a running tool — `cancel`, meaning
 wind down — and still collects its parting output, so a tool has the last word
 ([DECISION-model-sets-the-pace](DECISION-model-sets-the-pace.md)).
 

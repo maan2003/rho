@@ -15,3 +15,9 @@ pub use auth_cli::{AuthArgs, run_auth_cli};
 pub use inference::Inference;
 pub use responses::{InferenceAuth, OpenAiResponsesProviderData, PromptCacheKey, ResolvedOAuth};
 pub use session::InferenceSession;
+
+/// Installs the TLS crypto provider if nothing has yet. Any HTTP client built
+/// here needs one; a host that has not installed its own can call this first.
+pub fn ensure_crypto_provider() {
+    antigravity::ensure_crypto_provider();
+}

@@ -204,6 +204,10 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  runtime: rho")?;
                 writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
             }
+            AgentRuntime::Rho2 { core } => {
+                writeln!(output, "  runtime: rho-agent2")?;
+                writeln!(output, "  core: {core:?}")?;
+            }
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
@@ -265,6 +269,10 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                     events.len()
                 )?;
                 writeln!(output, "  restored context_used: {context_used:?}")?;
+            }
+            AgentRuntime::Rho2 { core } => {
+                writeln!(output, "  runtime: rho-agent2")?;
+                writeln!(output, "  core: {core:?}")?;
             }
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;

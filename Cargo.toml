@@ -7,6 +7,7 @@ members = [
   "crates/prefix-id",
   "crates/rho-agent",
   "crates/rho-agent2",
+  "crates/rho-agent2-tools",
   "crates/rho-browser",
   "crates/rho-browser-wayland",
   "crates/rho-ci",
@@ -111,6 +112,8 @@ rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
+rho-agent2 = { path = "crates/rho-agent2" }
+rho-agent2-tools = { path = "crates/rho-agent2-tools" }
 rho-code-mode = { path = "crates/rho-code-mode" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }

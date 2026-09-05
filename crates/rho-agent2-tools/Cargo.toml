@@ -1,5 +1,5 @@
 [package]
-name = "rho-agent2"
+name = "rho-agent2-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,20 +8,15 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-stream.workspace = true
-bytes.workspace = true
 futures.workspace = true
-prefix-id = { workspace = true, features = ["redb"] }
-rand.workspace = true
-redb.workspace = true
-redb-derive.workspace = true
+rho-agent2.workspace = true
+rho-code-mode.workspace = true
 rho-core.workspace = true
-rho-db.workspace = true
-rho-inference.workspace = true
+rho-tool-shell.workspace = true
+rho-web-search.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-senax-encoder.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+rho-workspaces.workspace = true

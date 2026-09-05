@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::cell::{CellShared, CellStatus};
 use crate::description::{
     DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_WAIT_YIELD_TIME_MS, DEFAULT_YIELD_TIME_MS, NestedTool,
-    parse_exec_source,
+    YIELD_GRACE_PERIOD_MS, YIELD_GRACE_THRESHOLD_MS, parse_exec_source,
 };
 use crate::runtime::{self, Command, HEARTBEAT_STALE, RuntimeHandle};
 use crate::truncate::truncate_middle;
@@ -56,6 +56,106 @@ impl NestedToolOutput {
             images: output.images.as_ref().clone(),
             status: output.status,
         }
+    }
+}
+
+/// A cell started with [`CodeModeSession::start`], observed by its caller
+/// rather than through `wait`. Dropping the handle forgets the cell; the
+/// script itself is stopped by [`CodeModeSession::terminate`].
+pub struct CellHandle {
+    cell: Arc<CellShared>,
+    cells: Arc<Mutex<HashMap<u32, Arc<CellShared>>>>,
+}
+
+/// How a cell stands, for a [`CellHandle`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CellOutcome {
+    Running,
+    Completed,
+    Failed(String),
+    Terminated,
+}
+
+impl CellHandle {
+    pub fn id(&self) -> u32 {
+        self.cell.id
+    }
+
+    pub fn outcome(&self) -> CellOutcome {
+        match self.cell.status() {
+            CellStatus::Running => CellOutcome::Running,
+            CellStatus::Completed { error: None } => CellOutcome::Completed,
+            CellStatus::Completed { error: Some(error) } => CellOutcome::Failed(error),
+            CellStatus::Terminated => CellOutcome::Terminated,
+        }
+    }
+
+    /// Whether `take_output` would return anything.
+    pub fn has_new_output(&self) -> bool {
+        self.cell.has_new_output()
+    }
+
+    /// Text and image items appended since the previous take.
+    pub fn take_output(&self) -> (Vec<String>, Vec<ImageContent>) {
+        let mut text = Vec::new();
+        let mut images = Vec::new();
+        for item in self.cell.drain_new_output() {
+            match item {
+                crate::cell::CellOutput::Text(item) => text.push(item),
+                crate::cell::CellOutput::Image(item) => images.push(item),
+            }
+        }
+        (text, images)
+    }
+
+    /// Whether the script called `yield_control()` since last asked.
+    pub fn take_yield_request(&self) -> bool {
+        self.cell.take_yield_request()
+    }
+
+    /// Resolves when the cell has new output, a yield request, or a new
+    /// status. May also resolve spuriously; re-read the facts after it.
+    pub async fn changed(&self) {
+        self.cell.notify.notified().await;
+    }
+}
+
+impl CellHandle {
+    /// A view of the same cell that can be watched from another task.
+    pub fn watcher(&self) -> CellWatcher {
+        CellWatcher(Arc::clone(&self.cell))
+    }
+
+    /// Whether the script has called `yield_control()` and nobody has taken
+    /// the request yet.
+    pub fn yield_requested(&self) -> bool {
+        self.cell.yield_requested.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for CellHandle {
+    fn drop(&mut self) {
+        // A running cell stays registered: the runtime thread finds cells by
+        // id for `notify` and nested calls. The session's own drop ends it.
+        if !self.cell.is_running() {
+            self.cells.lock().unwrap().remove(&self.cell.id);
+        }
+    }
+}
+
+/// A cheap, clonable view of a started cell for watching and terminating it.
+#[derive(Clone)]
+pub struct CellWatcher(Arc<CellShared>);
+
+impl CellWatcher {
+    pub fn is_running(&self) -> bool {
+        self.0.is_running()
+    }
+
+    /// Resolves when the cell has new output, a yield request, or a new
+    /// status. Wakeups are not stored: read the facts before and after.
+    pub async fn changed(&self) {
+        self.0.notify.notified().await;
     }
 }
 
@@ -149,6 +249,50 @@ impl CodeModeSession {
             .await
     }
 
+    /// Starts a cell and hands it over unobserved, for a host that follows the
+    /// cell itself: `Err` is the model-facing text for a script that could
+    /// not start.
+    pub fn start(
+        &self,
+        call_id: ToolCallId,
+        input: &str,
+        context: ToolExecutionContext,
+    ) -> Result<CellHandle, ToolOutput> {
+        let parsed = parse_exec_source(input).map_err(error_output)?;
+        let cell = Arc::new(CellShared::new(
+            self.next_cell.fetch_add(1, Ordering::Relaxed),
+            call_id,
+            context,
+        ));
+        self.cells
+            .lock()
+            .unwrap()
+            .insert(cell.id, Arc::clone(&cell));
+        if self
+            .cmd_tx
+            .send(Command {
+                cell: Arc::clone(&cell),
+                source: parsed.code,
+            })
+            .is_err()
+        {
+            self.cells.lock().unwrap().remove(&cell.id);
+            return Err(error_output(
+                "code-mode runtime is not available".to_string(),
+            ));
+        }
+        Ok(CellHandle {
+            cell,
+            cells: Arc::clone(&self.cells),
+        })
+    }
+
+    /// Stops a cell started with [`CodeModeSession::start`]. Its final status
+    /// and any last output are read from the handle as usual.
+    pub async fn terminate(&self, cell: &CellWatcher) {
+        self.terminate_cell(&cell.0).await;
+    }
+
     /// Handles one `wait` tool call.
     pub async fn wait(&self, args: WaitArgs) -> ToolOutput {
         let cell = args
@@ -194,6 +338,11 @@ impl CodeModeSession {
         max_tokens: Option<usize>,
     ) -> ToolOutput {
         let call_started = Instant::now();
+        let yield_time = if yield_time >= Duration::from_millis(YIELD_GRACE_THRESHOLD_MS) {
+            yield_time + Duration::from_millis(YIELD_GRACE_PERIOD_MS)
+        } else {
+            yield_time
+        };
         let deadline = call_started + yield_time;
         let status = loop {
             let status = cell.status();

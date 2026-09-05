@@ -31,6 +31,7 @@ use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
+pub mod agent2;
 mod claude;
 pub use claude::{backfill_last_turn_ended_from_claude_messages, last_assistant_message_at};
 #[cfg(feature = "code-mode")]

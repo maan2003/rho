@@ -13602,6 +13602,8 @@ dependencies = [
  "rand 0.8.7",
  "redb",
  "redb-derive",
+ "rho-agent2",
+ "rho-agent2-tools",
  "rho-claude",
  "rho-code-mode",
  "rho-context-config",
@@ -13636,7 +13638,26 @@ dependencies = [
  "rho-db",
  "rho-inference",
  "senax-encoder",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rho-agent2-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.33",
+ "rho-agent2",
+ "rho-code-mode",
+ "rho-core",
+ "rho-tool-shell",
+ "rho-web-search",
+ "rho-workspaces",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

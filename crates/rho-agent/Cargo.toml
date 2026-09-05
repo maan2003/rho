@@ -22,6 +22,8 @@ prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
 redb-derive = "0.1"
+rho-agent2.workspace = true
+rho-agent2-tools.workspace = true
 rho-claude.workspace = true
 rho-code-mode = { workspace = true, optional = true }
 rho-context-config.workspace = true

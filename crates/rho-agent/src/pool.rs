@@ -17,6 +17,7 @@ use rho_inference::Inference;
 use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
+use crate::agent2::Agent2Runtime;
 use crate::claude::ClaudeAgent;
 use crate::db::{
     AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
@@ -465,18 +466,33 @@ impl AgentPool {
             | SessionBinding::AdvisorSol(_)
             | SessionBinding::AdvisorTerra(_)
             | SessionBinding::AntigravityFlashLow(_) => {
-                let (agent_id, agent) = Agent::create(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    mode,
-                    config,
-                    display_name,
-                    start,
-                    parent,
-                    Arc::downgrade(self),
-                )
-                .await?;
-                (agent_id, RunningAgent::Rho(agent))
+                if crate::agent2::enabled() && config != AgentRole::Iris {
+                    let (agent_id, agent) = Agent2Runtime::create(
+                        self.db.clone(),
+                        self.inference.clone(),
+                        mode,
+                        config,
+                        display_name,
+                        start,
+                        parent,
+                        Arc::downgrade(self),
+                    )
+                    .await?;
+                    (agent_id, RunningAgent::Rho2(agent))
+                } else {
+                    let (agent_id, agent) = Agent::create(
+                        self.db.clone(),
+                        self.inference.clone(),
+                        mode,
+                        config,
+                        display_name,
+                        start,
+                        parent,
+                        Arc::downgrade(self),
+                    )
+                    .await?;
+                    (agent_id, RunningAgent::Rho(agent))
+                }
             }
             SessionBinding::ClaudeFable { .. }
             | SessionBinding::ClaudeOpus { .. }
@@ -815,6 +831,16 @@ impl AgentPool {
                 .await?;
                 RunningAgent::Claude(agent)
             }
+            AgentRuntime::Rho2 { .. } => RunningAgent::Rho2(
+                Agent2Runtime::load(
+                    self.db.clone(),
+                    self.inference.clone(),
+                    agent_id,
+                    view,
+                    Arc::downgrade(self),
+                )
+                .await?,
+            ),
         };
         self.agents.lock().await.insert(agent_id, agent.clone());
         self.observe_activation(agent_id, agent.clone()).await;
@@ -898,6 +924,7 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
 pub enum RunningAgent {
     Rho(Agent),
     Claude(ClaudeAgent),
+    Rho2(Agent2Runtime),
 }
 
 impl RunningAgent {
@@ -905,6 +932,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => Some(agent.watch_presentation()),
             Self::Claude(agent) => Some(agent.watch_presentation()),
+            Self::Rho2(_) => None,
         }
     }
 
@@ -912,6 +940,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.state(),
             Self::Claude(agent) => agent.state(),
+            Self::Rho2(agent) => agent.state(),
         }
     }
 
@@ -927,6 +956,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.send_user_content(content, delivery),
             Self::Claude(agent) => agent.send_user_content(content),
+            Self::Rho2(agent) => agent.send_user_content(content, delivery),
         }
     }
 
@@ -943,6 +973,7 @@ impl RunningAgent {
                     .await
             }
             Self::Claude(agent) => agent.send_user_content_accepted(content).await,
+            Self::Rho2(agent) => agent.send_user_content_accepted(content, delivery).await,
         }
     }
 
@@ -957,6 +988,9 @@ impl RunningAgent {
             // The Claude CLI does its own mid-turn steering; there is no
             // lane choice to forward.
             Self::Claude(agent) => agent.send_user_message(text),
+            Self::Rho2(agent) => {
+                agent.send_user_content(vec![rho_core::ContentPart::Text { text }], delivery)
+            }
         }
     }
 
@@ -975,6 +1009,7 @@ impl RunningAgent {
             Self::Claude(agent) => agent.send_user_message(format!(
                 "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
             )),
+            Self::Rho2(agent) => agent.send_agent_message(sender, body),
         }
     }
 
@@ -998,6 +1033,7 @@ impl RunningAgent {
                     ))
                     .await
             }
+            Self::Rho2(agent) => agent.send_agent_message_accepted(sender, body).await,
         }
     }
 
@@ -1011,6 +1047,10 @@ impl RunningAgent {
                 agent.compact(delivery);
                 Ok(())
             }
+            Self::Rho2(agent) => {
+                agent.compact();
+                Ok(())
+            }
         }
     }
 
@@ -1018,6 +1058,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.cancel(),
             Self::Claude(agent) => agent.cancel(),
+            Self::Rho2(agent) => agent.cancel(),
         }
     }
 
@@ -1025,16 +1066,17 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.continue_unfinished(),
             Self::Claude(_) => {}
+            Self::Rho2(agent) => agent.retry(),
         }
     }
 
     pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
         match self {
             Self::Claude(agent) => agent.wait_for_input(timeout).await,
-            Self::Rho(agent) => {
+            Self::Rho(_) | Self::Rho2(_) => {
                 let deadline = tokio::time::Instant::now() + timeout;
                 loop {
-                    if !agent.state().queued_inputs.is_empty() {
+                    if !self.state().queued_inputs.is_empty() {
                         return true;
                     }
                     if tokio::time::Instant::now() >= deadline {
@@ -1057,13 +1099,16 @@ impl RunningAgent {
                 Ok(())
             }
             Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
+            Self::Rho2(_) => anyhow::bail!("profile changes are not available on rho-agent2 yet"),
         }
     }
 
     pub async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
         match self {
             Self::Claude(agent) => agent.set_effort(effort).await,
-            Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
+            Self::Rho(_) | Self::Rho2(_) => {
+                anyhow::bail!("cannot apply Claude effort to Rho agent")
+            }
         }
     }
 
@@ -1071,6 +1116,7 @@ impl RunningAgent {
         match self {
             Self::Claude(agent) => agent.change_role(role).await,
             Self::Rho(agent) => agent.change_role(role).await,
+            Self::Rho2(_) => anyhow::bail!("role changes are not available on rho-agent2 yet"),
         }
     }
 
@@ -1080,7 +1126,7 @@ impl RunningAgent {
                 agent.change_prompt_cache_key();
                 Ok(())
             }
-            Self::Claude(_) => {
+            Self::Claude(_) | Self::Rho2(_) => {
                 anyhow::bail!("prompt cache keys are only available for Rho agents")
             }
         }
@@ -1090,6 +1136,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.rewind(turns).await,
             Self::Claude(agent) => agent.rewind(turns).await,
+            Self::Rho2(_) => anyhow::bail!("rewind is not available on rho-agent2 yet"),
         }
     }
 
@@ -1097,6 +1144,7 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.subscribe().boxed(),
             Self::Claude(agent) => agent.subscribe().boxed(),
+            Self::Rho2(agent) => agent.subscribe().boxed(),
         }
     }
 }

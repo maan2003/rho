@@ -88,6 +88,12 @@ impl Store {
         Self(RhoDb::open(path))
     }
 
+    /// Share a database with whoever else lives in it; every table here is
+    /// namespaced, so nothing collides.
+    pub fn from_db(db: RhoDb) -> Self {
+        Self(db)
+    }
+
     /// Mints an agent, the lineage its history starts on, and the position its
     /// first event goes at.
     pub(crate) async fn create_agent(

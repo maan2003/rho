@@ -13,9 +13,16 @@ pub const EXEC_TOOL_NAME: &str = "exec";
 pub const WAIT_TOOL_NAME: &str = "wait";
 pub const CODE_MODE_PRAGMA_PREFIX: &str = "// @exec:";
 
-pub const DEFAULT_YIELD_TIME_MS: u64 = 10_000;
+/// `exec` and `wait` both hold the request until the cell finishes by default.
+/// A "still running" answer costs a round trip; a long server-side wait costs
+/// nothing, and the model can always ask for less.
+pub const DEFAULT_YIELD_TIME_MS: u64 = 300_000;
 pub const MIN_WAIT_YIELD_TIME_MS: u64 = 30_000;
-pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 30_000;
+pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 300_000;
+/// A nested command that yields at the same instant as the cell would leave
+/// two things to poll. A little grace lets the script consume it first.
+pub const YIELD_GRACE_PERIOD_MS: u64 = 1_000;
+pub const YIELD_GRACE_THRESHOLD_MS: u64 = 10_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
@@ -28,7 +35,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Runs raw JavaScript -- no Node, no file system, no network access, no console. All host access goes through the nested tools.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
+- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 300000 ms, so a script normally returns when it finishes; lower it only to check on an interactive command sooner.
 - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
 - A script that fails or is terminated may have applied only part of its changes to shared session state.
 - Unawaited promises are not tracked; `await` everything whose result you need.
@@ -45,7 +52,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `yield_time_ms` controls how long to wait for more output before yielding again. Use at least 30000 ms and prefer a longer wait over repeated short waits. Defaults to 30000 ms.
+- `yield_time_ms` controls how long to wait for more output before yielding again. `wait` returns as soon as the cell finishes, so a long wait costs nothing: use at least 30000 ms, and prefer the default of 300000 ms over repeated short waits.
 - `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
@@ -168,7 +175,7 @@ pub fn wait_tool_spec() -> ToolSpec {
                 "yield_time_ms": {
                     "type": "number",
                     "minimum": MIN_WAIT_YIELD_TIME_MS,
-                    "description": "Wait before yielding more output. Use at least 30000 ms and prefer a longer wait over repeated short waits. Defaults to 30000 ms."
+                    "description": "Wait before yielding more output. Returns early when the cell finishes, so prefer the default of 300000 ms over repeated short waits. At least 30000 ms."
                 },
                 "max_tokens": {
                     "type": "number",
@@ -545,13 +552,13 @@ mod tests {
     #[test]
     fn wait_encourages_long_yields_with_a_thirty_second_minimum() {
         let spec = wait_tool_spec();
-        assert!(spec.description.contains("prefer a longer wait"));
-        assert!(spec.description.contains("Defaults to 30000 ms"));
+        assert!(spec.description.contains("prefer the default"));
+        assert!(spec.description.contains("prefer the default of 300000 ms"));
         assert_eq!(
             spec.input_schema["properties"]["yield_time_ms"]["minimum"],
             MIN_WAIT_YIELD_TIME_MS
         );
-        assert_eq!(DEFAULT_WAIT_YIELD_TIME_MS, MIN_WAIT_YIELD_TIME_MS);
+        const { assert!(DEFAULT_WAIT_YIELD_TIME_MS >= MIN_WAIT_YIELD_TIME_MS) };
     }
 
     #[test]
