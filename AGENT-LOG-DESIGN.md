@@ -79,7 +79,12 @@ stores it only as `spawned_by`).
 `projects` goes too: a project is `Project { host, path }` on a label
 (`STORE-DESIGN.md`), and `ProjectSet`, `ProjectRemove`, and
 `Ready.projects` leave the wire. `view_config` goes: it is a client
-setting and lives in the GUI's own db.
+setting and lives in the GUI's own db. Both wait for slice B, because
+the user's project paths were never converted and the Workdir field's
+completions read them: in B the GUI converts `Ready.projects` once into
+labels carrying `Project { host, path }` (the user's own data, written by
+their GUI, not the daemon) and moves view_config into its own db, and
+only then does the daemon drop the tables.
 
 ### The story events
 
@@ -187,16 +192,23 @@ from store slice 1 is deleted in slice A for the same reason).
 ## Slices, in landing order
 
 A. **Config in the log, no record.** `Created` and the config events,
-   the head table, the `agents` table gone, `projects` and `view_config`
-   tables gone with their messages, `desk_migration.rs` gone, the
-   record→log migration. Daemon change; the GUI keeps `UiAgentSummary`
-   for now, filled from the head, so no epoch bump. Lands with a
-   profile upgrade and a restart.
+   the head table, the transitional attention table, the `agents` table
+   gone, `desk_migration.rs` gone, the record→log migration. Daemon
+   change; the GUI keeps `UiAgentSummary` for now, filled from the head,
+   so no epoch bump; `projects` and `view_config` stay until B. Lands
+   with a profile upgrade and a restart. Found on the way (b8os, 5 Sep):
+   the record table's recorded redb type name is the old module path, so
+   the migration reads it through `SenAs`, the same escape hatch store
+   slice 1 needed; the unit tests could not see it because they write
+   and read from one module, which is why every daemon migration runs
+   on a copy of the user's store first.
 B. **The story log and its replication.** `StoryEvent`, the story
    table written live for both runtimes, `Ready` heads, `AgentLogs` /
    `AgentStory` / `AgentHead`, the GUI mirror, attention derived on the
    client, `AgentHandledThrough(StoryPos)`, the deletions listed under
-   the wire, the story migration. Daemon and GUI, epoch bump. The
+   the wire, the one-time GUI conversion of projects into `Project`
+   labels and of view_config into the GUI's db, the transitional
+   attention table deleted, the story migration. Daemon and GUI, epoch bump. The
    biggest slice; b8os may land the daemon half writing the story table
    first, behind no wire change, then the wire and GUI half.
 C. **Usage from the mirror.** Graphs read `Cost` events; the usage
