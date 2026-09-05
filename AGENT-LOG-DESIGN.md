@@ -307,6 +307,15 @@ C. **Usage from the mirror.** Graphs read `Cost` events; the usage
 D. **On-demand detail.** `AgentDetail` for tool bodies and diffs from
    the raw log; the transcript surface reads the mirror and fetches
    bodies when a call is opened.
+E. **The Desk mirror.** Found while proving change two on the rig
+   (b8os, 5 Sep): the agent mirror alone gives a cold GUI heads, stories
+   and attention, but the store's cells, frontier and bodies arrive by
+   `DeskSync` every session and are not kept, so nothing offline has a
+   note, a label or a breadcrumb to hang a card on. The client keeping
+   its own copy of the store is the client half of store sync
+   (`STORE-DESIGN.md`, rho-sync direction) and gets its own design; the
+   frontier and body snapshots must come back exactly or the next sync
+   is wrong. Offline Home is claimed only when this lands, not with B.
 
 Each slice lands on its own with the tests of the slices before it
 green; each daemon slice is proven on a read-only copy of the user's
