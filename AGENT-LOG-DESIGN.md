@@ -184,6 +184,22 @@ fails to connect rather than to decode.
   `rho-agent`.
 - `AgentUsage` and the global usage requests stay until slice C, or
   Home's cost column would go blank in between.
+- The parent id was nowhere in the log: `Created` carries a spawned-by
+  kind, and the 2349 parent ids lived only in the transitional table,
+  which the GUI nests delegated work on and the daemon routes mail by.
+  `StoryEvent::Parented { parent, at }` is told at creation (and once
+  for migrated agents by the backfill), the head folds it, `UiAgentHead`
+  carries it. The spawner is a source fact the daemon owns and is never
+  written into the store; the store's `Parent` is the user's filing and
+  wins in the view: an agent shows under its store `Parent` if any, else
+  under its spawner from the head, else at the root, one rule in
+  `desk_view`.
+- `usage_total` is not in `UiAgentHead` until slice C: folded from `Cost`
+  it would read zero for all history while the usage tables still hold
+  the truth.
+- The transitional table comes off the wire in this slice and is deleted
+  in the landing after the restart, with the conversion code that reads
+  it.
 
 ### The client mirrors the story and decides attention
 
