@@ -179,11 +179,20 @@ seq 0, the old root's parent pointer set to it, so the replay is
 `Created` then the old events unchanged and every existing position and
 fork stays valid; b8os proves this byte-for-byte on a copy), fold the
 record into the head and the transitional table, and drop the `agents`
-table. On first start of the slice B build, for every agent:
-build the story from the raw log (Rho runtime) or from the Claude
-session file named by the runtime (Claude runtime), or write
-`HistoryUnavailableBefore` when that file is gone, and drop
-`agent_presentation_events`. Each migration runs once on the user's
+table. The slice B build backfills the story in the
+background rather than at start: sizing on a copy (b8os, 5 Sep) put the
+whole history at about 843k story events and 350 MiB for 2823 agents,
+not large, but decoding a million raw events and parsing 553 MiB of
+Claude transcripts would block a restart for tens of minutes. So the
+daemon starts and serves as before; each head says whether its story
+is built; a background job builds agents most recently touched first,
+one agent per transaction, resumable across restarts; an agent loaded
+before its turn (a turn, a subscribe) is built synchronously first so
+live writes never land ahead of history; the 76 Claude agents whose
+session file is gone get `HistoryUnavailableBefore` at once. Whole
+history, no cutoff (a 30-day cut would have kept 60% of the events for
+52% of the agents, which buys little). `agent_presentation_events` is
+dropped once every agent is built. Each migration runs once on the user's
 real daemon after b8os has run it on a read-only copy of that store and
 reported the counts; the migration code is deleted in the next landing
 after the user has restarted on it (the standing rule; `desk_migration.rs`
