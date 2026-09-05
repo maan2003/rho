@@ -33,6 +33,40 @@ pub fn agents_awaiting_story(db: &RhoDb) -> Vec<AgentId> {
     waiting.into_iter().map(|(agent_id, _)| agent_id).collect()
 }
 
+/// Tells `Parented` for the agents whose story was already built before
+/// the story carried a spawner. Returns how many learned one.
+///
+/// The agents still awaiting a story learn it in [`ensure_story`] instead,
+/// in the right place in their history rather than after it.
+pub async fn tell_missing_parents(db: &RhoDb) -> usize {
+    let read = db.read();
+    let missing = read
+        .list_agents()
+        .into_iter()
+        .filter(|(_, head)| head.story_built && head.parent.is_none())
+        .filter_map(|(agent_id, head)| {
+            let parent = read.agent_attention(agent_id).parent_agent?;
+            Some((agent_id, parent, head.config.created_at))
+        })
+        .collect::<Vec<_>>();
+    drop(read);
+    if missing.is_empty() {
+        return 0;
+    }
+    let mut write = db.write().await;
+    for (agent_id, parent, at) in &missing {
+        write.append_agent_story(
+            *agent_id,
+            &StoryEvent::Parented {
+                parent: *parent,
+                at: *at,
+            },
+        );
+    }
+    write.commit();
+    missing.len()
+}
+
 /// Builds one agent's story if it has none yet, in a single transaction.
 /// Returns how many events were written.
 pub async fn ensure_story(db: &RhoDb, agent_id: AgentId) -> usize {
@@ -56,6 +90,17 @@ pub async fn ensure_story(db: &RhoDb, agent_id: AgentId) -> usize {
             from_claude_transcript(db, agent_id, &messages)
         }
     };
+    // The parent's id lives only in the transitional attention table; the
+    // story learns it here, once, so it survives the table.
+    let mut told = told;
+    if let Some(parent) = db.read().agent_attention(agent_id).parent_agent {
+        let at = head.config.created_at;
+        let after_creation = told
+            .iter()
+            .position(|(event, _)| matches!(event, StoryEvent::Created { .. }))
+            .map_or(0, |index| index + 1);
+        told.insert(after_creation, (StoryEvent::Parented { parent, at }, None));
+    }
     let mut write = db.write().await;
     // The background job and a load can prepare the same agent at once;
     // the transaction is where that is decided, so the loser writes

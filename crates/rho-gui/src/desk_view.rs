@@ -4,9 +4,10 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_desk::cells::{
     BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Project, Property, PropertyKey,
-    SlackTs, SlackUnit, Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid,
-    Verdict, VerdictEvent, Version,
+    SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
+    Uuid, Verdict, VerdictEvent, Version,
 };
+use rho_registry::Attention;
 use rho_ui_proto::ClientMessage;
 use text::{BufferId, ReplicaId};
 
@@ -81,11 +82,29 @@ impl HostDeskCells {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSource {
     pub agent: rho_core::AgentId,
+    /// Who asked for this agent. The store's `Parent` is the user's
+    /// filing and beats it; this is where the agent came from.
     pub spawned_by: Option<rho_core::AgentId>,
     pub workdir: Option<camino::Utf8PathBuf>,
-    /// Waiting on the user, so the map and the dealer show it even when the
-    /// user has never said anything about it.
-    pub open: bool,
+    /// One past the newest story event this client holds: the cursor a
+    /// verdict on this agent writes.
+    pub newest: StoryPos,
+    /// A turn is running.
+    pub turn_running: bool,
+    /// Where the last turn ended badly, if nothing has happened since.
+    pub errored: Option<StoryPos>,
+    /// What the last finished turn says it asks of the user, and where it
+    /// said so.
+    pub wants: Option<(rho_ui_proto::story::UiAgentWant, StoryPos)>,
+}
+
+impl AgentSource {
+    /// The story has told something that asks for the user. Whether it is
+    /// still owed is the cursor's business, in [`agent_card`]; this only
+    /// decides whether the agent is on the map for its own sake.
+    pub fn wants_user(&self) -> bool {
+        self.wants.is_some() || self.errored.is_some()
+    }
 }
 
 /// What the Slack mirror says about a conversation or a followed thread.
@@ -225,6 +244,55 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
         // else past that arrived while it was snoozed, and that is what
         // brings the card straight back.
         voided: facts.defer_until.is_some() && past(facts.slack_snoozed_at.as_ref()),
+    })
+}
+
+/// What the join of an agent's story and the user's verdicts says: the
+/// card's state, and how badly it wants the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentCard {
+    pub state: State,
+    pub attention: Attention,
+}
+
+/// An agent's card, derived and never stored. Like a Slack unit, it is open
+/// exactly while the story has told something past the cursor the user's
+/// last verdict left; unlike one, what is past the cursor also says how
+/// loudly it asks, because the agent declares that itself.
+///
+/// This is the only place attention is decided. Every rail reads the answer
+/// through the registry rather than working it out again.
+pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard> {
+    let Id::Agent(agent) = id else {
+        return None;
+    };
+    let source = sources.agent(*agent)?;
+    let cursor = facts.agent_handled_through.unwrap_or_default();
+    let past = |pos: StoryPos| pos >= cursor;
+    // A running turn is the agent's court, whatever the user has said: the
+    // row shows work in flight rather than a verdict.
+    let attention = if source.turn_running {
+        Attention::Working
+    } else if facts.state == State::Muted {
+        Attention::Quiet
+    } else if source.errored.is_some_and(past) {
+        Attention::NeedsInput
+    } else if source.wants.is_some_and(|(_, at)| past(at)) {
+        Attention::Pending
+    } else {
+        Attention::Quiet
+    };
+    Some(AgentCard {
+        // Open exactly while the story has told something the user has not
+        // dealt with, the same reading a Slack unit gets from its cursor.
+        // Reading it off the attention level instead left `d` on a quiet
+        // agent with nothing to change, so the card came straight back.
+        state: match (facts.state, source.newest > cursor) {
+            (State::Muted, _) => State::Muted,
+            (_, true) => State::Open,
+            (_, false) => State::Done,
+        },
+        attention,
     })
 }
 
@@ -540,7 +608,7 @@ impl DeskCells {
         // Open by its source: a waiting agent and a Slack unit with new
         // traffic matter even when the user has never said anything.
         for agent in &sources.agents {
-            if agent.open {
+            if agent.wants_user() {
                 facts.entry(Id::Agent(agent.agent)).or_default();
             }
         }
@@ -577,13 +645,18 @@ impl DeskCells {
             // the one cell puts the hierarchy back.
             let parent = place(id, fact, sources).filter(|parent| !desk.view.facts(parent).deleted);
             let slack = slack_card(id, fact, sources);
+            let agent = agent_card(id, fact, sources);
             nodes.insert(
                 id.clone(),
                 DeskNode {
                     id: id.clone(),
                     under: parent.clone(),
                     parent,
-                    state: slack.map_or(fact.state, |card| card.state),
+                    state: match (slack, agent) {
+                        (Some(card), _) => card.state,
+                        (_, Some(card)) => card.state,
+                        _ => fact.state,
+                    },
                     defer_until: match slack {
                         Some(card) if card.voided => None,
                         _ => fact.defer_until,
@@ -628,6 +701,48 @@ impl DeskCells {
             );
         }
         order(nodes)
+    }
+
+    /// What every agent of this host is asking of the user, derived from
+    /// the store and the mirror in [`agent_card`]. The rails read it from
+    /// the registry; this is where the registry gets it.
+    pub fn agent_attentions(&self, host: HostId) -> Vec<(rho_core::AgentId, Attention)> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        desk.sources
+            .agents
+            .iter()
+            .filter_map(|source| {
+                let id = Id::Agent(source.agent);
+                let facts = desk.view.facts(&id);
+                let card = agent_card(&id, &facts, &desk.sources)?;
+                Some((source.agent, card.attention))
+            })
+            .collect()
+    }
+
+    /// How the user filed each agent of this host: muted, and the names of
+    /// the labels on it. The registry hides and groups by this.
+    pub fn agent_filing(&self, host: HostId) -> Vec<(rho_core::AgentId, bool, Vec<String>)> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        desk.view
+            .all_facts()
+            .into_iter()
+            .filter_map(|(id, facts)| {
+                let Id::Agent(agent) = id else {
+                    return None;
+                };
+                let labels = facts
+                    .labels
+                    .iter()
+                    .filter_map(|label| desk.view.facts(label).name)
+                    .collect();
+                Some((agent, facts.state == State::Muted, labels))
+            })
+            .collect()
     }
 
     pub fn node(&self, host: HostId, id: &Id) -> Option<DeskNode> {
@@ -943,6 +1058,22 @@ impl DeskCells {
         parent.map(|id| (id, writes))
     }
 
+    /// `w`: the label the path names stands for this workdir, minted if
+    /// the path is new. A registered project is exactly this.
+    pub fn project_writes(
+        &mut self,
+        host: HostId,
+        path: &str,
+        project: Option<Project>,
+    ) -> Option<Vec<CellWrite>> {
+        let (label, mut writes) = self.label_path_writes(host, path)?;
+        writes.push(CellWrite {
+            id: label,
+            property: Property::Project(project),
+        });
+        Some(writes)
+    }
+
     /// Every label the store holds, as the path a person would type. What
     /// the picker completes over, and what a label row is called.
     pub fn label_paths(&self, host: HostId) -> Vec<(Id, String)> {
@@ -1000,6 +1131,7 @@ impl DeskCells {
             id,
             &verdict,
             &|key| view.property(id, key).cloned(),
+            None,
             None,
             None,
         )
@@ -1201,6 +1333,23 @@ impl DeskCells {
         None
     }
 
+    /// Every label that stands for a workdir, by name. This is what a
+    /// registered project is now: a label carrying a `Project`.
+    pub fn projects(&self, host: HostId) -> Vec<(String, Project)> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        let mut projects = desk
+            .view
+            .all_facts()
+            .into_iter()
+            .filter(|(id, _)| matches!(id, Id::Label(_)))
+            .filter_map(|(_, facts)| Some((facts.name?, facts.project?)))
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.0.cmp(&right.0));
+        projects
+    }
+
     /// The workdir a label stands for, if it stands for one.
     pub fn project(&self, host: HostId, id: &Id) -> Option<Project> {
         self.facts(host, id)?.project
@@ -1337,6 +1486,25 @@ impl DeskCells {
             })
     }
 
+    /// Where an agent's story stands, for a verdict about to write a
+    /// cursor. `None` for everything that is not an agent, and for an agent
+    /// no source knows about, which is a verdict on a card that cannot be
+    /// dealt.
+    fn agent_verdict(&self, host: HostId, id: &Id) -> Option<rho_desk::cells::AgentVerdict> {
+        let Id::Agent(agent) = id else {
+            return None;
+        };
+        self.hosts
+            .get(&host)?
+            .sources
+            .agents
+            .iter()
+            .find(|source| &source.agent == agent)
+            .map(|source| rho_desk::cells::AgentVerdict {
+                newest: source.newest,
+            })
+    }
+
     /// A dealt verdict: the facts it changes, plus the log entry recording
     /// exactly what it changed so an undo can be validated against it.
     pub fn verdict_writes(
@@ -1348,7 +1516,8 @@ impl DeskCells {
         // What a verdict on a Slack unit writes is a message timestamp, and
         // that timestamp is the mirror's rather than the store's.
         let slack = self.slack_verdict(host, id);
-        self.verdict_writes_with_cursor(host, id, verdict, slack)
+        let agent = self.agent_verdict(host, id);
+        self.verdict_writes_with_cursor(host, id, verdict, slack, agent)
     }
 
     /// Done on a Slack unit at a cursor the caller names instead of the
@@ -1366,6 +1535,7 @@ impl DeskCells {
             &Id::Slack(unit.clone()),
             DeskVerdict::Done,
             Some(rho_desk::cells::SlackVerdict { newest }),
+            None,
         )
     }
 
@@ -1375,6 +1545,7 @@ impl DeskCells {
         id: &Id,
         verdict: DeskVerdict,
         slack: Option<rho_desk::cells::SlackVerdict>,
+        agent: Option<rho_desk::cells::AgentVerdict>,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
@@ -1411,15 +1582,27 @@ impl DeskCells {
                         pace_days: pace,
                     }),
                     slack.clone(),
+                    agent,
                 )
                 .ok()?;
-                // A Slack unit is handled by its cursor, which the changes
-                // above already carry; everything else is handled by a state.
-                if slack.is_none() {
-                    writes.push(CellWrite {
-                        id: id.clone(),
-                        property: Property::State(State::Done),
-                    });
+                // Every change the entry states has to be a write too, or
+                // the daemon rejects the verdict as unapplied. That is how
+                // the dealt thing is handled: a state for a note, and the
+                // cursor for a Slack unit or an agent.
+                for change in &changes {
+                    let Some(after) = change.after.clone() else {
+                        continue;
+                    };
+                    match writes
+                        .iter_mut()
+                        .find(|write| write.id == change.id && write.property.key() == change.key)
+                    {
+                        Some(write) => write.property = after,
+                        None => writes.push(CellWrite {
+                            id: change.id.clone(),
+                            property: after,
+                        }),
+                    }
                 }
                 let event = VerdictEvent::Applied {
                     verdict,
@@ -1442,6 +1625,7 @@ impl DeskCells {
             &|key| view.property(id, key).cloned(),
             None,
             slack,
+            agent,
         )
         .ok()?;
         // A verdict that changes nothing about what it is for is not one:

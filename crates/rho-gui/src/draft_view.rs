@@ -282,6 +282,14 @@ impl DraftModel {
         cx.notify();
     }
 
+    /// Whether the cursor sits in one of the header rows rather than in the
+    /// message body.
+    pub fn cursor_in_a_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.workdir_buffer, editor, cx)
+            || self.cursor_in(&self.role_buffer, editor, cx)
+            || self.cursor_in(&self.start_buffer, editor, cx)
+    }
+
     pub fn cursor_in_start_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         self.cursor_in(&self.start_buffer, editor, cx)
     }
@@ -376,8 +384,7 @@ impl DraftModel {
         }
     }
 
-    /// Tab: cycles workdir field → role field → start field → message body
-    /// (field values arrive selected, so typing replaces them).
+    /// Tab: cycles workdir field → role field → start field → message body.
     pub fn toggle_field(
         &mut self,
         editor: &Entity<Editor>,
@@ -385,18 +392,85 @@ impl DraftModel {
         cx: &mut Context<Self>,
     ) {
         let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
-            &self.role_buffer
+            Some(&self.role_buffer)
         } else if self.cursor_in(&self.role_buffer, editor, cx) {
-            &self.start_buffer
+            Some(&self.start_buffer)
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
+            None
+        } else {
+            Some(&self.workdir_buffer)
+        };
+        self.go_to_field(target.cloned(), editor, window, cx);
+    }
+
+    /// Shift-Tab: the same rows the other way round, body → start field →
+    /// role field → workdir field → body.
+    pub fn toggle_field_back(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = if self.cursor_in(&self.workdir_buffer, editor, cx) {
+            None
+        } else if self.cursor_in(&self.role_buffer, editor, cx) {
+            Some(&self.workdir_buffer)
+        } else if self.cursor_in(&self.start_buffer, editor, cx) {
+            Some(&self.role_buffer)
+        } else {
+            Some(&self.start_buffer)
+        };
+        self.go_to_field(target.cloned(), editor, window, cx);
+    }
+
+    /// Empties the header row the cursor is on and leaves the cursor in it,
+    /// ready to type. Answers whether there was a row to clear.
+    pub fn clear_field(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let field = if self.cursor_in(&self.workdir_buffer, editor, cx) {
+            self.workdir_buffer.clone()
+        } else if self.cursor_in(&self.role_buffer, editor, cx) {
+            self.role_buffer.clone()
+        } else if self.cursor_in(&self.start_buffer, editor, cx) {
+            self.start_buffer.clone()
+        } else {
+            return false;
+        };
+        self.suppress_draft_activation = true;
+        field.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, "")], None, cx);
+        });
+        self.suppress_draft_activation = false;
+        let start = field.read(cx).anchor_before(0);
+        self.select_range(editor, start..start, window, cx);
+        true
+    }
+
+    /// Puts the cursor at the end of a field, or in the body when there is
+    /// no field left to walk to. The whole value used to arrive selected,
+    /// which reads as visual mode: `cc` spent its first `c` on the
+    /// selection and typed the second into the field, and `enter` was a
+    /// key with no meaning there. An empty selection keeps the field an
+    /// ordinary vim line, so the line editing keys all mean what they say.
+    fn go_to_field(
+        &mut self,
+        target: Option<Entity<Buffer>>,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = target else {
             self.focus_body(editor, window, cx);
             return;
-        } else {
-            &self.workdir_buffer
         };
         let field = target.read(cx);
-        let range = field.anchor_before(0)..field.anchor_after(field.len());
-        self.select_range(editor, range, window, cx);
+        let end = field.anchor_after(field.len());
+        self.select_range(editor, end..end, window, cx);
     }
 
     /// Puts the viewport's cursor at the end of the message body.

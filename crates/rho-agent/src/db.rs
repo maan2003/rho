@@ -48,10 +48,6 @@ const AGENT_STORY_SOURCE: TableDefinition<StoryKey, AgentEventPos> =
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
-/// Opaque client-owned view configuration (see
-/// [`AgentReadTxnExt::view_config`]). A client setting the daemon only
-/// keeps; it moves into the GUI's own db in slice B.
-const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
 const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
@@ -412,6 +408,9 @@ pub struct AgentHead {
     /// backfill reaches it (or a load forces it first).
     #[senax(default)]
     pub story_built: bool,
+    /// The agent that spawned this one, folded from `Parented`.
+    #[senax(default)]
+    pub parent: Option<AgentId>,
     pub current_lineage: AgentLineageId,
 }
 
@@ -804,7 +803,6 @@ pub trait AgentReadTxnExt {
     fn last_agent_counter(&self) -> u64;
     /// Opaque client-owned view configuration; the daemon stores and
     /// forwards it without interpreting a byte.
-    fn view_config(&self) -> Vec<u8>;
     fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
     fn get_agent(&self, agent_id: AgentId) -> AgentHead;
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
@@ -844,8 +842,6 @@ pub trait AgentReadTxnExt {
 #[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
-
-    fn set_view_config(&mut self, data: Vec<u8>);
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
 
@@ -1015,6 +1011,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             // An agent born after the story exists has one from its first
             // event; nothing is ever backfilled for it.
             story_built: true,
+            parent: parent_agent,
             generated_title: None,
             activity: None,
             current_lineage: lineage_id,
@@ -1023,6 +1020,11 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             .insert(&agent_id, SenValue::borrowed(&head));
         for event in crate::story::from_raw_event(&created, now) {
             self.append_agent_story_from(agent_id, &event, at);
+        }
+        // The raw log has never carried the parent's id, only the kind of
+        // agent it was, so the story tells it itself.
+        if let Some(parent) = parent_agent {
+            self.append_agent_story(agent_id, &StoryEvent::Parented { parent, at: now });
         }
         self.open_table(AGENT_ATTENTION).insert(
             &agent_id,
@@ -1063,17 +1065,12 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or(0)
     }
 
-    fn view_config(&self) -> Vec<u8> {
-        if !self.has_table("view_config") {
+    /// The rows the slice B conversion moves into the store. The table is
+    /// dropped once they are there, so a missing one means done.
+    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)> {
+        if !self.has_table("projects") {
             return Vec::new();
         }
-        self.open_table(VIEW_CONFIG)
-            .get(&())
-            .map(|value| value.value())
-            .unwrap_or_default()
-    }
-
-    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)> {
         self.open_table(PROJECTS)
             .iter()
             .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
@@ -1319,8 +1316,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_STORY);
         self.open_table(AGENT_STORY_SOURCE);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
-        self.open_table(PROJECTS);
-        self.open_table(VIEW_CONFIG);
         self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
@@ -1329,10 +1324,6 @@ impl AgentWriteTxnExt for WriteTxn {
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
-    }
-
-    fn set_view_config(&mut self, data: Vec<u8>) {
-        self.open_table(VIEW_CONFIG).insert(&(), &data);
     }
 
     fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {
@@ -1369,6 +1360,22 @@ impl AgentWriteTxnExt for WriteTxn {
         drop(heads);
         self.open_table(AGENT_STORY)
             .insert(&StoryKey { agent_id, pos }, SenValue::borrowed(event));
+        // Told after the commit lands: a listener must never learn of an
+        // event it cannot yet read.
+        if let Some(appends) = self
+            .observer::<crate::story::StoryObserver>()
+            .map(crate::story::StoryObserver::sender)
+        {
+            let appended = crate::story::StoryAppended {
+                agent_id,
+                pos,
+                event: event.clone(),
+                head,
+            };
+            self.after_commit(move || {
+                let _ = appends.send(appended);
+            });
+        }
         pos
     }
 
@@ -1426,6 +1433,9 @@ impl AgentWriteTxnExt for WriteTxn {
             story_pos: previous.story_pos,
             turn_running: previous.turn_running,
             story_built: previous.story_built,
+            // The spawner is the story's fact, like the position: the raw
+            // log never carried it, so a raw rebuild keeps what stood.
+            parent: previous.parent,
             generated_title: None,
             activity: None,
             current_lineage,
@@ -1972,6 +1982,7 @@ fn fold_story_head(head: &mut AgentHead, event: &StoryEvent) {
             head.generated_title = Some(title.clone());
         }
         StoryEvent::Activity { label, .. } => head.activity = label.clone(),
+        StoryEvent::Parented { parent, .. } => head.parent = Some(*parent),
         StoryEvent::TurnStarted { .. } => head.turn_running = true,
         StoryEvent::TurnEnded { .. } => {
             head.turn_running = false;

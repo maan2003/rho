@@ -54,6 +54,8 @@ octo-types = { workspace = true }
 path = { path = "../../vendor/zed/crates/path" }
 project = { path = "../../vendor/zed/crates/project" }
 redb = { workspace = true }
+redb-derive = { workspace = true }
+prefix-id = { workspace = true, features = ["redb"] }
 release_channel = { path = "../../vendor/zed/crates/release_channel" }
 rho-browser = { workspace = true }
 rho-core.workspace = true

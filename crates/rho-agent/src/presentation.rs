@@ -25,6 +25,7 @@ use crate::db::{
     AgentDisposition, AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _,
     AgentRole, AgentWriteTxnExt as _, PresentationField, TurnReport,
 };
+use crate::story::{AgentWant, StoryEvent};
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
 };
@@ -188,6 +189,21 @@ pub(crate) fn spawn_turn_report(
         {
             let mut write = db.write().await;
             write.record_agent_turn_report(agent_id, &report);
+            // Until the reply's own tag is parsed (`AGENT-WANTS-DESIGN.md`),
+            // this classification is what the story has to say about what
+            // the turn asks of the person.
+            write.append_agent_story(
+                agent_id,
+                &StoryEvent::Wants {
+                    want: if report.needs_you {
+                        AgentWant::Ask
+                    } else {
+                        AgentWant::Show
+                    },
+                    summary: (!report.summary.is_empty()).then(|| report.summary.clone()),
+                    at: rho_core::UnixMs::now(),
+                },
+            );
             write.commit();
         }
         if let Some(pool) = pool.upgrade() {

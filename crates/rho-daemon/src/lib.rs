@@ -24,8 +24,7 @@ use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
     McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
-    UiAgentFacts, UiAgentSummary, UiAttention, UiProject, UiTurnReport, WorkspaceInfo, read_frame,
-    write_frame,
+    WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
@@ -39,6 +38,7 @@ mod iris;
 mod realtime;
 mod secret_store;
 mod shell;
+mod story_wire;
 mod terminal;
 mod workspace_channel;
 
@@ -408,7 +408,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     backfill_legacy_turn_end_times(&agents).await;
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
-    spawn_turn_report_projection(Arc::clone(&agents));
     spawn_inference_projection(Arc::clone(&agents));
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -431,19 +430,15 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
-    // Attention watchers are daemon-owned and pre-armed synchronously by the
+    // Turn watchers are daemon-owned and pre-armed synchronously by the
     // pool before any activation caller can start work on the returned agent.
     // The weak pool reference avoids a pool -> observer -> pool cycle.
     let watched_agents = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let activation_observer: Arc<rho_agent::pool::ActivationObserver> = {
         let pool = Arc::downgrade(&agents.pool);
-        let db = agents.db.clone();
-        let events = agents.events.clone();
         let watched_agents = watched_agents.clone();
         Arc::new(move |agent_id, agent| {
             let pool = pool.clone();
-            let db = db.clone();
-            let events = events.clone();
             let watched_agents = watched_agents.clone();
             async move {
                 if !watched_agents.lock().expect("poison").insert(agent_id) {
@@ -452,7 +447,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
                 let Some(pool) = pool.upgrade() else {
                     return;
                 };
-                spawn_attention_watcher(pool, db, events, agent_id, agent).await;
+                spawn_turn_watcher(pool, agent_id, agent).await;
             }
             .boxed()
         })
@@ -463,22 +458,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     for (agent_id, agent) in agents.loaded().await {
         activation_observer(agent_id, agent).await;
     }
-    // Re-arm snooze wake-ups that were pending when the daemon last stopped.
-    for (agent_id, _) in agents.db.read().list_agents() {
-        if let AgentDisposition::Snoozed { until } =
-            agents.db.read().agent_attention(agent_id).disposition
-            && until > rho_core::UnixMs::now()
-        {
-            spawn_snooze_timer(
-                agents.db.clone(),
-                agents.pool.clone(),
-                agents.events.clone(),
-                agent_id,
-                until,
-            );
-        }
-    }
 
+    convert_agent_dispositions(&agents).await;
+    let projects_converted = convert_projects(&agents).await;
+    drop_converted_tables(&agents.db, projects_converted).await;
     spawn_story_backfill(agents.db.clone());
 
     if let Some(listener) = iroh_listener {
@@ -641,12 +624,12 @@ struct IrohAgentStreams {
     connection: iroh::endpoint::Connection,
     opened: Arc<Mutex<HashMap<AgentId, watch::Sender<bool>>>>,
     control_claimed: Arc<AtomicBool>,
-    focus: watch::Sender<Option<AgentId>>,
+    focus: watch::Sender<Vec<AgentId>>,
 }
 
 impl IrohAgentStreams {
     fn new(connection: iroh::endpoint::Connection) -> Self {
-        let (focus, _) = watch::channel(None);
+        let (focus, _) = watch::channel(Vec::new());
         Self {
             connection,
             opened: Arc::new(Mutex::new(HashMap::new())),
@@ -655,8 +638,8 @@ impl IrohAgentStreams {
         }
     }
 
-    fn set_focus(&self, agent_id: Option<AgentId>) {
-        self.focus.send_replace(agent_id);
+    fn set_focus(&self, agent_ids: Vec<AgentId>) {
+        self.focus.send_replace(agent_ids);
     }
 
     fn claim_control(&self) -> bool {
@@ -755,7 +738,7 @@ async fn serve_iroh_agent_stream(
     agent_id: AgentId,
     agent: RunningAgent,
     send: iroh::endpoint::SendStream,
-    mut focus: watch::Receiver<Option<AgentId>>,
+    mut focus: watch::Receiver<Vec<AgentId>>,
     mut cancel: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if *cancel.borrow() {
@@ -770,7 +753,7 @@ async fn serve_iroh_agent_stream(
         }
     };
     priority
-        .set_weight(weight(*focus.borrow() == Some(agent_id)))
+        .set_weight(weight(focus.borrow().contains(&agent_id)))
         .context("set initial iroh agent stream weight")?;
     let mut focus_cancel = cancel.clone();
     let focus_task = tokio::spawn(async move {
@@ -779,7 +762,7 @@ async fn serve_iroh_agent_stream(
                 changed = focus.changed() => {
                     changed.context("iroh agent focus channel closed")?;
                     priority
-                        .set_weight(weight(*focus.borrow_and_update() == Some(agent_id)))
+                        .set_weight(weight(focus.borrow_and_update().contains(&agent_id)))
                         .context("update iroh agent stream weight")?;
                 }
                 _ = focus_cancel.changed() => return Ok::<(), anyhow::Error>(()),
@@ -1095,90 +1078,24 @@ impl AgentRegistry {
             write.set_agent_disposition(*agent_id, disposition);
         }
         write.commit();
-        let kinds = self.agent_state_kinds().await;
-        for agent_id in agent_ids {
-            if let AgentDisposition::Snoozed { until } = disposition {
-                spawn_snooze_timer(
-                    self.db.clone(),
-                    self.pool.clone(),
-                    self.events.clone(),
-                    *agent_id,
-                    until,
-                );
-            }
-            let _ = self.events.send(ServerMessage::AgentAttention {
-                agent_id: *agent_id,
-                attention: attention_level(kinds.get(agent_id), disposition),
-                facts: agent_facts(
-                    &self.db.read().agent_attention(*agent_id),
-                    kinds.get(agent_id),
-                ),
-            });
-        }
     }
 
-    fn ui_agents(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiAgentSummary> {
-        let read = self.db.read();
-        let mut heads = read.list_agents();
+    /// Every agent's head, oldest first. Iris is not an agent a client
+    /// lists (`STORE-DESIGN.md` capabilities).
+    fn ui_agents(&self) -> Vec<rho_ui_proto::story::UiAgentHead> {
+        let mut heads = self.db.read().list_agents();
         heads.sort_by_key(|(_, agent)| agent.config.created_at);
         heads
             .into_iter()
             .filter(|(_, agent)| agent.config.role != AgentRole::Iris)
-            .map(|(agent_id, agent)| {
-                let attention = read.agent_attention(agent_id);
-                UiAgentSummary {
-                    agent_id,
-                    parent_agent: attention.parent_agent,
-                    role: agent.config(),
-                    created_at: agent.config.created_at,
-                    updated_at: attention.updated_at,
-                    workspace: agent.primary_workdir().clone(),
-                    facts: agent_facts(&attention, kinds.get(&agent_id)),
-                    display_name: agent.title().map(str::to_owned),
-                    attention: attention_level(kinds.get(&agent_id), attention.disposition),
-                    last_active: attention
-                        .last_turn_ended
-                        .unwrap_or(attention.last_user_message)
-                        .max(agent.config.created_at),
-                    hidden: attention.disposition == AgentDisposition::Hidden,
-                    disposition: attention.disposition,
-                    last_user_message_text: attention.last_user_message_text,
-                    activity: agent.activity,
-                    turn_report: attention.turn_report.map(|report| UiTurnReport {
-                        needs_you: report.needs_you,
-                        summary: report.summary,
-                    }),
-                    // Labels are the store's `Labeled` facts; the client
-                    // reads them there (`AGENT-LOG-DESIGN.md`).
-                    labels: Vec::new(),
-                }
-            })
+            .map(|(agent_id, agent)| story_wire::ui_agent_head(agent_id, &agent))
             .collect()
     }
 
-    fn iris_agent_id(&self) -> Option<AgentId> {
-        self.db
-            .read()
-            .list_agents()
-            .into_iter()
-            .find(|(_, agent)| agent.config.role == AgentRole::Iris)
-            .map(|(agent_id, _)| agent_id)
-    }
-
-    fn projects(&self) -> Vec<UiProject> {
-        let mut projects = self
-            .db
-            .read()
-            .list_projects()
-            .into_iter()
-            .map(|(path, record)| UiProject {
-                path,
-                name: record.name,
-                description: record.description,
-            })
-            .collect::<Vec<_>>();
-        projects.sort_by(|left, right| left.name.cmp(&right.name));
-        projects
+    /// The projects the user has filed, sorted by name, read from the
+    /// store's labels. Iris routes by them; the daemon's own table is gone.
+    fn projects(&self) -> Vec<(Utf8PathBuf, String)> {
+        self.desk_cells.projects()
     }
 
     fn auth_state(&self) -> AuthState {
@@ -1196,11 +1113,8 @@ impl AgentRegistry {
 
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
-            agents: self.ui_agents(&self.agent_state_kinds().await),
-            iris_agent: self.iris_agent_id(),
-            projects: self.projects(),
+            agents: self.ui_agents(),
             auth: self.auth_state(),
-            view_config: self.db.read().view_config(),
             machine_seed: self.machine_seed,
             agent_counter: self.db.read().last_agent_counter(),
         }
@@ -1498,53 +1412,6 @@ impl AgentRegistry {
         self.pool.agent_handle(agent_id)
     }
 
-    async fn agent_label(&self, agent_id: AgentId, label: String, add: bool) -> anyhow::Result<()> {
-        validate_label(&label)?;
-        // A label is the store's `Labeled` fact, written by the client
-        // that set it; the daemon keeps none (`AGENT-LOG-DESIGN.md`). The
-        // message leaves the wire in slice B.
-        let _ = (agent_id, label, add);
-        Ok(())
-    }
-
-    async fn rename_agent(&self, agent_id: AgentId, name: String) -> anyhow::Result<()> {
-        if name.trim().is_empty() {
-            anyhow::bail!("agent name cannot be empty");
-        }
-        // A name is the store's `Name` fact now, and the client writes it
-        // there; a summary's display name is the spawn name or the
-        // generated title. The message leaves the wire in slice B.
-        let _ = (agent_id, name);
-        Ok(())
-    }
-
-    async fn set_project(
-        &self,
-        path: Utf8PathBuf,
-        name: Option<String>,
-        description: String,
-    ) -> anyhow::Result<()> {
-        let path = validate_repo_root(path)?;
-        let name = match name {
-            Some(name) => name,
-            None => path
-                .file_name()
-                .map(str::to_owned)
-                .ok_or_else(|| anyhow::anyhow!("workdir path has no basename: {path}"))?,
-        };
-        let mut write = self.db.write().await;
-        write.upsert_project(rho_core::UnixMs::now(), path.as_str(), name, description);
-        write.commit();
-        Ok(())
-    }
-
-    async fn remove_project(&self, path: Utf8PathBuf) -> anyhow::Result<()> {
-        let mut write = self.db.write().await;
-        write.remove_project(path.as_str());
-        write.commit();
-        Ok(())
-    }
-
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
         self.pool.load(agent_id).await
     }
@@ -1554,8 +1421,97 @@ impl AgentRegistry {
 /// so a restart is never held for the migration. Most-recently-touched
 /// first, one agent per transaction, resumable across restarts; a load
 /// jumps the queue on its own. Goes with the rest of the migration code.
+/// Moves the user's hidden and snoozed agents into the store, once, on the
+/// start that first has somewhere to put them. Deleted after the restart,
+/// with the table it reads.
+async fn convert_agent_dispositions(agents: &AgentRegistry) {
+    let dispositions = {
+        let read = agents.db.read();
+        read.list_agents()
+            .into_iter()
+            .map(|(agent_id, head)| {
+                (
+                    agent_id,
+                    read.agent_attention(agent_id).disposition,
+                    head.story_pos.0,
+                )
+            })
+            .filter(|(_, disposition, _)| {
+                matches!(
+                    disposition,
+                    AgentDisposition::Hidden | AgentDisposition::Snoozed { .. }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if dispositions.is_empty() {
+        return;
+    }
+    match agents
+        .desk_cells
+        .convert_agent_dispositions(&dispositions)
+        .await
+    {
+        Ok((0, 0)) => {}
+        Ok((muted, deferred)) => eprintln!(
+            "rho daemon: filed {muted} hidden and {deferred} snoozed agents into the store"
+        ),
+        Err(error) => eprintln!("rho daemon: agent disposition conversion failed: {error}"),
+    }
+}
+
+/// Moves the registered projects into the store, once, on the start that
+/// first has somewhere to put them. Deleted after the restart, with the
+/// table it reads.
+/// Returns whether the old table may now be dropped: it may once its rows
+/// are in the store, and a failed conversion keeps them where they are.
+async fn convert_projects(agents: &AgentRegistry) -> bool {
+    let projects = {
+        let mut projects = agents.db.read().list_projects();
+        projects.sort_by(|(_, left), (_, right)| left.name.cmp(&right.name));
+        projects
+    };
+    if projects.is_empty() {
+        return true;
+    }
+    match agents
+        .desk_cells
+        .convert_projects(agents.machine_seed, &projects)
+        .await
+    {
+        Ok(0) => true,
+        Ok(written) => {
+            eprintln!("rho daemon: filed {written} projects into the store");
+            true
+        }
+        Err(error) => {
+            eprintln!("rho daemon: project conversion failed: {error}");
+            false
+        }
+    }
+}
+
+/// The tables slice B leaves behind, dropped on the start that no longer
+/// needs them. `projects` goes only once this same start has put its rows
+/// in the store; `view_config` has been unread by every client since the
+/// fold toggle became session state, so there is nothing to convert.
+/// `agent_attention_until_slice_b` stays: the story backfill still reads
+/// it for an agent's spawner, and it goes with the conversion code.
+async fn drop_converted_tables(db: &RhoDb, projects_converted: bool) {
+    let mut write = db.write().await;
+    if projects_converted {
+        write.delete_table("projects");
+    }
+    write.delete_table("view_config");
+    write.commit();
+}
+
 fn spawn_story_backfill(db: RhoDb) {
     tokio::spawn(async move {
+        let parented = rho_agent::story_backfill::tell_missing_parents(&db).await;
+        if parented > 0 {
+            eprintln!("rho daemon: story backfill told {parented} agents their spawner");
+        }
         let waiting = rho_agent::story_backfill::agents_awaiting_story(&db);
         if waiting.is_empty() {
             return;
@@ -1740,6 +1696,7 @@ where
     let _ = outgoing_tx.send(agents.ready_message().await);
     let mut local_subscriptions = HashMap::new();
     let mut presentation_watches = HashMap::new();
+    let mut story_follow: Option<tokio::task::JoinHandle<()>> = None;
     let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
@@ -1826,6 +1783,7 @@ where
             agent_streams.as_ref(),
             &mut local_subscriptions,
             &mut presentation_watches,
+            &mut story_follow,
             &mut desk_session,
             message,
         )
@@ -1839,8 +1797,12 @@ where
             }
             Ok(Refresh::None) => {}
             Err(error) => {
+                // The whole chain, not just the outermost context: a new
+                // agent that failed said "create managed jj workspace" and
+                // kept the reason to itself, which is not something a
+                // reader can act on.
                 let _ = outgoing_tx.send(ServerMessage::Error {
-                    message: error.to_string(),
+                    message: format!("{error:#}"),
                 });
             }
         }
@@ -1849,6 +1811,9 @@ where
         agents.desk_devices.lock().await.remove(&device);
     }
     events_task.abort();
+    if let Some(story_follow) = story_follow {
+        story_follow.abort();
+    }
     for (_, subscription) in local_subscriptions {
         subscription.abort();
     }
@@ -2001,53 +1966,6 @@ async fn backfill_legacy_turn_end_times(agents: &AgentRegistry) {
     }
 }
 
-/// Stuck rather than finished: the agent cannot proceed without the user.
-fn is_blocked(kind: &AgentStateKind) -> bool {
-    matches!(
-        kind,
-        AgentStateKind::Error(_) | AgentStateKind::UnfinishedTurn { .. }
-    )
-}
-
-/// Attention = f(live state, disposition). The live half (working, blocked)
-/// is read off the running agent — `None` for unloaded agents, which render
-/// as idle. The persisted half is the user's verdict on the last turn end;
-/// sub-agent turn ends only set it to Pending once the user has personally
-/// engaged the agent (see `settle_turn`), so untouched children stay quiet
-/// by construction.
-fn agent_facts(
-    attention: &rho_agent::db::AgentAttention,
-    kind: Option<&AgentStateKind>,
-) -> UiAgentFacts {
-    UiAgentFacts {
-        turn_running: kind.is_some_and(AgentStateKind::is_working),
-        last_turn_ended: attention.last_turn_ended,
-        last_user_message_at: attention.last_user_message,
-        needs_you_hint: attention
-            .turn_report
-            .as_ref()
-            .is_some_and(|report| report.needs_you),
-    }
-}
-
-fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition) -> UiAttention {
-    if kind.is_some_and(AgentStateKind::is_working) {
-        return UiAttention::Working;
-    }
-    let pending = match disposition {
-        AgentDisposition::Pending => true,
-        AgentDisposition::Done | AgentDisposition::Hidden => false,
-        // An expired snooze is pending again; the timer only exists to
-        // broadcast that moment.
-        AgentDisposition::Snoozed { until } => until <= rho_core::UnixMs::now(),
-    };
-    match (pending, kind.is_some_and(is_blocked)) {
-        (false, _) => UiAttention::Quiet,
-        (true, true) => UiAttention::NeedsInput,
-        (true, false) => UiAttention::Pending,
-    }
-}
-
 /// Durable presentation changes refresh the normal snapshot for every
 /// connection. Broadcast loss is harmless because `Ready` is reconstructed
 /// from the agent cache, including after daemon restart.
@@ -2083,63 +2001,10 @@ fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
     });
 }
 
-/// Relays turn reports to every client. Classification and persistence
-/// happen runtime-side at turn end; broadcast loss is harmless because
-/// `Ready` snapshots carry the persisted report.
-fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
-    let mut reports = agents.pool.subscribe_turn_reports();
-    let agents = Arc::downgrade(&agents);
-    tokio::spawn(async move {
-        loop {
-            let reported = match reports.recv().await {
-                Ok(reported) => reported,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-            let Some(agents) = agents.upgrade() else {
-                break;
-            };
-            let _ = agents.events.send(ServerMessage::AgentTurnReport {
-                agent_id: reported.agent_id,
-                report: UiTurnReport {
-                    needs_you: reported.report.needs_you,
-                    summary: reported.report.summary,
-                },
-            });
-            // An FYI settled the row Done as it persisted; tell clients the
-            // level moved, exactly as a user verdict would.
-            if !reported.report.needs_you {
-                let kind = agents
-                    .get(reported.agent_id)
-                    .await
-                    .map(|agent| agent.state().kind);
-                let _ = agents.events.send(ServerMessage::AgentAttention {
-                    agent_id: reported.agent_id,
-                    attention: attention_level(kind.as_ref(), AgentDisposition::Done),
-                    facts: agent_facts(
-                        &agents.db.read().agent_attention(reported.agent_id),
-                        kind.as_ref(),
-                    ),
-                });
-            }
-        }
-    });
-}
-
 /// Watches one running agent for the daemon itself (not any particular
-/// connection): records turn ends and broadcasts attention level changes to
-/// every client. Spawned exactly once per activated agent.
-///
-/// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
-/// records until the user personally engages them: their finished turns are
-/// the parent's court, not the user's.
-async fn spawn_attention_watcher(
-    pool: Arc<AgentPool>,
-    db: RhoDb,
-    events: broadcast::Sender<ServerMessage>,
-    agent_id: AgentId,
-    agent: RunningAgent,
-) {
+/// connection): flushes its usage when a turn stops. What a reader sees of
+/// the turn is the story's own `TurnStarted` and `TurnEnded`.
+async fn spawn_turn_watcher(pool: Arc<AgentPool>, agent_id: AgentId, agent: RunningAgent) {
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(async move {
         let changes = agent.subscribe();
@@ -2153,7 +2018,6 @@ async fn spawn_attention_watcher(
         // than inferred from this coalescing snapshot stream.
         let _ = ready_tx.send(());
         let mut was_working = initial_state.kind.is_working();
-        let mut last_sent = None;
         let states = futures::stream::once(async move { initial_state }).chain(changes);
         futures::pin_mut!(states);
         while let Some(state) = states.next().await {
@@ -2162,17 +2026,6 @@ async fn spawn_attention_watcher(
                 pool.flush_agent_usage(Some(agent_id)).await;
             }
             was_working = working;
-            let stored = db.read().agent_attention(agent_id);
-            let attention = attention_level(Some(&state.kind), stored.disposition);
-            let facts = agent_facts(&stored, Some(&state.kind));
-            if last_sent != Some((attention, facts)) {
-                let _ = events.send(ServerMessage::AgentAttention {
-                    agent_id,
-                    attention,
-                    facts,
-                });
-                last_sent = Some((attention, facts));
-            }
         }
     });
     let _ = ready_rx.await;
@@ -2509,24 +2362,98 @@ fn spawn_claude_quota_recorder(
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
 /// level. Harmless if the disposition changed meanwhile — it just sends the
 /// then-current level.
-fn spawn_snooze_timer(
-    db: RhoDb,
-    pool: Arc<AgentPool>,
-    events: broadcast::Sender<ServerMessage>,
-    agent_id: AgentId,
-    until: rho_core::UnixMs,
-) {
+/// How many story events travel in one [`ServerMessage::AgentStory`] while
+/// a client is catching up. The first mirror of an unseen daemon is a whole
+/// history, so it goes in slices the connection can interleave.
+const STORY_CATCHUP_CHUNK: usize = 512;
+
+/// Sends this connection every story event it lacks, then follows: each new
+/// event goes out as it is appended, on any agent.
+///
+/// The daemon remembers what it has sent per agent. An event that is not the
+/// next one - the client asked from further back, or a background backfill
+/// jumped an agent's story forward - is not sent at all; the head goes
+/// instead, and the client asks again with a fresh `AgentLogs` when it sees
+/// a position it does not hold. That keeps a client that fell behind exact
+/// rather than clever.
+fn spawn_story_follow(
+    agents: Arc<AgentRegistry>,
+    outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
+    known: Vec<(AgentId, rho_ui_proto::story::UiStoryPos)>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let delay = until.saturating_duration_since(rho_core::UnixMs::now());
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        let kind = pool.get(agent_id).await.map(|agent| agent.state().kind);
-        let disposition = db.read().agent_attention(agent_id).disposition;
-        let _ = events.send(ServerMessage::AgentAttention {
-            agent_id,
-            attention: attention_level(kind.as_ref(), disposition),
-            facts: agent_facts(&db.read().agent_attention(agent_id), kind.as_ref()),
-        });
-    });
+        // Subscribed before the catch-up read, so an event appended during
+        // it is queued rather than lost; the cursor drops the duplicates.
+        let mut appends = rho_agent::story::story_appends(&agents.db);
+        let mut sent = known
+            .into_iter()
+            .map(|(agent_id, pos)| (agent_id, story_wire::story_pos(pos)))
+            .collect::<HashMap<_, _>>();
+
+        let heads = agents.db.read().list_agents();
+        for (agent_id, head) in heads {
+            if head.config.role == AgentRole::Iris {
+                continue;
+            }
+            let mut from = sent.get(&agent_id).copied().unwrap_or_default();
+            if from >= head.story_pos {
+                continue;
+            }
+            let story = agents.db.read().agent_story(agent_id, from);
+            for chunk in story.chunks(STORY_CATCHUP_CHUNK) {
+                let events = chunk
+                    .iter()
+                    .map(|(_, event)| story_wire::ui_story_event(event.clone()))
+                    .collect::<Vec<_>>();
+                let sending = ServerMessage::AgentStory {
+                    agent_id,
+                    from: story_wire::ui_story_pos(from),
+                    events,
+                };
+                if outgoing_tx.send(sending).is_err() {
+                    return;
+                }
+                from = chunk.last().map_or(from, |(pos, _)| pos.next());
+                // Catching up must never starve the connection's own traffic.
+                tokio::task::yield_now().await;
+            }
+            sent.insert(agent_id, from);
+        }
+
+        loop {
+            match appends.recv().await {
+                Ok(appended) => {
+                    let expected = sent.get(&appended.agent_id).copied().unwrap_or_default();
+                    let sending = if appended.pos == expected {
+                        sent.insert(appended.agent_id, appended.pos.next());
+                        ServerMessage::AgentStory {
+                            agent_id: appended.agent_id,
+                            from: story_wire::ui_story_pos(appended.pos),
+                            events: vec![story_wire::ui_story_event(appended.event)],
+                        }
+                    } else if appended.pos < expected {
+                        // Already sent in the catch-up read.
+                        continue;
+                    } else {
+                        ServerMessage::AgentHead {
+                            head: story_wire::ui_agent_head(appended.agent_id, &appended.head),
+                        }
+                    };
+                    if outgoing_tx.send(sending).is_err() {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // What was missed is unknown, so say only what is true:
+                    // here are the heads. The client asks for the rest.
+                    if outgoing_tx.send(agents.ready_message().await).is_err() {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 /// Whether a handled message changed registry state that clients see through
@@ -2549,6 +2476,7 @@ async fn handle_message(
     agent_streams: Option<&IrohAgentStreams>,
     local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
     presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
+    story_follow: &mut Option<tokio::task::JoinHandle<()>>,
     desk_session: &mut Option<(rho_desk::cells::DeviceId, u16)>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
@@ -2882,18 +2810,6 @@ async fn handle_message(
             }
             Ok(Refresh::Ready)
         }
-        ClientMessage::ProjectSet {
-            path,
-            name,
-            description,
-        } => {
-            agents.set_project(path, name, description).await?;
-            Ok(Refresh::Ready)
-        }
-        ClientMessage::ProjectRemove { path } => {
-            agents.remove_project(path).await?;
-            Ok(Refresh::Ready)
-        }
         ClientMessage::AcquireLandLease { repo, agent_id } => {
             let lock = agents.land_lock(repo.clone()).await;
             let lease = match lock.clone().try_lock_owned() {
@@ -2942,34 +2858,24 @@ async fn handle_message(
             }
             Ok(Refresh::None)
         }
-        ClientMessage::SubscribeAgent { agent_id } => {
-            subscribe_connection_agents(
-                agents,
-                outgoing_tx,
-                agent_streams,
-                local_subscriptions,
-                presentation_watches,
-                [agent_id],
-            )
-            .await?;
-            Ok(Refresh::None)
-        }
-        ClientMessage::SubscribeAgents { agent_ids } => {
-            anyhow::ensure!(agent_ids.len() <= 1024, "too many agent subscriptions");
-            subscribe_connection_agents(
-                agents,
-                outgoing_tx,
-                agent_streams,
-                local_subscriptions,
-                presentation_watches,
-                agent_ids,
-            )
-            .await?;
-            Ok(Refresh::None)
-        }
-        ClientMessage::UnsubscribeAgents { agent_ids } => {
-            anyhow::ensure!(agent_ids.len() <= 1024, "too many agent unsubscriptions");
-            for agent_id in agent_ids {
+        ClientMessage::AgentStreamFocus { agent_ids } => {
+            anyhow::ensure!(agent_ids.len() <= 64, "too many focused agents");
+            // The focus set is replaced wholesale: whoever left it stops
+            // streaming, whoever joined starts. Everything durable is on
+            // the story regardless, so this is only about live frames.
+            let wanted = agent_ids.iter().copied().collect::<HashSet<_>>();
+            let leaving = local_subscriptions
+                .keys()
+                .copied()
+                .filter(|agent_id| !wanted.contains(agent_id))
+                .chain(
+                    presentation_watches
+                        .keys()
+                        .copied()
+                        .filter(|agent_id| !wanted.contains(agent_id)),
+                )
+                .collect::<HashSet<_>>();
+            for agent_id in leaving {
                 if let Some(streams) = agent_streams {
                     streams.remove(agent_id).await;
                 }
@@ -2983,12 +2889,29 @@ async fn handle_message(
                     reason: rho_ui_proto::AgentUnloadReason::Unsubscribed,
                 });
             }
+            subscribe_connection_agents(
+                agents,
+                outgoing_tx,
+                agent_streams,
+                local_subscriptions,
+                presentation_watches,
+                agent_ids.clone(),
+            )
+            .await?;
+            if let Some(agent_streams) = agent_streams {
+                agent_streams.set_focus(agent_ids);
+            }
             Ok(Refresh::None)
         }
-        ClientMessage::AgentStreamFocus { agent_id } => {
-            if let Some(agent_streams) = agent_streams {
-                agent_streams.set_focus(agent_id);
+        ClientMessage::AgentLogs { known } => {
+            if let Some(previous) = story_follow.take() {
+                previous.abort();
             }
+            *story_follow = Some(spawn_story_follow(
+                Arc::clone(agents),
+                outgoing_tx.clone(),
+                known,
+            ));
             Ok(Refresh::None)
         }
         ClientMessage::SendUserMessage {
@@ -3014,18 +2937,6 @@ async fn handle_message(
             agent.compact(delivery)?;
             Ok(Refresh::None)
         }
-        ClientMessage::AgentLabel {
-            agent_id,
-            label,
-            add,
-        } => {
-            agents.agent_label(agent_id, label, add).await?;
-            Ok(Refresh::Ready)
-        }
-        ClientMessage::RenameAgent { agent_id, name } => {
-            agents.rename_agent(agent_id, name).await?;
-            Ok(Refresh::Ready)
-        }
         ClientMessage::ChangeAgentRole { agent_id, role } => {
             let agent = agents
                 .get(agent_id)
@@ -3042,28 +2953,9 @@ async fn handle_message(
             agent.change_prompt_cache_key()?;
             Ok(Refresh::None)
         }
-        ClientMessage::ViewConfigSet { data } => {
-            let mut write = agents.db.write().await;
-            write.set_view_config(data);
-            write.commit();
-            Ok(Refresh::None)
-        }
         ClientMessage::SetAuthAccountEnabled { name, enabled } => {
             agents.set_auth_account_enabled(&name, enabled).await;
             Ok(Refresh::None)
-        }
-        ClientMessage::SetAgentDisposition {
-            agent_id,
-            disposition,
-        } => {
-            agents.set_disposition(agent_id, disposition).await;
-            // Hidden changes what the rail folds, which clients read off
-            // summaries; attention alone travels on its own broadcast.
-            if disposition == AgentDisposition::Hidden {
-                Ok(Refresh::Ready)
-            } else {
-                Ok(Refresh::None)
-            }
         }
         ClientMessage::CancelTurn { agent_id } => {
             if let Some(agent) = agents.get(agent_id).await {
@@ -3951,7 +3843,6 @@ async fn subscribe_connection_agents(
         {
             presentation_watches.insert(agent_id, watch);
         }
-        let _ = outgoing_tx.send(ServerMessage::AgentSubscribed { agent_id });
     }
     Ok(())
 }
@@ -4042,13 +3933,6 @@ async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()
         *data = prepared.content.data;
     }
     validate_image_content(content)
-}
-
-fn validate_label(label: &str) -> anyhow::Result<()> {
-    if label.trim().is_empty() {
-        anyhow::bail!("label cannot be empty");
-    }
-    Ok(())
 }
 
 fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {

@@ -235,3 +235,38 @@ async fn clears_every_story() {
     }
     println!("cleared: {} agents", agents.len());
 }
+
+/// What the daemon's attention table still holds that the wire half is
+/// about to stop carrying, so the loss can be counted before it happens.
+#[tokio::test]
+#[ignore = "needs a copy of a real daemon store in RHO_PROOF_DB"]
+async fn counts_what_the_attention_table_holds() {
+    use crate::db::AgentDisposition;
+
+    let path = std::env::var("RHO_PROOF_DB").expect("RHO_PROOF_DB must name a copy");
+    let db = RhoDb::open(&path);
+    let mut hidden = 0usize;
+    let mut snoozed = 0usize;
+    let mut reports = 0usize;
+    let mut parents = 0usize;
+    let mut agents = 0usize;
+    for (agent_id, _) in db.read().list_agents() {
+        let attention = db.read().agent_attention(agent_id);
+        agents += 1;
+        match attention.disposition {
+            AgentDisposition::Hidden => hidden += 1,
+            AgentDisposition::Snoozed { .. } => snoozed += 1,
+            _ => {}
+        }
+        if attention.turn_report.is_some() {
+            reports += 1;
+        }
+        if attention.parent_agent.is_some() {
+            parents += 1;
+        }
+    }
+    println!(
+        "attention: {agents} agents, {hidden} hidden, {snoozed} snoozed, {reports} with a turn \
+         report, {parents} with a parent"
+    );
+}

@@ -4,12 +4,13 @@
 //! for senax-backed redb keys/values and small transaction wrappers that treat
 //! local database errors as fatal.
 
+use std::any::Any;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::BytesMut;
 use redb::{
@@ -74,6 +75,10 @@ impl<T: Clone> SenValue<'_, T> {
 pub struct RhoDb {
     database: Arc<Database>,
     write_lock: Arc<Mutex<()>>,
+    /// One slot for the owning crate's observer of this database. Writers
+    /// deep inside a transaction publish what they wrote through it, so no
+    /// call site has to carry a channel down to the table.
+    observer: Arc<OnceLock<Box<dyn Any + Send + Sync>>>,
 }
 
 /// Read transaction wrapper. Methods panic on local database errors.
@@ -85,6 +90,10 @@ pub struct ReadTxn {
 pub struct WriteTxn {
     inner: redb::WriteTransaction,
     _guard: OwnedMutexGuard<()>,
+    observer: Arc<OnceLock<Box<dyn Any + Send + Sync>>>,
+    /// Run after the commit lands, never before: a reader woken by one of
+    /// these must find the write already durable.
+    after_commit: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 /// Read-only table wrapper. Methods panic on local database errors.
@@ -309,6 +318,7 @@ impl RhoDb {
         Self {
             database: Arc::new(database),
             write_lock: Arc::new(Mutex::new(())),
+            observer: Arc::new(OnceLock::new()),
         }
     }
 
@@ -324,7 +334,18 @@ impl RhoDb {
         WriteTxn {
             inner,
             _guard: guard,
+            observer: Arc::clone(&self.observer),
+            after_commit: Vec::new(),
         }
+    }
+
+    /// This database's observer, made on first use. One type per database:
+    /// asking for a second is a bug in the owning crate.
+    pub fn observer<T: Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> &T {
+        self.observer
+            .get_or_init(|| Box::new(init()))
+            .downcast_ref()
+            .expect("one observer type per database")
     }
 
     pub async fn persistent_savepoint(&self, record: impl FnOnce(&mut WriteTxn, u64)) -> u64 {
@@ -336,6 +357,8 @@ impl RhoDb {
         let mut write = WriteTxn {
             inner,
             _guard: guard,
+            observer: Arc::clone(&self.observer),
+            after_commit: Vec::new(),
         };
         record(&mut write, id);
         write.commit();
@@ -402,8 +425,33 @@ impl WriteTxn {
             .expect("delete rho-db table")
     }
 
+    /// This database's observer, if one has been made.
+    pub fn observer<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.observer
+            .get()
+            .and_then(|observer| observer.downcast_ref())
+    }
+
+    /// Queues work for after this transaction commits. Dropped unrun if it
+    /// never does.
+    pub fn after_commit(&mut self, effect: impl FnOnce() + Send + 'static) {
+        self.after_commit.push(Box::new(effect));
+    }
+
     pub fn commit(self) {
-        self.inner.commit().expect("commit rho-db write txn");
+        let Self {
+            inner,
+            _guard,
+            after_commit,
+            ..
+        } = self;
+        inner.commit().expect("commit rho-db write txn");
+        // The write lock is held until the commit lands, so an effect never
+        // wakes a reader ahead of the next writer.
+        drop(_guard);
+        for effect in after_commit {
+            effect();
+        }
     }
 }
 

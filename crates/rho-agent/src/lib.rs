@@ -45,6 +45,7 @@ pub mod pool;
 pub mod presentation;
 pub mod story;
 pub mod story_backfill;
+pub mod story_fixture;
 #[cfg(test)]
 mod story_sizing;
 pub mod system_prompt;

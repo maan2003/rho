@@ -17,7 +17,6 @@ use tokio::sync::broadcast;
 
 use crate::AgentRegistry;
 
-const IRIS_LABEL: &str = rho_agent::iris_tools::LABEL;
 pub(crate) struct IrisBackend {
     agent_id: AgentId,
     agent: RunningAgent,
@@ -102,24 +101,26 @@ impl AgentRegistry {
     }
 
     pub(crate) async fn iris_startup_context(&self) -> String {
-        let kinds = self.agent_state_kinds().await;
         let mut lines = self
-            .ui_agents(&kinds)
+            .ui_agents()
             .into_iter()
-            .filter(|agent| !agent.hidden && !agent.labels.iter().any(|label| label == IRIS_LABEL))
             .map(|agent| {
                 format!(
-                    "{} | {} | {:?}",
+                    "{} | {} | {}",
                     self.display_agent_id(agent.agent_id),
-                    agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
-                    agent.attention,
+                    agent.title().unwrap_or("unnamed"),
+                    if agent.turn_running {
+                        "working"
+                    } else {
+                        "idle"
+                    },
                 )
             })
             .collect::<Vec<_>>();
         if lines.is_empty() {
             return "No visible agents are currently registered.".to_owned();
         }
-        lines.insert(0, "Visible agents: handle | name | attention".to_owned());
+        lines.insert(0, "Visible agents: handle | name | state".to_owned());
         let mut context = lines.join("\n");
         let mut end = context.len().min(16 * 1024);
         while !context.is_char_boundary(end) {
@@ -178,12 +179,12 @@ impl AgentRegistry {
             let workspace = match source {
                 Some(source) => self.pool.open_workspace(&source).await?,
                 None => {
-                    let project = self
+                    let (path, _) = self
                         .projects()
                         .into_iter()
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("Iris needs a registered project or existing agent to establish its coordinator view"))?;
-                    self.pool.repo(&project.path).await?.user_checkout().await?
+                    self.pool.repo(&path).await?.user_checkout().await?
                 }
             };
             let (agent_id, _) = self
@@ -226,19 +227,17 @@ impl IrisToolHost for IrisTools {
 async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow::Result<String> {
     match call.name.as_str() {
         "iris_list_agents" => {
-            let kinds = registry.agent_state_kinds().await;
             let mut lines = Vec::new();
-            for agent in registry
-                .ui_agents(&kinds)
-                .into_iter()
-                .filter(|agent| !agent.labels.iter().any(|label| label == IRIS_LABEL))
-            {
+            for agent in registry.ui_agents() {
                 lines.push(format!(
-                    "{} | {} | {:?} | {}",
+                    "{} | {} | {}",
                     registry.display_agent_id(agent.agent_id),
-                    agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
-                    agent.attention,
-                    agent.last_user_message_text
+                    agent.title().unwrap_or("unnamed"),
+                    if agent.turn_running {
+                        "working"
+                    } else {
+                        "idle"
+                    },
                 ));
             }
             Ok(if lines.is_empty() {
@@ -251,10 +250,10 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
             let args: StartAgentArgs = parse(&call)?;
             anyhow::ensure!(!args.prompt.trim().is_empty(), "prompt must not be empty");
             let projects = registry.projects();
-            let project = match args.project.as_deref() {
+            let (project_path, _) = match args.project.as_deref() {
                 Some(needle) => projects
                     .iter()
-                    .find(|project| project.name == needle || project.path.as_str() == needle)
+                    .find(|(path, name)| name == needle || path.as_str() == needle)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("unknown project {needle}"))?,
                 None if projects.len() == 1 => projects[0].clone(),
@@ -267,7 +266,7 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 .create(
                     role,
                     StartMode::NewOn {
-                        repo: project.path,
+                        repo: project_path,
                         revset: "trunk()".to_owned(),
                     },
                 )
@@ -426,10 +425,13 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
         }
         "iris_rename_agent" => {
             let args: RenameArgs = parse(&call)?;
-            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
-            registry.rename_agent(agent_id, args.name.clone()).await?;
-            refresh_clients(registry).await;
-            Ok(format!("Renamed agent to {}.", args.name))
+            // A name is the client's `Name` fact in the store now, not the
+            // daemon's (`AGENT-LOG-DESIGN.md`); nothing here can set one.
+            let _ = registry.resolve_display_agent_id(&args.agent)?;
+            anyhow::bail!(
+                "naming an agent is the client's, not the daemon's: {} was not set",
+                args.name
+            )
         }
         "iris_set_agent_visibility" => {
             let args: VisibilityArgs = parse(&call)?;

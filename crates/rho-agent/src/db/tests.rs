@@ -889,22 +889,6 @@ async fn turn_end_and_user_message_set_dispositions() {
 }
 
 #[tokio::test]
-async fn view_config_round_trips_and_defaults_empty() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.commit();
-    assert_eq!(db.read().view_config(), Vec::<u8>::new());
-
-    let mut write = db.write().await;
-    write.set_view_config(vec![1, 2, 3]);
-    write.commit();
-    assert_eq!(db.read().view_config(), [1, 2, 3]);
-}
-
-#[tokio::test]
 async fn projects_upsert_by_path_and_remove() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

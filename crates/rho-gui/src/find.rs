@@ -68,6 +68,10 @@ pub(crate) struct FindCandidate {
     /// The reader remembers the filing as often as the place, so a label
     /// path finds a thing exactly as its parent path does.
     pub labels: Vec<String>,
+    /// Names the query matches but the row never shows: an agent's tag and
+    /// the last thing the user said to it. The reader looks for what they
+    /// remember, which is rarely the title something ended up with.
+    pub aka: Vec<String>,
     /// Unix milliseconds of the last use, for ranking equal matches. Zero
     /// where nothing records a use.
     pub recency: i64,
@@ -83,6 +87,7 @@ impl FindCandidate {
     fn names(&self) -> Vec<String> {
         let mut names = vec![self.path.clone()];
         names.extend(self.labels.iter().cloned());
+        names.extend(self.aka.iter().cloned());
         names
     }
 }
@@ -233,6 +238,7 @@ fn slack_candidates(
             recency: row.latest.as_ref().map_or(0, millis),
             target: FindTarget::Slack(rho_slack::session::Source::Conversation(row.id)),
             labels: Vec::new(),
+            aka: Vec::new(),
         });
     }
     for (key, card, title) in threads {
@@ -242,6 +248,7 @@ fn slack_candidates(
             recency: millis(&card.newest),
             target: FindTarget::Slack(rho_slack::session::Source::Thread(key)),
             labels: Vec::new(),
+            aka: Vec::new(),
         });
     }
     candidates

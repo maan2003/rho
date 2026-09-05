@@ -3848,45 +3848,15 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
 fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript(
     cx: &mut TestAppContext,
 ) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, ClientMessage, UiAgentSummary, UiAttention,
-        WorkspaceInfo,
-    };
+    use rho_ui_proto::ClientMessage;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
-    let summary = || UiAgentSummary {
-        agent_id,
-        parent_agent: None,
-        display_name: Some("retained transcript".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
+    let head = || rho_ui_proto::story::UiAgentHead {
+        spawn_name: Some("retained transcript".to_owned()),
+        ..ui_head(agent_id)
     };
-    let ready = || ConnEvent::Ready {
-        agents: vec![summary()],
-        iris_agent: None,
-        projects: Vec::new(),
-        auth: AuthState {
-            namespaces: Vec::new(),
-            disabled_namespaces: Vec::new(),
-            active_namespace: None,
-        },
-        machine_seed: 0,
-        agent_counter: 2,
-    };
+    let ready = || ready_with(vec![head()], 2);
 
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3894,11 +3864,12 @@ fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript
             workspace.take_host_messages_for_test(HostId::default());
             workspace.handle_event(HostId::default(), ready(), window, cx);
             let refresh_messages = workspace.take_host_messages_for_test(HostId::default());
-            assert!(
-                !refresh_messages
-                    .iter()
-                    .any(|message| { matches!(message, ClientMessage::SubscribeAgents { .. }) })
-            );
+            assert!(!refresh_messages.iter().any(|message| {
+                matches!(
+                    message,
+                    ClientMessage::AgentStreamFocus { agent_ids } if !agent_ids.is_empty()
+                )
+            }));
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::Disconnected("link dropped".to_owned()),
@@ -3917,7 +3888,7 @@ fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript
             assert!(messages.iter().any(|message| {
                 matches!(
                     message,
-                    ClientMessage::SubscribeAgents { agent_ids }
+                    ClientMessage::AgentStreamFocus { agent_ids }
                         if agent_ids == &vec![agent_id]
                 )
             }));
@@ -3927,10 +3898,7 @@ fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript
 
 #[gpui::test]
 fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContext) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, ClientMessage, UiAgentFacts, UiAgentSummary,
-        UiAttention, WorkspaceInfo,
-    };
+    use rho_ui_proto::ClientMessage;
 
     let ids = [agent(21), agent(22), agent(23), agent(24)];
     let mut desk = DeskFixture::new();
@@ -3938,34 +3906,14 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
         let heading = desk.note(None, &format!("Warm agent {}", index + 1));
         desk.agent_row(heading, agent_id);
     }
-    let summaries = ids
+    let heads = ids
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, agent_id)| UiAgentSummary {
-            agent_id,
-            parent_agent: None,
-            display_name: Some(format!("warm {}", index + 1)),
-            created_at: UnixMs(1),
-            updated_at: UnixMs(1),
-            role: AgentRole::default(),
-            workspace: WorkspaceInfo::UserCheckout {
-                repo: "/tmp".into(),
-            },
-            attention: UiAttention::Pending,
-            last_active: UnixMs((ids.len() - index) as u64),
-            facts: UiAgentFacts {
-                last_turn_ended: Some(UnixMs(1)),
-                last_user_message_at: UnixMs(0),
-                needs_you_hint: true,
-                ..Default::default()
-            },
-            hidden: false,
-            disposition: AgentDisposition::Pending,
-            last_user_message_text: String::new(),
-            activity: None,
-            turn_report: None,
-            labels: Vec::new(),
+        .map(|(index, agent_id)| rho_ui_proto::story::UiAgentHead {
+            story_pos: rho_ui_proto::story::UiStoryPos(1),
+            spawn_name: Some(format!("warm {}", index + 1)),
+            ..ui_head(agent_id)
         })
         .collect();
 
@@ -3973,23 +3921,17 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: summaries,
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 30,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), ready_with(heads, 30), window, cx);
+            // Each of them asked for the user, the first waiting longest,
+            // which is the order the dealer ranks them in.
+            for (index, agent_id) in ids.iter().copied().enumerate() {
+                workspace.handle_event(
+                    HostId::default(),
+                    story_wanting(agent_id, UnixMs(index as u64 + 1)),
+                    window,
+                    cx,
+                );
+            }
         })
         .unwrap();
     cx.run_until_parked();
@@ -4011,14 +3953,16 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
                 .take_host_messages_for_test(HostId::default())
                 .into_iter()
                 .filter_map(|message| match message {
-                    ClientMessage::SubscribeAgents { agent_ids } => Some(agent_ids),
+                    ClientMessage::AgentStreamFocus { agent_ids } => Some(agent_ids),
                     _ => None,
                 })
-                .flatten()
-                .collect::<Vec<_>>()
+                .next_back()
+                .unwrap_or_default()
         })
         .unwrap();
-    assert_eq!(subscribed, vec![ids[1], ids[2]]);
+    // The focus set is replaced whole, so what it must say is the top three
+    // and not the fourth card.
+    assert_eq!(subscribed, vec![ids[0], ids[1], ids[2]]);
 
     workspace
         .update(cx, |workspace, window, cx| {
@@ -4042,7 +3986,12 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
                 workspace
                     .take_host_messages_for_test(HostId::default())
                     .into_iter()
-                    .all(|message| !matches!(message, ClientMessage::SubscribeAgents { .. }))
+                    .all(|message| {
+                        !matches!(
+                            message,
+                            ClientMessage::AgentStreamFocus { agent_ids } if !agent_ids.is_empty()
+                        )
+                    })
             );
         })
         .unwrap();
@@ -4233,10 +4182,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceId,
-        WorkspaceIdDomain, WorkspaceInfo,
-    };
+    use rho_ui_proto::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -4244,38 +4190,17 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![UiAgentSummary {
-                        agent_id,
-                        parent_agent: None,
-                        display_name: Some("worker".to_owned()),
-                        created_at: UnixMs(1),
-                        updated_at: UnixMs(1),
-                        role: AgentRole::default(),
-                        workspace: WorkspaceInfo::Workspace {
+                ready_with(
+                    vec![rho_ui_proto::story::UiAgentHead {
+                        spawn_name: Some("worker".to_owned()),
+                        workdirs: vec![WorkspaceInfo::Workspace {
                             repo: "/tmp/rho".into(),
                             id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
-                        },
-                        attention: UiAttention::Quiet,
-                        last_active: UnixMs(1),
-                        facts: Default::default(),
-                        hidden: false,
-                        disposition: AgentDisposition::Pending,
-                        last_user_message_text: String::new(),
-                        activity: None,
-                        turn_report: None,
-                        labels: Vec::new(),
+                        }],
+                        ..ui_head(agent_id)
                     }],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
+                    100,
+                ),
                 window,
                 cx,
             );
@@ -4591,6 +4516,64 @@ fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppConte
             assert!(mutation.writes.iter().any(|write| write.id == dealt
                 && write.property
                     == rho_desk::cells::Property::State(rho_desk::cells::State::Done)));
+        })
+        .unwrap();
+}
+
+/// Filing says where a card is shown, not whether it exists. An agent
+/// nobody put under a note still asks for the user, so it is dealt, at the
+/// root and with no breadcrumb.
+#[gpui::test]
+fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) {
+    let agent_id = agent(41);
+    let desk = DeskFixture::new();
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ready_with(
+                    vec![rho_ui_proto::story::UiAgentHead {
+                        story_pos: rho_ui_proto::story::UiStoryPos(4),
+                        spawn_name: Some("nobody filed me".to_owned()),
+                        ..ui_head(agent_id)
+                    }],
+                    50,
+                ),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(1)),
+                window,
+                cx,
+            );
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let (identity, kind) = workspace
+                .current_deal_card_for_test(cx)
+                .expect("the unfiled agent is dealt");
+            assert_eq!(kind, crate::dashboard::DealCardKind::Agent);
+            assert_eq!(
+                identity.node_id,
+                rho_desk::cells::Id::Agent(agent_id),
+                "the card stands for the agent itself, not a note over it"
+            );
+            // Opening it must reach the transcript. With no note behind the
+            // card, a target looked up by node alone finds nothing and
+            // opens an empty page instead.
+            assert_eq!(
+                workspace.card_target_for_test(identity),
+                crate::dashboard::CardTarget::Agent(agent_id)
+            );
         })
         .unwrap();
 }
@@ -6923,11 +6906,6 @@ fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext
 /// as its full path, and submitting one opens the surface that path names.
 #[gpui::test]
 fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppContext) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
-        WorkspaceInfo,
-    };
-
     cx.update(bind_test_keymaps);
     // A page node makes the dashboard look at the browser, which is a
     // global rather than a field.
@@ -6951,37 +6929,14 @@ fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppCon
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![UiAgentSummary {
-                        agent_id,
-                        parent_agent: None,
-                        display_name: Some("warm agent".into()),
-                        created_at: UnixMs(1),
-                        updated_at: UnixMs(1),
-                        role: AgentRole::default(),
-                        workspace: WorkspaceInfo::UserCheckout {
-                            repo: "/tmp".into(),
-                        },
-                        attention: UiAttention::Pending,
-                        last_active: UnixMs(5),
-                        facts: UiAgentFacts::default(),
-                        hidden: false,
-                        disposition: AgentDisposition::Pending,
-                        last_user_message_text: String::new(),
-                        activity: None,
-                        turn_report: None,
-                        labels: Vec::new(),
+                ready_with(
+                    vec![rho_ui_proto::story::UiAgentHead {
+                        story_pos: rho_ui_proto::story::UiStoryPos(1),
+                        spawn_name: Some("warm agent".into()),
+                        ..ui_head(agent_id)
                     }],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 40,
-                },
+                    40,
+                ),
                 window,
                 cx,
             );
@@ -7159,11 +7114,6 @@ fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppCo
 /// rather than making a second one.
 #[gpui::test]
 fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
-        WorkspaceInfo,
-    };
-
     cx.update(bind_test_keymaps);
     let agent_id = agent(77);
     let mut desk = DeskFixture::new();
@@ -7176,37 +7126,14 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![UiAgentSummary {
-                        agent_id,
-                        parent_agent: None,
-                        display_name: Some("warm agent".into()),
-                        created_at: UnixMs(1),
-                        updated_at: UnixMs(1),
-                        role: AgentRole::default(),
-                        workspace: WorkspaceInfo::UserCheckout {
-                            repo: "/tmp".into(),
-                        },
-                        attention: UiAttention::Pending,
-                        last_active: UnixMs(5),
-                        facts: UiAgentFacts::default(),
-                        hidden: false,
-                        disposition: AgentDisposition::Pending,
-                        last_user_message_text: String::new(),
-                        activity: None,
-                        turn_report: None,
-                        labels: Vec::new(),
+                ready_with(
+                    vec![rho_ui_proto::story::UiAgentHead {
+                        story_pos: rho_ui_proto::story::UiStoryPos(1),
+                        spawn_name: Some("warm agent".into()),
+                        ..ui_head(agent_id)
                     }],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 40,
-                },
+                    40,
+                ),
                 window,
                 cx,
             );
@@ -7254,6 +7181,69 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
 
 /// A desk as the daemon would hand it over: cells the client merges, plus a
 /// text history per note. Tests build one and send it as `DeskSynced`.
+/// A head as `Ready` carries it: the least an agent can say about itself,
+/// with the story empty. Tests that care about a title or a running turn
+/// set those fields with struct update syntax.
+fn ui_head(agent_id: AgentId) -> rho_ui_proto::story::UiAgentHead {
+    rho_ui_proto::story::UiAgentHead {
+        agent_id,
+        story_pos: rho_ui_proto::story::UiStoryPos(0),
+        role: rho_ui_proto::AgentRole::default(),
+        runtime_kind: rho_ui_proto::story::UiRuntimeKind::Rho,
+        workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        }],
+        spawned_by: rho_ui_proto::story::UiSpawnedBy::Direct,
+        parent: None,
+        spawn_name: None,
+        generated_title: None,
+        activity: None,
+        turn_running: false,
+        created_at: UnixMs(1),
+    }
+}
+
+/// The whole story of an agent that has finished a turn and asked for the
+/// user: the least a card needs to rank as waiting on a reply.
+fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
+    use rho_ui_proto::story::UiStoryEvent;
+    ConnEvent::AgentStory {
+        agent_id,
+        from: rho_ui_proto::story::UiStoryPos(0),
+        events: vec![
+            UiStoryEvent::UserMessage {
+                text: "go".to_owned(),
+                at: UnixMs(0),
+            },
+            UiStoryEvent::TurnStarted { at: UnixMs(0) },
+            UiStoryEvent::Wants {
+                want: rho_ui_proto::story::UiAgentWant::Ask,
+                summary: None,
+                at,
+            },
+            UiStoryEvent::TurnEnded {
+                outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                at,
+            },
+        ],
+    }
+}
+
+/// `Ready` with these heads and nothing else: the shape every test that
+/// only cares about the agents list wants.
+fn ready_with(agents: Vec<rho_ui_proto::story::UiAgentHead>, agent_counter: u64) -> ConnEvent {
+    ConnEvent::Ready {
+        agents,
+        auth: rho_ui_proto::AuthState {
+            namespaces: Vec::new(),
+            disabled_namespaces: Vec::new(),
+            active_namespace: None,
+        },
+        machine_seed: 0,
+        agent_counter,
+    }
+}
+
 struct DeskFixture {
     device: rho_desk::cells::DeviceId,
     store: rho_desk::cells::Store,
@@ -7365,6 +7355,24 @@ impl DeskFixture {
                 newest_from_other: Some(rho_desk::cells::SlackTs(newest.clone())),
             })
             .collect()
+    }
+
+    /// A registered project: a label that names a workdir. Projects live
+    /// in the store rather than on the wire, so this is where a test says
+    /// one exists.
+    fn project(&mut self, name: &str, path: &str) -> rho_desk::cells::Id {
+        self.next_node += 1;
+        let id = rho_desk::cells::Id::Label(rho_desk::cells::Uuid([self.next_node as u8; 16]));
+        self.file(id.clone(), None);
+        self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
+        self.set(
+            id.clone(),
+            rho_desk::cells::Property::Project(Some(rho_desk::cells::Project {
+                host: 0,
+                path: path.into(),
+            })),
+        );
+        id
     }
 
     /// An agent the user filed under a note.
@@ -7748,38 +7756,14 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
-        WorkspaceInfo,
-    };
-
     let running = agent(31);
     let mut desk = DeskFixture::new();
     let heading = desk.note(None, "phone feed");
     desk.agent_row(heading, running);
-    let summary = |activity: &str| UiAgentSummary {
-        agent_id: running,
-        parent_agent: None,
-        display_name: None,
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Working,
-        last_active: UnixMs(1),
-        facts: UiAgentFacts {
-            turn_running: true,
-            last_user_message_at: UnixMs(chrono::Local::now().timestamp_millis() as u64),
-            ..Default::default()
-        },
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
+    let head = |activity: &str| rho_ui_proto::story::UiAgentHead {
         activity: Some(activity.to_owned()),
-        turn_report: None,
-        labels: Vec::new(),
+        turn_running: true,
+        ..ui_head(running)
     };
 
     let workspace = test_workspace(cx);
@@ -7788,18 +7772,7 @@ fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary("wiring the flick recogniser")],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 40,
-                },
+                ready_with(vec![head("wiring the flick recogniser")], 40),
                 window,
                 cx,
             );
@@ -7826,18 +7799,7 @@ fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary("unfurl box: background tint")],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 40,
-                },
+                ready_with(vec![head("unfurl box: background tint")], 40),
                 window,
                 cx,
             );
@@ -7966,33 +7928,14 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
     let area = desk.due_note(None, "the area in view");
+    // The one registered project is the workdir the draft inherits when
+    // the area names none.
+    desk.project("rho", "/tmp/rho-test-repo");
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: Vec::new(),
-                    iris_agent: None,
-                    // The one registered project is the workdir the draft
-                    // inherits when the area names none.
-                    projects: vec![rho_ui_proto::UiProject {
-                        path: "/tmp/rho-test-repo".into(),
-                        name: "rho".to_owned(),
-                        description: String::new(),
-                    }],
-                    auth: rho_ui_proto::AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 1,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), ready_with(Vec::new(), 1), window, cx);
             workspace.force_host_online(HostId::default());
         })
         .unwrap();
@@ -8502,6 +8445,217 @@ fn a_muted_slack_unit_stays_off_home_until_it_is_opened(cx: &mut TestAppContext)
                 workspace.dashboard.node_is_open(card),
                 "the message that arrived while it was muted is a card again"
             );
+        })
+        .unwrap();
+}
+
+/// Two agents filed under one note are two cards. Taking the note as the
+/// topic collapsed them into one, so every agent under a note but the
+/// loudest was missing from Home entirely. An errored agent is one of
+/// them, and it reads as errored rather than as finished work.
+#[gpui::test]
+fn every_agent_under_a_note_is_its_own_card(cx: &mut TestAppContext) {
+    let asking = agent(51);
+    let dead = agent(52);
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "rig agents");
+    desk.agent_row(note.clone(), asking);
+    desk.agent_row(note, dead);
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ready_with(vec![ui_head(asking), ui_head(dead)], 60),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                story_wanting(asking, UnixMs(1)),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::AgentStory {
+                    agent_id: dead,
+                    from: rho_ui_proto::story::UiStoryPos(0),
+                    events: vec![
+                        rho_ui_proto::story::UiStoryEvent::UserMessage {
+                            text: "go".to_owned(),
+                            at: UnixMs(0),
+                        },
+                        rho_ui_proto::story::UiStoryEvent::TurnStarted { at: UnixMs(0) },
+                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
+                            outcome: rho_ui_proto::story::UiTurnOutcome::Errored {
+                                message: "the deploy script exited 1".to_owned(),
+                            },
+                            at: UnixMs(1),
+                        },
+                    ],
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("waiting on reply"),
+        "the asking agent: {text:?}"
+    );
+    assert!(
+        text.contains("errored ·"),
+        "the dead turn waits on the user and says so: {text:?}"
+    );
+}
+
+/// `d` on an agent closes its card, and the card comes back only when the
+/// story tells something past the cursor the verdict wrote. Being filed
+/// under a note does not exempt it: filing says where, not whether.
+#[gpui::test]
+fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppContext) {
+    let agent_id = agent(42);
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "rig agents");
+    desk.agent_row(note, agent_id);
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 50),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(1)),
+                window,
+                cx,
+            );
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let (identity, _) = workspace
+                .current_deal_card_for_test(cx)
+                .expect("the agent asks, so it is dealt");
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &identity.node_id,
+                crate::desk_view::DeskVerdict::Done,
+                window,
+                cx,
+            ));
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace
+                    .current_deal_card_for_test(cx)
+                    .map(|(id, kind)| (id.node_id, kind)),
+                None,
+                "the verdict handled everything the story had told"
+            );
+            // Something new past the cursor is the card again.
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::AgentStory {
+                    agent_id,
+                    from: rho_ui_proto::story::UiStoryPos(4),
+                    events: vec![
+                        rho_ui_proto::story::UiStoryEvent::Wants {
+                            want: rho_ui_proto::story::UiAgentWant::Ask,
+                            summary: None,
+                            at: UnixMs(2),
+                        },
+                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
+                            outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                            at: UnixMs(2),
+                        },
+                    ],
+                },
+                window,
+                cx,
+            );
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                workspace.current_deal_card_for_test(cx).is_some(),
+                "the agent asked again past the cursor"
+            );
+        })
+        .unwrap();
+}
+
+/// A todo on a Slack unit has to write the cursor it says it moved. The
+/// daemon rejects a verdict whose entry states a change the mutation does
+/// not make, so a missing write is not a stale card, it is a refusal.
+#[gpui::test]
+fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            let (writes, (_, event)) = workspace
+                .desk_cells
+                .verdict_writes(
+                    HostId::default(),
+                    &node,
+                    crate::desk_view::DeskVerdict::Todo {
+                        defer_until: rho_desk::cells::Timestamp {
+                            unix_ms: 1_000,
+                            precision: rho_desk::cells::TimestampPrecision::Minute,
+                        },
+                        pace: 3,
+                    },
+                )
+                .expect("the unit has a source, so it can take a verdict");
+            let rho_desk::cells::VerdictEvent::Applied { changes, .. } = event else {
+                panic!("a dealt verdict is applied");
+            };
+            for change in &changes {
+                let after = change.after.clone().expect("a change writes a fact");
+                assert!(
+                    writes
+                        .iter()
+                        .any(|write| write.id == change.id && write.property == after),
+                    "the mutation is missing {:?} on {:?}",
+                    change.key,
+                    change.id
+                );
+            }
         })
         .unwrap();
 }
@@ -9132,6 +9286,75 @@ fn find_matches_a_thing_by_the_label_it_carries(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// An agent nobody filed is still findable, and it answers to the words
+/// the user last said to it as well as to its name: that is what the
+/// reader remembers, and a spawn name they never gave it is not.
+#[gpui::test]
+fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) {
+    let agent_id = agent(61);
+    let desk = DeskFixture::new();
+
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ready_with(vec![ui_head(agent_id)], 70),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::AgentStory {
+                    agent_id,
+                    from: rho_ui_proto::story::UiStoryPos(0),
+                    events: vec![
+                        rho_ui_proto::story::UiStoryEvent::UserMessage {
+                            text: "rebuild the search index".to_owned(),
+                            at: UnixMs(1),
+                        },
+                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
+                            outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                            at: UnixMs(2),
+                        },
+                    ],
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let candidates = workspace.find_candidates(cx);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.target == crate::find::FindTarget::Agent(agent_id)),
+                "the unfiled agent is a candidate"
+            );
+            let names = candidates
+                .iter()
+                .map(|candidate| (candidate.names_for_test(), candidate.recency))
+                .collect::<Vec<_>>();
+            let best = crate::find::rank_names(&names, "searchindex")
+                .first()
+                .copied()
+                .expect("the words the user said match");
+            assert_eq!(
+                candidates[best].target,
+                crate::find::FindTarget::Agent(agent_id),
+                "what the user said names the agent, got {:?}",
+                candidates[best].path
+            );
+        })
+        .unwrap();
+}
+
 /// A tab opened from a page belongs under that page. The browser is the
 /// only thing that knows where a tab came from, so the map joins it in
 /// live; nothing about a tab is ever written to the store.
@@ -9427,6 +9650,292 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 vec![Some(desk_page(origin))],
                 "the group the page carries comes with it"
             );
+        })
+        .unwrap();
+}
+
+/// `space n a` after an agent has been read: the draft that opens is the
+/// one that submits. Selection is what routes enter, so a stale one sent
+/// the message to the agent's own empty prompt and dropped it silently.
+#[gpui::test]
+fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(agent(1)), window, cx);
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("look at the readme", window, cx)
+            });
+        })
+        .expect("type the first message");
+
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+
+    // Disconnected in tests, so the send reports itself instead of leaving
+    // no trace: reaching the draft's own submit is what is under test.
+    assert!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .message_log_texts()
+                .iter()
+                .any(|message| message.contains("not connected to rho-daemon")))
+            .expect("read messages"),
+        "enter in a new-agent draft should submit the draft"
+    );
+}
+
+/// `n a` into a label makes the agent a member of it. Filing it as a child
+/// left the label empty on the map and the agent at the root.
+#[test]
+fn a_new_agent_made_in_a_label_is_labelled_not_reparented() {
+    use rho_desk::cells::{Id, Property};
+
+    let label = Id::Label(rho_desk::cells::Uuid([3; 16]));
+    assert!(matches!(
+        crate::workspace::filing_property(label.clone()),
+        Property::Labeled { present: true, .. }
+    ));
+    let note = Id::Note(rho_desk::cells::Uuid([4; 16]));
+    assert!(matches!(
+        crate::workspace::filing_property(note.clone()),
+        Property::Parent(Some(parent)) if parent == note
+    ));
+}
+
+/// Enter in the workdir row sends the draft. The prompt's own enter is
+/// insert-only and tab leaves the cursor in normal mode, so a message
+/// written and then corrected in a field could not be sent at all.
+#[gpui::test]
+fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("look at the readme", window, cx)
+            });
+        })
+        .expect("type the first message");
+
+    cx.dispatch_action(*workspace, crate::RoleCycle);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(
+                workspace.cursor_in_draft_field_for_test(cx),
+                "tab from the body lands in the workdir row"
+            );
+            workspace.submit_from_draft_field_for_test(window, cx);
+        })
+        .expect("enter in the field");
+
+    assert!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .message_log_texts()
+                .iter()
+                .any(|message| message.contains("not connected to rho-daemon")))
+            .expect("read messages"),
+        "enter in the workdir row should submit the draft"
+    );
+}
+
+/// Shift-Tab walks the rows the other way round. It used to cycle the value
+/// under the cursor, so there was no way back except forwards through every
+/// row.
+#[gpui::test]
+fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+
+    // From the body, backwards is the start row, then the role row.
+    cx.dispatch_action(*workspace, crate::RoleCycleGroup);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.cursor_in_draft_start_field_for_test(cx));
+        })
+        .expect("start row");
+    cx.dispatch_action(*workspace, crate::RoleCycleGroup);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.cursor_in_draft_role_field_for_test(cx));
+        })
+        .expect("role row");
+}
+
+/// A draft stands for no card: it is a message being written, not a thing
+/// that was dealt. With no node of its own it wore whichever card the
+/// cursor had left behind, label, why and all.
+#[gpui::test]
+fn a_draft_wears_no_other_cards_label(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                workspace.open_card_in_view(cx).is_some(),
+                "the pulled card is what is in view"
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.open_card_in_view(cx).map(|card| card.identity),
+                None,
+                "the draft in front of it stands for no card"
+            );
+        })
+        .unwrap();
+}
+
+/// Where enter goes in a draft's header row, as the keymap resolves it: to
+/// the draft's own submit, over vim's normal-mode motion.
+#[gpui::test]
+fn enter_in_a_draft_field_routes_to_the_drafts_submit(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let draft = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoDraft").unwrap(),
+            KeyContext::parse("Editor vim_mode=normal vim_operator=none").unwrap(),
+        ];
+        let (bindings, _) =
+            keymap.bindings_for_input(&[Keystroke::parse("enter").unwrap()], &draft);
+        assert_eq!(
+            bindings.first().map(|binding| binding.action().name()),
+            Some("rho_gui::DraftFieldSubmit"),
+            "enter in a draft should reach the draft's submit: {bindings:?}"
+        );
+    });
+}
+
+/// Clearing a header row leaves nothing behind and keeps what is typed
+/// next in that row. Vim's own `cc` stops at the row's buffer boundary: it
+/// cleared nothing, and the path typed after it was split between the
+/// workdir and the role.
+#[gpui::test]
+fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .draft_model_for_test()
+                .update(cx, |view, cx| view.set_workdir_text("wrong", cx));
+        })
+        .expect("seed the workdir row");
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.dispatch_action(*workspace, crate::RoleCycle);
+    cx.dispatch_action(*workspace, crate::DraftFieldClear);
+    cx.simulate_keystrokes(*workspace, "o k");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let draft = workspace.draft_model_for_test().read(cx);
+            assert_eq!(draft.workdir_text(cx), "ok", "the row holds what was typed");
+            assert_eq!(draft.role_text(cx), "eng", "the row below is untouched");
+        })
+        .expect("read the rows");
+}
+
+/// A verdict says which card it took. The echo used to name the path above
+/// the card, so `done` over an agent filed under a label said the label.
+#[gpui::test]
+fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
+    let agent_id = agent(42);
+    let desk = DeskFixture::new();
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ready_with(
+                    vec![rho_ui_proto::story::UiAgentHead {
+                        story_pos: rho_ui_proto::story::UiStoryPos(4),
+                        spawn_name: Some("the deploy".to_owned()),
+                        ..ui_head(agent_id)
+                    }],
+                    50,
+                ),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                story_wanting(agent_id, UnixMs(1)),
+                window,
+                cx,
+            );
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    let stamp = workspace
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default())
+                .expect("verdict mutation")
+                .stamp
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+            assert_eq!(workspace.echo_text_for_test(), Some("done: the deploy"));
         })
         .unwrap();
 }

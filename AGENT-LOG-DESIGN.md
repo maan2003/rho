@@ -126,8 +126,9 @@ for that call, from the raw log, no runtime loaded.
 ### The wire is log replication plus one focus stream
 
 - `Ready` carries every agent's head: `UiAgentHead { agent_id, story_pos,
-  config, title, activity, usage_total, turn_running }`. That is the
-  agents list; a title or a cost total never waits on a log.
+  role, runtime_kind, workdirs, spawned_by, parent, spawn_name,
+  generated_title, activity, turn_running, created_at }`. That is the
+  agents list; a title or a workdir never waits on a log.
 - `AgentLogs { known: Vec<(AgentId, StoryPos)> }`, sent once after
   `Ready`: the client's version vector, one position per agent it holds.
   The daemon answers with `AgentStory { agent_id, from: StoryPos, events }`
@@ -283,7 +284,7 @@ B. **The story log and its replication.** `StoryEvent`, the story
    table written live for both runtimes, `Ready` heads, `AgentLogs` /
    `AgentStory` / `AgentHead`, the GUI mirror, attention derived on the
    client, `AgentHandledThrough(StoryPos)`, the deletions listed under
-   the wire, the one-time GUI conversion of projects into `Project`
+   the wire, the one-time conversion of projects into `Project`
    labels and of view_config into the GUI's db, the transitional
    attention table deleted, the story migration. Daemon and GUI, epoch bump. The
    biggest slice; b8os may land the daemon half writing the story table
@@ -302,6 +303,74 @@ B. **The story log and its replication.** `StoryEvent`, the story
    list in 25-62 ms. Known gap: a Claude compaction is not told, because
    the stream carries no event this can be mapped from; a Rho one is
    (`Compacted`).
+   Wire and GUI half, change one (b8os, 5 Sep): epoch RUP9, ALPN
+   `rho/ui/9`. `Ready` carries `UiAgentHead` only; `AgentLogs` /
+   `AgentStory` / `AgentHead` and the connection-wide follow replace the
+   per-agent subscription, with `AgentStreamFocus` left as the whole
+   focus set, replaced wholesale rather than added to one agent at a
+   time. The follow keeps a per-agent cursor per connection: an event in
+   step goes as `AgentStory`, one past the cursor as `AgentHead` so the
+   client re-asks with `AgentLogs`, and broadcast lag falls back to
+   `Ready`. That makes lag and the background backfill self-healing with
+   no new message. Attention is decided in one function, `agent_card` in
+   `desk_view`, beside the Slack card, and pushed into the registry so
+   every rail reads one answer.
+   Three places the shape did not survive contact:
+   - The spawner's id lived only in the transitional attention table, so
+     the story learns it: `Parented { parent, at }`, written at creation,
+     inserted after `Created` by the backfill, and told once for
+     already-built stories. It folds into `AgentHead.parent`.
+   - Publishing a story event needed every `append_agent_story` call
+     site to carry a channel. Instead rho-db grew two small mechanisms:
+     one type-erased observer slot per database, and an after-commit
+     effect queue, so the append publishes itself once the transaction
+     is durable and never while the write lock is held.
+   - The projects conversion could not be the GUI's: `Ready.projects`
+     is gone in the same epoch, so there is nothing client-side left to
+     convert from. It is a daemon conversion like the dispositions one,
+     writing one label per project with `Name` and `Project { host, path
+     }`, the label id derived from the path so a second run recognises
+     it. A project's description is dropped; nothing read it.
+   Change two is the redb mirror in place of the in-memory fold, the
+   transcript surface rendering from it with the live frame layered on,
+   and then the daemon dropping `projects`, `view_config` and the
+   transitional attention table.
+   The mirror is `agent-mirror.redb` in the client state directory:
+   the head with the name of the host it was heard from, one row per
+   story event keyed agent then position, and the attention the card
+   decided. It is written on the events that carry those things and
+   read back before any daemon answers, so `AgentLogs` on `Ready` asks
+   only for what came after. Two rules keep it honest: a row whose host
+   is not attached this session is dropped, because host ids are handed
+   out in attach order and mean nothing across a restart; and a story
+   that is not contiguous from position zero is thrown away and asked
+   for again rather than folded with a hole in it.
+   A card also stopped needing a note. Filing is the user's labelling
+   and placement, never a precondition: an agent whose story ends
+   asking for the user is a card whether or not anyone filed it, ranked
+   at the root with no breadcrumb, with its store node consulted only
+   for the user's own verdict on it (muted, deferred) when there is
+   one. That is what lets Home rank from the mirror alone.
+   Opening such a card reads the agent from the card's own id
+   rather than from a node, which is what was wrong the first time: a
+   card with nothing filed behind it opened an empty page.
+   The transcript reads the mirror too. Opening an agent shows the
+   story folded into blocks straight away instead of waiting on a
+   load, and shows it with the daemon down. Subscribing makes the
+   daemon send a snapshot first, so the live transcript replaces the
+   story-made one whole and nothing is merged. What the story does not
+   carry it does not invent: a tool call is its name and its one line,
+   never its output, and the status is never `Streaming`, because a
+   turn that was running when the client last heard is the daemon's to
+   report again. Bodies come on demand in slice D.
+   `view_config` moved nowhere: nothing had read it since July, so the
+   table is deleted rather than mirrored.
+   Home is not offline yet, and this change does not claim it. The
+   Desk's rows still come from the daemon by `DeskSync` every session,
+   so a cold client has agents and no notes, no filing and no
+   breadcrumbs. The client's own copy of the store is the `rho-sync`
+   direction in `STORE-DESIGN.md` and gets its own slice after this
+   one; offline Home is claimed when that lands.
 C. **Usage from the mirror.** Graphs read `Cost` events; the usage
    requests and tables go. Daemon and GUI, epoch bump.
 D. **On-demand detail.** `AgentDetail` for tool bodies and diffs from
@@ -335,6 +404,12 @@ in `STORE-DESIGN.md`.
 - A story event carrying tool output or a raw model message.
 - The daemon computing whether an agent wants the user.
 - A per-agent subscription reappearing on the wire.
+- A source that adds rows but only refreshes facts: a story event or a
+  page's metadata makes a row exist, so the tree the dealer reads has to
+  be made again, not only the sources under it.
+- A surface borrowing a card it does not stand for: a why or a label
+  read on a list, a log or a picker belongs to whatever the map's
+  cursor last left behind, and a verdict pressed there takes it.
 - A migration file still present after the user has restarted on it.
 
 ## What done means

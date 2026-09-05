@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rho_ui_proto::{AgentId, UiAgentSummary};
+use rho_ui_proto::AgentId;
+
+use crate::AgentSummary;
 
 pub const MAX_AGENT_SUBSCRIPTIONS: usize = 128;
 pub const INITIAL_AGENT_SUBSCRIPTIONS: usize = 10;
@@ -115,7 +117,7 @@ impl AgentStreamGenerations {
 
 /// The most recently active visible top-level transcripts.
 pub fn recent_agent_roots(
-    agents: &[UiAgentSummary],
+    agents: &[AgentSummary],
     selected: Option<AgentId>,
     limit: usize,
 ) -> Vec<AgentId> {

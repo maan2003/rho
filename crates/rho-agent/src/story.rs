@@ -5,10 +5,48 @@
 
 use camino::Utf8PathBuf;
 use rho_core::{AgentId, InferenceResponseItem, ToolName};
+use rho_db::RhoDb;
 use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode};
 
-use crate::db::{AgentRole, AgentSpawnedBy, AgentUsageBucket, StoryPos, UnixMillis};
+use crate::db::{AgentHead, AgentRole, AgentSpawnedBy, AgentUsageBucket, StoryPos, UnixMillis};
+
+/// One story event, the moment it became durable, with the head it left
+/// behind. Published after the transaction commits, so a listener woken by
+/// one always finds it on disk.
+#[derive(Clone, Debug)]
+pub struct StoryAppended {
+    pub agent_id: AgentId,
+    pub pos: StoryPos,
+    pub event: StoryEvent,
+    pub head: AgentHead,
+}
+
+/// The database's story observer. Held in the database's own observer slot
+/// rather than passed down, because a story event is appended from a dozen
+/// places and none of them should have to carry a channel.
+pub struct StoryObserver {
+    appends: tokio::sync::broadcast::Sender<StoryAppended>,
+}
+
+/// Every story event appended to this database from now on. A slow reader
+/// lags rather than blocking the writer; a lagged reader catches up by
+/// reading the story table, which is the truth.
+pub fn story_appends(db: &RhoDb) -> tokio::sync::broadcast::Receiver<StoryAppended> {
+    db.observer(new_story_observer).appends.subscribe()
+}
+
+fn new_story_observer() -> StoryObserver {
+    StoryObserver {
+        appends: tokio::sync::broadcast::Sender::new(4096),
+    }
+}
+
+impl StoryObserver {
+    pub(crate) fn sender(&self) -> tokio::sync::broadcast::Sender<StoryAppended> {
+        self.appends.clone()
+    }
+}
 
 /// What an agent says this turn asks of the person, declared by the tag
 /// its reply ended with (`AGENT-WANTS-DESIGN.md`). Never derived: no tag
@@ -65,6 +103,13 @@ pub enum StoryEvent {
         spawn_name: Option<String>,
         at: UnixMillis,
     },
+    /// Who spawned this agent, by id. Told separately from `Created`
+    /// because the raw log never carried the id, so the agents that
+    /// predate the story learn it from the migration instead.
+    Parented {
+        parent: AgentId,
+        at: UnixMillis,
+    },
     UserMessage {
         text: String,
         at: UnixMillis,
@@ -92,9 +137,11 @@ pub enum StoryEvent {
         what: ToolLine,
         at: UnixMillis,
     },
-    /// The tag the reply ended with, when there was one.
+    /// What this turn asks of the person, when the turn declared it, with
+    /// the few-word label of what it is about.
     Wants {
         want: AgentWant,
+        summary: Option<String>,
         at: UnixMillis,
     },
     Titled {
@@ -138,6 +185,7 @@ impl StoryEvent {
     pub fn at(&self) -> UnixMillis {
         match self {
             Self::Created { at, .. }
+            | Self::Parented { at, .. }
             | Self::UserMessage { at, .. }
             | Self::AgentMail { at, .. }
             | Self::TurnStarted { at }

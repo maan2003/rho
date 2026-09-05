@@ -729,6 +729,12 @@ pub fn root_menu() -> Transient {
         .item("b", "switch buffer…", |workspace, window, cx| {
             workspace.open_buffer_picker(window, cx);
         })
+        // The echo area keeps two seconds; the log keeps everything it
+        // said. Reachable by no key at all until now, which made every
+        // notice that scrolled past unrecoverable.
+        .item("l", "message log", |workspace, window, cx| {
+            workspace.cmd_messages(window, cx);
+        })
         .item("k", "surface back", |workspace, window, cx| {
             workspace.cmd_surface_back(window, cx);
         })

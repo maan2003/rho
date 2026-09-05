@@ -18,6 +18,7 @@ pub mod hosts;
 pub(crate) mod image_view;
 pub mod journal;
 pub mod minibuffer;
+pub mod mirror;
 pub mod note_view;
 pub mod pane;
 pub(crate) mod realtime_client;
@@ -144,7 +145,10 @@ actions!(
         NotesForThis,
         NoteOpenRow,
         MessagesOpen,
-        HomeOpenRow
+        HomeOpenRow,
+        DraftFieldSubmit,
+        DraftFieldClear,
+        DraftValueCycle
     ]
 );
 
@@ -237,6 +241,38 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             "shift-tab",
             RoleCycleGroup,
             Some("RhoGui > Editor && !showing_completions && !VimDeal"),
+        ),
+        // The values the header rows hold, cycled in place: the role, and
+        // whether the agent starts on top of the target, joins it, or is
+        // sandboxed. Shift-tab used to do this, which cost the draft its
+        // way back through the rows.
+        KeyBinding::new(
+            "ctrl-tab",
+            DraftValueCycle,
+            Some("RhoGui > Editor && !showing_completions && !VimDeal"),
+        ),
+        // A draft is one message however many rows it has, so enter in the
+        // workdir, role, or start row sends it like enter in the body does.
+        // The prompt's own enter is insert-only, and tab leaves the cursor
+        // in normal mode, so from a field the key used to mean nothing at
+        // all. In the body it is still vim's own motion; the handler passes
+        // it on.
+        KeyBinding::new(
+            "enter",
+            DraftFieldSubmit,
+            Some("RhoDraft > Editor && !showing_completions && vim_mode != insert"),
+        ),
+        // `ctrl-u` empties the header row the cursor is on, in either mode,
+        // the way it clears a line everywhere else. Each row of the draft
+        // is its own buffer in one multibuffer, and vim's own `cc` stops at
+        // that boundary: it clears nothing and leaves the cursor on the
+        // seam, so the next character typed lands in the row below. Vim
+        // reads the operator before any keymap does, so the row needs a key
+        // of its own. In the body this is vim's scroll and stays vim's.
+        KeyBinding::new(
+            "ctrl-u",
+            DraftFieldClear,
+            Some("RhoDraft > Editor && !showing_completions"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
