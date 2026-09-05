@@ -40,9 +40,13 @@ Per agent the daemon keeps:
   Rho runtime and from the Claude stream for the Claude runtime. It is
   what clients mirror. No tool output, no diffs, no raw model exchange.
 - **The head**: the daemon's cache of the fold over both logs: story
-  position, current config, generated title, activity, usage totals,
-  whether a turn is running. Rebuilt from the logs if lost; never the
-  source of anything.
+  position, current config, current lineage, generated title, activity,
+  usage totals, whether a turn is running. Rebuilt from the logs if
+  lost; never the source of anything. A field joins the head only once
+  the logs can rebuild it: `turn_running` in slice B (with
+  `TurnStarted`/`TurnEnded`), `usage_total` in slice C (with `Cost`);
+  until then usage is read from the existing totals table so there is
+  one number.
 
 There is no `AgentRecord`. There is no `agent_presentation_events`
 table: a generated title or activity is a story event
@@ -65,10 +69,10 @@ stores it only as `spawned_by`).
 | record field | goes to |
 | --- | --- |
 | role, runtime, workdirs, spawned_by, created_at, binding | `Created` and the config events |
-| display_name, labels, parent_agent | already store facts (`Name`, `Labeled`, `Parent`); dropped |
+| display_name | `Created.spawn_name` (it was also what `RenameAgent` wrote, so no agent loses its name; a given name still beats a generated title; the store's `Name` overrides both) |
+| labels, parent_agent | already store facts (`Labeled`, `Parent`); dropped |
 | generated_title, activity | story events; head caches the latest |
-| updated_at, last_turn_ended, last_user_message, last_user_message_text | derived by the client from the story tail |
-| disposition, turn_report, user_interacted | the client's attention cache (below); the daemon no longer has an opinion |
+| updated_at, last_turn_ended, last_user_message, last_user_message_text, disposition, turn_report, user_interacted | slice A: a transitional table named for its deletion (`agent_attention_until_slice_b`), because raw events carry no wall clock and these are judgements; slice B: the times become a fold over story events (every `StoryEvent` has `at`), the judgements become the client's attention cache and the table is deleted |
 | claude_rewind | a raw event (`RuntimeRebound` pending, then confirmed) |
 | current_lineage | the head |
 
@@ -164,12 +168,13 @@ the daemon go. Quota observations from providers stay a daemon request.
 
 ### Migration, once
 
-On first start of the slice A build, for every `AgentRecord`: append
-`Created` from its fields as a new first raw event on its current
-lineage (positioned before the existing events by seq, which means a
-new lineage whose parent is the record's lineage at seq 0; b8os proves
-the ordering on a copy), fold the record into the head, and drop the
-`agents` table. On first start of the slice B build, for every agent:
+On first start of the slice A build, for every `AgentRecord`: write
+`Created` from its fields as the agent's new root lineage (one event at
+seq 0, the old root's parent pointer set to it, so the replay is
+`Created` then the old events unchanged and every existing position and
+fork stays valid; b8os proves this byte-for-byte on a copy), fold the
+record into the head and the transitional table, and drop the `agents`
+table. On first start of the slice B build, for every agent:
 build the story from the raw log (Rho runtime) or from the Claude
 session file named by the runtime (Claude runtime), or write
 `HistoryUnavailableBefore` when that file is gone, and drop
