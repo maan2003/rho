@@ -202,6 +202,17 @@ A. **Config in the log, no record.** `Created` and the config events,
    slice 1 needed; the unit tests could not see it because they write
    and read from one module, which is why every daemon migration runs
    on a copy of the user's store first.
+   Landed 5 Sep (088e88e3, daemon only). On a copy of the user's real
+   store: 2823 agents, 2645 with a spawn name, 105 Claude runtimes, 2
+   pending Claude rewinds; after migration every agent replays as
+   `Created` followed by its old events equal value by value, no
+   position changed. The store held 0 agent `Name` facts, so
+   `Created.spawn_name` carrying the record's display_name is what kept
+   2645 agents named. `create_agent` now takes the role, so no log opens
+   with a pointless `RoleChanged`; `append_agent_event` steps past an
+   occupied position so a config event mid-turn is not overwritten.
+   Migration files (`record_to_log_migration.rs`, `record_to_log_proof.rs`,
+   the `AGENT_DB_MIGRATIONS` entry) come out once the user has restarted.
 B. **The story log and its replication.** `StoryEvent`, the story
    table written live for both runtimes, `Ready` heads, `AgentLogs` /
    `AgentStory` / `AgentHead`, the GUI mirror, attention derived on the
