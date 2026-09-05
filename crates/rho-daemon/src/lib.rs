@@ -32,8 +32,6 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 mod agent_ui;
 pub mod debug;
 mod desk_cells;
-#[cfg(test)]
-mod record_to_log_proof;
 
 mod iris;
 mod realtime;

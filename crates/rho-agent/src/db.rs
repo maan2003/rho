@@ -64,11 +64,9 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "d37a6f02",
-    to: "b1e40c93",
-    migrate: record_to_log_migration::migrate,
-}];
+/// Empty until the next format change needs one. The record→log
+/// migration that filled it has run on the user's store and come out.
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -2008,8 +2006,6 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }
-
-pub mod record_to_log_migration;
 
 #[cfg(test)]
 mod tests;
