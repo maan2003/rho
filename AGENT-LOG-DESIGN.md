@@ -103,8 +103,20 @@ person wrote or the model said:
 - `HistoryUnavailableBefore` — the first event of a migrated Claude agent whose session file is gone
 
 Rewind is an appended `Rewound { to }`; positions never go backwards
-and the client hides its view past `to`. A projected segment is
+and the client hides its view past `to`. The daemon finds `to` through
+a side table of its own, `agent_story_source: (AgentId, StoryPos) →
+AgentEventPos`, written for the events told from the raw log, so the
+event clients copy carries no raw position. A projected segment is
 `(AgentId, StoryPos)` and "since" means the same on both sides.
+
+`Reply` is whole for both runtimes. Rho replies always were; Claude
+replies had been capped at 1024 bytes because the only durable copy rho
+kept was the mirror that feeds the title sidecar, deliberately capped so
+Claude's transcript would not become a second unbounded local copy. The
+story is that copy now, by decision (5 Sep): 105 Claude agents made
+25 MiB with the cap on, and a reply is bounded by the model's output
+limit. The sidecar mirror keeps its cap. Not told yet: Claude
+compactions, because the stream has no mapping for them.
 
 Tool output, diffs, reasoning, and the raw exchange stay on the host
 and are fetched on demand when the user opens that call:
