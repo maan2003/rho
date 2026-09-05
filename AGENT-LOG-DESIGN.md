@@ -385,6 +385,7 @@ E. **The Desk mirror.** Found while proving change two on the rig
    (`STORE-DESIGN.md`, rho-sync direction) and gets its own design; the
    frontier and body snapshots must come back exactly or the next sync
    is wrong. Offline Home is claimed only when this lands, not with B.
+   Designed as `STORE-DESIGN.md` slice 5, "The client keeps the store".
 
 Each slice lands on its own with the tests of the slices before it
 green; each daemon slice is proven on a read-only copy of the user's
