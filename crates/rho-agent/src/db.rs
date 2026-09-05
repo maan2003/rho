@@ -14,6 +14,7 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
 use crate::AgentEvent;
+use crate::story::StoryEvent;
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
@@ -25,10 +26,6 @@ const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_events");
-/// A compact index of presentation history. Keeping it separate from the
-/// full transcript lets rewind repair inspect only sidecar updates.
-const PRESENTATION_EVENTS: TableDefinition<AgentEventPos, Sen<AgentPresentationUpdate>> =
-    TableDefinition::new("agent_presentation_events");
 const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 /// The fold over an agent's logs: config, the latest presentation, where
 /// its story stands. A cache, never a source; [`rebuild_agent_head`]
@@ -40,6 +37,14 @@ const AGENT_HEADS: TableDefinition<AgentId, Sen<AgentHead>> = TableDefinition::n
 /// (`AGENT-LOG-DESIGN.md`).
 const AGENT_ATTENTION: TableDefinition<AgentId, Sen<AgentAttention>> =
     TableDefinition::new("agent_attention_until_slice_b");
+/// The story log: the events a person reads, one row per position, in
+/// the order they happened. Range-read per agent; never rewritten.
+const AGENT_STORY: TableDefinition<StoryKey, Sen<StoryEvent>> = TableDefinition::new("agent_story");
+/// Which raw event each story event was told from, for the events that
+/// came from one. Daemon-only and never on the wire: a rewind reads it to
+/// say how far back the story a reader keeps still holds.
+const AGENT_STORY_SOURCE: TableDefinition<StoryKey, AgentEventPos> =
+    TableDefinition::new("agent_story_source");
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
@@ -328,8 +333,36 @@ pub struct ProjectRecord {
 /// The position of an agent's story log, the log a person reads. The
 /// story itself arrives in slice B (`AGENT-LOG-DESIGN.md`); until then
 /// every head carries the same zero.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Key,
+    RedbValue,
+    Encode,
+    Decode,
+)]
 pub struct StoryPos(pub u64);
+
+impl StoryPos {
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+/// One agent's story, ordered by position: the key sorts by agent first,
+/// so a range read gives one agent's events and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue)]
+pub struct StoryKey {
+    agent_id: AgentId,
+    pos: StoryPos,
+}
 
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
@@ -369,6 +402,16 @@ pub struct AgentHead {
     pub generated_title: Option<String>,
     /// The last durable, model-derived activity label.
     pub activity: Option<String>,
+    /// Whether a turn is running, folded from the story's turn events.
+    /// Durable because a reader asks it of every agent, including the
+    /// ones no runtime is loaded for.
+    #[senax(default)]
+    pub turn_running: bool,
+    /// Whether this agent's story has been built. False on every agent
+    /// migrated from before the story existed, until the background
+    /// backfill reaches it (or a load forces it first).
+    #[senax(default)]
+    pub story_built: bool,
     pub current_lineage: AgentLineageId,
 }
 
@@ -766,6 +809,12 @@ pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentHead;
     fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
     fn agent_attention(&self, agent_id: AgentId) -> AgentAttention;
+    /// One agent's story from `from` onward, oldest first. The whole
+    /// story when `from` is zero.
+    fn agent_story(&self, agent_id: AgentId, from: StoryPos) -> Vec<(StoryPos, StoryEvent)>;
+    /// The title and activity a reader sees now: the head's fold of the
+    /// story's `Titled` and `Activity` events.
+    fn agent_presentation_cache(&self, agent_id: AgentId) -> AgentPresentationCache;
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId>;
     fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
@@ -773,10 +822,6 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
-    /// Historical presentation events whose source position remains reachable
-    /// from the selected lineage. Their own event positions intentionally do
-    /// not decide reachability: a result may arrive after newer input.
-    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate>;
     /// Newest text-bearing event records, read from the selected lineage in
     /// reverse and bounded before decoding/building a Luna request.
     fn agent_presentation_source_tail(
@@ -806,6 +851,20 @@ pub trait AgentWriteTxnExt {
 
     fn remove_project(&mut self, path: &str);
 
+    /// Appends one event to the story a person reads and folds it into
+    /// the head. The position is the head's, so the story is written
+    /// once and never rewritten.
+    fn append_agent_story(&mut self, agent_id: AgentId, event: &StoryEvent) -> StoryPos;
+
+    /// The same, for an event told from one raw event, remembering which
+    /// one so a rewind can say where the story a reader keeps stops.
+    fn append_agent_story_from(
+        &mut self,
+        agent_id: AgentId,
+        event: &StoryEvent,
+        through: AgentEventPos,
+    ) -> StoryPos;
+
     /// Appends a config event at the agent's true tail and folds it into
     /// the head. The tail is read from the table, not from a runtime's
     /// cursor, so this is safe while a turn is running.
@@ -813,6 +872,14 @@ pub trait AgentWriteTxnExt {
 
     /// Makes the head again from the log, as if the cached one were lost.
     fn rebuild_agent_head(&mut self, agent_id: AgentId) -> AgentHead;
+
+    /// Whether this agent's story has been built, read inside the write
+    /// transaction that is about to build it.
+    fn agent_story_built(&mut self, agent_id: AgentId) -> bool;
+
+    /// Marks this agent's story complete, so the backfill never visits it
+    /// again and a runtime may append live events to it.
+    fn mark_agent_story_built(&mut self, agent_id: AgentId);
 
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
@@ -822,11 +889,6 @@ pub trait AgentWriteTxnExt {
     fn alloc_agent_id(&mut self) -> AgentId;
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
-    fn append_agent_presentation_history(
-        &mut self,
-        at: AgentEventPos,
-        update: &AgentPresentationUpdate,
-    );
 
     /// Applies an update only when its source is still in the selected
     /// lineage. The returned cache is the acknowledged source of truth for a
@@ -837,12 +899,9 @@ pub trait AgentWriteTxnExt {
         agent_id: AgentId,
         update: &AgentPresentationUpdate,
     ) -> Option<AgentPresentationCache>;
-    /// Rebuilds the denormalized cache after a lineage fork.
-    fn rebuild_agent_presentation_cache(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-    ) -> AgentPresentationCache;
+
+    /// Forks the agent onto a new lineage whose parent is `parent`, so a
+    /// rewind hides the abandoned tail without rewriting a position.
     fn fork_agent_lineage(
         &mut self,
         now: UnixMillis,
@@ -850,10 +909,6 @@ pub trait AgentWriteTxnExt {
         parent: AgentEventPos,
     ) -> AgentEventPos;
 
-    /// Records a turn end for attention purposes; resets the disposition to
-    /// `Pending` — every finished turn demands a fresh disposition. An
-    /// unexpired snooze survives: "quiet until T" holds across turn ends and
-    /// the expiry broadcast resurfaces whatever finished meanwhile.
     fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId);
 
     /// Fills the chronology fact for records created before it existed.
@@ -956,12 +1011,19 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         let head = AgentHead {
             config: created_config(&created),
             story_pos: StoryPos::default(),
+            turn_running: false,
+            // An agent born after the story exists has one from its first
+            // event; nothing is ever backfilled for it.
+            story_built: true,
             generated_title: None,
             activity: None,
             current_lineage: lineage_id,
         };
         self.open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
+        for event in crate::story::from_raw_event(&created, now) {
+            self.append_agent_story_from(agent_id, &event, at);
+        }
         self.open_table(AGENT_ATTENTION).insert(
             &agent_id,
             SenValue::borrowed(&AgentAttention {
@@ -1040,6 +1102,29 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or_default()
     }
 
+    fn agent_presentation_cache(&self, agent_id: AgentId) -> AgentPresentationCache {
+        let head = self.get_agent(agent_id);
+        AgentPresentationCache {
+            generated_title: head.generated_title,
+            activity: head.activity,
+        }
+    }
+
+    fn agent_story(&self, agent_id: AgentId, from: StoryPos) -> Vec<(StoryPos, StoryEvent)> {
+        self.open_table(AGENT_STORY)
+            .range(
+                StoryKey {
+                    agent_id,
+                    pos: from,
+                }..=StoryKey {
+                    agent_id,
+                    pos: StoryPos(u64::MAX),
+                },
+            )
+            .map(|(key, value)| (key.value().pos, value.value().into_owned()))
+            .collect()
+    }
+
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId> {
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
             .iter()
@@ -1103,15 +1188,6 @@ impl AgentReadTxnExt for ReadTxn {
             }
         }
         (next, events)
-    }
-
-    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate> {
-        let agent = self.get_agent(agent_id);
-        self.open_table(PRESENTATION_EVENTS)
-            .iter()
-            .map(|(_, update)| update.value().into_owned())
-            .filter(|update| agent_event_visible_read(self, agent.current_lineage, update.through))
-            .collect()
     }
 
     fn agent_presentation_source_tail(
@@ -1238,9 +1314,10 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(LINEAGE_PARENTS);
         self.open_table(AGENT_EVENTS);
-        self.open_table(PRESENTATION_EVENTS);
         self.open_table(AGENT_HEADS);
         self.open_table(AGENT_ATTENTION);
+        self.open_table(AGENT_STORY);
+        self.open_table(AGENT_STORY_SOURCE);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
@@ -1278,6 +1355,35 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(PROJECTS).remove(&path.to_owned());
     }
 
+    fn append_agent_story(&mut self, agent_id: AgentId, event: &StoryEvent) -> StoryPos {
+        let mut heads = self.open_table(AGENT_HEADS);
+        let mut head = heads
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        let pos = head.story_pos;
+        head.story_pos = pos.next();
+        fold_story_head(&mut head, event);
+        heads.insert(&agent_id, SenValue::borrowed(&head));
+        drop(heads);
+        self.open_table(AGENT_STORY)
+            .insert(&StoryKey { agent_id, pos }, SenValue::borrowed(event));
+        pos
+    }
+
+    fn append_agent_story_from(
+        &mut self,
+        agent_id: AgentId,
+        event: &StoryEvent,
+        through: AgentEventPos,
+    ) -> StoryPos {
+        let pos = self.append_agent_story(agent_id, event);
+        self.open_table(AGENT_STORY_SOURCE)
+            .insert(&StoryKey { agent_id, pos }, &through);
+        pos
+    }
+
     fn append_agent_config_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) {
         let at = agent_tail_position(self, agent_id);
         self.open_table(AGENT_EVENTS)
@@ -1290,26 +1396,36 @@ impl AgentWriteTxnExt for WriteTxn {
             .into_owned();
         fold_agent_head(&mut head, event);
         heads.insert(&agent_id, SenValue::borrowed(&head));
+        drop(heads);
+        // A role change and a new workdir are things a reader is told;
+        // the rest of the config events are the runtime's own business.
+        for told in crate::story::from_raw_event(event, UnixMillis::now()) {
+            self.append_agent_story_from(agent_id, &told, at);
+        }
     }
 
     fn rebuild_agent_head(&mut self, agent_id: AgentId) -> AgentHead {
         // Which lineage is selected is the head's own fact: a fork is not
         // an event in the log it forks from.
-        let current_lineage = self
+        let previous = self
             .open_table(AGENT_HEADS)
             .get(&agent_id)
             .expect("agent id missing")
             .value()
-            .into_owned()
-            .current_lineage;
+            .into_owned();
+        let current_lineage = previous.current_lineage;
         let events = agent_events_write(self, current_lineage);
         let created = events
             .iter()
             .find(|event| matches!(event, AgentEvent::Created { .. }))
             .expect("every agent's log begins with its creation");
+        // The story is not rebuilt from the raw log: it is its own
+        // append-only log, so where it stands survives a head rebuild.
         let mut head = AgentHead {
             config: created_config(created),
-            story_pos: StoryPos::default(),
+            story_pos: previous.story_pos,
+            turn_running: previous.turn_running,
+            story_built: previous.story_built,
             generated_title: None,
             activity: None,
             current_lineage,
@@ -1320,6 +1436,26 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_HEADS)
             .insert(&agent_id, SenValue::borrowed(&head));
         head
+    }
+
+    fn agent_story_built(&mut self, agent_id: AgentId) -> bool {
+        self.open_table(AGENT_HEADS)
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned()
+            .story_built
+    }
+
+    fn mark_agent_story_built(&mut self, agent_id: AgentId) {
+        let mut heads = self.open_table(AGENT_HEADS);
+        let mut head = heads
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        head.story_built = true;
+        heads.insert(&agent_id, SenValue::borrowed(&head));
     }
 
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole) {
@@ -1377,21 +1513,6 @@ impl AgentWriteTxnExt for WriteTxn {
         at.next()
     }
 
-    fn append_agent_presentation_history(
-        &mut self,
-        at: AgentEventPos,
-        update: &AgentPresentationUpdate,
-    ) {
-        let mut history = self.open_table(PRESENTATION_EVENTS);
-        // The raw log may have moved on by a config event; keep this row
-        // beside it rather than on top of an older one.
-        let mut at = at;
-        while history.get(&at).is_some() {
-            at = at.next();
-        }
-        history.insert(&at, SenValue::borrowed(update));
-    }
-
     fn apply_agent_presentation(
         &mut self,
         now: UnixMillis,
@@ -1402,73 +1523,21 @@ impl AgentWriteTxnExt for WriteTxn {
             return None;
         }
         touch_agent(self, now, agent_id);
-        let cache = {
-            let mut heads = self.open_table(AGENT_HEADS);
-            let mut head = heads
-                .get(&agent_id)
-                .expect("agent id missing")
-                .value()
-                .into_owned();
-            match &update.generated_title {
-                PresentationField::Unchanged => {}
-                PresentationField::Set(title) if head.config.spawn_name.is_none() => {
-                    head.generated_title = Some(title.clone());
-                }
-                PresentationField::Set(_) | PresentationField::Clear => {}
-            }
-            match &update.activity {
-                PresentationField::Unchanged => {}
-                PresentationField::Set(activity) => head.activity = Some(activity.clone()),
-                PresentationField::Clear => head.activity = None,
-            }
-            let cache = AgentPresentationCache {
-                generated_title: head.generated_title.clone(),
-                activity: head.activity.clone(),
-            };
-            heads.insert(&agent_id, SenValue::borrowed(&head));
-            cache
-        };
-        Some(cache)
-    }
-
-    fn rebuild_agent_presentation_cache(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-    ) -> AgentPresentationCache {
-        let updates = self
-            .open_table(PRESENTATION_EVENTS)
-            .iter()
-            .map(|(_, update)| update.value().into_owned())
-            .collect::<Vec<_>>();
-        let updates = updates
-            .into_iter()
-            .filter(|update| agent_event_visible_write(self, agent_id, update.through))
-            .collect::<Vec<_>>();
-        let mut cache = AgentPresentationCache::default();
-        for update in updates {
-            match update.generated_title {
-                PresentationField::Set(title) => cache.generated_title = Some(title),
-                PresentationField::Clear => cache.generated_title = None,
-                PresentationField::Unchanged => {}
-            }
-            match update.activity {
-                PresentationField::Set(activity) => cache.activity = Some(activity),
-                PresentationField::Clear => cache.activity = None,
-                PresentationField::Unchanged => {}
-            }
+        // The story is the source: `Titled` and `Activity` are told once,
+        // and the head's fold of them is the cache every reader sees.
+        for event in crate::story::from_presentation_update(update, now) {
+            self.append_agent_story(agent_id, &event);
         }
-        touch_agent(self, now, agent_id);
-        let mut heads = self.open_table(AGENT_HEADS);
-        let mut head = heads
+        let head = self
+            .open_table(AGENT_HEADS)
             .get(&agent_id)
             .expect("agent id missing")
             .value()
             .into_owned();
-        head.generated_title = cache.generated_title.clone();
-        head.activity = cache.activity.clone();
-        heads.insert(&agent_id, SenValue::borrowed(&head));
-        cache
+        Some(AgentPresentationCache {
+            generated_title: head.generated_title,
+            activity: head.activity,
+        })
     }
 
     fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId) {
@@ -1573,6 +1642,11 @@ impl AgentWriteTxnExt for WriteTxn {
             .into_owned();
         head.current_lineage = lineage_id;
         heads.insert(&agent_id, SenValue::borrowed(&head));
+        drop(heads);
+        // A rewind is told, not undone: positions only grow, and this says
+        // from where a reader stops showing what it already has.
+        let to = story_position_after_rewind(self, agent_id);
+        self.append_agent_story(agent_id, &StoryEvent::Rewound { to, at: now });
         AgentEventPos::root(lineage_id)
     }
 
@@ -1710,17 +1784,6 @@ fn agent_lineage_segments_read(
     segments
 }
 
-fn agent_event_visible_read(
-    read: &ReadTxn,
-    current_lineage: AgentLineageId,
-    position: AgentEventPos,
-) -> bool {
-    agent_lineage_segments_read(read, current_lineage)
-        .into_iter()
-        .find_map(|(lineage_id, end_seq)| (lineage_id == position.lineage_id).then_some(end_seq))
-        .is_some_and(|end_seq| end_seq == u32::MAX || position.seq < end_seq)
-}
-
 fn agent_event_visible_write(
     write: &mut WriteTxn,
     agent_id: AgentId,
@@ -1816,6 +1879,40 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
     }
 }
 
+/// Puts an agent back the way the record-to-log migration leaves it: a
+/// head that says its story is not built, and no story rows. Goes with
+/// the backfill it exercises.
+#[cfg(test)]
+pub(crate) fn clear_agent_story(write: &mut WriteTxn, agent_id: AgentId) {
+    let positions = write
+        .open_table(AGENT_STORY)
+        .range(
+            StoryKey {
+                agent_id,
+                pos: StoryPos::default(),
+            }..=StoryKey {
+                agent_id,
+                pos: StoryPos(u64::MAX),
+            },
+        )
+        .map(|(key, _)| key.value())
+        .collect::<Vec<_>>();
+    let mut story = write.open_table(AGENT_STORY);
+    for key in positions {
+        story.remove(&key);
+    }
+    drop(story);
+    let mut heads = write.open_table(AGENT_HEADS);
+    let mut head = heads
+        .get(&agent_id)
+        .expect("agent id missing")
+        .value()
+        .into_owned();
+    head.story_built = false;
+    head.story_pos = StoryPos::default();
+    heads.insert(&agent_id, SenValue::borrowed(&head));
+}
+
 /// One event's effect on the head. Everything the head knows arrives
 /// through here, so a rebuild and the live fold cannot disagree.
 fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
@@ -1865,6 +1962,79 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::QueueCleared
         | AgentEvent::ClaudePresentationSource { .. } => {}
     }
+}
+
+/// One story event's effect on the head: the latest title and activity
+/// a reader sees, and whether a turn is running.
+fn fold_story_head(head: &mut AgentHead, event: &StoryEvent) {
+    match event {
+        StoryEvent::Titled { title, .. } if head.config.spawn_name.is_none() => {
+            head.generated_title = Some(title.clone());
+        }
+        StoryEvent::Activity { label, .. } => head.activity = label.clone(),
+        StoryEvent::TurnStarted { .. } => head.turn_running = true,
+        StoryEvent::TurnEnded { .. } => {
+            head.turn_running = false;
+            // The label described work that just stopped.
+            head.activity = None;
+        }
+        StoryEvent::Titled { .. }
+        | StoryEvent::Created { .. }
+        | StoryEvent::UserMessage { .. }
+        | StoryEvent::AgentMail { .. }
+        | StoryEvent::Reply { .. }
+        | StoryEvent::ToolCall { .. }
+        | StoryEvent::Wants { .. }
+        | StoryEvent::Cost { .. }
+        | StoryEvent::Rewound { .. }
+        | StoryEvent::Compacted { .. }
+        | StoryEvent::HistoryUnavailableBefore { .. }
+        // Config is the raw log's fold; telling it again here would push
+        // the same workdir twice.
+        | StoryEvent::RoleChanged { .. }
+        | StoryEvent::WorkdirAdded { .. } => {}
+    }
+}
+
+/// Where the story stops holding after a rewind: the position just past
+/// the newest event whose raw source is still on the selected lineage.
+/// Scanning back from the tail is cheap because a rewind abandons a
+/// short tail, and events with no raw source (a title, a cost, a turn
+/// boundary) travel with the events around them.
+fn story_position_after_rewind(write: &mut WriteTxn, agent_id: AgentId) -> StoryPos {
+    let head_pos = write
+        .open_table(AGENT_HEADS)
+        .get(&agent_id)
+        .expect("agent id missing")
+        .value()
+        .into_owned()
+        .story_pos;
+    let sources = write
+        .open_table(AGENT_STORY_SOURCE)
+        .range(
+            StoryKey {
+                agent_id,
+                pos: StoryPos::default(),
+            }..=StoryKey {
+                agent_id,
+                pos: StoryPos(u64::MAX),
+            },
+        )
+        .rev()
+        .map(|(key, value)| (key.value().pos, value.value()))
+        .collect::<Vec<_>>();
+    // Nothing was ever told from the raw log (a Claude story built from a
+    // transcript): there is nothing this can place, so keep it all.
+    if sources.is_empty() {
+        return head_pos;
+    }
+    for (pos, through) in sources {
+        if agent_event_visible_write(write, agent_id, through) {
+            return pos.next();
+        }
+    }
+    // The rewind reached past everything the raw log told.
+    StoryPos::default()
 }
 
 /// The first free position on the agent's selected lineage, read from the
@@ -2008,4 +2178,4 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

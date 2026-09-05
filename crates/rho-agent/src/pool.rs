@@ -385,6 +385,19 @@ impl AgentPool {
     pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
         let now = rho_core::UnixMs::now().0;
         usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
+        // What a model response cost, told once, so the graphs can read the
+        // story instead of a usage table (`AGENT-LOG-DESIGN.md`, slice C).
+        {
+            let mut write = self.db.write().await;
+            write.append_agent_story(
+                agent_id,
+                &crate::story::StoryEvent::Cost {
+                    usage: usage.clone(),
+                    at: rho_core::UnixMs(now),
+                },
+            );
+            write.commit();
+        }
         let mut pending = self.usage.lock().await;
         pending
             .entry((agent_id, usage.bucket_start_ms))
@@ -795,6 +808,9 @@ impl AgentPool {
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
             return Ok((agent_id, agent, false));
         }
+        // A load reads this agent's log anyway, and the runtime is about
+        // to append to its story: its history has to be in there first.
+        crate::story_backfill::ensure_story(&self.db, agent_id).await;
         let record = self.db.read().get_agent(agent_id);
         let view = self.lazy_view(agent_id, record.config.workdirs.clone());
         let agent = match record.config.runtime {

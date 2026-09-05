@@ -43,6 +43,10 @@ mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod presentation;
+pub mod story;
+pub mod story_backfill;
+#[cfg(test)]
+mod story_sizing;
 pub mod system_prompt;
 
 #[cfg(feature = "code-mode")]
@@ -379,6 +383,37 @@ pub enum AgentStateKind {
     // Permanent error, thread is paused
     Error(FailedInferenceResponse),
     Idle,
+}
+
+/// Tells the story that a turn started or stopped. Both runtimes cross
+/// the same edge (working, then not working), and the head's
+/// `turn_running` is the fold of the two events.
+pub(crate) async fn tell_turn_boundary(
+    db: &RhoDb,
+    agent_id: AgentId,
+    previous: &AgentStateKind,
+    current: &AgentStateKind,
+    attempt_started: bool,
+) {
+    let now = UnixMillis::now();
+    let event = if !previous.is_working() && current.is_working() {
+        story::StoryEvent::TurnStarted { at: now }
+    } else if execution_settled(previous, current, attempt_started) {
+        story::StoryEvent::TurnEnded {
+            outcome: match current {
+                AgentStateKind::Error(failed) => story::TurnOutcome::Errored {
+                    message: failed.error.to_string(),
+                },
+                _ => story::TurnOutcome::Completed,
+            },
+            at: now,
+        }
+    } else {
+        return;
+    };
+    let mut write = db.write().await;
+    write.append_agent_story(agent_id, &event);
+    write.commit();
 }
 
 /// A reliable state-machine transition that returns execution to the user's
@@ -1734,11 +1769,11 @@ impl AgentLoop {
                                             agent_id,
                                             cursor,
                                         );
-                                        let cache = write.rebuild_agent_presentation_cache(
-                                            UnixMillis::now(),
-                                            agent_id,
-                                        );
                                         write.commit();
+                                        // The story is append-only: a rewind
+                                        // is told, not undone, so the last
+                                        // title and activity still stand.
+                                        let cache = db.read().agent_presentation_cache(agent_id);
 
                                         let (loaded_next_event, events) =
                                             db.read().agent_events(agent_id);
@@ -2143,6 +2178,14 @@ impl AgentLoop {
                     .await;
                 }
             }
+            tell_turn_boundary(
+                &self.persistence.db,
+                self.persistence.agent_id,
+                &previous_kind,
+                &state.kind,
+                self.execution_generation != previous_execution_generation,
+            )
+            .await;
             if execution_settled(
                 &previous_kind,
                 &state.kind,
@@ -2163,8 +2206,14 @@ impl AgentLoop {
     async fn persist_event(&mut self, event: AgentEvent<'_>) -> AgentEventPos {
         let persistence = &mut self.persistence;
         let event_pos = persistence.next_event;
+        let now = UnixMillis::now();
         let mut write = persistence.db.write().await;
         persistence.next_event = write.append_agent_event(persistence.next_event, &event);
+        // The story is written beside the raw event, in the same
+        // transaction, so a reader never sees one without the other.
+        for told in crate::story::from_raw_event(&event, now) {
+            write.append_agent_story_from(persistence.agent_id, &told, event_pos);
+        }
         write.commit();
         event_pos
     }
@@ -2177,8 +2226,6 @@ impl AgentLoop {
         let mut write = persistence.db.write().await;
         let cache =
             write.apply_agent_presentation(UnixMillis::now(), persistence.agent_id, &update)?;
-        let event_pos = persistence.next_event;
-        write.append_agent_presentation_history(event_pos, &update);
         persistence.next_event = write.append_agent_event(
             persistence.next_event,
             &AgentEvent::PresentationUpdated {

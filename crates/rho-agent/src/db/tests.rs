@@ -396,7 +396,7 @@ fn agent_role_resolves_opinionated_bindings() {
 
 use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};
 
-fn user_event(text: &str) -> AgentEvent<'static> {
+pub(crate) fn user_event(text: &str) -> AgentEvent<'static> {
     AgentEvent::Queued(QueuedItem {
         kind: QueuedItemKind::UserMessage {
             sender: MessageSender::User,
@@ -425,14 +425,14 @@ fn event_text(event: &AgentEvent<'_>) -> String {
 }
 
 /// Tests exercise agent records only; any workspace info will do.
-fn test_workspace() -> WorkspaceInfo {
+pub(crate) fn test_workspace() -> WorkspaceInfo {
     WorkspaceInfo::Workspace {
         repo: "/home/user/src/rho".into(),
         id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
     }
 }
 
-fn test_agent_runtime() -> AgentRuntime {
+pub(crate) fn test_agent_runtime() -> AgentRuntime {
     AgentRuntime::Rho {
         prompt_cache_key: PromptCacheKey::generate(),
     }
@@ -694,7 +694,7 @@ async fn fork_agent_lineage_repoints_current_branch() {
 }
 
 #[tokio::test]
-async fn presentation_history_folds_by_source_reachability_after_rewind() {
+async fn a_presentation_update_is_rejected_when_its_source_was_rewound_away() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
@@ -722,7 +722,6 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
             .apply_agent_presentation(UnixMs(2), agent_id, &update)
             .is_some()
     );
-    write.append_agent_presentation_history(third, &update);
     let fourth = write.append_agent_event(
         third,
         &AgentEvent::PresentationUpdated {
@@ -731,12 +730,9 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
     );
     write.append_agent_event(fourth, &user_event("even later"));
 
-    // Rewind before the second input. The update itself is on the abandoned
-    // branch, but its source (`first`) remains selected and must survive.
+    // Rewind before the second input. The story is append-only, so what
+    // it told about the abandoned branch still stands.
     write.fork_agent_lineage(UnixMs(3), agent_id, second);
-    let cache = write.rebuild_agent_presentation_cache(UnixMs(3), agent_id);
-    assert_eq!(cache.generated_title.as_deref(), Some("first-subject"));
-    assert_eq!(cache.activity.as_deref(), Some("reading first request"));
 
     // A completion based on the discarded input cannot write into the new
     // lineage, even if it reaches the serialized loop after the rewind.
@@ -1004,4 +1000,119 @@ async fn response_subscriptions_are_persistent_edges() {
     write.commit();
     assert!(!db.read().is_agent_response_subscribed(subscriber, target));
     assert!(db.read().agent_response_subscribers(target).is_empty());
+}
+
+#[tokio::test]
+async fn the_story_head_folds_the_title_activity_and_running_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        None,
+        vec![test_workspace()],
+        AgentRole::PM,
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    for event in [
+        crate::story::StoryEvent::TurnStarted { at: UnixMs(2) },
+        crate::story::StoryEvent::Titled {
+            title: "story-log".to_owned(),
+            at: UnixMs(3),
+        },
+        crate::story::StoryEvent::Activity {
+            label: Some("writing the fold".to_owned()),
+            at: UnixMs(4),
+        },
+    ] {
+        write.append_agent_story(agent_id, &event);
+    }
+    write.commit();
+
+    let head = db.read().get_agent(agent_id);
+    assert_eq!(head.title(), Some("story-log"));
+    assert_eq!(head.activity.as_deref(), Some("writing the fold"));
+    assert!(head.turn_running);
+
+    // Creation is the story's first event, so the turn events follow it.
+    let story = db.read().agent_story(agent_id, StoryPos::default());
+    assert!(matches!(
+        story[0].1,
+        crate::story::StoryEvent::Created { .. }
+    ));
+    assert_eq!(story.len(), 4);
+
+    let mut write = db.write().await;
+    write.append_agent_story(
+        agent_id,
+        &crate::story::StoryEvent::TurnEnded {
+            outcome: crate::story::TurnOutcome::Completed,
+            at: UnixMs(5),
+        },
+    );
+    write.commit();
+
+    // The label described work that just stopped.
+    let head = db.read().get_agent(agent_id);
+    assert!(!head.turn_running);
+    assert_eq!(head.activity, None);
+    assert_eq!(head.title(), Some("story-log"));
+}
+
+#[tokio::test]
+async fn a_rewind_tells_where_the_story_a_reader_keeps_stops() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    let first = write.create_agent(
+        UnixMs(1),
+        agent_id,
+        None,
+        vec![test_workspace()],
+        AgentRole::PM,
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    let second = write.append_agent_event(first, &user_event("first"));
+    write.append_agent_story_from(
+        agent_id,
+        &crate::story::StoryEvent::UserMessage {
+            text: "first".to_owned(),
+            at: UnixMs(2),
+        },
+        first,
+    );
+    write.append_agent_event(second, &user_event("later"));
+    write.append_agent_story_from(
+        agent_id,
+        &crate::story::StoryEvent::UserMessage {
+            text: "later".to_owned(),
+            at: UnixMs(3),
+        },
+        second,
+    );
+
+    // Rewind before the second input: what it told is on the abandoned
+    // branch, what the first told is still selected.
+    write.fork_agent_lineage(UnixMs(4), agent_id, second);
+    write.commit();
+
+    let story = db.read().agent_story(agent_id, StoryPos::default());
+    assert!(matches!(
+        story.last().expect("a story").1,
+        crate::story::StoryEvent::Rewound {
+            to: StoryPos(2),
+            ..
+        }
+    ));
 }

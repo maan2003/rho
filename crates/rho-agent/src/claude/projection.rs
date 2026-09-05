@@ -355,7 +355,7 @@ fn project_tool_result(content: &Value) -> anyhow::Result<Option<ToolResult>> {
 
 /// Text-only, transcript-confirmed input for the shared Luna presentation
 /// sidecar. Tool results and hidden Claude protocol messages are omitted.
-pub(super) fn presentation_source(
+pub(crate) fn presentation_source(
     message: &rho_claude::SessionMessage,
 ) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
     presentation_source_parts(message.kind, message.uuid, &message.message)

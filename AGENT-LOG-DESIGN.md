@@ -243,6 +243,20 @@ B. **The story log and its replication.** `StoryEvent`, the story
    attention table deleted, the story migration. Daemon and GUI, epoch bump. The
    biggest slice; b8os may land the daemon half writing the story table
    first, behind no wire change, then the wire and GUI half.
+   Daemon half landed (b8os, 5 Sep): the story is written live for both
+   runtimes, `Titled`/`Activity` replace `agent_presentation_events` as
+   the source with the head caching the latest, `turn_running` is the
+   fold over `TurnStarted`/`TurnEnded`, `Cost` is told per model
+   response, and a rewind tells `Rewound { to }` using a daemon-only
+   `agent_story_source` index of which raw event each story event came
+   from. The backfill runs in the background rather than holding a
+   restart: `story_built` on the head, most-recently-touched agents
+   first, one transaction each, resumable, and a load builds its own
+   agent's story first. On a copy of the user's store it built 2823
+   agents and 629k events in 17 s while the daemon answered an agent
+   list in 25-62 ms. Known gap: a Claude compaction is not told, because
+   the stream carries no event this can be mapped from; a Rho one is
+   (`Compacted`).
 C. **Usage from the mirror.** Graphs read `Cost` events; the usage
    requests and tables go. Daemon and GUI, epoch bump.
 D. **On-demand detail.** `AgentDetail` for tool bodies and diffs from

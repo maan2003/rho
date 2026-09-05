@@ -33,7 +33,7 @@ use crate::{
     PresentationSpeaker, QueuedItem, QueuedItemKind, StartWorkdir, system_prompt,
 };
 
-mod projection;
+pub(crate) mod projection;
 
 use projection::{
     ClaudeStreamItem, assistant_message_to_block, assistant_presentation_source,
@@ -627,11 +627,23 @@ struct ClaudeTurn {
     content: Arc<Vec<ContentPart>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 struct ClaudePresentationSource {
     source_id: Uuid,
     speaker: PresentationSpeaker,
+    /// The capped mirror text, which is what the raw event holds.
     text: String,
+    /// The same message uncapped, for the story. Not part of identity:
+    /// a persisted event only ever carries the capped text.
+    whole: String,
+}
+
+impl PartialEq for ClaudePresentationSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_id == other.source_id
+            && self.speaker == other.speaker
+            && self.text == other.text
+    }
 }
 
 struct ClaudePresentationReconciliation {
@@ -639,7 +651,6 @@ struct ClaudePresentationReconciliation {
     persisted: Vec<(AgentEventPos, ClaudePresentationSource)>,
     common: usize,
     next_event: AgentEventPos,
-    previous_cache: AgentPresentationCache,
 }
 
 fn claude_presentation_sources(
@@ -649,12 +660,13 @@ fn claude_presentation_sources(
         .iter()
         .filter_map(|message| presentation_source(message).transpose())
         .filter_map(|source| match source {
-            Ok((source_id, speaker, text)) => crate::presentation::canonical_source_text(&text)
+            Ok((source_id, speaker, whole)) => crate::presentation::canonical_source_text(&whole)
                 .map(|text| {
                     Ok(ClaudePresentationSource {
                         source_id,
                         speaker,
                         text,
+                        whole: whole.trim().to_owned(),
                     })
                 }),
             Err(error) => Some(Err(error)),
@@ -673,11 +685,6 @@ fn prepare_claude_presentation_reconciliation(
 ) -> anyhow::Result<ClaudePresentationReconciliation> {
     let sources = claude_presentation_sources(messages)?;
     let read = db.read();
-    let record = read.get_agent(agent_id);
-    let previous_cache = AgentPresentationCache {
-        generated_title: record.generated_title,
-        activity: record.activity,
-    };
     let (next_event, records) = read.agent_event_records(agent_id);
     let persisted = records
         .iter()
@@ -692,6 +699,7 @@ fn prepare_claude_presentation_reconciliation(
                     source_id: *source_id,
                     speaker: *speaker,
                     text: text.to_string(),
+                    whole: text.to_string(),
                 },
             )),
             _ => None,
@@ -707,7 +715,6 @@ fn prepare_claude_presentation_reconciliation(
         persisted,
         common,
         next_event,
-        previous_cache,
     })
 }
 
@@ -718,24 +725,26 @@ impl ClaudePresentationReconciliation {
         now: UnixMillis,
         agent_id: AgentId,
     ) -> (AgentEventPos, Option<AgentPresentationCache>) {
-        let (mut next_event, rebuilt_cache) = if self.common < self.persisted.len() {
-            let next = write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0);
-            let cache = write.rebuild_agent_presentation_cache(now, agent_id);
-            (next, (cache != self.previous_cache).then_some(cache))
+        // A rewind forks the raw lineage, but the story is append-only:
+        // the title and activity it already told still stand.
+        let mut next_event = if self.common < self.persisted.len() {
+            write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0)
         } else {
-            (self.next_event, None)
+            self.next_event
         };
         for source in self.sources.iter().skip(self.common) {
-            next_event = write.append_agent_event(
-                next_event,
-                &AgentEvent::ClaudePresentationSource {
-                    source_id: source.source_id,
-                    speaker: source.speaker,
-                    text: Cow::Borrowed(&source.text),
-                },
-            );
+            let event = AgentEvent::ClaudePresentationSource {
+                source_id: source.source_id,
+                speaker: source.speaker,
+                text: Cow::Borrowed(&source.text),
+            };
+            let told_from = next_event;
+            next_event = write.append_agent_event(next_event, &event);
+            for told in crate::story::from_claude_source(source.speaker, &source.whole, now) {
+                write.append_agent_story_from(agent_id, &told, told_from);
+            }
         }
-        (next_event, rebuilt_cache)
+        (next_event, None)
     }
 
     fn state(
@@ -840,6 +849,14 @@ impl ClaudeLoop {
                 self.handle_control(control).await;
             }
             let kind = self.state.read().expect("poison").kind.clone();
+            crate::tell_turn_boundary(
+                &self.db,
+                self.agent_id,
+                &initial_kind,
+                &kind,
+                self.execution_generation != initial_execution_generation,
+            )
+            .await;
             if crate::execution_settled(
                 &initial_kind,
                 &kind,
@@ -1042,8 +1059,6 @@ impl ClaudeLoop {
     ) -> Option<AgentPresentationCache> {
         let mut write = self.db.write().await;
         let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update)?;
-        let event_pos = self.next_event;
-        write.append_agent_presentation_history(event_pos, &update);
         self.next_event = write.append_agent_event(
             self.next_event,
             &AgentEvent::PresentationUpdated {
@@ -1067,6 +1082,7 @@ impl ClaudeLoop {
         speaker: PresentationSpeaker,
         text: String,
     ) {
+        let whole = text.trim().to_owned();
         let Some(text) = crate::presentation::canonical_source_text(&text) else {
             return;
         };
@@ -1074,15 +1090,20 @@ impl ClaudeLoop {
             return;
         }
         let event_pos = self.next_event;
+        let now = UnixMillis::now();
         let mut write = self.db.write().await;
-        self.next_event = write.append_agent_event(
-            self.next_event,
-            &AgentEvent::ClaudePresentationSource {
-                source_id,
-                speaker,
-                text: Cow::Borrowed(&text),
-            },
-        );
+        let event = AgentEvent::ClaudePresentationSource {
+            source_id,
+            speaker,
+            text: Cow::Borrowed(&text),
+        };
+        self.next_event = write.append_agent_event(self.next_event, &event);
+        // The story carries the whole message: for a Claude agent it is
+        // the durable copy a reader gets. The mirror event above stays
+        // capped because Luna's prompt is what it is for.
+        for told in crate::story::from_claude_source(speaker, &whole, now) {
+            write.append_agent_story_from(self.agent_id, &told, event_pos);
+        }
         write.commit();
         self.last_presentation_source = Some(event_pos);
         self.presentation.dirty = true;
@@ -1809,7 +1830,28 @@ impl ClaudeLoop {
         }
     }
 
-    async fn persist_inference_block(&self, _block: &Arc<ContextBlock>) {}
+    /// The calls a Claude turn made, told as they stream. The reply text
+    /// is not told here: the durable mirror
+    /// (`persist_presentation_source`) is the one place it comes from, so
+    /// a message is never told twice.
+    async fn persist_inference_block(&self, block: &Arc<ContextBlock>) {
+        let ContextBlock::InferenceResponse { items, .. } = block.as_ref() else {
+            return;
+        };
+        let now = UnixMillis::now();
+        let told = crate::story::from_inference_items(items, now)
+            .into_iter()
+            .filter(|event| !matches!(event, crate::story::StoryEvent::Reply { .. }))
+            .collect::<Vec<_>>();
+        if told.is_empty() {
+            return;
+        }
+        let mut write = self.db.write().await;
+        for event in &told {
+            write.append_agent_story(self.agent_id, event);
+        }
+        write.commit();
+    }
 
     async fn complete_rewind(&mut self) -> anyhow::Result<()> {
         if !self.pending_rewind {
@@ -2280,7 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_divergence_rebuilds_cache_and_discards_stale_updates() {
+    async fn reconciliation_divergence_keeps_the_story_and_discards_stale_updates() {
         let (_temp, db, agent_id) = presentation_test_agent().await;
         let first = presentation_message(
             rho_claude::SessionMessageKind::User,
@@ -2326,7 +2368,6 @@ mod tests {
                 .apply_agent_presentation(rho_core::UnixMs(2), agent_id, &update)
                 .is_some()
         );
-        write.append_agent_presentation_history(next, &update);
         write.append_agent_event(
             next,
             &AgentEvent::PresentationUpdated {
@@ -2339,8 +2380,12 @@ mod tests {
             reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
                 .await
                 .unwrap();
-        assert_eq!(rebuilt, Some(AgentPresentationCache::default()));
-        assert!(db.read().agent_presentation_updates(agent_id).is_empty());
+        // A fork does not unsay what the story told: the title stands.
+        assert!(rebuilt.is_none());
+        assert_eq!(
+            db.read().agent_presentation_cache(agent_id).generated_title,
+            Some("discarded-title".to_owned())
+        );
         let mut write = db.write().await;
         assert!(
             write

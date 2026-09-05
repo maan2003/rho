@@ -32,6 +32,8 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 mod agent_ui;
 pub mod debug;
 mod desk_cells;
+#[cfg(test)]
+mod story_backfill_proof;
 
 mod iris;
 mod realtime;
@@ -476,6 +478,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             );
         }
     }
+
+    spawn_story_backfill(agents.db.clone());
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
@@ -1544,6 +1548,32 @@ impl AgentRegistry {
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
         self.pool.load(agent_id).await
     }
+}
+
+/// Builds the story of every agent that predates it, in the background,
+/// so a restart is never held for the migration. Most-recently-touched
+/// first, one agent per transaction, resumable across restarts; a load
+/// jumps the queue on its own. Goes with the rest of the migration code.
+fn spawn_story_backfill(db: RhoDb) {
+    tokio::spawn(async move {
+        let waiting = rho_agent::story_backfill::agents_awaiting_story(&db);
+        if waiting.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut events = 0usize;
+        for agent_id in &waiting {
+            events += rho_agent::story_backfill::ensure_story(&db, *agent_id).await;
+            // The daemon serves while this runs; never hold the write lock
+            // back to back.
+            tokio::task::yield_now().await;
+        }
+        eprintln!(
+            "rho daemon: story backfill built {} agents, {events} events, in {:.1}s",
+            waiting.len(),
+            started.elapsed().as_secs_f64()
+        );
+    });
 }
 
 async fn serve_connection(
