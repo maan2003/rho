@@ -21,10 +21,9 @@ use rho_ui_proto::shell::{
     MAX_STYLE_SPANS, ShellClientFrame, ShellColor, ShellServerFrame, ShellStyleSpan,
     ShellTextStyle, command_fits,
 };
+use rho_window::highlights::{apply_class_highlights, excerpt_range};
+use rho_window::style::{Region, StyleClass};
 use theme::ActiveTheme as _;
-
-use crate::highlights::{apply_class_highlights, excerpt_range};
-use crate::style::{Region, StyleClass};
 
 const PROMPT_INLAY_ID: usize = 0;
 const ANSI_HIGHLIGHT_KEY_BASE: usize = usize::MAX / 2;
@@ -145,7 +144,7 @@ impl ShellModel {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             for buffer_id in buffer_ids {
                 editor.disable_header_for_buffer(buffer_id, cx);
             }

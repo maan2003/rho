@@ -390,7 +390,7 @@ impl Workspace {
             self.notice_on(
                 None,
                 &format!("nothing matching `{path}`"),
-                crate::style::StyleClass::SystemInfo,
+                rho_window::style::StyleClass::SystemInfo,
                 cx,
             );
             return;

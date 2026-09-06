@@ -12,11 +12,11 @@ use rho_slack::model::{Change, Model, Unit, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::EditStart;
+use rho_window::style::StyleClass;
 
 use crate::dashboard::SlackFacts;
 use crate::minibuffer::Candidate;
 use crate::pane::SurfaceKey;
-use crate::style::StyleClass;
 use crate::workspace::{ContextId, SurfaceView, Workspace};
 
 impl Workspace {
@@ -191,7 +191,7 @@ impl Workspace {
     /// client borrows, so chat reads like every other buffer in the frame.
     pub(crate) fn slack_hooks() -> rho_slack::ui::Hooks {
         rho_slack::ui::Hooks {
-            configure_editor: crate::editor_config::configure,
+            configure_editor: rho_window::editor_config::configure,
             configure_markdown: crate::render::markdown::configure_buffer,
         }
     }
@@ -389,7 +389,7 @@ impl Workspace {
                     this.notice_on(
                         None,
                         &format!("slack: {error:#}"),
-                        crate::style::StyleClass::SystemInfo,
+                        rho_window::style::StyleClass::SystemInfo,
                         cx,
                     );
                 }

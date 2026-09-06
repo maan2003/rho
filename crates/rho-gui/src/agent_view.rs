@@ -26,10 +26,10 @@ use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
 use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
+use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
 use crate::store::FrameSummary;
-use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::transcript::TranscriptModel;
 use crate::workspace::now_ms;
 
@@ -215,7 +215,7 @@ impl AgentModel {
                 window,
                 cx,
             );
-            crate::editor_config::configure_preview(&mut editor, window, cx);
+            rho_window::editor_config::configure_preview(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
@@ -250,7 +250,7 @@ impl AgentModel {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(prompt_id, cx);
             editor.set_completion_provider(Some(completions));

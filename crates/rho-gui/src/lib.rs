@@ -9,9 +9,7 @@ pub mod dashboard;
 pub mod desk_view;
 pub(crate) mod diff_view;
 pub mod draft_view;
-pub mod editor_config;
 pub(crate) mod find;
-pub mod highlights;
 pub mod home;
 pub(crate) mod image_view;
 pub mod journal;
@@ -26,21 +24,23 @@ pub mod rho_assets;
 mod sampler;
 pub(crate) mod shell_view;
 pub mod slack;
-pub mod style;
 #[doc(hidden)]
 pub mod telemetry;
 pub(crate) mod terminal_view;
 pub mod transcript;
 pub mod transient;
-pub(crate) mod visualization;
 pub mod workspace;
 pub(crate) mod zed_remote;
 
+// The chrome every screen is drawn with belongs to the window
+// (`GUI-CRATES-DESIGN.md`). These aliases keep `rho_window::style::…` reading
+// the same at the several hundred use sites.
 // The registry and per-agent frame store live in a shared crate. These aliases
 // preserve the existing module paths in the client views.
 use gpui::{App, KeyBinding, actions};
 pub use rho_registry as registry;
 pub use rho_registry::store;
+pub use rho_window::{editor_config, highlights, style, visualization};
 
 actions!(
     rho_gui,

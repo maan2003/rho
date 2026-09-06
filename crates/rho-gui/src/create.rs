@@ -11,11 +11,11 @@
 use std::rc::Rc;
 
 use gpui::{App, Context, Window};
+use rho_window::style::StyleClass;
 
 use crate::find::rank;
 use crate::minibuffer::Candidate;
 use crate::registry::HostId;
-use crate::style::StyleClass;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

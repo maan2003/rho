@@ -63,6 +63,7 @@ rho-db = { workspace = true }
 rho-desk.workspace = true
 rho-agents = { workspace = true }
 rho-hosts = { workspace = true }
+rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-profiling = { workspace = true }
 rho-registry.workspace = true

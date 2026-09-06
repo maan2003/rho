@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use rho_registry::render::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_ui_proto::{AgentId, MessageDelivery};
-
-use crate::style::StyleClass;
+use rho_window::style::StyleClass;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {

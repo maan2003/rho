@@ -23,9 +23,9 @@ use gpui::{Context, Entity, Subscription, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_core::ContentPart;
+use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 
 use crate::commands::WorkspaceCompletionProvider;
-use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::workspace::Workspace;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
@@ -177,7 +177,7 @@ impl DraftModel {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             for buffer_id in buffer_ids {
                 editor.disable_header_for_buffer(buffer_id, cx);
             }

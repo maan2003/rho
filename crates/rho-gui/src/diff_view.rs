@@ -725,7 +725,7 @@ fn build_editor(
     cx.new(|cx| {
         let mut editor =
             editor::Editor::new(editor::EditorMode::full(), multibuffer, None, window, cx);
-        crate::editor_config::configure_diff(&mut editor, window, cx);
+        rho_window::editor_config::configure_diff(&mut editor, window, cx);
         editor.set_diff_hunk_delegate(
             Some(Arc::new(editor::RestoreOnlyUnstagedDiffHunkDelegate)),
             cx,

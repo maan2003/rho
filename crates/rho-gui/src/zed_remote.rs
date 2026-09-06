@@ -748,7 +748,7 @@ impl FileView {
             let multibuffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer.clone(), cx));
             let mut editor =
                 editor::Editor::new(editor::EditorMode::full(), multibuffer, None, window, cx);
-            crate::editor_config::configure_file(&mut editor, window, cx);
+            rho_window::editor_config::configure_file(&mut editor, window, cx);
             editor
         });
         Self { remote, editor }

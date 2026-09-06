@@ -16,10 +16,10 @@ use gpui::prelude::*;
 use gpui::{Context, Entity};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
 use rho_registry::render::UiBlock;
+use rho_window::highlights::excerpt_range;
 use text::Anchor;
 use ui::{Icon, IconName, IconSize, div};
 
-use crate::highlights::excerpt_range;
 use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, turn_start_index};
 
 /// What one fold looks like, independent of its editor identity.
@@ -218,7 +218,7 @@ fn render_elision_block(label: &str, cx: &mut BlockContext<'_, '_>) -> impl Into
     let text_color = if cx.selected {
         text_style.color
     } else {
-        crate::style::hint_color(cx.app)
+        rho_window::style::hint_color(cx.app)
     };
     div()
         .block_mouse_except_scroll()

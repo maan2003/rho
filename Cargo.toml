@@ -39,6 +39,7 @@ members = [
   "crates/rho-transcript",
   "crates/rho-touch-keyboard",
   "crates/rho-ui-proto",
+  "crates/rho-window",
   "crates/rho-visualizations",
   "crates/rho-web-search",
   "crates/rho-workspaces",
@@ -129,6 +130,7 @@ rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-hosts = { path = "crates/rho-hosts" }
+rho-window = { path = "crates/rho-window" }
 rho-registry = { path = "crates/rho-registry" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }

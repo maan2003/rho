@@ -180,6 +180,21 @@ wrong at the design, not at the polish.
   closures, and 791 of its 2,101 lines are agent quota and cost charts that
   are not a window primitive at all. The shape is kept, the primitive is
   replaced. Owner: eng-8gpr, after eng-b8os's chrome cut creates the crate.
+
+  *Landed, the chrome (first cut of `rho-window`).* The vocabulary every
+  screen is drawn with, moved verbatim and nothing else: `style` (the
+  classes a span carries, the regions, the gutter and chip colours, the
+  attachment and refusal blocks), `highlights` over a multibuffer,
+  `editor_config` (what a buffer is opened as), and `visualization`. None
+  of the four reached into `Workspace`: they knew buffers, editors and the
+  theme and nothing above, which is why the move is verbatim and why the
+  cut is a manifest and a set of imports rather than a redesign. Every use
+  site names `rho_window::` now rather than `crate::`; no alias was left
+  behind, because a re-export would have let a screen keep believing the
+  chrome is its own. The rest of the window — focus, surfaces, history,
+  transients, the minibuffer, selection and the active pane — follows here.
+  Gate green: rho-gui 275 and rho-window 1 (the style test moved with its
+  module), workspace clippy `-D warnings` green.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but

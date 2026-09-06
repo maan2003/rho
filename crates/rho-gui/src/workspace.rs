@@ -36,6 +36,7 @@ use rho_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_ui_proto::AdvisorIntelligence;
 use rho_ui_proto::{AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery};
+use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 
@@ -48,7 +49,6 @@ use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::ActiveAgents;
 use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::FrameSummary;
-use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
@@ -811,7 +811,7 @@ impl Workspace {
         });
         let messages_editor = cx.new(|cx| {
             let mut editor = editor::Editor::for_buffer(messages_buffer.clone(), None, window, cx);
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(
                 multi_buffer::Anchor::Max,
@@ -2496,7 +2496,7 @@ impl Workspace {
     /// buffer in the frame.
     fn zulip_hooks() -> rho_zulip::ui::Hooks {
         rho_zulip::ui::Hooks {
-            configure_editor: crate::editor_config::configure,
+            configure_editor: rho_window::editor_config::configure,
             configure_markdown: crate::render::markdown::configure_buffer,
         }
     }
@@ -4244,10 +4244,10 @@ impl Workspace {
                 .1
                 .push(range.clone());
         }
-        crate::highlights::apply_class_highlights(
+        rho_window::highlights::apply_class_highlights(
             &self.messages_editor,
             &multi_buffer,
-            crate::style::Region::System,
+            rho_window::style::Region::System,
             by_class
                 .iter()
                 .map(|(class, ranges)| (*class, ranges.as_slice())),

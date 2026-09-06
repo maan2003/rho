@@ -40,14 +40,14 @@ use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_hosts::connection::VisualizationClient;
 use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
+use rho_window::highlights::{apply_class_highlights, excerpt_range};
+use rho_window::style::{Region, StyleClass};
+use rho_window::visualization::Visualization;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
 use crate::store::{FrameSummary, IncrementalUpdate};
-use crate::style::{Region, StyleClass};
-use crate::visualization::Visualization;
 
 pub struct TranscriptModel {
     multi_buffer: Entity<MultiBuffer>,
@@ -939,7 +939,7 @@ impl TranscriptModel {
                     .iter()
                     .filter(|(class, _)| *class == StyleClass::UserMessage)
                     .filter_map(|(_, range)| excerpt_range(&snapshot, range))
-                    .map(|range| (range, crate::style::USER_MESSAGE_SCALE))
+                    .map(|range| (range, rho_window::style::USER_MESSAGE_SCALE))
                     .collect::<Vec<_>>();
                 let display_map = editor.read(cx).display_map.clone();
                 display_map.update(cx, |display_map, cx| display_map.set_row_scales(scales, cx));
@@ -991,12 +991,12 @@ impl TranscriptModel {
                 editor.update(cx, |editor, cx| {
                     editor.highlight_gutter::<UserMessageGutter>(
                         user_ranges,
-                        crate::style::user_prompt_gutter_color,
+                        rho_window::style::user_prompt_gutter_color,
                         cx,
                     );
                     editor.highlight_gutter::<AgentMessageGutter>(
                         agent_ranges,
-                        crate::style::agent_message_gutter_color,
+                        rho_window::style::agent_message_gutter_color,
                         cx,
                     );
                 });

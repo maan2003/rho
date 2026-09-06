@@ -221,7 +221,7 @@ impl HomeView {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             editor.disable_header_for_buffer(buffer.read(cx).remote_id(), cx);
             editor
         });

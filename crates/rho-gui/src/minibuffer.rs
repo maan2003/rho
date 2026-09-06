@@ -14,9 +14,9 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Focusable as _, SharedString, Subscription, Window, div, px,
 };
+use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
-use crate::style::StyleClass;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

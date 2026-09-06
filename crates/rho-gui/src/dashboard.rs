@@ -1207,7 +1207,7 @@ impl Dashboard {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             // Unlike the chat editors, clicking a row to put the cursor on
             // it is the whole point.
             editor.set_mouse_click_selection_enabled(true, cx);

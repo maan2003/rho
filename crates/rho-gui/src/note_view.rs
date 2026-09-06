@@ -65,7 +65,7 @@ impl NoteView {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            rho_window::editor_config::configure(&mut editor, window, cx);
             editor.set_mouse_click_selection_enabled(true, cx);
             editor
         });

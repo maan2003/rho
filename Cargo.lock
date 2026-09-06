@@ -13928,6 +13928,7 @@ dependencies = [
  "rho-slack",
  "rho-transcript",
  "rho-ui-proto",
+ "rho-window",
  "rho-zulip",
  "rodio",
  "rust-embed",
@@ -14293,6 +14294,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "rho-window"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "rho-core",
+ "rho-hosts",
+ "text",
+ "theme",
 ]
 
 [[package]]

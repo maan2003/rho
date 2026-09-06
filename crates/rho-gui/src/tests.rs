@@ -3536,7 +3536,7 @@ fn scrolled_messages_viewport_stays_put_across_append(cx: &mut TestAppContext) {
             workspace.seed_messages_for_test(
                 (0..200).map(|index| {
                     (
-                        crate::style::StyleClass::SystemInfo,
+                        rho_window::style::StyleClass::SystemInfo,
                         format!("message-{index}"),
                     )
                 }),
@@ -3572,7 +3572,7 @@ fn scrolled_messages_viewport_stays_put_across_append(cx: &mut TestAppContext) {
         .update(cx, |workspace, _, cx| {
             workspace.append_test_message(
                 "new message".to_owned(),
-                crate::style::StyleClass::SystemInfo,
+                rho_window::style::StyleClass::SystemInfo,
                 cx,
             );
         })
@@ -3596,12 +3596,12 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
         .update(cx, |workspace, window, cx| {
             workspace.seed_messages_for_test(
                 std::iter::once((
-                    crate::style::StyleClass::SystemImportant,
+                    rho_window::style::StyleClass::SystemImportant,
                     "important".to_owned(),
                 ))
                 .chain((1..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
                     (
-                        crate::style::StyleClass::SystemInfo,
+                        rho_window::style::StyleClass::SystemInfo,
                         format!("ordinary-{index}"),
                     )
                 })),
@@ -3610,14 +3610,16 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
             workspace.cmd_messages(window, cx);
             workspace.append_test_message(
                 "ordinary-new".to_owned(),
-                crate::style::StyleClass::SystemInfo,
+                rho_window::style::StyleClass::SystemInfo,
                 cx,
             );
         })
         .expect("evict the important message");
     let important_color = workspace
         .update(cx, |_, _, cx| {
-            crate::style::StyleClass::SystemImportant.resolve(cx).color
+            rho_window::style::StyleClass::SystemImportant
+                .resolve(cx)
+                .color
         })
         .expect("resolve important color");
     assert!(
@@ -3653,7 +3655,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
             workspace.seed_messages_for_test(
                 (0..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
                     (
-                        crate::style::StyleClass::SystemInfo,
+                        rho_window::style::StyleClass::SystemInfo,
                         format!("initial-{index}"),
                     )
                 }),
@@ -3667,7 +3669,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
             for index in 0..crate::workspace::MESSAGE_REBASE_EVICTIONS {
                 workspace.append_test_message(
                     format!("replacement-{index}"),
-                    crate::style::StyleClass::SystemInfo,
+                    rho_window::style::StyleClass::SystemInfo,
                     cx,
                 );
             }
@@ -4993,7 +4995,7 @@ fn user_messages_render_larger_than_the_transcript_around_them(cx: &mut TestAppC
                 let snapshot = editor.snapshot(window, cx);
                 assert_eq!(
                     snapshot.row_scale(question),
-                    crate::style::USER_MESSAGE_SCALE,
+                    rho_window::style::USER_MESSAGE_SCALE,
                     "the user's own turn renders larger"
                 );
                 assert_eq!(
@@ -5214,7 +5216,7 @@ fn every_row_of_a_user_message_renders_larger(cx: &mut TestAppContext) {
                 for row in mine {
                     assert_eq!(
                         snapshot.row_scale(row),
-                        crate::style::USER_MESSAGE_SCALE,
+                        rho_window::style::USER_MESSAGE_SCALE,
                         "every row of the user's turn renders larger: {lines:?}"
                     );
                 }
