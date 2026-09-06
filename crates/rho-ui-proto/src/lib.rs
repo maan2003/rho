@@ -21,12 +21,11 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 pub mod client;
 #[doc(hidden)]
 pub use rho_desk as desk_tree;
+pub mod mirror;
 pub mod realtime;
-pub mod remote;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
 pub mod shell;
-pub mod story;
 pub mod term;
 pub mod workspace;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -39,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/9";
+pub const IROH_ALPN: &[u8] = b"rho/ui/12";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP9";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP12";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,19 +239,23 @@ pub enum ClientMessage {
         offer_sdp: String,
     },
     /// The agents whose live frames this connection wants: the ones on
-    /// screen. Everything durable arrives as story events regardless, so
+    /// screen. Everything durable arrives on the journal regardless, so
     /// this only decides who streams partial text and tools in flight.
     /// Replaces the set wholesale; an empty set asks for none.
     AgentStreamFocus {
         agent_ids: Vec<AgentId>,
     },
-    /// The client's version vector, sent once after [`ServerMessage::Ready`]:
-    /// one position per agent whose story it already holds. The daemon
-    /// answers [`ServerMessage::AgentStory`] for everything past it, and
-    /// from zero for agents the client has never seen, then follows: every
-    /// new story event on any agent is pushed on this connection.
-    AgentLogs {
-        known: Vec<(AgentId, story::UiStoryPos)>,
+    /// Sent once after [`ServerMessage::Ready`]: the last journal entry
+    /// this client holds for this host (zero for none). The daemon answers
+    /// [`ServerMessage::Log`] pages for everything past it, then follows:
+    /// every later append on any agent is pushed on this connection.
+    Follow {
+        since: mirror::Seq,
+    },
+    /// The bodies of one raw event: tool output, a response whole.
+    Detail {
+        agent_id: AgentId,
+        pos: mirror::AgentPos,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -355,10 +358,6 @@ pub enum ClientMessage {
     /// Requests the daemon account's weekly ChatGPT Codex allowance.
     ChatGptUsage,
     QuotaHistory,
-    AgentUsage {
-        agent_id: AgentId,
-        since_ms: u64,
-    },
     GlobalUsage {
         since_ms: u64,
     },
@@ -504,7 +503,7 @@ pub struct McpAgentToolResponse {
 pub enum StartMode {
     /// A fresh workspace in `repo` with a new change on top of the revset.
     /// Clients resolve agent targets to `<workspace name>@` themselves
-    /// (workspace names arrive on [`story::UiAgentHead`]).
+    /// (workspace names arrive on the mirror's `Created` event).
     NewOn { repo: Utf8PathBuf, revset: String },
     /// A fresh restricted workspace in `repo` on top of the revset.
     Sandbox { repo: Utf8PathBuf, revset: String },
@@ -517,7 +516,7 @@ pub enum StartMode {
 /// Whose workspace [`StartMode::Join`] joins.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum JoinTarget {
-    /// A known workspace, sent back verbatim from [`story::UiAgentHead`].
+    /// A known workspace, sent back verbatim from the mirror's `Created`.
     Workspace(WorkspaceInfo),
     /// The user's own checkout of `repo`.
     User { repo: Utf8PathBuf },
@@ -566,9 +565,6 @@ pub enum ServerMessage {
     },
     DeskResyncRequired,
     Ready {
-        /// Every agent's head: the agents list, so a title, a role or a
-        /// workdir never waits on a log.
-        agents: Vec<story::UiAgentHead>,
         auth: AuthState,
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
@@ -576,6 +572,9 @@ pub enum ServerMessage {
         /// Last allocated agent-id counter; clients use it for uniform
         /// short-prefix rendering.
         agent_counter: u64,
+        /// How far this host's journal runs, so a client knows how far
+        /// behind it is before it follows.
+        journal_head: mirror::Seq,
     },
     Error {
         message: String,
@@ -589,9 +588,11 @@ pub enum ServerMessage {
         running: bool,
         detail: String,
     },
-    Agent {
+    /// What a runtime has past the log, as it changes, for every agent
+    /// any client is looking at.
+    Live {
         agent_id: AgentId,
-        frame: remote::AgentRemoteFrame,
+        live: mirror::Live,
     },
     AgentCreated {
         agent_id: AgentId,
@@ -599,17 +600,17 @@ pub enum ServerMessage {
     TurnCancelled {
         agent_id: AgentId,
     },
-    /// A run of one agent's story, in position order starting at `from`:
-    /// the answer to [`ClientMessage::AgentLogs`], and afterwards one
-    /// event at a time as the story grows.
-    AgentStory {
-        agent_id: AgentId,
-        from: story::UiStoryPos,
-        events: Vec<story::UiStoryEvent>,
+    /// A run of the host's journal in order: the answer to
+    /// [`ClientMessage::Follow`], paged, and afterwards every append as it
+    /// lands. Entries never repeat and never skip within one connection.
+    Log {
+        entries: Vec<mirror::LogEntry>,
     },
-    /// An agent's head changed, or an agent was created.
-    AgentHead {
-        head: story::UiAgentHead,
+    /// The answer to [`ClientMessage::Detail`].
+    Detail {
+        agent_id: AgentId,
+        pos: mirror::AgentPos,
+        body: mirror::DetailBody,
     },
     LandLeaseQueued {
         repo: Utf8PathBuf,
@@ -651,11 +652,6 @@ pub enum ServerMessage {
     },
     RealtimeRefused {
         reason: String,
-    },
-    /// First frame on a daemon-opened iroh unidirectional stream. Every later
-    /// frame on that stream is [`ServerMessage::Agent`] for this agent.
-    AgentStreamOpened {
-        agent_id: AgentId,
     },
     /// Handshake reply on a terminal stream (see
     /// [`ClientMessage::TerminalCreate`] and
@@ -744,12 +740,6 @@ pub enum ServerMessage {
     QuotaHistory {
         series: Vec<QuotaSeries>,
     },
-    AgentUsage {
-        agent_id: AgentId,
-        model: String,
-        buckets: Vec<AgentUsageBucket>,
-        total: AgentUsageBucket,
-    },
     GlobalUsage {
         series: Vec<AgentUsageSeries>,
     },
@@ -767,23 +757,9 @@ pub enum ServerMessage {
     VisualizationRefused {
         reason: String,
     },
-    /// The daemon stopped this connection's live state stream for an agent.
-    /// Clients may retain the last snapshot and subscribe again on demand.
-    AgentUnloaded {
-        agent_id: AgentId,
-        reason: AgentUnloadReason,
-    },
     DiffBaseContents {
         contents: Vec<WorkspaceDiffBaseContent>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentUnloadReason {
-    /// This connection released its subscription.
-    Unsubscribed,
-    /// The daemon evicted a settled runtime under its idle policy.
-    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -1069,7 +1045,7 @@ pub fn print_protocol_log(
 fn read_protocol_log_record(
     input: &mut impl std::io::Read,
 ) -> anyhow::Result<Option<(u64, ProtocolLogDirection, Vec<u8>)>> {
-    let mut magic = [0; 4];
+    let mut magic = [0; 5];
     match input.read_exact(&mut magic) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -1143,7 +1119,8 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP8"[..];
+        // The previous epoch's magic followed by a record's worth of bytes.
+        let mut old = &b"RUP9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -1333,8 +1310,12 @@ mod tests {
                 agent_ids: vec![agent_id],
             },
             ClientMessage::AgentStreamFocus { agent_ids: vec![] },
-            ClientMessage::AgentLogs {
-                known: vec![(agent_id, story::UiStoryPos(9))],
+            ClientMessage::Follow {
+                since: mirror::Seq(9),
+            },
+            ClientMessage::Detail {
+                agent_id,
+                pos: mirror::AgentPos(3),
             },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();
@@ -1343,13 +1324,25 @@ mod tests {
             assert_eq!(message, decoded);
         }
 
-        for message in [
-            ServerMessage::AgentStreamOpened { agent_id },
-            ServerMessage::AgentUnloaded {
-                agent_id,
-                reason: AgentUnloadReason::Idle,
+        for live in [
+            mirror::Live::Requesting,
+            mirror::Live::Item {
+                index: 0,
+                item: mirror::Item::Text {
+                    text: "hel".to_owned(),
+                    phase: Some(mirror::TextPhase::FinalAnswer),
+                },
             },
+            mirror::Live::Appended {
+                index: 0,
+                text: "lo".to_owned(),
+            },
+            mirror::Live::Waiting {
+                until: Some(rho_core::UnixMs(5)),
+            },
+            mirror::Live::Idle,
         ] {
+            let message = ServerMessage::Live { agent_id, live };
             let bytes = senax_encoder::pack(&message).unwrap();
             let mut slice: &[u8] = &bytes;
             let decoded = senax_encoder::unpack(&mut slice).unwrap();

@@ -37,8 +37,8 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
+use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
-use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::connection::VisualizationClient;

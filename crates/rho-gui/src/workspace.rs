@@ -37,17 +37,13 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{
-    AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision, HostEvent,
-};
+use crate::connection::{ConnEvent, Connection, GitApprovalDecision, HostEvent};
 use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{Pane, SurfaceKey};
-use crate::registry::session::{
-    AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_agent_roots,
-};
+use crate::registry::session::ActiveAgents;
 use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::{AgentStore, FrameSummary};
 #[cfg(test)]
@@ -400,7 +396,10 @@ struct DeskSemanticUndo {
 
 pub struct Workspace {
     pub(crate) hosts: Hosts,
-    subscriptions: AgentSubscriptions,
+    /// The agents held whole: their events, the transcript folded from
+    /// them, and the daemon's live tail. Also the focus set every host
+    /// is told. Everyone else is a digest in the registry.
+    active: ActiveAgents,
     store: AgentStore,
     pub(crate) registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
@@ -416,11 +415,12 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
-    /// Agent frames accumulated since the last draw. Applying a streaming
-    /// update immediately can monopolize the foreground thread, preventing
-    /// both a draw and input dispatch when several agents are active.
-    pending_frames: Vec<PendingAgentFrame>,
-    frame_flush_scheduled: bool,
+    /// Each host's journal cursor, restored from the mirror and moved by
+    /// every `Log`.
+    mirror_hosts: HashMap<HostId, MirrorCursor>,
+    /// The transcript fold of every active agent, in memory, so a `Log`
+    /// entry folds into it without waiting on the disk copy.
+    open_mirrors: HashMap<AgentId, rho_registry::TranscriptFold>,
     draft_model: Entity<DraftModel>,
     message_log: MessageLog,
     messages_buffer: Entity<language::Buffer>,
@@ -637,10 +637,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_attention(&mut self, agent_id: AgentId, attention: rho_registry::Attention) {
-        self.registry.set_attention(agent_id, attention);
-    }
-
     /// The workdirs this daemon offers: the labels in its store that carry
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
@@ -662,84 +658,115 @@ impl Workspace {
         host: HostId,
         machine_seed: u64,
         agent_counter: u64,
-        agents: Vec<rho_ui_proto::story::UiAgentHead>,
-    ) -> (bool, Option<Vec<AgentId>>) {
+        journal_head: rho_ui_proto::mirror::Seq,
+    ) -> bool {
         let first_ready = self.ready_hosts.insert(host);
-        let live = agents
-            .iter()
-            .map(|head| head.agent_id)
-            .collect::<HashSet<_>>();
-        let departed = self
-            .registry
-            .known_story_positions(host)
-            .into_iter()
-            .map(|(agent_id, _)| agent_id)
-            .filter(|agent_id| !live.contains(agent_id))
-            .collect::<Vec<_>>();
-        crate::mirror::forget(departed);
         let name = self.registry.host_name(host).to_owned();
-        for head in &agents {
-            crate::mirror::write_head(&name, head.clone());
+        let cursor = self.mirror_hosts.entry(host).or_insert(MirrorCursor {
+            machine_seed,
+            seq: rho_ui_proto::mirror::Seq(0),
+        });
+        // A daemon whose database is not the one this client mirrored, or
+        // whose journal is shorter than the copy: the copy starts over.
+        if cursor.machine_seed != machine_seed || cursor.seq > journal_head {
+            *cursor = MirrorCursor {
+                machine_seed,
+                seq: rho_ui_proto::mirror::Seq(0),
+            };
+            crate::mirror::reset_host(&name);
+            for agent_id in self.registry.host_agents(host) {
+                self.store.forget(agent_id);
+                self.open_mirrors.remove(&agent_id);
+                self.active.remove(agent_id);
+            }
+            self.registry.reset_host(host);
         }
         self.registry
-            .set_host_data(host, machine_seed, agent_counter, agents);
-        let initial = first_ready.then(|| {
-            recent_agent_roots(
-                self.registry.summaries(),
-                self.registry.selected_agent().copied(),
-                INITIAL_AGENT_SUBSCRIPTIONS,
-            )
-        });
-        (first_ready, initial)
+            .set_host_data(host, machine_seed, agent_counter);
+        first_ready
+    }
+
+    /// What `Follow` asks for: everything after the newest entry held.
+    fn journal_cursor(&self, host: HostId) -> rho_ui_proto::mirror::Seq {
+        self.mirror_hosts
+            .get(&host)
+            .map(|cursor| cursor.seq)
+            .unwrap_or_default()
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
         self.registry.note_agent_created(host, agent_id);
     }
 
-    /// Shows an agent's transcript from the story the client already holds,
-    /// for a reader who opened it before any frame arrived, or with the
-    /// daemon down. The daemon's first frame on subscribing is a snapshot,
-    /// so the live transcript replaces this whole and nothing merges.
-    fn seed_transcript_from_story(&mut self, agent_id: AgentId) -> bool {
-        // A state with no blocks is what a disconnect leaves behind: it
-        // shows nothing, so the story is strictly better than it.
-        if self
-            .store
-            .get(&agent_id)
-            .is_some_and(|state| !state.blocks.is_empty())
-        {
+    /// Shows an agent's transcript from the mirror the client already
+    /// holds: the fold, for a reader who opened it before any live frame,
+    /// or with the daemon down. The live frame rides on its tail.
+    fn seed_transcript_from_mirror(&mut self, agent_id: AgentId) -> bool {
+        if self.open_mirrors.contains_key(&agent_id) {
             return false;
         }
-        let events = crate::mirror::read_story(agent_id);
+        // The disk copy may trail the rows just heard by a queued write;
+        // waiting for it is what makes the fold whole.
+        crate::mirror::flush();
+        let events = crate::mirror::read_events(agent_id);
         if events.is_empty() {
             return false;
         }
-        let state =
-            rho_registry::story_view::story_transcript(rho_ui_proto::story::UiStoryPos(0), &events);
-        self.store.apply(
-            agent_id,
-            rho_ui_proto::remote::AgentRemoteFrame::Snapshot(state),
-        );
+        let fold = rho_registry::TranscriptFold::new(&events);
+        self.store.set_fold(agent_id, fold.state());
+        self.open_mirrors.insert(agent_id, fold);
         true
+    }
+
+    /// Folds new rows into every open transcript they belong to.
+    fn refold_open_transcripts(
+        &mut self,
+        entries: &[rho_ui_proto::mirror::LogEntry],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut refolded = Vec::new();
+        for entry in entries {
+            let Some(fold) = self.open_mirrors.get_mut(&entry.agent_id) else {
+                continue;
+            };
+            if !fold.tell(entry.pos, &entry.event) {
+                continue;
+            }
+            if !refolded.contains(&entry.agent_id) {
+                refolded.push(entry.agent_id);
+            }
+        }
+        let frames = refolded
+            .into_iter()
+            .map(|agent_id| {
+                let state = self.open_mirrors[&agent_id].state();
+                (agent_id, TranscriptFrame::Fold(state))
+            })
+            .collect::<Vec<_>>();
+        if !frames.is_empty() {
+            self.handle_frame_batch(frames, window, cx);
+        }
     }
 
     fn apply_frame_state(
         &mut self,
         agent_id: AgentId,
-        frame: rho_ui_proto::remote::AgentRemoteFrame,
+        frame: TranscriptFrame,
     ) -> Option<(FrameSummary, Option<u64>, bool, bool)> {
-        if !self.subscriptions.accepts_frames(agent_id) {
-            return None;
-        }
         let old_context = self
             .store
             .get(&agent_id)
             .and_then(|state| state.context_used);
         let old_usage = self.store.get(&agent_id).map(|state| state.usage.clone());
-        let summary = self.store.apply(agent_id, frame);
+        let (summary, live_changed) = match frame {
+            TranscriptFrame::Live(live) => (
+                self.store.apply_live(agent_id, live),
+                self.registry.mark_live(agent_id),
+            ),
+            TranscriptFrame::Fold(state) => (self.store.set_fold(agent_id, state), false),
+        };
         let usage_changed = old_usage.as_ref() != self.store.get(&agent_id).map(|s| &s.usage);
-        let live_changed = self.registry.mark_live(agent_id);
         Some((summary, old_context, usage_changed, live_changed))
     }
 
@@ -796,23 +823,6 @@ impl Workspace {
         }
     }
 
-    fn apply_agent_unloaded(
-        &mut self,
-        agent_id: AgentId,
-        reason: rho_ui_proto::AgentUnloadReason,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.subscriptions.mark_unloaded(agent_id, reason) {
-            return false;
-        }
-        self.registry.mark_not_live(agent_id);
-        let summary = self.store.mark_unloaded(agent_id);
-        if let Some(model) = self.models.get(&agent_id).cloned() {
-            self.sync_agent_model(agent_id, &model, summary, false, cx);
-        }
-        true
-    }
-
     fn finish_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let Some(model) = self.models.get(&agent_id).cloned() else {
             return;
@@ -833,12 +843,19 @@ impl Workspace {
     }
 }
 
-struct PendingAgentFrame {
-    agent_id: AgentId,
-    frame: rho_ui_proto::remote::AgentRemoteFrame,
-    /// Keeps the connection's decode-budget reservation until the frame is
-    /// applied, preserving transport backpressure while it waits for a draw.
-    allocation: Option<AgentFrameAllocation>,
+/// One change to an agent's transcript: a delta to the runtime's live
+/// tail, or the fold of its mirror made again.
+pub(crate) enum TranscriptFrame {
+    Live(rho_ui_proto::mirror::Live),
+    Fold(rho_registry::render::UiAgentState),
+}
+
+/// Where this client stands in a host's journal, and whose database it
+/// counts in.
+#[derive(Clone, Copy, Debug)]
+struct MirrorCursor {
+    machine_seed: u64,
+    seq: rho_ui_proto::mirror::Seq,
 }
 
 /// Who a command speaks about: the rail row under the cursor, or the open
@@ -1024,15 +1041,15 @@ impl Workspace {
             });
         let mut this = Self {
             hosts,
-            subscriptions: AgentSubscriptions::default(),
+            active: ActiveAgents::default(),
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
             models: HashMap::new(),
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
-            pending_frames: Vec::new(),
-            frame_flush_scheduled: false,
+            mirror_hosts: HashMap::new(),
+            open_mirrors: HashMap::new(),
             draft_model,
             message_log: MessageLog::default(),
             messages_buffer,
@@ -1157,30 +1174,47 @@ impl Workspace {
         host
     }
 
-    /// What the last session heard about every agent, read back before any
+    /// What the last session made of every agent, read back before any
     /// daemon answers. The rails are then whole from the first frame, and
-    /// the `AgentLogs` this client sends on `Ready` asks only for what came
-    /// after. A row whose host is no longer attached is dropped: it belongs
-    /// to a daemon this session does not have.
+    /// the `Follow` this client sends on `Ready` asks only for what came
+    /// after. An agent whose host is no longer attached is dropped: it
+    /// belongs to a daemon this session does not have.
     fn restore_mirror(&mut self) {
         let hosts = self
             .registry
             .hosts()
             .map(|(host, name)| (name.to_owned(), host))
             .collect::<HashMap<_, _>>();
-        for (agent_id, mirrored) in crate::mirror::load() {
+        let loaded = crate::mirror::load();
+        for mirrored in loaded.hosts {
+            if let Some(&host) = hosts.get(&mirrored.name) {
+                self.mirror_hosts.insert(
+                    host,
+                    MirrorCursor {
+                        machine_seed: mirrored.machine_seed,
+                        seq: mirrored.seq,
+                    },
+                );
+            }
+        }
+        let mut agents = Vec::new();
+        let mut verdicts = Vec::new();
+        for (agent_id, mirrored) in loaded.agents {
             let Some(&host) = hosts.get(&mirrored.host) else {
                 continue;
             };
-            self.registry.set_head(host, mirrored.head);
-            self.registry.tell_story(
-                agent_id,
-                rho_ui_proto::story::UiStoryPos(0),
-                &mirrored.story,
-            );
-            if let Some(attention) = mirrored.attention {
-                self.registry.set_attention(agent_id, attention);
+            agents.push(rho_registry::MirroredAgent {
+                host,
+                identity: mirrored.snapshot.identity,
+                digest: mirrored.snapshot.digest,
+            });
+            if let Some(verdict) = mirrored.verdict {
+                verdicts.push((agent_id, verdict));
             }
+        }
+        self.registry.restore(agents);
+        for (agent_id, verdict) in verdicts {
+            self.registry.set_agent_verdict(agent_id, verdict);
         }
     }
 
@@ -1218,7 +1252,8 @@ impl Workspace {
         self.registry.detach_host(host);
         self.refresh_dashboard(window, cx);
         for agent_id in departed {
-            self.subscriptions.forget(agent_id);
+            self.active.remove(agent_id);
+            self.open_mirrors.remove(&agent_id);
             self.store.forget(agent_id);
             self.models.remove(&agent_id);
             self.pending_syncs.remove(&agent_id);
@@ -1339,9 +1374,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let SurfaceKey::Transcript(agent_id) = warm.surface.key
-            && !self.subscriptions.contains(agent_id)
+            && !self.active.contains(agent_id)
         {
-            self.subscribe_agent(agent_id, cx);
+            self.activate_agent(agent_id, cx);
             warm.surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
         }
         self.ensure_surface_subscription(&warm.surface.key, cx);
@@ -1735,19 +1770,6 @@ impl Workspace {
                 }
                 _ => true,
             });
-        let warm_agents = candidates
-            .cards
-            .iter()
-            .filter(|card| matches!(card.kind, crate::dashboard::DealCardKind::Agent))
-            .filter_map(|card| card.agent_id)
-            .take(3)
-            .filter(|agent_id| {
-                self.agent_online(*agent_id) && !self.subscriptions.contains(*agent_id)
-            })
-            .collect::<Vec<_>>();
-        for agent_id in warm_agents {
-            self.subscribe_agent(agent_id, cx);
-        }
         // Home is a window onto this same ranking, so it is rebuilt wherever
         // the dealer is invalidated and never on a timer.
         self.refresh_home(cx);
@@ -1839,86 +1861,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         for HostEvent { host, event } in events {
-            match event {
-                ConnEvent::Frame {
-                    agent_id,
-                    frame,
-                    allocation,
-                } => self.queue_frame(agent_id, frame, allocation, window, cx),
-                event => {
-                    // Preserve protocol order: a control event always sees
-                    // all preceding agent state before it is handled. Frames
-                    // are queued per agent and agents never move between
-                    // hosts, so batching across hosts cannot reorder one
-                    // agent's stream.
-                    self.flush_pending_frames(window, cx);
-                    self.handle_event(host, event, window, cx);
-                }
-            }
+            self.handle_event(host, event, window, cx);
         }
-    }
-
-    fn queue_frame(
-        &mut self,
-        agent_id: AgentId,
-        frame: rho_ui_proto::remote::AgentRemoteFrame,
-        allocation: Option<AgentFrameAllocation>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_frames.push(PendingAgentFrame {
-            agent_id,
-            frame,
-            allocation,
-        });
-        if self.frame_flush_scheduled {
-            return;
-        }
-        self.frame_flush_scheduled = true;
-        // GPUI's test platform reports every window as inactive, so tests use
-        // the foreground path unless they explicitly exercise this policy.
-        if window.is_window_active() || cfg!(test) {
-            cx.on_next_frame(window, |this, window, cx| {
-                this.frame_flush_scheduled = false;
-                this.flush_pending_frames(window, cx);
-            });
-            // `on_next_frame` attaches to a draw; make sure an otherwise idle
-            // window gets one to consume the queued transport state.
-            cx.notify();
-        } else {
-            cx.spawn_in(window, async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(200))
-                    .await;
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.frame_flush_scheduled = false;
-                    this.flush_pending_frames(window, cx);
-                });
-            })
-            .detach();
-        }
-    }
-
-    fn flush_pending_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_frames.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.pending_frames);
-        let mut allocations = Vec::with_capacity(pending.len());
-        let frames = pending
-            .into_iter()
-            .map(|frame| {
-                allocations.push(frame.allocation);
-                (frame.agent_id, frame.frame)
-            })
-            .collect();
-        self.handle_frame_batch(frames, window, cx);
-        drop(allocations);
     }
 
     fn handle_frame_batch(
         &mut self,
-        frames: Vec<(AgentId, rho_ui_proto::remote::AgentRemoteFrame)>,
+        frames: Vec<(AgentId, TranscriptFrame)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1927,12 +1876,6 @@ impl Workspace {
         let mut live_changed = false;
 
         for (agent_id, frame) in frames {
-            // A transport may still deliver already-buffered frames after
-            // this GUI evicts a subscription. They must not resurrect its
-            // connection-local Live state or mutate the retained snapshot.
-            if !self.subscriptions.accepts_frames(agent_id) {
-                continue;
-            }
             let Some((summary, old_context, usage_changed, became_live)) =
                 self.apply_frame_state(agent_id, frame)
             else {
@@ -2035,22 +1978,21 @@ impl Workspace {
                 self.sync_tree_dashboard(host, window, cx);
             }
             ConnEvent::Ready {
-                agents,
                 auth,
                 machine_seed,
                 agent_counter,
+                journal_head,
             } => {
-                let reconnecting = self.replay_hosts.remove(&host);
-                let (first_ready, initial_subscriptions) =
-                    self.apply_ready(host, machine_seed, agent_counter, agents);
+                self.replay_hosts.remove(&host);
+                let first_ready = self.apply_ready(host, machine_seed, agent_counter, journal_head);
                 self.prune_contexts();
                 self.refresh_workdirs(host);
-                // Ask for every story event this client lacks. The daemon
-                // answers with the gap and then follows.
+                // Ask for every journal entry this client lacks. The daemon
+                // answers with the rest and then follows.
                 self.hosts.send(
                     host,
-                    ClientMessage::AgentLogs {
-                        known: self.registry.known_story_positions(host),
+                    ClientMessage::Follow {
+                        since: self.journal_cursor(host),
                     },
                 );
                 if let Some(entry) = self.hosts.get_mut(host) {
@@ -2063,23 +2005,9 @@ impl Workspace {
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
                 }
-                let agent_ids = if reconnecting {
-                    let retained = self
-                        .subscriptions
-                        .iter()
-                        .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
-                        .collect::<Vec<_>>();
-                    (!retained.is_empty())
-                        .then_some(retained)
-                        .or(initial_subscriptions)
-                } else {
-                    initial_subscriptions
-                };
-                if let Some(agent_ids) = agent_ids
-                    && !agent_ids.is_empty()
-                {
-                    self.set_initial_subscriptions(agent_ids, cx);
-                }
+                // The focus set is this client's to keep; a daemon that
+                // just came up is told it whole.
+                self.send_agent_focus_to(host);
                 self.update_statuses(cx);
                 self.dashboard_cursor_moved(window, cx);
                 cx.notify();
@@ -2114,7 +2042,7 @@ impl Workspace {
                 }
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
-                    self.subscribe_agent(agent_id, cx);
+                    self.activate_agent(agent_id, cx);
                     // The draft became this agent: reset the compose surface
                     // and follow the new agent.
                     let label = self
@@ -2132,51 +2060,63 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::AgentUnloaded { agent_id, reason } => {
-                if !self.apply_agent_unloaded(agent_id, reason, cx) {
+            ConnEvent::Live { agent_id, live } => {
+                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
+            }
+            #[cfg(test)]
+            ConnEvent::Transcript { agent_id, state } => {
+                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
+            }
+            #[cfg(test)]
+            ConnEvent::Many(events) => {
+                for event in events {
+                    self.handle_event(host, event, window, cx);
+                }
+            }
+            ConnEvent::Log { entries } => {
+                let name = self.registry.host_name(host).to_owned();
+                let machine_seed = match (entries.last(), self.mirror_hosts.get_mut(&host)) {
+                    (Some(last), Some(cursor)) => {
+                        cursor.seq = cursor.seq.max(last.seq);
+                        cursor.machine_seed
+                    }
+                    _ => 0,
+                };
+                let changed = self.registry.tell(host, &entries);
+                // Rows of an agent whose creation this client never heard
+                // fold to nothing; the copy keeps only what the registry
+                // could make something of, with what it made.
+                let entries = entries
+                    .into_iter()
+                    .filter(|entry| self.registry.mirrored(entry.agent_id).is_some())
+                    .collect::<Vec<_>>();
+                let digests = changed
+                    .iter()
+                    .filter_map(|agent_id| {
+                        let mirrored = self.registry.mirrored(*agent_id)?;
+                        Some((
+                            *agent_id,
+                            crate::mirror::AgentSnapshot::new(
+                                mirrored.identity.clone(),
+                                mirrored.digest.clone(),
+                            ),
+                        ))
+                    })
+                    .collect();
+                crate::mirror::write_log(&name, machine_seed, entries.clone(), digests);
+                self.refold_open_transcripts(&entries, window, cx);
+                if changed.is_empty() {
                     return;
                 }
-                self.release_agent_view_cache(agent_id, cx);
-                self.refresh_draft_agent_targets(cx);
-                cx.notify();
-            }
-            ConnEvent::Frame {
-                agent_id,
-                frame,
-                allocation,
-            } => {
-                self.handle_frame_batch(vec![(agent_id, frame)], window, cx);
-                drop(allocation);
-            }
-            ConnEvent::AgentStory {
-                agent_id,
-                from,
-                events,
-            } => {
-                crate::mirror::write_story(agent_id, from, events.clone());
-                self.registry.tell_story(agent_id, from, &events);
-                // The story is a source of rows, not only of facts: an agent
+                // The log is a source of rows, not only of facts: an agent
                 // that has just asked for the user is on the map for its own
                 // sake, so the tree the dealer reads has to be made again.
                 self.sync_tree_dashboard(host, window, cx);
                 self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
-            ConnEvent::AgentHead { head } => {
-                let agent_id = head.agent_id;
-                crate::mirror::write_head(self.registry.host_name(host), head.clone());
-                self.registry.set_head(host, head);
-                // A head past what this client holds is the daemon saying
-                // the follow skipped a run; ask for exactly that gap.
-                let gaps = self.registry.story_gaps(host);
-                if gaps.iter().any(|(id, _)| *id == agent_id) {
-                    self.hosts
-                        .send(host, ClientMessage::AgentLogs { known: gaps });
-                }
-                self.sync_tree_dashboard(host, window, cx);
-                self.invalidate_dealer_signals(cx);
-                cx.notify();
-            }
+            // Bodies on demand are not yet asked for; nothing to hold.
+            ConnEvent::Detail { .. } => {}
             ConnEvent::ChatGptUsage {
                 used_percent,
                 reset_at_unix,
@@ -4259,51 +4199,55 @@ impl Workspace {
         }
     }
 
-    /// Seeds this GUI's bounded transcript subscription set for a host that
-    /// has just come up. The LRU is shared across hosts — it bounds this
-    /// client's memory, not any one daemon's — so a newly attached host adds
-    /// its warm set rather than resetting everyone else's.
-    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>, cx: &mut Context<Self>) {
-        for agent_id in &agent_ids {
-            let (_, evicted) = self.subscriptions.touch(*agent_id);
-            if let Some(evicted) = evicted {
-                self.release_agent_view_cache(evicted, cx);
-            }
+    /// Holds an agent whole from here on: its transcript is being looked
+    /// at, or about to be. Whoever this pushes past the bound is let go,
+    /// unless they are on screen.
+    fn activate_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let joined = self.active.touch(agent_id);
+        let shown = self
+            .contexts
+            .values()
+            .filter_map(|pane| match pane.surface.key {
+                SurfaceKey::Transcript(agent_id) => Some(agent_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let evicted = self.active.evict(|agent_id| shown.contains(&agent_id));
+        for agent_id in &evicted {
+            self.release_agent(*agent_id, cx);
         }
-        self.send_agent_focus();
-    }
-
-    fn subscribe_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let (subscribe, evicted) = self.subscriptions.touch(agent_id);
-        if let Some(evicted) = evicted {
-            self.release_agent_view_cache(evicted, cx);
-        }
-        if subscribe || evicted.is_some() {
+        if joined || !evicted.is_empty() {
             self.send_agent_focus();
         }
     }
 
     /// Tells every host which of its agents this client wants live frames
-    /// for: the whole subscription set, replaced. Nothing durable travels
-    /// on it, so a set that lags by one frame costs nothing.
+    /// for: the active set, replaced whole. Nothing durable travels on it,
+    /// so a set that lags by one frame costs nothing.
     fn send_agent_focus(&mut self) {
-        let mut by_host: HashMap<HostId, Vec<AgentId>> = HashMap::new();
-        for agent_id in self.subscriptions.iter() {
-            if let Some(host) = self.registry.host_of_agent(agent_id) {
-                by_host.entry(host).or_default().push(agent_id);
-            }
-        }
         for host in self.hosts.ids() {
-            let agent_ids = by_host.remove(&host).unwrap_or_default();
-            self.hosts
-                .send(host, ClientMessage::AgentStreamFocus { agent_ids });
+            self.send_agent_focus_to(host);
         }
     }
 
-    /// Applies the subscription LRU's eviction to client-side editor state.
-    /// Visible transcripts stay pinned; dashboard previews, viewport history,
-    /// and hidden transcript surfaces are cache and can be rebuilt lazily.
-    fn release_agent_view_cache(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+    fn send_agent_focus_to(&mut self, host: HostId) {
+        let agent_ids = self
+            .active
+            .iter()
+            .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
+            .collect();
+        self.hosts
+            .send(host, ClientMessage::AgentStreamFocus { agent_ids });
+    }
+
+    /// Lets go of everything held for an agent that left the active set:
+    /// its events, its transcript, its live tail, and the view unless a
+    /// pane still shows it. The digest stays; the rails read that.
+    fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        self.open_mirrors.remove(&agent_id);
+        self.store.forget(agent_id);
+        self.pending_syncs.remove(&agent_id);
+        self.registry.mark_not_live(agent_id);
         if let Some(model) = self.models.get(&agent_id).cloned() {
             model.update(cx, |model, _| model.clear_preview_editor());
         }
@@ -4323,7 +4267,6 @@ impl Workspace {
             surfaces.retain(|surface| surface.key != SurfaceKey::Transcript(agent_id));
         }
         self.phone.remove_key(&SurfaceKey::Transcript(agent_id));
-        self.pending_syncs.remove(&agent_id);
         self.models.remove(&agent_id);
     }
 
@@ -4331,9 +4274,7 @@ impl Workspace {
         crate::journal::record(crate::journal::Event::AgentOpened {
             agent_id: agent_id.into(),
         });
-        if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
-            self.subscribe_agent(agent_id, cx);
-        }
+        self.activate_agent(agent_id, cx);
         self.select_agent(Some(agent_id), window, cx);
     }
 
@@ -4940,9 +4881,7 @@ impl Workspace {
         if self.dashboard_preview == Some(agent_id) {
             return;
         }
-        if self.connected() && !self.subscriptions.contains(agent_id) {
-            self.subscribe_agent(agent_id, cx);
-        }
+        self.activate_agent(agent_id, cx);
         let view = self.materialize_model(&agent_id, window, cx);
         view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         self.dashboard_preview = Some(agent_id);
@@ -4990,13 +4929,10 @@ impl Workspace {
         // Any other route to the draft page composes at the root; only
         // `n a` sets an area, and it sets it after this.
         self.draft_area = None;
-        if self.connected()
-            && let Some(agent_id) = agent_id
-        {
-            // Selection is the strongest subscription signal. Touch it here
-            // so keyboard cycling and every other direct selection path keep
-            // the visible transcript at the protected end of the LRU.
-            self.subscribe_agent(agent_id, cx);
+        if let Some(agent_id) = agent_id {
+            // Selection is the strongest signal: the transcript about to be
+            // shown is the newest of the active set.
+            self.activate_agent(agent_id, cx);
         }
         if let Some(agent_id) = &agent_id {
             let view = self.materialize_model(agent_id, window, cx);
@@ -5020,9 +4956,6 @@ impl Workspace {
         self.display_surface(surface, cx);
         if focus {
             self.focus_active_surface(window, cx);
-        }
-        if let Some(agent_id) = agent_id {
-            self.subscribe_agent(agent_id, cx);
         }
         self.ensure_duration_timer(cx);
         cx.notify();
@@ -5280,9 +5213,9 @@ impl Workspace {
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         if let SurfaceKey::Transcript(agent_id) = key
-            && !self.subscriptions.contains(agent_id)
+            && !self.active.contains(agent_id)
         {
-            self.release_agent_view_cache(agent_id, cx);
+            self.release_agent(agent_id, cx);
         }
         cx.notify();
     }
@@ -5510,11 +5443,8 @@ impl Workspace {
             SurfaceKey::Transcript(agent_id) | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
             _ => None,
         };
-        if let Some(agent_id) = agent_id
-            && self.agent_online(agent_id)
-            && !self.subscriptions.contains(agent_id)
-        {
-            self.subscribe_agent(agent_id, cx);
+        if let Some(agent_id) = agent_id {
+            self.activate_agent(agent_id, cx);
         }
     }
 
@@ -5850,7 +5780,7 @@ impl Workspace {
     ) -> Entity<AgentModel> {
         // Every route to a transcript comes through here, so this is where
         // the story stands in until a frame arrives.
-        let told = self.seed_transcript_from_story(*agent_id);
+        let told = self.seed_transcript_from_mirror(*agent_id);
         let (view, _) = self.ensure_agent_model(*agent_id, window, cx);
         // Seeding the store is not showing it: a view that already exists
         // (the daemon answers for every agent on connecting, with nothing
@@ -6173,19 +6103,8 @@ impl Workspace {
         );
         let draft = self.make_surface(SurfaceKey::Draft, window, cx);
         self.display_surface_with_method(draft, crate::journal::SurfaceShowMethod::Overview, cx);
-        self.subscriptions
-            .mark_unloaded(agent_id, rho_ui_proto::AgentUnloadReason::Idle);
-        self.release_agent_view_cache(agent_id, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn agent_subscribed_for_test(&self, agent_id: AgentId) -> bool {
-        self.subscriptions.contains(agent_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn forget_agent_subscription_for_test(&mut self, agent_id: AgentId) {
-        self.subscriptions.forget(agent_id);
+        self.active.remove(agent_id);
+        self.release_agent(agent_id, cx);
     }
 
     #[cfg(test)]
@@ -6310,9 +6229,9 @@ impl Workspace {
     /// thread's conversation is the mirror's, and a copy could only go
     /// stale.
     fn refresh_desk_sources(&mut self, host: HostId, cx: &Context<Self>) {
-        /// The story's positions and the store's are the same number; the
+        /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
-        fn story_pos(pos: rho_ui_proto::story::UiStoryPos) -> rho_desk::cells::StoryPos {
+        fn story_pos(pos: rho_ui_proto::mirror::AgentPos) -> rho_desk::cells::StoryPos {
             rho_desk::cells::StoryPos(pos.0)
         }
 
@@ -6388,11 +6307,13 @@ impl Workspace {
             pages,
         };
         self.desk_cells.set_sources(host, sources);
-        // The card is the one place attention is decided; the registry is
-        // where every rail reads the answer.
-        for (agent_id, attention) in self.desk_cells.agent_attentions(host) {
-            crate::mirror::write_attention(agent_id, attention);
-            self.registry.set_attention(agent_id, attention);
+        // The user's verdicts are the one thing attention needs that no
+        // row carries; the registry derives it from them and the digest,
+        // and the mirror keeps them so a restart ranks the same way.
+        for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
+            if self.registry.set_agent_verdict(agent_id, verdict) {
+                crate::mirror::write_verdict(agent_id, verdict);
+            }
         }
     }
 
@@ -6899,6 +6820,24 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    /// The transcript this workspace shows for an agent, for a test that
+    /// feeds it back changed.
+    #[cfg(test)]
+    pub(crate) fn transcript_for_test(
+        &self,
+        agent_id: AgentId,
+    ) -> rho_registry::render::UiAgentState {
+        self.store
+            .get(&agent_id)
+            .cloned()
+            .unwrap_or_else(|| rho_registry::render::UiAgentState {
+                blocks: Vec::new(),
+                status: rho_registry::render::UiAgentStatus::Idle,
+                context_used: None,
+                usage: Default::default(),
+            })
+    }
+
     pub(crate) fn is_startup_pane(&self) -> bool {
         matches!(self.registry.active_pane(), ActivePane::Startup)
     }
@@ -7138,10 +7077,8 @@ impl Workspace {
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
             SurfaceKey::Image { .. } => None,
         };
-        if self.connected()
-            && let Some(agent_id) = selected
-        {
-            self.subscribe_agent(agent_id, cx);
+        if let Some(agent_id) = selected {
+            self.activate_agent(agent_id, cx);
         }
         cx.notify();
     }
@@ -7641,7 +7578,7 @@ impl Workspace {
                 });
                 self.registry.select_agent(agent_id);
                 self.active_context = self.context_for_agent(agent_id);
-                self.subscribe_agent(agent_id, cx);
+                self.activate_agent(agent_id, cx);
                 self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
             }
             // A thread is a conversation: the deal view is the conversation

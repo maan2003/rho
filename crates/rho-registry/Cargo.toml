@@ -14,3 +14,5 @@ camino.workspace = true
 prefix-id = { workspace = true, default-features = false }
 rho-core.workspace = true
 rho-ui-proto.workspace = true
+senax-encoder.workspace = true
+bytes.workspace = true

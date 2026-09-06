@@ -4,8 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use rho_agent::db::{
-    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _,
-    EngineerIntelligence,
+    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
@@ -29,23 +28,30 @@ enum DebugCommand {
     Agents,
     /// Snapshot the database and run pending migrations on the copy.
     Migrate,
+    /// Put the real database back as it was before its last migration,
+    /// from the savepoint taken then. Stop the daemon first.
+    Rollback,
+    /// List the recovery savepoints the real database holds, and the
+    /// migration each was taken for. Stop the daemon first.
+    Savepoints,
+    /// Drop the savepoints no migration recorded: leftovers of older
+    /// builds that keep freed pages from being reused. Stop the daemon
+    /// first.
+    DropStaleSavepoints,
+    /// Drop the savepoints recorded for migrations once they are verified,
+    /// so nothing pins the pages they freed. Stop the daemon first.
+    ForgetSavepoints,
+    /// Rewrite the real database file without the pages nothing refers to
+    /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
+    /// the last migration is done). Stop the daemon first.
+    Compact,
+    /// Print bytes stored per table and pages allocated overall for the
+    /// real database. Stop the daemon first.
+    Stats,
     /// Snapshot the database and print the context usage each agent would
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
-    /// Write a few agents with whole stories into a database, for driving
-    /// a rig by hand. Refuses the daemon's own database: `--db-path` must
-    /// name the rig's.
-    SeedAgents,
-    /// Tell one more turn on a seeded agent, so a rig can watch a card
-    /// come back. Refuses the daemon's own database, like `seed-agents`.
-    NudgeAgent {
-        /// The agent's id, or any prefix of it.
-        agent: String,
-        /// Whether the new turn asks the user for something.
-        #[arg(long)]
-        asks: bool,
-    },
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
@@ -58,82 +64,15 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
     match args.command {
         DebugCommand::Agents => print_agents(args.db_path).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
+        DebugCommand::Rollback => rollback(args.db_path).await,
+        DebugCommand::Savepoints => savepoints(args.db_path).await,
+        DebugCommand::DropStaleSavepoints => drop_stale_savepoints(args.db_path).await,
+        DebugCommand::Compact => compact(args.db_path),
+        DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
+        DebugCommand::Stats => stats(args.db_path),
         DebugCommand::Context => print_context(args.db_path).await,
-        DebugCommand::SeedAgents => seed_agents(args.db_path).await,
-        DebugCommand::NudgeAgent { agent, asks } => nudge_agent(args.db_path, &agent, asks).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
-}
-
-/// The fixture, written straight into the named database. The daemon must
-/// not be running on it: redb takes the lock, and a daemon that already
-/// read its heads would not see these.
-async fn seed_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
-    use rho_agent::story_fixture::Situation;
-
-    let path = db_path.context(
-        "seed-agents needs --db-path: it writes agents, and never into the daemon's own database",
-    )?;
-    if default_db_path().is_ok_and(|daemon| daemon == path) {
-        anyhow::bail!(
-            "refusing to seed the daemon's own database at {}",
-            path.display()
-        );
-    }
-    let db = RhoDb::open(&path);
-    let seeded = rho_agent::story_fixture::seed(
-        &db,
-        &[
-            ("the deploy", Situation::Asking),
-            ("release notes", Situation::Showing),
-            ("flaky test", Situation::Errored),
-            ("index rebuild", Situation::Working),
-            ("changelog", Situation::Quiet),
-        ],
-    )
-    .await;
-    // Home ranks an agent through the note it is filed under, so the
-    // fixture files them too.
-    let desk = crate::desk_cells::DeskCellStore::new(db)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    desk.seed_desk_rows("rig agents", &seeded)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    println!(
-        "seeded {} agents into {}, filed under one note",
-        seeded.len(),
-        path.display()
-    );
-    Ok(())
-}
-
-async fn nudge_agent(db_path: Option<PathBuf>, agent: &str, asks: bool) -> anyhow::Result<()> {
-    let path =
-        db_path.context("nudge-agent needs --db-path: the rig's database, never the daemon's")?;
-    if default_db_path().is_ok_and(|daemon| daemon == path) {
-        anyhow::bail!(
-            "refusing to write the daemon's own database at {}",
-            path.display()
-        );
-    }
-    let db = RhoDb::open(&path);
-    let read = db.read();
-    let agent_id = read
-        .list_agents()
-        .into_iter()
-        .map(|(id, _)| id)
-        .find(|id| id.encoded().starts_with(agent) || format!("{id:?}").contains(agent))
-        .with_context(|| format!("no agent matching `{agent}`"))?;
-    drop(read);
-    rho_agent::story_fixture::nudge(
-        &db,
-        agent_id,
-        asks.then_some(rho_agent::story::AgentWant::Ask),
-    )
-    .await;
-    println!("told one more turn on {}", agent_id.encoded());
-    Ok(())
 }
 
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
@@ -264,9 +203,9 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
-            "  story: head {:?}, {} events told",
-            agent.story_pos,
-            read.agent_story(agent_id, Default::default()).len()
+            "  log: next {:?}, {} rows visible",
+            agent.next,
+            read.agent_events(agent_id).1.len()
         )?;
         writeln!(
             output,
@@ -327,7 +266,7 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 let mut context_used = None;
                 let mut responses = 0usize;
                 for event in &events {
-                    if let rho_agent::AgentEvent::InferenceResponse {
+                    if let rho_agent::AgentEvent::Replied {
                         context_used: response_context_used,
                         ..
                     } = event
@@ -415,9 +354,18 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
-    // Slice B drops these on the start that no longer needs them; a
-    // migration check is the place that says whether they are still there.
-    for table in ["projects", "view_config", "agent_attention_until_slice_b"] {
+    // The fused migration drops the old layout; a migration check is the
+    // place that says whether any of it is still there.
+    for table in [
+        "projects",
+        "view_config",
+        "agent_heads",
+        "agent_events",
+        "lineage_parents",
+        "agent_story",
+        "agent_story_source",
+        "agent_attention_until_slice_b",
+    ] {
         writeln!(
             output,
             "table {table}: {}",
@@ -434,9 +382,88 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     Inference::migrate(db).await?;
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.commit();
+    rho_agent::db::prepare(db).await;
+    Ok(())
+}
+
+async fn savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    for (id, hop) in rho_agent::db::savepoints(&db).await {
+        println!(
+            "savepoint {id}: {}",
+            hop.as_deref().unwrap_or("not recorded for a migration")
+        );
+    }
+    Ok(())
+}
+
+async fn drop_stale_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let dropped = rho_agent::db::drop_stale_savepoints(&db).await;
+    println!(
+        "{}: dropped {} stale savepoint(s) {dropped:?}",
+        path.display(),
+        dropped.len()
+    );
+    Ok(())
+}
+
+async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let dropped = rho_agent::db::forget_savepoints(&db).await;
+    println!(
+        "{}: forgot {} migration savepoint(s) {dropped:?}",
+        path.display(),
+        dropped.len()
+    );
+    Ok(())
+}
+
+fn stats(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    RhoDb::print_stats(&path)
+}
+
+fn compact(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let started = std::time::Instant::now();
+    let (before, after) = RhoDb::compact(&path)?;
+    println!(
+        "{}: {} -> {} bytes in {:.1?}",
+        path.display(),
+        before,
+        after,
+        started.elapsed()
+    );
+    Ok(())
+}
+
+async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let hop = rho_agent::db::rollback(&db).await?;
+    println!("{}: migration {hop} undone", path.display());
     Ok(())
 }
 

@@ -95,7 +95,7 @@ octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 rand = "0.8"
-redb = "4.1.0"
+redb = "4.2.0"
 redb-derive = "0.1.0"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
@@ -204,4 +204,7 @@ inherits = "release"
 iroh = { path = "vendor/iroh/iroh" }
 noq = { path = "vendor/noq/noq" }
 noq-proto = { path = "vendor/noq/noq-proto" }
+# Local redb fork: compaction keeps relocating pages past one it cannot
+# move lower, instead of stopping at the first such page.
+redb = { path = "vendor/redb" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }

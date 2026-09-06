@@ -11,14 +11,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use async_stream::stream;
 use camino::Utf8PathBuf;
-use futures::Stream;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
-use rho_core::{ContentPart, ContextBlock, ContextItemEvent, PendingInferenceResponse};
+use rho_core::{
+    ContentPart, ContextBlock, ContextItemEvent, InferenceResponseItem, PendingInferenceResponse,
+};
 use rho_db::{RhoDb, WriteTxn};
 use rho_inference::Inference;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
@@ -28,8 +28,8 @@ use crate::db::{
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
-    AgentEvent, AgentState, AgentStateKind, FailedInferenceResponse, InputKind, InputQueues,
-    MessageDelivery, PresentationSpeaker, QueuedInput, StartWorkdir, system_prompt,
+    AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
+    InputQueues, MessageDelivery, PresentationSpeaker, QueuedInput, StartWorkdir, system_prompt,
 };
 
 pub(crate) mod projection;
@@ -42,39 +42,11 @@ use projection::{
 
 use crate::lazy::Lazy;
 
-/// Last real assistant-message timestamp in a persisted Claude transcript.
-/// Missing or malformed timestamps are ignored rather than replaced with an
-/// invented chronology value.
-pub fn last_assistant_message_at(
-    messages: &[rho_claude::SessionMessage],
-) -> Option<rho_core::UnixMs> {
-    messages
-        .iter()
-        .filter(|message| message.kind == rho_claude::SessionMessageKind::Assistant)
-        .filter_map(|message| message.timestamp.as_deref())
-        .filter_map(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
-        .filter_map(|timestamp| timestamp.timestamp_millis().try_into().ok())
-        .map(rho_core::UnixMs)
-        .max()
-}
-
-/// Persists a legacy turn-end fact from transcript ground truth, if present.
-pub fn backfill_last_turn_ended_from_claude_messages(
-    write: &mut WriteTxn,
-    agent_id: AgentId,
-    messages: &[rho_claude::SessionMessage],
-) -> bool {
-    let Some(at) = last_assistant_message_at(messages) else {
-        return false;
-    };
-    write.backfill_agent_last_turn_ended(agent_id, at)
-}
-
 #[derive(Clone)]
 pub struct ClaudeAgent {
-    state: Arc<RwLock<AgentState>>,
+    status: Arc<RwLock<AgentStatus>>,
     control: mpsc::UnboundedSender<ClaudeControl>,
-    notify: Arc<Notify>,
+    head: Arc<RwLock<crate::db::AgentHead>>,
 }
 
 impl ClaudeAgent {
@@ -100,7 +72,7 @@ impl ClaudeAgent {
         let entries = crate::materialize_workdirs(start).await?;
         let view = rho_workspaces::View::new(entries.clone())?;
         let session_id = Uuid::new_v4();
-        let next_event = write.create_agent(
+        write.create_agent(
             UnixMillis::now(),
             agent_id,
             display_name,
@@ -119,6 +91,7 @@ impl ClaudeAgent {
         let multi_agent = pool
             .upgrade()
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
+        let head = db.read().get_agent(agent_id);
         let state = AgentState {
             blocks: Vec::new(),
             queued_inputs: InputQueues::default(),
@@ -148,8 +121,8 @@ impl ClaudeAgent {
                 multi_agent,
                 pool_events,
                 role,
-                next_event,
                 HashSet::new(),
+                head,
             ),
         ))
     }
@@ -162,7 +135,8 @@ impl ClaudeAgent {
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
-        let parent_agent = db.read().agent_attention(agent_id).parent_agent;
+        let head = record.clone();
+        let parent_agent = record.parent;
         let AgentRuntime::Claude { session_id } = record.config.runtime else {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
@@ -256,13 +230,8 @@ impl ClaudeAgent {
                 rho_claude::read_session_context_used_by_id(session_id, &primary_repo).await?;
             (session_id, messages, start_mode, false, context_used)
         };
-        let (next_event, known_presentation_sources, _, rebuilt_cache) =
+        let (known_presentation_sources, _) =
             reconcile_claude_presentation_sources(&db, agent_id, &messages).await?;
-        if let Some(cache) = rebuilt_cache
-            && let Some(pool) = pool.upgrade()
-        {
-            pool.publish_presentation_changed(agent_id, cache.generated_title, cache.activity);
-        }
         let blocks = transcript_messages_to_context(&messages)?;
         let state = AgentState {
             blocks,
@@ -293,8 +262,8 @@ impl ClaudeAgent {
                 .map(|_| MultiAgentTools::new(pool, agent_id, parent_agent)),
             pool_events,
             record.config.role,
-            next_event,
             known_presentation_sources,
+            head,
         ))
     }
 
@@ -313,11 +282,14 @@ impl ClaudeAgent {
         multi_agent: Option<MultiAgentTools>,
         pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
-        next_event: AgentEventPos,
         known_presentation_sources: HashSet<Uuid>,
+        head: crate::db::AgentHead,
     ) -> Self {
-        let state = Arc::new(RwLock::new(state));
-        let notify = Arc::new(Notify::new());
+        let status = Arc::new(RwLock::new(AgentStatus {
+            kind: state.kind.clone(),
+            queued: state.queued_inputs.len(),
+        }));
+        let head = Arc::new(RwLock::new(head));
         let (control, control_rx) = mpsc::unbounded_channel();
         let last_presentation_source = {
             let records = db
@@ -345,31 +317,43 @@ impl ClaudeAgent {
             stream_items: BTreeMap::new(),
             queued_turns: VecDeque::new(),
             turn_usage: None,
+            reply_usage: None,
             cancelling: false,
             pending_rewind,
             execution_generation: 0,
-            state: Arc::clone(&state),
-            notify: Arc::clone(&notify),
+            state,
+            status: Arc::clone(&status),
+            head: Arc::clone(&head),
+            teller: std::sync::Mutex::new(crate::live::Teller::default()),
             control_rx,
             presentation_control: control.downgrade(),
             multi_agent,
             pool_events,
             role,
-            next_event,
             known_presentation_sources,
             presentation: ClaudePresentationState::default(),
             last_presentation_source,
         };
         tokio::spawn(loop_state.run());
         Self {
-            state,
+            status,
             control,
-            notify,
+            head,
         }
     }
 
-    pub fn state(&self) -> AgentState {
-        self.state.read().expect("poison").clone()
+    pub fn status(&self) -> AgentStatus {
+        self.status.read().expect("poison").clone()
+    }
+
+    /// The record as of the loop's last change to it.
+    pub fn head(&self) -> crate::db::AgentHead {
+        self.head.read().expect("poison").clone()
+    }
+
+    /// Say the whole tail again: a client just started looking.
+    pub fn tell_tail(&self) {
+        let _ = self.control.send(ClaudeControl::TellTail);
     }
 
     pub fn send_user_message(&self, text: impl Into<String>) {
@@ -381,7 +365,6 @@ impl ClaudeAgent {
         let _ = self.control.send(ClaudeControl::UserMessage {
             content,
             uuid,
-            user: true,
             accepted: None,
         });
     }
@@ -390,28 +373,23 @@ impl ClaudeAgent {
         &self,
         content: Vec<ContentPart>,
     ) -> anyhow::Result<()> {
-        self.send_content_accepted(content, true).await
+        self.send_content_accepted(content).await
     }
 
     /// Deliver agent mail and wait for acceptance into Rho's volatile Claude
     /// queue. A process or daemon restart may lose it before Claude records it.
     pub async fn send_agent_message_accepted(&self, text: String) -> anyhow::Result<()> {
-        self.send_content_accepted(vec![ContentPart::Text { text }], false)
+        self.send_content_accepted(vec![ContentPart::Text { text }])
             .await
     }
 
-    async fn send_content_accepted(
-        &self,
-        content: Vec<ContentPart>,
-        user: bool,
-    ) -> anyhow::Result<()> {
+    async fn send_content_accepted(&self, content: Vec<ContentPart>) -> anyhow::Result<()> {
         let uuid = Uuid::new_v4().to_string();
         let (accepted, reply) = oneshot::channel();
         self.control
             .send(ClaudeControl::UserMessage {
                 content,
                 uuid,
-                user,
                 accepted: Some(accepted),
             })
             .map_err(|_| anyhow::anyhow!("Claude agent stopped before accepting mail"))?;
@@ -458,31 +436,12 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
     }
 
-    pub(crate) fn watch_presentation(&self) -> crate::presentation::Watch {
+    /// Whether anyone is looking at this agent; titles and activity are
+    /// made only then.
+    pub(crate) fn set_watched(&self, watching: bool) {
         let _ = self
             .control
-            .send(ClaudeControl::PresentationWatch { watching: true });
-        let control = self.control.clone();
-        crate::presentation::Watch::new(move || {
-            let _ = control.send(ClaudeControl::PresentationWatch { watching: false });
-        })
-    }
-
-    pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
-        let state = Arc::clone(&self.state);
-        let notify = Arc::clone(&self.notify);
-        stream! {
-            loop {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-
-                let snapshot = state.read().expect("poison").clone();
-                yield snapshot;
-
-                notified.await;
-            }
-        }
+            .send(ClaudeControl::PresentationWatch { watching });
     }
 }
 
@@ -500,7 +459,6 @@ enum ClaudeControl {
     UserMessage {
         content: Vec<ContentPart>,
         uuid: String,
-        user: bool,
         accepted: Option<oneshot::Sender<anyhow::Result<()>>>,
     },
     SetEffort {
@@ -527,6 +485,8 @@ enum ClaudeControl {
         generation: u64,
         result: Result<Option<AgentPresentationUpdate>, String>,
     },
+    /// Tell the live tail whole, for a client that just started looking.
+    TellTail,
 }
 
 struct ClaudeLoop {
@@ -550,17 +510,24 @@ struct ClaudeLoop {
     /// `input_tokens` is a streaming placeholder). Snapshots are taken as-is,
     /// never accumulated — stream-json repeats usage per content block.
     turn_usage: Option<rho_claude::protocol::TokenUsage>,
+    /// The last message's cost, held from its stop until the assistant
+    /// message it belongs to is persisted with it.
+    reply_usage: Option<crate::db::AgentUsageBucket>,
     cancelling: bool,
     pending_rewind: bool,
     execution_generation: u64,
-    state: Arc<RwLock<AgentState>>,
-    notify: Arc<Notify>,
+    /// The loop's own transcript and queue; readers get `status`.
+    state: AgentState,
+    status: Arc<RwLock<AgentStatus>>,
+    head: Arc<RwLock<crate::db::AgentHead>>,
+    /// What clients have been told of the tail, so each publish says only
+    /// what changed.
+    teller: std::sync::Mutex<crate::live::Teller>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
     presentation_control: mpsc::WeakUnboundedSender<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
     pool_events: std::sync::Weak<crate::pool::AgentPool>,
     role: crate::db::AgentRole,
-    next_event: AgentEventPos,
     known_presentation_sources: HashSet<Uuid>,
     presentation: ClaudePresentationState,
     last_presentation_source: Option<AgentEventPos>,
@@ -568,7 +535,7 @@ struct ClaudeLoop {
 
 #[derive(Default)]
 struct ClaudePresentationState {
-    watches: usize,
+    watched: bool,
     dirty: bool,
     generation: u64,
     last_started: Option<tokio::time::Instant>,
@@ -592,10 +559,10 @@ struct ClaudeTurn {
 struct ClaudePresentationSource {
     source_id: Uuid,
     speaker: PresentationSpeaker,
-    /// The capped mirror text, which is what the raw event holds.
+    /// The canonical (capped) text: what identity is compared on, so rows
+    /// written before the log kept messages whole still match.
     text: String,
-    /// The same message uncapped, for the story. Not part of identity:
-    /// a persisted event only ever carries the capped text.
+    /// The message whole, which is what the row holds.
     whole: String,
 }
 
@@ -611,7 +578,6 @@ struct ClaudePresentationReconciliation {
     sources: Vec<ClaudePresentationSource>,
     persisted: Vec<(AgentEventPos, ClaudePresentationSource)>,
     common: usize,
-    next_event: AgentEventPos,
 }
 
 fn claude_presentation_sources(
@@ -646,7 +612,7 @@ fn prepare_claude_presentation_reconciliation(
 ) -> anyhow::Result<ClaudePresentationReconciliation> {
     let sources = claude_presentation_sources(messages)?;
     let read = db.read();
-    let (next_event, records) = read.agent_event_records(agent_id);
+    let (_, records) = read.agent_event_records(agent_id);
     let persisted = records
         .iter()
         .filter_map(|(position, event)| match event {
@@ -654,12 +620,13 @@ fn prepare_claude_presentation_reconciliation(
                 source_id,
                 speaker,
                 text,
+                ..
             } => Some((
                 *position,
                 ClaudePresentationSource {
                     source_id: *source_id,
                     speaker: *speaker,
-                    text: text.to_string(),
+                    text: crate::presentation::canonical_source_text(text)?,
                     whole: text.to_string(),
                 },
             )),
@@ -675,45 +642,31 @@ fn prepare_claude_presentation_reconciliation(
         sources,
         persisted,
         common,
-        next_event,
     })
 }
 
 impl ClaudePresentationReconciliation {
-    fn apply(
-        &self,
-        write: &mut WriteTxn,
-        now: UnixMillis,
-        agent_id: AgentId,
-    ) -> (AgentEventPos, Option<AgentPresentationCache>) {
-        // A rewind forks the raw lineage, but the story is append-only:
-        // the title and activity it already told still stand.
-        let mut next_event = if self.common < self.persisted.len() {
-            write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0)
-        } else {
-            self.next_event
-        };
-        for source in self.sources.iter().skip(self.common) {
-            let event = AgentEvent::ClaudePresentationSource {
-                source_id: source.source_id,
-                speaker: source.speaker,
-                text: Cow::Borrowed(&source.text),
-            };
-            let told_from = next_event;
-            next_event = write.append_agent_event(next_event, &event);
-            for told in crate::story::from_claude_source(source.speaker, &source.whole, now) {
-                write.append_agent_story_from(agent_id, &told, told_from);
-            }
+    /// A shortened or diverged transcript is a rewind of our mirror of
+    /// it, told like any other; the title and activity already told
+    /// still stand.
+    fn apply(&self, write: &mut WriteTxn, now: UnixMillis, agent_id: AgentId) {
+        if self.common < self.persisted.len() {
+            write.rewind_agent(now, agent_id, self.persisted[self.common].0);
         }
-        (next_event, None)
+        for source in self.sources.iter().skip(self.common) {
+            write.append_agent_event(
+                agent_id,
+                &AgentEvent::ClaudePresentationSource {
+                    source_id: source.source_id,
+                    speaker: source.speaker,
+                    text: Cow::Borrowed(&source.whole),
+                    at: now,
+                },
+            );
+        }
     }
 
-    fn state(
-        &self,
-        db: &RhoDb,
-        agent_id: AgentId,
-        next_event: AgentEventPos,
-    ) -> (AgentEventPos, HashSet<Uuid>, Option<AgentEventPos>) {
+    fn state(&self, db: &RhoDb, agent_id: AgentId) -> (HashSet<Uuid>, Option<AgentEventPos>) {
         let records = db
             .read()
             .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
@@ -721,7 +674,6 @@ impl ClaudePresentationReconciliation {
             .last()
             .map(|source| source.through);
         (
-            next_event,
             self.sources.iter().map(|source| source.source_id).collect(),
             last,
         )
@@ -732,24 +684,18 @@ async fn reconcile_claude_presentation_sources(
     db: &RhoDb,
     agent_id: AgentId,
     messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<(
-    AgentEventPos,
-    HashSet<Uuid>,
-    Option<AgentEventPos>,
-    Option<AgentPresentationCache>,
-)> {
+) -> anyhow::Result<(HashSet<Uuid>, Option<AgentEventPos>)> {
     let reconciliation = prepare_claude_presentation_reconciliation(db, agent_id, messages)?;
     let mut write = db.write().await;
-    let (next_event, rebuilt_cache) = reconciliation.apply(&mut write, UnixMillis::now(), agent_id);
+    reconciliation.apply(&mut write, UnixMillis::now(), agent_id);
     write.commit();
-    let (next_event, known_sources, last_source) = reconciliation.state(db, agent_id, next_event);
-    Ok((next_event, known_sources, last_source, rebuilt_cache))
+    Ok(reconciliation.state(db, agent_id))
 }
 
 impl ClaudeLoop {
     async fn run(mut self) {
         loop {
-            let initial_kind = self.state.read().expect("poison").kind.clone();
+            let initial_kind = self.state.kind.clone();
             let initial_execution_generation = self.execution_generation;
             if self.process.is_some() {
                 let event = {
@@ -784,10 +730,8 @@ impl ClaudeLoop {
                             // An exit without a result leaves the turn open;
                             // settle it as an error so the turn end is
                             // observable (attention, parent mail).
-                            let mid_turn = matches!(
-                                self.state.read().expect("poison").kind,
-                                AgentStateKind::ApiStreaming { .. }
-                            );
+                            let mid_turn =
+                                matches!(self.state.kind, AgentStateKind::ApiStreaming { .. });
                             if mid_turn {
                                 self.fail(anyhow::anyhow!(
                                     "Claude Code exited before finishing the turn"
@@ -809,7 +753,7 @@ impl ClaudeLoop {
                 };
                 self.handle_control(control).await;
             }
-            let kind = self.state.read().expect("poison").kind.clone();
+            let kind = self.state.kind.clone();
             crate::tell_turn_boundary(
                 &self.db,
                 self.agent_id,
@@ -830,7 +774,7 @@ impl ClaudeLoop {
                     pool.settle_turn(self.agent_id).await;
                     // set_kind notified before the durable disposition changed;
                     // wake projections again so they observe the settled pair.
-                    self.notify.notify_waiters();
+                    self.published();
                 }
             }
         }
@@ -841,22 +785,12 @@ impl ClaudeLoop {
             ClaudeControl::UserMessage {
                 content,
                 uuid,
-                user,
                 accepted,
             } => {
                 self.cancelling = false;
-                let busy = self.state.read().expect("poison").kind.is_working();
+                let busy = self.state.kind.is_working();
                 if !busy {
                     self.execution_generation = self.execution_generation.wrapping_add(1);
-                }
-                if user {
-                    let mut write = self.db.write().await;
-                    write.record_agent_user_message(
-                        rho_core::UnixMs::now(),
-                        self.agent_id,
-                        &rho_core::text_content(&content),
-                    );
-                    write.commit();
                 }
                 if let Err(error) = self.ensure_process().await {
                     if let Some(accepted) = accepted {
@@ -881,19 +815,15 @@ impl ClaudeLoop {
                     uuid: uuid.clone(),
                     content: Arc::clone(&content),
                 });
-                self.state
-                    .write()
-                    .expect("poison")
-                    .queued_inputs
-                    .push(QueuedInput {
-                        source: crate::MessageSender::User,
-                        kind: InputKind::Message {
-                            content: (*content).clone(),
-                        },
-                        delivery,
-                        at: rho_core::UnixMs::now(),
-                    });
-                self.notify.notify_waiters();
+                self.state.queued_inputs.push(QueuedInput {
+                    source: crate::MessageSender::User,
+                    kind: InputKind::Message {
+                        content: (*content).clone(),
+                    },
+                    delivery,
+                    at: rho_core::UnixMs::now(),
+                });
+                self.published();
                 // A turn-opening send starts the turn now: waiting for the
                 // CLI's first stream event (seconds on a cold spawn) leaves
                 // the agent looking idle while it is working.
@@ -924,14 +854,14 @@ impl ClaudeLoop {
                 let _ = reply.send(self.change_role(role).await);
             }
             ClaudeControl::Cancel => {
-                let kind = self.state.read().expect("poison").kind.clone();
+                let kind = self.state.kind.clone();
                 let busy = matches!(kind, AgentStateKind::ApiStreaming { .. });
                 let queued = self
                     .queued_turns
                     .iter()
                     .map(|turn| turn.uuid.clone())
                     .collect::<Vec<_>>();
-                self.state.write().expect("poison").queued_inputs.clear();
+                self.state.queued_inputs.clear();
                 self.queued_turns.clear();
                 self.cancelling = busy;
                 if busy && self.process.is_some() {
@@ -961,23 +891,20 @@ impl ClaudeLoop {
                 let _ = reply.send(self.rewind(turns).await);
             }
             ClaudeControl::PresentationWatch { watching } => {
+                if watching == self.presentation.watched {
+                    return;
+                }
+                self.presentation.watched = watching;
                 if watching {
-                    let first_watch = self.presentation.watches == 0;
-                    self.presentation.watches += 1;
-                    if first_watch {
-                        self.presentation.dirty = true;
-                        self.schedule_presentation();
-                    }
+                    self.presentation.dirty = true;
+                    self.schedule_presentation();
                 } else {
-                    self.presentation.watches = self.presentation.watches.saturating_sub(1);
-                    if self.presentation.watches == 0 {
-                        if let Some(task) = self.presentation.task.take() {
-                            task.abort();
-                        }
-                        self.presentation.generation = self.presentation.generation.wrapping_add(1);
-                        self.presentation.dirty = false;
-                        self.presentation.last_started = None;
+                    if let Some(task) = self.presentation.task.take() {
+                        task.abort();
                     }
+                    self.presentation.generation = self.presentation.generation.wrapping_add(1);
+                    self.presentation.dirty = false;
+                    self.presentation.last_started = None;
                 }
             }
             ClaudeControl::PresentationStarted {
@@ -985,13 +912,17 @@ impl ClaudeLoop {
                 acknowledged,
             } => {
                 let accepted = self.presentation.generation == generation
-                    && self.presentation.watches > 0
+                    && self.presentation.watched
                     && self.presentation.task.is_some();
                 if accepted {
                     self.presentation.dirty = false;
                     self.presentation.last_started = Some(tokio::time::Instant::now());
                 }
                 let _ = acknowledged.send(accepted);
+            }
+            ClaudeControl::TellTail => {
+                self.teller.lock().expect("poison").reset();
+                self.published();
             }
             ClaudeControl::PresentationFinished { generation, result } => {
                 if self.presentation.generation != generation {
@@ -1018,12 +949,6 @@ impl ClaudeLoop {
     ) -> Option<AgentPresentationCache> {
         let mut write = self.db.write().await;
         let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update)?;
-        self.next_event = write.append_agent_event(
-            self.next_event,
-            &AgentEvent::PresentationUpdated {
-                update: update.clone(),
-            },
-        );
         write.commit();
         if let Some(pool) = self.pool_events.upgrade() {
             pool.publish_presentation_changed(
@@ -1042,27 +967,24 @@ impl ClaudeLoop {
         text: String,
     ) {
         let whole = text.trim().to_owned();
-        let Some(text) = crate::presentation::canonical_source_text(&text) else {
+        if crate::presentation::canonical_source_text(&whole).is_none() {
             return;
-        };
+        }
         if !self.known_presentation_sources.insert(source_id) {
             return;
         }
-        let event_pos = self.next_event;
-        let now = UnixMillis::now();
+        // The row carries the whole message: for a Claude agent it is the
+        // durable copy a reader gets. Luna's prompt caps it when built.
         let mut write = self.db.write().await;
-        let event = AgentEvent::ClaudePresentationSource {
-            source_id,
-            speaker,
-            text: Cow::Borrowed(&text),
-        };
-        self.next_event = write.append_agent_event(self.next_event, &event);
-        // The story carries the whole message: for a Claude agent it is
-        // the durable copy a reader gets. The mirror event above stays
-        // capped because Luna's prompt is what it is for.
-        for told in crate::story::from_claude_source(speaker, &whole, now) {
-            write.append_agent_story_from(self.agent_id, &told, event_pos);
-        }
+        let event_pos = write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::ClaudePresentationSource {
+                source_id,
+                speaker,
+                text: Cow::Borrowed(&whole),
+                at: UnixMillis::now(),
+            },
+        );
         write.commit();
         self.last_presentation_source = Some(event_pos);
         self.presentation.dirty = true;
@@ -1075,11 +997,11 @@ impl ClaudeLoop {
         }
         self.presentation.generation = self.presentation.generation.wrapping_add(1);
         self.presentation.last_started = None;
-        self.presentation.dirty = self.presentation.watches > 0;
+        self.presentation.dirty = self.presentation.watched;
     }
 
     fn schedule_presentation(&mut self) {
-        if self.presentation.watches == 0
+        if !self.presentation.watched
             || !self.presentation.dirty
             || self.presentation.task.is_some()
         {
@@ -1253,14 +1175,13 @@ impl ClaudeLoop {
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
         anyhow::ensure!(
             matches!(
-                self.state.read().expect("poison").kind,
+                self.state.kind,
                 AgentStateKind::Idle | AgentStateKind::Error(_)
             ),
             "role changes are only available while idle or errored; cancel the turn first"
         );
         anyhow::ensure!(
-            self.state.read().expect("poison").queued_inputs.is_empty()
-                && self.queued_turns.is_empty(),
+            self.state.queued_inputs.is_empty() && self.queued_turns.is_empty(),
             "role changes are not available with queued inputs"
         );
 
@@ -1308,6 +1229,11 @@ impl ClaudeLoop {
         let mut write = self.db.write().await;
         write.set_agent_profile(self.agent_id, role, binding);
         write.commit();
+        {
+            let mut head = self.head.write().expect("poison");
+            head.config.role = role;
+            head.config.binding = binding;
+        }
         self.model = model;
         self.effort = effort;
         self.role = role;
@@ -1355,14 +1281,13 @@ impl ClaudeLoop {
         anyhow::ensure!(turns > 0, ":rewind turns must be greater than zero");
         anyhow::ensure!(
             matches!(
-                self.state.read().expect("poison").kind,
+                self.state.kind,
                 AgentStateKind::Idle | AgentStateKind::Error(_)
             ),
             ":rewind is only available while idle or errored; use :cancel first"
         );
         anyhow::ensure!(
-            self.state.read().expect("poison").queued_inputs.is_empty()
-                && self.queued_turns.is_empty(),
+            self.state.queued_inputs.is_empty() && self.queued_turns.is_empty(),
             ":rewind is not available with queued inputs"
         );
 
@@ -1418,7 +1343,7 @@ impl ClaudeLoop {
             None => ClaudeStartMode::New,
         };
         let mut write = self.db.write().await;
-        let (next_event, _) = reconciliation.apply(&mut write, UnixMillis::now(), self.agent_id);
+        reconciliation.apply(&mut write, UnixMillis::now(), self.agent_id);
         write.set_agent_claude_rewind(
             self.agent_id,
             Some(ClaudeRewind {
@@ -1428,9 +1353,7 @@ impl ClaudeLoop {
             }),
         );
         write.commit();
-        let (next_event, known_sources, last_source) =
-            reconciliation.state(&self.db, self.agent_id, next_event);
-        self.next_event = next_event;
+        let (known_sources, last_source) = reconciliation.state(&self.db, self.agent_id);
         self.known_presentation_sources = known_sources;
         self.last_presentation_source = last_source;
         self.reset_presentation();
@@ -1445,17 +1368,14 @@ impl ClaudeLoop {
         }
         self.pending_rewind = true;
 
-        {
-            let mut state = self.state.write().expect("poison");
-            state.blocks = blocks;
-            state.queued_inputs.clear();
-            state.kind = AgentStateKind::Idle;
-            state.context_used = context_used;
-        }
+        self.state.blocks = blocks;
+        self.state.queued_inputs.clear();
+        self.state.kind = AgentStateKind::Idle;
+        self.state.context_used = context_used;
         self.pending_response = PendingInferenceResponse::default();
         self.stream_items.clear();
         self.turn_usage = None;
-        self.notify.notify_waiters();
+        self.published();
         Ok(())
     }
 
@@ -1463,10 +1383,23 @@ impl ClaudeLoop {
     /// every user message when it enters context: an echo confirms a mirrored
     /// queued message and promotes it to history. Anything else (tool
     /// results, CLI-injected user content) passes through.
-    fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
+    async fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
+        if let ContextBlock::ToolResults { .. } = &*block {
+            // What the calls came back with, so a reader's mirror learns
+            // how each ended; the bodies stay here for `Detail`.
+            let mut write = self.db.write().await;
+            write.append_agent_event(
+                self.agent_id,
+                &AgentEvent::Sent {
+                    blocks: Cow::Borrowed(std::slice::from_ref(&*block)),
+                    at: UnixMillis::now(),
+                },
+            );
+            write.commit();
+        }
         if let ContextBlock::UserMessage { content, .. } = &*block {
-            let mut state = self.state.write().expect("poison");
-            let matched = state
+            let matched = self
+                .state
                 .queued_inputs
                 .remove_first(|queued| match &queued.kind {
                     InputKind::Message { content: queued } => {
@@ -1475,9 +1408,8 @@ impl ClaudeLoop {
                     InputKind::Compaction => false,
                 });
             if matched.is_some() {
-                state.blocks.push(block);
-                drop(state);
-                self.notify.notify_waiters();
+                self.state.blocks.push(block);
+                self.published();
                 return;
             }
         }
@@ -1585,7 +1517,8 @@ impl ClaudeLoop {
                     Ok(block) => {
                         self.pending_response = PendingInferenceResponse::default();
                         self.stream_items.clear();
-                        self.persist_inference_block(&block).await;
+                        // The text first, then the calls: the order a
+                        // reader sees them in.
                         match source {
                             Ok(Some((source_id, speaker, text))) => {
                                 self.persist_presentation_source(source_id, speaker, text)
@@ -1597,6 +1530,7 @@ impl ClaudeLoop {
                                 return;
                             }
                         }
+                        self.persist_inference_block(&block).await;
                         self.push_block(block);
                         self.set_streaming_kind();
                     }
@@ -1615,7 +1549,7 @@ impl ClaudeLoop {
                     return;
                 }
                 match user_output_to_block(message) {
-                    Ok(Some(block)) => self.handle_user_block(block),
+                    Ok(Some(block)) => self.handle_user_block(block).await,
                     Ok(None) => {}
                     Err(error) => self.fail(error).await,
                 }
@@ -1700,15 +1634,12 @@ impl ClaudeLoop {
                         requests: 1,
                         ..crate::db::AgentUsageBucket::default()
                     };
-                    self.state
-                        .write()
-                        .expect("poison")
-                        .total_usage
-                        .add(&turn_usage);
+                    self.reply_usage = Some(turn_usage.clone());
+                    self.state.total_usage.add(&turn_usage);
                     if let Some(pool) = self.pool_events.upgrade() {
                         pool.record_agent_usage(self.agent_id, turn_usage).await;
                     }
-                    self.notify.notify_waiters();
+                    self.published();
                 }
             }
             rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
@@ -1746,19 +1677,16 @@ impl ClaudeLoop {
                         self.persist_presentation_source(source_id, speaker, text)
                             .await;
                     }
-                    let mut state = self.state.write().expect("poison");
-                    promote_queued_user_message(&mut state, &turn.content);
+                    promote_queued_user_message(&mut self.state, &turn.content);
                 } else {
                     self.state
-                        .write()
-                        .expect("poison")
                         .queued_inputs
                         .remove_first(|queued| match &queued.kind {
                             InputKind::Message { content } => *content == *turn.content,
                             InputKind::Compaction => false,
                         });
                 }
-                self.notify.notify_waiters();
+                self.published();
 
                 // Claude emits `completed` after the command's result. If a
                 // missing replay echo left this command in our mirror, the
@@ -1777,26 +1705,41 @@ impl ClaudeLoop {
         }
     }
 
-    /// The calls a Claude turn made, told as they stream. The reply text
-    /// is not told here: the durable mirror
+    /// The calls a Claude message made and what it cost, as a `Replied`
+    /// row. The reply text is not in it: the durable mirror
     /// (`persist_presentation_source`) is the one place it comes from, so
     /// a message is never told twice.
-    async fn persist_inference_block(&self, block: &Arc<ContextBlock>) {
-        let ContextBlock::InferenceResponse { items, .. } = block.as_ref() else {
+    async fn persist_inference_block(&mut self, block: &Arc<ContextBlock>) {
+        let ContextBlock::InferenceResponse {
+            items,
+            provider_response_id,
+        } = block.as_ref()
+        else {
             return;
         };
-        let now = UnixMillis::now();
-        let told = crate::story::from_inference_items(items, now)
-            .into_iter()
-            .filter(|event| !matches!(event, crate::story::StoryEvent::Reply { .. }))
+        let usage = self.reply_usage.take();
+        let items = items
+            .iter()
+            .filter(|item| !matches!(item, InferenceResponseItem::AssistantMessage { .. }))
+            .cloned()
             .collect::<Vec<_>>();
-        if told.is_empty() {
+        if items.is_empty() && usage.is_none() {
             return;
         }
+        let context_used = self.state.context_used;
         let mut write = self.db.write().await;
-        for event in &told {
-            write.append_agent_story(self.agent_id, event);
-        }
+        write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::Replied {
+                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
+                    items,
+                    provider_response_id: provider_response_id.clone(),
+                }]),
+                context_used,
+                usage,
+                at: UnixMillis::now(),
+            },
+        );
         write.commit();
     }
 
@@ -1880,11 +1823,8 @@ impl ClaudeLoop {
                 .await;
         }
 
-        let mut state = self.state.write().expect("poison");
-        promote_queued_user_message(&mut state, &turn.content);
-        drop(state);
-
-        self.notify.notify_waiters();
+        promote_queued_user_message(&mut self.state, &turn.content);
+        self.published();
         true
     }
 
@@ -1896,36 +1836,56 @@ impl ClaudeLoop {
             return;
         };
 
-        {
-            let mut state = self.state.write().expect("poison");
-            remove_compact_commands(&mut state.queued_inputs);
-            if let Some(post_tokens) = compact_metadata.and_then(|metadata| metadata.post_tokens) {
-                state.context_used = Some(post_tokens);
-            }
+        remove_compact_commands(&mut self.state.queued_inputs);
+        if let Some(post_tokens) = compact_metadata.and_then(|metadata| metadata.post_tokens) {
+            self.state.context_used = Some(post_tokens);
         }
-        self.notify.notify_waiters();
+        self.published();
     }
 
-    fn push_block(&self, block: Arc<ContextBlock>) {
-        self.state.write().expect("poison").blocks.push(block);
-        self.notify.notify_waiters();
+    fn push_block(&mut self, block: Arc<ContextBlock>) {
+        self.state.blocks.push(block);
+        self.published();
     }
 
-    fn set_kind(&self, kind: AgentStateKind) {
-        self.state.write().expect("poison").kind = kind;
-        self.notify.notify_waiters();
+    /// The loop's state changed: publish the status, and say what changed
+    /// in the tail if anyone is looking. Every row this loop writes is
+    /// committed before the state moves, so the tail follows its row.
+    fn published(&self) {
+        *self.status.write().expect("poison") = AgentStatus {
+            kind: self.state.kind.clone(),
+            queued: self.state.queued_inputs.len(),
+        };
+        let live = self
+            .pool_events
+            .upgrade()
+            .is_some_and(|pool| pool.is_live(self.agent_id));
+        let mut teller = self.teller.lock().expect("poison");
+        if !live {
+            teller.reset();
+            return;
+        }
+        let kind = self.state.kind.clone();
+        for live in teller.tell(&kind) {
+            crate::mirror::tell_live(&self.db, self.agent_id, live);
+        }
+    }
+
+    fn set_kind(&mut self, kind: AgentStateKind) {
+        self.state.kind = kind;
+        self.published();
     }
 
     /// Publishes the in-flight message's usage as context occupancy.
-    fn update_context_used(&self) {
+    fn update_context_used(&mut self) {
         let Some(usage) = &self.turn_usage else {
             return;
         };
-        self.state.write().expect("poison").context_used = Some(usage.context_total());
-        self.notify.notify_waiters();
+        self.state.context_used = Some(usage.context_total());
+        self.published();
     }
 
-    fn set_streaming_kind(&self) {
+    fn set_streaming_kind(&mut self) {
         self.set_kind(AgentStateKind::ApiStreaming {
             pending_response: self.pending_response.clone(),
             previous_attempt: None,
@@ -1933,12 +1893,28 @@ impl ClaudeLoop {
     }
 
     async fn fail(&mut self, error: anyhow::Error) {
+        // The row first, so what Claude had said is kept and the tail
+        // the loop tells next follows it.
+        let partial = std::mem::take(&mut self.pending_response);
+        {
+            let mut write = self.db.write().await;
+            write.append_agent_event(
+                self.agent_id,
+                &AgentEvent::Failed {
+                    partial: partial.clone(),
+                    error: Cow::Owned(error.to_string()),
+                    retrying: false,
+                    at: UnixMillis::now(),
+                },
+            );
+            write.commit();
+        }
         if let Some(pool) = self.pool_events.upgrade() {
             pool.publish_failed_turn(self.agent_id, error.to_string())
                 .await;
         }
         self.set_kind(AgentStateKind::Error(FailedInferenceResponse {
-            partial_response: self.pending_response.clone(),
+            partial_response: partial,
             attempt_count: NonZeroU64::MIN,
             error: Arc::new(error.to_string()),
         }));
@@ -2104,74 +2080,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn legacy_turn_end_uses_last_real_assistant_transcript_timestamp() {
-        let session_id = Uuid::new_v4();
-        let message = |kind, timestamp: Option<&str>| rho_claude::SessionMessage {
-            kind,
-            uuid: Uuid::new_v4(),
-            session_id,
-            message: json!({}),
-            parent_tool_use_id: None,
-            timestamp: timestamp.map(str::to_owned),
-        };
-        let messages = vec![
-            message(
-                rho_claude::SessionMessageKind::Assistant,
-                Some("2026-07-01T10:00:00Z"),
-            ),
-            message(
-                rho_claude::SessionMessageKind::Assistant,
-                Some("not-a-timestamp"),
-            ),
-            message(
-                rho_claude::SessionMessageKind::User,
-                Some("2026-07-03T10:00:00Z"),
-            ),
-            message(
-                rho_claude::SessionMessageKind::Assistant,
-                Some("2026-07-02T10:00:00Z"),
-            ),
-        ];
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-07-02T10:00:00Z")
-            .unwrap()
-            .timestamp_millis() as u64;
-        assert_eq!(
-            last_assistant_message_at(&messages),
-            Some(rho_core::UnixMs(expected))
-        );
-        assert_eq!(
-            last_assistant_message_at(&[message(rho_claude::SessionMessageKind::Assistant, None,)]),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_record_is_backfilled_from_transcript_ground_truth() {
-        let (_temp, db, agent_id) = presentation_test_agent().await;
-        assert_eq!(db.read().agent_attention(agent_id).last_turn_ended, None);
-        let messages = [rho_claude::SessionMessage {
-            kind: rho_claude::SessionMessageKind::Assistant,
-            uuid: Uuid::new_v4(),
-            session_id: Uuid::new_v4(),
-            message: json!({}),
-            parent_tool_use_id: None,
-            timestamp: Some("2026-06-01T00:00:00Z".to_owned()),
-        }];
-        let mut write = db.write().await;
-        assert!(backfill_last_turn_ended_from_claude_messages(
-            &mut write, agent_id, &messages,
-        ));
-        write.commit();
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
-            .unwrap()
-            .timestamp_millis() as u64;
-        assert_eq!(
-            db.read().agent_attention(agent_id).last_turn_ended,
-            Some(rho_core::UnixMs(expected))
-        );
-    }
-
     async fn presentation_test_agent() -> (tempfile::TempDir, RhoDb, AgentId) {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -2235,12 +2143,12 @@ mod tests {
         reconcile_claude_presentation_sources(&db, agent_id, std::slice::from_ref(&first))
             .await
             .unwrap();
-        let (_, sources, _, rebuilt) =
+        let (sources, last) =
             reconcile_claude_presentation_sources(&db, agent_id, &[first, second])
                 .await
                 .unwrap();
 
-        assert!(rebuilt.is_none());
+        assert!(last.is_some());
         assert_eq!(sources.len(), 2);
         assert_eq!(
             db.read()
@@ -2271,10 +2179,9 @@ mod tests {
             uuid::uuid!("00000000-0000-4000-8000-000000000003"),
             "replacement",
         );
-        let (next, _, _, _) =
-            reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), discarded])
-                .await
-                .unwrap();
+        reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), discarded])
+            .await
+            .unwrap();
         let discarded_position = db
             .read()
             .agent_event_records(agent_id)
@@ -2300,22 +2207,15 @@ mod tests {
                 .apply_agent_presentation(rho_core::UnixMs(2), agent_id, &update)
                 .is_some()
         );
-        write.append_agent_event(
-            next,
-            &AgentEvent::PresentationUpdated {
-                update: update.clone(),
-            },
-        );
         write.commit();
 
-        let (_, _, _, rebuilt) =
-            reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
-                .await
-                .unwrap();
-        // A fork does not unsay what the story told: the title stands.
-        assert!(rebuilt.is_none());
+        reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
+            .await
+            .unwrap();
+        // A rewind takes back history, not configuration: the head folds
+        // hidden rows too, so the title stands until the sidecar retitles.
         assert_eq!(
-            db.read().agent_presentation_cache(agent_id).generated_title,
+            db.read().get_agent(agent_id).generated_title,
             Some("discarded-title".to_owned())
         );
         let mut write = db.write().await;
@@ -2326,12 +2226,10 @@ mod tests {
         );
         write.commit();
 
-        let (_, sources, _, rebuilt) =
-            reconcile_claude_presentation_sources(&db, agent_id, &[first])
-                .await
-                .unwrap();
+        let (sources, _) = reconcile_claude_presentation_sources(&db, agent_id, &[first])
+            .await
+            .unwrap();
         assert_eq!(sources.len(), 1);
-        assert!(rebuilt.is_none());
     }
 
     #[test]

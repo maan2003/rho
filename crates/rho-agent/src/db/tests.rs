@@ -1,5 +1,5 @@
 use rho_core::{ContentPart, UnixMs};
-use rho_db::{RhoDb, SenValue};
+use rho_db::RhoDb;
 use rho_inference::PromptCacheKey;
 use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
@@ -400,6 +400,7 @@ fn event_text(event: &AgentEvent<'_>) -> String {
         },
         // Every agent's log opens with its creation.
         AgentEvent::Created { .. } => "created".to_owned(),
+        AgentEvent::Rewound { .. } => "rewound".to_owned(),
         _ => unreachable!(),
     }
 }
@@ -510,44 +511,6 @@ fn deep_default_uses_default_deep_config() {
 }
 
 #[tokio::test]
-async fn agent_event_positions_sort_by_lineage_then_seq() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    {
-        let mut timeline = write.open_table(AGENT_EVENTS);
-        for seq in [2, 0, 1] {
-            timeline.insert(
-                &AgentEventPos {
-                    lineage_id: AgentLineageId(7),
-                    seq,
-                },
-                SenValue::owned(user_event("seq")),
-            );
-        }
-    }
-    write.commit();
-
-    let read = db.read();
-    let timeline = read.open_table(AGENT_EVENTS);
-    let seqs = timeline
-        .range(
-            AgentEventPos {
-                lineage_id: AgentLineageId(7),
-                seq: 0,
-            }..=AgentEventPos {
-                lineage_id: AgentLineageId(7),
-                seq: u32::MAX,
-            },
-        )
-        .map(|(key, _)| key.value().seq)
-        .collect::<Vec<_>>();
-
-    assert_eq!(seqs, [0, 1, 2]);
-}
-
-#[tokio::test]
 async fn init_agent_tables_stamps_current_db_format() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -569,303 +532,6 @@ async fn init_agent_tables_rejects_unsupported_db_format() {
     let mut write = db.write().await;
     write.open_table(FORMAT).insert(&(), &"deadbeef".to_owned());
     write.init_agent_tables();
-}
-
-#[tokio::test]
-async fn create_agent_and_append_events_with_cursor() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let next = write.append_agent_event(next, &user_event("hello"));
-    write.append_agent_event(next, &user_event("again"));
-    write.commit();
-
-    let read = db.read();
-    let agent = read.get_agent(agent_id);
-    assert_eq!(agent.config.spawn_name.as_deref(), Some("main"));
-
-    let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.seq, 3);
-    assert_eq!(events.len(), 3);
-    assert!(matches!(events[0], AgentEvent::Created { .. }));
-    assert_eq!(events[1], user_event("hello"));
-}
-
-#[tokio::test]
-async fn agent_events_read_lineage_parents() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let fork_at = write.append_agent_event(next, &user_event("parent"));
-    write.append_agent_event(fork_at, &user_event("sibling"));
-
-    let child_root = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
-    write.append_agent_event(child_root, &user_event("child"));
-    write.commit();
-
-    let read = db.read();
-    let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.lineage_id, child_root.lineage_id);
-    assert_eq!(next.seq, 1);
-    let texts = events
-        .into_iter()
-        .map(|event| event_text(&event))
-        .collect::<Vec<_>>();
-    assert_eq!(texts, ["created", "parent", "child"]);
-}
-
-#[tokio::test]
-async fn fork_agent_lineage_repoints_current_branch() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let fork_at = write.append_agent_event(next, &user_event("parent"));
-    write.append_agent_event(fork_at, &user_event("old branch"));
-
-    let child_next = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
-    write.append_agent_event(child_next, &user_event("new branch"));
-    write.commit();
-
-    let (_, events) = db.read().agent_events(agent_id);
-    let texts = events
-        .into_iter()
-        .map(|event| event_text(&event))
-        .collect::<Vec<_>>();
-    assert_eq!(texts, ["created", "parent", "new branch"]);
-}
-
-#[tokio::test]
-async fn a_presentation_update_is_rejected_when_its_source_was_rewound_away() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let first = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let second = write.append_agent_event(first, &user_event("first"));
-    let third = write.append_agent_event(second, &user_event("later"));
-    let update = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("first-subject".to_owned()),
-        activity: PresentationField::Set("reading first request".to_owned()),
-        through: first,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(2), agent_id, &update)
-            .is_some()
-    );
-    let fourth = write.append_agent_event(
-        third,
-        &AgentEvent::PresentationUpdated {
-            update: update.clone(),
-        },
-    );
-    write.append_agent_event(fourth, &user_event("even later"));
-
-    // Rewind before the second input. The story is append-only, so what
-    // it told about the abandoned branch still stands.
-    write.fork_agent_lineage(UnixMs(3), agent_id, second);
-
-    // A completion based on the discarded input cannot write into the new
-    // lineage, even if it reaches the serialized loop after the rewind.
-    let stale = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("discarded".to_owned()),
-        activity: PresentationField::Unchanged,
-        through: second,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
-            .is_none()
-    );
-    write.commit();
-
-    let record = db.read().get_agent(agent_id);
-    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
-}
-
-#[tokio::test]
-async fn legacy_turn_end_backfill_is_one_way_and_durable() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    assert!(write.backfill_agent_last_turn_ended(agent_id, UnixMs(20)));
-    assert!(!write.backfill_agent_last_turn_ended(agent_id, UnixMs(30)));
-    write.commit();
-    assert_eq!(
-        db.read().agent_attention(agent_id).last_turn_ended,
-        Some(UnixMs(20))
-    );
-}
-
-#[tokio::test]
-async fn turn_end_and_user_message_set_dispositions() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    write.record_agent_turn_end(UnixMs(2), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().agent_attention(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-    assert_eq!(
-        db.read().agent_attention(agent_id).last_turn_ended,
-        Some(UnixMs(2))
-    );
-
-    let mut write = db.write().await;
-    write.record_agent_user_message(UnixMs(5), agent_id, "  please\ncheck the   claims  ");
-    write.commit();
-    let agent = db.read().agent_attention(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert_eq!(agent.last_user_message, UnixMs(5));
-    assert_eq!(agent.last_user_message_text, "please check the claims");
-    assert!(agent.user_interacted);
-
-    // An unexpired snooze holds across a turn end; an expired one does not.
-    let mut write = db.write().await;
-    write.set_agent_disposition(agent_id, AgentDisposition::Snoozed { until: UnixMs(100) });
-    write.record_agent_turn_end(UnixMs(50), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().agent_attention(agent_id).disposition,
-        AgentDisposition::Snoozed { until: UnixMs(100) }
-    );
-    let mut write = db.write().await;
-    write.record_agent_turn_end(UnixMs(150), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().agent_attention(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-    assert_eq!(
-        db.read().agent_attention(agent_id).last_turn_ended,
-        Some(UnixMs(150))
-    );
-
-    // A needs-you report leaves the verdict alone; an FYI settles like a
-    // pressed Done while the summary stays for the row.
-    let mut write = db.write().await;
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: true,
-            summary: "which migration to drop?".to_owned(),
-        },
-    );
-    write.commit();
-    assert_eq!(
-        db.read().agent_attention(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-    let mut write = db.write().await;
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: false,
-            summary: "tests pass".to_owned(),
-        },
-    );
-    write.commit();
-    let agent = db.read().agent_attention(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert!(agent.turn_report.is_some());
-
-    // A new user message overrides any verdict: snooze and the stale turn
-    // report both give way to Done.
-    let mut write = db.write().await;
-    write.set_agent_disposition(
-        agent_id,
-        AgentDisposition::Snoozed {
-            until: UnixMs(1_000),
-        },
-    );
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: true,
-            summary: "which migration to drop?".to_owned(),
-        },
-    );
-    write.record_agent_user_message(UnixMs(200), agent_id, "next task");
-    write.commit();
-    let agent = db.read().agent_attention(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert_eq!(agent.turn_report, None);
 }
 
 #[tokio::test]
@@ -966,117 +632,256 @@ async fn response_subscriptions_are_persistent_edges() {
     assert!(db.read().agent_response_subscribers(target).is_empty());
 }
 
-#[tokio::test]
-async fn the_story_head_folds_the_title_activity_and_running_turn() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
+fn create(
+    write: &mut rho_db::WriteTxn,
+    spawn_name: Option<&str>,
+    parent: Option<AgentId>,
+) -> AgentId {
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        None,
+        spawn_name.map(str::to_owned),
         vec![test_workspace()],
         AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
-        None,
+        parent,
     );
-    for event in [
-        crate::story::StoryEvent::TurnStarted { at: UnixMs(2) },
-        crate::story::StoryEvent::Titled {
-            title: "story-log".to_owned(),
-            at: UnixMs(3),
-        },
-        crate::story::StoryEvent::Activity {
-            label: Some("writing the fold".to_owned()),
-            at: UnixMs(4),
-        },
-    ] {
-        write.append_agent_story(agent_id, &event);
-    }
-    write.commit();
-
-    let head = db.read().get_agent(agent_id);
-    assert_eq!(head.title(), Some("story-log"));
-    assert_eq!(head.activity.as_deref(), Some("writing the fold"));
-    assert!(head.turn_running);
-
-    // Creation is the story's first event, so the turn events follow it.
-    let story = db.read().agent_story(agent_id, StoryPos::default());
-    assert!(matches!(
-        story[0].1,
-        crate::story::StoryEvent::Created { .. }
-    ));
-    assert_eq!(story.len(), 4);
-
-    let mut write = db.write().await;
-    write.append_agent_story(
-        agent_id,
-        &crate::story::StoryEvent::TurnEnded {
-            outcome: crate::story::TurnOutcome::Completed,
-            at: UnixMs(5),
-        },
-    );
-    write.commit();
-
-    // The label described work that just stopped.
-    let head = db.read().get_agent(agent_id);
-    assert!(!head.turn_running);
-    assert_eq!(head.activity, None);
-    assert_eq!(head.title(), Some("story-log"));
+    agent_id
 }
 
 #[tokio::test]
-async fn a_rewind_tells_where_the_story_a_reader_keeps_stops() {
+async fn positions_are_dense_per_agent_and_creation_is_row_zero() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let first = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        AgentRole::default(),
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
+    let first = create(&mut write, Some("main"), None);
+    let second = create(&mut write, None, Some(first));
+    assert_eq!(
+        write.append_agent_event(first, &user_event("hello")),
+        AgentEventPos::new(1)
     );
-    let second = write.append_agent_event(first, &user_event("first"));
-    write.append_agent_story_from(
-        agent_id,
-        &crate::story::StoryEvent::UserMessage {
-            text: "first".to_owned(),
-            at: UnixMs(2),
-        },
-        first,
+    assert_eq!(
+        write.append_agent_event(second, &user_event("hi")),
+        AgentEventPos::new(1)
     );
-    write.append_agent_event(second, &user_event("later"));
-    write.append_agent_story_from(
-        agent_id,
-        &crate::story::StoryEvent::UserMessage {
-            text: "later".to_owned(),
-            at: UnixMs(3),
-        },
-        second,
+    assert_eq!(
+        write.append_agent_event(first, &user_event("again")),
+        AgentEventPos::new(2)
     );
-
-    // Rewind before the second input: what it told is on the abandoned
-    // branch, what the first told is still selected.
-    write.fork_agent_lineage(UnixMs(4), agent_id, second);
     write.commit();
 
-    let story = db.read().agent_story(agent_id, StoryPos::default());
-    assert!(matches!(
-        story.last().expect("a story").1,
-        crate::story::StoryEvent::Rewound {
-            to: StoryPos(2),
-            ..
-        }
-    ));
+    let read = db.read();
+    let agent = read.get_agent(first);
+    assert_eq!(agent.config.spawn_name.as_deref(), Some("main"));
+    assert_eq!(agent.next, AgentEventPos::new(3));
+    assert_eq!(read.get_agent(second).parent, Some(first));
+    assert_eq!(read.agent_parent(second), Some(first));
+    let mut ids = read.list_agent_ids();
+    ids.sort();
+    let mut expected = [first, second];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    let (next, events) = read.agent_events(first);
+    assert_eq!(next, AgentEventPos::new(3));
+    let texts = events.iter().map(event_text).collect::<Vec<_>>();
+    assert_eq!(texts, ["created", "hello", "again"]);
+    assert_eq!(
+        read.agent_event(first, AgentEventPos::new(2)),
+        Some(user_event("again"))
+    );
+    assert_eq!(read.agent_event(first, AgentEventPos::new(3)), None);
+}
+
+#[tokio::test]
+async fn a_rewind_hides_rows_and_is_itself_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = create(&mut write, None, None);
+    write.append_agent_event(agent_id, &user_event("parent"));
+    write.append_agent_event(agent_id, &user_event("old branch"));
+    // Take back everything from row 2 on; the rewind lands at row 3.
+    assert_eq!(
+        write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(2)),
+        AgentEventPos::new(3)
+    );
+    write.append_agent_event(agent_id, &user_event("new branch"));
+    write.commit();
+
+    let read = db.read();
+    let (next, records) = read.agent_event_records(agent_id);
+    assert_eq!(next, AgentEventPos::new(5));
+    let seen = records
+        .iter()
+        .map(|(pos, event)| (pos.pos, event_text(event)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seen,
+        [
+            (0, "created".to_owned()),
+            (1, "parent".to_owned()),
+            (3, "rewound".to_owned()),
+            (4, "new branch".to_owned()),
+        ]
+    );
+    // The hidden row is still there for anyone who asks by position.
+    assert_eq!(
+        read.agent_event(agent_id, AgentEventPos::new(2)),
+        Some(user_event("old branch"))
+    );
+    // The tail walk backward skips it too.
+    let tail = read
+        .agent_presentation_source_tail(agent_id, usize::MAX)
+        .into_iter()
+        .map(|(pos, _)| pos.pos)
+        .collect::<Vec<_>>();
+    assert_eq!(tail, [1, 4]);
+}
+
+#[tokio::test]
+async fn a_presentation_update_is_rejected_when_its_source_was_rewound_away() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = create(&mut write, None, None);
+    let first = write.append_agent_event(agent_id, &user_event("first"));
+    let second = write.append_agent_event(agent_id, &user_event("later"));
+    let update = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("first-subject".to_owned()),
+        activity: PresentationField::Set("reading first request".to_owned()),
+        through: first,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(2), agent_id, &update)
+            .is_some()
+    );
+    write.append_agent_event(agent_id, &user_event("even later"));
+
+    write.rewind_agent(UnixMs(3), agent_id, second);
+
+    // A completion based on the discarded input cannot write after the
+    // rewind, even if it reaches the serialized loop late.
+    let stale = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("discarded".to_owned()),
+        activity: PresentationField::Unchanged,
+        through: second,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
+            .is_none()
+    );
+    write.commit();
+
+    let record = db.read().get_agent(agent_id);
+    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
+    assert_eq!(record.activity.as_deref(), Some("reading first request"));
+}
+
+#[tokio::test]
+async fn the_head_folds_title_activity_turns_and_user_contact() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let root = create(&mut write, None, None);
+    let child = create(&mut write, Some("named"), Some(root));
+    write.tell_turn(UnixMs(2), child, TurnEdge::Started);
+    write.append_agent_event(
+        child,
+        &AgentEvent::Presented {
+            title: PresentationField::Set("story-log".to_owned()),
+            activity: PresentationField::Set("writing the fold".to_owned()),
+            at: UnixMs(3),
+        },
+    );
+    write.commit();
+
+    let head = db.read().get_agent(child);
+    // The spawner's name beats the sidecar's title.
+    assert_eq!(head.title(), Some("named"));
+    assert_eq!(head.generated_title.as_deref(), Some("story-log"));
+    assert_eq!(head.activity.as_deref(), Some("writing the fold"));
+    assert!(head.turn_running);
+    assert!(!head.user_interacted);
+    assert_eq!(head.last_turn_ended, None);
+
+    let mut write = db.write().await;
+    write.tell_turn(UnixMs(5), child, TurnEdge::Ended(TurnOutcome::Completed));
+    write.append_agent_event(child, &user_event("the user speaks"));
+    write.tell_wants(UnixMs(6), child, AgentWant::Ask, Some("which?".to_owned()));
+    write.commit();
+
+    // The label described work that just stopped.
+    let head = db.read().get_agent(child);
+    assert!(!head.turn_running);
+    assert_eq!(head.activity, None);
+    assert_eq!(head.last_turn_ended, Some(UnixMs(5)));
+    assert!(head.user_interacted);
+    assert!(!db.read().get_agent(root).user_interacted);
+}
+
+#[tokio::test]
+async fn the_journal_names_every_row_in_write_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut feed = crate::mirror::feed(&db);
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = create(&mut write, None, None);
+    let second = create(&mut write, None, None);
+    write.append_agent_event(first, &user_event("one"));
+    write.append_agent_event(second, &user_event("two"));
+    write.append_agent_event(first, &user_event("three"));
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.journal_head(), Seq(5));
+    let named = read
+        .journal_since(Seq(0), 100)
+        .into_iter()
+        .map(|(seq, agent_id, pos, event)| (seq.0, agent_id, pos.pos, event_text(&event)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        [
+            (1, first, 0, "created".to_owned()),
+            (2, second, 0, "created".to_owned()),
+            (3, first, 1, "one".to_owned()),
+            (4, second, 1, "two".to_owned()),
+            (5, first, 2, "three".to_owned()),
+        ]
+    );
+    // Paged: `since` is exclusive, `limit` bounds the page.
+    let page = read.journal_since(Seq(3), 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, Seq(4));
+    assert!(read.journal_since(Seq(5), 100).is_empty());
+
+    // Every row was announced after commit, in the same order.
+    let mut announced = Vec::new();
+    while let Ok(crate::mirror::Feed::Appended(appended)) = feed.try_recv() {
+        announced.push((appended.seq.0, appended.agent_id, appended.pos.0));
+    }
+    assert_eq!(
+        announced,
+        [
+            (1, first, 0),
+            (2, second, 0),
+            (3, first, 1),
+            (4, second, 1),
+            (5, first, 2)
+        ]
+    );
 }

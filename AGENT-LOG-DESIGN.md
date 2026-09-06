@@ -256,6 +256,203 @@ reported the counts; the migration code is deleted in the next landing
 after the user has restarted on it (the standing rule; `desk_migration.rs`
 from store slice 1 is deleted in slice A for the same reason).
 
+## Revision, 6 Sep: the mirror is a pure function of the raw log
+
+The user's calls on 6 Sep, after slice B's wire and GUI half had landed
+and the rho-agent2 loop had become the only Rho runtime. Everything
+below supersedes the sections above where they differ; the sections
+above stay as the record of what landed and why.
+
+### What was wrong with what landed
+
+- The story was a second, hand-written log. The loop told a story
+  event beside each raw event, a backfill told the same story again
+  from old raw events, a side index (`agent_story_source`) mapped story
+  positions back to raw ones so a rewind could be told, and the head
+  folded both logs. Three writers of one truth.
+- The transcript existed twice: as the fold over the story, and as the
+  live `AgentRemoteFrame` snapshot plus block diffs. Opening an agent
+  sent a whole snapshot that replaced the story-made view, and tool
+  results existed only on the live side.
+- Resync was a version vector of one position per agent (2823 pairs on
+  every `Ready`), a per-agent cursor per connection on the daemon, and a
+  gap on one agent sent `AgentHead`, made the client re-send the whole
+  vector, and made the daemon abort and restart the follow. A broadcast
+  lag sent a whole `Ready`. Correct, but healing by restart.
+- The first copy pushed the whole history into an unbounded channel.
+
+The user's read: the one-time copy is fine (it is one time, and the
+wire is zstd-compressed; nothing about it needs to be clever), the
+mechanism is not; the story fold is too complicated; the mirror should
+be a pure function of the raw event, tool output stripped.
+
+### The mirror event is `strip(raw event)`, nothing else
+
+One function, per event, no state carried between events:
+`strip: AgentEvent -> MirrorEvent`. The variants are the raw log's
+variants with bodies removed: tool results, images, reasoning and the
+raw model exchange are gone; `Sent` keeps its call names and one typed
+line each (the path, the command, the query); `Replied` keeps its
+visible text, its calls, its usage and `context_used`. Because it is
+pure, the mirror is rebuildable from the raw log at any time, on either
+side, and there is nothing to backfill: no story table, no
+`agent_story_source`, no `story_built`, no head table.
+
+Transcript blocks, heads (config, title, activity, parent, turn
+running), attention and cost are one fold over mirror events, in a
+crate that builds for wasm and that the GUI runs. The daemon keeps no
+derived agent state: at load it reads its own agent's config while
+`replay` walks that agent's log anyway; a parent is the child's
+`Created` at position zero, one point read; a listing for the CLI is a
+scan of position zero of every agent, rare and cheap. The daemon can
+call the fold for tests, and does not need it to run.
+
+Tool bodies stay on the host and come on demand, `Detail { agent, pos }`,
+from the raw log, no runtime loaded, as slice D said.
+
+### The raw log carries everything a reader needs
+
+Four raw events join the loop's `persist` path, which already owns
+every append: `Turn { Started | Ended(outcome), at }`, `Presented
+{ title, activity, at }` from the sidecar, `Wants { want, summary, at }`
+from the turn-report sidecar (later the tag parser), and `Rewound { to,
+at }`. The Claude runtime writes the same events from its stream.
+
+`Replied` carries `usage: Option<AgentUsageBucket>` beside
+`context_used`. Why there: usage is provider-reported per model
+response (input, cache read, cache write, output) and cannot be
+recomputed from text, since the tokenizer is the provider's and a cache
+hit is only knowable from what they report; `Replied` is the one raw
+event per model response, so it is the only event the numbers can
+describe; per response and not per turn because a turn is many
+responses when the model loops over tools, and cache read against cache
+write per request is exactly the signal the spend work needed; not a
+separate `Usage` event because it would follow every `Replied` one to
+one and every reader would have to pair them. Today `Replied` carries
+only `context_used`, itself derived from these numbers, and the bucket
+goes to the usage tables and a `Cost` story event.
+
+Every raw event written from now on carries `at`. Only `Accepted` and
+`Created` did; "how long has it been" is the reader's first question
+and the story answered it by stamping every event on the way out. Old
+events read `at` as zero, which the fold treats as unknown and fills
+from the nearest stamped neighbour.
+
+Rewind stops forking. Today `AgentEventPos` is `(lineage, seq)` and a
+rewind forks the agent onto a new lineage whose parent points at the
+cut (`lineage_parents`), which is why the story needed its own index to
+say where a reader's view stops. From now on an agent has one lineage,
+`AgentEventPos` is a dense per-agent position that never moves, and a
+rewind appends `Rewound { to }`; `replay` hides the range for the
+runtime and the fold hides it for the reader, with one rule. The
+migration flattens each existing fork once: the abandoned tail stays
+where it is, followed by the `Rewound` that hides it. Prompt-cache and
+history behave as before. Forking an agent, if it is ever wanted, is a
+new agent whose `Created` names another agent's `(agent, pos)` as the
+history it starts from; the user's read, 6 Sep: possibly useful later,
+not needed now, and nothing here stands in its way.
+
+`AgentEventPos` stays, and stays per agent. The agent log is
+self-contained on purpose: resuming one agent is one range read over
+`(agent, pos)` and never touches anything daemon-wide. The user's call,
+6 Sep: "agent log being separate is very important".
+
+### Cost is derived on the client
+
+The fold multiplies `Replied.usage` by the price of the model in force,
+known from `Created` and `RoleChanged` since a role carries its model
+binding, from a price table by model and date on the client. The
+`Cost` event, `record_agent_usage`, the three usage tables and the
+usage requests go. History: old `Replied` events carry no usage and the
+tables hold buckets per agent per time bucket, not per response, so the
+graphs read the tables for the past and the fold for the future until
+the past no longer matters, and the tables are dropped then.
+
+### One journal beside the agent logs, one cursor per client
+
+A second table, `journal: seq -> (agent, pos)`, appended in the same
+write transaction as the agent's raw event. The agent log stays primary
+and holds the payload under `(agent, pos)`, so an agent's range read is
+contiguous; the journal is 24 bytes per entry and only the follow reads
+it. No new contention: every append already takes redb's single write
+transaction. `Created` is position zero and gets a seq like any event,
+so the agent list on the client is a fold and needs no message.
+
+Why one global sequence and not a version vector: there is one writer.
+A client's whole knowledge of a host is one integer, the last seq it
+holds; a gap is impossible by construction; resume, lag and a cold
+start are all "send from my seq".
+
+Not sliding sync: server-side sorted windows exist for a client that
+cannot hold the set. The client holds the whole mirror on disk, so
+sorting is local. The only ordering the daemon ever chooses is the
+order of the one-time copy, and that is journal order, oldest first,
+accepted as is. The one knob if a cold start ever hurts is a second
+cursor going backwards, `Backfill { before: seq }`, so a cold client
+follows live from `journal_head` and fills history newest first. Not
+built.
+
+### The wire
+
+```
+client -> daemon
+  Follow { since: Seq }              everything after since, every agent,
+                                     contiguous by seq, forever; a cold
+                                     client sends 0
+  AgentStreamFocus { agent_ids }     which agents this client is looking
+                                     at; never loads one
+  Detail { agent, pos }              a tool call's body, on demand
+  commands unchanged: NewAgent, SendUserMessage, CancelTurn, RewindAgent,
+  ContinueTurn, CompactAgent, ChangeAgentRole, ChangePromptCacheKey;
+  every one that names an agent loads it
+
+daemon -> client
+  Ready { auth, machine_seed, agent_counter, journal_head: Seq }
+  Log { entries: Vec<(Seq, AgentId, Pos, MirrorEvent)> }
+                                     pages of at most 512 in catch-up,
+                                     one entry at a time live
+  Live { agent, live: Live }         one delta: Requesting | Item | Appended
+                                     | Retrying | Waiting | Idle
+  Detail { agent, pos, body }        body is Results or Response(Vec<Item>)
+```
+
+`Live` and `Log` are one ordered feed per connection. A loop writes its
+row, the commit hook puts the row on the feed, and the same task then
+puts the next `Live` on it; a client applies the row, then the tail.
+The live set is server-wide, the union of every connection's focus;
+every connection forwards every delta and a client ignores agents it
+is not holding. A joiner is told `Requesting`, one `Item` per index,
+then the phase; an `Appended` for an index it does not hold is dropped.
+
+Gone: `AgentLogs`, `AgentStory`, `AgentHead`, `Agent { frame }`, the
+snapshot and the block diff, `AgentSubscribed`, `AgentAttention`,
+`AgentTurnReport`, `AgentUsage`, `Ready.agents`, `UiAgentHead` on the
+wire. Every wire change bumps the epoch and the iroh ALPN.
+
+Completeness is one rule per side. Follow: the client holds every seq
+up to its cursor, or it re-sends `Follow` from the last one it has.
+Lag: the daemon reads the journal from the last seq it sent and carries
+on; no `Ready`, no restart. Head changes need no message: title,
+activity, turn running, parent and role arrive as `Log` entries.
+
+Live is ephemeral only: the response in flight, item by item and
+append by append, and the phase. It is layered on the mirror's tail by
+the client and replaced by the `Log` entries when the response lands,
+so nothing durable travels only in `Live`. Everything else a reader
+wants is a row: the queue is `Message` rows no `Sent` has carried, a
+call runs until a `Sent` answers it, a turn ends with a `Turn` row.
+No snapshot on focus: the transcript is the fold, once.
+
+### The client
+
+The mirror is keyed `(host, agent, pos) -> MirrorEvent` with one
+`(host, seq)` cursor, in the GUI's redb as today; the story rows are
+replaced by mirror rows. Attention, heads, transcript and cost come
+from the fold crate; `AgentHandledThrough` stays an agent position.
+`Ready` no longer carries agents, so on a first connect Home fills as
+`Created` and `Presented` entries arrive, complete when the copy is; on
+a warm connect nothing changes.
+
 ## Slices, in landing order
 
 A. **Config in the log, no record.** `Created` and the config events,
@@ -387,6 +584,179 @@ E. **The Desk mirror.** Found while proving change two on the rig
    is wrong. Offline Home is claimed only when this lands, not with B.
    Designed as `STORE-DESIGN.md` slice 5, "The client keeps the store".
 
+F. **The pure mirror and the journal** (the 6 Sep revision). In three
+   landings:
+   1. Daemon, no wire change: `Turn`, `Presented`, `Wants`, `Rewound`
+      and `at` on every raw event; usage on `Replied`; the journal table
+      appended in the same transaction and built once for existing logs
+      in creation order; lineages flattened into `Rewound`; `strip` and
+      the fold crate, with a test that the fold over stripped raw events
+      matches today's story transcript on the fixture. Proven on a copy
+      of the user's store, counts reported, before the restart.
+   2. Wire and GUI, epoch bump: `Follow` / `Log` / `Live` / `Detail`,
+      `Ready` shrunk, the mirror rekeyed, attention and heads from the
+      fold; the story table, `agent_story_source`, the backfill,
+      `story_wire`, the head table, `AgentRemoteEncoder` and the
+      registry's story fold deleted.
+   3. Usage: the graphs read the fold for events that carry usage and
+      the tables for the rest; the tables and requests go when the past
+      no longer matters.
+   Slices C and D fold into this: C is the fold's cost, D is `Detail`.
+
+   Landings 1 and 2 landed together, 6 Sep, as one migration
+   `b1e40c93 -> 50351c18`. Found on the way: the user's store was at
+   the slice A layout (`b1e40c93`: raw events by lineage, a folded
+   head per agent, the presentation record, the transitional attention
+   table; slice B's story never ran on it), not the pre-A layout the
+   first draft of the migration read; a proof on a `cp` of the store
+   said so (0 agents found) before any restart, which is what the
+   proof is for. The migration reads the heads, lays each agent's
+   lineages out as one log with forks as `Rewound`, weaves in the rows
+   only a story carried (turn edges, titles, activity labels, wants)
+   after the raw row each followed when a store has one, and tells the
+   head's title and activity again at the end when the rows had not.
+   The heads, the presentation record, the attention table and any
+   story tables are dropped; cost rows are not carried over, the usage
+   tables still answer for the past (landing 3). The five variants the
+   previous Rho loop wrote (`InferenceResponse`, `ToolResult`,
+   `Queued`, `Dequeued`, `PresentationUpdated`) are rewritten as
+   `Replied`, `Sent`, `Accepted` and `Presented` by the old replay's
+   rules, so the runtime enum has no legacy variant; the old enum
+   lives in `db/legacy_events.rs` and leaves with the migration. A title the sidecar
+   gave an agent with a spawn name stays in the log now, where the old
+   head dropped it; a reader prefers the spawn name on its own. On a
+   `cp` of the store: 2824 agents, 1,109,932 rows, 110 forks, 146 heads
+   told again, 21 s in one write transaction; every agent's visible
+   history replayed value by value, unchanged. What the landing leaves
+   open, in the order it will bite:
+   - `Detail` is served but not asked for: the transcript folded from
+     the mirror shows a tool call as its line and its status, never its
+     output, and the GUI has no request wired to a tool being opened.
+     That is the client half of D, still to do.
+   - `Log` rides the main stream and `Live` the uni streams, so they are
+     unordered: a reply that has just landed in the log may show twice
+     for a moment, once in the fold and once in the live tail, until the
+     next live frame drops it from the tail.
+   - Every `Log` entry re-folds each open transcript from its whole
+     mirror, O(session) per entry per open agent; an incremental fold
+     is the fix when a long session streams.
+   - `get_agent` folds the agent's whole log on every call; the daemon's
+     hot paths (mail routing, parents, subscribers) want a config-only
+     projection, not yet written.
+   - A client that holds none of a host's agents at `Ready` picks its
+     first subscriptions only when its cursor reaches the `journal_head`
+     `Ready` named, so a cold client's rail fills before any transcript
+     is asked for.
+   - The GUI tests feed whole transcript states; the diff frames went
+     with the encoder and no test describes a transcript as diffs.
+
+   Landed 6 Sep, after it: the client and the daemon made dumber. The
+   client holds every agent as a digest (identity plus what the rails
+   read, folded incrementally) and at most four agents whole: their
+   events, the transcript folded from them, and the live tail. The
+   digests go to disk in the same transaction as the rows that made
+   them (`gui_agent_digest_v1`), so a restart reads them back instead of
+   folding every event again; the rows are read only when a transcript
+   opens. The four are the focus set every host is told, replaced whole
+   when one joins or leaves; leaving drops the events, the transcript,
+   the live tail and the view unless a pane still shows it. Gone with
+   that: the warm set seeded at `Ready`, the resubscribe of retained
+   transcripts on reconnect (the focus set is simply sent again after
+   `Follow`), the frame queue that coalesced live frames across draws,
+   `AgentUnloaded` (the daemon sends one empty `Live` when an agent
+   leaves the focus set, and nothing else about loading), and the six
+   tests that described retention. The daemon answers whether an agent
+   exists with one key lookup instead of folding every head, and the
+   cost series walks agent ids instead of heads. Still open:
+   - `Detail` unwired on the client, as above.
+   - `Log` and `Live` unordered, as above.
+   - The transcript of an active agent is re-folded whole on every
+     `Log` entry; the digest is incremental, the transcript is not.
+   - `get_agent` still folds one agent's whole log per call on the
+     daemon's mail and tool paths; nothing loaded keeps its config in
+     memory yet.
+   - The mirror's per-agent rows are kept for every agent, not only
+     the active four; nothing prunes them.
+
+   Landed 6 Sep, after that: the live tail as deltas, step 1 of
+   `LIVE-TAIL-PLAN.md` (wire `rho/ui/11`). `LiveFrame` and everything
+   named `Ui*` left the wire; `Live` is one of `Requesting`, `Item`,
+   `Appended`, `Retrying`, `Waiting`, `Idle`, and `Detail` answers a
+   response with the same `Item`s. The loop says what changed at its
+   one publish site through a teller that remembers what it last told;
+   `AStr::diff` makes an append an `Appended`. Rows and deltas ride
+   one broadcast feed in the daemon (the journal observer carries
+   both), so a connection forwards them in the order they happened and
+   the row always precedes the tail that follows it: `Log` and `Live`
+   are ordered now. The per-agent iroh uni streams, their weights and
+   decode budget, `AgentStreamOpened` and the stream generations are
+   gone. Focus never loads: the pool unions every connection's focus
+   into one live set, a loop tells only while it is in it, and a
+   loaded agent entering it is told to say its tail whole; a follower
+   asks the same after its catch-up and after a lag, and drops deltas
+   until the first whole tell arrives. Every command that names an
+   agent loads it. Loaded agents sit in an LRU of 100; past it the
+   least recently used one that is idle, has nothing queued and nobody
+   is looking at is dropped, which ends its loop (the created event
+   and the turn watcher no longer hold handles). Each loop keeps its
+   `AgentHead` in memory, updated when it changes its own profile, and
+   the daemon's tool, mail, shell and terminal paths load the agent
+   and read that instead of folding the log. The render types moved to
+   `rho-registry::render`; the client's store keeps the tail from the
+   deltas. Still open, in `LIVE-TAIL-PLAN.md`: the incremental
+   transcript fold, derived attention, batched mirror writes, the
+   digest fold version (step 2); presentation into the loop, and with
+   it `AgentState`, the sidecar and the turn watcher (step 3);
+   `agent_handle` still folds a log for its label.
+
+   Landed 6 Sep, after that: step 2 of `LIVE-TAIL-PLAN.md`, the client.
+   The transcript is folded incrementally: `TranscriptFold` takes one
+   row at a time like the digest and gives the store its blocks; a
+   `Log` entry for an active agent no longer refolds its events. The
+   attention table is gone; attention is `rho_registry::attention`
+   over the digest's facts (turn running, errored past, wants past)
+   and one user verdict (`handled_through`, `muted`) kept in
+   `gui_agent_verdict_v1` and written when it changes. The desk card
+   and the registry make the same call. The mirror writer drains
+   everything queued and commits once, so catch-up is one transaction
+   per batch rather than one per row. Each stored digest carries the
+   fold version; a mismatch at startup refolds that agent from its
+   rows and writes the digest back. Claude rewinds reach the mirror as
+   `Rewound` rows already, so no `TranscriptReplaced` row was needed.
+
+   Landed 6 Sep, after that: step 3 of `LIVE-TAIL-PLAN.md`. What a
+   loop publishes is an `AgentStatus` (its kind and how many inputs
+   wait), not the whole `AgentState`; the Rho loop builds it from its
+   own fields without cloning history, and the Claude loop owns its
+   `AgentState` as a private field. `subscribe()`, the `Notify` and
+   the daemon's turn watcher are gone: both loops already settle the
+   turn with the pool, which flushes usage. Presentation is gated by
+   the live set: the pool tells a loaded loop it is watched when it
+   enters the set and unwatched when it leaves (an idempotent flag,
+   no counted `Watch` handles), and the sidecar makes titles and
+   activity only while watched; the turn report at every turn end is
+   unchanged. The pool's activation observer is gone with the watcher.
+   `agent_handle` reads the loaded loop's head and folds a log only
+   for a cold agent. Left as it was: the sidecar itself, since the loop
+   drives it and its `Presented` rows are already the loop's own.
+
+   Landed 6 Sep, after that: two leftovers closed. Blocks are shared
+   (`Vec<Arc<UiBlock>>`): the fold hands out pointers to what it keeps
+   and copies a block out of its sharing only when a row changes it,
+   so a `Log` row costs the blocks it adds and the store's summary
+   walks pointers. A failed request is a row, `Failed { partial,
+   error, retrying, at }`, written by the Rho loop on every temporary
+   failure and by both loops on a final one, before the phase moves;
+   its strip carries the text the model had said, the fold shows it,
+   and a retry is a notice after it. `Live::Retrying` is gone with it
+   (wire `rho/ui/12`); a retry tells `Requesting` after its row. The
+   variant id is a hash of the name, so older logs decode unchanged.
+
+   With it, a way back: `db::prepare` takes a redb persistent savepoint
+   before a due migration and records its id; `rho debug rollback`
+   restores it with the daemon stopped. The savepoint pins every page
+   it covers, so it goes with the migration once the new build has run.
+
 Each slice lands on its own with the tests of the slices before it
 green; each daemon slice is proven on a read-only copy of the user's
 store before the user restarts.
@@ -414,10 +784,24 @@ in `STORE-DESIGN.md`.
   read on a list, a log or a picker belongs to whatever the map's
   cursor last left behind, and a verdict pressed there takes it.
 - A migration file still present after the user has restarted on it.
+- A story event written by hand beside a raw event, or a mirror event
+  that is not `strip` of exactly one raw event.
+- A table on the daemon that the agent logs and the journal could
+  rebuild.
+- A per-agent position in a client's request, or a head on the wire.
 
 ## What done means
 
-The daemon stores raw log, story log, and head per agent and nothing
-else; the GUI lists, ranks, and reads every agent from its own mirror,
-offline, with the daemon only streaming increments and the open agent's
-live frame; usage graphs and attention are the client's.
+The daemon stores the raw log per agent and one journal, and nothing
+else; the mirror is `strip` of the raw log and a client's knowledge of
+a host is one seq; the GUI lists, ranks, and reads every agent from its
+own mirror, offline, with the daemon only streaming `Log` from the
+client's cursor and the focused agents' live frames; usage graphs,
+heads and attention are the client's fold.
+
+**Store size (6 Sep).** The 47 GB file held 3.6 GB of rows; the rest was
+pages pinned by ten stale persistent savepoints. `rho debug
+drop-stale-savepoints`, `forget-savepoints`, `compact` and `stats` handle it;
+redb moved to 4.2.0 vendored with one allocator fix so compaction reaches
+the empty regions (copy: 30.1 GB to 5.44 GB in 12 s). Details in
+LIVE-TAIL-PLAN.md.

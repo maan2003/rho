@@ -4,8 +4,10 @@
 //! Pure over the block list plus a per-block visibility mask; the transcript
 //! model materializes the resulting index ranges into buffer anchors.
 
+use std::borrow::Borrow;
+
+use rho_registry::render::{UiBlock, UiMessagePhase};
 use rho_ui_proto::MessageDelivery;
-use rho_ui_proto::remote::{UiBlock, UiMessagePhase};
 
 pub const LIMITED_TAIL_ROWS: u32 = 12;
 
@@ -33,8 +35,8 @@ pub struct ElisionPlan {
 /// `turn_in_progress` says the last turn is still being produced; the last
 /// fold in that open turn keeps a limited visible tail instead of collapsing
 /// fully.
-pub fn elision_plans_from(
-    blocks: &[UiBlock],
+pub fn elision_plans_from<B: Borrow<UiBlock>>(
+    blocks: &[B],
     visible: &[bool],
     from_block: usize,
     carry: Option<ElisionPlan>,
@@ -48,7 +50,7 @@ pub fn elision_plans_from(
     while turn_start < blocks.len() {
         let turn_end = blocks[turn_start + 1..]
             .iter()
-            .position(is_user)
+            .position(|block| is_user(block.borrow()))
             .map(|offset| turn_start + 1 + offset)
             .unwrap_or(blocks.len());
         let turn = &blocks[turn_start..turn_end];
@@ -56,8 +58,10 @@ pub fn elision_plans_from(
         if tail_open {
             open_turn_start = Some(turn_start);
         }
-        let has_non_working = (0..turn.len())
-            .any(|offset| !is_user(&turn[offset]) && !block_is_working(&turn[offset]));
+        let has_non_working = turn
+            .iter()
+            .map(Borrow::borrow)
+            .any(|block| !is_user(block) && !block_is_working(block));
         let tail_rows = if has_non_working {
             0
         } else {
@@ -65,6 +69,7 @@ pub fn elision_plans_from(
         };
 
         for (offset, block) in turn.iter().enumerate() {
+            let block = block.borrow();
             let index = turn_start + offset;
             if !visible.get(index).copied().unwrap_or(false) {
                 continue;
@@ -108,9 +113,12 @@ pub fn elision_plans_from(
 }
 
 /// Start of the turn containing `block_index` (clamped to the last turn).
-pub fn turn_start_index(blocks: &[UiBlock], block_index: usize) -> usize {
+pub fn turn_start_index<B: Borrow<UiBlock>>(blocks: &[B], block_index: usize) -> usize {
     let end = block_index.saturating_add(1).min(blocks.len());
-    blocks[..end].iter().rposition(is_user).unwrap_or(0)
+    blocks[..end]
+        .iter()
+        .rposition(|block| is_user(block.borrow()))
+        .unwrap_or(0)
 }
 
 fn is_user(block: &UiBlock) -> bool {
@@ -151,7 +159,7 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::remote::{UiMessagePhase, UiTool, UiToolStatus};
+    use rho_registry::render::{UiMessagePhase, UiTool, UiToolStatus};
 
     use super::*;
 

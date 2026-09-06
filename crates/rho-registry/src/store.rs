@@ -1,13 +1,18 @@
-//! Canonical per-agent protocol state and frame change summaries.
+//! Canonical per-agent transcript state and change summaries.
 //!
-//! Each agent's `UiAgentState` exists exactly once, here. Frames mutate it in
-//! place; the returned [`FrameSummary`] tells views the minimal region they
-//! must re-render, so per-event cost is O(changed suffix), never O(session).
+//! Each agent's `UiAgentState` exists exactly once, here: the fold of its
+//! mirror, with the runtime's live tail layered after it while a turn
+//! runs. The tail is kept from the deltas the runtime tells; every change
+//! returns a [`FrameSummary`] telling views the minimal region they must
+//! re-render, so per-event cost is O(changed suffix), never O(session).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rho_ui_proto::AgentId;
-use rho_ui_proto::remote::{AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlockDiff};
+use rho_ui_proto::mirror::{Item, Live};
+
+use crate::render::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSummary {
@@ -36,6 +41,13 @@ impl FrameSummary {
         }
     }
 
+    pub fn nothing() -> Self {
+        Self {
+            first_changed_block: None,
+            incremental: None,
+        }
+    }
+
     /// Combines two summaries into one covering both changes, so hidden
     /// views can accumulate frames and render once when shown.
     pub fn merge(self, other: Self) -> Self {
@@ -55,70 +67,166 @@ impl FrameSummary {
     }
 }
 
+/// One agent's transcript: the fold, the live tail, and the two composed.
+struct Layered {
+    fold: UiAgentState,
+    tail: Tail,
+    state: UiAgentState,
+}
+
+impl Layered {
+    fn compose(&mut self) {
+        let mut state = self.fold.clone();
+        state.blocks.extend(
+            self.tail
+                .items
+                .iter()
+                .flatten()
+                .map(|item| Arc::new(block(item))),
+        );
+        state.status = match self.tail.phase {
+            Phase::Requesting => UiAgentStatus::Streaming,
+            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
+            Phase::Idle | Phase::Unknown => state.status,
+        };
+        self.state = state;
+    }
+}
+
+/// What the runtime has past the log, kept from its deltas. Every phase
+/// message empties the items: a request starts with none, and once calls
+/// run or the turn ends the row carries the response.
+#[derive(Default)]
+struct Tail {
+    phase: Phase,
+    /// By the runtime's index; `None` where nothing was told.
+    items: Vec<Option<Item>>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    /// Nothing told yet: the fold's status stands.
+    #[default]
+    Unknown,
+    Requesting,
+    Waiting(Option<rho_core::UnixMs>),
+    Idle,
+}
+
+impl Tail {
+    fn apply(&mut self, live: Live) {
+        match live {
+            Live::Requesting => {
+                self.phase = Phase::Requesting;
+                self.items.clear();
+            }
+            Live::Item { index, item } => {
+                let index = index as usize;
+                if self.items.len() <= index {
+                    self.items.resize(index + 1, None);
+                }
+                self.items[index] = Some(item);
+            }
+            // An index not held is from before this client was told the
+            // tail whole; the whole item follows.
+            Live::Appended { index, text } => {
+                if let Some(Some(item)) = self.items.get_mut(index as usize) {
+                    match item {
+                        Item::Text { text: held, .. } | Item::Reasoning { text: held } => {
+                            held.push_str(&text)
+                        }
+                        Item::ToolCall { arguments, .. } => arguments.push_str(&text),
+                    }
+                }
+            }
+            Live::Waiting { until } => {
+                self.phase = Phase::Waiting(until);
+                self.items.clear();
+            }
+            Live::Idle => {
+                self.phase = Phase::Idle;
+                self.items.clear();
+            }
+        }
+    }
+}
+
+/// An in-flight item as the transcript draws it.
+pub fn block(item: &Item) -> UiBlock {
+    match item {
+        Item::Text { text, phase } => UiBlock::AssistantMessage {
+            text: text.clone(),
+            phase: phase.map(Into::into),
+        },
+        Item::Reasoning { text } => UiBlock::Reasoning { text: text.clone() },
+        Item::ToolCall {
+            id,
+            name,
+            arguments,
+        } => UiBlock::Tool(UiTool {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+            preview: None,
+            status: UiToolStatus::Running,
+            output: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            metadata: None,
+        }),
+    }
+}
+
 #[derive(Default)]
 pub struct AgentStore {
-    states: HashMap<AgentId, UiAgentState>,
+    states: HashMap<AgentId, Layered>,
 }
 
 impl AgentStore {
-    pub fn apply(&mut self, agent_id: AgentId, frame: AgentRemoteFrame) -> FrameSummary {
-        let state = self.states.entry(agent_id).or_insert_with(empty_state);
-        let old_status = state.status;
-        // A snapshot with no blocks says the daemon has nothing loaded for
-        // this agent, never that the agent said nothing. Letting it through
-        // wiped a transcript read from the story and left the reader with a
-        // blank page and a composer.
-        if let AgentRemoteFrame::Snapshot(fresh) = &frame
-            && fresh.blocks.is_empty()
-            && !state.blocks.is_empty()
-        {
-            state.status = fresh.status;
-            state.context_used = fresh.context_used;
-            state.usage = fresh.usage.clone();
-            return FrameSummary {
-                first_changed_block: None,
-                incremental: None,
-            };
-        }
-        let mut summary = summarize(&frame);
-        frame.apply_diff(state);
-        // Elision gives the last fold in an open turn a limited visible tail,
-        // so ending (or reopening) a turn re-renders its last block even when
-        // no block content changed.
-        if turn_open(old_status) != turn_open(state.status) && !state.blocks.is_empty() {
-            summary = summary.merge(FrameSummary {
-                first_changed_block: Some(state.blocks.len() - 1),
-                incremental: None,
-            });
-        }
-        summary
+    /// The transcript as folded from the mirror. The live tail, if any,
+    /// stays on top of it.
+    pub fn set_fold(&mut self, agent_id: AgentId, fold: UiAgentState) -> FrameSummary {
+        self.change(agent_id, |layered| layered.fold = fold)
+    }
+
+    /// One change to what the runtime has past the mirror.
+    pub fn apply_live(&mut self, agent_id: AgentId, live: Live) -> FrameSummary {
+        self.change(agent_id, |layered| layered.tail.apply(live))
     }
 
     pub fn get(&self, agent_id: &AgentId) -> Option<&UiAgentState> {
-        self.states.get(agent_id)
+        self.states.get(agent_id).map(|layered| &layered.state)
     }
 
-    /// Drops a retained transcript. Unlike unloading, which keeps the
-    /// snapshot readable, this is for an agent whose daemon is gone.
+    /// Drops a transcript: the agent left this client's active set, or
+    /// its daemon is gone.
     pub fn forget(&mut self, agent_id: AgentId) {
         self.states.remove(&agent_id);
     }
 
-    pub fn mark_unloaded(&mut self, agent_id: AgentId) -> FrameSummary {
-        let state = self.states.entry(agent_id).or_insert_with(empty_state);
-        let was_open = turn_open(state.status);
-        state.status = UiAgentStatus::Unloaded;
-        if was_open && !state.blocks.is_empty() {
-            FrameSummary {
-                first_changed_block: Some(state.blocks.len() - 1),
+    fn change(&mut self, agent_id: AgentId, change: impl FnOnce(&mut Layered)) -> FrameSummary {
+        let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
+            fold: empty_state(),
+            tail: Tail::default(),
+            state: empty_state(),
+        });
+        let old = std::mem::replace(&mut layered.state, empty_state());
+        change(layered);
+        layered.compose();
+        let mut summary = summarize(&old.blocks, &layered.state.blocks);
+        // Elision gives the last fold in an open turn a limited visible tail,
+        // so ending (or reopening) a turn re-renders its last block even when
+        // no block content changed.
+        if turn_open(old.status) != turn_open(layered.state.status)
+            && !layered.state.blocks.is_empty()
+        {
+            summary = summary.merge(FrameSummary {
+                first_changed_block: Some(layered.state.blocks.len() - 1),
                 incremental: None,
-            }
-        } else {
-            FrameSummary {
-                first_changed_block: None,
-                incremental: None,
-            }
+            });
         }
+        summary
     }
 }
 
@@ -142,264 +250,139 @@ fn empty_state() -> UiAgentState {
     }
 }
 
-/// Computes what a frame will change, before it is applied.
-fn summarize(frame: &AgentRemoteFrame) -> FrameSummary {
-    match frame {
-        AgentRemoteFrame::Snapshot(_) => FrameSummary::everything(),
-        AgentRemoteFrame::Diff { blocks, .. } => {
-            let mut first_changed = None;
-            let mut note = |index: usize| {
-                first_changed = Some(first_changed.map_or(index, |first: usize| first.min(index)));
-            };
-            for update in &blocks.updates {
-                note(update.index);
-            }
-            if let Some(truncate_to) = blocks.truncate_to {
-                note(truncate_to);
-            }
-            let incremental = if blocks.truncate_to.is_none() && blocks.updates.len() == 1 {
-                let update = &blocks.updates[0];
-                match &update.block {
-                    UiBlockDiff::AssistantText(_) => Some(IncrementalUpdate::AssistantText {
-                        index: update.index,
-                    }),
-                    UiBlockDiff::ReasoningText(_) => Some(IncrementalUpdate::ReasoningText {
-                        index: update.index,
-                    }),
-                    UiBlockDiff::Tool(_) => Some(IncrementalUpdate::Tool {
-                        index: update.index,
-                    }),
-                    UiBlockDiff::Replace(_) => None,
-                }
-            } else {
-                None
-            };
-            FrameSummary {
-                first_changed_block: first_changed,
-                incremental,
-            }
-        }
+/// What changed between two block lists: the first index that differs,
+/// and whether it is one block growing in place. Blocks the fold kept
+/// are the same pointer on both sides, which `Arc`'s equality sees first.
+fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
+    let shared = old.len().min(new.len());
+    let first_changed = (0..shared).find(|index| old[*index] != new[*index]);
+    let first_changed = match first_changed {
+        Some(index) => index,
+        None if old.len() == new.len() => return FrameSummary::nothing(),
+        None => shared,
+    };
+    let incremental = (old.len() == new.len()
+        && old[first_changed + 1..] == new[first_changed + 1..])
+        .then(|| match &*new[first_changed] {
+            UiBlock::AssistantMessage { .. } => Some(IncrementalUpdate::AssistantText {
+                index: first_changed,
+            }),
+            UiBlock::Reasoning { .. } => Some(IncrementalUpdate::ReasoningText {
+                index: first_changed,
+            }),
+            UiBlock::Tool(_) => Some(IncrementalUpdate::Tool {
+                index: first_changed,
+            }),
+            _ => None,
+        })
+        .flatten();
+    FrameSummary {
+        first_changed_block: Some(first_changed),
+        incremental,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::remote::{
-        UiBlock, UiBlockDiff, UiBlockUpdate, UiBlocksDiff, UiTextDiff, UiToolDiff, UiToolStatus,
-    };
+    use rho_ui_proto::AgentIdDomain;
 
     use super::*;
 
-    fn diff_frame(blocks: UiBlocksDiff) -> AgentRemoteFrame {
-        AgentRemoteFrame::Diff {
-            blocks,
-            status: None,
-            context_used: None,
-            usage: None,
+    fn agent() -> AgentId {
+        AgentId::from_counter(1, &AgentIdDomain(0)).unwrap()
+    }
+
+    fn fold(texts: &[&str]) -> UiAgentState {
+        UiAgentState {
+            blocks: texts
+                .iter()
+                .map(|text| {
+                    Arc::new(UiBlock::UserMessage {
+                        text: (*text).to_owned(),
+                    })
+                })
+                .collect(),
+            ..empty_state()
         }
     }
 
-    /// The daemon sends a snapshot with no blocks for an agent it has not
-    /// loaded. The story the client read is better than that, so it stays.
     #[test]
-    fn an_empty_snapshot_does_not_wipe_a_told_transcript() {
-        let agent_id = AgentId::from_counter(7, &rho_ui_proto::AgentIdDomain(0)).expect("agent id");
+    fn the_live_tail_rides_on_the_fold() {
         let mut store = AgentStore::default();
-        let mut told = empty_state();
-        told.blocks = vec![UiBlock::Notice {
-            text: "read from the story".to_owned(),
-        }];
-        store.apply(agent_id, AgentRemoteFrame::Snapshot(told));
-
-        let mut nothing = empty_state();
-        nothing.status = UiAgentStatus::Unloaded;
-        store.apply(agent_id, AgentRemoteFrame::Snapshot(nothing));
-
-        let state = store.get(&agent_id).expect("the agent has a state");
-        assert_eq!(state.blocks.len(), 1, "the told blocks stayed");
-        assert_eq!(state.status, UiAgentStatus::Unloaded, "the status is taken");
-    }
-
-    #[test]
-    fn snapshot_changes_everything() {
-        let frame = AgentRemoteFrame::Snapshot(empty_state());
-        assert_eq!(summarize(&frame), FrameSummary::everything());
-    }
-
-    #[test]
-    fn status_only_diff_is_a_noop() {
-        let frame = diff_frame(UiBlocksDiff {
-            truncate_to: None,
-            updates: Vec::new(),
-        });
         assert_eq!(
-            summarize(&frame),
+            store.set_fold(agent(), fold(&["one", "two"])),
             FrameSummary {
-                first_changed_block: None,
+                first_changed_block: Some(0),
                 incremental: None,
             }
         );
-    }
-
-    #[test]
-    fn streaming_update_changes_only_that_block() {
-        let frame = diff_frame(UiBlocksDiff {
-            truncate_to: None,
-            updates: vec![UiBlockUpdate {
-                index: 4,
-                block: UiBlockDiff::AssistantText(UiTextDiff {
-                    keep_bytes: 3,
-                    value: "lo".to_owned(),
-                }),
-            }],
-        });
+        let summary = store.apply_live(agent(), Live::Requesting);
+        assert_eq!(summary.first_changed_block, Some(1));
         assert_eq!(
-            summarize(&frame),
-            FrameSummary {
-                first_changed_block: Some(4),
-                incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
-            }
+            store.get(&agent()).unwrap().status,
+            UiAgentStatus::Streaming
         );
-    }
-
-    #[test]
-    fn tool_update_carries_incremental_hint() {
-        let frame = diff_frame(UiBlocksDiff {
-            truncate_to: None,
-            updates: vec![UiBlockUpdate {
-                index: 2,
-                block: UiBlockDiff::Tool(UiToolDiff {
-                    id: "tool-1".to_owned(),
-                    name: "shell_command".to_owned(),
-                    arguments: Some(UiTextDiff {
-                        keep_bytes: 4,
-                        value: " ok".to_owned(),
-                    }),
-                    preview: None,
-                    status: Some(UiToolStatus::Running),
-                    output: None,
-                    error: None,
-                    started_at: None,
-                    finished_at: None,
-                    metadata: None,
-                }),
-            }],
-        });
-        assert_eq!(
-            summarize(&frame),
-            FrameSummary {
-                first_changed_block: Some(2),
-                incremental: Some(IncrementalUpdate::Tool { index: 2 }),
-            }
-        );
-    }
-
-    #[test]
-    fn merging_updates_to_the_same_block_keeps_incremental_hint() {
-        let update = FrameSummary {
-            first_changed_block: Some(4),
-            incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
-        };
-        assert_eq!(update.merge(update), update);
-    }
-
-    #[test]
-    fn merging_updates_to_different_blocks_drops_incremental_hint() {
-        let first = FrameSummary {
-            first_changed_block: Some(4),
-            incremental: Some(IncrementalUpdate::AssistantText { index: 4 }),
-        };
-        let second = FrameSummary {
-            first_changed_block: Some(5),
-            incremental: Some(IncrementalUpdate::AssistantText { index: 5 }),
-        };
-        assert_eq!(
-            first.merge(second),
-            FrameSummary {
-                first_changed_block: Some(4),
-                incremental: None,
-            }
-        );
-    }
-
-    #[test]
-    fn closing_the_turn_re_renders_the_last_block() {
-        let mut store = AgentStore::default();
-        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
-        store.apply(
-            agent,
-            AgentRemoteFrame::Snapshot(UiAgentState {
-                blocks: vec![
-                    UiBlock::UserMessage {
-                        text: "go".to_owned(),
-                    },
-                    UiBlock::AssistantMessage {
-                        text: "done".to_owned(),
-                        phase: None,
-                    },
-                ],
-                status: UiAgentStatus::Streaming,
-                context_used: None,
-                usage: Default::default(),
-            }),
-        );
-        let summary = store.apply(
-            agent,
-            AgentRemoteFrame::Diff {
-                blocks: UiBlocksDiff {
-                    truncate_to: None,
-                    updates: Vec::new(),
+        let summary = store.apply_live(
+            agent(),
+            Live::Item {
+                index: 0,
+                item: Item::Text {
+                    text: "th".to_owned(),
+                    phase: None,
                 },
-                status: Some(UiAgentStatus::Idle),
-                context_used: None,
-                usage: None,
             },
         );
-        assert_eq!(summary.first_changed_block, Some(1));
-    }
+        assert_eq!(summary.first_changed_block, Some(2));
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 3);
+        assert_eq!(state.status, UiAgentStatus::Streaming);
 
-    #[test]
-    fn server_unload_retains_transcript_and_closes_turn() {
-        let mut store = AgentStore::default();
-        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
-        store.apply(
-            agent,
-            AgentRemoteFrame::Snapshot(UiAgentState {
-                blocks: vec![UiBlock::AssistantMessage {
-                    text: "partial".to_owned(),
-                    phase: None,
-                }],
-                status: UiAgentStatus::Streaming,
-                context_used: None,
-                usage: Default::default(),
-            }),
+        // The same block growing is an incremental update.
+        let summary = store.apply_live(
+            agent(),
+            Live::Appended {
+                index: 0,
+                text: "ree".to_owned(),
+            },
+        );
+        assert_eq!(
+            summary.incremental,
+            Some(IncrementalUpdate::AssistantText { index: 2 })
+        );
+        assert_eq!(
+            *store.get(&agent()).unwrap().blocks[2],
+            UiBlock::AssistantMessage {
+                text: "three".to_owned(),
+                phase: None
+            }
         );
 
-        let summary = store.mark_unloaded(agent);
-
-        let state = store.get(&agent).unwrap();
-        assert_eq!(state.status, UiAgentStatus::Unloaded);
-        assert_eq!(state.blocks.len(), 1);
-        assert_eq!(summary.first_changed_block, Some(0));
-    }
-
-    #[test]
-    fn update_and_truncate_take_the_smaller_index() {
-        let frame = diff_frame(UiBlocksDiff {
-            truncate_to: Some(2),
-            updates: vec![UiBlockUpdate {
-                index: 4,
-                block: UiBlockDiff::Replace(UiBlock::Notice {
-                    text: "x".to_owned(),
-                }),
-            }],
-        });
+        // An append to an index never told is from before this client
+        // was told the tail; it is dropped.
         assert_eq!(
-            summarize(&frame),
-            FrameSummary {
-                first_changed_block: Some(2),
-                incremental: None,
-            }
+            store.apply_live(
+                agent(),
+                Live::Appended {
+                    index: 3,
+                    text: "x".to_owned()
+                }
+            ),
+            FrameSummary::nothing()
+        );
+
+        // The row lands first, then the tail says the turn is over.
+        store.set_fold(agent(), fold(&["one", "two", "three"]));
+        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 4);
+        let summary = store.apply_live(agent(), Live::Idle);
+        assert_eq!(summary.first_changed_block, Some(2));
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 3);
+        assert_eq!(state.status, UiAgentStatus::Idle);
+
+        // An unchanged fold is no change at all.
+        assert_eq!(
+            store.set_fold(agent(), fold(&["one", "two", "three"])),
+            FrameSummary::nothing()
         );
     }
 }

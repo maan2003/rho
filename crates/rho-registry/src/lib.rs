@@ -1,10 +1,10 @@
 //! Agent lifecycle, selection, naming, and host ownership shared by Rho
 //! clients.
 
+pub mod fold;
+pub mod render;
 pub mod session;
 pub mod store;
-pub mod story;
-pub mod story_view;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,9 +12,12 @@ use std::fmt;
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
-use rho_ui_proto::story::{UiAgentHead, UiStoryEvent, UiStoryPos};
+use rho_ui_proto::mirror::{AgentWant, LogEntry};
 
-pub use crate::story::{Attention, MirroredAgent, StoryDigest, Wants};
+pub use crate::fold::{
+    AgentIdentity, Attention, AttentionFacts, DIGEST_VERSION, Digest, MirroredAgent,
+    TranscriptFold, Verdict, Wants, attention, one_line, transcript,
+};
 
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,25 +82,25 @@ pub struct AgentSummary {
 
 impl AgentSummary {
     fn of(mirrored: &MirroredAgent) -> Self {
-        let head = &mirrored.head;
+        let identity = &mirrored.identity;
         let digest = &mirrored.digest;
         Self {
-            agent_id: head.agent_id,
-            parent_agent: head.parent,
-            display_name: head.title().map(str::to_owned),
-            created_at: head.created_at,
-            role: head.role,
+            agent_id: identity.agent_id,
+            parent_agent: identity.parent,
+            display_name: mirrored.title().map(str::to_owned),
+            created_at: identity.created_at,
+            role: identity.role,
             // Every agent is created with at least one workdir, so the
-            // fallback is only for a head that arrived malformed.
-            workspace: head.workspace().cloned().unwrap_or(
+            // fallback is only for a creation that arrived malformed.
+            workspace: identity.workspace().cloned().unwrap_or(
                 rho_ui_proto::WorkspaceInfo::UserCheckout {
                     repo: Default::default(),
                 },
             ),
-            last_active: digest.last_active.max(head.created_at),
+            last_active: digest.last_active.max(identity.created_at),
             hidden: false,
             last_user_message_text: digest.last_user_message_text.clone(),
-            activity: head.activity.clone(),
+            activity: digest.activity.clone(),
             labels: Vec::new(),
         }
     }
@@ -124,9 +127,11 @@ pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
     /// What the view derived, pushed back in so every rail reads one
     /// answer rather than each deriving its own.
-    attention: BTreeMap<AgentId, Attention>,
+    /// What the user said about each agent; attention is derived from
+    /// this and the digest, never stored.
+    verdicts: BTreeMap<AgentId, Verdict>,
     activities: BTreeMap<AgentId, String>,
-    /// The mirror: every agent's head and the fold of its story.
+    /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: hidden agents and their labels.
     filing: BTreeMap<AgentId, (bool, Vec<String>)>,
@@ -167,17 +172,7 @@ impl AgentRegistry {
                     .map(|(id, _)| *id),
             )
             .collect::<BTreeSet<_>>();
-        self.agents.retain(|id, _| !departed.contains(id));
-        self.attention.retain(|id, _| !departed.contains(id));
-        self.activities.retain(|id, _| !departed.contains(id));
-        self.mirror.retain(|id, _| !departed.contains(id));
-        self.filing.retain(|id, _| !departed.contains(id));
-        self.last_active.retain(|id, _| !departed.contains(id));
-        self.announced_hosts.retain(|id, _| !departed.contains(id));
-        self.order.retain(|id| !departed.contains(id));
-        if matches!(self.active, ActivePane::Agent(id) if departed.contains(&id)) {
-            self.active = ActivePane::Draft;
-        }
+        self.forget_agents(&departed);
         self.rebuild(None);
         self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
@@ -218,22 +213,8 @@ impl AgentRegistry {
         self.mark_known(agent_id);
     }
 
-    pub fn set_host_data(
-        &mut self,
-        host: HostId,
-        machine_seed: u64,
-        agent_counter: u64,
-        heads: Vec<UiAgentHead>,
-    ) {
-        let live = heads
-            .iter()
-            .map(|head| head.agent_id)
-            .collect::<BTreeSet<_>>();
-        self.mirror
-            .retain(|agent_id, mirrored| live.contains(agent_id) || mirrored.host != host);
-        for head in heads {
-            self.set_head(host, head);
-        }
+    /// What `Ready` says of a host. The agents come by the log, not here.
+    pub fn set_host_data(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
@@ -241,63 +222,77 @@ impl AgentRegistry {
         self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
-    /// One agent's head, from `Ready` or from a later `AgentHead`. The
-    /// fold of its story is kept: a head says what the agent is, never
-    /// what has happened to it.
-    pub fn set_head(&mut self, host: HostId, head: UiAgentHead) {
-        let agent_id = head.agent_id;
-        match self.mirror.get_mut(&agent_id) {
-            Some(mirrored) => {
-                mirrored.host = host;
-                mirrored.digest.turn_running = head.turn_running;
-                mirrored.head = head;
-            }
-            None => {
-                self.mirror.insert(agent_id, MirroredAgent::new(host, head));
+    /// Drops everything mirrored from a host that is still attached: for
+    /// a daemon whose database is not the one this client mirrored.
+    pub fn reset_host(&mut self, host: HostId) {
+        let departed = self
+            .mirror
+            .values()
+            .filter(|mirrored| mirrored.host == host)
+            .map(MirroredAgent::agent_id)
+            .collect::<BTreeSet<_>>();
+        self.forget_agents(&departed);
+        self.rebuild(None);
+        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+    }
+
+    fn forget_agents(&mut self, departed: &BTreeSet<AgentId>) {
+        self.agents.retain(|id, _| !departed.contains(id));
+        self.verdicts.retain(|id, _| !departed.contains(id));
+        self.activities.retain(|id, _| !departed.contains(id));
+        self.mirror.retain(|id, _| !departed.contains(id));
+        self.filing.retain(|id, _| !departed.contains(id));
+        self.last_active.retain(|id, _| !departed.contains(id));
+        self.announced_hosts.retain(|id, _| !departed.contains(id));
+        self.order.retain(|id| !departed.contains(id));
+        if matches!(self.active, ActivePane::Agent(id) if departed.contains(&id)) {
+            self.active = ActivePane::Draft;
+        }
+    }
+
+    /// A run of a host's log, folded. Positions the client already holds
+    /// are skipped, so a repeated run is harmless. An agent's first row
+    /// creates it; a row for an agent this client has not seen created
+    /// is dropped, since without its creation nothing can be said of it.
+    ///
+    /// Returns the agents that changed.
+    pub fn tell(&mut self, host: HostId, entries: &[LogEntry]) -> Vec<AgentId> {
+        let mut changed = Vec::new();
+        let mut attention_before = BTreeMap::new();
+        for entry in entries {
+            attention_before
+                .entry(entry.agent_id)
+                .or_insert_with(|| self.attention(entry.agent_id));
+            let told = match self.mirror.get_mut(&entry.agent_id) {
+                Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
+                None => match MirroredAgent::new(host, entry.agent_id, &entry.event) {
+                    Some(mirrored) => {
+                        self.mirror.insert(entry.agent_id, mirrored);
+                        self.agents
+                            .entry(entry.agent_id)
+                            .or_insert(AgentLife::Known);
+                        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if told && !changed.contains(&entry.agent_id) {
+                changed.push(entry.agent_id);
             }
         }
-        self.agents.entry(agent_id).or_insert(AgentLife::Known);
-    }
-
-    /// A run of one agent's story, folded. Positions the client already
-    /// holds are skipped, so a repeated range is harmless.
-    ///
-    /// Returns whether the client is now behind the daemon's own head,
-    /// which is how a gap asks to be filled again.
-    pub fn tell_story(&mut self, agent_id: AgentId, from: UiStoryPos, events: &[UiStoryEvent]) {
-        let Some(mirrored) = self.mirror.get_mut(&agent_id) else {
-            return;
-        };
-        mirrored.tell(from, events);
-        let digest = mirrored.digest.clone();
-        let host = mirrored.host;
-        self.last_active
-            .entry(agent_id)
-            .and_modify(|active| *active = (*active).max(digest.last_active))
-            .or_insert(digest.last_active);
-        let _ = host;
-        self.rebuild(None);
-    }
-
-    /// What this client holds of every agent's story: the version vector
-    /// `AgentLogs` sends.
-    pub fn known_story_positions(&self, host: HostId) -> Vec<(AgentId, UiStoryPos)> {
-        self.mirror
-            .values()
-            .filter(|mirrored| mirrored.host == host)
-            .map(|mirrored| (mirrored.agent_id(), mirrored.digest.newest))
-            .collect()
-    }
-
-    /// Whether this client's fold has fallen behind the head the daemon
-    /// last sent, which is what makes it ask for the gap.
-    pub fn story_gaps(&self, host: HostId) -> Vec<(AgentId, UiStoryPos)> {
-        self.mirror
-            .values()
-            .filter(|mirrored| mirrored.host == host)
-            .filter(|mirrored| mirrored.digest.newest.0 < mirrored.head.story_pos.0)
-            .map(|mirrored| (mirrored.agent_id(), mirrored.digest.newest))
-            .collect()
+        if !changed.is_empty() {
+            self.rebuild(None);
+        }
+        // A row can move attention on its own (a turn ends asking for
+        // the user); the dealer reads the revision to know.
+        if attention_before
+            .iter()
+            .any(|(agent_id, before)| self.attention(*agent_id) != *before)
+        {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
+        changed
     }
 
     /// The user's filing of an agent, from the store: hidden, and the
@@ -317,22 +312,42 @@ impl AgentRegistry {
         &self.summaries
     }
 
-    pub fn agent_digest(&self, agent_id: AgentId) -> Option<&StoryDigest> {
+    /// Agents read back from the client's own copy, digest and all, so
+    /// nothing has to be folded again. Rows that come after fold on top.
+    pub fn restore(&mut self, agents: Vec<MirroredAgent>) {
+        if agents.is_empty() {
+            return;
+        }
+        for mirrored in agents {
+            let agent_id = mirrored.agent_id();
+            self.mirror.insert(agent_id, mirrored);
+            self.agents.entry(agent_id).or_insert(AgentLife::Known);
+        }
+        self.rebuild(None);
+        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+    }
+
+    pub fn mirrored(&self, agent_id: AgentId) -> Option<&MirroredAgent> {
+        self.mirror.get(&agent_id)
+    }
+
+    pub fn agent_digest(&self, agent_id: AgentId) -> Option<&Digest> {
         self.mirror.get(&agent_id).map(|mirrored| &mirrored.digest)
     }
 
-    pub fn agent_head(&self, agent_id: AgentId) -> Option<&UiAgentHead> {
-        self.mirror.get(&agent_id).map(|mirrored| &mirrored.head)
+    pub fn agent_identity(&self, agent_id: AgentId) -> Option<&AgentIdentity> {
+        self.mirror
+            .get(&agent_id)
+            .map(|mirrored| &mirrored.identity)
     }
 
-    pub fn set_data(&mut self, agents: Vec<UiAgentHead>) {
-        let host = HostId::default();
-        let (seed, counter) = self
-            .hosts
-            .get(&host)
-            .map(|h| (h.machine_seed, h.agent_counter))
-            .unwrap_or_default();
-        self.set_host_data(host, seed, counter, agents);
+    /// Every agent mirrored from a host.
+    pub fn host_agents(&self, host: HostId) -> Vec<AgentId> {
+        self.mirror
+            .values()
+            .filter(|mirrored| mirrored.host == host)
+            .map(MirroredAgent::agent_id)
+            .collect()
     }
 
     fn rebuild(&mut self, refreshed: Option<HostId>) {
@@ -369,7 +384,7 @@ impl AgentRegistry {
             }
             summaries.push(summary);
         }
-        self.attention.retain(|id, _| self.mirror.contains_key(id));
+        self.verdicts.retain(|id, _| self.mirror.contains_key(id));
         self.agent_hosts = self
             .mirror
             .iter()
@@ -414,14 +429,22 @@ impl AgentRegistry {
         self.summaries = summaries;
     }
 
-    /// What the view derived for this agent. Attention is decided in one
-    /// place (`desk_view`) and kept here so every rail agrees.
-    pub fn set_attention(&mut self, agent_id: AgentId, attention: Attention) {
-        let changed = self.attention(agent_id) != attention;
-        self.attention.insert(agent_id, attention);
-        if changed {
+    /// What the user last said about this agent. Returns whether it is
+    /// new, so the caller writes it down only then.
+    pub fn set_agent_verdict(&mut self, agent_id: AgentId, verdict: Verdict) -> bool {
+        if self.verdicts.get(&agent_id) == Some(&verdict) {
+            return false;
+        }
+        let before = self.attention(agent_id);
+        self.verdicts.insert(agent_id, verdict);
+        if self.attention(agent_id) != before {
             self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
         }
+        true
+    }
+
+    pub fn agent_verdict(&self, agent_id: AgentId) -> Verdict {
+        self.verdicts.get(&agent_id).copied().unwrap_or_default()
     }
     pub fn set_activity(&mut self, agent_id: AgentId, activity: String) {
         self.activities.insert(agent_id, activity);
@@ -439,8 +462,12 @@ impl AgentRegistry {
         .then(|| self.agent_digest(agent_id)?.wants.as_ref())
         .flatten()
     }
+    /// Derived from the digest and the verdict, never stored.
     pub fn attention(&self, agent_id: AgentId) -> Attention {
-        self.attention.get(&agent_id).copied().unwrap_or_default()
+        match self.agent_digest(agent_id) {
+            Some(digest) => attention(digest.attention_facts(), self.agent_verdict(agent_id)),
+            None => Attention::Quiet,
+        }
     }
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
@@ -587,7 +614,7 @@ impl AgentRegistry {
             needs_you_hint: digest
                 .wants
                 .as_ref()
-                .is_some_and(|wants| wants.want == rho_ui_proto::story::UiAgentWant::Ask),
+                .is_some_and(|wants| wants.want == AgentWant::Ask),
             errored: digest.errored.is_some(),
         }
     }
@@ -719,28 +746,40 @@ impl AgentRegistry {
 
 #[cfg(test)]
 mod tests {
+    use rho_core::UnixMs;
     use rho_ui_proto::AgentIdDomain;
-    use rho_ui_proto::story::{UiAgentHead, UiRuntimeKind, UiSpawnedBy, UiStoryEvent, UiStoryPos};
+    use rho_ui_proto::mirror::{
+        AgentPos, MirrorEvent, RuntimeKind, Seq, SpawnedBy, TurnEdge, TurnOutcome,
+    };
 
     use super::*;
 
-    fn head(agent_id: AgentId) -> UiAgentHead {
-        UiAgentHead {
-            agent_id,
-            story_pos: UiStoryPos(0),
+    fn created(at: u64) -> MirrorEvent {
+        MirrorEvent::Created {
             role: rho_ui_proto::AgentRole::default(),
-            runtime_kind: UiRuntimeKind::Rho,
+            runtime: RuntimeKind::Rho,
             workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
                 repo: "/repo".into(),
             }],
-            spawned_by: UiSpawnedBy::Direct,
-            parent: None,
+            spawned_by: SpawnedBy::Direct,
             spawn_name: None,
-            generated_title: None,
-            activity: None,
-            turn_running: false,
-            created_at: rho_core::UnixMs(1),
+            parent: None,
+            model: "sol".to_owned(),
+            at: UnixMs(at),
         }
+    }
+
+    fn log(agent_id: AgentId, from: u64, events: Vec<MirrorEvent>) -> Vec<LogEntry> {
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(offset, event)| LogEntry {
+                seq: Seq(from + offset as u64 + 1),
+                agent_id,
+                pos: AgentPos(from + offset as u64),
+                event,
+            })
+            .collect()
     }
 
     #[test]
@@ -754,54 +793,117 @@ mod tests {
         registry.touch_agent(agent_id);
         assert_eq!(registry.deal_count_revision(), known_revision);
 
-        registry.set_attention(agent_id, Attention::Pending);
+        // A turn that ends asking for the user moves attention by itself.
+        let host = HostId::default();
+        registry.set_host_data(host, 0, 1);
+        registry.tell(
+            host,
+            &log(
+                agent_id,
+                0,
+                vec![
+                    created(1),
+                    MirrorEvent::Wants {
+                        want: AgentWant::Ask,
+                        summary: None,
+                        at: UnixMs(2),
+                    },
+                    MirrorEvent::Turn {
+                        edge: TurnEdge::Ended(TurnOutcome::Completed),
+                        at: UnixMs(3),
+                    },
+                ],
+            ),
+        );
+        assert_eq!(registry.attention(agent_id), Attention::Pending);
         let pending_revision = registry.deal_count_revision();
         assert_ne!(pending_revision, known_revision);
-        registry.set_attention(agent_id, Attention::Pending);
-        assert_eq!(registry.deal_count_revision(), pending_revision);
+
+        // Dealing with it is the user's verdict; saying it again is not.
+        let handled = Verdict {
+            handled_through: AgentPos(3),
+            muted: false,
+        };
+        assert!(registry.set_agent_verdict(agent_id, handled));
+        assert_eq!(registry.attention(agent_id), Attention::Quiet);
+        let handled_revision = registry.deal_count_revision();
+        assert_ne!(handled_revision, pending_revision);
+        assert!(!registry.set_agent_verdict(agent_id, handled));
+        assert_eq!(registry.deal_count_revision(), handled_revision);
     }
 
-    /// The rails read the story, not the daemon: a turn that starts and
+    /// The rails read the log, not the daemon: a turn that starts and
     /// ends asking for something leaves the fold saying exactly that.
     #[test]
-    fn the_story_is_what_the_rails_read() {
+    fn the_log_is_what_the_rails_read() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+        let host = HostId::default();
         let mut registry = AgentRegistry::default();
-        registry.set_host_data(HostId::default(), 0, 1, vec![head(agent_id)]);
-
-        registry.tell_story(
-            agent_id,
-            UiStoryPos(0),
-            &[
-                UiStoryEvent::UserMessage {
-                    text: "do the thing\nand then some".to_owned(),
-                    at: rho_core::UnixMs(10),
-                },
-                UiStoryEvent::TurnStarted {
-                    at: rho_core::UnixMs(11),
-                },
-            ],
+        registry.set_host_data(host, 0, 1);
+        // A row before the creation says nothing.
+        assert!(
+            registry
+                .tell(
+                    host,
+                    &log(
+                        agent_id,
+                        1,
+                        vec![MirrorEvent::Turn {
+                            edge: TurnEdge::Started,
+                            at: UnixMs(11),
+                        }]
+                    )
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            registry.tell(
+                host,
+                &log(
+                    agent_id,
+                    0,
+                    vec![
+                        created(1),
+                        MirrorEvent::Message {
+                            from: None,
+                            text: "do the thing\nand then some".to_owned(),
+                            delivery: rho_core::MessageDelivery::Immediate,
+                            at: UnixMs(10),
+                        },
+                        MirrorEvent::Turn {
+                            edge: TurnEdge::Started,
+                            at: UnixMs(11),
+                        },
+                    ],
+                )
+            ),
+            [agent_id]
         );
         assert!(registry.agent_facts(agent_id).turn_running);
         assert_eq!(
             registry.agent_attention_reason(agent_id),
             Some("do the thing")
         );
+        assert_eq!(registry.summaries().len(), 1);
+        assert_eq!(registry.host_of_agent(agent_id), Some(host));
 
-        registry.tell_story(
-            agent_id,
-            UiStoryPos(2),
-            &[
-                UiStoryEvent::Wants {
-                    want: rho_ui_proto::story::UiAgentWant::Ask,
-                    summary: Some("needs a decision".to_owned()),
-                    at: rho_core::UnixMs(12),
-                },
-                UiStoryEvent::TurnEnded {
-                    outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
-                    at: rho_core::UnixMs(13),
-                },
-            ],
+        registry.tell(
+            host,
+            &log(
+                agent_id,
+                3,
+                vec![
+                    MirrorEvent::Wants {
+                        want: AgentWant::Ask,
+                        summary: Some("needs a decision".to_owned()),
+                        at: UnixMs(12),
+                    },
+                    MirrorEvent::Turn {
+                        edge: TurnEdge::Ended(TurnOutcome::Completed),
+                        at: UnixMs(13),
+                    },
+                ],
+            ),
         );
         let facts = registry.agent_facts(agent_id);
         assert!(!facts.turn_running);
@@ -811,18 +913,25 @@ mod tests {
             Some("needs a decision")
         );
         // Replaying a range the fold already holds changes nothing.
-        registry.tell_story(
-            agent_id,
-            UiStoryPos(2),
-            &[UiStoryEvent::Wants {
-                want: rho_ui_proto::story::UiAgentWant::Ask,
-                summary: Some("needs a decision".to_owned()),
-                at: rho_core::UnixMs(12),
-            }],
+        assert!(
+            registry
+                .tell(
+                    host,
+                    &log(
+                        agent_id,
+                        3,
+                        vec![MirrorEvent::Wants {
+                            want: AgentWant::Ask,
+                            summary: Some("needs a decision".to_owned()),
+                            at: UnixMs(12),
+                        }]
+                    )
+                )
+                .is_empty()
         );
-        assert_eq!(
-            registry.agent_digest(agent_id).unwrap().newest,
-            UiStoryPos(4)
-        );
+        assert_eq!(registry.agent_digest(agent_id).unwrap().newest, AgentPos(5));
+
+        registry.reset_host(host);
+        assert!(registry.summaries().is_empty());
     }
 }

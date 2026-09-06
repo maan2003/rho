@@ -11,7 +11,7 @@ pub mod markdown;
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_ui_proto::remote::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
+use rho_registry::render::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_ui_proto::{AgentId, MessageDelivery};
 
 use crate::style::StyleClass;

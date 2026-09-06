@@ -95,7 +95,7 @@ pub struct AgentSource {
     pub errored: Option<StoryPos>,
     /// What the last finished turn says it asks of the user, and where it
     /// said so.
-    pub wants: Option<(rho_ui_proto::story::UiAgentWant, StoryPos)>,
+    pub wants: Option<(rho_ui_proto::mirror::AgentWant, StoryPos)>,
 }
 
 impl AgentSource {
@@ -268,20 +268,14 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     };
     let source = sources.agent(*agent)?;
     let cursor = facts.agent_handled_through.unwrap_or_default();
-    let past = |pos: StoryPos| pos >= cursor;
-    // A running turn is the agent's court, whatever the user has said: the
-    // row shows work in flight rather than a verdict.
-    let attention = if source.turn_running {
-        Attention::Working
-    } else if facts.state == State::Muted {
-        Attention::Quiet
-    } else if source.errored.is_some_and(past) {
-        Attention::NeedsInput
-    } else if source.wants.is_some_and(|(_, at)| past(at)) {
-        Attention::Pending
-    } else {
-        Attention::Quiet
-    };
+    let attention = rho_registry::attention(
+        rho_registry::AttentionFacts {
+            turn_running: source.turn_running,
+            errored: source.errored.map(agent_pos),
+            wants_at: source.wants.map(|(_, at)| agent_pos(at)),
+        },
+        verdict(facts),
+    );
     Some(AgentCard {
         // Open exactly while the story has told something the user has not
         // dealt with, the same reading a Slack unit gets from its cursor.
@@ -294,6 +288,18 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
         },
         attention,
     })
+}
+
+fn agent_pos(pos: StoryPos) -> rho_ui_proto::mirror::AgentPos {
+    rho_ui_proto::mirror::AgentPos(pos.0)
+}
+
+/// The user's verdict on an agent, as the store holds it.
+fn verdict(facts: &Facts) -> rho_registry::Verdict {
+    rho_registry::Verdict {
+        handled_through: agent_pos(facts.agent_handled_through.unwrap_or_default()),
+        muted: facts.state == State::Muted,
+    }
 }
 
 /// Whether `frontier` covers every device version in `poke`.
@@ -706,18 +712,18 @@ impl DeskCells {
     /// What every agent of this host is asking of the user, derived from
     /// the store and the mirror in [`agent_card`]. The rails read it from
     /// the registry; this is where the registry gets it.
-    pub fn agent_attentions(&self, host: HostId) -> Vec<(rho_core::AgentId, Attention)> {
+    /// The user's verdict on each agent of this host, for the registry
+    /// to derive attention from.
+    pub fn agent_verdicts(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_registry::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
         desk.sources
             .agents
             .iter()
-            .filter_map(|source| {
-                let id = Id::Agent(source.agent);
-                let facts = desk.view.facts(&id);
-                let card = agent_card(&id, &facts, &desk.sources)?;
-                Some((source.agent, card.attention))
+            .map(|source| {
+                let facts = desk.view.facts(&Id::Agent(source.agent));
+                (source.agent, verdict(&facts))
             })
             .collect()
     }

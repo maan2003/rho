@@ -322,6 +322,76 @@ impl RhoDb {
         }
     }
 
+    /// Print what the file at `path` holds: bytes stored per table, and the
+    /// pages the file allocates overall. Opens the file exclusively.
+    pub fn print_stats(path: impl AsRef<Path>) -> anyhow::Result<()> {
+        use redb::ReadableTableMetadata;
+        let database = Database::builder()
+            .set_cache_size(CACHE_SIZE)
+            .open(path.as_ref())?;
+        let read = database.begin_read()?;
+        let write = database.begin_write()?;
+        let mut rows = Vec::new();
+        for handle in read.list_tables()? {
+            let table = read.open_untyped_table(handle.clone())?;
+            let stats = table.stats()?;
+            rows.push((
+                stats.stored_bytes(),
+                format!(
+                    "{:>14} stored {:>12} meta {:>12} fragmented {:>9} leaf {:>7} branch  {}",
+                    stats.stored_bytes(),
+                    stats.metadata_bytes(),
+                    stats.fragmented_bytes(),
+                    stats.leaf_pages(),
+                    stats.branch_pages(),
+                    handle.name()
+                ),
+            ));
+        }
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, row) in rows {
+            println!("{row}");
+        }
+        let stats = write.stats()?;
+        println!(
+            "database: {} allocated pages x {} bytes = {} bytes; {} stored, {} fragmented; savepoints {:?}",
+            stats.allocated_pages(),
+            stats.page_size(),
+            stats.allocated_pages() * stats.page_size() as u64,
+            stats.stored_bytes(),
+            stats.fragmented_bytes(),
+            write.list_persistent_savepoints()?.collect::<Vec<_>>()
+        );
+        write.abort()?;
+        Ok(())
+    }
+
+    /// Compact the file at `path` in place and return `(bytes before, bytes
+    /// after)`.
+    ///
+    /// Opens the file exclusively: nothing else may have it open. Fails while a
+    /// persistent savepoint exists, because compaction moves the pages a
+    /// savepoint would need to restore.
+    pub fn compact(path: impl AsRef<Path>) -> anyhow::Result<(u64, u64)> {
+        let path = path.as_ref();
+        let before = std::fs::metadata(path)?.len();
+        let mut database = Database::builder().set_cache_size(CACHE_SIZE).open(path)?;
+        // redb shrinks the file by one region tail per commit, and a single
+        // compact() commits only a few times, so a file with many free
+        // regions at its end needs repeated calls.
+        let mut after = before;
+        loop {
+            database.compact()?;
+            let len = std::fs::metadata(path)?.len();
+            if len >= after {
+                break;
+            }
+            after = len;
+        }
+        drop(database);
+        Ok((before, after))
+    }
+
     pub fn read(&self) -> ReadTxn {
         ReadTxn {
             inner: self.database.begin_read().expect("begin rho-db read txn"),
@@ -367,6 +437,16 @@ impl RhoDb {
 }
 
 impl ReadTxn {
+    /// Every table's name, for a migration proof looking at a store it
+    /// did not write.
+    pub fn table_names(&self) -> Vec<String> {
+        self.inner
+            .list_tables()
+            .expect("list rho-db tables")
+            .map(|table| table.name().to_owned())
+            .collect()
+    }
+
     pub fn has_table(&self, name: &str) -> bool {
         self.inner
             .list_tables()
@@ -389,6 +469,21 @@ impl ReadTxn {
 }
 
 impl WriteTxn {
+    /// Puts the database back as it was when the savepoint was taken.
+    /// Everything written since is gone once this commits, and savepoints
+    /// taken after it are invalid. Returns whether the savepoint existed.
+    pub fn restore_persistent_savepoint(&mut self, id: u64) -> bool {
+        let savepoint = match self.inner.get_persistent_savepoint(id) {
+            Ok(savepoint) => savepoint,
+            Err(redb::SavepointError::InvalidSavepoint) => return false,
+            Err(error) => panic!("get rho-db persistent savepoint {id}: {error}"),
+        };
+        self.inner
+            .restore_savepoint(&savepoint)
+            .expect("restore rho-db persistent savepoint");
+        true
+    }
+
     /// Deletes a persistent recovery savepoint, returning whether it existed.
     pub fn delete_persistent_savepoint(&mut self, id: u64) -> bool {
         self.inner

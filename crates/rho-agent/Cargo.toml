@@ -31,6 +31,7 @@ rho-db.workspace = true
 rho-inference.workspace = true
 rho-image.workspace = true
 rho-tool-shell.workspace = true
+rho-ui-proto.workspace = true
 rho-workspaces.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }
@@ -42,3 +43,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+zstd = "0.13"

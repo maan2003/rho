@@ -1,65 +1,129 @@
 //! The client's own copy of what the daemon told it about every agent.
 //!
-//! The registry folds an agent's story in memory, which is enough while
-//! the daemon is up and nothing at all after a restart: the rails would
-//! be blank until `Ready` and the whole story arrived again. This keeps
-//! the same rows on disk - the heads, the story events, and the attention
-//! the view derived - so the GUI comes up already knowing them and asks
-//! the daemon only for what it lacks.
+//! The registry folds the mirror in memory, which is enough while the
+//! daemon is up and nothing at all after a restart: the rails would be
+//! blank until the whole log arrived again. This keeps the same rows on
+//! disk - every `Log` entry, keyed by agent and position, one journal
+//! cursor per host, and the attention the view derived - so the GUI comes
+//! up already knowing them and asks the daemon only for what came after.
+//!
+//! What the rails read is not folded again at startup: the digest of
+//! every agent is written in the same transaction as the rows it folds,
+//! and read back whole. The rows themselves are read only for the few
+//! agents whose transcript is open.
 //!
 //! It is a mirror, never a source. Every row here came from the daemon or
 //! from the view's own fold of it; anything doubted is thrown away and
-//! asked for again.
+//! asked for again from the start.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
-use rho_registry::Attention;
+use rho_registry::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 use rho_ui_proto::AgentId;
-use rho_ui_proto::story::{UiAgentHead, UiStoryEvent, UiStoryPos};
+use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 
 pub const FILE_NAME: &str = "agent-mirror.redb";
 
-/// The head, with the name of the host it was heard from. The name rather
-/// than the host id: ids are handed out in attach order and mean nothing
-/// across a restart, and a row whose host is no longer attached is dropped
-/// rather than filed under the wrong daemon.
-const HEADS: TableDefinition<AgentId, Sen<StoredHead>> = TableDefinition::new("gui_agent_head_v1");
-/// One agent's story, ordered by position, agent first: a range read gives
-/// one agent's events and nothing else.
-const STORY: TableDefinition<(AgentId, u64), Sen<UiStoryEvent>> =
-    TableDefinition::new("gui_agent_story_v1");
-/// What the view decided an agent wants, so Home ranks the same way on the
-/// first frame as it did before the restart. Derived, never authoritative:
-/// the view overwrites it as soon as it has the store again.
-const ATTENTION: TableDefinition<AgentId, u8> = TableDefinition::new("gui_agent_attention_v1");
+/// Where this client stands in a host's journal, by the host's name. The
+/// name rather than the host id: ids are handed out in attach order and
+/// mean nothing across a restart. The seed says which database the
+/// cursor counts in; a daemon with another one starts the copy over.
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v1");
+/// Which host an agent was heard from, so a host's rows can go together.
+const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v1");
+/// One agent's mirror, ordered by position, agent first: a range read
+/// gives one agent's events and nothing else.
+const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
+    TableDefinition::new("gui_mirror_events_v1");
+/// What the registry made of an agent's rows, as of the newest row held:
+/// written with the rows, so the two never disagree.
+const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
+    TableDefinition::new("gui_agent_digest_v1");
+/// What the user last said about an agent, so Home ranks the same way on
+/// the first frame as it did before the restart: attention is derived
+/// from this and the digest. The store overwrites it as soon as the GUI
+/// has it again.
+const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
+    TableDefinition::new("gui_agent_verdict_v1");
+/// The rows the story kept, and the attention the view once stored.
+/// Nothing reads them.
+const RETIRED_TABLES: [&str; 3] = [
+    "gui_agent_head_v1",
+    "gui_agent_story_v1",
+    "gui_agent_attention_v1",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
-struct StoredHead {
-    host: String,
-    head: UiAgentHead,
+struct StoredHost {
+    machine_seed: u64,
+    seq: Seq,
 }
 
-/// One agent as the mirror holds it: what it is, what has happened to it,
-/// and what the view last decided it wants.
+/// One host as the mirror holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MirroredHost {
+    pub name: String,
+    pub machine_seed: u64,
+    /// The newest journal entry this client holds; what `Follow` sends.
+    pub seq: Seq,
+}
+
+/// The registry's fold of one agent, as it stood after the newest row.
+#[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct AgentSnapshot {
+    /// Which fold made the digest; another version on disk is folded
+    /// again from the rows at startup.
+    #[senax(default)]
+    pub version: u32,
+    pub identity: AgentIdentity,
+    pub digest: Digest,
+}
+
+impl AgentSnapshot {
+    pub fn new(identity: AgentIdentity, digest: Digest) -> Self {
+        Self {
+            version: DIGEST_VERSION,
+            identity,
+            digest,
+        }
+    }
+}
+
+/// One agent as the mirror holds it: whose it is, what the registry made
+/// of it, and what the user last said about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MirroredAgent {
     pub host: String,
-    pub head: UiAgentHead,
-    /// From position zero, in order. A gap would make the fold wrong, so a
-    /// story that is not contiguous from zero is dropped and asked for
-    /// again instead.
-    pub story: Vec<UiStoryEvent>,
-    pub attention: Option<Attention>,
+    pub snapshot: AgentSnapshot,
+    pub verdict: Option<Verdict>,
+}
+
+#[derive(Default)]
+pub struct Loaded {
+    pub hosts: Vec<MirroredHost>,
+    pub agents: Vec<(AgentId, MirroredAgent)>,
 }
 
 enum Write {
-    Head(String, Box<UiAgentHead>),
-    Story(AgentId, UiStoryPos, Vec<UiStoryEvent>),
-    Attention(AgentId, Attention),
-    /// The agents this host no longer has. Their rows go, story and all.
-    Departed(Vec<AgentId>),
+    /// A run of one host's log, with the seq the cursor moves to and the
+    /// digests the rows brought up to date. One transaction, so the
+    /// cursor never claims rows that are not there, and a digest never
+    /// stands ahead of its rows.
+    Log {
+        host: String,
+        machine_seed: u64,
+        entries: Vec<LogEntry>,
+        digests: Vec<(AgentId, AgentSnapshot)>,
+    },
+    Verdict(AgentId, Verdict),
+    /// Digests folded again at startup, from rows already held.
+    Digests(Vec<(AgentId, AgentSnapshot)>),
+    /// Everything heard from a host, gone: its daemon has another
+    /// database, or this client doubts what it holds.
+    Reset(String),
     Flush(mpsc::SyncSender<()>),
 }
 
@@ -78,9 +142,14 @@ impl Mirror {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
-            write.open_table(HEADS);
-            write.open_table(STORY);
-            write.open_table(ATTENTION);
+            write.open_table(HOSTS);
+            write.open_table(AGENT_HOSTS);
+            write.open_table(EVENTS);
+            write.open_table(DIGESTS);
+            write.open_table(VERDICTS);
+            for table in RETIRED_TABLES {
+                write.delete_table(table);
+            }
             write.commit();
         });
         let (sender, receiver) = mpsc::channel();
@@ -96,87 +165,117 @@ impl Mirror {
         })
     }
 
-    /// Everything the mirror holds, for the fold the GUI starts from.
-    pub fn load(&self) -> Vec<(AgentId, MirroredAgent)> {
+    /// Every host's cursor and every agent's digest: what the GUI starts
+    /// from. No rows; those are read when a transcript opens, and once
+    /// here for an agent whose digest an older fold made.
+    pub fn load(&self) -> Loaded {
+        let loaded = self.load_stored();
+        let mut refolded = Vec::new();
+        let agents = loaded
+            .agents
+            .into_iter()
+            .filter_map(|(agent_id, mut mirrored)| {
+                if mirrored.snapshot.version == DIGEST_VERSION {
+                    return Some((agent_id, mirrored));
+                }
+                let events = self.read_events(agent_id);
+                let (first, rest) = events.split_first()?;
+                let mut fold = rho_registry::MirroredAgent::new(
+                    rho_registry::HostId::default(),
+                    agent_id,
+                    &first.1,
+                )?;
+                for (pos, event) in rest {
+                    fold.tell(*pos, event);
+                }
+                mirrored.snapshot = AgentSnapshot::new(fold.identity, fold.digest);
+                refolded.push((agent_id, mirrored.snapshot.clone()));
+                Some((agent_id, mirrored))
+            })
+            .collect();
+        if !refolded.is_empty() {
+            self.send(Write::Digests(refolded));
+        }
+        Loaded {
+            hosts: loaded.hosts,
+            agents,
+        }
+    }
+
+    fn load_stored(&self) -> Loaded {
         let read = self.db.read();
-        let attention = read.open_table(ATTENTION);
-        let story = read.open_table(STORY);
-        read.open_table(HEADS)
+        let hosts = read
+            .open_table(HOSTS)
             .iter()
             .map(|(key, value)| {
-                let agent_id = key.value();
                 let stored = value.value().into_owned();
-                let told = story
-                    .range((agent_id, 0)..=(agent_id, u64::MAX))
-                    .map(|(key, value)| (key.value().1, value.value().into_owned()))
-                    .collect::<Vec<_>>();
-                // Contiguous from zero or nothing: a fold over a story with
-                // a hole in it says the wrong thing, and the daemon will
-                // send the whole run again for the asking.
-                let contiguous = told
-                    .iter()
-                    .enumerate()
-                    .all(|(index, (pos, _))| *pos == index as u64);
-                let story = contiguous
-                    .then(|| told.into_iter().map(|(_, event)| event).collect())
-                    .unwrap_or_default();
-                (
+                MirroredHost {
+                    name: key.value().to_owned(),
+                    machine_seed: stored.machine_seed,
+                    seq: stored.seq,
+                }
+            })
+            .collect();
+        let verdicts = read.open_table(VERDICTS);
+        let agent_hosts = read.open_table(AGENT_HOSTS);
+        let agents = read
+            .open_table(DIGESTS)
+            .iter()
+            .filter_map(|(key, value)| {
+                let agent_id = key.value();
+                // A digest without a host is a partial reset; the host's
+                // copy starts over the next time it is doubted.
+                let host = agent_hosts.get(&agent_id)?.value().to_owned();
+                Some((
                     agent_id,
                     MirroredAgent {
-                        host: stored.host,
-                        head: stored.head,
-                        story,
-                        attention: attention
+                        host,
+                        snapshot: value.value().into_owned(),
+                        verdict: verdicts
                             .get(&agent_id)
-                            .and_then(|value| attention_of(value.value())),
+                            .map(|value| value.value().into_owned()),
                     },
-                )
+                ))
             })
+            .collect();
+        Loaded { hosts, agents }
+    }
+
+    /// One agent's mirror, oldest first, for the transcript a reader opens.
+    pub fn read_events(&self, agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
+        self.db
+            .read()
+            .open_table(EVENTS)
+            .range((agent_id, 0)..=(agent_id, u64::MAX))
+            .map(|(key, value)| (AgentPos(key.value().1), value.value().into_owned()))
             .collect()
     }
 
-    /// One agent's story, oldest first, for the transcript a reader opens
-    /// before any frame arrives. Empty unless the run is contiguous from
-    /// zero, for the reason `load` gives.
-    pub fn read_story(&self, agent_id: AgentId) -> Vec<UiStoryEvent> {
-        let read = self.db.read();
-        let told = read
-            .open_table(STORY)
-            .range((agent_id, 0)..=(agent_id, u64::MAX))
-            .map(|(key, value)| (key.value().1, value.value().into_owned()))
-            .collect::<Vec<_>>();
-        let contiguous = told
-            .iter()
-            .enumerate()
-            .all(|(index, (pos, _))| *pos == index as u64);
-        if !contiguous {
-            return Vec::new();
-        }
-        told.into_iter().map(|(_, event)| event).collect()
-    }
-
-    pub fn write_head(&self, host: &str, head: UiAgentHead) {
-        self.send(Write::Head(host.to_owned(), Box::new(head)));
-    }
-
-    pub fn write_story(&self, agent_id: AgentId, from: UiStoryPos, events: Vec<UiStoryEvent>) {
-        if events.is_empty() {
+    /// Rows heard from a host, with the digests they brought up to date.
+    pub fn write_log(
+        &self,
+        host: &str,
+        machine_seed: u64,
+        entries: Vec<LogEntry>,
+        digests: Vec<(AgentId, AgentSnapshot)>,
+    ) {
+        if entries.is_empty() {
             return;
         }
-        self.send(Write::Story(agent_id, from, events));
+        self.send(Write::Log {
+            host: host.to_owned(),
+            machine_seed,
+            entries,
+            digests,
+        });
     }
 
-    pub fn write_attention(&self, agent_id: AgentId, attention: Attention) {
-        self.send(Write::Attention(agent_id, attention));
+    pub fn write_verdict(&self, agent_id: AgentId, verdict: Verdict) {
+        self.send(Write::Verdict(agent_id, verdict));
     }
 
-    /// Agents a host no longer lists. Keeping them would rank work that
-    /// does not exist.
-    pub fn forget(&self, agent_ids: Vec<AgentId>) {
-        if agent_ids.is_empty() {
-            return;
-        }
-        self.send(Write::Departed(agent_ids));
+    pub fn reset_host(&self, host: &str) {
+        self.send(Write::Reset(host.to_owned()));
     }
 
     /// Waits for everything already queued to commit. Shutdown calls this;
@@ -218,80 +317,115 @@ fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("build agent mirror runtime");
-    for write in receiver {
+    // Everything queued goes in one transaction: a catch-up arrives as
+    // many pages faster than each can commit on its own.
+    while let Ok(first) = receiver.recv() {
+        let mut batch = vec![first];
+        while let Ok(next) = receiver.try_recv() {
+            batch.push(next);
+        }
+        let mut flushed = Vec::new();
         runtime.block_on(async {
             let mut transaction = db.write().await;
-            match write {
-                Write::Head(host, head) => {
-                    let stored = StoredHead { host, head: *head };
-                    transaction
-                        .open_table(HEADS)
-                        .insert(&stored.head.agent_id, SenValue::borrowed(&stored));
-                }
-                Write::Story(agent_id, from, events) => {
-                    let mut table = transaction.open_table(STORY);
-                    for (offset, event) in events.iter().enumerate() {
-                        table.insert(
-                            &(agent_id, from.0 + offset as u64),
-                            SenValue::borrowed(event),
-                        );
-                    }
-                }
-                Write::Attention(agent_id, attention) => {
-                    transaction
-                        .open_table(ATTENTION)
-                        .insert(&agent_id, &attention_code(attention));
-                }
-                Write::Departed(agent_ids) => {
-                    let mut heads = transaction.open_table(HEADS);
-                    for agent_id in &agent_ids {
-                        heads.remove(agent_id);
-                    }
-                    drop(heads);
-                    let mut attention = transaction.open_table(ATTENTION);
-                    for agent_id in &agent_ids {
-                        attention.remove(agent_id);
-                    }
-                    drop(attention);
-                    let mut story = transaction.open_table(STORY);
-                    for agent_id in agent_ids {
-                        let told = story
-                            .range((agent_id, 0)..=(agent_id, u64::MAX))
-                            .map(|(key, _)| key.value())
-                            .collect::<Vec<_>>();
-                        for key in told {
-                            story.remove(&key);
-                        }
-                    }
-                }
-                Write::Flush(done) => {
-                    let _ = done.send(());
-                }
+            for write in batch {
+                apply(&mut transaction, write, &mut flushed);
             }
             transaction.commit();
         });
+        for done in flushed {
+            let _ = done.send(());
+        }
     }
 }
 
-/// Attention as one byte. The view derives it fresh every time it has the
-/// store, so an unknown code is simply forgotten rather than migrated.
-fn attention_code(attention: Attention) -> u8 {
-    match attention {
-        Attention::Quiet => 0,
-        Attention::Working => 1,
-        Attention::Pending => 2,
-        Attention::NeedsInput => 3,
+fn apply(
+    transaction: &mut rho_db::WriteTxn,
+    write: Write,
+    flushed: &mut Vec<mpsc::SyncSender<()>>,
+) {
+    match write {
+        Write::Log {
+            host,
+            machine_seed,
+            entries,
+            digests,
+        } => {
+            let Some(last) = entries.last() else {
+                return;
+            };
+            let seq = last.seq;
+            {
+                let mut events = transaction.open_table(EVENTS);
+                for entry in &entries {
+                    events.insert(
+                        &(entry.agent_id, entry.pos.0),
+                        SenValue::borrowed(&entry.event),
+                    );
+                }
+            }
+            {
+                let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
+                for entry in entries.iter().filter(|e| e.pos == AgentPos::ZERO) {
+                    agent_hosts.insert(&entry.agent_id, &host.as_str());
+                }
+            }
+            {
+                let mut table = transaction.open_table(DIGESTS);
+                for (agent_id, snapshot) in &digests {
+                    table.insert(agent_id, SenValue::borrowed(snapshot));
+                }
+            }
+            transaction.open_table(HOSTS).insert(
+                &host.as_str(),
+                SenValue::borrowed(&StoredHost { machine_seed, seq }),
+            );
+        }
+        Write::Verdict(agent_id, verdict) => {
+            transaction
+                .open_table(VERDICTS)
+                .insert(&agent_id, SenValue::borrowed(&verdict));
+        }
+        Write::Digests(digests) => {
+            let mut table = transaction.open_table(DIGESTS);
+            for (agent_id, snapshot) in &digests {
+                table.insert(agent_id, SenValue::borrowed(snapshot));
+            }
+        }
+        Write::Reset(host) => {
+            transaction.open_table(HOSTS).remove(&host.as_str());
+            let mut agent_hosts = transaction.open_table(AGENT_HOSTS);
+            let departed = agent_hosts
+                .iter()
+                .filter(|(_, owner)| owner.value() == host)
+                .map(|(key, _)| key.value())
+                .collect::<Vec<_>>();
+            for agent_id in &departed {
+                agent_hosts.remove(agent_id);
+            }
+            drop(agent_hosts);
+            let mut verdicts = transaction.open_table(VERDICTS);
+            for agent_id in &departed {
+                verdicts.remove(agent_id);
+            }
+            drop(verdicts);
+            let mut digests = transaction.open_table(DIGESTS);
+            for agent_id in &departed {
+                digests.remove(agent_id);
+            }
+            drop(digests);
+            let mut events = transaction.open_table(EVENTS);
+            for agent_id in departed {
+                let held = events
+                    .range((agent_id, 0)..=(agent_id, u64::MAX))
+                    .map(|(key, _)| key.value())
+                    .collect::<Vec<_>>();
+                for key in held {
+                    events.remove(&key);
+                }
+            }
+        }
+        Write::Flush(done) => flushed.push(done),
     }
-}
-
-fn attention_of(code: u8) -> Option<Attention> {
-    Some(match code {
-        0 => Attention::Quiet,
-        1 => Attention::Working,
-        2 => Attention::Pending,
-        3 => Attention::NeedsInput,
-        _ => return None,
-    })
 }
 
 static GLOBAL: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
@@ -308,38 +442,37 @@ pub fn init(state_dir: &Path) -> std::io::Result<()> {
     })
 }
 
-pub fn load() -> Vec<(AgentId, MirroredAgent)> {
+pub fn load() -> Loaded {
     GLOBAL.get().map(Mirror::load).unwrap_or_default()
 }
 
-pub fn read_story(agent_id: AgentId) -> Vec<UiStoryEvent> {
+pub fn read_events(agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
     GLOBAL
         .get()
-        .map(|mirror| mirror.read_story(agent_id))
+        .map(|mirror| mirror.read_events(agent_id))
         .unwrap_or_default()
 }
 
-pub fn write_head(host: &str, head: UiAgentHead) {
+pub fn write_log(
+    host: &str,
+    machine_seed: u64,
+    entries: Vec<LogEntry>,
+    digests: Vec<(AgentId, AgentSnapshot)>,
+) {
     if let Some(mirror) = GLOBAL.get() {
-        mirror.write_head(host, head);
+        mirror.write_log(host, machine_seed, entries, digests);
     }
 }
 
-pub fn write_story(agent_id: AgentId, from: UiStoryPos, events: Vec<UiStoryEvent>) {
+pub fn write_verdict(agent_id: AgentId, verdict: Verdict) {
     if let Some(mirror) = GLOBAL.get() {
-        mirror.write_story(agent_id, from, events);
+        mirror.write_verdict(agent_id, verdict);
     }
 }
 
-pub fn write_attention(agent_id: AgentId, attention: Attention) {
+pub fn reset_host(host: &str) {
     if let Some(mirror) = GLOBAL.get() {
-        mirror.write_attention(agent_id, attention);
-    }
-}
-
-pub fn forget(agent_ids: Vec<AgentId>) {
-    if let Some(mirror) = GLOBAL.get() {
-        mirror.forget(agent_ids);
+        mirror.reset_host(host);
     }
 }
 
@@ -351,7 +484,7 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::story::{UiRuntimeKind, UiSpawnedBy, UiTurnOutcome};
+    use rho_ui_proto::mirror::{RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome};
 
     use super::*;
 
@@ -359,117 +492,145 @@ mod tests {
         AgentId::from_counter(counter, &rho_ui_proto::AgentIdDomain(7)).expect("agent id")
     }
 
-    fn head(agent_id: AgentId) -> UiAgentHead {
-        UiAgentHead {
-            agent_id,
-            story_pos: UiStoryPos(2),
-            role: Default::default(),
-            runtime_kind: UiRuntimeKind::Rho,
-            workdirs: Vec::new(),
-            spawned_by: UiSpawnedBy::Direct,
-            parent: None,
-            spawn_name: Some("the deploy".to_owned()),
-            generated_title: None,
-            activity: None,
-            turn_running: false,
-            created_at: rho_core::UnixMs(1_000),
-        }
-    }
-
-    fn told() -> Vec<UiStoryEvent> {
-        vec![
-            UiStoryEvent::UserMessage {
-                text: "have a look".to_owned(),
+    fn told(agent: AgentId, from_seq: u64) -> Vec<LogEntry> {
+        [
+            MirrorEvent::Created {
+                role: Default::default(),
+                runtime: RuntimeKind::Rho,
+                workdirs: Vec::new(),
+                spawned_by: SpawnedBy::Direct,
+                spawn_name: Some("the deploy".to_owned()),
+                parent: None,
+                model: "sol".to_owned(),
                 at: rho_core::UnixMs(1_000),
             },
-            UiStoryEvent::TurnEnded {
-                outcome: UiTurnOutcome::Completed,
+            MirrorEvent::Message {
+                from: None,
+                text: "have a look".to_owned(),
+                delivery: rho_core::MessageDelivery::Immediate,
+                at: rho_core::UnixMs(1_000),
+            },
+            MirrorEvent::Turn {
+                edge: TurnEdge::Ended(TurnOutcome::Completed),
                 at: rho_core::UnixMs(2_000),
             },
         ]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, event)| LogEntry {
+            seq: Seq(from_seq + offset as u64),
+            agent_id: agent,
+            pos: AgentPos(offset as u64),
+            event,
+        })
+        .collect()
     }
 
-    /// What a transcript reads when it is opened before any frame: one
-    /// agent's story, without the other agents' events.
+    fn events(entries: &[LogEntry]) -> Vec<(AgentPos, MirrorEvent)> {
+        entries
+            .iter()
+            .map(|entry| (entry.pos, entry.event.clone()))
+            .collect()
+    }
+
+    /// What the registry makes of a run of one agent's rows.
+    fn snapshot(entries: &[LogEntry]) -> AgentSnapshot {
+        let mut mirrored = rho_registry::MirroredAgent::new(
+            rho_registry::HostId::default(),
+            entries[0].agent_id,
+            &entries[0].event,
+        )
+        .expect("opens with the creation");
+        for entry in &entries[1..] {
+            mirrored.tell(entry.pos, &entry.event);
+        }
+        AgentSnapshot::new(mirrored.identity, mirrored.digest)
+    }
+
+    fn write(mirror: &Mirror, host: &str, machine_seed: u64, entries: Vec<LogEntry>) {
+        let digests = vec![(entries[0].agent_id, snapshot(&entries))];
+        mirror.write_log(host, machine_seed, entries, digests);
+    }
+
+    /// What a transcript reads when it is opened: one agent's mirror,
+    /// without the other agents' events.
     #[test]
-    fn a_story_is_read_back_for_one_agent_alone() {
+    fn events_are_read_back_for_one_agent_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mine = agent_id(1);
         let theirs = agent_id(2);
         let mirror = Mirror::open(dir.path()).expect("open");
-        mirror.write_head("local", head(mine));
-        mirror.write_story(mine, UiStoryPos(0), told());
-        mirror.write_story(
-            theirs,
-            UiStoryPos(0),
-            vec![UiStoryEvent::UserMessage {
-                text: "not mine".to_owned(),
-                at: rho_core::UnixMs(3_000),
-            }],
-        );
+        write(&mirror, "local", 7, told(mine, 1));
+        write(&mirror, "local", 7, told(theirs, 4));
         mirror.flush();
 
-        assert_eq!(mirror.read_story(mine), told());
-        assert!(mirror.read_story(agent_id(3)).is_empty());
+        assert_eq!(mirror.read_events(mine), events(&told(mine, 1)));
+        assert!(mirror.read_events(agent_id(3)).is_empty());
     }
 
-    /// What the GUI comes up holding after a restart: the head, the story
-    /// in order, and the attention the view had decided.
+    /// What the GUI comes up holding after a restart: the host's cursor,
+    /// the digest as it stood, and the attention the view had decided.
     #[test]
     fn a_reopened_mirror_holds_what_was_written() {
         let dir = tempfile::tempdir().expect("tempdir");
         let agent = agent_id(1);
         {
             let mirror = Mirror::open(dir.path()).expect("open");
-            mirror.write_head("local", head(agent));
-            mirror.write_story(agent, UiStoryPos(0), told());
-            mirror.write_attention(agent, Attention::NeedsInput);
+            write(&mirror, "local", 7, told(agent, 1));
+            mirror.write_verdict(
+                agent,
+                Verdict {
+                    handled_through: AgentPos(2),
+                    muted: false,
+                },
+            );
             mirror.flush();
         }
 
         let mirror = Mirror::open(dir.path()).expect("reopen");
         let loaded = mirror.load();
-        assert_eq!(loaded.len(), 1);
-        let (loaded_id, mirrored) = &loaded[0];
+        assert_eq!(
+            loaded.hosts,
+            [MirroredHost {
+                name: "local".to_owned(),
+                machine_seed: 7,
+                seq: Seq(3),
+            }]
+        );
+        assert_eq!(loaded.agents.len(), 1);
+        let (loaded_id, mirrored) = &loaded.agents[0];
         assert_eq!(*loaded_id, agent);
         assert_eq!(mirrored.host, "local");
-        assert_eq!(mirrored.head, head(agent));
-        assert_eq!(mirrored.story, told());
-        assert_eq!(mirrored.attention, Some(Attention::NeedsInput));
+        assert_eq!(mirrored.snapshot, snapshot(&told(agent, 1)));
+        assert_eq!(mirrored.snapshot.digest.newest, AgentPos(3));
+        assert_eq!(
+            mirrored.verdict,
+            Some(Verdict {
+                handled_through: AgentPos(2),
+                muted: false,
+            })
+        );
+        assert_eq!(mirrored.snapshot.version, DIGEST_VERSION);
+        assert_eq!(mirror.read_events(agent), events(&told(agent, 1)));
     }
 
-    /// A story with a hole in it is worse than none: the fold over it would
-    /// say the wrong thing, so it is dropped and asked for again.
+    /// A host with another database leaves nothing behind, or Home would
+    /// rank work that does not exist.
     #[test]
-    fn a_story_that_does_not_start_at_zero_is_dropped() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let agent = agent_id(2);
-        let mirror = Mirror::open(dir.path()).expect("open");
-        mirror.write_head("local", head(agent));
-        mirror.write_story(agent, UiStoryPos(3), told());
-        mirror.flush();
-
-        let loaded = mirror.load();
-        assert!(loaded[0].1.story.is_empty());
-    }
-
-    /// An agent the daemon no longer lists leaves nothing behind, or Home
-    /// would rank work that does not exist.
-    #[test]
-    fn forgetting_an_agent_takes_its_story_with_it() {
+    fn resetting_a_host_takes_its_agents_with_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (kept, gone) = (agent_id(3), agent_id(4));
         let mirror = Mirror::open(dir.path()).expect("open");
-        for agent in [kept, gone] {
-            mirror.write_head("local", head(agent));
-            mirror.write_story(agent, UiStoryPos(0), told());
-        }
-        mirror.forget(vec![gone]);
+        write(&mirror, "local", 7, told(kept, 1));
+        write(&mirror, "remote", 8, told(gone, 1));
+        mirror.reset_host("remote");
         mirror.flush();
 
         let loaded = mirror.load();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].0, kept);
-        assert_eq!(loaded[0].1.story, told());
+        assert_eq!(loaded.hosts.len(), 1);
+        assert_eq!(loaded.hosts[0].name, "local");
+        assert_eq!(loaded.agents.len(), 1);
+        assert_eq!(loaded.agents[0].0, kept);
+        assert!(mirror.read_events(gone).is_empty());
     }
 }

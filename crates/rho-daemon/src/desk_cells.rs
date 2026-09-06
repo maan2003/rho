@@ -215,81 +215,6 @@ impl DeskCellStore {
         Ok(namespace)
     }
 
-    /// Moves the user's filed and snoozed agents out of the transitional
-    /// attention table and into the store, where every other verdict of
-    /// theirs lives: hidden becomes `Mute`, snoozed becomes `Defer`. One
-    /// verdict entry per agent, authored by the daemon's own device.
-    ///
-    /// Once: an agent that already carries the fact is skipped, so a second
-    /// run writes nothing. Deleted with the table it reads
-    /// (`AGENT-LOG-DESIGN.md`).
-    pub(crate) async fn convert_agent_dispositions(
-        &self,
-        agents: &[(rho_core::AgentId, rho_core::AgentDisposition, u64)],
-    ) -> Result<(usize, usize), String> {
-        let mut write = self.db.write().await;
-        let mut meta = load_meta_from_write(&mut write)?;
-        let snapshot = read_snapshot_from_write(&mut write)?;
-        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
-        let (mut muted, mut deferred) = (0, 0);
-        for (agent_id, disposition, story_pos) in agents {
-            let id = Id::Agent(*agent_id);
-            let verdict = match disposition {
-                rho_core::AgentDisposition::Hidden => {
-                    if store.property(&id, &PropertyKey::State).is_some() {
-                        continue;
-                    }
-                    muted += 1;
-                    rho_desk::cells::Verdict::Mute
-                }
-                rho_core::AgentDisposition::Snoozed { until } => {
-                    if store.property(&id, &PropertyKey::DeferUntil).is_some() {
-                        continue;
-                    }
-                    deferred += 1;
-                    rho_desk::cells::Verdict::Defer {
-                        until: rho_desk::cells::Timestamp {
-                            unix_ms: until.0 as i64,
-                            precision: rho_desk::cells::TimestampPrecision::Minute,
-                        },
-                    }
-                }
-                rho_core::AgentDisposition::Pending | rho_core::AgentDisposition::Done => continue,
-            };
-            let before = |key: &PropertyKey| store.property(&id, key).cloned();
-            // A verdict on an agent is written at its story position, the
-            // same as one the user gives today; without it the conversion
-            // is rejected and the disposition is silently left behind.
-            let agent_verdict = rho_desk::cells::AgentVerdict {
-                newest: rho_desk::cells::StoryPos(*story_pos),
-            };
-            let changes = rho_desk::cells::verdict_changes(
-                &id,
-                &verdict,
-                &before,
-                None,
-                None,
-                Some(agent_verdict),
-            )?;
-            for change in &changes {
-                if let Some(after) = change.after.clone() {
-                    store.write(change.id.clone(), after)?;
-                }
-            }
-            store.append_verdict(id, verdict, changes)?;
-        }
-        if muted == 0 && deferred == 0 {
-            return Ok((0, 0));
-        }
-        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
-        meta.frontier = store.version().clone();
-        write
-            .open_table(META)
-            .insert(&(), SenValue::borrowed(&meta));
-        write.commit();
-        Ok((muted, deferred))
-    }
-
     /// Moves the registered projects out of their own table and into the
     /// store, where the client reads them: one label per project, carrying
     /// its name and the workdir it stands for. The label's id is derived
@@ -989,12 +914,8 @@ mod copy_counts {
                 - 7 * 24 * 60 * 60 * 1000,
         );
         let (mut recent, mut recent_without_node) = (0usize, 0usize);
-        for (agent_id, _) in db.read().list_agents() {
-            let attention = db.read().agent_attention(agent_id);
-            let last = attention
-                .last_turn_ended
-                .unwrap_or(attention.last_user_message)
-                .max(attention.last_user_message);
+        for (agent_id, head) in db.read().list_agents() {
+            let last = head.last_turn_ended.unwrap_or(head.config.created_at);
             if last.0 < week_ago.0 {
                 continue;
             }

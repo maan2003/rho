@@ -1,5 +1,7 @@
 //! End-to-end tests: synthetic protocol frames in, rendered editor state out.
 
+use std::sync::Arc;
+
 use editor::display_map::{Block, DisplayPoint, DisplayRow};
 use editor::{Copy, Editor, MoveRight, SelectionEffects};
 use gpui::{
@@ -8,14 +10,16 @@ use gpui::{
     point, px, size,
 };
 use rho_core::UnixMs;
-use rho_ui_proto::AgentId;
-use rho_ui_proto::remote::{
-    AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
-    UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolDiff, UiToolStatus,
+use rho_registry::render::{
+    UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
+use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
+use story::ready_with;
 
 use crate::connection::{ConnEvent, HostEvent};
+
+mod story;
 use crate::registry::HostId;
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
@@ -1160,6 +1164,7 @@ fn hold_shift(workspace: &WindowHandle<Workspace>, down: bool, cx: &mut TestAppC
 }
 
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
+    story::reset();
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
     let specs = vec![HostSpec {
@@ -1255,15 +1260,73 @@ fn agent(id: u64) -> AgentId {
     AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
 }
 
-fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {
-    AgentRemoteFrame::Snapshot(state)
+/// The transcript the workspace holds for this agent, to edit and feed back.
+fn transcript_of(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> UiAgentState {
+    workspace
+        .update(cx, |workspace, _, _| {
+            workspace.transcript_for_test(agent_id)
+        })
+        .expect("read transcript")
+}
+
+/// Feeds the transcript back with one change, as a daemon that saw more
+/// of the turn would.
+fn feed_edit(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+    edit: impl FnOnce(&mut UiAgentState),
+) {
+    let mut state = transcript_of(workspace, cx, agent_id);
+    edit(&mut state);
+    feed_frame(workspace, cx, agent_id, state);
+}
+
+/// Applies an edit and hands back the state after it, for a run of frames
+/// built up one on the last.
+fn edited_in(state: &mut UiAgentState, edit: impl FnOnce(&mut UiAgentState)) -> UiAgentState {
+    edit(state);
+    state.clone()
+}
+
+/// The assistant message at `index` keeps its first `keep_bytes` and grows
+/// by `value`; past the end, a new message begins.
+fn stream_text(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
+    if index == state.blocks.len() {
+        state.blocks.push(Arc::new(assistant("", None)));
+    }
+    let UiBlock::AssistantMessage { text, .. } = Arc::make_mut(&mut state.blocks[index]) else {
+        panic!("block {index} is not an assistant message");
+    };
+    text.truncate(keep_bytes);
+    text.push_str(value);
+}
+
+fn stream_tool_arguments(state: &mut UiAgentState, index: usize, keep_bytes: usize, value: &str) {
+    let UiBlock::Tool(tool) = Arc::make_mut(&mut state.blocks[index]) else {
+        panic!("block {index} is not a tool");
+    };
+    tool.arguments.truncate(keep_bytes);
+    tool.arguments.push_str(value);
+}
+
+fn replace_block(state: &mut UiAgentState, index: usize, block: UiBlock) {
+    if index == state.blocks.len() {
+        state.blocks.push(Arc::new(block));
+    } else {
+        state.blocks[index] = Arc::new(block);
+    }
 }
 
 fn feed_frame(
     workspace: &WindowHandle<Workspace>,
     cx: &mut TestAppContext,
     agent_id: AgentId,
-    frame: AgentRemoteFrame,
+    state: UiAgentState,
 ) {
     workspace
         .update(cx, |workspace, window, cx| {
@@ -1274,11 +1337,7 @@ fn feed_frame(
             }
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Frame {
-                    agent_id,
-                    frame,
-                    allocation: None,
-                },
+                ConnEvent::Transcript { agent_id, state },
                 window,
                 cx,
             );
@@ -1290,24 +1349,20 @@ fn feed_frame(
 fn feed_frames(
     workspace: &WindowHandle<Workspace>,
     cx: &mut TestAppContext,
-    frames: impl IntoIterator<Item = (AgentId, AgentRemoteFrame)>,
+    frames: impl IntoIterator<Item = (AgentId, UiAgentState)>,
 ) {
     let events: Vec<_> = frames
         .into_iter()
-        .map(|(agent_id, frame)| HostEvent {
+        .map(|(agent_id, state)| HostEvent {
             host: HostId::default(),
-            event: ConnEvent::Frame {
-                agent_id,
-                frame,
-                allocation: None,
-            },
+            event: ConnEvent::Transcript { agent_id, state },
         })
         .collect();
     workspace
         .update(cx, |workspace, window, cx| {
             if workspace.is_startup_pane()
                 && let Some(agent_id) = events.iter().find_map(|event| match &event.event {
-                    ConnEvent::Frame { agent_id, .. } => Some(*agent_id),
+                    ConnEvent::Transcript { agent_id, .. } => Some(*agent_id),
                     _ => None,
                 })
             {
@@ -1338,7 +1393,7 @@ fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppCo
         &workspace,
         cx,
         agent_id,
-        snapshot_frame(state(vec![user("read this first")], Vec::new())),
+        state(vec![user("read this first")], Vec::new()),
     );
     let editor = active_editor(&workspace, cx);
     workspace
@@ -1641,8 +1696,7 @@ fn tool(
 }
 
 fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
-    let mut blocks = history;
-    blocks.extend(live);
+    let blocks = history.into_iter().chain(live).map(Arc::new).collect();
     UiAgentState {
         blocks,
         status: UiAgentStatus::Streaming,
@@ -1662,14 +1716,14 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("first"),
                 assistant("answer", Some(UiMessagePhase::FinalAnswer)),
                 user("second"),
             ],
             Vec::new(),
-        )),
+        ),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -1707,13 +1761,13 @@ fn initial_transcript_preserves_line_endings_when_placing_spans(cx: &mut TestApp
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("first\r\nsecond\rthird")],
             vec![assistant(
                 "answer\r\ncontinued\rfinished",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
 
     let text = display_text(&workspace, cx);
@@ -1728,7 +1782,7 @@ fn selection_actions_recover_cursor_from_replaced_transcript_excerpt(cx: &mut Te
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("old transcript")], Vec::new())),
+        state(vec![user("old transcript")], Vec::new()),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -1754,7 +1808,7 @@ fn selection_actions_recover_cursor_from_replaced_transcript_excerpt(cx: &mut Te
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("replacement")], Vec::new())),
+        state(vec![user("replacement")], Vec::new()),
     );
 
     workspace
@@ -1787,10 +1841,7 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
-            vec![user("question")],
-            vec![assistant("answer", None)],
-        )),
+        state(vec![user("question")], vec![assistant("answer", None)]),
     );
 
     let text = display_text(&workspace, cx);
@@ -1803,7 +1854,7 @@ fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("last user")], Vec::new())),
+        state(vec![user("last user")], Vec::new()),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -1820,10 +1871,10 @@ fn agent_messages_use_their_text_color_in_the_gutter(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("local"), agent_message(agent(2), "remote")],
             Vec::new(),
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -1847,33 +1898,16 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
     assert!(display_text(&workspace, cx).contains("hel"));
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: 3,
-                        value: "lo world".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, 3, "lo world")
+    });
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("hello world"),
@@ -1908,12 +1942,7 @@ fn bench_markdown_transcript(cx: &mut TestAppContext) {
     }
     crate::sampler::start(2000);
     let start = std::time::Instant::now();
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(blocks, Vec::new())),
-    );
+    feed_frame(&workspace, cx, agent(1), state(blocks, Vec::new()));
     let initial = start.elapsed();
     let attach_samples = crate::sampler::stop();
 
@@ -1931,26 +1960,9 @@ fn bench_markdown_transcript(cx: &mut TestAppContext) {
     let start = std::time::Instant::now();
     for (keep_bytes, value) in &deltas {
         let delta = std::time::Instant::now();
-        feed_frame(
-            &workspace,
-            cx,
-            agent(1),
-            AgentRemoteFrame::Diff {
-                blocks: UiBlocksDiff {
-                    truncate_to: None,
-                    updates: vec![UiBlockUpdate {
-                        index,
-                        block: UiBlockDiff::AssistantText(UiTextDiff {
-                            keep_bytes: *keep_bytes,
-                            value: value.clone(),
-                        }),
-                    }],
-                },
-                status: None,
-                context_used: None,
-                usage: None,
-            },
-        );
+        feed_edit(&workspace, cx, agent(1), |state| {
+            stream_text(state, index, *keep_bytes, value)
+        });
         worst = worst.max(delta.elapsed());
     }
     let streaming = start.elapsed();
@@ -2012,21 +2024,11 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
 
     // Attaching to an agent for the first time.
     let start = std::time::Instant::now();
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(transcript(1), Vec::new())),
-    );
+    feed_frame(&workspace, cx, agent(1), state(transcript(1), Vec::new()));
     phase("attach", start.elapsed(), 1);
 
     let start = std::time::Instant::now();
-    feed_frame(
-        &workspace,
-        cx,
-        agent(2),
-        snapshot_frame(state(transcript(2), Vec::new())),
-    );
+    feed_frame(&workspace, cx, agent(2), state(transcript(2), Vec::new()));
     phase("second agent frame", start.elapsed(), 1);
     // The user takes a moment before switching; the parse ahead of that view
     // runs in it.
@@ -2070,37 +2072,24 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
     let index = blocks_count * 4 - 2;
     let start = std::time::Instant::now();
     for tick in 0..50u64 {
-        feed_frame(
-            &workspace,
-            cx,
-            agent(1),
-            AgentRemoteFrame::Diff {
-                blocks: UiBlocksDiff {
-                    truncate_to: None,
-                    updates: vec![UiBlockUpdate {
-                        index,
-                        block: UiBlockDiff::Tool(UiToolDiff {
-                            id: format!("t1.{}", blocks_count - 1),
-                            name: "shell_command".to_owned(),
-                            arguments: Some(UiTextDiff {
-                                keep_bytes: 0,
-                                value: format!("echo {tick}"),
-                            }),
-                            preview: None,
-                            status: Some(UiToolStatus::Running),
-                            output: None,
-                            error: None,
-                            started_at: None,
-                            finished_at: None,
-                            metadata: None,
-                        }),
-                    }],
-                },
-                status: None,
-                context_used: None,
-                usage: None,
-            },
-        );
+        feed_edit(&workspace, cx, agent(1), |state| {
+            replace_block(
+                state,
+                index,
+                UiBlock::Tool(UiTool {
+                    id: format!("t1.{}", blocks_count - 1),
+                    name: "shell_command".to_owned(),
+                    arguments: format!("echo {tick}"),
+                    preview: None,
+                    status: UiToolStatus::Running,
+                    output: None,
+                    error: None,
+                    started_at: None,
+                    finished_at: None,
+                    metadata: None,
+                }),
+            )
+        });
     }
     phase("tool update", start.elapsed(), 50);
 
@@ -2115,13 +2104,13 @@ fn highlights_survive_the_folds_that_conceal_markup(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![assistant(
                 "**bold** and `code` and plain\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
             Vec::new(),
-        )),
+        ),
     );
 
     // Highlight text that spans and follows concealed markup. The chunk
@@ -2193,13 +2182,13 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("**user markup stays visible**")],
             vec![assistant(
                 "## Heading\n\n**bold** and `code`.\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     cx.run_until_parked();
 
@@ -2216,26 +2205,14 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
     );
 
     // Streaming past a concealed range refolds it in place.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: "## Heading\n\n**bold** and `code`.\n".len(),
-                        value: "*more*\n".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(
+            state,
+            1,
+            "## Heading\n\n**bold** and `code`.\n".len(),
+            "*more*\n",
+        )
+    });
     cx.run_until_parked();
     let text = display_text(&workspace, cx);
     assert!(
@@ -2268,10 +2245,10 @@ fn markdown_tables_align_with_virtual_tabs_but_keep_their_source(cx: &mut TestAp
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("show a table")],
             vec![assistant(table, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
     cx.run_until_parked();
 
@@ -2282,26 +2259,9 @@ fn markdown_tables_align_with_virtual_tabs_but_keep_their_source(cx: &mut TestAp
     );
     assert_table_pipes_align(&workspace, 3, cx);
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: table.len(),
-                        value: "| longest name | failed |\n".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, table.len(), "| longest name | failed |\n")
+    });
     cx.run_until_parked();
     assert_table_pipes_align(&workspace, 4, cx);
 }
@@ -2340,36 +2300,23 @@ fn visualization_refs_become_inline_editor_blocks(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("show it")],
             vec![assistant(tag, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     assert!(buffer_text(&workspace, cx).contains(tag));
     assert!(!display_text(&workspace, cx).contains(tag));
     assert!(has_custom_block(&workspace, cx));
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::Replace(assistant(
-                        "ordinary text",
-                        Some(UiMessagePhase::FinalAnswer),
-                    )),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        replace_block(
+            state,
+            1,
+            assistant("ordinary text", Some(UiMessagePhase::FinalAnswer)),
+        )
+    });
     assert!(!has_custom_block(&workspace, cx));
 }
 
@@ -2380,26 +2327,17 @@ fn queued_streaming_updates_to_one_block_render_once_to_final_state(cx: &mut Tes
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
-    let update = |keep_bytes, value: &str| AgentRemoteFrame::Diff {
-        blocks: UiBlocksDiff {
-            truncate_to: None,
-            updates: vec![UiBlockUpdate {
-                index: 1,
-                block: UiBlockDiff::AssistantText(UiTextDiff {
-                    keep_bytes,
-                    value: value.to_owned(),
-                }),
-            }],
-        },
-        status: None,
-        context_used: None,
-        usage: None,
+    let mut streamed = transcript_of(&workspace, cx, agent(1));
+    let mut update = |keep_bytes, value: &str| {
+        edited_in(&mut streamed, |state| {
+            stream_text(state, 1, keep_bytes, value)
+        })
     };
     feed_frames(
         &workspace,
@@ -2427,10 +2365,10 @@ fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContex
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("write a long response")],
             vec![assistant(&original, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -2446,26 +2384,9 @@ fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContex
         })
         .expect("clear initial wrap edits");
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: original.len(),
-                        value: " appended suffix".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, original.len(), " appended suffix")
+    });
 
     let (batches, width_changes) = workspace
         .update(cx, |_, _, cx| {
@@ -2484,50 +2405,24 @@ fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContex
 
     let first_suffix = " first";
     let second_suffix = " second";
-    feed_frames(
-        &workspace,
-        cx,
-        [
-            (
-                agent(1),
-                AgentRemoteFrame::Diff {
-                    blocks: UiBlocksDiff {
-                        truncate_to: None,
-                        updates: vec![UiBlockUpdate {
-                            index: 1,
-                            block: UiBlockDiff::AssistantText(UiTextDiff {
-                                keep_bytes: original.len() + " appended suffix".len(),
-                                value: first_suffix.to_owned(),
-                            }),
-                        }],
-                    },
-                    status: None,
-                    context_used: None,
-                    usage: None,
-                },
-            ),
-            (
-                agent(1),
-                AgentRemoteFrame::Diff {
-                    blocks: UiBlocksDiff {
-                        truncate_to: None,
-                        updates: vec![UiBlockUpdate {
-                            index: 1,
-                            block: UiBlockDiff::AssistantText(UiTextDiff {
-                                keep_bytes: original.len()
-                                    + " appended suffix".len()
-                                    + first_suffix.len(),
-                                value: second_suffix.to_owned(),
-                            }),
-                        }],
-                    },
-                    status: None,
-                    context_used: None,
-                    usage: None,
-                },
-            ),
-        ],
-    );
+    let mut streamed = transcript_of(&workspace, cx, agent(1));
+    let first = edited_in(&mut streamed, |state| {
+        stream_text(
+            state,
+            1,
+            original.len() + " appended suffix".len(),
+            first_suffix,
+        )
+    });
+    let second = edited_in(&mut streamed, |state| {
+        stream_text(
+            state,
+            1,
+            original.len() + " appended suffix".len() + first_suffix.len(),
+            second_suffix,
+        )
+    });
+    feed_frames(&workspace, cx, [(agent(1), first), (agent(1), second)]);
     let (batches, width_changes) = workspace
         .update(cx, |_, _, cx| {
             editor.update(cx, |editor, cx| {
@@ -2551,13 +2446,13 @@ fn document_preview_reconciles_decorations_when_appending_a_user_turn(cx: &mut T
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("do work")],
             vec![assistant(
                 &long_working_text(),
                 Some(UiMessagePhase::Commentary),
             )],
-        )),
+        ),
     );
     let preview = workspace
         .update(cx, |workspace, window, cx| {
@@ -2587,23 +2482,9 @@ fn document_preview_reconciles_decorations_when_appending_a_user_turn(cx: &mut T
     // The existing decorated response becomes an interior excerpt, but is not
     // rebuilt. Its concrete editor decoration and reconciliation state must
     // remain paired rather than inserting a duplicate.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 2,
-                    block: UiBlockDiff::Replace(user("continue")),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        replace_block(state, 2, user("continue"))
+    });
     assert_eq!(folded_elisions(cx), initial_elisions);
 }
 
@@ -2616,7 +2497,7 @@ fn document_preview_preserves_decorations_across_invisible_tail_status_change(
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("do work")],
             vec![
                 assistant(&long_working_text(), Some(UiMessagePhase::Commentary)),
@@ -2624,7 +2505,7 @@ fn document_preview_preserves_decorations_across_invisible_tail_status_change(
                     text: String::new(),
                 },
             ],
-        )),
+        ),
     );
     let preview = workspace
         .update(cx, |workspace, window, cx| {
@@ -2654,20 +2535,9 @@ fn document_preview_preserves_decorations_across_invisible_tail_status_change(
     // Only the invisible terminal reasoning buffer is rebuilt. Cropping the
     // preceding composed document tail must not discard decoration state for
     // its surviving excerpt and insert a duplicate editor object.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: Vec::new(),
-            },
-            status: Some(UiAgentStatus::Idle),
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        state.status = UiAgentStatus::Idle
+    });
     assert_eq!(folded_elisions(cx), initial_elisions);
 }
 
@@ -2686,10 +2556,10 @@ fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user(&user_text)],
             vec![assistant(&response, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -2716,37 +2586,14 @@ fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
     // Updating two blocks deliberately drops the single-block incremental hint and
     // exercises transcript suffix reconstruction. The settled user excerpt must
     // retain its identity.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![
-                    UiBlockUpdate {
-                        index: 1,
-                        block: UiBlockDiff::AssistantText(UiTextDiff {
-                            keep_bytes: response.len(),
-                            value: "\nappended response".to_owned(),
-                        }),
-                    },
-                    UiBlockUpdate {
-                        index: 2,
-                        block: UiBlockDiff::Replace(UiBlock::Tool(tool(
-                            "tool-1",
-                            UiToolStatus::Running,
-                            Some(1),
-                            None,
-                        ))),
-                    },
-                ],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, response.len(), "\nappended response");
+        replace_block(
+            state,
+            2,
+            UiBlock::Tool(tool("tool-1", UiToolStatus::Running, Some(1), None)),
+        );
+    });
 
     let (traces, width_changes) = workspace
         .update(cx, |_, _, cx| {
@@ -2813,12 +2660,7 @@ fn whole_transcript_rebuild_batches_multibuffer_events(cx: &mut TestAppContext) 
             }
         })
         .collect::<Vec<_>>();
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(blocks, Vec::new())),
-    );
+    feed_frame(&workspace, cx, agent(1), state(blocks, Vec::new()));
 
     let editor = active_editor(&workspace, cx);
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2837,13 +2679,13 @@ fn whole_transcript_rebuild_batches_multibuffer_events(cx: &mut TestAppContext) 
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("replacement"),
                 assistant("done", Some(UiMessagePhase::FinalAnswer)),
             ],
             Vec::new(),
-        )),
+        ),
     );
 
     let events = events.lock().unwrap();
@@ -2925,10 +2767,10 @@ fn benchmark_streaming_suffix_wrap_pipeline(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("write a long response")],
             vec![assistant(&streamed, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -2948,26 +2790,9 @@ fn benchmark_streaming_suffix_wrap_pipeline(cx: &mut TestAppContext) {
     for _ in 0..APPENDS {
         let keep_bytes = streamed.len();
         let suffix = " next";
-        feed_frame(
-            &workspace,
-            cx,
-            agent(1),
-            AgentRemoteFrame::Diff {
-                blocks: UiBlocksDiff {
-                    truncate_to: None,
-                    updates: vec![UiBlockUpdate {
-                        index: 1,
-                        block: UiBlockDiff::AssistantText(UiTextDiff {
-                            keep_bytes,
-                            value: suffix.to_owned(),
-                        }),
-                    }],
-                },
-                status: None,
-                context_used: None,
-                usage: None,
-            },
-        );
+        feed_edit(&workspace, cx, agent(1), |state| {
+            stream_text(state, 1, keep_bytes, suffix)
+        });
         streamed.push_str(suffix);
     }
     let elapsed = started.elapsed();
@@ -3030,10 +2855,10 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant("hel", Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -3043,26 +2868,9 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
         })
         .expect("type prompt");
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: 3,
-                        value: "lo".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, 3, "lo")
+    });
 
     workspace
         .update(cx, |_, window, cx| {
@@ -3087,13 +2895,13 @@ fn streaming_update_keeps_prompt_cursor_editable(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![
                 assistant("hello", Some(UiMessagePhase::FinalAnswer)),
                 UiBlock::Tool(tool("t1", UiToolStatus::Running, None, None)),
             ],
-        )),
+        ),
     );
     workspace
         .update(cx, |_, window, cx| {
@@ -3114,7 +2922,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("run")],
             vec![UiBlock::Tool(UiTool {
                 id: "tool-1".to_owned(),
@@ -3128,40 +2936,12 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
                 finished_at: None,
                 metadata: None,
             })],
-        )),
+        ),
     );
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::Tool(UiToolDiff {
-                        id: "tool-1".to_owned(),
-                        name: "shell_command".to_owned(),
-                        arguments: Some(UiTextDiff {
-                            keep_bytes: 4,
-                            value: " ok".to_owned(),
-                        }),
-                        preview: None,
-                        status: None,
-                        output: None,
-                        error: None,
-                        started_at: None,
-                        finished_at: None,
-                        metadata: None,
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_tool_arguments(state, 1, 4, " ok")
+    });
 
     let text = display_text(&workspace, cx);
     assert!(
@@ -3177,13 +2957,13 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("do work")],
             vec![assistant(
                 &long_working_text(),
                 Some(UiMessagePhase::Commentary),
             )],
-        )),
+        ),
     );
     assert!(has_display_elision(&workspace, cx));
     let text = display_text(&workspace, cx);
@@ -3204,13 +2984,13 @@ fn pending_commentary_elides_but_final_answer_does_not(cx: &mut TestAppContext) 
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("do work")],
             vec![assistant(
                 &long_working_text(),
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -3242,7 +3022,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("run tools")], pending)),
+        state(vec![user("run tools")], pending),
     );
 
     assert!(has_display_elision(&workspace, cx));
@@ -3264,13 +3044,13 @@ fn finished_tool_renders_duration(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("go"),
                 UiBlock::Tool(tool("t1", UiToolStatus::Success, Some(1_000), Some(3_500))),
             ],
             Vec::new(),
-        )),
+        ),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -3287,13 +3067,13 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("go"),
                 UiBlock::Tool(tool("t1", UiToolStatus::Running, Some(started), None)),
             ],
             Vec::new(),
-        )),
+        ),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -3330,119 +3110,6 @@ fn running_tool_duration_ticks_in_place(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn subscribed_hidden_views_stay_warm(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(vec![user("one")], Vec::new())),
-    );
-
-    // Agent 2 has never been focused; its subscription still creates a warm
-    // model so selecting it later does no transcript work.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(2),
-        snapshot_frame(state(
-            vec![
-                user("two"),
-                assistant("done", Some(UiMessagePhase::FinalAnswer)),
-            ],
-            Vec::new(),
-        )),
-    );
-    let hidden_view = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .agent_model(&agent(2))
-                .expect("agent 2 view exists")
-        })
-        .expect("read workspace");
-    let hidden_text = workspace
-        .update(cx, |_, _, cx| {
-            hidden_view.update(cx, |view, cx| view.buffer_text(cx))
-        })
-        .expect("read hidden view");
-    assert!(
-        hidden_text.contains("done"),
-        "subscribed hidden views should stay synchronized: {hidden_text:?}"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(Some(agent(2)), window, cx);
-        })
-        .expect("select agent 2");
-    let text = display_text(&workspace, cx);
-    assert!(
-        text.contains("two") && text.contains("done"),
-        "selecting a hidden agent should reuse its warm model: {text:?}"
-    );
-}
-
-#[gpui::test]
-fn frames_coalesce_while_subscribed_model_is_loading(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Frame {
-                    agent_id: agent(2),
-                    frame: snapshot_frame(state(
-                        vec![user("go"), assistant("hel", None)],
-                        Vec::new(),
-                    )),
-                    allocation: None,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Frame {
-                    agent_id: agent(2),
-                    frame: AgentRemoteFrame::Diff {
-                        blocks: UiBlocksDiff {
-                            truncate_to: None,
-                            updates: vec![UiBlockUpdate {
-                                index: 1,
-                                block: UiBlockDiff::AssistantText(UiTextDiff {
-                                    keep_bytes: 3,
-                                    value: "lo".to_owned(),
-                                }),
-                            }],
-                        },
-                        status: None,
-                        context_used: None,
-                        usage: None,
-                    },
-                    allocation: None,
-                },
-                window,
-                cx,
-            );
-        })
-        .expect("queue frames during initial load");
-    cx.run_until_parked();
-
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .agent_model(&agent(2))
-                .expect("subscribed model")
-                .update(cx, |view, cx| view.buffer_text(cx))
-        })
-        .expect("read warmed model");
-    assert!(
-        text.contains("hello"),
-        "queued diff was not applied: {text:?}"
-    );
-}
-
-#[gpui::test]
 fn empty_prompt_shows_placeholder_and_gutter(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     let text = display_text(&workspace, cx);
@@ -3470,7 +3137,7 @@ fn previous_agent_frames_do_not_leave_intentional_draft(cx: &mut TestAppContext)
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("previous agent")], Vec::new())),
+        state(vec![user("previous agent")], Vec::new()),
     );
     assert!(display_text(&workspace, cx).contains("previous agent"));
 
@@ -3490,13 +3157,13 @@ fn previous_agent_frames_do_not_leave_intentional_draft(cx: &mut TestAppContext)
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("previous agent"),
                 assistant("background update", Some(UiMessagePhase::FinalAnswer)),
             ],
             Vec::new(),
-        )),
+        ),
     );
     let text = display_text(&workspace, cx);
     assert!(
@@ -3523,7 +3190,7 @@ fn editing_startup_draft_prevents_first_frame_auto_selection(cx: &mut TestAppCon
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("background agent")], Vec::new())),
+        state(vec![user("background agent")], Vec::new()),
     );
 
     let text = display_text(&workspace, cx);
@@ -3544,7 +3211,7 @@ fn notices_append_to_messages_without_changing_the_transcript(cx: &mut TestAppCo
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("first")], Vec::new())),
+        state(vec![user("first")], Vec::new()),
     );
     let transcript_before = buffer_text(&workspace, cx);
     workspace
@@ -3612,7 +3279,7 @@ fn first_messages_open_joins_surface_history(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("agent transcript")], Vec::new())),
+        state(vec![user("agent transcript")], Vec::new()),
     );
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3790,7 +3457,7 @@ fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("first")], Vec::new())),
+        state(vec![user("first")], Vec::new()),
     );
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3845,159 +3512,6 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript(
-    cx: &mut TestAppContext,
-) {
-    use rho_ui_proto::ClientMessage;
-
-    let workspace = test_workspace(cx);
-    let agent_id = agent(1);
-    let head = || rho_ui_proto::story::UiAgentHead {
-        spawn_name: Some("retained transcript".to_owned()),
-        ..ui_head(agent_id)
-    };
-    let ready = || ready_with(vec![head()], 2);
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), ready(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
-            workspace.handle_event(HostId::default(), ready(), window, cx);
-            let refresh_messages = workspace.take_host_messages_for_test(HostId::default());
-            assert!(!refresh_messages.iter().any(|message| {
-                matches!(
-                    message,
-                    ClientMessage::AgentStreamFocus { agent_ids } if !agent_ids.is_empty()
-                )
-            }));
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Disconnected("link dropped".to_owned()),
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Recovering(std::time::Duration::from_millis(500)),
-                window,
-                cx,
-            );
-            workspace.handle_event(HostId::default(), ready(), window, cx);
-
-            let messages = workspace.take_host_messages_for_test(HostId::default());
-            assert!(messages.iter().any(|message| {
-                matches!(
-                    message,
-                    ClientMessage::AgentStreamFocus { agent_ids }
-                        if agent_ids == &vec![agent_id]
-                )
-            }));
-        })
-        .expect("reconnect fake daemon");
-}
-
-#[gpui::test]
-fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContext) {
-    use rho_ui_proto::ClientMessage;
-
-    let ids = [agent(21), agent(22), agent(23), agent(24)];
-    let mut desk = DeskFixture::new();
-    for (index, agent_id) in ids.iter().copied().enumerate() {
-        let heading = desk.note(None, &format!("Warm agent {}", index + 1));
-        desk.agent_row(heading, agent_id);
-    }
-    let heads = ids
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, agent_id)| rho_ui_proto::story::UiAgentHead {
-            story_pos: rho_ui_proto::story::UiStoryPos(1),
-            spawn_name: Some(format!("warm {}", index + 1)),
-            ..ui_head(agent_id)
-        })
-        .collect();
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(HostId::default(), ready_with(heads, 30), window, cx);
-            // Each of them asked for the user, the first waiting longest,
-            // which is the order the dealer ranks them in.
-            for (index, agent_id) in ids.iter().copied().enumerate() {
-                workspace.handle_event(
-                    HostId::default(),
-                    story_wanting(agent_id, UnixMs(index as u64 + 1)),
-                    window,
-                    cx,
-                );
-            }
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.take_host_messages_for_test(HostId::default());
-            // The highest card is already warm. The recompute must not resend
-            // it or expand the warm set to the fourth card.
-            for agent_id in ids.into_iter().skip(1) {
-                workspace.forget_agent_subscription_for_test(agent_id);
-            }
-            workspace.invalidate_dealer_signals(cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let subscribed = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .filter_map(|message| match message {
-                    ClientMessage::AgentStreamFocus { agent_ids } => Some(agent_ids),
-                    _ => None,
-                })
-                .next_back()
-                .unwrap_or_default()
-        })
-        .unwrap();
-    // The focus set is replaced whole, so what it must say is the top three
-    // and not the fourth card.
-    assert_eq!(subscribed, vec![ids[0], ids[1], ids[2]]);
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Disconnected("test".into()),
-                window,
-                cx,
-            );
-            for agent_id in ids {
-                workspace.forget_agent_subscription_for_test(agent_id);
-            }
-            workspace.take_host_messages_for_test(HostId::default());
-            workspace.invalidate_dealer_signals(cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .take_host_messages_for_test(HostId::default())
-                    .into_iter()
-                    .all(|message| {
-                        !matches!(
-                            message,
-                            ClientMessage::AgentStreamFocus { agent_ids } if !agent_ids.is_empty()
-                        )
-                    })
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
@@ -4006,13 +3520,13 @@ fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("do work")],
             vec![assistant(
                 &long_working_text(),
                 Some(UiMessagePhase::Commentary),
             )],
-        )),
+        ),
     );
     let collapsed = display_text(&workspace, cx);
     assert!(
@@ -4105,15 +3619,15 @@ fn restored_context_usage_shows_in_status_chips(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        AgentRemoteFrame::Snapshot(UiAgentState {
+        UiAgentState {
             blocks: vec![
-                user("go"),
-                assistant("done", Some(UiMessagePhase::FinalAnswer)),
+                Arc::new(user("go")),
+                Arc::new(assistant("done", Some(UiMessagePhase::FinalAnswer))),
             ],
             status: UiAgentStatus::Idle,
             context_used: Some(194_816),
             usage: Default::default(),
-        }),
+        },
     );
     let spans = workspace
         .update(cx, |workspace, _, cx| {
@@ -4137,36 +3651,25 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        AgentRemoteFrame::Snapshot(UiAgentState {
-            blocks: vec![user("go")],
+        UiAgentState {
+            blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
             usage: Default::default(),
-        }),
-    );
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: Vec::new(),
-            },
-            status: None,
-            context_used: None,
-            usage: Some(rho_ui_proto::remote::UiAgentUsage {
-                provider: "fable".to_owned(),
-                total: rho_ui_proto::AgentUsageBucket {
-                    input_tokens: 1_000_000,
-                    cache_read_tokens: 1_000_000,
-                    cache_write_tokens: 1_000_000,
-                    output_tokens: 1_000_000,
-                    ..Default::default()
-                },
-            }),
         },
     );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        state.usage = rho_registry::render::UiAgentUsage {
+            provider: "fable".to_owned(),
+            total: rho_ui_proto::AgentUsageBucket {
+                input_tokens: 1_000_000,
+                cache_read_tokens: 1_000_000,
+                cache_write_tokens: 1_000_000,
+                output_tokens: 1_000_000,
+                ..Default::default()
+            },
+        }
+    });
 
     let spans = workspace
         .update(cx, |workspace, _, cx| {
@@ -4191,7 +3694,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             workspace.handle_event(
                 HostId::default(),
                 ready_with(
-                    vec![rho_ui_proto::story::UiAgentHead {
+                    vec![story::UiAgentHead {
                         spawn_name: Some("worker".to_owned()),
                         workdirs: vec![WorkspaceInfo::Workspace {
                             repo: "/tmp/rho".into(),
@@ -4210,18 +3713,18 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
         &workspace,
         cx,
         agent_id,
-        AgentRemoteFrame::Snapshot(UiAgentState {
-            blocks: vec![user("go")],
+        UiAgentState {
+            blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
-            usage: rho_ui_proto::remote::UiAgentUsage {
+            usage: rho_registry::render::UiAgentUsage {
                 provider: "fable".to_owned(),
                 total: rho_ui_proto::AgentUsageBucket {
                     input_tokens: 1_000_000,
                     ..Default::default()
                 },
             },
-        }),
+        },
     );
 
     let status = |cx: &mut TestAppContext| {
@@ -4250,56 +3753,6 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
     assert!(
         !status(cx).contains("ws-"),
         "desktop keeps workspace ids hidden after leaving phone mode"
-    );
-}
-
-/// The view can exist before any frame arrives (agent selected first, load
-/// completes later): the chip must appear when the snapshot lands.
-#[gpui::test]
-fn context_chip_appears_when_frame_arrives_after_selection(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.select_agent(Some(agent(1)), window, cx);
-        })
-        .expect("select agent");
-    let spans_before = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .active_agent_model()
-                .expect("agent view")
-                .read(cx)
-                .status_span_text()
-        })
-        .expect("read spans");
-    assert!(
-        !spans_before.contains('k'),
-        "no chip expected before any frame: {spans_before:?}"
-    );
-
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Snapshot(UiAgentState {
-            blocks: vec![user("go")],
-            status: UiAgentStatus::Idle,
-            context_used: Some(62_300),
-            usage: Default::default(),
-        }),
-    );
-    let spans = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .active_agent_model()
-                .expect("agent view")
-                .read(cx)
-                .status_span_text()
-        })
-        .expect("read spans");
-    assert!(
-        spans.contains("62k"),
-        "context chip missing after late frame: {spans:?}"
     );
 }
 
@@ -4536,8 +3989,8 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
             workspace.handle_event(
                 HostId::default(),
                 ready_with(
-                    vec![rho_ui_proto::story::UiAgentHead {
-                        story_pos: rho_ui_proto::story::UiStoryPos(4),
+                    vec![story::UiAgentHead {
+                        story_pos: story::UiStoryPos(4),
                         spawn_name: Some("nobody filed me".to_owned()),
                         ..ui_head(agent_id)
                     }],
@@ -5047,13 +4500,13 @@ fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(
                 "```\n**bold**\nplain\n```\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     cx.run_until_parked();
     assert!(display_text(&workspace, cx).contains("**bold**"));
@@ -5071,10 +4524,10 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(&markup, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     // Parsing and query-backed decoration are both asynchronous.
@@ -5121,72 +4574,19 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn subscribed_transcript_eagerly_parses_history(cx: &mut TestAppContext) {
-    let mut history = Vec::new();
-    for turn in 0..40 {
-        history.push(user(&format!("request {turn}")));
-        history.push(assistant(
-            &format!("assistant turn {turn}\n{}", "historical line\n".repeat(12)),
-            Some(UiMessagePhase::FinalAnswer),
-        ));
-    }
-    let workspace = test_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(
-            history,
-            vec![assistant(
-                "assistant visible tail **bold**",
-                Some(UiMessagePhase::FinalAnswer),
-            )],
-        )),
-    );
-    for _ in 0..64 {
-        cx.run_until_parked();
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(20));
-    }
-
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |_, _, cx| {
-            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
-            let middle = buffers
-                .iter()
-                .find(|buffer| buffer.read(cx).text().contains("assistant turn 20"))
-                .expect("middle response buffer");
-            let tail = buffers
-                .iter()
-                .find(|buffer| buffer.read(cx).text().contains("assistant visible tail"))
-                .expect("visible response buffer");
-            assert!(
-                middle.read(cx).has_syntax_tree(),
-                "subscribed history should be parsed before Ready"
-            );
-            assert!(
-                tail.read(cx).has_syntax_tree(),
-                "the visible tail should be parsed"
-            );
-        })
-        .expect("inspect eager transcript syntax");
-}
-
-#[gpui::test]
 fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(
                 "**bold** and `code`\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     cx.run_until_parked();
 
@@ -5212,10 +4612,10 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(original, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
     cx.run_until_parked();
 
@@ -5223,26 +4623,9 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
     let before = concealed_ranges(&workspace, &editor, cx);
     assert!(!before.is_empty());
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: original.len(),
-                        value: "more plain text\n".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 1, original.len(), "more plain text\n")
+    });
     cx.run_until_parked();
 
     let after = concealed_ranges(&workspace, &editor, cx);
@@ -5269,10 +4652,10 @@ fn edits_under_overlapping_elisions_keep_the_block_map_consistent(cx: &mut TestA
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(&lines, Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     // Two elisions over rows that overlap, inserted latest-first.
@@ -5304,13 +4687,13 @@ fn edits_under_overlapping_elisions_keep_the_block_map_consistent(cx: &mut TestA
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(
                 &format!("{lines}line 40 of the answer\n"),
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
 
     let text = display_text(&workspace, cx);
@@ -5330,10 +4713,10 @@ fn user_messages_render_larger_than_the_transcript_around_them(cx: &mut TestAppC
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("my question")],
             vec![assistant("the answer", Some(UiMessagePhase::FinalAnswer))],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -5373,10 +4756,7 @@ fn streaming_replacement_does_not_inherit_previous_markdown_syntax(cx: &mut Test
         &replaced,
         cx,
         agent(2),
-        snapshot_frame(state(
-            vec![user("go")],
-            vec![assistant("**bold text**", None)],
-        )),
+        state(vec![user("go")], vec![assistant("**bold text**", None)]),
     );
 
     for _ in 0..64 {
@@ -5384,26 +4764,9 @@ fn streaming_replacement_does_not_inherit_previous_markdown_syntax(cx: &mut Test
         cx.executor()
             .advance_clock(std::time::Duration::from_millis(20));
     }
-    feed_frame(
-        &replaced,
-        cx,
-        agent(2),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 1,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: 0,
-                        value: "plain text".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&replaced, cx, agent(2), |state| {
+        stream_text(state, 1, 0, "plain text")
+    });
     let highlights = syntax_highlights_for_text(&replaced, "plain text", cx);
     assert!(
         highlights.iter().all(Option::is_none),
@@ -5418,13 +4781,13 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
         &isolated,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("go")],
             vec![assistant(
                 "target **bold text**",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
 
     let after_unclosed_fence = test_workspace(cx);
@@ -5432,7 +4795,7 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
         &after_unclosed_fence,
         cx,
         agent(2),
-        snapshot_frame(state(
+        state(
             vec![
                 user("first"),
                 assistant("```text\nunclosed", Some(UiMessagePhase::FinalAnswer)),
@@ -5442,7 +4805,7 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
                 "target **bold text**",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
 
     for _ in 0..64 {
@@ -5463,7 +4826,7 @@ fn markdown_and_tool_segments_use_separate_syntax_buffers(cx: &mut TestAppContex
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("first request"),
                 assistant("first assistant segment", Some(UiMessagePhase::Commentary)),
@@ -5475,7 +4838,7 @@ fn markdown_and_tool_segments_use_separate_syntax_buffers(cx: &mut TestAppContex
                 user("second request"),
             ],
             vec![assistant("next turn response", None)],
-        )),
+        ),
     );
 
     let editor = active_editor(&workspace, cx);
@@ -5513,13 +4876,13 @@ fn adding_markdown_turn_does_not_blank_settled_highlights(cx: &mut TestAppContex
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("first")],
             vec![assistant(
                 "settled **bold text**",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     for _ in 0..64 {
         cx.run_until_parked();
@@ -5543,29 +4906,10 @@ fn adding_markdown_turn_does_not_blank_settled_highlights(cx: &mut TestAppContex
         })
         .expect("disable synchronous transcript parsing");
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![
-                    UiBlockUpdate {
-                        index: 2,
-                        block: UiBlockDiff::Replace(user("second")),
-                    },
-                    UiBlockUpdate {
-                        index: 3,
-                        block: UiBlockDiff::Replace(assistant("new response", None)),
-                    },
-                ],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        replace_block(state, 2, user("second"));
+        replace_block(state, 3, assistant("new response", None));
+    });
 
     assert_eq!(
         syntax_highlights_for_text(&workspace, "settled **bold text**", cx),
@@ -5584,13 +4928,13 @@ fn every_row_of_a_user_message_renders_larger(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![user("first line\nsecond line\nthird line")],
             vec![assistant(
                 "## Heading\n\n**bold** answer\n",
                 Some(UiMessagePhase::FinalAnswer),
             )],
-        )),
+        ),
     );
     cx.run_until_parked();
 
@@ -5639,7 +4983,7 @@ fn streamed_markup_conceals_once_its_delimiters_close(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("go")], vec![assistant("", None)])),
+        state(vec![user("go")], vec![assistant("", None)]),
     );
 
     let message = "Here is **bold** text, `code`, and **more strong** words.\n";
@@ -5649,26 +4993,9 @@ fn streamed_markup_conceals_once_its_delimiters_close(cx: &mut TestAppContext) {
         while !message.is_char_boundary(next) {
             next += 1;
         }
-        feed_frame(
-            &workspace,
-            cx,
-            agent(1),
-            AgentRemoteFrame::Diff {
-                blocks: UiBlocksDiff {
-                    truncate_to: None,
-                    updates: vec![UiBlockUpdate {
-                        index: 1,
-                        block: UiBlockDiff::AssistantText(UiTextDiff {
-                            keep_bytes: sent,
-                            value: message[sent..next].to_owned(),
-                        }),
-                    }],
-                },
-                status: None,
-                context_used: None,
-                usage: None,
-            },
-        );
+        feed_edit(&workspace, cx, agent(1), |state| {
+            stream_text(state, 1, sent, &message[sent..next])
+        });
         sent = next;
     }
 
@@ -5692,34 +5019,17 @@ fn terminal_invisible_assistant_segment_rebuilds_its_turn_when_it_appears(cx: &m
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("go"),
                 assistant("first", Some(UiMessagePhase::Commentary)),
             ],
             vec![assistant("", None)],
-        )),
+        ),
     );
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: 2,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: 0,
-                        value: "second".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(state, 2, 0, "second")
+    });
 
     let text = display_text(&workspace, cx);
     assert!(
@@ -5735,14 +5045,14 @@ fn invisible_response_chunk_adds_no_excerpt_boundary(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(
+        state(
             vec![
                 user("first"),
                 assistant("", Some(UiMessagePhase::FinalAnswer)),
                 user("second"),
             ],
             Vec::new(),
-        )),
+        ),
     );
 
     assert_eq!(buffer_text(&workspace, cx), "first\n\nsecond\n\n");
@@ -5755,7 +5065,7 @@ fn terminal_user_message_keeps_its_style_at_the_excerpt_boundary(cx: &mut TestAp
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("last user")], Vec::new())),
+        state(vec![user("last user")], Vec::new()),
     );
 
     let runs = styled_runs(&workspace, cx);
@@ -5773,7 +5083,7 @@ fn growing_document_preview_omits_the_terminal_blank_row(cx: &mut TestAppContext
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(vec![user("first")], vec![assistant("second", None)])),
+        state(vec![user("first")], vec![assistant("second", None)]),
     );
 
     let preview = workspace
@@ -5814,7 +5124,7 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
         &workspace,
         cx,
         agent(1),
-        snapshot_frame(state(history, vec![assistant(initial, None)])),
+        state(history, vec![assistant(initial, None)]),
     );
     for _ in 0..64 {
         cx.run_until_parked();
@@ -5844,26 +5154,14 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
         })
         .expect("set transcript parse budget");
 
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        AgentRemoteFrame::Diff {
-            blocks: UiBlocksDiff {
-                truncate_to: None,
-                updates: vec![UiBlockUpdate {
-                    index: active_index,
-                    block: UiBlockDiff::AssistantText(UiTextDiff {
-                        keep_bytes: initial.len(),
-                        value: "\n\n## New heading\n\n**new bold**".to_owned(),
-                    }),
-                }],
-            },
-            status: None,
-            context_used: None,
-            usage: None,
-        },
-    );
+    feed_edit(&workspace, cx, agent(1), |state| {
+        stream_text(
+            state,
+            active_index,
+            initial.len(),
+            "\n\n## New heading\n\n**new bold**",
+        )
+    });
 
     let text = display_text(&workspace, cx);
     assert!(
@@ -6930,8 +6228,8 @@ fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppCon
             workspace.handle_event(
                 HostId::default(),
                 ready_with(
-                    vec![rho_ui_proto::story::UiAgentHead {
-                        story_pos: rho_ui_proto::story::UiStoryPos(1),
+                    vec![story::UiAgentHead {
+                        story_pos: story::UiStoryPos(1),
                         spawn_name: Some("warm agent".into()),
                         ..ui_head(agent_id)
                     }],
@@ -7127,8 +6425,8 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
             workspace.handle_event(
                 HostId::default(),
                 ready_with(
-                    vec![rho_ui_proto::story::UiAgentHead {
-                        story_pos: rho_ui_proto::story::UiStoryPos(1),
+                    vec![story::UiAgentHead {
+                        story_pos: story::UiStoryPos(1),
                         spawn_name: Some("warm agent".into()),
                         ..ui_head(agent_id)
                     }],
@@ -7184,16 +6482,16 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
 /// A head as `Ready` carries it: the least an agent can say about itself,
 /// with the story empty. Tests that care about a title or a running turn
 /// set those fields with struct update syntax.
-fn ui_head(agent_id: AgentId) -> rho_ui_proto::story::UiAgentHead {
-    rho_ui_proto::story::UiAgentHead {
+fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
+    story::UiAgentHead {
         agent_id,
-        story_pos: rho_ui_proto::story::UiStoryPos(0),
+        story_pos: story::UiStoryPos(0),
         role: rho_ui_proto::AgentRole::default(),
-        runtime_kind: rho_ui_proto::story::UiRuntimeKind::Rho,
+        runtime_kind: story::UiRuntimeKind::Rho,
         workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
             repo: "/tmp".into(),
         }],
-        spawned_by: rho_ui_proto::story::UiSpawnedBy::Direct,
+        spawned_by: story::UiSpawnedBy::Direct,
         parent: None,
         spawn_name: None,
         generated_title: None,
@@ -7206,42 +6504,26 @@ fn ui_head(agent_id: AgentId) -> rho_ui_proto::story::UiAgentHead {
 /// The whole story of an agent that has finished a turn and asked for the
 /// user: the least a card needs to rank as waiting on a reply.
 fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
-    use rho_ui_proto::story::UiStoryEvent;
-    ConnEvent::AgentStory {
+    use story::UiStoryEvent;
+    story::story(
         agent_id,
-        from: rho_ui_proto::story::UiStoryPos(0),
-        events: vec![
+        vec![
             UiStoryEvent::UserMessage {
                 text: "go".to_owned(),
                 at: UnixMs(0),
             },
             UiStoryEvent::TurnStarted { at: UnixMs(0) },
             UiStoryEvent::Wants {
-                want: rho_ui_proto::story::UiAgentWant::Ask,
+                want: story::UiAgentWant::Ask,
                 summary: None,
                 at,
             },
             UiStoryEvent::TurnEnded {
-                outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                outcome: story::UiTurnOutcome::Completed,
                 at,
             },
         ],
-    }
-}
-
-/// `Ready` with these heads and nothing else: the shape every test that
-/// only cares about the agents list wants.
-fn ready_with(agents: Vec<rho_ui_proto::story::UiAgentHead>, agent_counter: u64) -> ConnEvent {
-    ConnEvent::Ready {
-        agents,
-        auth: rho_ui_proto::AuthState {
-            namespaces: Vec::new(),
-            disabled_namespaces: Vec::new(),
-            active_namespace: None,
-        },
-        machine_seed: 0,
-        agent_counter,
-    }
+    )
 }
 
 struct DeskFixture {
@@ -7760,7 +7042,7 @@ fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let heading = desk.note(None, "phone feed");
     desk.agent_row(heading, running);
-    let head = |activity: &str| rho_ui_proto::story::UiAgentHead {
+    let head = |activity: &str| story::UiAgentHead {
         activity: Some(activity.to_owned()),
         turn_running: true,
         ..ui_head(running)
@@ -8481,23 +7763,22 @@ fn every_agent_under_a_note_is_its_own_card(cx: &mut TestAppContext) {
             );
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::AgentStory {
-                    agent_id: dead,
-                    from: rho_ui_proto::story::UiStoryPos(0),
-                    events: vec![
-                        rho_ui_proto::story::UiStoryEvent::UserMessage {
+                story::story(
+                    dead,
+                    vec![
+                        story::UiStoryEvent::UserMessage {
                             text: "go".to_owned(),
                             at: UnixMs(0),
                         },
-                        rho_ui_proto::story::UiStoryEvent::TurnStarted { at: UnixMs(0) },
-                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
-                            outcome: rho_ui_proto::story::UiTurnOutcome::Errored {
+                        story::UiStoryEvent::TurnStarted { at: UnixMs(0) },
+                        story::UiStoryEvent::TurnEnded {
+                            outcome: story::UiTurnOutcome::Errored {
                                 message: "the deploy script exited 1".to_owned(),
                             },
                             at: UnixMs(1),
                         },
                     ],
-                },
+                ),
                 window,
                 cx,
             );
@@ -8577,21 +7858,20 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
             // Something new past the cursor is the card again.
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::AgentStory {
+                story::story(
                     agent_id,
-                    from: rho_ui_proto::story::UiStoryPos(4),
-                    events: vec![
-                        rho_ui_proto::story::UiStoryEvent::Wants {
-                            want: rho_ui_proto::story::UiAgentWant::Ask,
+                    vec![
+                        story::UiStoryEvent::Wants {
+                            want: story::UiAgentWant::Ask,
                             summary: None,
                             at: UnixMs(2),
                         },
-                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
-                            outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                        story::UiStoryEvent::TurnEnded {
+                            outcome: story::UiTurnOutcome::Completed,
                             at: UnixMs(2),
                         },
                     ],
-                },
+                ),
                 window,
                 cx,
             );
@@ -9307,20 +8587,19 @@ fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) 
             );
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::AgentStory {
+                story::story(
                     agent_id,
-                    from: rho_ui_proto::story::UiStoryPos(0),
-                    events: vec![
-                        rho_ui_proto::story::UiStoryEvent::UserMessage {
+                    vec![
+                        story::UiStoryEvent::UserMessage {
                             text: "rebuild the search index".to_owned(),
                             at: UnixMs(1),
                         },
-                        rho_ui_proto::story::UiStoryEvent::TurnEnded {
-                            outcome: rho_ui_proto::story::UiTurnOutcome::Completed,
+                        story::UiStoryEvent::TurnEnded {
+                            outcome: story::UiTurnOutcome::Completed,
                             at: UnixMs(2),
                         },
                     ],
-                },
+                ),
                 window,
                 cx,
             );
@@ -9896,8 +9175,8 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
             workspace.handle_event(
                 HostId::default(),
                 ready_with(
-                    vec![rho_ui_proto::story::UiAgentHead {
-                        story_pos: rho_ui_proto::story::UiStoryPos(4),
+                    vec![story::UiAgentHead {
+                        story_pos: story::UiStoryPos(4),
                         spawn_name: Some("the deploy".to_owned()),
                         ..ui_head(agent_id)
                     }],

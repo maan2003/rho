@@ -15,7 +15,7 @@ use editor::{DisplayElisionId, DisplayElisionProperties, Editor};
 use gpui::prelude::*;
 use gpui::{Context, Entity};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
-use rho_ui_proto::remote::UiBlock;
+use rho_registry::render::UiBlock;
 use text::Anchor;
 use ui::{Icon, IconName, IconSize, div};
 
@@ -52,7 +52,7 @@ impl ElisionSync {
     /// turn onward. `plan_range` resolves a plan to its buffer anchor range.
     pub fn refresh(
         &mut self,
-        blocks: &[UiBlock],
+        blocks: &[Arc<UiBlock>],
         first_changed_block: usize,
         visible: &[bool],
         turn_in_progress: bool,
@@ -77,7 +77,7 @@ impl ElisionSync {
     /// onward.
     fn rebuild_plans(
         &mut self,
-        blocks: &[UiBlock],
+        blocks: &[Arc<UiBlock>],
         first_changed_block: usize,
         visible: &[bool],
         turn_in_progress: bool,

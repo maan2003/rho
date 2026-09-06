@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use rho_core::{
     ApplyPatchMetadata, ContentPart, ContextBlock, InferenceResponseItem, PendingInferenceResponse,
-    ProviderResponseId, ToolCall, ToolCallId, ToolResult, ToolSpec, ToolUpdate, UnixMs,
+    ToolCall, ToolCallId, ToolResult, ToolSpec, UnixMs,
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
@@ -21,26 +21,23 @@ use rho_workspaces::{Repo, Workspace, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentPresentationUpdate, AgentRole, AgentRuntime, AgentSpawnedBy,
-    AgentWriteTxnExt as _, ClaudeRewind, SessionBinding, UnixMillis,
+    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, AgentWant,
+    AgentWriteTxnExt as _, ClaudeRewind, PresentationField, SessionBinding, TurnEdge, TurnOutcome,
+    UnixMillis,
 };
 
 pub mod agent;
 mod claude;
 pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
-pub use claude::{backfill_last_turn_ended_from_claude_messages, last_assistant_message_at};
 
 pub mod db;
 mod image_tool;
 mod lazy;
+pub mod live;
+pub mod mirror;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod presentation;
-pub mod story;
-pub mod story_backfill;
-pub mod story_fixture;
-#[cfg(test)]
-mod story_sizing;
 pub mod system_prompt;
 
 const PRESENTATION_SOURCE_TAIL_BYTES: usize = 12 * 1024;
@@ -54,10 +51,9 @@ pub struct RenderedAgentSurface {
 
 /// One event of an agent's raw log.
 ///
-/// The Rho runtime writes `Accepted`, `QueueCleared`, `Sent` and `Replied`;
-/// the head's config events are written by the store on the agent's behalf.
-/// The rest are what earlier runtimes wrote and are decoded only, so a log
-/// from before the current loop still replays (`agent::replay`).
+/// The Rho runtime writes `Accepted`, `QueueCleared`, `Sent`, `Replied` and
+/// `Failed`; the Claude runtime `ClaudePresentationSource`; the head's
+/// config events are written by the store on the agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
     /// An input entered a queue: user text, mail, or a `/compact`. It becomes
@@ -73,6 +69,8 @@ pub enum AgentEvent<'a> {
     /// down.
     Sent {
         blocks: Cow<'a, [ContextBlock]>,
+        #[senax(default)]
+        at: UnixMs,
     },
     /// The model answered, and the request is over.
     Replied {
@@ -80,26 +78,52 @@ pub enum AgentEvent<'a> {
         /// Context-window occupancy after this response (all input plus
         /// output tokens), or `None` when it compacted or usage was missing.
         context_used: Option<u64>,
+        /// What the response cost, as the provider reported it. Told
+        /// here, at the response, so a reader can price the transcript
+        /// without a usage table (`AGENT-LOG-DESIGN.md`).
+        #[senax(default)]
+        usage: Option<crate::db::AgentUsageBucket>,
+        #[senax(default)]
+        at: UnixMs,
     },
-    /// All queued items were dropped (cancel).
+    /// All queued items were dropped (cancel). Written before the log
+    /// carried times; `Cleared` is what is written now.
     QueueCleared,
-
-    // -- what the previous Rho loop wrote; decoded, never written ------------
-    InferenceResponse {
-        items: Cow<'a, [InferenceResponseItem]>,
-        provider_response_id: Option<ProviderResponseId>,
-        context_used: Option<u64>,
+    Cleared {
+        at: UnixMs,
     },
-    ToolResult {
-        result: Cow<'a, ToolResult>,
+    /// A turn started or stopped: the edge both runtimes cross.
+    Turn {
+        edge: TurnEdge,
+        at: UnixMs,
     },
-    Queued(QueuedItem),
-    Dequeued {
-        boundary: LegacyDelivery,
+    /// The sidecar's title and activity, applied.
+    Presented {
+        title: PresentationField,
+        activity: PresentationField,
+        at: UnixMs,
     },
-    /// Once the presentation's own record; the story carries it now.
-    PresentationUpdated {
-        update: AgentPresentationUpdate,
+    /// What the last turn asks of the person.
+    Wants {
+        want: AgentWant,
+        summary: Option<String>,
+        at: UnixMs,
+    },
+    /// Everything from `to` up to this event is no longer the agent's
+    /// history. Told, never undone: positions only grow.
+    Rewound {
+        to: AgentEventPos,
+        at: UnixMs,
+    },
+    /// A request failed with this much of a response in. `retrying` when
+    /// the loop makes the request again by itself; otherwise the turn
+    /// ends in error right after. Never history: the next request does
+    /// not carry it. Written so what the model said is not lost.
+    Failed {
+        partial: PendingInferenceResponse,
+        error: Cow<'a, str>,
+        retrying: bool,
+        at: UnixMs,
     },
 
     // -- the runtimes' shared config log --------------------------------------
@@ -109,7 +133,11 @@ pub enum AgentEvent<'a> {
     ClaudePresentationSource {
         source_id: uuid::Uuid,
         speaker: PresentationSpeaker,
+        /// The message whole (rows from before the mirror existed hold
+        /// the first kilobyte only).
         text: Cow<'a, str>,
+        #[senax(default)]
+        at: UnixMs,
     },
     /// The agent coming into being: the first event of every agent's log,
     /// and the base the head's config is folded from. A spawn name given
@@ -122,20 +150,29 @@ pub enum AgentEvent<'a> {
         spawned_by: AgentSpawnedBy,
         spawn_name: Option<String>,
         created_at: rho_core::UnixMs,
+        /// The agent that spawned this one.
+        #[senax(default)]
+        parent: Option<AgentId>,
     },
     RoleChanged {
         role: AgentRole,
         /// `None` when only the role moved and the session binding stands.
         binding: Option<SessionBinding>,
+        #[senax(default)]
+        at: UnixMs,
     },
     WorkdirAdded {
         workdir: WorkspaceInfo,
+        #[senax(default)]
+        at: UnixMs,
     },
     /// The runtime itself changing under the agent: a Claude rewind before
     /// and after its destination transcript is verified, or a new prompt
     /// cache key for the Rho runtime.
     RuntimeRebound {
         change: RuntimeChange,
+        #[senax(default)]
+        at: UnixMs,
     },
 }
 
@@ -147,14 +184,6 @@ impl AgentEvent<'_> {
             Self::Accepted(QueuedInput {
                 source: MessageSender::User,
                 kind: InputKind::Message { .. },
-                ..
-            }) => true,
-            Self::Queued(QueuedItem {
-                kind:
-                    QueuedItemKind::UserMessage {
-                        sender: MessageSender::User,
-                        ..
-                    },
                 ..
             }) => true,
             _ => false,
@@ -195,44 +224,6 @@ pub enum InputKind {
     Compaction,
 }
 
-/// What the previous loop queued. Decoded from old logs only.
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub struct QueuedItem {
-    pub kind: QueuedItemKind,
-    pub delivery: LegacyDelivery,
-}
-
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum QueuedItemKind {
-    UserMessage {
-        sender: MessageSender,
-        content: Arc<Vec<ContentPart>>,
-        #[senax(default)]
-        source_id: Option<InputSourceId>,
-    },
-    Compaction,
-    ToolUpdate(ToolUpdate),
-}
-
-/// The delivery lanes the previous loop had. `NextTurn` no longer exists
-/// live; old rows that name it still have to decode, and replay reads it
-/// as `NextRequest`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum LegacyDelivery {
-    Immediate,
-    NextRequest,
-    NextTurn,
-}
-
-impl From<LegacyDelivery> for MessageDelivery {
-    fn from(delivery: LegacyDelivery) -> Self {
-        match delivery {
-            LegacyDelivery::Immediate => Self::Immediate,
-            LegacyDelivery::NextRequest | LegacyDelivery::NextTurn => Self::NextRequest,
-        }
-    }
-}
-
 /// Opaque tag the previous loop stored for the surface that submitted an
 /// input. Kept so old rows decode; nothing reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
@@ -255,9 +246,25 @@ pub struct PresentationSource {
     pub text: String,
 }
 
-/// Live runtime state of an agent turn.
+/// What a loop publishes about itself: its phase, and how much input
+/// waits. Everything else a reader wants is in the log.
 #[derive(Clone, Debug, PartialEq)]
-// should be cheap to clone, it is cloned a lot
+pub struct AgentStatus {
+    pub kind: AgentStateKind,
+    /// Inputs waiting to enter model context.
+    pub queued: usize,
+}
+
+impl AgentStatus {
+    /// Nothing running and nothing waiting: safe to drop the loop.
+    pub fn settled(&self) -> bool {
+        !self.kind.is_working() && self.queued == 0
+    }
+}
+
+/// The Claude runtime's own view of its transcript and queue. Internal
+/// to that loop; the Rho loop keeps its history as blocks of its own.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentState {
     /// Rho-runtime blocks are append-only. Provider-managed runtimes may
     /// replace this with a compacted transcript snapshot when the provider
@@ -342,9 +349,9 @@ pub enum AgentStateKind {
     Idle,
 }
 
-/// Tells the story that a turn started or stopped. Both runtimes cross
-/// the same edge (working, then not working), and the head's
-/// `turn_running` is the fold of the two events.
+/// Tells the log that a turn started or stopped. Both runtimes cross the
+/// same edge (working, then not working), and a head's `turn_running` is
+/// the fold of the two events.
 pub(crate) async fn tell_turn_boundary(
     db: &RhoDb,
     agent_id: AgentId,
@@ -353,23 +360,20 @@ pub(crate) async fn tell_turn_boundary(
     attempt_started: bool,
 ) {
     let now = UnixMillis::now();
-    let event = if !previous.is_working() && current.is_working() {
-        story::StoryEvent::TurnStarted { at: now }
+    let edge = if !previous.is_working() && current.is_working() {
+        TurnEdge::Started
     } else if execution_settled(previous, current, attempt_started) {
-        story::StoryEvent::TurnEnded {
-            outcome: match current {
-                AgentStateKind::Error(failed) => story::TurnOutcome::Errored {
-                    message: failed.error.to_string(),
-                },
-                _ => story::TurnOutcome::Completed,
+        TurnEdge::Ended(match current {
+            AgentStateKind::Error(failed) => TurnOutcome::Errored {
+                message: failed.error.to_string(),
             },
-            at: now,
-        }
+            _ => TurnOutcome::Completed,
+        })
     } else {
         return;
     };
     let mut write = db.write().await;
-    write.append_agent_story(agent_id, &event);
+    write.tell_turn(now, agent_id, edge);
     write.commit();
 }
 
@@ -544,28 +548,18 @@ pub(crate) fn presentation_sources(
                 PresentationSpeaker::Assistant,
                 replied_text(blocks),
             ),
-            AgentEvent::Queued(QueuedItem {
-                kind:
-                    QueuedItemKind::UserMessage {
-                        sender, content, ..
-                    },
-                ..
-            }) => found(through, speaker_of(sender), rho_core::text_content(content)),
-            AgentEvent::InferenceResponse { items, .. } => found(
-                through,
-                PresentationSpeaker::Assistant,
-                assistant_text(items),
-            ),
             AgentEvent::ClaudePresentationSource { speaker, text, .. } => {
                 found(through, *speaker, text.to_string())
             }
             AgentEvent::Accepted(_)
             | AgentEvent::Sent { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::Queued(_)
-            | AgentEvent::Dequeued { .. }
             | AgentEvent::QueueCleared
-            | AgentEvent::PresentationUpdated { .. }
+            | AgentEvent::Cleared { .. }
+            | AgentEvent::Turn { .. }
+            | AgentEvent::Presented { .. }
+            | AgentEvent::Wants { .. }
+            | AgentEvent::Rewound { .. }
+            | AgentEvent::Failed { .. }
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
             | AgentEvent::WorkdirAdded { .. }
@@ -604,23 +598,41 @@ mod encoding_tests {
             }),
             AgentEvent::Sent {
                 blocks: Cow::Owned(vec![ContextBlock::CompactionTrigger]),
+                at: UnixMs(9),
             },
             AgentEvent::Replied {
                 blocks: Cow::Owned(Vec::new()),
                 context_used: Some(12),
+                usage: None,
+                at: UnixMs(10),
             },
-            AgentEvent::Queued(QueuedItem {
-                kind: QueuedItemKind::Compaction,
-                delivery: LegacyDelivery::NextTurn,
-            }),
-            AgentEvent::Dequeued {
-                boundary: LegacyDelivery::NextRequest,
+            AgentEvent::Cleared { at: UnixMs(11) },
+            AgentEvent::Turn {
+                edge: TurnEdge::Ended(TurnOutcome::Errored {
+                    message: "boom".to_owned(),
+                }),
+                at: UnixMs(12),
+            },
+            AgentEvent::Presented {
+                title: PresentationField::Set("title".to_owned()),
+                activity: PresentationField::Clear,
+                at: UnixMs(13),
+            },
+            AgentEvent::Wants {
+                want: AgentWant::Ask,
+                summary: Some("which one?".to_owned()),
+                at: UnixMs(14),
+            },
+            AgentEvent::Rewound {
+                to: crate::db::AgentEventPos::new(3),
+                at: UnixMs(15),
             },
             AgentEvent::QueueCleared,
             AgentEvent::ClaudePresentationSource {
                 source_id: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
                 speaker: PresentationSpeaker::Assistant,
                 text: Cow::Borrowed("confirmed response"),
+                at: UnixMs(16),
             },
         ];
         for event in events {

@@ -23,8 +23,8 @@ use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Wind
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
+use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
-use rho_ui_proto::remote::UiAgentState;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
 use crate::commands::WorkspaceCompletionProvider;

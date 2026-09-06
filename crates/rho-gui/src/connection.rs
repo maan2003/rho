@@ -13,7 +13,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, Task};
 use gpui_tokio::Tokio;
 use rho_ui_proto::client::Client;
-use rho_ui_proto::remote::AgentRemoteFrame;
+use rho_ui_proto::mirror::{AgentPos, DetailBody, Live, LogEntry, Seq};
 use rho_ui_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, WorkspaceInfo,
     read_frame, write_frame,
@@ -95,37 +95,45 @@ pub enum ConnEvent {
     },
     DeskResyncRequired,
     Ready {
-        agents: Vec<rho_ui_proto::story::UiAgentHead>,
         auth: rho_ui_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
+        /// How far the daemon's journal runs, so a client holding more
+        /// knows its copy is of another database.
+        journal_head: Seq,
     },
     AuthState(rho_ui_proto::AuthState),
     AgentCreated {
         agent_id: AgentId,
     },
-    AgentUnloaded {
+    /// What changed in the runtime's tail past the log, for an agent
+    /// some client is looking at.
+    Live {
         agent_id: AgentId,
-        reason: rho_ui_proto::AgentUnloadReason,
+        live: Live,
     },
-    Frame {
+    /// A transcript handed in whole, for tests that drive the view without
+    /// a mirror to fold.
+    #[cfg(test)]
+    Transcript {
         agent_id: AgentId,
-        frame: AgentRemoteFrame,
-        /// Holds aggregate decode budget until the GUI consumes this frame.
-        allocation: Option<AgentFrameAllocation>,
+        state: rho_registry::render::UiAgentState,
     },
+    /// Several events in order, for a test helper that stands for what a
+    /// daemon sends in more than one message.
+    #[cfg(test)]
+    Many(Vec<ConnEvent>),
     TurnCancelled,
-    /// A run of one agent's story, from the daemon's answer to
-    /// `AgentLogs` or from the follow that comes after it.
-    AgentStory {
-        agent_id: AgentId,
-        from: rho_ui_proto::story::UiStoryPos,
-        events: Vec<rho_ui_proto::story::UiStoryEvent>,
+    /// A run of the host's journal, contiguous by seq: the answer to
+    /// `Follow` and everything appended since.
+    Log {
+        entries: Vec<LogEntry>,
     },
-    /// An agent's head changed, or this connection is out of step and the
-    /// daemon is saying where the story stands.
-    AgentHead {
-        head: rho_ui_proto::story::UiAgentHead,
+    /// The bodies of one row, asked for by position.
+    Detail {
+        agent_id: AgentId,
+        pos: AgentPos,
+        body: DetailBody,
     },
     ChatGptUsage {
         used_percent: f64,
@@ -1034,12 +1042,11 @@ fn replay_safe(message: &ClientMessage) -> bool {
         ClientMessage::Ping
             | ClientMessage::Subscribe
             | ClientMessage::AgentStreamFocus { .. }
-            | ClientMessage::AgentLogs { .. }
+            | ClientMessage::Follow { .. }
             | ClientMessage::GitTransportRegister
             | ClientMessage::ShellList { .. }
             | ClientMessage::ChatGptUsage
             | ClientMessage::QuotaHistory
-            | ClientMessage::AgentUsage { .. }
             | ClientMessage::GlobalUsage { .. }
             | ClientMessage::AgentCostDistribution { .. }
     )
@@ -1106,20 +1113,20 @@ async fn run(
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
-        agents,
         auth,
         machine_seed,
         agent_counter,
+        journal_head,
     } = message
     else {
         anyhow::bail!("rho daemon did not send ready message");
     };
     if events
         .unbounded_send(ConnEvent::Ready {
-            agents,
             auth,
             machine_seed,
             agent_counter,
+            journal_head,
         })
         .is_err()
     {
@@ -1134,15 +1141,7 @@ async fn run(
 
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
-    let health_connection = agent_connection.clone();
-    let agent_stream_task = agent_connection.map(|connection| {
-        let events = events.clone();
-        let (shutdown, requested) = tokio::sync::oneshot::channel();
-        (
-            shutdown,
-            tokio::spawn(run_agent_streams(connection, events, requested)),
-        )
-    });
+    let health_connection = agent_connection;
     let git_transport_limit = Arc::new(tokio::sync::Semaphore::new(1));
     let git_requests = Arc::new(Mutex::new(
         HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
@@ -1235,37 +1234,30 @@ async fn run(
             } => Some(ConnEvent::DeskTextApplied { id, operation }),
             ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
             ServerMessage::Ready {
-                agents,
                 auth,
                 machine_seed,
                 agent_counter,
+                journal_head,
             } => Some(ConnEvent::Ready {
-                agents,
                 auth,
                 machine_seed,
                 agent_counter,
+                journal_head,
             }),
             ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
             ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
-            ServerMessage::AgentUnloaded { agent_id, reason } => {
-                Some(ConnEvent::AgentUnloaded { agent_id, reason })
-            }
-            ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
-                agent_id,
-                frame,
-                allocation: None,
-            }),
+            ServerMessage::Live { agent_id, live } => Some(ConnEvent::Live { agent_id, live }),
             ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
-            ServerMessage::AgentStory {
+            ServerMessage::Log { entries } => Some(ConnEvent::Log { entries }),
+            ServerMessage::Detail {
                 agent_id,
-                from,
-                events,
-            } => Some(ConnEvent::AgentStory {
+                pos,
+                body,
+            } => Some(ConnEvent::Detail {
                 agent_id,
-                from,
-                events,
+                pos,
+                body,
             }),
-            ServerMessage::AgentHead { head } => Some(ConnEvent::AgentHead { head }),
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::ChatGptUsage {
                 used_percent,
@@ -1276,7 +1268,6 @@ async fn run(
             }),
             ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries)),
             ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
-            ServerMessage::AgentUsage { .. } => None,
             ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series)),
             ServerMessage::AgentCostDistribution { series } => {
                 Some(ConnEvent::AgentCostDistribution(series))
@@ -1381,7 +1372,6 @@ async fn run(
             | ServerMessage::GuiTelemetryRefused { .. }
             | ServerMessage::RealtimeOpened { .. }
             | ServerMessage::RealtimeRefused { .. }
-            | ServerMessage::AgentStreamOpened { .. }
             | ServerMessage::VisualizationContent { .. }
             | ServerMessage::VisualizationRefused { .. } => None,
         };
@@ -1397,10 +1387,6 @@ async fn run(
     }
     if let Some(task) = health_task {
         task.abort();
-        let _ = task.await;
-    }
-    if let Some((shutdown, task)) = agent_stream_task {
-        let _ = shutdown.send(());
         let _ = task.await;
     }
     abort_tasks(&mut git_provider_tasks).await;
@@ -1732,172 +1718,6 @@ fn display_field(value: &str) -> String {
         .collect()
 }
 
-async fn run_agent_streams(
-    connection: iroh::endpoint::Connection,
-    events: EventSink,
-    mut shutdown: tokio::sync::oneshot::Receiver<()>,
-) {
-    const AGENT_FRAME_ALLOCATION_BUDGET: usize = 128 * 1024 * 1024;
-    let mut streams = tokio::task::JoinSet::new();
-    let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
-        AGENT_FRAME_ALLOCATION_BUDGET,
-    ));
-    let generations = Arc::new(tokio::sync::Mutex::new(
-        crate::registry::session::AgentStreamGenerations::default(),
-    ));
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = connection.accept_uni() => {
-                let Ok(recv) = accepted else { break };
-                let mut recv = rho_rpc::Reader::new(recv);
-                let events = events.clone();
-                let allocation_budget = allocation_budget.clone();
-                let generations = generations.clone();
-                streams.spawn(async move {
-                    let (header, header_allocation) =
-                        read_agent_stream_message(&mut recv, &allocation_budget).await?;
-                    let ServerMessage::AgentStreamOpened { agent_id } = header
-                    else {
-                        anyhow::bail!("invalid agent stream header");
-                    };
-                    drop(header_allocation);
-                    let generation = generations.lock().await.open(agent_id);
-                    loop {
-                        let (message, allocation) = match read_agent_stream_message(
-                            &mut recv,
-                            &allocation_budget,
-                        )
-                        .await
-                        {
-                            Ok(message) => message,
-                            Err(error)
-                                if error
-                                    .downcast_ref::<std::io::Error>()
-                                    .is_some_and(|error| {
-                                        error.kind() == std::io::ErrorKind::UnexpectedEof
-                                    }) =>
-                            {
-                                return Ok(())
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let ServerMessage::Agent {
-                            agent_id: frame_agent_id,
-                            frame,
-                        } = message
-                        else {
-                            anyhow::bail!("invalid message on agent stream");
-                        };
-                        anyhow::ensure!(frame_agent_id == agent_id, "agent stream id changed");
-                        let generations = generations.lock().await;
-                        if !generations.is_current(agent_id, generation) {
-                            continue;
-                        }
-                        // Keep generation validation and enqueue atomic with
-                        // respect to a replacement stream registering itself.
-                        if events
-                            .unbounded_send(ConnEvent::Frame {
-                                agent_id,
-                                frame,
-                                allocation: Some(allocation),
-                            })
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                        drop(generations);
-                    }
-                    #[allow(unreachable_code)]
-                    Ok::<(), anyhow::Error>(())
-                });
-            }
-            joined = streams.join_next(), if !streams.is_empty() => {
-                match joined {
-                    Some(Ok(Err(error))) => {
-                        let _ = events.unbounded_send(ConnEvent::ServerError(
-                            format!("agent state stream failed; retrying: {error:#}"),
-                        ));
-                    }
-                    Some(Err(error)) => {
-                        let _ = events.unbounded_send(ConnEvent::ServerError(
-                            format!("agent state stream task failed: {error}"),
-                        ));
-                    }
-                    Some(Ok(Ok(()))) | None => {}
-                }
-            }
-        }
-    }
-    abort_tasks(&mut streams).await;
-}
-
-async fn read_agent_stream_message(
-    recv: &mut rho_rpc::Reader,
-    allocation_budget: &Arc<AgentFrameAllocationBudget>,
-) -> anyhow::Result<(ServerMessage, AgentFrameAllocation)> {
-    let (message, allocation, _) =
-        rho_rpc::read_frame_allocated(recv, rho_ui_proto::MAX_FRAME_LEN, |len| {
-            allocation_budget.reserve(len)
-        })
-        .await?;
-    Ok((message, allocation))
-}
-
-struct AgentFrameAllocationBudget {
-    available: std::sync::atomic::AtomicUsize,
-    notify: tokio::sync::Notify,
-}
-
-impl AgentFrameAllocationBudget {
-    fn new(bytes: usize) -> Self {
-        Self {
-            available: std::sync::atomic::AtomicUsize::new(bytes),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    async fn reserve(self: &Arc<Self>, bytes: usize) -> AgentFrameAllocation {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let mut available = self.available.load(std::sync::atomic::Ordering::Acquire);
-            while available >= bytes {
-                match self.available.compare_exchange_weak(
-                    available,
-                    available - bytes,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        return AgentFrameAllocation {
-                            budget: self.clone(),
-                            bytes,
-                        };
-                    }
-                    Err(current) => available = current,
-                }
-            }
-            notified.as_mut().await;
-        }
-    }
-}
-
-pub struct AgentFrameAllocation {
-    budget: Arc<AgentFrameAllocationBudget>,
-    bytes: usize,
-}
-
-impl Drop for AgentFrameAllocation {
-    fn drop(&mut self) {
-        self.budget
-            .available
-            .fetch_add(self.bytes, std::sync::atomic::Ordering::Release);
-        self.budget.notify.notify_waiters();
-    }
-}
-
 /// The client's iroh identity, bound once and shared by every attached
 /// daemon. One identity means one key for the user to recognize across
 /// hosts, and each host still enrolls it separately over its own SSH login.
@@ -1988,10 +1808,10 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
-        AgentFrameAllocationBudget, INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY,
-        ShellControlReply, ShellControlRequests, abort_tasks, copy_planned_receive_pack,
-        display_field, fail_attempted_shell_requests, git_push_prompt, next_reconnect_delay,
-        read_frame, receive_pack_refs_match, run_control_writer, validate_git_transport_request,
+        INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY, ShellControlReply, ShellControlRequests,
+        abort_tasks, copy_planned_receive_pack, display_field, fail_attempted_shell_requests,
+        git_push_prompt, next_reconnect_delay, read_frame, receive_pack_refs_match,
+        run_control_writer, validate_git_transport_request,
     };
 
     #[test]
@@ -2392,29 +2212,6 @@ mod tests {
                 let mut received = Vec::new();
                 remote.read_to_end(&mut received).await.unwrap();
                 assert!(received.is_empty());
-            });
-    }
-
-    #[test]
-    fn small_frame_bypasses_waiting_large_allocation() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let budget = Arc::new(AgentFrameAllocationBudget::new(10));
-                let held = budget.reserve(6).await;
-                let large_budget = budget.clone();
-                let large = tokio::spawn(async move { large_budget.reserve(10).await });
-                tokio::task::yield_now().await;
-
-                let small =
-                    tokio::time::timeout(std::time::Duration::from_millis(100), budget.reserve(4))
-                        .await
-                        .expect("small allocation should bypass the waiting large one");
-                drop(small);
-                drop(held);
-                drop(large.await.unwrap());
             });
     }
 }

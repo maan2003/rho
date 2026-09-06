@@ -22,10 +22,9 @@ use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::db::{
-    AgentDisposition, AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _,
+    AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, AgentWant,
     AgentWriteTxnExt as _, PresentationField, TurnReport,
 };
-use crate::story::{AgentWant, StoryEvent};
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
 };
@@ -62,31 +61,12 @@ summary is a concise few-word label of the outcome — for report_needs_you, of 
 asked — at most 50 bytes, the same shape as activity. Use lowercase except for types, \
 functions, and other code identifiers; no trailing period. Use the tools; do not write prose.";
 
-pub struct Watch {
-    release: Option<Box<dyn FnOnce() + Send>>,
-}
-
-impl Drop for Watch {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            release();
-        }
-    }
-}
-
-impl Watch {
-    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
-        Self {
-            release: Some(Box::new(release)),
-        }
-    }
-}
-
 /// What the sidecar's background task tells its owning loop. A loop that
 /// gets one of these hands it to [`Sidecar`] on its own thread of control,
 /// so completion can never race the loop's own source commits.
 pub(crate) enum SidecarMessage {
-    /// A watcher came or went.
+    /// Whether anyone is looking at the agent: the pool says so when it
+    /// enters or leaves the live set.
     Watch { watching: bool },
     /// The task is about to read the durable tail; `acknowledged` says
     /// whether that generation is still wanted.
@@ -105,7 +85,8 @@ pub(crate) enum SidecarMessage {
 /// last request read. The loop persists what comes back.
 pub(crate) struct Sidecar {
     session: Arc<TokioMutex<Session>>,
-    watches: usize,
+    /// Someone is looking: titles and activity are made only then.
+    watched: bool,
     dirty: bool,
     generation: u64,
     last_started: Option<tokio::time::Instant>,
@@ -119,7 +100,7 @@ impl Sidecar {
     pub(crate) fn new(inference: Inference, last_source: Option<AgentEventPos>) -> Self {
         Self {
             session: Arc::new(TokioMutex::new(Session::new(inference))),
-            watches: 0,
+            watched: false,
             dirty: false,
             generation: 0,
             last_started: None,
@@ -142,18 +123,15 @@ impl Sidecar {
 
     /// Returns whether a schedule is now due.
     pub(crate) fn watch(&mut self, watching: bool) -> bool {
+        if watching == self.watched {
+            return false;
+        }
+        self.watched = watching;
         if watching {
-            self.watches += 1;
-            if self.watches == 1 {
-                self.dirty = true;
-                return true;
-            }
-            false
+            self.dirty = true;
+            true
         } else {
-            self.watches = self.watches.saturating_sub(1);
-            if self.watches == 0
-                && let Some(task) = self.task.take()
-            {
+            if let Some(task) = self.task.take() {
                 task.abort();
             }
             false
@@ -162,7 +140,7 @@ impl Sidecar {
 
     /// Whether `generation` may go ahead and read the durable snapshot.
     pub(crate) fn started(&mut self, generation: u64) -> bool {
-        let accepted = self.generation == generation && self.watches > 0 && self.task.is_some();
+        let accepted = self.generation == generation && self.watched && self.task.is_some();
         if accepted {
             // Sources observed before this boundary are in the durable
             // snapshot about to be read; only later sources need another
@@ -204,7 +182,7 @@ impl Sidecar {
         }
         self.generation = self.generation.wrapping_add(1);
         self.last_started = None;
-        self.dirty = self.watches > 0;
+        self.dirty = self.watched;
         self.last_source = last_source;
     }
 
@@ -229,7 +207,7 @@ impl Sidecar {
         agent_id: AgentId,
         deliver: impl Fn(SidecarMessage) -> bool + Send + Sync + 'static,
     ) {
-        if self.watches == 0 || !self.dirty || self.task.is_some() {
+        if !self.watched || !self.dirty || self.task.is_some() {
             return;
         }
         self.dirty = false;
@@ -337,8 +315,8 @@ pub(crate) fn spawn_turn_report(
     }
     // Sub-agent turns are the parent's court unless the user has personally
     // messaged the agent; those get no report.
-    let attention = db.read().agent_attention(agent_id);
-    if attention.parent_agent.is_some() && !attention.user_interacted {
+    let head = db.read().get_agent(agent_id);
+    if head.parent.is_some() && !head.user_interacted {
         return;
     }
     tokio::spawn(async move {
@@ -358,34 +336,21 @@ pub(crate) fn spawn_turn_report(
                 return;
             }
         };
-        // Pending still wants the report; so does snoozed — the turn
-        // finished inside the quiet window and the expiry broadcast will
-        // resurface this row, summary and all. A Done row keeps showing its
-        // settled summary, so a raced ack persists too; only Hidden means
-        // the user does not want the row at all.
-        match db.read().agent_attention(agent_id).disposition {
-            AgentDisposition::Pending
-            | AgentDisposition::Snoozed { .. }
-            | AgentDisposition::Done => {}
-            AgentDisposition::Hidden => return,
-        }
         {
             let mut write = db.write().await;
-            write.record_agent_turn_report(agent_id, &report);
             // Until the reply's own tag is parsed (`AGENT-WANTS-DESIGN.md`),
-            // this classification is what the story has to say about what
-            // the turn asks of the person.
-            write.append_agent_story(
+            // this classification is what the log has to say about what
+            // the turn asks of the person. Whether the person wants the
+            // row at all is the desk's, on the client.
+            write.tell_wants(
+                rho_core::UnixMs::now(),
                 agent_id,
-                &StoryEvent::Wants {
-                    want: if report.needs_you {
-                        AgentWant::Ask
-                    } else {
-                        AgentWant::Show
-                    },
-                    summary: (!report.summary.is_empty()).then(|| report.summary.clone()),
-                    at: rho_core::UnixMs::now(),
+                if report.needs_you {
+                    AgentWant::Ask
+                } else {
+                    AgentWant::Show
                 },
+                (!report.summary.is_empty()).then(|| report.summary.clone()),
             );
             write.commit();
         }

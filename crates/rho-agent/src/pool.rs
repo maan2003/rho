@@ -4,14 +4,11 @@
 //! make live-workspace sharing possible. Higher layers (the daemon) own
 //! product policy around it: topics, titles, land leases.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::StreamExt as _;
-use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::Inference;
 use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
@@ -20,16 +17,19 @@ use tokio::sync::{Mutex, broadcast};
 use crate::agent::AgentHandle;
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
-    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
-    EngineerIntelligence, SessionBinding,
+    AGENT_USAGE_BUCKET_MS, AgentId, AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _,
+    AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{AgentState, MessageDelivery, StartWorkdir};
+use crate::{AgentStatus, MessageDelivery, StartWorkdir};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
 const MAX_WORKING_CHILDREN: usize = 20;
+/// How many agents stay loaded. Past this the least recently used one
+/// that is settled and nobody is looking at is dropped; its log is the
+/// whole of it, so nothing is lost.
+pub const MAX_LOADED: usize = 100;
 const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
@@ -38,6 +38,15 @@ pub struct AgentPool {
     path_overrides: PathOverrides,
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
+    /// Loaded agents, least recently used first. Touched by every load.
+    recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
+    /// Which agents each connection is looking at; the union is the live
+    /// set. A connection that goes away takes its wants with it.
+    live_wants: std::sync::Mutex<HashMap<u64, HashSet<AgentId>>>,
+    /// The live set: agents whose loops tell the tail as it changes. A
+    /// loaded live agent is also told it is watched, which is what lets
+    /// its title and activity refresh.
+    live: std::sync::Mutex<HashSet<AgentId>>,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
@@ -48,24 +57,20 @@ pub struct AgentPool {
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
-    /// Synchronously pre-arms daemon-owned observation before a newly loaded
-    /// runtime is returned to callers that may immediately start work.
-    activation_observer: std::sync::RwLock<Option<Arc<ActivationObserver>>>,
     presentation_changes: broadcast::Sender<AgentPresentationChanged>,
     turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
 }
 
-/// Broadcast when any agent is created in the pool.
+/// Broadcast when any agent is created in the pool. Carries no handle:
+/// a handle sitting in the channel's buffer would keep an evicted loop
+/// alive.
 #[derive(Clone)]
 pub struct AgentCreated {
     pub agent_id: AgentId,
-    pub agent: RunningAgent,
     /// The agent that spawned this one, when another agent did.
     pub parent: Option<AgentId>,
 }
-
-pub type ActivationObserver = dyn Fn(AgentId, RunningAgent) -> BoxFuture<'static, ()> + Send + Sync;
 
 /// An agent completed a turn: its final answer is mailed to whoever
 /// subscribed to its responses.
@@ -117,19 +122,19 @@ impl AgentPool {
         path_overrides: PathOverrides,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        write.commit();
+        crate::db::prepare(&db).await;
         let pool = Arc::new(Self {
             db,
             inference: inference.clone(),
             path_overrides,
             user_environment,
             agents: Mutex::new(HashMap::new()),
+            recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            live_wants: std::sync::Mutex::new(HashMap::new()),
+            live: std::sync::Mutex::new(HashSet::new()),
             load_locks: Mutex::new(HashMap::new()),
             repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
-            activation_observer: std::sync::RwLock::new(None),
             presentation_changes: broadcast::channel(64).0,
             turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
@@ -154,17 +159,6 @@ impl AgentPool {
         self.created.subscribe()
     }
 
-    pub fn set_activation_observer(&self, observer: Arc<ActivationObserver>) {
-        *self.activation_observer.write().expect("poison") = Some(observer);
-    }
-
-    async fn observe_activation(&self, agent_id: AgentId, agent: RunningAgent) {
-        let observer = self.activation_observer.read().expect("poison").clone();
-        if let Some(observer) = observer {
-            observer(agent_id, agent).await;
-        }
-    }
-
     pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
         self.presentation_changes.subscribe()
     }
@@ -177,19 +171,6 @@ impl AgentPool {
         let _ = self
             .turn_reports
             .send(AgentTurnReported { agent_id, report });
-    }
-
-    /// Keeps Luna work for this agent alive while the returned handle
-    /// exists. Dropping the last handle cancels any in-flight provider call.
-    pub async fn watch_presentation(
-        &self,
-        agent_id: AgentId,
-    ) -> Option<crate::presentation::Watch> {
-        self.agents
-            .lock()
-            .await
-            .get(&agent_id)
-            .and_then(RunningAgent::watch_presentation)
     }
 
     pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
@@ -248,19 +229,10 @@ impl AgentPool {
             .is_agent_response_subscribed(subscriber, target)
     }
 
-    /// Persist that execution stopped and the agent is back in the user's
-    /// court. Runtimes call this from their non-coalescing state machines
-    /// only when no newer queued turn took over, or on terminal failure
-    /// where queued work cannot proceed. Sub-agent turn ends are the
-    /// parent's court unless the user has personally engaged the agent.
+    /// Execution stopped: the usage it accrued lands now rather than at
+    /// the next flush. The turn's edge itself is the log's (`Turn`).
     pub async fn settle_turn(&self, agent_id: AgentId) {
         self.flush_agent_usage(Some(agent_id)).await;
-        let attention = self.db.read().agent_attention(agent_id);
-        if attention.parent_agent.is_none() || attention.user_interacted {
-            let mut write = self.db.write().await;
-            write.record_agent_turn_end(crate::db::UnixMillis::now(), agent_id);
-            write.commit();
-        }
     }
 
     pub(crate) fn publish_presentation_changed(
@@ -283,19 +255,6 @@ impl AgentPool {
     pub async fn record_agent_usage(&self, agent_id: AgentId, mut usage: AgentUsageBucket) {
         let now = rho_core::UnixMs::now().0;
         usage.bucket_start_ms = now / AGENT_USAGE_BUCKET_MS * AGENT_USAGE_BUCKET_MS;
-        // What a model response cost, told once, so the graphs can read the
-        // story instead of a usage table (`AGENT-LOG-DESIGN.md`, slice C).
-        {
-            let mut write = self.db.write().await;
-            write.append_agent_story(
-                agent_id,
-                &crate::story::StoryEvent::Cost {
-                    usage: usage.clone(),
-                    at: rho_core::UnixMs(now),
-                },
-            );
-            write.commit();
-        }
         let mut pending = self.usage.lock().await;
         pending
             .entry((agent_id, usage.bucket_start_ms))
@@ -332,20 +291,130 @@ impl AgentPool {
         &self.inference
     }
 
-    pub async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
-        let mut agents = self
-            .agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent_id, agent)| (*agent_id, agent.clone()))
-            .collect::<Vec<_>>();
-        agents.sort_by_key(|(agent_id, _)| *agent_id);
-        agents
+    pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
+        let agent = self.agents.lock().await.get(&agent_id).cloned();
+        if agent.is_some() {
+            self.touch(agent_id);
+        }
+        agent
     }
 
-    pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
-        self.agents.lock().await.get(&agent_id).cloned()
+    /// Whether any client is looking at this agent right now. Read by the
+    /// loops on every publish, so it is a plain lock and no await.
+    pub fn is_live(&self, agent_id: AgentId) -> bool {
+        self.live.lock().expect("poison").contains(&agent_id)
+    }
+
+    /// One connection's whole focus set, replacing what it wanted before.
+    /// The live set is the union over connections; an agent entering it
+    /// starts telling its tail (whole, once) and an agent leaving it stops.
+    pub async fn set_live_wants(&self, connection: u64, wants: HashSet<AgentId>) {
+        let union = {
+            let mut live_wants = self.live_wants.lock().expect("poison");
+            if wants.is_empty() {
+                live_wants.remove(&connection);
+            } else {
+                live_wants.insert(connection, wants);
+            }
+            live_wants
+                .values()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        let (joined, left) = {
+            let mut live = self.live.lock().expect("poison");
+            let left = live
+                .iter()
+                .copied()
+                .filter(|agent_id| !union.contains(agent_id))
+                .collect::<Vec<_>>();
+            let joined = union
+                .iter()
+                .copied()
+                .filter(|agent_id| !live.contains(agent_id))
+                .collect::<Vec<_>>();
+            *live = union;
+            (joined, left)
+        };
+        let agents = self.agents.lock().await;
+        for agent_id in left {
+            if let Some(agent) = agents.get(&agent_id) {
+                agent.set_watched(false);
+            }
+        }
+        for agent_id in joined {
+            if let Some(agent) = agents.get(&agent_id) {
+                self.attach_live(agent_id, agent);
+            }
+        }
+    }
+
+    /// A live agent is loaded: it is watched (titles and activity get
+    /// made) and tells its tail whole. Leaving the live set unwatches it.
+    fn attach_live(&self, agent_id: AgentId, agent: &RunningAgent) {
+        if !self.live.lock().expect("poison").contains(&agent_id) {
+            return;
+        }
+        agent.set_watched(true);
+        agent.tell_tail();
+    }
+
+    /// Every loaded live agent tells its tail whole again: a connection
+    /// just caught up from the journal and holds nothing of the tails.
+    pub async fn tell_tails(&self) {
+        let live = self
+            .live
+            .lock()
+            .expect("poison")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let agents = self.agents.lock().await;
+        for agent_id in live {
+            if let Some(agent) = agents.get(&agent_id) {
+                agent.tell_tail();
+            }
+        }
+    }
+
+    fn touch(&self, agent_id: AgentId) {
+        let mut recent = self.recent.lock().expect("poison");
+        recent.retain(|id| *id != agent_id);
+        recent.push_back(agent_id);
+    }
+
+    /// Drop the least recently used loaded agents past [`MAX_LOADED`],
+    /// skipping any that is mid-turn, has input waiting, or is being
+    /// looked at. Dropping the last handle ends its loop.
+    fn trim(&self, agents: &mut HashMap<AgentId, RunningAgent>) {
+        if agents.len() <= MAX_LOADED {
+            return;
+        }
+        let candidates = self
+            .recent
+            .lock()
+            .expect("poison")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for agent_id in candidates {
+            if agents.len() <= MAX_LOADED {
+                break;
+            }
+            if self.is_live(agent_id) {
+                continue;
+            }
+            let settled = agents.get(&agent_id).is_some_and(RunningAgent::settled);
+            if !settled {
+                continue;
+            }
+            agents.remove(&agent_id);
+            self.recent
+                .lock()
+                .expect("poison")
+                .retain(|id| *id != agent_id);
+        }
     }
 
     pub async fn create(
@@ -404,13 +473,14 @@ impl AgentPool {
                 (agent_id, RunningAgent::Claude(agent))
             }
         };
-        self.agents.lock().await.insert(agent_id, agent.clone());
-        self.observe_activation(agent_id, agent.clone()).await;
-        let _ = self.created.send(AgentCreated {
-            agent_id,
-            agent: agent.clone(),
-            parent,
-        });
+        {
+            let mut agents = self.agents.lock().await;
+            agents.insert(agent_id, agent.clone());
+            self.touch(agent_id);
+            self.attach_live(agent_id, &agent);
+            self.trim(&mut agents);
+        }
+        let _ = self.created.send(AgentCreated { agent_id, parent });
         Ok((agent_id, agent))
     }
 
@@ -428,8 +498,7 @@ impl AgentPool {
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
         let (parent_workdirs, parent_role) = {
-            let read = self.db.read();
-            let record = read.get_agent(parent);
+            let record = self.load(parent).await?.1.head();
             (record.config.workdirs, record.config.role)
         };
         let workdirs = if workdirs.is_empty() {
@@ -524,23 +593,18 @@ impl AgentPool {
                 if depth > MAX_SPAWN_DEPTH {
                     anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
                 }
-                cursor = read.agent_attention(id).parent_agent;
+                cursor = read.agent_parent(id);
             }
-            read.list_agents()
+            read.list_agent_ids()
                 .into_iter()
-                .map(|(id, _)| (id, read.agent_attention(id)))
-                .filter(|(_, attention)| {
-                    attention.parent_agent == Some(parent)
-                        && attention.disposition != AgentDisposition::Hidden
-                })
-                .map(|(id, _)| id)
+                .filter(|id| read.agent_parent(*id) == Some(parent))
                 .collect::<Vec<_>>()
         };
         let agents = self.agents.lock().await;
         let working_children = child_ids
             .into_iter()
             .filter_map(|id| agents.get(&id))
-            .filter(|agent| agent.state().kind.is_working())
+            .filter(|agent| agent.status().kind.is_working())
             .count();
         if working_children >= MAX_WORKING_CHILDREN {
             anyhow::bail!(
@@ -563,7 +627,7 @@ impl AgentPool {
         let (_, agent, _) = self.load(to).await?;
         let sender_label = self.agent_handle(from);
         if matches!(
-            self.db.read().get_agent(from).config.role,
+            self.load(from).await?.1.head().config.role,
             AgentRole::Advisor { .. }
         ) {
             body.push_str(&format!(
@@ -592,10 +656,7 @@ impl AgentPool {
     }
 
     pub fn agent_exists(&self, agent_id: AgentId) -> bool {
-        let read = self.db.read();
-        read.list_agents()
-            .iter()
-            .any(|(existing, _)| *existing == agent_id)
+        self.db.read().agent_exists(agent_id)
     }
 
     /// Short raw prefix for an agent id.
@@ -607,7 +668,13 @@ impl AgentPool {
     }
 
     pub fn agent_handle(&self, agent_id: AgentId) -> String {
-        let role = self.db.read().get_agent(agent_id).config.role;
+        // A loaded loop keeps its head; only a cold agent folds its log.
+        let loaded = self
+            .agents
+            .try_lock()
+            .ok()
+            .and_then(|agents| agents.get(&agent_id).map(|agent| agent.head().config.role));
+        let role = loaded.unwrap_or_else(|| self.db.read().get_agent(agent_id).config.role);
         format!(
             "{}-{}",
             role.handle_prefix(),
@@ -700,11 +767,9 @@ impl AgentPool {
             .clone();
         let _loading = load_lock.lock().await;
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
+            self.touch(agent_id);
             return Ok((agent_id, agent, false));
         }
-        // A load reads this agent's log anyway, and the runtime is about
-        // to append to its story: its history has to be in there first.
-        crate::story_backfill::ensure_story(&self.db, agent_id).await;
         let record = self.db.read().get_agent(agent_id);
         let view = self.lazy_view(agent_id, record.config.workdirs.clone());
         let agent = match record.config.runtime {
@@ -730,8 +795,13 @@ impl AgentPool {
                 RunningAgent::Claude(agent)
             }
         };
-        self.agents.lock().await.insert(agent_id, agent.clone());
-        self.observe_activation(agent_id, agent.clone()).await;
+        {
+            let mut agents = self.agents.lock().await;
+            agents.insert(agent_id, agent.clone());
+            self.touch(agent_id);
+            self.attach_live(agent_id, &agent);
+            self.trim(&mut agents);
+        }
         Ok((agent_id, agent, true))
     }
 }
@@ -797,18 +867,41 @@ pub enum RunningAgent {
 }
 
 impl RunningAgent {
-    pub(crate) fn watch_presentation(&self) -> Option<crate::presentation::Watch> {
+    /// Whether anyone is looking at this agent; titles and activity are
+    /// made only then.
+    pub(crate) fn set_watched(&self, watching: bool) {
         match self {
-            Self::Rho(agent) => Some(agent.watch_presentation()),
-            Self::Claude(agent) => Some(agent.watch_presentation()),
+            Self::Rho(agent) => agent.set_watched(watching),
+            Self::Claude(agent) => agent.set_watched(watching),
         }
     }
 
-    pub fn state(&self) -> AgentState {
+    pub fn status(&self) -> AgentStatus {
         match self {
-            Self::Rho(agent) => agent.state(),
-            Self::Claude(agent) => agent.state(),
+            Self::Rho(agent) => agent.status(),
+            Self::Claude(agent) => agent.status(),
         }
+    }
+
+    /// The record as the loop keeps it.
+    pub fn head(&self) -> crate::db::AgentHead {
+        match self {
+            Self::Rho(agent) => agent.head(),
+            Self::Claude(agent) => agent.head(),
+        }
+    }
+
+    /// Say the live tail whole again.
+    pub fn tell_tail(&self) {
+        match self {
+            Self::Rho(agent) => agent.tell_tail(),
+            Self::Claude(agent) => agent.tell_tail(),
+        }
+    }
+
+    /// Nothing running and nothing waiting: safe to drop.
+    pub fn settled(&self) -> bool {
+        self.status().settled()
     }
 
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
@@ -930,13 +1023,6 @@ impl RunningAgent {
         match self {
             Self::Rho(agent) => agent.rewind(turns).await,
             Self::Claude(agent) => agent.rewind(turns).await,
-        }
-    }
-
-    pub fn subscribe(&self) -> BoxStream<'static, AgentState> {
-        match self {
-            Self::Rho(agent) => agent.subscribe().boxed(),
-            Self::Claude(agent) => agent.subscribe().boxed(),
         }
     }
 }

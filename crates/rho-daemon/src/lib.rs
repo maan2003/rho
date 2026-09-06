@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::num::NonZeroU16;
 use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,17 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
-use futures::{FutureExt as _, StreamExt as _};
+use rho_agent::MessageDelivery;
 use rho_agent::db::{
-    AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageModel,
-    AgentWriteTxnExt as _, ClaudeRewind, QuotaModel, QuotaObservationRecord, QuotaProvider,
+    AgentId, AgentReadTxnExt as _, AgentRole, AgentUsageModel, AgentWriteTxnExt as _, QuotaModel,
+    QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
-use rho_agent::{AgentStateKind, MessageDelivery};
 use rho_core::ContentPart;
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
@@ -26,18 +23,14 @@ use rho_ui_proto::{
     McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
     WorkspaceInfo, read_frame, write_frame,
 };
-use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
-mod agent_ui;
 pub mod debug;
 mod desk_cells;
-#[cfg(test)]
-mod story_backfill_proof;
-
+mod detail;
 mod realtime;
 mod secret_store;
 mod shell;
-mod story_wire;
 mod terminal;
 mod workspace_channel;
 
@@ -404,8 +397,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         )
         .await?,
     );
-    backfill_legacy_turn_end_times(&agents).await;
-    spawn_presentation_projection(Arc::clone(&agents));
     spawn_inference_projection(Arc::clone(&agents));
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -428,39 +419,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
-    // Turn watchers are daemon-owned and pre-armed synchronously by the
-    // pool before any activation caller can start work on the returned agent.
-    // The weak pool reference avoids a pool -> observer -> pool cycle.
-    let watched_agents = Arc::new(std::sync::Mutex::new(HashSet::new()));
-    let activation_observer: Arc<rho_agent::pool::ActivationObserver> = {
-        let pool = Arc::downgrade(&agents.pool);
-        let watched_agents = watched_agents.clone();
-        Arc::new(move |agent_id, agent| {
-            let pool = pool.clone();
-            let watched_agents = watched_agents.clone();
-            async move {
-                if !watched_agents.lock().expect("poison").insert(agent_id) {
-                    return;
-                }
-                let Some(pool) = pool.upgrade() else {
-                    return;
-                };
-                spawn_turn_watcher(pool, agent_id, agent).await;
-            }
-            .boxed()
-        })
-    };
-    agents
-        .pool
-        .set_activation_observer(activation_observer.clone());
-    for (agent_id, agent) in agents.loaded().await {
-        activation_observer(agent_id, agent).await;
-    }
-
-    convert_agent_dispositions(&agents).await;
     let projects_converted = convert_projects(&agents).await;
     drop_converted_tables(&agents.db, projects_converted).await;
-    spawn_story_backfill(agents.db.clone());
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
@@ -528,10 +488,12 @@ async fn run_iroh_listener(
         let agents = agents.clone();
         let iroh_auth = iroh_auth.clone();
         tokio::spawn(async move {
-            let agent_streams = Some(IrohAgentStreams::new(connection.clone()));
+            // One UI control session per iroh connection; the rest of its
+            // streams are dedicated (files, shells, one-shot queries).
+            let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
                 let agents = agents.clone();
-                let agent_streams = agent_streams.clone();
+                let control_claimed = control_claimed.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
                     let result = async {
@@ -561,18 +523,22 @@ async fn run_iroh_listener(
                                 | ClientMessage::GitTransportQuery { .. }
                         );
                         let control = if !dedicated {
-                            let streams = agent_streams
-                                .clone()
-                                .context("iroh agent streams missing")?;
                             anyhow::ensure!(
-                                streams.claim_control(),
+                                control_claimed
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Relaxed
+                                    )
+                                    .is_ok(),
                                 "iroh connection already has a UI control session"
                             );
                             send.set_priority(1)
                                 .context("set iroh control stream priority")?;
-                            Some(streams)
+                            true
                         } else {
-                            None
+                            false
                         };
                         if matches!(
                             &first,
@@ -585,18 +551,11 @@ async fn run_iroh_listener(
                                 .context("set iroh interactive stream priority")?;
                         }
                         let send = rho_rpc::Writer::new(send);
-                        let result = serve_connection_io(
-                            agents,
-                            iroh_auth,
-                            recv,
-                            send,
-                            None,
-                            agent_streams,
-                            Some(first),
-                        )
-                        .await;
-                        if let Some(control) = control {
-                            control.close();
+                        let result =
+                            serve_connection_io(agents, iroh_auth, recv, send, None, Some(first))
+                                .await;
+                        if control {
+                            control_claimed.store(false, Ordering::Release);
                         }
                         result
                     }
@@ -609,202 +568,6 @@ async fn run_iroh_listener(
         });
     }
     listener.close().await;
-}
-
-const FOCUSED_AGENT_STREAM_WEIGHT: NonZeroU16 = NonZeroU16::new(200).unwrap();
-const MAX_IROH_AGENT_STREAMS: usize = 1024;
-
-/// Per-iroh-connection agent streams. Agent state is sent on daemon-opened
-/// unidirectional streams so QUIC can schedule agents independently while the
-/// bidirectional UI session remains a low-volume control channel.
-#[derive(Clone)]
-struct IrohAgentStreams {
-    connection: iroh::endpoint::Connection,
-    opened: Arc<Mutex<HashMap<AgentId, watch::Sender<bool>>>>,
-    control_claimed: Arc<AtomicBool>,
-    focus: watch::Sender<Vec<AgentId>>,
-}
-
-impl IrohAgentStreams {
-    fn new(connection: iroh::endpoint::Connection) -> Self {
-        let (focus, _) = watch::channel(Vec::new());
-        Self {
-            connection,
-            opened: Arc::new(Mutex::new(HashMap::new())),
-            control_claimed: Arc::new(AtomicBool::new(false)),
-            focus,
-        }
-    }
-
-    fn set_focus(&self, agent_ids: Vec<AgentId>) {
-        self.focus.send_replace(agent_ids);
-    }
-
-    fn claim_control(&self) -> bool {
-        self.control_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    fn close(&self) {
-        self.connection
-            .close(0u32.into(), b"UI control session closed");
-    }
-
-    async fn remove(&self, agent_id: AgentId) {
-        if let Some(cancel) = self.opened.lock().await.remove(&agent_id) {
-            cancel.send_replace(true);
-        }
-    }
-
-    async fn ensure(&self, agent_id: AgentId, agent: RunningAgent) -> anyhow::Result<()> {
-        {
-            let mut opened = self.opened.lock().await;
-            if opened.contains_key(&agent_id) {
-                return Ok(());
-            }
-            if opened.len() >= MAX_IROH_AGENT_STREAMS {
-                self.connection
-                    .close(2u32.into(), b"too many subscribed agents");
-                anyhow::bail!(
-                    "iroh agent stream limit ({MAX_IROH_AGENT_STREAMS}) reached; \
-                     hide agents before reconnecting"
-                );
-            }
-            let (cancel, _) = watch::channel(false);
-            opened.insert(agent_id, cancel.clone());
-        }
-        let connection = self.connection.clone();
-        let focus_sender = self.focus.clone();
-        let cancel_sender = self.opened.lock().await[&agent_id].clone();
-        let opened = self.opened.clone();
-        tokio::spawn(async move {
-            const RETRIES: usize = 3;
-            let mut exhausted = true;
-            for attempt in 0..RETRIES {
-                if *cancel_sender.borrow() {
-                    exhausted = false;
-                    break;
-                }
-                let focus = focus_sender.subscribe();
-                let cancel = cancel_sender.subscribe();
-                let result = async {
-                    let send = connection
-                        .open_uni()
-                        .await
-                        .context("open iroh agent stream")?;
-                    serve_iroh_agent_stream(agent_id, agent.clone(), send, focus, cancel).await
-                }
-                .await;
-                match result {
-                    Ok(()) => {
-                        exhausted = false;
-                        break;
-                    }
-                    Err(error) => {
-                        eprintln!("rho daemon iroh agent stream error: {error:#}");
-                        if attempt + 1 < RETRIES {
-                            let mut retry_cancel = cancel_sender.subscribe();
-                            tokio::select! {
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(100 << attempt)) => {}
-                                _ = retry_cancel.changed() => {
-                                    exhausted = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let mut opened = opened.lock().await;
-            if opened
-                .get(&agent_id)
-                .is_some_and(|current| current.same_channel(&cancel_sender))
-            {
-                opened.remove(&agent_id);
-            }
-            drop(opened);
-            if exhausted {
-                connection.close(1u32.into(), b"agent state stream failed");
-            }
-        });
-        Ok(())
-    }
-}
-
-async fn serve_iroh_agent_stream(
-    agent_id: AgentId,
-    agent: RunningAgent,
-    send: iroh::endpoint::SendStream,
-    mut focus: watch::Receiver<Vec<AgentId>>,
-    mut cancel: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    if *cancel.borrow() {
-        return Ok(());
-    }
-    let priority = send.priority_handle();
-    let weight = |focused| {
-        if focused {
-            FOCUSED_AGENT_STREAM_WEIGHT
-        } else {
-            NonZeroU16::MIN
-        }
-    };
-    priority
-        .set_weight(weight(focus.borrow().contains(&agent_id)))
-        .context("set initial iroh agent stream weight")?;
-    let mut focus_cancel = cancel.clone();
-    let focus_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                changed = focus.changed() => {
-                    changed.context("iroh agent focus channel closed")?;
-                    priority
-                        .set_weight(weight(focus.borrow_and_update().contains(&agent_id)))
-                        .context("update iroh agent stream weight")?;
-                }
-                _ = focus_cancel.changed() => return Ok::<(), anyhow::Error>(()),
-            }
-        }
-    });
-
-    let mut send = rho_rpc::Writer::new(send);
-    let result: anyhow::Result<()> = async {
-        write_frame(&mut send, &ServerMessage::AgentStreamOpened { agent_id }).await?;
-        let changes = agent.subscribe();
-        let mut encoder = AgentRemoteEncoder::new();
-        write_frame(
-            &mut send,
-            &ServerMessage::Agent {
-                agent_id,
-                frame: encoder.encode(agent_ui::project_agent_state(&agent.state())),
-            },
-        )
-        .await?;
-        futures::pin_mut!(changes);
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => return Ok(()),
-                state = changes.next() => {
-                    let Some(state) = state else { return Ok(()) };
-                    write_frame(
-                        &mut send,
-                        &ServerMessage::Agent {
-                            agent_id,
-                            frame: encoder.encode(agent_ui::project_agent_state(&state)),
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
-    }
-    .await;
-    focus_task.abort();
-    result?;
-    tokio::io::AsyncWriteExt::shutdown(&mut send)
-        .await
-        .context("finish compressed iroh agent stream")
 }
 
 trait GitStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -1047,50 +810,6 @@ impl AgentRegistry {
         Ok(registry)
     }
 
-    /// Live state kinds of every loaded agent, for attention derivation.
-    /// Blocked/working are read off the running agent, never persisted; only
-    /// the disposition (the user's verdict) lives in the database.
-    async fn agent_state_kinds(&self) -> HashMap<AgentId, AgentStateKind> {
-        self.pool
-            .loaded()
-            .await
-            .into_iter()
-            .map(|(agent_id, agent)| (agent_id, agent.state().kind))
-            .collect()
-    }
-
-    /// Applies the user's verdict and tells every client the new level; for
-    /// snoozes, arms the wake-up timer.
-    async fn set_disposition(&self, agent_id: AgentId, disposition: AgentDisposition) {
-        self.set_dispositions(&[agent_id], disposition).await;
-    }
-
-    /// Applies one verdict atomically to a GUI-equivalent multi-agent scope.
-    async fn set_dispositions(&self, agent_ids: &[AgentId], disposition: AgentDisposition) {
-        let mut write = self.db.write().await;
-        for agent_id in agent_ids {
-            write.set_agent_disposition(*agent_id, disposition);
-        }
-        write.commit();
-    }
-
-    /// Every agent's head, oldest first. Iris is not an agent a client
-    /// lists (`STORE-DESIGN.md` capabilities).
-    fn ui_agents(&self) -> Vec<rho_ui_proto::story::UiAgentHead> {
-        let mut heads = self.db.read().list_agents();
-        heads.sort_by_key(|(_, agent)| agent.config.created_at);
-        heads
-            .into_iter()
-            .map(|(agent_id, agent)| story_wire::ui_agent_head(agent_id, &agent))
-            .collect()
-    }
-
-    /// The projects the user has filed, sorted by name, read from the
-    /// store's labels. Iris routes by them; the daemon's own table is gone.
-    fn projects(&self) -> Vec<(Utf8PathBuf, String)> {
-        self.desk_cells.projects()
-    }
-
     fn auth_state(&self) -> AuthState {
         let state = self.inference.state();
         AuthState {
@@ -1105,20 +824,13 @@ impl AgentRegistry {
     }
 
     async fn ready_message(&self) -> ServerMessage {
+        let read = self.db.read();
         ServerMessage::Ready {
-            agents: self.ui_agents(),
             auth: self.auth_state(),
             machine_seed: self.machine_seed,
-            agent_counter: self.db.read().last_agent_counter(),
+            agent_counter: read.last_agent_counter(),
+            journal_head: read.journal_head(),
         }
-    }
-
-    async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
-        self.pool.loaded().await
-    }
-
-    async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
-        self.pool.get(agent_id).await
     }
 
     async fn land_lock(&self, repo: Utf8PathBuf) -> Arc<TokioMutex<()>> {
@@ -1198,7 +910,8 @@ impl AgentRegistry {
         if !self.pool.agent_exists(self_agent_id) {
             anyhow::bail!("agent is not known: {self_agent_id:?}");
         }
-        let role = self.db.read().get_agent(self_agent_id).config.role;
+        let (_, self_agent, _) = self.load(self_agent_id).await?;
+        let role = self_agent.head().config.role;
         if matches!(role, AgentRole::Advisor { .. })
             && !matches!(
                 &request,
@@ -1237,7 +950,7 @@ impl AgentRegistry {
                         AgentRole::default(),
                     )
                     .await?;
-                let child_record = self.pool.db().read().get_agent(child_id);
+                let child_record = self.load(child_id).await?.1.head();
                 let workspace_note = match child_record.primary_workdir().workspace_handle() {
                     Some(workspace) => format!(
                         " Its jj workspace is `{workspace}`; inspect its working-copy commit with \
@@ -1258,7 +971,7 @@ impl AgentRegistry {
                 if message.trim().is_empty() {
                     anyhow::bail!("message must not be empty");
                 }
-                let recipient = self.resolve_display_agent_id(&agent_id)?;
+                let recipient = self.resolve_display_agent_id(&agent_id).await?;
                 if recipient == self_agent_id {
                     anyhow::bail!("cannot send a message to yourself");
                 }
@@ -1278,7 +991,7 @@ impl AgentRegistry {
             McpAgentToolRequest::InterruptEngineer {
                 engineer_id: agent_id,
             } => {
-                let target = self.resolve_display_agent_id(&agent_id)?;
+                let target = self.resolve_display_agent_id(&agent_id).await?;
                 if target == self_agent_id {
                     anyhow::bail!("cannot interrupt yourself");
                 }
@@ -1290,10 +1003,8 @@ impl AgentRegistry {
                 ))
             }
             McpAgentToolRequest::AskAdvisor { message } => {
-                let workdirs = self
-                    .db
-                    .read()
-                    .get_agent(self_agent_id)
+                let workdirs = self_agent
+                    .head()
                     .config
                     .workdirs
                     .into_iter()
@@ -1323,14 +1034,14 @@ impl AgentRegistry {
                 advisor_id,
                 message,
             } => {
-                let advisor = self.resolve_display_agent_id(&advisor_id)?;
-                let record = self.db.read().get_agent(advisor);
+                let advisor = self.resolve_display_agent_id(&advisor_id).await?;
+                let record = self.load(advisor).await?.1.head();
                 anyhow::ensure!(
                     matches!(record.config.role, AgentRole::Advisor { .. }),
                     "target is not an Advisor"
                 );
                 anyhow::ensure!(
-                    self.db.read().agent_attention(advisor).parent_agent == Some(self_agent_id),
+                    self.db.read().agent_parent(advisor) == Some(self_agent_id),
                     "Advisor belongs to another agent"
                 );
                 self.pool
@@ -1346,7 +1057,7 @@ impl AgentRegistry {
         }
     }
 
-    fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
+    async fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
         let text = agent_id.trim();
         let (prefix, raw_agent_id) = match text.split_once('-') {
             Some((prefix, raw)) => (Some(prefix), raw),
@@ -1366,9 +1077,10 @@ impl AgentRegistry {
         }
         if let Some(prefix) = prefix {
             let expected = self
-                .db
-                .read()
-                .get_agent(resolved)
+                .load(resolved)
+                .await?
+                .1
+                .head()
                 .config
                 .role
                 .handle_prefix();
@@ -1393,45 +1105,6 @@ impl AgentRegistry {
 /// so a restart is never held for the migration. Most-recently-touched
 /// first, one agent per transaction, resumable across restarts; a load
 /// jumps the queue on its own. Goes with the rest of the migration code.
-/// Moves the user's hidden and snoozed agents into the store, once, on the
-/// start that first has somewhere to put them. Deleted after the restart,
-/// with the table it reads.
-async fn convert_agent_dispositions(agents: &AgentRegistry) {
-    let dispositions = {
-        let read = agents.db.read();
-        read.list_agents()
-            .into_iter()
-            .map(|(agent_id, head)| {
-                (
-                    agent_id,
-                    read.agent_attention(agent_id).disposition,
-                    head.story_pos.0,
-                )
-            })
-            .filter(|(_, disposition, _)| {
-                matches!(
-                    disposition,
-                    AgentDisposition::Hidden | AgentDisposition::Snoozed { .. }
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    if dispositions.is_empty() {
-        return;
-    }
-    match agents
-        .desk_cells
-        .convert_agent_dispositions(&dispositions)
-        .await
-    {
-        Ok((0, 0)) => {}
-        Ok((muted, deferred)) => eprintln!(
-            "rho daemon: filed {muted} hidden and {deferred} snoozed agents into the store"
-        ),
-        Err(error) => eprintln!("rho daemon: agent disposition conversion failed: {error}"),
-    }
-}
-
 /// Moves the registered projects into the store, once, on the start that
 /// first has somewhere to put them. Deleted after the restart, with the
 /// table it reads.
@@ -1478,32 +1151,6 @@ async fn drop_converted_tables(db: &RhoDb, projects_converted: bool) {
     write.commit();
 }
 
-fn spawn_story_backfill(db: RhoDb) {
-    tokio::spawn(async move {
-        let parented = rho_agent::story_backfill::tell_missing_parents(&db).await;
-        if parented > 0 {
-            eprintln!("rho daemon: story backfill told {parented} agents their spawner");
-        }
-        let waiting = rho_agent::story_backfill::agents_awaiting_story(&db);
-        if waiting.is_empty() {
-            return;
-        }
-        let started = std::time::Instant::now();
-        let mut events = 0usize;
-        for agent_id in &waiting {
-            events += rho_agent::story_backfill::ensure_story(&db, *agent_id).await;
-            // The daemon serves while this runs; never hold the write lock
-            // back to back.
-            tokio::task::yield_now().await;
-        }
-        eprintln!(
-            "rho daemon: story backfill built {} agents, {events} events, in {:.1}s",
-            waiting.len(),
-            started.elapsed().as_secs_f64()
-        );
-    });
-}
-
 async fn serve_connection(
     agents: Arc<AgentRegistry>,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
@@ -1516,7 +1163,7 @@ async fn serve_connection(
     });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
-    serve_connection_io(agents, iroh_auth, reader, writer, land_holder, None, None).await
+    serve_connection_io(agents, iroh_auth, reader, writer, land_holder, None).await
 }
 
 /// One UI protocol session over any framed byte stream (Unix socket or an
@@ -1527,7 +1174,6 @@ async fn serve_connection_io<R, W>(
     reader: R,
     writer: W,
     land_holder: Option<LandLeaseHolder>,
-    agent_streams: Option<IrohAgentStreams>,
     first: Option<ClientMessage>,
 ) -> anyhow::Result<()>
 where
@@ -1659,16 +1305,16 @@ where
         }
     });
 
-    // Creations update lightweight registry summaries. Agent-state streams
-    // are opened only by this connection's explicit subscriptions. Subscribe
-    // before building Ready so a concurrent creation is either in its
-    // snapshot or arrives on this receiver (occasionally both, harmlessly).
+    // Creations update lightweight registry summaries. Subscribe before
+    // building Ready so a concurrent creation is either in its snapshot or
+    // arrives on this receiver (occasionally both, harmlessly).
     let mut created_rx = agents.pool.subscribe_created();
     let mut events_rx = agents.events.subscribe();
     let _ = outgoing_tx.send(agents.ready_message().await);
-    let mut local_subscriptions = HashMap::new();
-    let mut presentation_watches = HashMap::new();
-    let mut story_follow: Option<tokio::task::JoinHandle<()>> = None;
+    // Names this connection's wants in the pool's live set, so they leave
+    // with it.
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut log_follow: Option<tokio::task::JoinHandle<()>> = None;
     let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
@@ -1752,10 +1398,8 @@ where
             &outgoing_tx,
             &mut land_leases,
             land_holder.clone(),
-            agent_streams.as_ref(),
-            &mut local_subscriptions,
-            &mut presentation_watches,
-            &mut story_follow,
+            connection_id,
+            &mut log_follow,
             &mut desk_session,
             message,
         )
@@ -1783,14 +1427,17 @@ where
         agents.desk_devices.lock().await.remove(&device);
     }
     events_task.abort();
-    if let Some(story_follow) = story_follow {
-        story_follow.abort();
+    if let Some(log_follow) = log_follow {
+        log_follow.abort();
     }
-    for (_, subscription) in local_subscriptions {
-        subscription.abort();
-    }
+    agents
+        .pool
+        .set_live_wants(connection_id, HashSet::new())
+        .await;
     result
 }
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn serve_git_transport_request<R, W>(
     agents: Arc<AgentRegistry>,
@@ -1857,8 +1504,9 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 fn rewind_destination_materialized(
-    rewind: &ClaudeRewind,
+    rewind: &rho_agent::db::ClaudeRewind,
     messages: &[rho_claude::SessionMessage],
 ) -> bool {
     match rewind.resume_at {
@@ -1869,72 +1517,15 @@ fn rewind_destination_materialized(
     }
 }
 
+#[cfg(test)]
 fn rewind_source_prefix(
-    rewind: &ClaudeRewind,
+    rewind: &rho_agent::db::ClaudeRewind,
     messages: &[rho_claude::SessionMessage],
 ) -> anyhow::Result<Vec<rho_claude::SessionMessage>> {
     match rewind.resume_at {
         Some(resume_at) => rho_claude::session_messages_through_assistant(messages, resume_at)
             .context("Claude rewind point is no longer in the transcript"),
         None => Ok(Vec::new()),
-    }
-}
-
-async fn selected_claude_messages_for_backfill(
-    session_id: uuid::Uuid,
-    rewind: Option<ClaudeRewind>,
-    cwd: &Utf8Path,
-) -> anyhow::Result<Vec<rho_claude::SessionMessage>> {
-    let options = rho_claude::SessionMessagesOptions::default();
-    let Some(rewind) = rewind else {
-        return rho_claude::read_session_messages_by_id(session_id, cwd, options).await;
-    };
-    let destination =
-        rho_claude::read_session_messages_by_id(rewind.session_id, cwd, options.clone()).await?;
-    if rewind_destination_materialized(&rewind, &destination) {
-        return Ok(destination);
-    }
-    let source =
-        rho_claude::read_session_messages_by_id(rewind.source_session_id, cwd, options).await?;
-    rewind_source_prefix(&rewind, &source)
-}
-
-/// Backfills chronology for Claude agents written before `last_turn_ended`
-/// existed. Native event records do not retain assistant timestamps, so they
-/// deliberately remain unknown rather than receiving an invented value.
-async fn backfill_legacy_turn_end_times(agents: &AgentRegistry) {
-    let kinds = agents.agent_state_kinds().await;
-    let read = agents.db.read();
-    let candidates = read
-        .list_agents()
-        .into_iter()
-        .filter_map(|(agent_id, agent)| {
-            if read.agent_attention(agent_id).last_turn_ended.is_some()
-                || kinds.get(&agent_id).is_some_and(AgentStateKind::is_working)
-            {
-                return None;
-            }
-            let AgentRuntime::Claude { session_id } = agent.config.runtime else {
-                return None;
-            };
-            let cwd = agent.primary_workdir().repo().to_owned();
-            Some((agent_id, session_id, agent.config.claude_rewind, cwd))
-        })
-        .collect::<Vec<_>>();
-
-    for (agent_id, session_id, rewind, cwd) in candidates {
-        let messages = match selected_claude_messages_for_backfill(session_id, rewind, &cwd).await {
-            Ok(messages) => messages,
-            Err(error) => {
-                tracing::warn!(?agent_id, %error, "could not read Claude transcript for turn-end backfill");
-                continue;
-            }
-        };
-        let mut write = agents.db.write().await;
-        if rho_agent::backfill_last_turn_ended_from_claude_messages(&mut write, agent_id, &messages)
-        {
-            write.commit();
-        }
     }
 }
 
@@ -1958,49 +1549,6 @@ fn spawn_inference_projection(agents: Arc<AgentRegistry>) {
             });
         }
     });
-}
-
-fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
-    let mut changes = agents.pool.subscribe_presentation_changes();
-    let agents = Arc::downgrade(&agents);
-    tokio::spawn(async move {
-        while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
-            let Some(agents) = agents.upgrade() else {
-                break;
-            };
-            let _ = agents.events.send(agents.ready_message().await);
-        }
-    });
-}
-
-/// Watches one running agent for the daemon itself (not any particular
-/// connection): flushes its usage when a turn stops. What a reader sees of
-/// the turn is the story's own `TurnStarted` and `TurnEnded`.
-async fn spawn_turn_watcher(pool: Arc<AgentPool>, agent_id: AgentId, agent: RunningAgent) {
-    let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let changes = agent.subscribe();
-        futures::pin_mut!(changes);
-        let Some(initial_state) = changes.next().await else {
-            let _ = ready_tx.send(());
-            return;
-        };
-        // The state subscription is armed. Activation callers may now start
-        // work; durable turn completion is published by each runtime rather
-        // than inferred from this coalescing snapshot stream.
-        let _ = ready_tx.send(());
-        let mut was_working = initial_state.kind.is_working();
-        let states = futures::stream::once(async move { initial_state }).chain(changes);
-        futures::pin_mut!(states);
-        while let Some(state) = states.next().await {
-            let working = state.kind.is_working();
-            if !working && was_working {
-                pool.flush_agent_usage(Some(agent_id)).await;
-            }
-            was_working = working;
-        }
-    });
-    let _ = ready_rx.await;
 }
 
 fn combined_quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSummary> {
@@ -2126,7 +1674,7 @@ fn hourly_agent_cost_series(
 
     let read = db.read();
     let mut hourly = BTreeMap::new();
-    for (agent_id, _) in read.list_agents() {
+    for agent_id in read.list_agent_ids() {
         for bucket in read.agent_usage(agent_id, since) {
             if !matches!(
                 bucket.model,
@@ -2334,95 +1882,128 @@ fn spawn_claude_quota_recorder(
 /// Wakes a snoozed agent: at `until`, rebroadcasts its (by then pending)
 /// level. Harmless if the disposition changed meanwhile — it just sends the
 /// then-current level.
-/// How many story events travel in one [`ServerMessage::AgentStory`] while
-/// a client is catching up. The first mirror of an unseen daemon is a whole
-/// history, so it goes in slices the connection can interleave.
-const STORY_CATCHUP_CHUNK: usize = 512;
+/// How many journal entries travel in one [`ServerMessage::Log`] while a
+/// client is catching up. A cold client's first copy is a whole history,
+/// so it goes in pages the connection can interleave.
+const LOG_PAGE: usize = 512;
 
-/// Sends this connection every story event it lacks, then follows: each new
-/// event goes out as it is appended, on any agent.
+/// Sends this connection every journal entry after `since`, then follows
+/// the feed: each new row as it is appended, on any agent, and every live
+/// delta any loop tells, in the order they happened.
 ///
-/// The daemon remembers what it has sent per agent. An event that is not the
-/// next one - the client asked from further back, or a background backfill
-/// jumped an agent's story forward - is not sent at all; the head goes
-/// instead, and the client asks again with a fresh `AgentLogs` when it sees
-/// a position it does not hold. That keeps a client that fell behind exact
-/// rather than clever.
-fn spawn_story_follow(
+/// Contiguous by seq is the whole contract for rows. The daemon remembers
+/// the last seq it sent; an append that is not the next one, or a lagged
+/// subscription, sends it back to the journal from there. Rows the
+/// mirror leaves behind (`strip` says nothing) advance the seq without a
+/// message.
+///
+/// Live deltas are forwarded only once the loops have been asked to tell
+/// their tails whole, which happens after the catch-up: a delta from
+/// before that would be an append to a tail the client does not hold.
+/// After a lag the same is done again, since deltas were lost.
+fn spawn_log_follow(
     agents: Arc<AgentRegistry>,
     outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
-    known: Vec<(AgentId, rho_ui_proto::story::UiStoryPos)>,
+    since: rho_ui_proto::mirror::Seq,
 ) -> tokio::task::JoinHandle<()> {
+    use rho_agent::mirror::Feed;
     tokio::spawn(async move {
-        // Subscribed before the catch-up read, so an event appended during
-        // it is queued rather than lost; the cursor drops the duplicates.
-        let mut appends = rho_agent::story::story_appends(&agents.db);
-        let mut sent = known
-            .into_iter()
-            .map(|(agent_id, pos)| (agent_id, story_wire::story_pos(pos)))
-            .collect::<HashMap<_, _>>();
-
-        let heads = agents.db.read().list_agents();
-        for (agent_id, head) in heads {
-            let mut from = sent.get(&agent_id).copied().unwrap_or_default();
-            if from >= head.story_pos {
-                continue;
-            }
-            let story = agents.db.read().agent_story(agent_id, from);
-            for chunk in story.chunks(STORY_CATCHUP_CHUNK) {
-                let events = chunk
-                    .iter()
-                    .map(|(_, event)| story_wire::ui_story_event(event.clone()))
-                    .collect::<Vec<_>>();
-                let sending = ServerMessage::AgentStory {
-                    agent_id,
-                    from: story_wire::ui_story_pos(from),
-                    events,
-                };
-                if outgoing_tx.send(sending).is_err() {
-                    return;
-                }
-                from = chunk.last().map_or(from, |(pos, _)| pos.next());
-                // Catching up must never starve the connection's own traffic.
-                tokio::task::yield_now().await;
-            }
-            sent.insert(agent_id, from);
+        // Subscribed before the catch-up read, so a row appended during it
+        // is queued rather than lost; the seq drops the duplicates.
+        let mut feed = rho_agent::mirror::feed(&agents.db);
+        let mut sent = since;
+        if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
+            return;
         }
-
+        let mut told = false;
+        agents.pool.tell_tails().await;
         loop {
-            match appends.recv().await {
-                Ok(appended) => {
-                    let expected = sent.get(&appended.agent_id).copied().unwrap_or_default();
-                    let sending = if appended.pos == expected {
-                        sent.insert(appended.agent_id, appended.pos.next());
-                        ServerMessage::AgentStory {
-                            agent_id: appended.agent_id,
-                            from: story_wire::ui_story_pos(appended.pos),
-                            events: vec![story_wire::ui_story_event(appended.event)],
+            match feed.recv().await {
+                Ok(Feed::Live { agent_id, live }) => {
+                    // The first whole tell for a loop starts with a phase
+                    // (`Requesting`, `Waiting`, `Idle`); anything before
+                    // one is from before the ask and is dropped.
+                    if !told {
+                        told = !matches!(
+                            live,
+                            rho_ui_proto::mirror::Live::Item { .. }
+                                | rho_ui_proto::mirror::Live::Appended { .. }
+                        );
+                        if !told {
+                            continue;
                         }
-                    } else if appended.pos < expected {
-                        // Already sent in the catch-up read.
+                    }
+                    if outgoing_tx
+                        .send(ServerMessage::Live { agent_id, live })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Feed::Appended(appended)) => {
+                    if appended.seq <= sent {
                         continue;
-                    } else {
-                        ServerMessage::AgentHead {
-                            head: story_wire::ui_agent_head(appended.agent_id, &appended.head),
+                    }
+                    if appended.seq != sent.next() {
+                        if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
+                            return;
                         }
-                    };
-                    if outgoing_tx.send(sending).is_err() {
+                        continue;
+                    }
+                    sent = appended.seq;
+                    if let Some(entry) = appended.entry()
+                        && outgoing_tx
+                            .send(ServerMessage::Log {
+                                entries: vec![entry],
+                            })
+                            .is_err()
+                    {
                         return;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // What was missed is unknown, so say only what is true:
-                    // here are the heads. The client asks for the rest.
-                    if outgoing_tx.send(agents.ready_message().await).is_err() {
+                    if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
                         return;
                     }
+                    told = false;
+                    agents.pool.tell_tails().await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     })
+}
+
+/// Pages the journal out from after `sent`, moving it as it goes. False
+/// when the connection is gone.
+async fn send_journal_from(
+    db: &RhoDb,
+    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    sent: &mut rho_ui_proto::mirror::Seq,
+) -> bool {
+    loop {
+        let page = db.read().journal_since(*sent, LOG_PAGE);
+        let Some((last, _, _, _)) = page.last() else {
+            return true;
+        };
+        *sent = *last;
+        let entries = page
+            .into_iter()
+            .filter_map(|(seq, agent_id, pos, event)| {
+                Some(rho_ui_proto::mirror::LogEntry {
+                    seq,
+                    agent_id,
+                    pos: pos.into(),
+                    event: rho_agent::mirror::strip(&event)?,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !entries.is_empty() && outgoing_tx.send(ServerMessage::Log { entries }).is_err() {
+            return false;
+        }
+        // Catching up must never starve the connection's own traffic.
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Whether a handled message changed registry state that clients see through
@@ -2442,10 +2023,8 @@ async fn handle_message(
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
     land_holder: Option<LandLeaseHolder>,
-    agent_streams: Option<&IrohAgentStreams>,
-    local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
-    presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
-    story_follow: &mut Option<tokio::task::JoinHandle<()>>,
+    connection_id: u64,
+    log_follow: &mut Option<tokio::task::JoinHandle<()>>,
     desk_session: &mut Option<(rho_desk::cells::DeviceId, u16)>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
@@ -2546,27 +2125,6 @@ async fn handle_message(
         ClientMessage::QuotaHistory => {
             let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
                 series: quota_history(&agents.db, &agents.inference),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::AgentUsage { agent_id, since_ms } => {
-            agents.pool.flush_agent_usage(Some(agent_id)).await;
-            let read = agents.db.read();
-            let model = match read.get_agent(agent_id).config.runtime {
-                AgentRuntime::Rho { .. } => "gpt-5.6-sol",
-                AgentRuntime::Claude { .. } => "claude-fable-5",
-            };
-            let buckets = read
-                .agent_usage(agent_id, rho_core::UnixMs(since_ms))
-                .into_iter()
-                .map(ui_agent_usage_bucket)
-                .collect();
-            let total = ui_agent_usage_bucket(read.agent_usage_total(agent_id));
-            let _ = outgoing_tx.send(ServerMessage::AgentUsage {
-                agent_id,
-                model: model.to_owned(),
-                buckets,
-                total,
             });
             Ok(Refresh::None)
         }
@@ -2829,58 +2387,33 @@ async fn handle_message(
         }
         ClientMessage::AgentStreamFocus { agent_ids } => {
             anyhow::ensure!(agent_ids.len() <= 64, "too many focused agents");
-            // The focus set is replaced wholesale: whoever left it stops
-            // streaming, whoever joined starts. Everything durable is on
-            // the story regardless, so this is only about live frames.
-            let wanted = agent_ids.iter().copied().collect::<HashSet<_>>();
-            let leaving = local_subscriptions
-                .keys()
-                .copied()
-                .filter(|agent_id| !wanted.contains(agent_id))
-                .chain(
-                    presentation_watches
-                        .keys()
-                        .copied()
-                        .filter(|agent_id| !wanted.contains(agent_id)),
-                )
-                .collect::<HashSet<_>>();
-            for agent_id in leaving {
-                if let Some(streams) = agent_streams {
-                    streams.remove(agent_id).await;
-                }
-                if let Some(subscription) = local_subscriptions.remove(&agent_id) {
-                    subscription.abort();
-                    let _ = subscription.await;
-                }
-                presentation_watches.remove(&agent_id);
-                let _ = outgoing_tx.send(ServerMessage::AgentUnloaded {
-                    agent_id,
-                    reason: rho_ui_proto::AgentUnloadReason::Unsubscribed,
-                });
-            }
-            subscribe_connection_agents(
-                agents,
-                outgoing_tx,
-                agent_streams,
-                local_subscriptions,
-                presentation_watches,
-                agent_ids.clone(),
-            )
-            .await?;
-            if let Some(agent_streams) = agent_streams {
-                agent_streams.set_focus(agent_ids);
-            }
+            // Focus is what this client is looking at, nothing more: it
+            // never loads an agent. The pool unions it across connections
+            // into the live set; a loaded agent in it tells its tail.
+            agents
+                .pool
+                .set_live_wants(connection_id, agent_ids.into_iter().collect())
+                .await;
             Ok(Refresh::None)
         }
-        ClientMessage::AgentLogs { known } => {
-            if let Some(previous) = story_follow.take() {
+        ClientMessage::Follow { since } => {
+            if let Some(previous) = log_follow.take() {
                 previous.abort();
             }
-            *story_follow = Some(spawn_story_follow(
+            *log_follow = Some(spawn_log_follow(
                 Arc::clone(agents),
                 outgoing_tx.clone(),
-                known,
+                since,
             ));
+            Ok(Refresh::None)
+        }
+        ClientMessage::Detail { agent_id, pos } => {
+            let body = agent_detail(&agents.db, agent_id, pos);
+            let _ = outgoing_tx.send(ServerMessage::Detail {
+                agent_id,
+                pos,
+                body,
+            });
             Ok(Refresh::None)
         }
         ClientMessage::SendUserMessage {
@@ -2889,10 +2422,7 @@ async fn handle_message(
             delivery,
         } => {
             prepare_image_content(&mut content).await?;
-            let agent = agents
-                .get(agent_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            let (_, agent, _) = agents.load(agent_id).await?;
             agent.send_user_content_accepted(content, delivery).await?;
             Ok(Refresh::None)
         }
@@ -2902,26 +2432,17 @@ async fn handle_message(
             agent_id,
             delivery: _,
         } => {
-            let agent = agents
-                .get(agent_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            let (_, agent, _) = agents.load(agent_id).await?;
             agent.compact();
             Ok(Refresh::None)
         }
         ClientMessage::ChangeAgentRole { agent_id, role } => {
-            let agent = agents
-                .get(agent_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            let (_, agent, _) = agents.load(agent_id).await?;
             agent.change_role(role).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::ChangePromptCacheKey { agent_id } => {
-            let agent = agents
-                .get(agent_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            let (_, agent, _) = agents.load(agent_id).await?;
             agent.change_prompt_cache_key()?;
             Ok(Refresh::None)
         }
@@ -2930,24 +2451,19 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::CancelTurn { agent_id } => {
-            if let Some(agent) = agents.get(agent_id).await {
-                agent.cancel();
-                let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
-            }
+            let (_, agent, _) = agents.load(agent_id).await?;
+            agent.cancel();
+            let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
             Ok(Refresh::None)
         }
         ClientMessage::RewindAgent { agent_id, turns } => {
-            let agent = agents
-                .get(agent_id)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
+            let (_, agent, _) = agents.load(agent_id).await?;
             agent.rewind(turns).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::ContinueTurn { agent_id } => {
-            if let Some(agent) = agents.get(agent_id).await {
-                agent.retry();
-            }
+            let (_, agent, _) = agents.load(agent_id).await?;
+            agent.retry();
             Ok(Refresh::None)
         }
         ClientMessage::McpAgentTool {
@@ -3203,8 +2719,8 @@ where
 }
 
 async fn shell_start(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = agents.resolve_display_agent_id(agent)?;
-    let record = agents.db.read().get_agent(agent_id);
+    let agent_id = agents.resolve_display_agent_id(agent).await?;
+    let record = agents.load(agent_id).await?.1.head();
     shell::ensure_supported_workdirs(&record.config.workdirs)?;
     let view = agents
         .pool
@@ -3229,7 +2745,7 @@ async fn shell_attach(
     agents: &Arc<AgentRegistry>,
     agent: &str,
 ) -> anyhow::Result<shell::ShellClient> {
-    let agent_id = agents.resolve_display_agent_id(agent)?;
+    let agent_id = agents.resolve_display_agent_id(agent).await?;
     agents.shells.attach(agent_id).await
 }
 
@@ -3237,9 +2753,10 @@ async fn shell_list(
     agents: &Arc<AgentRegistry>,
     agent: Option<&str>,
 ) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
-    let filter = agent
-        .map(|agent| agents.resolve_display_agent_id(agent))
-        .transpose()?;
+    let filter = match agent {
+        Some(agent) => Some(agents.resolve_display_agent_id(agent).await?),
+        None => None,
+    };
     Ok(agents
         .shells
         .list()
@@ -3254,7 +2771,7 @@ async fn shell_list(
 }
 
 async fn shell_close(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = agents.resolve_display_agent_id(agent)?;
+    let agent_id = agents.resolve_display_agent_id(agent).await?;
     agents.shells.close(agent_id).await
 }
 
@@ -3550,14 +3067,14 @@ async fn terminal_attach(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<terminal::TerminalClient> {
-    let agent_id = agents.resolve_display_agent_id(agent)?;
+    let agent_id = agents.resolve_display_agent_id(agent).await?;
     if !create {
         return agents
             .terminals
             .attach(agent_id, terminal_id, cols, rows)
             .await;
     }
-    let record = agents.db.read().get_agent(agent_id);
+    let record = agents.load(agent_id).await?.1.head();
     anyhow::ensure!(
         !record
             .config
@@ -3599,7 +3116,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let filter = match &agent {
-        Some(agent) => match agents.resolve_display_agent_id(agent) {
+        Some(agent) => match agents.resolve_display_agent_id(agent).await {
             Ok(agent_id) => Some(agent_id),
             Err(error) => {
                 let _ = write_frame(
@@ -3790,60 +3307,67 @@ where
         }
     }
 }
-async fn subscribe_connection_agents(
-    agents: &Arc<AgentRegistry>,
-    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
-    agent_streams: Option<&IrohAgentStreams>,
-    local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
-    presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
-    agent_ids: impl IntoIterator<Item = AgentId>,
-) -> anyhow::Result<()> {
-    for agent_id in agent_ids {
-        let (agent_id, agent, _loaded_now) = agents.load(agent_id).await?;
-        if let Some(streams) = agent_streams {
-            streams.ensure(agent_id, agent).await?;
-        } else {
-            local_subscriptions
-                .entry(agent_id)
-                .or_insert_with(|| subscribe_agent(agent_id, agent, outgoing_tx.clone()));
-        }
-        // `Ready` always includes the durable presentation cache for every
-        // dashboard row. This lease only permits a loaded agent to
-        // refresh that cache with Luna while its transcript is observed.
-        if !presentation_watches.contains_key(&agent_id)
-            && let Some(watch) = agents.pool.watch_presentation(agent_id).await
-        {
-            presentation_watches.insert(agent_id, watch);
-        }
+/// The bodies one raw row carries, for a client that asked by position:
+/// a request's tool results whole, or a response as the transcript draws
+/// it. Rows a rewind hid still answer; the client asked for one it holds.
+fn agent_detail(
+    db: &RhoDb,
+    agent_id: AgentId,
+    pos: rho_ui_proto::mirror::AgentPos,
+) -> rho_ui_proto::mirror::DetailBody {
+    use rho_ui_proto::mirror::DetailBody;
+    match db.read().agent_event(agent_id, pos.into()) {
+        Some(rho_agent::AgentEvent::Sent { blocks, .. }) => DetailBody::Results(
+            blocks
+                .iter()
+                .flat_map(|block| match block {
+                    rho_core::ContextBlock::ToolResults { results } => {
+                        results.iter().map(detail_result).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect(),
+        ),
+        Some(rho_agent::AgentEvent::Replied { blocks, .. }) => DetailBody::Response(
+            blocks
+                .iter()
+                .flat_map(|block| match block {
+                    rho_core::ContextBlock::InferenceResponse { items, .. } => {
+                        items.iter().filter_map(detail::item).collect::<Vec<_>>()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect(),
+        ),
+        Some(rho_agent::AgentEvent::Failed { partial, .. }) => DetailBody::Response(
+            partial
+                .items
+                .iter()
+                .filter_map(|slot| match slot {
+                    rho_core::StreamingContextItemState::Pending(item)
+                    | rho_core::StreamingContextItemState::Finished(item) => {
+                        rho_agent::live::to_item(item)
+                    }
+                    rho_core::StreamingContextItemState::Empty => None,
+                })
+                .collect(),
+        ),
+        _ => DetailBody::Nothing,
     }
-    Ok(())
 }
 
-fn subscribe_agent(
-    agent_id: AgentId,
-    agent: RunningAgent,
-    state_tx: mpsc::UnboundedSender<ServerMessage>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let changes = agent.subscribe();
-        let mut encoder = AgentRemoteEncoder::new();
-        let _ = state_tx.send(ServerMessage::Agent {
-            agent_id,
-            frame: encoder.encode(agent_ui::project_agent_state(&agent.state())),
-        });
-        futures::pin_mut!(changes);
-        while let Some(state) = changes.next().await {
-            if state_tx
-                .send(ServerMessage::Agent {
-                    agent_id,
-                    frame: encoder.encode(agent_ui::project_agent_state(&state)),
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    })
+fn detail_result(result: &rho_core::ToolResult) -> rho_ui_proto::mirror::DetailResult {
+    use rho_ui_proto::mirror::ToolStatus;
+    rho_ui_proto::mirror::DetailResult {
+        id: result.call_id.as_str().to_owned(),
+        status: match result.body.status {
+            rho_core::ToolOutputStatus::Success => ToolStatus::Success,
+            rho_core::ToolOutputStatus::Error => ToolStatus::Error,
+            rho_core::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
+        },
+        output: result.body.output.to_string(),
+        error: None,
+    }
 }
 
 /// Repo roots must be absolute (the daemon's cwd is meaningless by design)
