@@ -4333,10 +4333,11 @@ fn a_bare_shift_keystroke_opens_nothing(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// Snooze end to end through the transient. It was an operator in deal
-/// mode, `ss` for a day and `45sm` for forty-five minutes; the count now
-/// goes inside the menu, where the units are written down, and lands on
-/// exactly the same time.
+/// Snooze end to end through the transient, every unit the fingers know.
+/// It was an operator in deal mode, `ss` for a day and `45sm` for
+/// forty-five minutes; the count now goes inside the menu, where the units
+/// are written down, and lands on exactly the same time. `s` is still a
+/// day on its own, which is what makes the habit survive the move.
 #[gpui::test]
 fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
     use crate::workspace::{SnoozeUnit, snooze_target};
@@ -4348,6 +4349,8 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         ("s s", SnoozeUnit::Days, 1usize),
         ("s 7 d", SnoozeUnit::Days, 7),
         ("s 4 5 m", SnoozeUnit::Minutes, 45),
+        ("s 3 h", SnoozeUnit::Hours, 3),
+        ("s 2 w", SnoozeUnit::Weeks, 2),
     ] {
         // A card apiece: a verdict waits on the daemon before the deal
         // moves on, so one desk cannot hold three of them.
