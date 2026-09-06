@@ -66,37 +66,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "50351c18",
-    to: "3ac1e7d4",
-    migrate: name_claude_quota_observations_after_the_default_account,
-}];
-
-/// Claude quota was observed for whatever account the host was logged into,
-/// and bootstrap makes that the default account, so every observation
-/// written before accounts existed belongs to it. Naming it keeps one
-/// account's history in one series instead of splitting at the change.
-///
-/// Temporary: delete with the format hop once developer databases have run
-/// it (`.agents/skills/temp-migration`).
-fn name_claude_quota_observations_after_the_default_account(write: &mut WriteTxn) {
-    let mut table = write.open_table(QUOTA_OBSERVATIONS);
-    let stale: Vec<_> = table
-        .iter()
-        .filter_map(|(key, value)| {
-            let record = value.value().into_owned();
-            matches!(
-                (&record.provider, &record.auth_namespace),
-                (QuotaProvider::Claude, None)
-            )
-            .then(|| (key.value(), record))
-        })
-        .collect();
-    for (key, mut record) in stale {
-        record.auth_namespace = Some(rho_claude::accounts::DEFAULT_ACCOUNT.to_owned());
-        table.insert(&key, SenValue::borrowed(&record));
-    }
-}
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
