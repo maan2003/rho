@@ -2973,16 +2973,6 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
 /// the user has spoken since it finished.
 /// The names an agent answers to besides its title: its tag, and the last
 /// thing the user said to it.
-fn agent_aka(registry: &AgentRegistry, agent_id: AgentId, title: &str) -> Vec<String> {
-    let mut aka = vec![registry.agent_id_label(agent_id)];
-    if let Some(said) = registry.agent_last_user_message(agent_id)
-        && said != title
-    {
-        aka.push(said.to_owned());
-    }
-    aka
-}
-
 fn agent_card_facts(
     facts: &rho_registry::AgentFacts,
     agent_id: AgentId,
@@ -3550,17 +3540,17 @@ impl Dashboard {
                         let Some(agent_id) = node.agent() else {
                             continue;
                         };
-                        let title = title_of(node.id.clone())
-                            .unwrap_or_else(|| registry.agent_human_name(agent_id));
+                        // Which names an agent answers to is the agent
+                        // crate's; where it sits in the tree is this row's.
+                        let hit =
+                            rho_agents::find::hit(registry, agent_id, title_of(node.id.clone()));
                         FindCandidate {
-                            labels: labelled(&title),
-                            aka: agent_aka(registry, agent_id, &title),
-                            path: under(title.clone()),
+                            labels: labelled(&hit.title),
+                            aka: hit.aka,
+                            path: under(hit.title),
                             kind: "agent",
                             target: FindTarget::Agent(agent_id),
-                            recency: registry
-                                .agent_last_active(agent_id)
-                                .map_or(0, |active| active.0 as i64),
+                            recency: hit.recency,
                         }
                     }
                     rho_desk::cells::Id::Page(_) => {
@@ -3596,16 +3586,14 @@ impl Dashboard {
             if filed.contains(&agent_id) || registry.agent_hidden(agent_id) {
                 continue;
             }
-            let title = registry.agent_human_name(agent_id);
+            let hit = rho_agents::find::hit(registry, agent_id, None);
             candidates.push(crate::find::FindCandidate {
                 labels: Vec::new(),
-                aka: agent_aka(registry, agent_id, &title),
-                path: title,
+                aka: hit.aka,
+                path: hit.title,
                 kind: "agent",
                 target: crate::find::FindTarget::Agent(agent_id),
-                recency: registry
-                    .agent_last_active(agent_id)
-                    .map_or(0, |active| active.0 as i64),
+                recency: hit.recency,
             });
         }
         candidates

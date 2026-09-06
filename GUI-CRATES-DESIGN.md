@@ -81,6 +81,19 @@ connection to the screen, tested alone against its own fake server.
   tests run the crate alone, including the two-host refusal and the default
   base, which had no test before. Gate green: rho-gui 276, rho-agents 7,
   rho-hosts 14, rho-registry 14.
+
+  *Landed, Find (7).* Which names an agent answers to is the crate's:
+  `find::hit` gives the title a row shows, the names it also answers to
+  (its label, and the last thing the user said to it when that is not the
+  title already), and how recently it was used. Where an agent sits in the
+  tree stays with the row that draws it, and the scorer and the prompt stay
+  one thing across sources — Find is not per-source, only its answers are.
+  A hit is its own type, as ruled: it answers a query where a card claims
+  attention. The reason type is deferred with dealing composition, and the
+  doc comment on `AgentHit` says so, so a hit gains one the day a card's
+  reason becomes a type. Three tests run the crate alone, over a registry
+  told an agent the way the model thread tells it one. Gate green: rho-gui
+  276, rho-agents 10, rho-hosts 14, rho-registry 14.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

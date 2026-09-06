@@ -11,7 +11,9 @@
 //! time.
 
 pub mod create;
+pub mod find;
 pub mod transcript;
 
 pub use create::{StartBase, StartFieldMode};
+pub use find::AgentHit;
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};
