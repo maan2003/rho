@@ -195,14 +195,14 @@ impl AgentEvent<'_> {
     /// Whether this is a message the user typed, in either generation of
     /// the log: what a rewind counts turns by.
     pub fn is_user_message(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Accepted(QueuedInput {
                 source: MessageSender::User,
                 kind: InputKind::Message { .. },
                 ..
-            }) => true,
-            _ => false,
-        }
+            })
+        )
     }
 }
 

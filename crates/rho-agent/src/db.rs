@@ -1675,9 +1675,6 @@ fn assistant_text_bytes(items: &[crate::InferenceResponseItem]) -> usize {
 
 /// The config a `Created` event states. Panics on any other event: only
 /// creation can begin a config.
-
-/// The config a `Created` event states. Panics on any other event: only
-/// creation can begin a config.
 fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
     let AgentEvent::Created {
         role,
@@ -1741,7 +1738,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             }
             crate::RuntimeChange::PromptCacheKey(key) => {
                 head.config.runtime = AgentRuntime::Rho {
-                    prompt_cache_key: key.clone(),
+                    prompt_cache_key: *key,
                 };
             }
         },
@@ -1939,8 +1936,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
 }
-
-/// One display line from a user message: whitespace collapsed, cut at a
 
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
     let mut counters = write.open_table(COUNTERS);
