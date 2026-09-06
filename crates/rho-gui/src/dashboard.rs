@@ -195,8 +195,6 @@ fn eol_hint(text: gpui::SharedString) -> editor::EolHintRenderer {
 /// what is written in front of it and what is hinted after it. Keeping
 /// this is what lets a verdict cost its own row.
 struct TreeRowDraw {
-    host: HostId,
-    node_id: rho_desk::cells::Id,
     /// Where the row starts and ends in the map, as anchors that survive
     /// an edit inside the row.
     start: editor::Anchor,
@@ -311,6 +309,9 @@ struct DealerFacts<'a> {
 
 /// What a note lends the cards under it.
 struct HeadingContext {
+    /// The machine the heading is on. A card is made from a row on a host
+    /// and stays about that host's agent, so the two travel together.
+    host: HostId,
     /// The row that lends the place. An agent's card is remade when this
     /// row moves, so the set knows which cards a heading holds.
     heading: rho_desk::cells::Id,
@@ -480,7 +481,6 @@ enum CursorPlace {
 /// A document slice's `id` is its stable identity across passes: a hash
 /// of the title of the heading whose cut opens the slice (0 for the
 /// slice that starts the document). The composition keys the excerpt on
-
 pub struct Dashboard {
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
@@ -754,6 +754,7 @@ impl Dashboard {
     /// subtree, which is the gate the old model spelled as a ripe todo.
     fn heading_context(
         &self,
+        host: HostId,
         source: &TreeHostSource,
         heading: &crate::desk_view::DeskNode,
         now: chrono::DateTime<chrono::FixedOffset>,
@@ -779,6 +780,7 @@ impl Dashboard {
             .filter_map(|node| node.agent())
             .collect::<Vec<_>>();
         Some(HeadingContext {
+            host,
             heading: heading.id.clone(),
             breadcrumb,
             room,
@@ -840,7 +842,6 @@ impl Dashboard {
     /// unfiled agents does not deal it twice.
     fn agent_card(
         &self,
-        host: HostId,
         source: &TreeHostSource,
         agent_id: AgentId,
         context: &HeadingContext,
@@ -848,6 +849,7 @@ impl Dashboard {
         facts: &DealerFacts<'_>,
         carded: &mut HashSet<AgentId>,
     ) -> Option<RankedDealCard> {
+        let host = context.host;
         let breadcrumb = context.breadcrumb.as_str();
         let room = context.room.as_ref();
         let agent = facts.by_agent.get(&agent_id).copied()?;
@@ -895,7 +897,6 @@ impl Dashboard {
     /// them, the ones they spawned.
     fn agent_cards_under(
         &self,
-        host: HostId,
         source: &TreeHostSource,
         context: &HeadingContext,
         order: usize,
@@ -912,8 +913,7 @@ impl Dashboard {
                 cursor += 1;
             }
             for agent_id in agents {
-                if let Some(card) =
-                    self.agent_card(host, source, agent_id, context, order, facts, carded)
+                if let Some(card) = self.agent_card(source, agent_id, context, order, facts, carded)
                 {
                     cards.push(card);
                 }
@@ -1775,7 +1775,7 @@ impl Dashboard {
             interactions: agent_interactions,
         };
         let made = if node.is_note() {
-            match self.heading_context(source, &node, now) {
+            match self.heading_context(host, source, &node, now) {
                 Some(context) => self.desk_cards(host, &node, &context, order, &facts),
                 None => Vec::new(),
             }
@@ -1838,18 +1838,11 @@ impl Dashboard {
         let mut carded = HashSet::new();
         for (order, node) in source.nodes.iter().enumerate() {
             if node.is_note() {
-                let Some(context) = self.heading_context(source, node, now) else {
+                let Some(context) = self.heading_context(host, source, node, now) else {
                     continue;
                 };
                 made.extend(self.desk_cards(host, node, &context, order, &facts));
-                made.extend(self.agent_cards_under(
-                    host,
-                    source,
-                    &context,
-                    order,
-                    &facts,
-                    &mut carded,
-                ));
+                made.extend(self.agent_cards_under(source, &context, order, &facts, &mut carded));
             } else if node.slack().is_some() {
                 made.extend(self.thread_card(host, node, order, &facts));
             }
@@ -1907,10 +1900,10 @@ impl Dashboard {
         let context = self
             .tree_hosts
             .get(&host)
-            .and_then(|source| self.heading_for_agent(source, agent_id, registry, now));
+            .and_then(|source| self.heading_for_agent(host, source, agent_id, registry, now));
         let card = match (context, self.tree_hosts.get(&host)) {
             (Some(context), Some(source)) => {
-                self.agent_card(host, source, agent_id, &context, order, &facts, &mut carded)
+                self.agent_card(source, agent_id, &context, order, &facts, &mut carded)
             }
             _ => self.loose_agent_card(&agent, order, &facts),
         };
@@ -1934,6 +1927,7 @@ impl Dashboard {
     /// card at the root.
     fn heading_for_agent(
         &self,
+        host: HostId,
         source: &TreeHostSource,
         agent_id: AgentId,
         registry: &AgentRegistry,
@@ -1959,7 +1953,7 @@ impl Dashboard {
             cursor = registry.agent_parent(agent);
         }
         let (_, heading) = best?;
-        self.heading_context(source, heading, now)
+        self.heading_context(host, source, heading, now)
     }
 
     /// When the ranking changes next without anybody touching anything: a
@@ -2299,7 +2293,7 @@ impl Dashboard {
             if let Some(buffer) = self
                 .tree_hosts
                 .get(&host)
-                .and_then(|source| source.buffers.get(&node_id))
+                .and_then(|source| source.buffers.get(node_id))
             {
                 let buffer = buffer.read(cx);
                 let anchor = buffer.anchor_after(offset.min(buffer.len()));
@@ -2492,8 +2486,6 @@ impl Dashboard {
                 .or_default()
                 .push(self.tree_draw.len());
             self.tree_draw.push(TreeRowDraw {
-                host: *host,
-                node_id: node.id.clone(),
                 start,
                 end,
                 prefix,
@@ -3607,8 +3599,8 @@ impl Dashboard {
     ) -> Vec<(String, String)> {
         let needle = needle.to_lowercase();
         self.tree_hosts
-            .iter()
-            .flat_map(|(_, source)| {
+            .values()
+            .flat_map(|source| {
                 source
                     .nodes
                     .iter()

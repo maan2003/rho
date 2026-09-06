@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+#[cfg(not(test))]
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
@@ -74,6 +75,9 @@ pub(crate) enum ModelCommand {
 /// What reaches the model, in the order the main thread and the
 /// connections produced it. One channel, so a host is always known
 /// before its frames arrive.
+// Under test the model is driven inline and the thread's loop is not
+// built, so nothing reads what the shell puts on this queue.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) enum ToModel {
     Event(HostEvent),
     Command(ModelCommand),
@@ -184,7 +188,7 @@ impl Model {
                 identity: mirrored.snapshot.identity.clone(),
                 digest: mirrored.snapshot.digest.clone(),
             });
-            if let Some(verdict) = mirrored.verdict.clone() {
+            if let Some(verdict) = mirrored.verdict {
                 verdicts.push((*agent_id, verdict));
             }
         }
@@ -399,6 +403,7 @@ pub(crate) fn spawn() -> ModelChannels {
     ModelChannels { incoming, changes }
 }
 
+#[cfg(not(test))]
 async fn run(
     mut incoming: futures_mpsc::UnboundedReceiver<ToModel>,
     changes: futures_mpsc::UnboundedSender<ModelEvent>,

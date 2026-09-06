@@ -507,7 +507,7 @@ mod tests {
             skipped: false,
             ..card("", 2.0)
         };
-        let rows = split_hand(&[thread.clone()], |card| {
+        let rows = split_hand(std::slice::from_ref(&thread), |card| {
             card_title(card, |_| unreachable!())
         });
         assert_eq!(rows.next[0].title, "#design › can you look at the deploy?");

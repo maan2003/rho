@@ -48,8 +48,6 @@ use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::ActiveAgents;
 use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::FrameSummary;
-#[cfg(test)]
-use crate::style::RoleFamily;
 use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
@@ -302,7 +300,8 @@ fn snooze_said(
 enum VerdictUndoState {
     /// The applied verdict this undo appends `Undone { of }` against.
     DeskVerdict {
-        card: crate::dashboard::DealCard,
+        /// Boxed: the card dwarfs everything else an undo entry holds.
+        card: Box<crate::dashboard::DealCard>,
         verdict: crate::dashboard::DealerVerdict,
         host: HostId,
         node: rho_desk::cells::Id,
@@ -1697,16 +1696,17 @@ impl Workspace {
             self.chime_above_threshold = chime_above;
             return;
         }
-        if chime_above && !self.chime_above_threshold {
-            if let (Some(priority), Some(card)) = (max_priority, card) {
-                if !cfg!(test) {
-                    self.chime.play();
-                }
-                crate::journal::record(crate::journal::Event::ChimeRing {
-                    top_priority: priority,
-                    card,
-                });
+        if chime_above
+            && !self.chime_above_threshold
+            && let (Some(priority), Some(card)) = (max_priority, card)
+        {
+            if !cfg!(test) {
+                self.chime.play();
             }
+            crate::journal::record(crate::journal::Event::ChimeRing {
+                top_priority: priority,
+                card,
+            });
         }
         self.chime_above_threshold = chime_above;
     }
@@ -4427,11 +4427,6 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn semantic_undo_count_for_test(&self) -> usize {
-        self.desk_semantic_undo.len()
-    }
-
-    #[cfg(test)]
     pub(crate) fn messages_following(&self, cx: &App) -> bool {
         self.messages_editor.read(cx).has_active_autoscroll_pin()
     }
@@ -4697,99 +4692,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// A completing-read picker over the context's surface list, emacs
-    /// `C-x b`.
-    pub(crate) fn open_buffer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _cx: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            workspace
-                .buffer_table()
-                .into_iter()
-                .filter(|(name, _)| name.to_lowercase().contains(&needle))
-                .map(|(name, kind)| crate::commands::Candidate {
-                    value: name,
-                    description: kind,
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                if !input.is_empty() {
-                    workspace.switch_buffer(input, window, cx);
-                }
-            },
-        );
-        self.open_prompt("buffer:", complete, on_submit, window, cx);
-    }
-
-    /// Removes a surface from the context. The viewport falls back to its
-    /// history, then to the list's most recent conversation
-    /// surface. Dropping a terminal's last view detaches its wire client
-    /// (the daemon keeps the pty; reopening the terminal reattaches).
-    pub(crate) fn close_surface(
-        &mut self,
-        name: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = match name {
-            Some(name) => match self.surface_named(name) {
-                Some(surface) => surface.key.clone(),
-                None => {
-                    self.notice_on(
-                        None,
-                        &format!("no surface matching `{name}`"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                }
-            },
-            None => self.active_pane().surface.key.clone(),
-        };
-        let Some(list) = self.surfaces.get_mut(&self.active_context) else {
-            return;
-        };
-        if list.iter().filter(|s| s.key != key).count() == 0 {
-            self.notice_on(
-                None,
-                ":close: nothing else to show",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        list.retain(|surface| surface.key != key);
-        if self.phone.enabled {
-            self.phone.remove(self.active_context, &key);
-        }
-        let fallback = list
-            .iter()
-            .rev()
-            .find(|surface| surface.key.is_conversation())
-            .or_else(|| list.last())
-            .cloned()
-            .expect("list retains at least one surface");
-
-        let pane = self.active_pane_mut();
-        pane.purge_history(|surface| surface.key == key);
-        if pane.surface.key == key && !pane.back() {
-            pane.surface = fallback;
-        }
-        self.sync_selection_to_focus(cx);
-        self.focus_active_surface(window, cx);
-        if let SurfaceKey::Transcript(agent_id) = key
-            && !self.active.contains(agent_id)
-        {
-            self.release_agent(agent_id, cx);
-        }
-        cx.notify();
-    }
-
     fn journal_surface(key: &SurfaceKey) -> crate::journal::SurfaceIdentity {
         use crate::journal::SurfaceIdentity;
         match key {
@@ -4933,6 +4835,35 @@ impl Workspace {
     /// surface joins the context's surface list first, so it stays alive
     /// while hidden. The context's single viewport shows it, and is founded
     /// on the context's first visit.
+    /// A completing-read picker over the context's surface list, emacs
+    /// `C-x b`.
+    pub(crate) fn open_buffer_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _cx: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .buffer_table()
+                .into_iter()
+                .filter(|(name, _)| name.to_lowercase().contains(&needle))
+                .map(|(name, kind)| crate::commands::Candidate {
+                    value: name,
+                    description: kind,
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if !input.is_empty() {
+                    workspace.switch_buffer(input, window, cx);
+                }
+            },
+        );
+        self.open_prompt("buffer:", complete, on_submit, window, cx);
+    }
+
     pub(crate) fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         let method = if self.overview_open {
             crate::journal::SurfaceShowMethod::Overview
@@ -5391,21 +5322,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn agent_model(&self, agent_id: &AgentId) -> Option<Entity<AgentModel>> {
-        self.models.get(agent_id).cloned()
-    }
-
-    #[cfg(test)]
     pub(crate) fn dashboard_editor(&self) -> Entity<editor::Editor> {
         self.dashboard.editor().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tree_cursor_for_test(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_desk::cells::Id, usize)> {
-        self.dashboard.tree_node_cursor_offset(cx)
     }
 
     #[cfg(test)]
@@ -5425,7 +5343,7 @@ impl Workspace {
     ) -> Vec<(rho_desk::cells::Id, Option<rho_desk::cells::Id>, String)> {
         self.desk_cells
             .nodes(host)
-            .into_iter()
+            .iter()
             .filter_map(|node| {
                 let text = self.desk_cells.buffer(host, &node.id)?.read(cx).text();
                 Some((node.id.clone(), node.parent.clone(), text))
@@ -5457,16 +5375,6 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn pending_agent_filing_for_test(&self) -> Option<(HostId, rho_desk::cells::Id)> {
         self.pending_agent_filing.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_dashboard(window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_preview_agent(&self) -> Option<AgentId> {
-        self.dashboard_preview
     }
 
     #[cfg(test)]
@@ -5591,45 +5499,6 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn history_contains_agent_for_test(&self, agent_id: AgentId) -> bool {
-        self.surface_history
-            .iter()
-            .any(|warm| warm.surface.key == SurfaceKey::Transcript(agent_id))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn agent_surface_visible_for_test(&self, agent_id: AgentId) -> bool {
-        !self.overview_open && self.active_pane().surface.key == SurfaceKey::Transcript(agent_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reopen_agent_for_test(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_agent_inner(Some(agent_id), true, window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn active_editor_in_deal_mode_for_test(&self, cx: &App) -> bool {
-        vim::editor_in_deal_mode(&self.active_editor(cx), cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn append_newer_history_for_test(&mut self, name: &str, cx: &mut Context<Self>) {
-        let surface = Self::wrap_surface(
-            SurfaceKey::ZulipNarrow {
-                label: name.to_owned(),
-            },
-            SurfaceView::DeskNode(self.active_editor(cx)),
-        );
-        self.append_history(surface, crate::journal::HistoryAppendMethod::Overview, cx);
-        self.history_cursor = self.history_cursor.saturating_sub(1);
-    }
-
-    #[cfg(test)]
     pub(crate) fn show_current_history_for_test(
         &mut self,
         method: crate::journal::SurfaceShowMethod,
@@ -5643,33 +5512,6 @@ impl Workspace {
     pub(crate) fn open_history_index_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
         let surface = self.surface_history[index].surface.clone();
         self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Open, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn deal_skip_exists_for_test(
-        &self,
-        identity: &crate::dashboard::DealCardId,
-    ) -> bool {
-        self.dashboard.has_skip_for_test(identity)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_evicted_transcript_history_for_test(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let transcript = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
-        self.display_surface_with_method(
-            transcript,
-            crate::journal::SurfaceShowMethod::Overview,
-            cx,
-        );
-        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
-        self.display_surface_with_method(draft, crate::journal::SurfaceShowMethod::Overview, cx);
-        self.active.remove(agent_id);
-        self.release_agent(agent_id, cx);
     }
 
     #[cfg(test)]
@@ -5687,33 +5529,6 @@ impl Workspace {
         card: crate::dashboard::DealCardId,
     ) -> crate::dashboard::CardTarget {
         self.dashboard.card_target(card)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seek_deal_card_for_test(
-        &mut self,
-        wanted: fn(crate::dashboard::DealCardKind) -> bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        for _ in 0..8 {
-            if self
-                .open_card_in_view(cx)
-                .is_some_and(|card| wanted(card.kind))
-            {
-                return true;
-            }
-            self.pull_card(window, cx);
-        }
-        false
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_deal_card_value_for_test(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<crate::dashboard::DealCard> {
-        self.open_card_in_view(cx)
     }
 
     /// The state a cold start used to leave behind before Home took the
@@ -5734,34 +5549,6 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn verdict_undo_count_for_test(&self) -> usize {
         self.verdict_undo.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn focus_dealt_surface_for_test(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let card = self.open_card_in_view(cx);
-        if let Some(card) = &card
-            && matches!(card.kind, crate::dashboard::DealCardKind::Agent)
-            && let Some(agent_id) = card.agent_id
-        {
-            self.select_agent_inner(Some(agent_id), true, window, cx);
-            return;
-        }
-        let focus = match &self.active_pane().surface.view {
-            SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
-            SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
-            SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
-            _ => self.dashboard.editor().read(cx).focus_handle(cx),
-        };
-        window.focus(&focus, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_deal_highlight_for_test(&self, cx: &App) -> bool {
-        self.dashboard.deal_highlight_active_for_test(cx)
     }
 
     /// Reconciles the dashboard against the current world. Event-driven,
@@ -6098,10 +5885,11 @@ impl Workspace {
         {
             self.note_views.remove(&(host, node_id.clone()));
         }
-        if !self.note_views.contains_key(&(host, node_id.clone())) {
-            let view = crate::note_view::NoteView::new(host, node_id.clone(), body, window, cx);
-            self.note_views.insert((host, node_id.clone()), view);
-        }
+        self.note_views
+            .entry((host, node_id.clone()))
+            .or_insert_with(|| {
+                crate::note_view::NoteView::new(host, node_id.clone(), body, window, cx)
+            });
         self.sync_note_views(host, cx);
         self.note_views.get(&(host, node_id))
     }
@@ -6540,6 +6328,9 @@ impl Workspace {
             })
     }
 
+    /// Whether nothing has been opened yet. Only the tests ask; the
+    /// startup pane is a state the shell moves out of on its own.
+    #[cfg(test)]
     pub(crate) fn is_startup_pane(&self) -> bool {
         matches!(self.registry.active_pane(), ActivePane::Startup)
     }
@@ -7019,11 +6810,6 @@ impl Workspace {
             .values()
             .next_back()
             .map(|pending| pending.echo.as_str())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transient_title_for_test(&self) -> Option<&'static str> {
-        self.transient.as_ref().map(|transient| transient.title())
     }
 
     fn has_modal_overlay(&self) -> bool {
@@ -7693,7 +7479,7 @@ impl Workspace {
             StyleClass::SystemInfo,
             cx,
         );
-        self.open_card(card, window, cx);
+        self.open_card(*card, window, cx);
         self.refresh_dashboard(window, cx);
     }
 
@@ -7888,7 +7674,7 @@ impl Workspace {
         let node_id = target_node
             .clone()
             .unwrap_or_else(|| card.identity.node_id.clone());
-        let phone_verdict = self.phone.enabled.then(|| match dealt {
+        let phone_verdict = self.phone.enabled.then_some(match dealt {
             crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
             crate::desk_view::DeskVerdict::Mute => crate::journal::PhoneVerdict::Mute,
             crate::desk_view::DeskVerdict::Defer { .. } => crate::journal::PhoneVerdict::Defer,
@@ -7939,7 +7725,7 @@ impl Workspace {
         let undo = self.next_verdict_undo(
             verb,
             VerdictUndoState::DeskVerdict {
-                card: card.clone(),
+                card: Box::new(card.clone()),
                 verdict,
                 host: card.host,
                 node: node_id,
@@ -8336,9 +8122,12 @@ impl Workspace {
     /// Vim-style `o`/`O` on a heading line: insert a sibling node below or
     /// above. Anywhere else the action propagates so vim's own open-line
     /// binding runs.
+    /// `above` makes no difference: sibling order is `(CreatedAt, NodeId)`
+    /// and `CreatedAt` cannot be rewritten, so a new row lands after its
+    /// siblings either way. The semantic `O` says so in the echo area.
     fn dashboard_insert_heading(
         &mut self,
-        above: bool,
+        _above: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8348,11 +8137,10 @@ impl Workspace {
                   _window: &mut Window,
                   cx: &mut Context<Workspace>| {
                 let title = input.trim();
-                if !title.is_empty() {
-                    if let Some((host, relative)) = workspace.dashboard.tree_node_at_cursor(cx) {
-                        workspace
-                            .append_tree_heading(host, relative, false, above, title, _window, cx);
-                    }
+                if !title.is_empty()
+                    && let Some((host, relative)) = workspace.dashboard.tree_node_at_cursor(cx)
+                {
+                    workspace.append_tree_heading(host, relative, false, title, _window, cx);
                 }
             },
         );
@@ -8549,7 +8337,6 @@ impl Workspace {
         host: HostId,
         relative: rho_desk::cells::Id,
         child: bool,
-        _above: bool,
         title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -9503,52 +9290,30 @@ pub(crate) fn resolve_filing_destination(
         .map(|(_, _, host, node_id)| (*host, node_id.clone()))
 }
 
+/// How a role reads in the chips a transcript shows. Only the tests ask
+/// for it as a string; the chips themselves are styled from the family.
 #[cfg(test)]
-struct RoleLabel {
-    text: String,
-    family: RoleFamily,
-}
-
-#[cfg(test)]
-fn agent_role_label(config: AgentRole) -> RoleLabel {
+fn agent_role_label(config: AgentRole) -> String {
     match config {
-        AgentRole::Advisor { intelligence } => RoleLabel {
-            text: match intelligence {
-                AdvisorIntelligence::Medium => "advisor",
-                AdvisorIntelligence::High => "advisor-high",
-                AdvisorIntelligence::Cheap => "advisor-cheap",
-            }
-            .to_owned(),
-            family: if intelligence == AdvisorIntelligence::High {
-                RoleFamily::Fable
-            } else {
-                RoleFamily::Deep
-            },
+        AgentRole::Advisor { intelligence } => match intelligence {
+            AdvisorIntelligence::Medium => "advisor",
+            AdvisorIntelligence::High => "advisor-high",
+            AdvisorIntelligence::Cheap => "advisor-cheap",
         },
         AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
-            RoleLabel {
-                text: match intelligence {
-                    EngineerIntelligence::Mini => "eng-mini",
-                    EngineerIntelligence::Low => "eng-low",
-                    EngineerIntelligence::Cheap => "eng-cheap",
-                    EngineerIntelligence::Medium => "eng",
-                    EngineerIntelligence::High => "eng-high",
-                    EngineerIntelligence::Ultra => "eng-ultra",
-                    EngineerIntelligence::Alt => "eng-alt",
-                    EngineerIntelligence::Gemini => "eng-gemini",
-                }
-                .to_owned(),
-                family: if matches!(
-                    intelligence,
-                    EngineerIntelligence::Ultra | EngineerIntelligence::Alt
-                ) {
-                    RoleFamily::Fable
-                } else {
-                    RoleFamily::Deep
-                },
+            match intelligence {
+                EngineerIntelligence::Mini => "eng-mini",
+                EngineerIntelligence::Low => "eng-low",
+                EngineerIntelligence::Cheap => "eng-cheap",
+                EngineerIntelligence::Medium => "eng",
+                EngineerIntelligence::High => "eng-high",
+                EngineerIntelligence::Ultra => "eng-ultra",
+                EngineerIntelligence::Alt => "eng-alt",
+                EngineerIntelligence::Gemini => "eng-gemini",
             }
         }
     }
+    .to_owned()
 }
 
 impl Render for Workspace {
@@ -10236,8 +10001,7 @@ mod tests {
 
     #[test]
     fn labels_agent_role() {
-        let label = agent_role_label(AgentRole::default());
-        assert_eq!(label.text, "eng");
+        assert_eq!(agent_role_label(AgentRole::default()), "eng");
     }
 
     #[test]

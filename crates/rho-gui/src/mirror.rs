@@ -143,7 +143,7 @@ pub struct Mirror {
 impl Mirror {
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(state_dir)?;
-        let db = RhoDb::open(&path(state_dir));
+        let db = RhoDb::open(path(state_dir));
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;

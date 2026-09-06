@@ -754,6 +754,9 @@ fn acquire_lock(state_dir: &Path) -> std::io::Result<File> {
         .create(true)
         .read(true)
         .write(true)
+        // The lock is the file's only purpose; nothing is ever written to
+        // it, so there is nothing to truncate.
+        .truncate(false)
         .open(&path)?;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();

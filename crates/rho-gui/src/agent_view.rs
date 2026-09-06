@@ -447,13 +447,6 @@ impl AgentModel {
             .collect()
     }
 
-    /// The composed multibuffer text; lets tests observe what the model
-    /// would display without requiring an attached editor.
-    #[cfg(test)]
-    pub(crate) fn buffer_text(&self, cx: &Context<Self>) -> String {
-        self.multi_buffer.read(cx).snapshot(cx).text()
-    }
-
     fn apply_status_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some(anchor) = self
             .multi_buffer

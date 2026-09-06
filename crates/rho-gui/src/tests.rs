@@ -751,35 +751,6 @@ fn bind_test_keymaps(cx: &mut App) {
     crate::bind_rho_key_overrides(cx);
 }
 
-/// `s` is the snooze operator: on its own it waits, and the unit after it
-/// picks the span. Shared by the deal-routing tests.
-fn assert_snooze_operator(keymap: &gpui::Keymap, contexts: &[gpui::KeyContext]) {
-    use gpui::Keystroke;
-
-    let (bindings, pending) =
-        keymap.bindings_for_input(&[Keystroke::parse("s").unwrap()], contexts);
-    assert!(pending, "`s` should wait for its unit: {bindings:?}");
-    assert!(bindings.is_empty(), "`s` alone should snooze nothing");
-    for (unit, action) in [
-        ("m", "rho_gui::DashboardDealSnoozeMinutes"),
-        ("h", "rho_gui::DashboardDealSnoozeHours"),
-        ("d", "rho_gui::DashboardDealSnooze"),
-        ("s", "rho_gui::DashboardDealSnooze"),
-        ("w", "rho_gui::DashboardDealSnoozeWeeks"),
-    ] {
-        let strokes = [
-            Keystroke::parse("s").unwrap(),
-            Keystroke::parse(unit).unwrap(),
-        ];
-        let (bindings, _) = keymap.bindings_for_input(&strokes, contexts);
-        assert_eq!(
-            bindings.first().map(|binding| binding.action().name()),
-            Some(action),
-            "`s{unit}` did not route to {action}",
-        );
-    }
-}
-
 /// `45sm` is 45 minutes and `2sd` two days: the unit picks the span, the
 /// count multiplies it, and the words the bar says name the time it lands on.
 #[test]
@@ -873,7 +844,7 @@ fn undo_verdict_binding_is_confined_to_normal_mode(cx: &mut TestAppContext) {
         let stroke = Keystroke::parse("shift-u").unwrap();
         let resolves = |contexts: &[KeyContext]| {
             keymap
-                .bindings_for_input(&[stroke.clone()], contexts)
+                .bindings_for_input(std::slice::from_ref(&stroke), contexts)
                 .0
                 .first()
                 .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict))
@@ -1008,7 +979,7 @@ fn undo_verdict_reaches_the_desk_tree_outside_a_deal(cx: &mut TestAppContext) {
         let stroke = Keystroke::parse("shift-u").unwrap();
         let resolves = |contexts: &[KeyContext]| {
             keymap
-                .bindings_for_input(&[stroke.clone()], contexts)
+                .bindings_for_input(std::slice::from_ref(&stroke), contexts)
                 .0
                 .first()
                 .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict))
@@ -4051,8 +4022,8 @@ fn filing_completion_keeps_duplicate_heading_identity() {
         0,
         "filing completion replaces the whole partial title"
     );
-    let first = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([(1) as u8; 16]));
-    let second = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([(2) as u8; 16]));
+    let first = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([1_u8; 16]));
+    let second = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([2_u8; 16]));
     let destinations = vec![
         (
             "Project Alpha".into(),
@@ -6232,18 +6203,6 @@ fn a_slack_card_is_read_with_the_conversations_own_keys(cx: &mut TestAppContext)
                 .first()
                 .map(|binding| binding.action().name())
         };
-        // A whole sequence, for the keys that take a second stroke.
-        let routes_all = |keys: &str, contexts: &[KeyContext]| {
-            let strokes: Vec<Keystroke> = keys
-                .split(' ')
-                .map(|key| Keystroke::parse(key).unwrap())
-                .collect();
-            keymap
-                .bindings_for_input(&strokes, contexts)
-                .0
-                .first()
-                .map(|binding| binding.action().name())
-        };
         // A Slack card is read with the conversation's own keys: deal mode
         // used to take `d`, `s` and `i` from it, and the verdicts are in the
         // transient now.
@@ -6820,7 +6779,6 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
 }
 
 struct DeskFixture {
-    device: rho_desk::cells::DeviceId,
     store: rho_desk::cells::Store,
     bodies: Vec<rho_desk::cells::BodySnapshot>,
     next_node: u64,
@@ -6837,7 +6795,6 @@ impl DeskFixture {
     fn new() -> Self {
         let device = rho_desk::cells::DeviceId([9; 16]);
         Self {
-            device,
             store: rho_desk::cells::Store::new(device),
             bodies: Vec::new(),
             next_node: 0,
@@ -7009,7 +6966,7 @@ fn take_desk_mutation(
 #[gpui::test]
 fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
     cx.update(init_test_app);
-    let home = cx.add_window(|window, cx| crate::home::HomeView::new(window, cx));
+    let home = cx.add_window(crate::home::HomeView::new);
 
     // Empty first: the glance still answers, in the deal bar's own words.
     let text = home

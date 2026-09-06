@@ -367,6 +367,16 @@ fn covers(frontier: &Version, poke: &Version) -> bool {
         .all(|(device, version)| frontier.get(device).copied().unwrap_or(0) >= *version)
 }
 
+/// The rows of one host's tree in the order they are drawn, the buffer
+/// behind each row that has one, and the title of each. Three parts of
+/// one answer: a screen needs all three to draw a row, and they are only
+/// consistent together.
+pub type TreeSource = (
+    Vec<DeskNode>,
+    BTreeMap<Id, Entity<Buffer>>,
+    Rc<HashMap<Id, String>>,
+);
+
 /// The store, as the GUI reads and writes it. One interface: today it
 /// talks to a daemon, and the wire carries cells rather than commands, so
 /// a local store is the same shape.
@@ -1007,15 +1017,8 @@ impl DeskCells {
         }
     }
 
-    pub fn tree_source(
-        &mut self,
-        host: HostId,
-        cx: &gpui::App,
-    ) -> Option<(
-        Vec<DeskNode>,
-        BTreeMap<Id, Entity<Buffer>>,
-        Rc<HashMap<Id, String>>,
-    )> {
+    /// What a screen is handed to draw one host's tree.
+    pub fn tree_source(&mut self, host: HostId, cx: &gpui::App) -> Option<TreeSource> {
         self.refresh_titles(host, cx);
         let nodes = self.nodes(host);
         let desk = self.hosts.get(&host)?;
@@ -1480,8 +1483,7 @@ impl DeskCells {
             let previous = nodes
                 .iter()
                 .filter(|other| other.parent == node.parent && &other.id != id)
-                .filter(|other| (other.created_at, &other.id) < (node.created_at, &node.id))
-                .next_back()?;
+                .rfind(|other| (other.created_at, &other.id) < (node.created_at, &node.id))?;
             Some(previous.id.clone())
         } else {
             let parent = nodes
@@ -1557,7 +1559,7 @@ impl DeskCells {
         {
             return Some(workdir);
         }
-        self.nodes(host).into_iter().find_map(|node| {
+        self.nodes(host).iter().find_map(|node| {
             (node.parent.as_ref() == Some(id))
                 .then(|| node.path().map(ToOwned::to_owned))
                 .flatten()
@@ -2113,7 +2115,11 @@ mod tests {
             (label.clone(), node(label.clone(), None, &[])),
             (
                 thing.clone(),
-                node(thing.clone(), Some(area.clone()), &[label.clone()]),
+                node(
+                    thing.clone(),
+                    Some(area.clone()),
+                    std::slice::from_ref(&label),
+                ),
             ),
             (child.clone(), node(child.clone(), Some(thing.clone()), &[])),
         ]);
@@ -2146,7 +2152,10 @@ mod tests {
         let tab = Id::Page(rho_desk::PageId([3; 16]));
         let nodes = BTreeMap::from([
             (label.clone(), node(label.clone(), None, &[])),
-            (origin.clone(), node(origin.clone(), None, &[label.clone()])),
+            (
+                origin.clone(),
+                node(origin.clone(), None, std::slice::from_ref(&label)),
+            ),
             (tab.clone(), node(tab.clone(), Some(origin.clone()), &[])),
         ]);
 
@@ -2177,7 +2186,10 @@ mod tests {
         let thing = Id::Note(Uuid([1; 16]));
         let label = Id::Label(Uuid([2; 16]));
         let nodes = BTreeMap::from([
-            (thing.clone(), node(thing.clone(), None, &[label.clone()])),
+            (
+                thing.clone(),
+                node(thing.clone(), None, std::slice::from_ref(&label)),
+            ),
             (label.clone(), node(label.clone(), Some(thing.clone()), &[])),
         ]);
 

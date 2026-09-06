@@ -83,7 +83,9 @@ enum PhoneRoot {
 }
 
 enum PhoneTransition {
-    Flick(crate::dashboard::DealCard),
+    /// Boxed: a card is far larger than a sequence number, and the stack
+    /// holds mostly the latter.
+    Flick(Box<crate::dashboard::DealCard>),
     Verdict(u64),
 }
 
@@ -218,11 +220,6 @@ impl PhoneUi {
         self.stack
             .retain(|entry| entry.0 != context || entry.1 != key);
         self.stack.push((context, key));
-    }
-
-    pub(super) fn remove(&mut self, context: ContextId, key: &SurfaceKey) {
-        self.stack
-            .retain(|entry| entry.0 != context || &entry.1 != key);
     }
 
     pub(super) fn remove_key(&mut self, key: &SurfaceKey) {
@@ -807,7 +804,7 @@ impl Workspace {
                     // Flicking back is taking the skip back: the card is the
                     // one to look at again, so it opens as it was.
                     self.dashboard.clear_skip(&card.identity);
-                    self.open_card(card, window, cx);
+                    self.open_card(*card, window, cx);
                     self.refresh_dashboard(window, cx);
                 }
                 Some(PhoneTransition::Verdict(sequence))
@@ -825,7 +822,9 @@ impl Workspace {
             && moved_card
             && let Some(card) = before
         {
-            self.phone.transitions.push(PhoneTransition::Flick(card));
+            self.phone
+                .transitions
+                .push(PhoneTransition::Flick(Box::new(card)));
         }
         self.record_phone_flick(direction, moved_card, cx);
     }
