@@ -319,6 +319,33 @@ work on it.
   for the old process to exit, kills it if it will not, and checks the new one
   is alive rather than trusting the socket.
 
+- **The handbook** (`QA-HANDBOOK.md`). Every case in the bullet above, written
+  so an agent runs it without asking what was meant: why it is tricky, the
+  exact keys and commands, what passes, what fails, and a "Closed by" line that
+  is empty until a run fills it in. Three sections beyond the cases. The rig's
+  own preconditions, because a rig that lies to you invalidates everything that
+  ran after it — the daemon alive and not just its socket, the GUI holding a
+  Slack session, and the mirror being the user's rather than QA's. The
+  Emacs-feel checks, run over whatever case is already running: the point
+  survives back, the same key means the same thing in every buffer, nothing
+  needs the mouse, no modal appears, a transient takes one key and closes. And
+  the scale proofs: which snapshot (`user-2026-09-06`, 42.8 GiB, 2,583,116 rows
+  across 55 tables), which numbers (`draw_ms` and `dirty_to_draw_ms` p99 from
+  the frame log, `duration_ms` against `input_rows` per stage from the editor
+  log — that pair is the per-event O(touched) evidence), and what fails: 8 ms
+  p99 draw, 50 ms p99 dirty-to-draw, any stage whose time grows with the
+  snapshot while its `input_rows` does not, any main-thread sample in ingest,
+  dealing or the store.
+  Two limits are recorded in the handbook rather than left to be rediscovered:
+  the snapshot is daemon-side only, because the user's GUI runs on their own
+  device, so no Slack case runs at flood scale yet; and `rig up` still starts
+  the GUI when the fake did not register as the workspace, which looks exactly
+  like a dealing bug. Both have a case with an open "Closed by".
+  Also learned while writing it: the CPU profile is symbolized where it is
+  written — the frames in `.0.bin.gz` carry Rust names, not addresses — so the
+  worst-frame-gap summary line on `rig down` needs the trace decoder only, not
+  the binary the profile came from.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists
