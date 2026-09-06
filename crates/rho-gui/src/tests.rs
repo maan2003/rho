@@ -1738,11 +1738,10 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
     );
 }
 
-/// The ranking is kept, not made again. A `Changed` for one agent makes
-/// that agent's card and nothing else: the desk it is filed on, the notes
-/// beside it and the other agents under the same note all stand. Before
-/// this the read rebuilt every card from a walk of every node, so the cost
-/// of one agent moving was the size of the desk.
+/// A verdict costs the cells it writes. Marking one note done moves that
+/// note's row and no other: the map is not composed, because the rows and
+/// their order did not move, and only the row the verdict named is drawn
+/// again. Before this every desk event rebuilt the whole composition.
 #[gpui::test]
 async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
@@ -1810,6 +1809,11 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
         .expect("read the map");
 }
 
+/// The ranking is kept, not made again. A `Changed` for one agent makes
+/// that agent's card and nothing else: the desk it is filed on, the notes
+/// beside it and the other agents under the same note all stand. Before
+/// this the read rebuilt every card from a walk of every node, so the cost
+/// of one agent moving was the size of the desk.
 #[gpui::test]
 fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();

@@ -1723,6 +1723,23 @@ impl Dashboard {
         true
     }
 
+    /// A row and everything drawn under it. A note's words are the head of
+    /// every breadcrumb below it, so an edit to them moves the cards of its
+    /// subtree and of nothing outside it.
+    pub fn subtree_ids(&self, host: HostId, id: &rho_desk::cells::Id) -> Vec<rho_desk::cells::Id> {
+        let Some(source) = self.tree_hosts.get(&host) else {
+            return Vec::new();
+        };
+        let mut ids = vec![id.clone()];
+        let mut cursor = 0;
+        while cursor < ids.len() {
+            let at = ids[cursor].clone();
+            cursor += 1;
+            ids.extend(source.children(&at).map(|node| node.id.clone()));
+        }
+        ids
+    }
+
     /// The cards of one row, made again. What it costs is the row and the
     /// agents it heads: a note that was deferred or closed stops lending
     /// its subtree a place in the hand, and that is the whole of what one

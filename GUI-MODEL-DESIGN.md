@@ -419,6 +419,30 @@ buffer's text to build titles, on every desk sync. That is slice 4. Slice
    transcript rows rather than a fifth path bolted on here.
 6. **Transcript rows append.** `refold_open_transcripts` hands deltas.
    Proof: a page for the open agent costs its rows.
+
+   *Landed.* `TranscriptFold` remembers the lowest index of the composed
+   transcript that has moved since a delta was last taken, and hands that
+   index with the blocks from there on. Everything before it is the same
+   pointer it already was, so the reader replaces a suffix. The store
+   applies the suffix in place and composes from the same index, and the
+   summary it answers with is that index rather than the result of
+   comparing two block lists. A transcript is handed whole exactly once,
+   when the reader opens an agent and there was nothing to append to.
+   Before this, one row of an open agent's mirror cost the whole
+   transcript three times over: the fold cloned every block into a state,
+   the store cloned it again to compose, and the summary walked the shared
+   prefix to find out that only the end had moved.
+   `DeskTextApplied` follows the map's delta path now. A body edit from
+   another device moves that note's words and the breadcrumbs made of
+   them, which is its subtree and nothing outside it; where the rows sit
+   does not move, so nothing is composed.
+   Proof: `a_page_for_the_open_agent_costs_its_rows` folds sixty-four
+   messages, takes the whole transcript once, appends one row, and asserts
+   the delta starts where the transcript already ended, carries one block,
+   and that the store renders from there rather than from the top.
+   Fixed in passing: slice 5's test was inserted above
+   `one_agents_change_makes_one_card` and took its doc comment with it.
+   Both tests have their own again.
 7. **The window split.** Replaced by `GUI-CRATES-DESIGN.md` (6 Sep): the
    GUI becomes vertical crates by source, and the window keeps only
    window state.

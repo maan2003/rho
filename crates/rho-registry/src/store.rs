@@ -75,6 +75,32 @@ struct Layered {
 }
 
 impl Layered {
+    /// Composes from one index on, leaving the blocks before it as the
+    /// pointers they already were.
+    fn compose_from(&mut self, from: usize) {
+        let from = from
+            .min(self.state.blocks.len())
+            .min(self.fold.blocks.len());
+        self.state.blocks.truncate(from);
+        self.state
+            .blocks
+            .extend(self.fold.blocks[from..].iter().cloned());
+        self.state.blocks.extend(
+            self.tail
+                .items
+                .iter()
+                .flatten()
+                .map(|item| Arc::new(block(item))),
+        );
+        self.state.status = match self.tail.phase {
+            Phase::Requesting => UiAgentStatus::Streaming,
+            Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
+            Phase::Idle | Phase::Unknown => self.fold.status,
+        };
+        self.state.context_used = self.fold.context_used;
+        self.state.usage = self.fold.usage.clone();
+    }
+
     fn compose(&mut self) {
         let mut state = self.fold.clone();
         state.blocks.extend(
@@ -188,6 +214,43 @@ impl AgentStore {
     /// stays on top of it.
     pub fn set_fold(&mut self, agent_id: AgentId, fold: UiAgentState) -> FrameSummary {
         self.change(agent_id, |layered| layered.fold = fold)
+    }
+
+    /// One telling of the mirror, as the suffix it moved. The reader is
+    /// told where the transcript first differs rather than handed a state
+    /// to compare, so a row appended to a long transcript costs the rows
+    /// it appended and not the ones above them.
+    pub fn apply_fold_delta(
+        &mut self,
+        agent_id: AgentId,
+        delta: crate::fold::FoldDelta,
+    ) -> FrameSummary {
+        let layered = self.states.entry(agent_id).or_insert_with(|| Layered {
+            fold: empty_state(),
+            tail: Tail::default(),
+            state: empty_state(),
+        });
+        let from = delta.from.min(layered.fold.blocks.len());
+        let open_before = turn_open(layered.state.status);
+        layered.fold.blocks.truncate(from);
+        layered.fold.blocks.extend(delta.blocks);
+        layered.fold.status = delta.status;
+        layered.fold.context_used = delta.context_used;
+        layered.fold.usage = delta.usage;
+        layered.compose_from(from);
+        let mut summary = FrameSummary {
+            first_changed_block: Some(from),
+            incremental: None,
+        };
+        // Elision gives the last fold in an open turn a limited visible
+        // tail, so ending or reopening a turn re-renders its last block.
+        if open_before != turn_open(layered.state.status) && !layered.state.blocks.is_empty() {
+            summary = summary.merge(FrameSummary {
+                first_changed_block: Some(layered.state.blocks.len() - 1),
+                incremental: None,
+            });
+        }
+        summary
     }
 
     /// One change to what the runtime has past the mirror.

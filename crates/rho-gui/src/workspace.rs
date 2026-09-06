@@ -728,8 +728,11 @@ impl Workspace {
         if events.is_empty() {
             return false;
         }
-        let fold = rho_registry::TranscriptFold::new(&events);
+        let mut fold = rho_registry::TranscriptFold::new(&events);
+        // The one time a transcript is handed whole: nothing was here to
+        // append to. Every telling after this hands the rows it moved.
         self.store.set_fold(agent_id, fold.state());
+        fold.delta();
         self.open_mirrors.insert(agent_id, fold);
         self.note_followed();
         true
@@ -758,8 +761,15 @@ impl Workspace {
         if !refolded {
             return;
         }
-        let state = self.open_mirrors[&agent_id].state();
-        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
+        // The rows the telling moved, not the transcript they are in.
+        let Some(delta) = self
+            .open_mirrors
+            .get_mut(&agent_id)
+            .and_then(|fold| fold.delta())
+        else {
+            return;
+        };
+        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Folded(delta))], window, cx);
     }
 
     fn apply_frame_state(
@@ -778,6 +788,7 @@ impl Workspace {
                 self.registry.mark_live(agent_id),
             ),
             TranscriptFrame::Fold(state) => (self.store.set_fold(agent_id, state), false),
+            TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
         };
         let usage_changed = old_usage.as_ref() != self.store.get(&agent_id).map(|s| &s.usage);
         Some((summary, old_context, usage_changed, live_changed))
@@ -860,7 +871,11 @@ impl Workspace {
 /// tail, or the fold of its mirror made again.
 pub(crate) enum TranscriptFrame {
     Live(rho_ui_proto::mirror::Live),
+    /// The mirror's fold, whole. What an agent's first read hands, and
+    /// nothing else: a transcript is handed once and appended to after.
     Fold(rho_registry::render::UiAgentState),
+    /// The rows one telling of the mirror moved.
+    Folded(rho_registry::fold::FoldDelta),
 }
 
 /// Who a command speaks about: the rail row under the cursor, or the open
@@ -2020,8 +2035,22 @@ impl Workspace {
                 self.notice_on(None, &format!("desk: {reason}"), StyleClass::SystemInfo, cx);
             }
             ConnEvent::DeskTextApplied { id, operation } => {
-                self.desk_cells.text_applied(host, id, operation, cx);
-                self.sync_tree_dashboard(host, window, cx);
+                // A body edit from another device moves that note's words
+                // and the breadcrumbs made of them, which is its subtree
+                // and nothing else. Where the rows sit does not move, so
+                // nothing is composed.
+                self.desk_cells
+                    .text_applied(host, id.clone(), operation, cx);
+                let touched = self
+                    .dashboard
+                    .subtree_ids(host, &id)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let delta = crate::desk_view::DeskDelta {
+                    touched,
+                    shape: false,
+                };
+                self.sync_tree_delta(host, &delta, window, cx);
             }
             ConnEvent::Ready {
                 auth,

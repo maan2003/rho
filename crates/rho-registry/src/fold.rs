@@ -360,6 +360,23 @@ pub struct TranscriptFold {
     /// What the last reply said the context holds, and where it said it.
     context_used: Option<(AgentPos, u64)>,
     digest: Digest,
+    /// The lowest index of the folded transcript whose block has moved
+    /// since a delta was last taken, or `None` when none has. Handing the
+    /// whole state made every appended row cost the whole transcript;
+    /// this is what a row costs instead.
+    dirty_from: Option<usize>,
+}
+
+/// What one telling changed: where the transcript first differs, and the
+/// blocks from there on. Everything before `from` is the same pointer it
+/// already was, so a reader replaces a suffix rather than a state.
+#[derive(Clone, Debug)]
+pub struct FoldDelta {
+    pub from: usize,
+    pub blocks: Vec<Arc<UiBlock>>,
+    pub status: UiAgentStatus,
+    pub context_used: Option<u64>,
+    pub usage: UiAgentUsage,
 }
 
 impl TranscriptFold {
@@ -377,8 +394,44 @@ impl TranscriptFold {
     }
 
     fn push(&mut self, pos: AgentPos, block: UiBlock) {
+        // The queue is drawn after the blocks, so a block landing moves
+        // every queued row along with it.
+        self.touch(self.blocks.len());
         self.blocks.push(Arc::new(block));
         self.told_at.push(pos);
+    }
+
+    /// Notes that the transcript differs from `at` on.
+    fn touch(&mut self, at: usize) {
+        self.dirty_from = Some(self.dirty_from.map_or(at, |held| held.min(at)));
+    }
+
+    /// The composed transcript from one index on: the folded blocks, then
+    /// the messages no request has carried yet.
+    fn composed_from(&self, from: usize) -> Vec<Arc<UiBlock>> {
+        let queued = self
+            .queue
+            .iter()
+            .map(|(_, queued)| Arc::new(queued.clone()));
+        if from < self.blocks.len() {
+            self.blocks[from..].iter().cloned().chain(queued).collect()
+        } else {
+            queued.skip(from - self.blocks.len()).collect()
+        }
+    }
+
+    /// What has moved since this was last asked. `None` when nothing has,
+    /// which is what a row the reader had already seen answers.
+    pub fn delta(&mut self) -> Option<FoldDelta> {
+        let from = self.dirty_from.take()?;
+        let state = self.state();
+        Some(FoldDelta {
+            from,
+            blocks: self.composed_from(from),
+            status: state.status,
+            context_used: state.context_used,
+            usage: state.usage,
+        })
     }
 
     /// Each result lands on the call it answers.
@@ -388,6 +441,9 @@ impl TranscriptFold {
                 .blocks
                 .iter()
                 .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == result.id));
+            if let Some(index) = called {
+                self.touch(index);
+            }
             if let Some(index) = called
                 && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
             {
@@ -418,6 +474,7 @@ impl TranscriptFold {
                 ..
             } => {
                 self.errored = false;
+                self.touch(self.blocks.len() + self.queue.len());
                 self.queue.push((
                     pos,
                     UiBlock::QueuedMessage {
@@ -427,13 +484,19 @@ impl TranscriptFold {
                     },
                 ));
             }
-            MirrorEvent::CompactionRequested { .. } => self.queue.push((
-                pos,
-                UiBlock::Notice {
-                    text: "compacting context".to_owned(),
-                },
-            )),
-            MirrorEvent::QueueCleared { .. } => self.queue.clear(),
+            MirrorEvent::CompactionRequested { .. } => {
+                self.touch(self.blocks.len() + self.queue.len());
+                self.queue.push((
+                    pos,
+                    UiBlock::Notice {
+                        text: "compacting context".to_owned(),
+                    },
+                ));
+            }
+            MirrorEvent::QueueCleared { .. } => {
+                self.touch(self.blocks.len());
+                self.queue.clear();
+            }
             MirrorEvent::Sent {
                 results,
                 compaction,
@@ -584,6 +647,7 @@ impl TranscriptFold {
             // one that hides what it undid.
             MirrorEvent::Rewound { to, .. } => {
                 let kept = self.told_at.iter().take_while(|told| *told < to).count();
+                self.touch(kept);
                 self.blocks.truncate(kept);
                 self.told_at.truncate(kept);
                 self.queue.retain(|(queued_at, _)| queued_at < to);
@@ -665,6 +729,73 @@ mod tests {
             delivery: MessageDelivery::Immediate,
             at: UnixMs(at),
         }
+    }
+
+    /// A long transcript, one page appended: the reader is told where the
+    /// transcript first differs, and that is the end of what it already
+    /// had. Handing the state whole made a row cost every row above it.
+    #[test]
+    fn a_page_for_the_open_agent_costs_its_rows() {
+        let mut fold = TranscriptFold::default();
+        let mut pos = 0u64;
+        let mut tell = |fold: &mut TranscriptFold, event: MirrorEvent| {
+            fold.tell(AgentPos(pos), &event);
+            pos += 1;
+        };
+        for nth in 0..64 {
+            tell(&mut fold, user(&format!("row {nth}"), nth as u64));
+            tell(
+                &mut fold,
+                MirrorEvent::Sent {
+                    results: Vec::new(),
+                    compaction: false,
+                    at: UnixMs(nth as u64),
+                },
+            );
+        }
+        // The one hand-off that is whole: the reader had nothing.
+        let whole = fold.state();
+        let held = whole.blocks.len();
+        assert_eq!(held, 64, "one block per delivered message");
+        fold.delta().expect("the first read hands everything");
+        assert!(fold.delta().is_none(), "nothing has moved since");
+
+        tell(&mut fold, user("one more", 100));
+        tell(
+            &mut fold,
+            MirrorEvent::Sent {
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(100),
+            },
+        );
+        let delta = fold.delta().expect("a row moved the transcript");
+        assert_eq!(
+            delta.from, held,
+            "the transcript first differs where it used to end"
+        );
+        assert_eq!(
+            delta.blocks.len(),
+            1,
+            "and what differs is the row appended"
+        );
+
+        let mut store = crate::store::AgentStore::default();
+        let agent = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).expect("an agent id");
+        // The reader opened the agent and was handed the transcript whole,
+        // once; the page arrives after that.
+        store.set_fold(agent, whole);
+        let summary = store.apply_fold_delta(agent, delta);
+        assert_eq!(
+            summary.first_changed_block,
+            Some(held),
+            "the reader renders from there, not from the top"
+        );
+        assert_eq!(
+            store.get(&agent).map(|state| state.blocks.len()),
+            Some(held + 1),
+            "and the transcript it holds is the whole of it"
+        );
     }
 
     #[test]
