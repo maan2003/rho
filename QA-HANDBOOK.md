@@ -58,6 +58,16 @@ alive. If `rig up` ever prints "daemon up" and the GUI still says
 "reconnecting", the check has regressed — read `logs/daemon.log` first, before
 believing any case that ran after it.
 
+The other half of R1 is the client. A daemon can be alive and its socket fine
+while the GUI never gets past "connecting", and the reason is only in the
+Wayland session's `application.log` (under the rig's `run/rho-wayland/<name>/`).
+That is where a store-schema mismatch shows up: redb records the Rust path of a
+table's value type, so a crate rename makes the client panic with
+`TableTypeMismatch` on a table the daemon is perfectly happy with. Found on the
+rig by eng-b8os during the map cut, which no unit test would have caught. If
+the GUI says "connecting" and the daemon is up, read that log before anything
+else.
+
 *Closed by:* 6 Sep 2026, the fix itself; `DatabaseAlreadyOpen` reproduced and
 then gone across four `rig up` cycles on `desk`.
 
@@ -298,6 +308,18 @@ session, including an old one.
    the `input_rows` beside it.
 4. Repeat on a snapshot half the size, or with half the rows in view. Both
    numbers should move with what is drawn or touched, not with what exists.
+
+*A worked example of measuring off the screen.* Not everything slow is
+measured in frames. The transcript of the desk's largest agent wraps in
+7,122 ms at 121,252 rows, and display elisions do not help it: measured
+offline against a copy of the rig's own client mirror with the crate's own
+planner — 12,348 blocks, 121,114 rendered rows, 697 elision plans covering
+118,403 rows, 97.8 per cent — the elisions sit in the block map, which is
+above the wrap map, so all 121k rows are laid out and then 98 per cent of them
+are hidden. Two habits to copy from it: measure the layer that does the work
+rather than the one that shows it, and copy the mirror before reading it,
+because opening a rig's live mirror takes a write transaction on it
+(eng-b8os, the transcript cut).
 
 *What fails it.*
 

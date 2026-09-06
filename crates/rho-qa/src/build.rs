@@ -11,7 +11,12 @@
 //! section under flakebox's `-Wl,--compress-debug-sections=zstd` and overflowed
 //! it, so `rho-gui` and the fake Slack did not link at all until the dev shell
 //! moved to wild 0.10.0. Pointing `RHO_QA_LD` at `ld.gold` was the way through
-//! that day, and is the way through the next one like it.
+//! that day, but it is not the way through this one: gold did not link the
+//! optimised binary and wild 0.10.0 did, first try. A shell that has not
+//! reloaded since main 227c1e0e still has wild 0.9.0 and will fail the same
+//! way; `direnv reload` is the real fix and removes the need for `RHO_QA_LD`
+//! altogether. Until the shell is reloaded, point it at wild 0.10.0 in the
+//! nix store (a `wild-unwrapped-wrapper-0.10.0/bin/wild` path).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -51,9 +56,10 @@ pub fn build(profile: &str, repo: &Path) -> Result<()> {
         let status = cargo.status().context("run cargo")?;
         if !status.success() {
             bail!(
-                "building {} failed.\nIf it failed in the linker, the dev shell's linker is the \
-                 suspect: point RHO_QA_LD at another one (ld.gold sits beside clang in the \
-                 wrapper's bin) and run this again.",
+                "building {} failed.\nIf it failed in the linker, the dev shell's linker is \
+                 the suspect: a shell that has not been reloaded since main 227c1e0e still \
+                 has wild 0.9.0, which cannot link an optimised binary. `direnv reload` is \
+                 the fix; until then point RHO_QA_LD at wild 0.10.0 in the nix store.",
                 args.join(" ")
             );
         }
