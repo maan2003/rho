@@ -85,6 +85,8 @@ cancels (`Turn Ended(..)`), turn running, `context_used` (last
 
 ## Client
 
+Superseded in shape by `GUI-MODEL-DESIGN.md` (6 Sep): no registry, no per-event rebuilds, the model off the main thread. What landed here is recorded in the step notes below.
+
 - `UiAgentState`, `UiBlock`, `UiAgentStatus`, tool metadata types move
   from `rho-ui-proto::remote` to `rho-registry` as the render model,
   built from rows and `Item`s. `UiAgentUsage` goes (cost is the digest).

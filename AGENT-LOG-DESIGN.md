@@ -204,6 +204,8 @@ fails to connect rather than to decode.
 
 ### The client mirrors the story and decides attention
 
+Shape superseded by `GUI-MODEL-DESIGN.md` (6 Sep): the fold and the mirror move to a model thread, the registry becomes a map plus per-change indexes. The facts below still hold.
+
 The GUI keeps every agent's story log in its own redb, the way it keeps
 the Slack mirror: tables `agent_story (agent, pos) → StoryEvent`,
 `agent_head`, and a per-agent attention cache. Attention is derived, on
