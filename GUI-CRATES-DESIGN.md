@@ -810,7 +810,8 @@ work on it.
   dealing or the store.
   Two limits are recorded in the handbook rather than left to be rediscovered:
   the snapshot is daemon-side only, because the user's GUI runs on their own
-  device, so no Slack case runs at flood scale yet; and `rig up` still starts
+  device, so no Slack case runs at flood scale yet (answered since by
+  `--gui-state`, below); and `rig up` still starts
   the GUI when the fake did not register as the workspace, which looks exactly
   like a dealing bug. Both have a case with an open "Closed by".
   Also learned while writing it: the CPU profile is symbolized where it is
@@ -845,6 +846,47 @@ work on it.
   40 µs against the two rows it touched, and no frame came near the budget.
   Reading a profile is O(events in it) once per `rig down`, off the GUI's own
   path entirely — the rig reads what the run already wrote.
+
+- **A snapshot of two devices** (`rho-qa snapshot --gui-state <dir>`, with
+  `paths`, `rig new` and the handbook). The limit the handbook recorded — the
+  snapshot is daemon-side only, because the GUI runs on the user's own device
+  — is now a flag. `--gui-state` names a client's state directory and copies
+  its half beside the daemon's, into `gui-state/rho/` in the snapshot, with
+  its own manifest entries (`gui_source`, `gui_files`, `gui_databases`) and
+  its own verification: every copied database is opened and its rows counted,
+  and a torn file is copied once more before the snapshot is called failed.
+  It is a second allow list with reasons, not a second deny list. What it
+  takes is what a screen reads: the agent mirror, the inbox, the action
+  journal so undo survives a restart, the desk device because a rig that lies
+  about which device it is deals the wrong hand, the client's own store, and
+  the Slack mirror. The mirror is on this list because it is the client's
+  file: `rho-slack`'s session writes every arriving message into it under the
+  client's state directory and the daemon never touches it, so the real flood
+  is on whichever device ran the GUI and the copy beside a daemon is whatever
+  that box happens to hold — on this one, QA's own `acme` fixture. It stays on
+  the daemon list as the fallback for a snapshot taken without `--gui-state`,
+  and the overlay in `rig new` is what makes the client's copy win.
+  What it refuses is what it refused before: no `auth.d`, no `iroh-secret.key`,
+  no `sessions` — a rig is never the user, on any device — and no `rho.redb`,
+  the daemon's store, which a client never has. Two tests hold both rules to
+  the lists themselves rather than to a comment.
+  `rig new` lays the GUI half over the daemon's state after the clone, because
+  a rig runs one state directory and the GUI reads its files from the same
+  place the daemon does; it says which files came from the other device.
+  Proven end to end on copies, never on live state: a snapshot of a fabricated
+  two-device pair copied and read back 1,197,254 agent-mirror rows on both
+  halves, copied neither of the two credentials planted as decoys in the GUI
+  source (an `auth.d/token` and an `iroh-secret.key`), listed as
+  `1198457 rows + gui 1198141 rows from …`, and a rig cloned from it came up
+  with the six GUI files overlaid — including a Slack mirror that differed on
+  the two sides, where the rig's copy is byte for byte the client's and not
+  the daemon-side one.
+  Also here, and the reason it is here: `rho-qa build` now builds `rho-qa`
+  itself alongside the rig's binaries. A stale copy in `target/profiling`
+  wrote no summary line into desk sessions 23 to 25 and looked like a rig
+  fault; the tool that reads a run can no longer be older than the run.
+  Gate green: rho-qa 4 tests (2 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
 
 ## Order
 

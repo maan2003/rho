@@ -15,6 +15,7 @@ excerpt, a number. A case with an empty "Closed by" has never passed.
 ```sh
 rho-qa snapshots                          # what state exists
 rho-qa rig list                           # what rigs exist
+rho-qa snapshot --gui-state ~/state-from-the-laptop  # a second device's GUI half
 rho-qa rig new --from user-2026-09-06 --name desk   # once; it refuses to overwrite
 rho-qa build --binaries profiling         # the binaries a rig runs
 rho-qa rig up desk                        # daemon, fakes, headless GUI, profiler
@@ -44,10 +45,10 @@ Three things the driver does not do, and what to do instead.
   `XDG_RUNTIME_DIR` pointed at the session's own `runtime` directory and
   `WAYLAND_DISPLAY=wayland-1`, puts an image where the GUI can paste it. In
   the GUI the paste is `ctrl+shift+v`; `ctrl+v` is visual block.
-- **Its own binary.** `rho-qa build` builds what a rig runs, not `rho-qa`
-  itself, so `target/profiling/rho-qa` can be older than main — an old one
-  quietly writes no summary into the session. Run it through `cargo run -p
-  rho-qa` when the line matters, and check `rho-qa --help` lists `profile`.
+- **Its own binary.** `rho-qa build` builds `rho-qa` with the rig's binaries,
+  so the tool that reads a run is never older than the run. It did not, once,
+  and a stale copy wrote no summary line into desk sessions 23 to 25 while
+  looking like a rig fault.
 
 Three rules for every run.
 
@@ -55,7 +56,12 @@ Three rules for every run.
    State accumulates across sessions the way the user's does; a case that needs
    an empty desk is not a case, it is a unit test.
 2. **Nothing touches the user's live state.** The live directory is read from
-   by `rho-qa snapshot` and by nothing else, ever.
+   by `rho-qa snapshot` and by nothing else, ever. Two allow lists say what a
+   snapshot may copy — the daemon's half and, when `--gui-state` names another
+   device's client directory, the GUI's half — and neither has ever named a
+   credential: no `auth.d`, no `iroh-secret.key`, no `sessions`. A rig daemon
+   is its own node. `rho-qa rig new` lays the GUI half over the daemon's state
+   when the snapshot has one, because a rig runs one state directory.
 3. **All mocking is server side.** The fake daemon is a real daemon on a copied
    store; Slack is `rho-qa fake-slack`; the browser is
    `rho-browser/examples/fake_browser`. Nothing is stubbed inside the GUI.
@@ -100,12 +106,20 @@ anyway — a GUI in that state looks exactly like a dealing bug.
 
 `slack.redb` in the snapshot taken 6 Sep holds only `acme`: 5 conversations,
 211 messages, which is the *fixture's* workspace written there by earlier QA
-runs. The user's real Slack state lives on their device with the GUI, not on
-this machine. Until a snapshot carries the device's mirror, every Slack case
-below runs at fixture scale and proves rendering, not flood behaviour. Say so
-in the run rather than reporting a green flood case.
+runs. That is what a daemon-side copy is: the mirror is the client's file —
+`rho-slack`'s session writes every arriving message into it under the state
+directory of whichever device ran the GUI, and the daemon never touches it —
+so the user's real Slack state is on their device, not on this machine.
 
-*Closed by:* not yet — waiting on the device's GUI state dir.
+The way to carry it is `rho-qa snapshot --gui-state <that device's state
+dir>`: the mirror comes over on the GUI half and `rig new` lays it over the
+daemon-side copy, so the rig reads the user's flood rather than the fixture.
+Until a snapshot is taken that way, every Slack case below runs at fixture
+scale and proves rendering, not flood behaviour. Say which one the run had
+rather than reporting a green flood case.
+
+*Closed by:* the flag exists; open until a snapshot of the user's own device
+has been taken with it and a Slack case has run at flood scale.
 
 ## The cases
 

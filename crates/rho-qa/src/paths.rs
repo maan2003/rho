@@ -58,8 +58,96 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
     "action-journal.redb",
     "inbox.redb",
     "desk-device",
-    // The Slack mirror: the flood, as the user's client has it.
+    // The Slack mirror, as a fallback only: it is the client's file, written
+    // by `rho-slack`'s session into whichever device ran the GUI, and the
+    // copy beside a daemon is whatever that box happens to hold — here, QA's
+    // own `acme` fixture. A snapshot taken with `--gui-state` overwrites this
+    // with the real one; see [`GUI_SNAPSHOT_CONTENTS`].
     "slack.redb",
     // The client's own store.
     "rho-client.redb",
 ];
+
+/// What a snapshot copies out of a *client's* state directory when
+/// `--gui-state` names one, in the order it is copied. Same shape as
+/// [`SNAPSHOT_CONTENTS`] and the same rule: an allow list, never a deny list.
+///
+/// A device that runs the GUI keeps the screens' own state beside the
+/// daemon's, and the two are not always the same machine: the desk's daemon
+/// holds the store, while the mirror, the journal and the inbox that a
+/// screen reads belong to whichever client the user was actually looking at.
+/// This is that client's half.
+///
+/// What is deliberately *not* here, for the same reason as before:
+///
+/// - `auth.d`, `iroh-secret.key`, `sessions`: credentials and identity. A rig
+///   is never the user, on any device.
+/// - `rho.redb`: the daemon's store, copied from the daemon's own state
+///   directory. A client never has it.
+/// - `gui-telemetry`, `qlog`, `debug`: what a run wrote, not what it needs.
+pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
+    // What the screens read: the agent mirror and the inbox behind Home.
+    "agent-mirror.redb",
+    "inbox.redb",
+    // What a verdict wrote, so undo means something after a restart.
+    "action-journal.redb",
+    // Which device this is. The desk device says yes; it names a device,
+    // not a person, and a rig that lies about it deals the wrong hand.
+    "desk-device",
+    // The client's own store.
+    "rho-client.redb",
+    // The Slack mirror: the client's file and the flood as the user's own
+    // device has it. `rho-slack`'s session writes every arriving message
+    // into it under the client's state directory and the daemon never
+    // touches it, so this copy is the real one and the daemon-side copy is
+    // the fixture. The overlay in `rig new` is what makes this one win.
+    "slack.redb",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The allow lists are the whole of the rule "a rig is never the user".
+    /// A file added to one without thinking is how that rule breaks, so the
+    /// names that must never appear are written down here too.
+    #[test]
+    fn no_allow_list_names_a_credential_or_a_log() {
+        const FORBIDDEN: &[&str] = &[
+            "auth.d",
+            "iroh-secret.key",
+            "sessions",
+            "qlog",
+            "debug",
+            "gui-telemetry",
+            "chromium-qa-profile",
+            "chromium-extension",
+            "sandboxes",
+        ];
+        for entry in SNAPSHOT_CONTENTS.iter().chain(GUI_SNAPSHOT_CONTENTS) {
+            assert!(
+                !FORBIDDEN.contains(entry),
+                "{entry} is copied by a snapshot and must not be"
+            );
+        }
+    }
+
+    /// The store is the daemon's and a client never has it; copying one from
+    /// a client would make a rig disagree with itself about which device it
+    /// is. The Slack mirror is the other way round — it is the client's, and
+    /// it is on both lists on purpose, the daemon-side copy being the
+    /// fallback for a snapshot taken without `--gui-state`.
+    #[test]
+    fn the_gui_half_holds_no_daemon_store() {
+        for entry in GUI_SNAPSHOT_CONTENTS {
+            assert_ne!(
+                *entry, "rho.redb",
+                "the store belongs to the daemon's state directory"
+            );
+        }
+        assert!(
+            GUI_SNAPSHOT_CONTENTS.contains(&"slack.redb"),
+            "the Slack mirror is the client's; the GUI half is where the real one is"
+        );
+    }
+}

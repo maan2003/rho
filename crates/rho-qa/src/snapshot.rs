@@ -32,6 +32,12 @@ pub struct SnapshotArgs {
     #[arg(long)]
     root: Option<PathBuf>,
 
+    /// A client's state directory, when the device that runs the GUI is not
+    /// the device that runs the daemon. Its own allow list, its own place in
+    /// the snapshot, read only like the other one.
+    #[arg(long)]
+    gui_state: Option<PathBuf>,
+
     /// Skip opening the copies to check they read. Faster, and worth less.
     #[arg(long)]
     no_verify: bool,
@@ -50,6 +56,15 @@ pub struct Manifest {
     pub tree_commit: Option<String>,
     pub files: Vec<FileRecord>,
     pub databases: Vec<DatabaseRecord>,
+    /// Where the GUI half came from, when `--gui-state` named a directory.
+    /// Absent in a snapshot of one device, which is the ordinary case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_source: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gui_files: Vec<FileRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gui_databases: Vec<DatabaseRecord>,
+    /// Everything copied, both halves.
     pub total_bytes: u64,
     pub seconds: f64,
 }
@@ -150,6 +165,62 @@ pub fn take(args: SnapshotArgs) -> Result<()> {
         }
     }
 
+    // The GUI half. A second directory, copied after the first so a failure
+    // in it cannot leave the daemon's half half-written, and verified the
+    // same way: a copy is not a snapshot until it has been read back.
+    let mut gui_files = Vec::new();
+    let mut gui_databases = Vec::new();
+    if let Some(gui_source) = &args.gui_state {
+        if !gui_source.is_dir() {
+            bail!("no GUI state directory at {}", gui_source.display());
+        }
+        let gui = dir.join("gui-state").join("rho");
+        fs::create_dir_all(&gui)
+            .with_context(|| format!("create snapshot directory {}", gui.display()))?;
+        for relative in paths::GUI_SNAPSHOT_CONTENTS {
+            let from = gui_source.join(relative);
+            if !from.exists() {
+                println!("skip    gui {relative} (not in the GUI state)");
+                continue;
+            }
+            let bytes = copy_file(&from, &gui.join(relative))?;
+            total_bytes += bytes;
+            gui_files.push(FileRecord {
+                relative: (*relative).to_owned(),
+                bytes,
+            });
+            println!("copied  gui {relative} ({})", human(bytes));
+        }
+        if !args.no_verify {
+            for record in &gui_files {
+                if !record.relative.ends_with(".redb") {
+                    continue;
+                }
+                let copy = gui.join(&record.relative);
+                let tables = match read_tables(&copy) {
+                    Ok(tables) => tables,
+                    Err(error) => {
+                        println!("torn    gui {}: {error:#}; copying again", record.relative);
+                        copy_file(&gui_source.join(&record.relative), &copy)?;
+                        read_tables(&copy).with_context(|| {
+                            format!("gui {} does not read after a second copy", record.relative)
+                        })?
+                    }
+                };
+                let rows: u64 = tables.iter().map(|table| table.rows).sum();
+                println!(
+                    "read    gui {} ({rows} rows in {} tables)",
+                    record.relative,
+                    tables.len()
+                );
+                gui_databases.push(DatabaseRecord {
+                    relative: record.relative.clone(),
+                    tables,
+                });
+            }
+        }
+    }
+
     let manifest = Manifest {
         name: args.name,
         taken_at: today.to_rfc3339(),
@@ -158,6 +229,9 @@ pub fn take(args: SnapshotArgs) -> Result<()> {
         tree_commit: tree_commit(),
         files,
         databases,
+        gui_source: args.gui_state,
+        gui_files,
+        gui_databases,
         total_bytes,
         seconds: started.elapsed().as_secs_f64(),
     };
@@ -199,8 +273,18 @@ pub fn list() -> Result<()> {
             .flat_map(|database| &database.tables)
             .map(|table| table.rows)
             .sum();
+        let gui: u64 = manifest
+            .gui_databases
+            .iter()
+            .flat_map(|database| &database.tables)
+            .map(|table| table.rows)
+            .sum();
+        let gui = match &manifest.gui_source {
+            Some(source) => format!("  + gui {gui} rows from {}", source.display()),
+            None => String::new(),
+        };
         println!(
-            "{}  {}  {rows} rows  taken {}",
+            "{}  {}  {rows} rows{gui}  taken {}",
             entry.file_name().display(),
             human(manifest.total_bytes),
             manifest.taken_at,

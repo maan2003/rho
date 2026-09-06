@@ -2,6 +2,9 @@
 //!
 //! One command, so nobody has to remember that examples cannot be built
 //! alongside other packages and that the rig needs five binaries, not three.
+//! `rho-qa` itself is built with them: it is the thing that reads a run, and
+//! a copy older than the run reads it wrong — a stale one wrote no summary
+//! line into sessions 23 to 25 of the desk and looked like a rig fault.
 //! The build uses whatever rustflags the shell sets: the rig does not have
 //! opinions about the toolchain.
 //!
@@ -31,7 +34,16 @@ const TARGET_RUSTFLAGS: &str = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
 /// One cargo invocation the rig needs. Examples cannot be built alongside
 /// other packages in one command, so they are their own lines.
 const PACKAGES: &[&[&str]] = &[
-    &["-p", "rho-cli", "-p", "rho-daemon", "-p", "rho-gui"],
+    &[
+        "-p",
+        "rho-cli",
+        "-p",
+        "rho-daemon",
+        "-p",
+        "rho-gui",
+        "-p",
+        "rho-qa",
+    ],
     &["-p", "rho-slack", "--example", "fake_slack"],
     &["-p", "rho-browser", "--example", "fake_browser"],
 ];

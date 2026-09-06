@@ -196,6 +196,23 @@ fn new(args: NewArgs) -> Result<()> {
     if !status.success() {
         bail!("cloning {} failed", snapshot.display());
     }
+    // A snapshot taken with `--gui-state` holds a second device's half: the
+    // mirror, the inbox, the journal, the desk device. It is laid over the
+    // daemon's state after the clone, because a rig runs one state directory
+    // and the GUI reads its files from the same place the daemon does.
+    let gui = snapshot.join("gui-state").join("rho");
+    if gui.is_dir() {
+        for relative in paths::GUI_SNAPSHOT_CONTENTS {
+            let from = gui.join(relative);
+            if !from.exists() {
+                continue;
+            }
+            let to = root.join("state").join("rho").join(relative);
+            fs::copy(&from, &to)
+                .with_context(|| format!("copy {} to {}", from.display(), to.display()))?;
+            println!("gui     {relative} from the snapshot's GUI half");
+        }
+    }
     for dir in ["config", "run", "logs", "screens", "profiles"] {
         fs::create_dir_all(root.join(dir))?;
     }
