@@ -93,7 +93,17 @@ agent. Nothing else crosses: no summaries, no block lists, no states.
   incremental below.
 - The task is a std thread with a channel in each direction, not a gpui
   background task: it must not compete with rendering and must survive
-  the window.
+  the window. The boundary is at the fold, not at the socket: each host's
+  IO already runs as a tokio task, and the model thread sits between the
+  connection's event channel and the main thread (b8os, 6 Sep). The
+  mirror writer thread that exists today is owned by the model thread.
+  The model thread sends `Follow { since }` itself, from its own cursor,
+  and decides "the copy started over" (seed mismatch, seq past the
+  head), which it says with `Loaded` instead of `Changed`.
+- The model is a plain struct, `ingest(host, ConnEvent) -> Vec<ModelMsg>`,
+  and the thread is a loop around it. Tests call `ingest` inline and hand
+  the messages to the workspace, so they stay synchronous with no
+  test-only path through the product code.
 
 ## Main-thread state
 
@@ -166,7 +176,9 @@ ids; neither calls `sync_tree_dashboard`.
 ## Slices, in landing order
 
 Each slice lands on its own with the gate green and a profile on the rig
-(`/tmp/rho-rig`, the 45 GB copy) showing the per-event cost it claims.
+(a daemon on `/tmp/rho-rig`, the 45 GB store copy, so the journal and the
+agent count are the user's; the GUI in the isolated `/tmp/rho-slack-ux`
+environment) showing the per-event cost it claims.
 Each gets a landing note here.
 
 1. **The model task and the change channel.** Connection, decode, fold and
