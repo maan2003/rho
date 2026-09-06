@@ -470,6 +470,34 @@ work on it.
   worst-frame-gap summary line on `rig down` needs the trace decoder only, not
   the binary the profile came from.
 
+- **The summary line on rig down** (`crates/rho-qa/src/profile.rs`, and the
+  session entry in `rig.rs`). Every landing note from here needs numbers off a
+  run, and getting them meant standing a viewer up over a directory of
+  sidecars. `rig down` now stops the GUI, waits for what it writes on the way
+  out, reads all three files and prints one line: frames drawn, `draw_ms` p99,
+  how many went over the 8 ms budget, the worst dirty-to-draw gap and its p99,
+  the editor stage with the worst p99 with the rows it had in hand — the pair
+  that is the per-event side of the cost rule — and where the GUI thread's
+  samples landed, three symbols with their share. The same line is written into
+  the rig's session entry in `rig.json`, so a note quotes the run instead of
+  re-deriving it, and `rho-qa profile <name>.bin` prints it again for any
+  session, including the ones already on disk. `rig status` shows the last.
+  The CPU profile needs no binary and no `addr2line`: Dial9 symbolizes each
+  segment against its own `/proc/self/maps` before compressing it, so the names
+  are in the file. A sample is attributed to its leaf frame, and the thread is
+  the GUI's own (`rho-gui`) rather than the profiler's flush and worker
+  threads, which are always in the file and never the answer.
+  A session with no profile says nothing rather than summarizing nothing.
+  Proven on the desk, session 5, driving Home with the keys and nothing else:
+  `81 frames, draw p99 3.6 ms, 0 over 8 ms; worst gap 11 ms, p99 11 ms; 11471
+  events, slowest stage buffer_edit p99 0.04 ms at 2 rows; 90 samples on
+  rho-gui: __memcpy_avx512_unaligned_erms 13%, parse.constprop.0 3%, runtime
+  3%`. That is the user's own 42.8 GiB desk with the fake's Slack rows beside
+  the real agents, and the cost rule holds on it: the worst editor stage is
+  40 µs against the two rows it touched, and no frame came near the budget.
+  Reading a profile is O(events in it) once per `rig down`, off the GUI's own
+  path entirely — the rig reads what the run already wrote.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

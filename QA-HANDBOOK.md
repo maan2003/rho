@@ -276,8 +276,16 @@ on, and `rig down` leaves three files in the rig's `profiles/`:
 - `<name>.0.bin.gz` — the CPU profile, for when the two above say something is
   wrong but not where. It is symbolized where it was written — the frames in it
   carry Rust names, not bare addresses — so reading it needs the trace decoder
-  and not the binary it came from. Today that means `dial9 serve --local-dir .`;
-  `rig down` will grow a summary line off the same data.
+  and not the binary it came from. `dial9 serve --local-dir .` opens the whole
+  thing when you need the flame graph.
+
+`rig down` reads all three and prints the line the run earned: frames drawn,
+`draw_ms` p99, how many frames went over the 8 ms budget, the worst
+dirty-to-draw gap and its p99, the editor stage with the worst p99 and the rows
+it had in hand, and where the GUI thread's samples landed. The same line goes
+into the rig's session entry in `rig.json`, so a landing note quotes the run
+instead of re-deriving it. `rho-qa profile <name>.bin` prints it again for any
+session, including an old one.
 
 *What to measure for a new screen or rule.*
 

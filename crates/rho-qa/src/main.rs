@@ -17,6 +17,7 @@
 
 mod build;
 mod paths;
+mod profile;
 mod rig;
 mod slack;
 mod snapshot;
@@ -44,6 +45,8 @@ enum Command {
     Snapshot(snapshot::SnapshotArgs),
     /// List the snapshots taken so far.
     Snapshots,
+    /// Summarize a session's profile: the frame gaps and where the time went.
+    Profile { path: std::path::PathBuf },
     /// Work with rigs: the runnable copies of a snapshot.
     #[command(subcommand)]
     Rig(rig::RigCommand),
@@ -55,6 +58,10 @@ fn main() -> Result<()> {
         Command::FakeSlack(args) => slack::run(args),
         Command::Snapshot(args) => snapshot::take(args),
         Command::Snapshots => snapshot::list(),
+        Command::Profile { path } => {
+            println!("{}", profile::summarize(&path)?.line);
+            Ok(())
+        }
         Command::Rig(command) => rig::run(command),
     }
 }

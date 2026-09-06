@@ -14,7 +14,9 @@ chrono = { version = "0.4", default-features = false, features = [
   "std",
 ] }
 clap.workspace = true
+dial9-trace-format = "0.4.1"
 dirs.workspace = true
+flate2 = "1"
 redb.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }
 serde = { workspace = true }

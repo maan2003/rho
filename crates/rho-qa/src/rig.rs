@@ -20,12 +20,15 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
+use crate::profile::{self, Summary};
 use crate::snapshot::human;
 
 /// How long to wait for the daemon's socket and the fake's readiness line.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the last session's daemon gets to let go of the store.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the GUI's profile sidecars get to land after it has exited.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Subcommand)]
 pub enum RigCommand {
@@ -127,6 +130,14 @@ struct Session {
     at: String,
     binaries: String,
     tree_commit: Option<String>,
+    /// What the GUI was told to profile to, so `rig down` knows which files
+    /// this session left behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<PathBuf>,
+    /// What those files said, written here on the way down so a landing
+    /// note can quote the run rather than re-derive it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<Summary>,
 }
 
 /// Build what a rig runs. Goes through `crate::build` so the linker the
@@ -249,6 +260,7 @@ fn up(args: UpArgs) -> Result<()> {
     let slack = start_fake_slack(&root, &bin)?;
     println!("slack   fake on {slack}");
 
+    let mut profile_path = None;
     if !args.no_gui {
         let profile = (!args.no_profile).then(|| {
             root.join("profiles").join(format!(
@@ -256,6 +268,7 @@ fn up(args: UpArgs) -> Result<()> {
                 chrono::Local::now().format("%Y%m%dT%H%M%S")
             ))
         });
+        profile_path = profile.clone();
         start_gui(&root, &bin, &args.name, &socket, &slack, profile.as_deref())?;
         println!(
             "gui     up in the `{}` wayland session{}",
@@ -271,6 +284,8 @@ fn up(args: UpArgs) -> Result<()> {
         at: chrono::Local::now().to_rfc3339(),
         binaries: bin.label.clone(),
         tree_commit: crate::snapshot::tree_commit(),
+        profile: profile_path.clone(),
+        summary: None,
     });
     save(&root, &rig)?;
     println!(
@@ -292,7 +307,58 @@ fn down(name: &str) -> Result<()> {
     stop_gui(&root, &bin, name);
     stop_daemon(&root);
     println!("rig {name} down; its state is as the run left it");
-    Ok(())
+    summarize_session(&root)
+}
+
+/// The line the run earned. The GUI writes its frame log, its editor log and
+/// its CPU profile as it exits, so this runs after the GUI is stopped and
+/// waits for the files rather than racing them. A session with no profile —
+/// `--no-gui`, `--no-profile`, or a GUI that died before it could write —
+/// says nothing, because a summary of nothing is worse than silence.
+fn summarize_session(root: &Path) -> Result<()> {
+    let mut rig = load(root)?;
+    let Some(session) = rig.sessions.last_mut() else {
+        return Ok(());
+    };
+    let Some(path) = session.profile.clone() else {
+        return Ok(());
+    };
+    if !wait_for_profile(&path) {
+        println!("profile {} never landed; no summary", path.display());
+        return Ok(());
+    }
+    match profile::summarize(&path) {
+        Ok(summary) => {
+            println!("{}", summary.line);
+            session.summary = Some(summary);
+            save(root, &rig)
+        }
+        Err(error) => {
+            println!("the profile is there but would not read: {error:#}");
+            Ok(())
+        }
+    }
+}
+
+/// The frame log is the one the summary cannot do without; the CPU profile is
+/// compressed on the way out and may be a moment behind it.
+fn wait_for_profile(path: &Path) -> bool {
+    let frames = PathBuf::from({
+        let mut held = path.as_os_str().to_owned();
+        held.push(".frames.json");
+        held
+    });
+    let deadline = Instant::now() + FLUSH_TIMEOUT;
+    while Instant::now() < deadline {
+        if frames.exists() {
+            // Give the compressor the same grace, but do not hold the
+            // command open for it: the summary reads what is there.
+            std::thread::sleep(Duration::from_millis(500));
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 fn status(name: &str) -> Result<()> {
@@ -304,6 +370,9 @@ fn status(name: &str) -> Result<()> {
     println!("  sessions {}", rig.sessions.len());
     if let Some(last) = rig.sessions.last() {
         println!("  last     {} on {} binaries", last.at, last.binaries);
+        if let Some(summary) = &last.summary {
+            println!("  profile  {}", summary.line);
+        }
     }
     println!("  state    {}", state_size(&root));
     let socket = root.join("run").join("rho").join("rho.sock");
