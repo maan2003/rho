@@ -53,11 +53,13 @@ every delta; clients ignore agents they are not holding. A dropped
 connection drops its wants. Focus on an unloaded agent does nothing
 until something loads it; then its deltas start.
 
-Derived on the client from rows, never on the wire: the queue
-(`Message` rows not covered by a later `Sent`/`QueueCleared`), running
-tools (calls in `Replied` without a result in `Sent`), errors and
-cancels (`Turn Ended(..)`), turn running, `context_used` (last
-`Replied` usage).
+Derived on the client from rows, never on the wire: the native
+runtime's queue (`Message` rows not covered by a later
+`Sent`/`QueueCleared`), running tools (calls in `Replied` without a
+result in `Sent`), errors and cancels (`Turn Ended(..)`), turn running,
+`context_used` (last `Replied` usage). A Claude agent's queue is not
+rows at all (7 Sep): `Live::Queued { items }`, whole, whenever it
+changes.
 
 `Detail` answers with `Item`s, not `UiBlock`s. `remote.rs` is deleted.
 
@@ -294,63 +296,78 @@ bounded by something like `O(log(agents × events))`. A row must not walk every
 agent, every fact, or every node; dealing and the tree sync are where that is
 still broken.
 
-## The Claude runtime reads its file (6 Sep, night)
+## The Claude rows come from the stream (7 Sep)
 
-Claude Code's session file (`~/.claude/projects/<cwd>/<session>.jsonl`) is
-the Claude runtime's history. Until now the loop wrote rows from the
-stream (`ClaudePresentationSource` for text, `Replied` for calls, `Sent`
-for results) and, on load, read the whole file and matched it against
-those rows by uuid, speaker and a text prefix. Two copies of one truth,
-reconciled by heuristic. That was the last place a Claude agent felt
-unlike a native one.
+Claude Code's session file (`~/.claude/projects/<cwd>/<session>.jsonl`)
+is the Claude runtime's history. Before 6 Sep the loop wrote rows from
+the stream (`ClaudePresentationSource` for text, `Replied` for calls,
+`Sent` for results) and, on load, read the whole file and matched it
+against those rows by uuid, speaker and a text prefix: two copies of one
+truth, reconciled by heuristic. On 6 Sep (night) the file became the
+only source of the rows, copied behind a cursor, with the stream as the
+live tail and the bell to read the file. Measured on 7 Sep: Claude Code
+writes a message's lines in one batch after the message and its tool
+results, 90–340 ms after the stream told them and after `result` itself
+(not the kernel or the runtime: every Bun write shows to another process
+within 5 ms). A row from the file could only follow the stream, and
+Rho's own rows (a turn end, a want, a delivery) could be ordered after
+it only by waiting; the waits stalled the loop and mostly missed.
 
-Now the file is the only source of the rows, and the stream is only the
-live tail and the bell:
+Now the stream is the source of the rows, and the file is read only
+where Claude is handed a session to fork:
 
-- **One row per line, from the file alone.** `AgentEvent::Transcript
-  { uuid, offset, line, at }`, with `TranscriptLine::{User, Assistant,
-  ToolResults, Compacted}`: whole bodies, the wire strips them. `strip`
-  tells them in the words a reader already knows (`ClaudeMessage`,
-  `Replied`, and `Results` for tool results, which unlike `Sent` carry
-  nothing out of the queue: a Claude message waits there until Claude's
-  own echo of it), so the client is unchanged and never learns which
-  runtime it is looking at. The summary Claude writes after compacting
-  (`isCompactSummary`, `isVisibleInTranscriptOnly`) is not a row; the
-  `compact_boundary` is. Claude writes one line per content block, so
-  a text and the call after it are two rows; usage rides on the first
-  row of a message only.
-- **A cursor, not a re-read.** `claude_transcript_cursors` holds `(session,
-  end)` per agent, written in the transaction with the rows. `TranscriptTail`
-  (rho-claude) keeps the file open and reads only the bytes past the
-  cursor, whole lines only; a half-written line waits. A file shorter than
-  the cursor, or another session (a rewind forks one), is read from its
-  start, skipping every uuid the log already holds. A writer checks the
-  cursor again inside its transaction and reads again if it moved, so two
-  writers never tell a line twice. The file is taken as a straight line:
-  Rho never branches a session file, it forks.
-- **The older rows were taken back once.** A one-off at daemon start
-  (`backfill_claude_transcripts`, gone with the 7 Sep cleanup) put one
-  `Rewound` over the rows the loop before 6 Sep wrote from the stream and
-  copied each file behind a cursor; an agent whose file was gone kept its
-  rows.
-- **The stream is the bell.** After each `assistant` and `user` message
-  the loop reads the tail and waits (25 ms steps, 1 s at most) until that
-  message's uuid is in, so a turn end or a want is never told ahead of the
-  row it follows. `result`, `compact_boundary` and a command's `completed`
-  read the tail too. A `notify` watch on the session directory is the
-  fallback bell for a file changed while the stream says nothing.
-- **The live tail empties once the message's row is in.** The loop reads
-  the file first, then lets the streamed text go, so a reader holds the
-  text twice for an instant rather than not at all while the file catches
-  up (the wait can be most of a second).
-- **Rho's own facts stay Rho's rows.** `Accepted` when a send is taken,
-  `QueueCleared` on cancel, `Failed`, `Turn`, `Wants`, `Presented`. The
-  echo of a send (its uuid) is when it leaves the queue; the file's row is
-  what the reader sees.
+- **One row per finished block, from the stream.** Each `assistant`
+  event is one content block with the message's id, usage, uuid and
+  time; `assistant_row` makes `AgentEvent::Transcript { uuid, line, at }`
+  of it, with `TranscriptLine::{User, Assistant, ToolResults,
+  Compacted}` as before and the uuid the file gives the same line (a
+  rewind forks the session there). Usage rides on the first block of a
+  message only. A `user` event is the echo of a send (`Delivered` first,
+  then the `User` row) or a call's results (`ToolResults`); a
+  `compact_boundary` is `Compacted`. A subagent's blocks, synthetic
+  messages, thinking-only blocks and Claude's command echoes make no
+  row. `strip` tells the rows in the words a reader already knows
+  (`ClaudeMessage`, `Replied`, and `Results`, which unlike `Sent` carry
+  nothing out of the queue), so the client never learns which runtime it
+  is looking at.
+- **Row, then tail, from one task.** The block's row is appended and
+  committed, then its streamed copy leaves the tail and the tail is told
+  again without it (the teller empties a shorter tail on the client and
+  says the rest). At `message_stop` whatever the tail still holds goes.
+  Nothing waits on anything: the stream is the order things happened.
+- **The queue is live, never rows.** Claude Code holds a Claude agent's
+  queued messages in its process and nothing persists them: a restart
+  loses them. So the loop writes no `Accepted` or `QueueCleared` row and
+  tells `Live::Queued { items }` whole whenever its queue changes (the
+  teller says it once per change and again for a joiner); the registry
+  keeps it in the tail, after the streamed items. The echo of a send
+  (its uuid) is when a message leaves the queue, and the echo's row is
+  the message in the conversation. Older Claude logs were the copier's:
+  the file's lines with `Accepted` and `QueueCleared` rows between
+  them, some never confirmed by an echo. A one-off at daemon start
+  (`rho_agent::rebuild`, 7 Sep), before any loop can append, rewinds
+  each such log to its first conversation row and appends the file's
+  active branch again in the file's order through the stream's
+  projection: rows only, no queue, what the stream would have told.
+  The client's mirror takes the `Rewound` and the rows like any other;
+  its fold hides what the rewind took back. A log with no file keeps
+  its rows and only a queue left open gets a `Cleared`.
+- **Rho's own facts stay Rho's rows.** `Failed`, `Turn`, `Wants`,
+  `Presented`, `Rewound`.
+- **What the file is for.** A rewind hands Claude the uuid to fork at
+  and reads the fork once to confirm it materialised. Sessions Rho did
+  not run are not imported, and lines written while the daemon was not
+  listening are not recovered: the log is what Rho witnessed. Rows from
+  the one night of copying keep the file's `offset` in the store; the
+  decoder skips it.
 
-What is gone: the reconciliation and its prefix matching, the in-memory
-`ContextBlock` copy of the transcript (nothing read it), `Sent` and
-`Replied` writes from the Claude loop, the whole-file read on every load.
+What is gone: the copier, `claude_transcript_cursors` (left in older
+stores, never opened), `TranscriptTail`, the directory watch, the waits,
+the reconciliation and its prefix matching, the in-memory `ContextBlock`
+copy of the transcript, `Sent` and `Replied` writes from the Claude
+loop, the whole-file read on every load. The one-off backfill of 7 Sep
+(`backfill_claude_transcripts`) put one `Rewound` over the rows written
+before 6 Sep and copied each file once; it ran and was removed.
 `ClaudePresentationSource` stays in the enum, read-only, so older logs
 still fold; dropping it needs a log-rewriting format hop, since the rows
 stay in the log behind their `Rewound`.

@@ -325,6 +325,23 @@ pub enum Live {
     Waiting { until: Option<UnixMs> },
     /// Nothing in flight.
     Idle,
+    /// What waits to go in, whole, whenever it changes. A Claude agent's
+    /// queue lives in Claude Code's process and nothing persists it, so
+    /// it is told here and never as rows; the native runtime's queue is
+    /// its `Message` rows, and it says nothing here.
+    Queued { items: Vec<QueuedItem> },
+}
+
+/// One thing waiting in an agent's queue.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum QueuedItem {
+    Message {
+        /// `None` when the person wrote it.
+        from: Option<AgentId>,
+        text: String,
+        delivery: MessageDelivery,
+    },
+    Compaction,
 }
 
 /// One item of a response, as it streams or as `Detail` hands it back.

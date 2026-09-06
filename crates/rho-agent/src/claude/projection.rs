@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use anyhow::Context as _;
+use rho_claude::protocol::{
+    AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
+    UserOutputMessage,
+};
 use rho_core::{
     ProviderSpecificData, StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
     ToolResult, ToolType, UnixMs,
@@ -134,162 +137,146 @@ impl ClaudeStreamItem {
     }
 }
 
-/// The row one transcript line becomes, or `None` for a line a reader
-/// never sees: a CLI command's own output, an empty message, a
-/// thinking-only block.
+/// The row an `assistant` event of the stream becomes: one finished
+/// content block, with the message's id, usage, uuid and time. `None`
+/// for a block a reader never sees (thinking only, empty).
 ///
 /// `usage_told` is the id of the API message whose usage a row already
-/// carries: Claude writes one line per content block and repeats the
-/// message's usage on each, and a reader counts a request once.
-pub(super) fn transcript_line(
-    row: &rho_claude::TranscriptRow,
+/// carries: every block's event repeats the message's usage, and a
+/// reader counts a request once.
+pub(super) fn assistant_row(
+    message: &AssistantMessage,
     usage_model: crate::db::AgentUsageModel,
     usage_told: &mut Option<String>,
 ) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
-    match row {
-        rho_claude::TranscriptRow::CompactBoundary {
-            uuid,
-            post_tokens,
-            timestamp,
-        } => Ok(Some((
-            *uuid,
-            TranscriptLine::Compacted {
-                context_used: *post_tokens,
-            },
-            line_time(timestamp.as_deref()),
-        ))),
-        rho_claude::TranscriptRow::Message(message) => {
-            let at = line_time(message.timestamp.as_deref());
-            let line = match message.kind {
-                rho_claude::SessionMessageKind::User => user_line(&message.message)?,
-                rho_claude::SessionMessageKind::Assistant => {
-                    assistant_line(&message.message, usage_model, usage_told)?
-                }
-                rho_claude::SessionMessageKind::System => None,
-            };
-            Ok(line.map(|line| (message.uuid, line, at)))
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for content in &message.message.content {
+        match content {
+            AssistantContent::Text { text: part } => text.push_str(part),
+            AssistantContent::ToolUse { id, name, input } => calls.push(TranscriptCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: serde_json::to_string(input)?,
+            }),
+            AssistantContent::Thinking { .. } | AssistantContent::Other => {}
         }
     }
+    if text.trim().is_empty() && calls.is_empty() {
+        return Ok(None);
+    }
+    let usage = message.message.usage.as_ref();
+    let context_used = usage.map(TokenUsage::context_total);
+    let usage = match (usage, &message.message.id) {
+        (Some(usage), Some(id)) if usage_told.as_deref() != Some(id.as_str()) => {
+            *usage_told = Some(id.clone());
+            Some(usage_bucket(usage, usage_model))
+        }
+        (Some(usage), None) => Some(usage_bucket(usage, usage_model)),
+        _ => None,
+    };
+    Ok(Some((
+        row_uuid(message.uuid.as_deref()),
+        TranscriptLine::Assistant {
+            text,
+            calls,
+            usage,
+            context_used,
+        },
+        line_time(message.timestamp.as_deref()),
+    )))
 }
 
-fn line_time(timestamp: Option<&str>) -> UnixMs {
+/// The row a `user` event of the stream becomes: the results it
+/// carries, else what the person said. Claude's own command echoes
+/// (`<command-name>`, `<local-command-stdout>`) are not something the
+/// person said.
+pub(super) fn user_row(
+    message: &UserOutputMessage,
+) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+    let Some(body) = &message.message else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    let mut results = Vec::new();
+    for content in &body.content {
+        match content {
+            OutputContent::Text { text: part } => {
+                if !is_auxiliary_user_text(part) {
+                    push_line(&mut text, part);
+                }
+            }
+            OutputContent::Image { source } => push_line(&mut text, image_marker(source)),
+            OutputContent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => results.push(tool_result(
+                tool_use_id,
+                content,
+                is_error.unwrap_or(false),
+            )?),
+            OutputContent::Other => {}
+        }
+    }
+    let uuid = row_uuid(message.uuid.as_deref());
+    let at = line_time(message.timestamp.as_deref());
+    if !results.is_empty() {
+        return Ok(Some((uuid, TranscriptLine::ToolResults { results }, at)));
+    }
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((uuid, TranscriptLine::User { text }, at)))
+}
+
+/// The row a `compact_boundary` becomes.
+pub(super) fn compacted_row(
+    uuid: Option<&str>,
+    metadata: Option<&SystemCompactMetadata>,
+) -> (Uuid, TranscriptLine, UnixMs) {
+    (
+        row_uuid(uuid),
+        TranscriptLine::Compacted {
+            context_used: metadata.and_then(|metadata| metadata.post_tokens),
+        },
+        UnixMs::now(),
+    )
+}
+
+/// The line's uuid as Claude names it (the same in its file); one of
+/// Rho's own for a message that came without one.
+fn row_uuid(uuid: Option<&str>) -> Uuid {
+    uuid.and_then(|uuid| Uuid::parse_str(uuid).ok())
+        .unwrap_or_else(Uuid::new_v4)
+}
+
+pub(super) fn line_time(timestamp: Option<&str>) -> UnixMs {
     timestamp
         .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|time| UnixMs(time.timestamp_millis().max(0) as u64))
         .unwrap_or_else(UnixMs::now)
 }
 
-/// A person's line: the results it carries, else its text. Claude's own
-/// command echoes (`<command-name>`, `<local-command-stdout>`) are not
-/// something the person said.
-fn user_line(message: &Value) -> anyhow::Result<Option<TranscriptLine>> {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    for content in message_content(message) {
-        match content.get("type").and_then(Value::as_str) {
-            None | Some("text") => {
-                if let Some(part) = content
-                    .get("text")
-                    .or_else(|| content.get("content"))
-                    .and_then(Value::as_str)
-                    && !is_auxiliary_user_text(part)
-                {
-                    if !text.is_empty() && !text.ends_with('\n') {
-                        text.push('\n');
-                    }
-                    text.push_str(part);
-                }
-            }
-            Some("image") => {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                let media_type = content
-                    .get("source")
-                    .and_then(|source| source.get("media_type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("image");
-                text.push_str(match media_type {
-                    "image/png" => "[image: PNG]",
-                    "image/jpeg" => "[image: JPEG]",
-                    "image/webp" => "[image: WebP]",
-                    "image/gif" => "[image: GIF]",
-                    _ => "[image]",
-                });
-            }
-            Some("tool_result") => {
-                if let Some(result) = project_tool_result(content)? {
-                    results.push(result);
-                }
-            }
-            _ => {}
-        }
+fn push_line(output: &mut String, part: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
     }
-    if !results.is_empty() {
-        return Ok(Some(TranscriptLine::ToolResults { results }));
-    }
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(TranscriptLine::User { text }))
+    output.push_str(part);
 }
 
-fn assistant_line(
-    message: &Value,
-    usage_model: crate::db::AgentUsageModel,
-    usage_told: &mut Option<String>,
-) -> anyhow::Result<Option<TranscriptLine>> {
-    let mut text = String::new();
-    let mut calls = Vec::new();
-    for content in message_content(message) {
-        match content.get("type").and_then(Value::as_str) {
-            Some("text") => push_text(&mut text, content),
-            Some("tool_use") => {
-                let id = content
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .context("Claude tool_use missing id")?;
-                let name = content
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .context("Claude tool_use missing name")?;
-                let input = content.get("input").cloned().unwrap_or(Value::Null);
-                calls.push(TranscriptCall {
-                    id: id.to_owned(),
-                    name: name.to_owned(),
-                    arguments: serde_json::to_string(&input)?,
-                });
-            }
-            _ => {}
-        }
+fn image_marker(source: &Value) -> &'static str {
+    match source.get("media_type").and_then(Value::as_str) {
+        Some("image/png") => "[image: PNG]",
+        Some("image/jpeg") => "[image: JPEG]",
+        Some("image/webp") => "[image: WebP]",
+        Some("image/gif") => "[image: GIF]",
+        _ => "[image]",
     }
-    if text.trim().is_empty() && calls.is_empty() {
-        return Ok(None);
-    }
-    let usage = message
-        .get("usage")
-        .cloned()
-        .and_then(|usage| serde_json::from_value::<rho_claude::protocol::TokenUsage>(usage).ok());
-    let context_used = usage.as_ref().map(|usage| usage.context_total());
-    let message_id = message.get("id").and_then(Value::as_str).map(str::to_owned);
-    let usage = match (usage, message_id) {
-        (Some(usage), Some(message_id)) if usage_told.as_deref() != Some(&message_id) => {
-            *usage_told = Some(message_id);
-            Some(usage_bucket(&usage, usage_model))
-        }
-        (Some(usage), None) => Some(usage_bucket(&usage, usage_model)),
-        _ => None,
-    };
-    Ok(Some(TranscriptLine::Assistant {
-        text,
-        calls,
-        usage,
-        context_used,
-    }))
 }
 
 fn usage_bucket(
-    usage: &rho_claude::protocol::TokenUsage,
+    usage: &TokenUsage,
     model: crate::db::AgentUsageModel,
 ) -> crate::db::AgentUsageBucket {
     crate::db::AgentUsageBucket {
@@ -308,59 +295,33 @@ fn usage_bucket(
     }
 }
 
-fn message_content(message: &Value) -> Vec<&Value> {
-    match message.get("content") {
-        Some(Value::Array(content)) => content.iter().collect(),
-        Some(Value::String(_)) => vec![message],
-        _ => Vec::new(),
-    }
-}
-
-fn push_text(output: &mut String, content: &Value) {
-    if let Some(text) = content
-        .get("text")
-        .or_else(|| content.get("content"))
-        .and_then(Value::as_str)
-    {
-        output.push_str(text);
-    }
-}
-
-fn project_tool_result(content: &Value) -> anyhow::Result<Option<ToolResult>> {
-    let Some(tool_use_id) = content.get("tool_use_id").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let output = match content.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
+fn tool_result(tool_use_id: &str, content: &Value, is_error: bool) -> anyhow::Result<ToolResult> {
+    let output = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join(""),
-        Some(other) => serde_json::to_string(other)?,
-        None => String::new(),
+        Value::Null => String::new(),
+        other => serde_json::to_string(other)?,
     };
-    let status = if content
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        ToolOutputStatus::Error
-    } else {
-        ToolOutputStatus::Success
-    };
-    Ok(Some(ToolResult {
+    Ok(ToolResult {
         call_id: ToolCallId::try_from(tool_use_id)?,
         tool_type: ToolType::Function,
         body: ToolOutput {
-            images: std::sync::Arc::new(Vec::new()),
+            images: Arc::new(Vec::new()),
             output: Arc::new(output),
-            status,
+            status: if is_error {
+                ToolOutputStatus::Error
+            } else {
+                ToolOutputStatus::Success
+            },
         },
         started_at: UnixMs(0),
         finished_at: UnixMs(0),
         metadata: None,
-    }))
+    })
 }
 
 fn is_auxiliary_user_text(text: &str) -> bool {
@@ -376,32 +337,46 @@ mod tests {
 
     use super::*;
 
-    fn row(kind: rho_claude::SessionMessageKind, message: Value) -> rho_claude::TranscriptRow {
-        rho_claude::TranscriptRow::Message(rho_claude::SessionMessage {
-            kind,
-            uuid: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
-            session_id: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
-            message,
-            parent_tool_use_id: None,
-            timestamp: Some("2026-09-06T10:00:00.000Z".to_owned()),
-        })
+    const UUID: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn user(message: Value) -> UserOutputMessage {
+        serde_json::from_value(json!({
+            "uuid": UUID,
+            "session_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp": "2026-09-06T10:00:00.000Z",
+            "message": message,
+        }))
+        .unwrap()
     }
 
-    fn line(row: &rho_claude::TranscriptRow) -> Option<TranscriptLine> {
-        transcript_line(row, crate::db::AgentUsageModel::OPUS, &mut None)
-            .unwrap()
-            .map(|(_, line, _)| line)
+    fn assistant(message: Value) -> AssistantMessage {
+        serde_json::from_value(json!({
+            "uuid": UUID,
+            "session_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp": "2026-09-06T10:00:01.000Z",
+            "message": message,
+        }))
+        .unwrap()
+    }
+
+    fn user_line(message: Value) -> Option<TranscriptLine> {
+        user_row(&user(message)).unwrap().map(|(_, line, _)| line)
+    }
+
+    fn assistant_line(message: Value) -> Option<TranscriptLine> {
+        assistant_row(
+            &assistant(message),
+            crate::db::AgentUsageModel::OPUS,
+            &mut None,
+        )
+        .unwrap()
+        .map(|(_, line, _)| line)
     }
 
     #[test]
-    fn a_persons_text_is_a_user_line_with_the_files_time() {
-        let row = row(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}),
-        );
-        let (uuid, line, at) = transcript_line(&row, crate::db::AgentUsageModel::OPUS, &mut None)
-            .unwrap()
-            .unwrap();
+    fn a_persons_text_is_a_user_line_with_the_streams_time() {
+        let message = user(json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}));
+        let (uuid, line, at) = user_row(&message).unwrap().unwrap();
         assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
         assert_eq!(
             line,
@@ -414,15 +389,11 @@ mod tests {
 
     #[test]
     fn images_become_bounded_markers() {
-        let row = row(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [
+        assert_eq!(
+            user_line(json!({"role": "user", "content": [
                 {"type": "text", "text": "look"},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
-            ]}),
-        );
-        assert_eq!(
-            line(&row),
+            ]})),
             Some(TranscriptLine::User {
                 text: "look\n[image: PNG]".to_owned()
             })
@@ -431,27 +402,25 @@ mod tests {
 
     #[test]
     fn a_commands_own_output_is_not_a_line() {
-        let command = row(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": "<command-name>/compact</command-name>"}),
+        assert_eq!(
+            user_line(json!({"role": "user", "content": "<command-name>/compact</command-name>"})),
+            None
         );
-        assert_eq!(line(&command), None);
-        let stdout = row(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]}),
+        assert_eq!(
+            user_line(
+                json!({"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]})
+            ),
+            None
         );
-        assert_eq!(line(&stdout), None);
     }
 
     #[test]
     fn a_failed_result_is_an_error() {
-        let row = row(
-            rho_claude::SessionMessageKind::User,
+        let Some(TranscriptLine::ToolResults { results }) = user_line(
             json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "boom"},
             ]}),
-        );
-        let Some(TranscriptLine::ToolResults { results }) = line(&row) else {
+        ) else {
             panic!("expected results");
         };
         assert_eq!(results.len(), 1);
@@ -463,24 +432,21 @@ mod tests {
     #[test]
     fn text_and_call_with_usage_told_once_per_message() {
         let usage = json!({"input_tokens": 3, "cache_read_input_tokens": 100, "output_tokens": 7});
-        let text = row(
-            rho_claude::SessionMessageKind::Assistant,
+        let text = assistant(
             json!({"role": "assistant", "id": "msg_1", "usage": usage, "content": [
-                {"type": "thinking", "thinking": "hmm"},
                 {"type": "text", "text": "reading"},
             ]}),
         );
-        let call = row(
-            rho_claude::SessionMessageKind::Assistant,
+        let call = assistant(
             json!({"role": "assistant", "id": "msg_1", "usage": usage, "content": [
                 {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "a.rs"}},
             ]}),
         );
         let mut told = None;
-        let (_, first, _) = transcript_line(&text, crate::db::AgentUsageModel::OPUS, &mut told)
+        let (_, first, _) = assistant_row(&text, crate::db::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
-        let (_, second, _) = transcript_line(&call, crate::db::AgentUsageModel::OPUS, &mut told)
+        let (_, second, _) = assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();
         let TranscriptLine::Assistant {
@@ -509,25 +475,28 @@ mod tests {
 
     #[test]
     fn a_thinking_only_block_is_no_line() {
-        let row = row(
-            rho_claude::SessionMessageKind::Assistant,
-            json!({"role": "assistant", "id": "msg_2", "content": [{"type": "thinking", "thinking": "hmm"}]}),
+        assert_eq!(
+            assistant_line(
+                json!({"role": "assistant", "id": "msg_2", "content": [{"type": "thinking", "thinking": "hmm"}]})
+            ),
+            None
         );
-        assert_eq!(line(&row), None);
     }
 
     #[test]
     fn a_compaction_boundary_is_compacted() {
-        let row = rho_claude::TranscriptRow::CompactBoundary {
-            uuid: uuid::uuid!("00000000-0000-4000-8000-000000000003"),
+        let metadata = SystemCompactMetadata {
+            trigger: None,
+            pre_tokens: Some(9000),
             post_tokens: Some(2000),
-            timestamp: None,
         };
+        let (uuid, line, _) = compacted_row(Some(UUID), Some(&metadata));
+        assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
         assert_eq!(
-            line(&row),
-            Some(TranscriptLine::Compacted {
+            line,
+            TranscriptLine::Compacted {
                 context_used: Some(2000)
-            })
+            }
         );
     }
 

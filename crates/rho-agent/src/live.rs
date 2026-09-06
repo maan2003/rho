@@ -4,7 +4,7 @@
 //! reader diffing snapshots.
 
 use rho_core::{AStr, Diff, StreamingContextItem, StreamingContextItemState};
-use rho_ui_proto::mirror::{Item, Live, TextPhase};
+use rho_ui_proto::mirror::{Item, Live, QueuedItem, TextPhase};
 
 use crate::AgentStateKind;
 
@@ -18,6 +18,8 @@ pub struct Teller {
     failures: u64,
     /// Per index, the item as last told; `None` where nothing was.
     items: Vec<Option<StreamingContextItem>>,
+    /// The queue as last told; `None` before the first tell.
+    queue: Option<Vec<QueuedItem>>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -30,6 +32,18 @@ enum Phase {
 impl Teller {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// The queue, whole, when it differs from what was last told. For a
+    /// loop whose queue is live rather than rows (Claude).
+    pub fn tell_queue(&mut self, queue: &[QueuedItem]) -> Option<Live> {
+        if self.queue.as_deref() == Some(queue) {
+            return None;
+        }
+        self.queue = Some(queue.to_vec());
+        Some(Live::Queued {
+            items: queue.to_vec(),
+        })
     }
 
     /// What changed since the last tell. Every phase message empties the
@@ -443,5 +457,31 @@ mod tests {
         assert_eq!(teller.tell(&AgentStateKind::Idle), vec![]);
         teller.reset();
         assert_eq!(teller.tell(&AgentStateKind::Idle), vec![Live::Idle]);
+    }
+
+    #[test]
+    fn the_queue_is_told_once_per_change_and_again_for_a_joiner() {
+        let mut teller = Teller::default();
+        let queue = vec![QueuedItem::Message {
+            from: None,
+            text: "later".to_owned(),
+            delivery: rho_core::MessageDelivery::NextRequest,
+        }];
+        assert_eq!(
+            teller.tell_queue(&queue),
+            Some(Live::Queued {
+                items: queue.clone()
+            })
+        );
+        assert_eq!(teller.tell_queue(&queue), None);
+        assert_eq!(
+            teller.tell_queue(&[]),
+            Some(Live::Queued { items: Vec::new() })
+        );
+        teller.reset();
+        assert_eq!(
+            teller.tell_queue(&[]),
+            Some(Live::Queued { items: Vec::new() })
+        );
     }
 }

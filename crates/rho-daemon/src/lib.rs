@@ -364,6 +364,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
+    // One-off (7 Sep), before any agent loop can append: every Claude
+    // log the file copier wrote is rebuilt from its session file.
+    let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db).await;
+    eprintln!(
+        "rho daemon: rebuilt {} Claude logs from their session files, closed {} queues without one (one-off)",
+        rebuilt.rebuilt, rebuilt.closed
+    );
     let inference = Inference::new(db.clone()).await?;
     let path_overrides = PathOverrides {
         before: args

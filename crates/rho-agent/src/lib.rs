@@ -29,6 +29,7 @@ use crate::db::{
 pub mod agent;
 mod claude;
 pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
+pub use claude::rebuild;
 
 pub mod db;
 mod image_tool;
@@ -127,16 +128,15 @@ pub enum AgentEvent<'a> {
         at: UnixMs,
     },
 
-    /// One line of Claude Code's transcript, as Rho read it. The file is
-    /// the Claude runtime's history; these rows are Rho's copy of the
-    /// lines a reader sees, cheap to sync and bound to the file by a
-    /// cursor (`AGENT-LOG-DESIGN.md`). Written from the file alone, never
-    /// from the stream, so a restart and a live run agree.
+    /// One line of the conversation, as the Claude runtime's stream told
+    /// it: a finished content block, a person's message (Claude's echo
+    /// of a send), a call's results, a compaction. Rows before 7 Sep
+    /// were copied from Claude Code's session file instead and carried
+    /// their offset in it, a field a decoder now skips.
     Transcript {
-        /// The line's uuid in the file.
+        /// The line's uuid, the same Claude Code's session file gives it
+        /// (a rewind forks the session there).
         uuid: uuid::Uuid,
-        /// Where the line starts in the file.
-        offset: u64,
         line: TranscriptLine,
         at: UnixMs,
     },
@@ -252,7 +252,7 @@ pub enum PresentationSpeaker {
 }
 
 /// What one transcript line says, as far as a reader needs. Bodies are
-/// whole: the wire strips them, the file keeps them.
+/// whole: the wire strips them.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum TranscriptLine {
     /// The person spoke (an agent's mail reaches Claude the same way).
@@ -726,7 +726,6 @@ mod encoding_tests {
             },
             AgentEvent::Transcript {
                 uuid: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
-                offset: 1234,
                 line: TranscriptLine::Assistant {
                     text: "read it".to_owned(),
                     calls: vec![TranscriptCall {

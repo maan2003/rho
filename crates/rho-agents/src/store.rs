@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{Item, Live};
+use rho_ui_proto::mirror::{Item, Live, QueuedItem};
 
 use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
@@ -92,6 +92,9 @@ impl Layered {
                 .flatten()
                 .map(|item| Arc::new(block(item))),
         );
+        self.state
+            .blocks
+            .extend(self.tail.queue.iter().cloned().map(Arc::new));
         self.state.status = match self.tail.phase {
             Phase::Requesting => UiAgentStatus::Streaming,
             Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
@@ -110,6 +113,9 @@ impl Layered {
                 .flatten()
                 .map(|item| Arc::new(block(item))),
         );
+        state
+            .blocks
+            .extend(self.tail.queue.iter().cloned().map(Arc::new));
         state.status = match self.tail.phase {
             Phase::Requesting => UiAgentStatus::Streaming,
             Phase::Waiting(until) => UiAgentStatus::ToolCalling { waiting: until },
@@ -127,6 +133,9 @@ struct Tail {
     phase: Phase,
     /// By the runtime's index; `None` where nothing was told.
     items: Vec<Option<Item>>,
+    /// What the runtime holds for later, told whole whenever it changes.
+    /// Live state, not rows: it outlives the phase and the items.
+    queue: Vec<UiBlock>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -173,7 +182,27 @@ impl Tail {
                 self.phase = Phase::Idle;
                 self.items.clear();
             }
+            Live::Queued { items } => {
+                self.queue = items.into_iter().map(queued_block).collect();
+            }
         }
+    }
+}
+
+fn queued_block(item: QueuedItem) -> UiBlock {
+    match item {
+        QueuedItem::Message {
+            from,
+            text,
+            delivery,
+        } => UiBlock::QueuedMessage {
+            text,
+            delivery,
+            sender: from,
+        },
+        QueuedItem::Compaction => UiBlock::Notice {
+            text: "compacting context".to_string(),
+        },
     }
 }
 
@@ -347,7 +376,7 @@ fn summarize(old: &[Arc<UiBlock>], new: &[Arc<UiBlock>]) -> FrameSummary {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::AgentIdDomain;
+    use rho_ui_proto::{AgentIdDomain, MessageDelivery};
 
     use super::*;
 
@@ -367,6 +396,61 @@ mod tests {
                 .collect(),
             ..empty_state()
         }
+    }
+
+    #[test]
+    fn a_live_queue_trails_the_tail_and_outlives_the_phase() {
+        let mut store = AgentStore::default();
+        store.set_fold(agent(), fold(&["one"]));
+        let queued = QueuedItem::Message {
+            from: None,
+            text: "later".to_owned(),
+            delivery: MessageDelivery::NextRequest,
+        };
+        let summary = store.apply_live(
+            agent(),
+            Live::Queued {
+                items: vec![queued.clone()],
+            },
+        );
+        assert_eq!(summary.first_changed_block, Some(1));
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(
+            *state.blocks[1],
+            UiBlock::QueuedMessage {
+                text: "later".to_owned(),
+                delivery: MessageDelivery::NextRequest,
+                sender: None,
+            }
+        );
+
+        // The response streams in before the queue, which stays put.
+        store.apply_live(agent(), Live::Requesting);
+        store.apply_live(
+            agent(),
+            Live::Item {
+                index: 0,
+                item: Item::Text {
+                    text: "two".to_owned(),
+                    phase: None,
+                },
+            },
+        );
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 3);
+        assert!(matches!(*state.blocks[1], UiBlock::AssistantMessage { .. }));
+        assert!(matches!(*state.blocks[2], UiBlock::QueuedMessage { .. }));
+
+        // The turn ends; the queue is still there until it is told empty.
+        store.set_fold(agent(), fold(&["one", "two"]));
+        store.apply_live(agent(), Live::Idle);
+        let state = store.get(&agent()).unwrap();
+        assert_eq!(state.blocks.len(), 3);
+        assert!(matches!(*state.blocks[2], UiBlock::QueuedMessage { .. }));
+        let summary = store.apply_live(agent(), Live::Queued { items: vec![] });
+        assert_eq!(summary.first_changed_block, Some(2));
+        assert_eq!(store.get(&agent()).unwrap().blocks.len(), 2);
     }
 
     #[test]

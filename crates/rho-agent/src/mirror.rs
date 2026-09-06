@@ -501,7 +501,6 @@ mod tests {
     fn an_older_rows_compaction_summary_is_not_told() {
         let summary = AgentEvent::Transcript {
             uuid: uuid::Uuid::nil(),
-            offset: 0,
             line: crate::TranscriptLine::User {
                 text: "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.".to_owned(),
             },
@@ -510,7 +509,6 @@ mod tests {
         assert_eq!(strip(&summary), None);
         let spoken = AgentEvent::Transcript {
             uuid: uuid::Uuid::nil(),
-            offset: 0,
             line: crate::TranscriptLine::User {
                 text: "This session is fine".to_owned(),
             },

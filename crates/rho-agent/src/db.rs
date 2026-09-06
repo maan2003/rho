@@ -41,8 +41,6 @@ const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
 const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("journal");
 /// Where each Claude agent's transcript rows stop: the session file they
 /// came from and one past the last line copied. Written with the rows.
-const CLAUDE_TRANSCRIPT_CURSORS: TableDefinition<AgentId, Sen<ClaudeTranscriptCursor>> =
-    TableDefinition::new("claude_transcript_cursors");
 const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
@@ -370,16 +368,6 @@ pub struct AgentHead {
     pub last_turn_ended: Option<UnixMillis>,
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
-}
-
-/// Where a Claude agent's `Transcript` rows stop: which session file they
-/// were read from, and one past the last line copied. A file shorter than
-/// `end`, or another session, means the rows are read again from the
-/// start (`claude.rs`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct ClaudeTranscriptCursor {
-    pub session_id: Uuid,
-    pub end: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -786,8 +774,6 @@ pub trait AgentReadTxnExt {
     ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
     /// How far the journal runs; zero when nothing has been appended.
     fn journal_head(&self) -> Seq;
-    /// Where the agent's transcript rows stop, if any were ever copied.
-    fn claude_transcript_cursor(&self, agent_id: AgentId) -> Option<ClaudeTranscriptCursor>;
     /// Journal entries after `since`, at most `limit`, with the rows they
     /// name.
     fn journal_since(
@@ -823,12 +809,6 @@ pub trait AgentWriteTxnExt {
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
     fn set_agent_claude_rewind(&mut self, agent_id: AgentId, rewind: Option<ClaudeRewind>);
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid);
-    /// Where the agent's transcript rows stop now. Written in the same
-    /// transaction as the rows it accounts for.
-    fn set_claude_transcript_cursor(&mut self, agent_id: AgentId, cursor: &ClaudeTranscriptCursor);
-    /// The cursor as this transaction sees it, for a writer checking that
-    /// no one moved it since its read.
-    fn claude_transcript_cursor(&mut self, agent_id: AgentId) -> Option<ClaudeTranscriptCursor>;
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
@@ -1077,12 +1057,6 @@ impl AgentReadTxnExt for ReadTxn {
         selected
     }
 
-    fn claude_transcript_cursor(&self, agent_id: AgentId) -> Option<ClaudeTranscriptCursor> {
-        self.open_table(CLAUDE_TRANSCRIPT_CURSORS)
-            .get(&agent_id)
-            .map(|value| value.value().into_owned())
-    }
-
     fn journal_head(&self) -> Seq {
         Seq(self
             .open_table(JOURNAL)
@@ -1198,7 +1172,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(AGENT_LOG);
         self.open_table(JOURNAL);
-        self.open_table(CLAUDE_TRANSCRIPT_CURSORS);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
@@ -1289,17 +1262,6 @@ impl AgentWriteTxnExt for WriteTxn {
                 at: UnixMillis::now(),
             },
         );
-    }
-
-    fn set_claude_transcript_cursor(&mut self, agent_id: AgentId, cursor: &ClaudeTranscriptCursor) {
-        self.open_table(CLAUDE_TRANSCRIPT_CURSORS)
-            .insert(&agent_id, SenValue::borrowed(cursor));
-    }
-
-    fn claude_transcript_cursor(&mut self, agent_id: AgentId) -> Option<ClaudeTranscriptCursor> {
-        self.open_table(CLAUDE_TRANSCRIPT_CURSORS)
-            .get(&agent_id)
-            .map(|value| value.value().into_owned())
     }
 
     fn alloc_agent_id(&mut self) -> AgentId {

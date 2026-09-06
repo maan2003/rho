@@ -564,14 +564,9 @@ impl TranscriptFold {
                     );
                 }
             }
-            // Claude's transcript is mirrored message by message; the
-            // queued copy of the same text is what it confirms.
+            // Claude's transcript is mirrored message by message. Its queue
+            // is live state (Claude Code never persists one), never rows.
             MirrorEvent::ClaudeMessage { speaker, text, .. } => {
-                if let Some(index) = self.queue.iter().position(|(_, queued)| {
-                    matches!(queued, UiBlock::QueuedMessage { text: queued, .. } if queued.trim() == text.trim())
-                }) {
-                    self.queue.remove(index);
-                }
                 self.push(
                     pos,
                     match speaker {

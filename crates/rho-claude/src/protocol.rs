@@ -195,6 +195,7 @@ pub struct AssistantMessage {
     pub message: AssistantConversationMessage,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
+    pub timestamp: Option<String>,
 }
 
 impl AssistantMessage {
@@ -213,9 +214,12 @@ impl AssistantMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssistantConversationMessage {
+    /// The API message's id; every block of the message carries it.
+    pub id: Option<String>,
     pub role: Option<Role>,
     #[serde(default)]
     pub content: Vec<AssistantContent>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -444,7 +448,7 @@ pub enum ContentBlockDelta {
     Other,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -453,7 +457,7 @@ pub struct TokenUsage {
     pub cache_creation: Option<CacheCreationUsage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CacheCreationUsage {
     pub ephemeral_5m_input_tokens: Option<u64>,
     pub ephemeral_1h_input_tokens: Option<u64>,
@@ -488,6 +492,7 @@ pub struct UserOutputMessage {
     pub is_replay: Option<bool>,
     #[serde(rename = "isSynthetic")]
     pub is_synthetic: Option<bool>,
+    pub timestamp: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -508,6 +513,9 @@ pub enum OutputContent {
         content: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+    },
+    Image {
+        source: Value,
     },
     #[serde(other)]
     Other,
