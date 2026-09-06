@@ -29,6 +29,7 @@ use gpui::{
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agents::TranscriptFrame;
+use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
 use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
@@ -46,7 +47,7 @@ use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::ActiveAgents;
 use crate::registry::{ActivePane, AgentRegistry, HostId};
-use crate::store::{AgentStore, FrameSummary};
+use crate::store::FrameSummary;
 #[cfg(test)]
 use crate::style::RoleFamily;
 use crate::style::StyleClass;
@@ -2612,6 +2613,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// What the map says about the label in the start field. The map is
+    /// still the shell's; `rho-agents` is handed the answer, not the map.
+    fn start_base(&self, target: &str) -> StartBase {
+        let agent = self.registry.agent_by_label(target);
+        StartBase {
+            host: agent.and_then(|agent_id| self.host_of(agent_id)),
+            workspace: agent
+                .and_then(|agent_id| self.registry.agent_workspace(agent_id))
+                .cloned(),
+        }
+    }
+
     /// Why a submission did not become an agent. The echo area says it once,
     /// and the draft keeps it: a refusal the reader has to act on outlives
     /// the two seconds an echo lasts.
@@ -2647,7 +2660,7 @@ impl Workspace {
         let working_directory = if field.is_empty() {
             self.draft_default_workdir()
         } else {
-            match self.resolve_workdir(&field) {
+            match rho_agents::create::resolve_workdir(&self.hosts, &field) {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -2659,7 +2672,14 @@ impl Workspace {
             let draft = self.draft_model.read(cx);
             let mode = draft.start_mode();
             let target = draft.start_text(cx).trim().to_owned();
-            match self.parse_start(mode, &target, working_directory, None) {
+            match parse_start(
+                &self.hosts,
+                mode,
+                &target,
+                working_directory,
+                None,
+                self.start_base(&target),
+            ) {
                 Ok(start) => start,
                 Err(message) => {
                     self.refuse_draft(&message, cx);
@@ -2805,149 +2825,6 @@ impl Workspace {
     /// only meaningful for Join — your own checkout. Agent targets carry their
     /// own repo; `workdir` is only needed (and only checked) for the other
     /// arms.
-    fn parse_start(
-        &self,
-        mode: crate::draft_view::StartFieldMode,
-        target: &str,
-        workdir: Option<HostPath>,
-        selected_host: Option<HostId>,
-    ) -> Result<(HostId, rho_ui_proto::StartMode), String> {
-        use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
-
-        use crate::draft_view::StartFieldMode;
-        let require_workdir = || {
-            workdir.clone().ok_or_else(|| {
-                "no working directory for the new agent: type one in the \
-                 Workdir field, or register one with :projects add <path>"
-                    .to_owned()
-            })
-        };
-        // An agent target settles the host by itself: the new agent shares
-        // that agent's repository, which only exists on that agent's daemon.
-        // Where the workdir also names a host, the two must agree — nothing
-        // downstream could reconcile a checkout on one machine with a base
-        // revision on another.
-        let base_agent = self.registry.agent_by_label(target);
-        let base_host = base_agent.and_then(|agent_id| self.host_of(agent_id));
-        if let Some(selected) = selected_host {
-            if let Some(workdir) = &workdir
-                && workdir.host != selected
-            {
-                return Err("the selected project belongs to a different host".to_owned());
-            }
-            if let Some(base) = base_host
-                && base != selected
-            {
-                return Err(format!(
-                    "`{target}` is on {}, not the selected host {}",
-                    self.hosts.host_label(base),
-                    self.hosts.host_label(selected),
-                ));
-            }
-        }
-        let host = match (base_host, &workdir) {
-            (Some(base), Some(workdir)) if base != workdir.host => {
-                return Err(format!(
-                    "`{target}` is on {}, but the working directory is on {}: \
-                     an agent cannot start from a base on another host",
-                    self.hosts.host_label(base),
-                    self.hosts.host_label(workdir.host),
-                ));
-            }
-            (Some(base), _) => base,
-            (None, Some(workdir)) => workdir.host,
-            (None, None) => selected_host
-                .or_else(|| self.hosts.primary())
-                .ok_or_else(|| "not connected to rho-daemon".to_owned())?,
-        };
-        let workspace = base_agent
-            .and_then(|agent_id| self.registry.agent_workspace(agent_id))
-            .cloned();
-        let start = match (mode, target, workspace) {
-            (StartFieldMode::Sandbox, "", _) => {
-                return Err("pick a sandbox base: a revset like `@-` or an agent label".to_owned());
-            }
-            (
-                StartFieldMode::Sandbox,
-                _,
-                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-            ) => StartMode::Sandbox {
-                repo,
-                revset: format!("{}@", id.encoded()),
-            },
-            (StartFieldMode::Sandbox, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-                StartMode::Sandbox {
-                    repo,
-                    revset: "@".to_owned(),
-                }
-            }
-            (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
-                repo: require_workdir()?.path,
-                revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
-                    crate::draft_view::AUTO_BASE_REVSET
-                } else {
-                    target
-                }
-                .to_owned(),
-            },
-            (StartFieldMode::NewOn, "", _) => {
-                return Err("pick a base: a revset like `@-` or an agent label".to_owned());
-            }
-            (
-                StartFieldMode::NewOn,
-                _,
-                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-            ) => StartMode::NewOn {
-                repo,
-                revset: format!("{}@", id.encoded()),
-            },
-            // An agent in the user's checkout works on the user's own change.
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-                StartMode::NewOn {
-                    repo,
-                    revset: "@".to_owned(),
-                }
-            }
-            (StartFieldMode::NewOn, _, None) => {
-                if target.eq_ignore_ascii_case("user") {
-                    return Err("`user` is a join target; base on a revset like `@-`, \
-                         or Shift-Tab to Join mode"
-                        .to_owned());
-                }
-                if target
-                    .strip_prefix('@')
-                    .is_some_and(|label| label.starts_with('a'))
-                {
-                    return Err(format!("no agent named `{target}`"));
-                }
-                StartMode::NewOn {
-                    repo: require_workdir()?.path,
-                    revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
-                        crate::draft_view::AUTO_BASE_REVSET
-                    } else {
-                        target
-                    }
-                    .to_owned(),
-                }
-            }
-            (StartFieldMode::Join, _, Some(workspace)) => {
-                StartMode::Join(JoinTarget::Workspace(workspace))
-            }
-            (StartFieldMode::Join, target, None) => {
-                if target.is_empty() || target.eq_ignore_ascii_case("user") {
-                    StartMode::Join(JoinTarget::User {
-                        repo: require_workdir()?.path,
-                    })
-                } else {
-                    return Err(format!(
-                        "join target must be `user` or an agent label, not `{target}`"
-                    ));
-                }
-            }
-        };
-        Ok((host, start))
-    }
-
     /// Every command a transient can run goes through one of these
     /// `cmd_*` methods: no textual grammar, no dispatch enum — the menu
     /// item closure is the command.
@@ -3378,7 +3255,7 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let workdir = match self.resolve_workdir(&path) {
+        let workdir = match rho_agents::create::resolve_workdir(&self.hosts, &path) {
             Ok(workdir) => workdir,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3968,13 +3845,14 @@ impl Workspace {
     ) {
         match working_directory {
             Some(argument) => {
-                let workdir = match self.resolve_workdir(argument.as_str()) {
-                    Ok(workdir) => workdir,
-                    Err(message) => {
-                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                };
+                let workdir =
+                    match rho_agents::create::resolve_workdir(&self.hosts, argument.as_str()) {
+                        Ok(workdir) => workdir,
+                        Err(message) => {
+                            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                            return;
+                        }
+                    };
                 let label = self.hosts.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
@@ -4251,49 +4129,6 @@ impl Workspace {
         Some(HostPath {
             host: self.host_of(agent_id)?,
             path: self.registry.working_directory(agent_id)?,
-        })
-    }
-
-    /// How a workdir reads in the draft header: its registered project name
-    /// when it has one, else the full path — qualified by host whenever more
-    /// than one daemon could be meant.
-    /// Resolves a workdir argument to a directory on a specific daemon. A
-    /// registered project name resolves to its registration; anything else
-    /// is a raw daemon-side path, which may name its host as `fern:/src/rho`.
-    /// Paths name directories on the daemon's machine, so the GUI never
-    /// joins its own cwd or expands its own home — the daemon expands `~`
-    /// and validates.
-    fn resolve_workdir(&self, argument: &str) -> Result<HostPath, String> {
-        if let Some(registered) = self.hosts.registered_workdir(argument) {
-            return Ok(registered);
-        }
-        // A Windows-style drive letter is not a thing on a daemon host, so a
-        // colon before any separator is unambiguously a host prefix.
-        if let Some((name, path)) = argument.split_once(':')
-            && !name.contains('/')
-        {
-            let host = self
-                .hosts
-                .by_name(name)
-                .ok_or_else(|| format!("no attached host named `{name}`"))?;
-            return Ok(HostPath {
-                host: host.id,
-                path: Utf8PathBuf::from(path),
-            });
-        }
-        let host = match self.hosts.len() {
-            0 => return Err("not connected to rho-daemon".to_owned()),
-            1 => self.hosts.iter().next().expect("one host").id,
-            _ => {
-                return Err(format!(
-                    "`{argument}` does not say which host: write `<host>:{argument}` \
-                     or use a registered project name"
-                ));
-            }
-        };
-        Ok(HostPath {
-            host,
-            path: Utf8PathBuf::from(argument),
         })
     }
 
@@ -9668,106 +9503,6 @@ pub(crate) fn resolve_filing_destination(
         .map(|(_, _, host, node_id)| (*host, node_id.clone()))
 }
 
-fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "" | "eng" => Ok(AgentRole::default()),
-        "eng-mini" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-        }),
-        "eng-low" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
-        }),
-        "eng-cheap" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-        }),
-        "eng-high" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-        }),
-        "eng-ultra" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
-        }),
-        "eng-alt" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Alt,
-        }),
-        "eng-gemini" => Ok(AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Gemini,
-        }),
-        other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, or eng-gemini"
-        )),
-    }
-}
-
-fn cycle_agent_role_text(current: &str) -> &'static str {
-    match parse_agent_role(current).unwrap_or_default() {
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Mini,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Mini,
-            ..
-        } => "eng-low",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Low,
-            ..
-        } => "eng-cheap",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Cheap,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Cheap,
-            ..
-        } => "eng",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Medium,
-            ..
-        } => "eng-high",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::High,
-            ..
-        } => "eng-ultra",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Ultra,
-            ..
-        } => "eng-alt",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Alt,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Alt,
-            ..
-        } => "eng-gemini",
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Gemini,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Gemini,
-            ..
-        } => "pm",
-        AgentRole::Advisor { .. } => "eng",
-    }
-}
-
 #[cfg(test)]
 struct RoleLabel {
     text: String,
@@ -10498,25 +10233,6 @@ pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_agent_role() {
-        assert_eq!(
-            parse_agent_role("eng-low").unwrap(),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Low,
-            }
-        );
-        assert_eq!(
-            parse_agent_role("eng-gemini").unwrap(),
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Gemini,
-            }
-        );
-        assert!(parse_agent_role("pm ultra").is_err());
-        assert!(parse_agent_role("eng-ultra-fast").is_err());
-        assert!(parse_agent_role("advisor high").is_err());
-    }
 
     #[test]
     fn labels_agent_role() {

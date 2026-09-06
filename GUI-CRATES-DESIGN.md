@@ -68,6 +68,19 @@ connection to the screen, tested alone against its own fake server.
   the events handed in, so this cut does not drag the model thread with it;
   it follows with (4). Three tests run the crate alone. Gate green: rho-gui
   277, rho-agents 3, rho-hosts 14, rho-registry 14.
+
+  *Landed, creation (6).* What a draft means is the crate's: the start
+  modes and the base they stand for, the role names and the cycle through
+  them, workdir resolution, and `parse_start` — the one place that decides
+  which host a new agent lands on and refuses, in the reader's words, every
+  way the four answers can fail to make one. The screen keeps its buffers
+  and its labels and re-exports the vocabulary rather than defining it. The
+  map's half of a base (which host an agent label is on, and the workspace
+  it works in) is looked up by the shell and handed in as `StartBase`, so
+  this cut does not pull the map in early; it goes when the map does. Seven
+  tests run the crate alone, including the two-host refusal and the default
+  base, which had no test before. Gate green: rho-gui 276, rho-agents 7,
+  rho-hosts 14, rho-registry 14.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

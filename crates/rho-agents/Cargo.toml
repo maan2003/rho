@@ -11,8 +11,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+camino.workspace = true
+rho-hosts = { workspace = true }
 rho-registry = { workspace = true }
 rho-ui-proto.workspace = true
 
 [dev-dependencies]
 rho-core.workspace = true
+rho-hosts = { workspace = true, features = ["test-support"] }

@@ -34,26 +34,11 @@ const MODE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 
-/// The user-facing name for selecting the first available conventional base.
-pub const DEFAULT_START: &str = "auto";
-/// The jj revset represented by [`DEFAULT_START`].
-pub const AUTO_BASE_REVSET: &str =
-    r#"coalesce(bookmarks(exact:"main"), bookmarks(exact:"master"), trunk())"#;
-pub const DEFAULT_ROLE: &str = "eng";
+// What a draft means — the start modes, the default base and the role
+// names — belongs to `rho-agents`; this screen draws it.
+pub use rho_agents::create::{AUTO_BASE_REVSET, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
 
-/// How the start field's target is interpreted; cycled with Shift-Tab while
-/// the cursor is in the field. The field label shows the current mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartFieldMode {
-    /// A fresh workspace with a new change on top of the target.
-    NewOn,
-    /// The same workspace as the target: shared checkout and namespace.
-    Join,
-    /// A VCS-masked workspace with restricted filesystem and network access.
-    Sandbox,
-}
-
-impl StartFieldMode {
+impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {
         match self {
             Self::NewOn => "On top of: ",
@@ -61,6 +46,12 @@ impl StartFieldMode {
             Self::Sandbox => "Sandbox: ",
         }
     }
+}
+
+/// How a start mode reads in the field label. The mode is the crate's;
+/// the words in front of it are this screen's.
+trait StartFieldModeLabel {
+    fn label(self) -> &'static str;
 }
 
 pub struct DraftGutter;

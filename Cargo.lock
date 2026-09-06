@@ -13641,7 +13641,9 @@ dependencies = [
 name = "rho-agents"
 version = "0.1.0"
 dependencies = [
+ "camino",
  "rho-core",
+ "rho-hosts",
  "rho-registry",
  "rho-ui-proto",
 ]

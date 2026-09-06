@@ -117,3 +117,19 @@ pub trait HostSink: Send + Sync + 'static {
     /// listening stops rather than dialling again for nothing.
     fn is_closed(&self) -> bool;
 }
+
+/// A sink with no reader: for a `Hosts` that stands in a test for the
+/// shape of an attachment, where nothing dials and nothing listens.
+#[cfg(feature = "test-support")]
+pub struct DroppedSink;
+
+#[cfg(feature = "test-support")]
+impl HostSink for DroppedSink {
+    fn send(&self, _event: HostEvent) -> Result<(), SinkClosed> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
