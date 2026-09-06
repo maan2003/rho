@@ -10,6 +10,7 @@
 //! prompt draft.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use collections::HashSet;
 use editor::display_map::CustomBlockId;
@@ -27,11 +28,10 @@ use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
-use crate::commands::WorkspaceCompletionProvider;
 use crate::store::FrameSummary;
 use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::transcript::TranscriptModel;
-use crate::workspace::Workspace;
+use crate::workspace::now_ms;
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
@@ -51,7 +51,10 @@ pub struct AgentModel {
     attachments: Vec<ContentPart>,
     attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     status_spans: Vec<(String, gpui::HighlightStyle)>,
-    workspace: WeakEntity<Workspace>,
+    /// What an editor over this transcript completes with. Handed in
+    /// rather than reached for: the screen knows there are completions,
+    /// not where they come from.
+    completions: Rc<dyn editor::CompletionProvider>,
     initial_load_started: bool,
     initial_load_ready: bool,
     initial_load: Option<Task<()>>,
@@ -63,9 +66,18 @@ pub struct AgentModel {
     _subscriptions: Vec<Subscription>,
 }
 
+/// What an agent's screen says to whoever opened it. The screen knows
+/// its own state; who cares about it is not its business.
+pub enum AgentModelEvent {
+    /// The transcript is composed and the screen is ready to draw.
+    Loaded(AgentId),
+}
+
+impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
+
 impl AgentModel {
     pub fn new(
-        workspace: WeakEntity<Workspace>,
+        completions: Rc<dyn editor::CompletionProvider>,
         visualization_client: rho_hosts::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -105,7 +117,7 @@ impl AgentModel {
             attachments: Vec::new(),
             attachment_blocks: Vec::new(),
             status_spans: Vec::new(),
-            workspace,
+            completions,
             initial_load_started: false,
             initial_load_ready: false,
             initial_load: None,
@@ -136,7 +148,6 @@ impl AgentModel {
             return;
         }
         self.initial_load_started = true;
-        let workspace = self.workspace.clone();
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
@@ -175,9 +186,9 @@ impl AgentModel {
             {
                 return;
             }
-            let _ = workspace.update(cx, |workspace, cx| {
-                workspace.finish_initial_agent_load(agent_id, cx)
-            });
+            // Whoever opened this agent is told the transcript is ready;
+            // the screen does not know who that is.
+            let _ = this.update(cx, |_, cx| cx.emit(AgentModelEvent::Loaded(agent_id)));
         }));
     }
 
@@ -210,8 +221,7 @@ impl AgentModel {
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
             editor
         });
-        self.transcript
-            .attach(&editor, crate::workspace::now_ms(), cx);
+        self.transcript.attach(&editor, now_ms(), cx);
         self.preview_editor = Some(editor.clone());
         editor
     }
@@ -225,7 +235,7 @@ impl AgentModel {
     /// Builds an editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        let workspace = self.workspace.clone();
+        let completions = self.completions.clone();
         let multi_buffer = self.multi_buffer.clone();
         let prompt_id = self.prompt_buffer.read(cx).remote_id();
         let editor = cx.new(|cx| {
@@ -243,9 +253,7 @@ impl AgentModel {
             crate::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(prompt_id, cx);
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace, None, None, None,
-            )));
+            editor.set_completion_provider(Some(completions));
             editor
         });
 
@@ -263,8 +271,7 @@ impl AgentModel {
             });
         }
 
-        self.transcript
-            .attach(&editor, crate::workspace::now_ms(), cx);
+        self.transcript.attach(&editor, now_ms(), cx);
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_prompt_chrome_to(&editor, cx);

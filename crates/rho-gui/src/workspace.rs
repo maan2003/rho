@@ -493,6 +493,9 @@ pub struct Workspace {
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
+    /// One per agent screen, for as long as the screen lives: what it says
+    /// when its transcript is ready.
+    agent_model_subscriptions: Vec<gpui::Subscription>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
     pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
     /// What the finder's highlighted row opens, carried from the prompt to
@@ -551,12 +554,25 @@ impl Workspace {
         let model = if let Some(model) = self.models.get(&agent_id).cloned() {
             model
         } else {
-            let workspace = cx.entity().downgrade();
+            let completions = crate::commands::WorkspaceCompletionProvider::new(
+                cx.entity().downgrade(),
+                None,
+                None,
+                None,
+            );
             let visualization_client = self
                 .connection_for(agent_id)
                 .map(Connection::visualization_client)
                 .unwrap_or_else(rho_hosts::connection::VisualizationClient::detached);
-            let model = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
+            let model = cx.new(|cx| AgentModel::new(completions, visualization_client, cx));
+            // The screen says when its transcript is composed; what that
+            // means for the rest of the shell is decided here.
+            self.agent_model_subscriptions
+                .push(cx.subscribe(&model, |workspace, _, event, cx| match event {
+                    crate::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                        workspace.finish_initial_agent_load(*agent_id, cx);
+                    }
+                }));
             self.refresh_view_status(&agent_id, &model, cx);
             self.models.insert(agent_id, model.clone());
             model
@@ -1033,6 +1049,7 @@ impl Workspace {
             slack_labels: HashMap::new(),
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
+            agent_model_subscriptions: Vec::new(),
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             pending_find_target: None,
