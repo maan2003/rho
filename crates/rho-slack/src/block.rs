@@ -874,7 +874,6 @@ mod tests {
             is_unfurl: true,
             service: Some("example.com".to_owned()),
             url: Some("https://example.com/post".to_owned()),
-            ..Attachment::default()
         };
         assert_eq!(
             render_message(&[], "worth a read", &[preview], &[], &Roster),

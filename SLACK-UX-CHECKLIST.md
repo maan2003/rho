@@ -321,7 +321,12 @@ done right after the transcript primitive (2.4) and before 2.10:
       in `client.counts` at no extra request. The surface takes the cursor
       once when it opens, so marking the conversation read does not pull
       the rule out from under the reader, and a page of older messages
-      landing above moves the rule up to the oldest unread one. The cursor
+      landing above moves the rule up to the oldest unread one. Corrected
+      2.24: taken once meant taken at construction, so a cursor that landed
+      a moment later — which is every conversation on a restart, and every
+      one that has never been opened — never reached the surface and the
+      rule never appeared. The surface now takes the first cursor it is
+      offered and no later one. The cursor
       opens on the first unread line; a conversation with nothing new opens
       on the composer, and a reader already typing keeps their cursor.
       `G` still goes to the end. Screens `21-01-unread-rule`, `21-02-end`.
@@ -333,6 +338,10 @@ done right after the transcript primitive (2.4) and before 2.10:
       holds this loosely; different read semantics may come later, so keep
       the mark call in one place.
       Landed: `Session::open` fetches with `mark_read`, and `mark_read` is the one call that marks (`session.rs`).
+      Corrected 2.24: a thread is marked as a thread. `mark_read` used to
+      send `conversations.mark` whatever the surface was, and a reply's
+      timestamp is a real timestamp in its channel, so reading one thread
+      marked every older message in the channel around it read.
 - [x] 2.3 Following the tail, done 3 Sep: the anchoring landed with 2.4;
       the count is the rest of it. A message arriving at the live end while
       the reader is further up counts; the status line says `3 new` beside
@@ -724,6 +733,39 @@ done right after the transcript primitive (2.4) and before 2.10:
       `mpim` from someone else, or an unread DM in `client.counts` at
       startup, raises the same obligation card as a mention.
 
+- [x] 2.24 Mark read that sticks. The user's report: they read a
+      conversation and it comes back unread. Landed as the first change of
+      the `rho-slack` crate order in `GUI-CRATES-DESIGN.md`. Four things
+      were wrong, and none of them could be caught, because the fake did
+      not have the server behaviour to catch them with.
+      The fake first, as the rule says: `conversations.mark` works the
+      badge out again from what is left above the cursor and pushes the
+      `channel_marked`/`im_marked`/`group_marked` frame Slack sends every
+      client the user is signed in on; `subscriptions.thread.mark` keeps
+      the thread's own cursor and pushes `thread_marked`, and
+      `subscriptions.thread.getView` serves it back; `activity.feed` is
+      newest-first and paged, so a restart has a tail longer than one page
+      to walk back through; and `/control` gained `mark`, which is the user
+      reading on their phone.
+      Then the client. (a) The cursor rises and never falls, so a
+      `channel_marked` that overtakes rho's own request, or a
+      `client.counts` prepared before it, cannot pull the rule back over
+      messages the reader has been through — a reconnect used to re-badge a
+      conversation read a second earlier. (b) A thread's cursor is Slack's
+      per-thread one: reading a thread no longer marks the channel around
+      it read, and `thread_marked` from another client no longer marks the
+      channel either. (c) The cursor is written to the mirror wherever it
+      moves and read back at startup, so the rule is in the right place
+      before the network answers and at all when offline; Slack's cursor
+      still overtakes it the moment the counts land. (d) The surface takes
+      the first cursor it is offered rather than only the one that existed
+      when it was built. Proofs: the badge after a mark and the same asked
+      of the server, a mark from the phone landing here and surviving the
+      reconnect, the rule after a restart with Slack overtaking it, a
+      thread read leaving its channel alone, a mark short of the newest
+      message leaving the badge standing, and the feed walked back through
+      its pages.
+
 ## Phase 3: composing
 
 - [x] 3.1 Composer boundary. Now a bare line under the last message. Rho:
@@ -882,8 +924,12 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 ## Still deferred
 
-Adding reactions, file upload, edit and delete, presence and typing, message
-search, automatic token extraction, dialogs and modals.
+Presence and typing, automatic token extraction, dialogs and modals.
+
+File upload, edit and delete have since been built. Adding reactions and
+message search are no longer deferred: they are items 3 and 4 of the
+`rho-slack` order in `GUI-CRATES-DESIGN.md`, where what a client owes the
+user is now settled.
 
 ## Done means
 

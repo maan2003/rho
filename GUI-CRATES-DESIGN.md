@@ -89,6 +89,33 @@ connection to the screen, tested alone against its own fake server.
   mirror. Read state: Slack's own cursor is the truth for reading and is
   written back when the user reads here; Rho's `SlackHandledThrough`
   stays the dealing cursor only. Owner: eng-bgwk.
+  Order, set 6 Sep after the inventory: the crate already had the list, the
+  thread view, compose and reply, and reactions on screen, so the work is
+  (1) mark read that sticks, (2) the card rule into the crate as Slack's own
+  notion of attention, which is the flood fix, (3) adding reactions, (4)
+  search, (5) the keys and the card-handing out of `rho-gui/src/slack.rs`,
+  once `rho-window` exists.
+  *1 landed.* Mark read that sticks. The fake first, because none of the
+  four client bugs could be caught without the server behaviour to catch
+  them with: `conversations.mark` works the badge out again from what is
+  left above the cursor and pushes the frame Slack sends every client the
+  user is signed in on; `subscriptions.thread.mark` keeps the thread's own
+  cursor, serves it back through `getView`, and pushes `thread_marked`;
+  `activity.feed` is newest-first and paged; `/control` gained `mark`, which
+  is the user reading on their phone. Then the client: the cursor rises and
+  never falls, so a reconnect cannot re-badge a conversation read a second
+  earlier; a thread is marked as a thread, so reading one no longer marks
+  the channel around it read; the cursor is written to the mirror wherever
+  it moves and read back at startup, so the unread rule is in place before
+  the network answers and at all when offline, with Slack's cursor still
+  overtaking it the moment the counts land; and a surface takes the first
+  cursor it is offered rather than only the one that existed when it was
+  built, which is why a restart used to show no rule at all. The read-state
+  rule above is unchanged and is now what the code does: Slack's cursor is
+  the truth, the mirror is a head start and never a second opinion, and
+  `SlackHandledThrough` was not touched. Six proofs against the fake, one
+  of them replacing a test that had been asserting the bug. Gate green:
+  rho-slack 144.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is

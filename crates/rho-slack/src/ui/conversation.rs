@@ -26,7 +26,7 @@ use theme::ActiveTheme as _;
 
 use crate::model::Model;
 use crate::session::{Session, Source, Update};
-use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, IMAGE_ROWS, Message, ThreadKey, Ts};
+use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
 
 /// The composer's placeholder, which is the only custom inlay this surface
@@ -375,16 +375,8 @@ impl ConversationView {
         };
         view.transcript.attach(&view.editor.clone(), cx);
         session.update(cx, |session, cx| session.open(&source, cx));
-        // Read before the open's own mark can land, and only for a
-        // conversation: a thread's read cursor is Slack's per-thread one,
-        // which is a different fact.
-        if matches!(source, Source::Conversation(_)) {
-            view.unread_from = session
-                .read(cx)
-                .model()
-                .last_read(source.channel())
-                .cloned();
-        }
+        // Read before the open's own mark can land.
+        view.adopt_cursor(cx);
         view.apply_compose_chrome(cx);
         view.refresh(window, cx);
         // A conversation with nothing new opens on the composer, which is
@@ -539,8 +531,7 @@ impl ConversationView {
         let Some(message) = self
             .shown_messages(cx)
             .into_iter()
-            .filter(|message| message.user.as_ref() == Some(&self_id))
-            .next_back()
+            .rfind(|message| message.user.as_ref() == Some(&self_id))
         else {
             return EditStart::Nothing;
         };
@@ -848,12 +839,35 @@ impl ConversationView {
         self.refresh(window, cx);
     }
 
-    /// Puts the cursor on the dealt message once it is in the transcript.
+    /// Takes the session's read cursor for this surface, but only while the
+    /// surface has none of its own.
+    ///
+    /// Both halves matter. A cursor can land after the surface opened — the
+    /// mirror has none for a conversation opened for the first time, and
+    /// `client.counts` answers a moment later — and a surface that read it
+    /// once at construction would show no rule at all for the whole of that
+    /// conversation's life. And once a rule is drawn it is the reader's
+    /// place in the conversation: a mark arriving from the phone, or rho's
+    /// own mark on the way out, must not pull it out from under them.
+    fn adopt_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.unread_from.is_some() {
+            return;
+        }
+        let session = self.session.read(cx);
+        self.unread_from = match &self.source {
+            Source::Conversation(channel) => session.model().last_read(channel).cloned(),
+            // A thread's cursor is Slack's per-thread one, a different fact
+            // from the cursor on the conversation it hangs in.
+            Source::Thread(key) => session.model().thread_last_read(key).cloned(),
+        };
+    }
+
     /// Keeps `── new ──` above the first message the reader has not seen.
     /// The anchor is recomputed rather than remembered because a page of
     /// older messages can land above it, and the rule belongs over the
     /// oldest unread one, not over whichever was first on screen.
     fn refresh_unread(&mut self, cx: &mut Context<Self>) {
+        self.adopt_cursor(cx);
         let Some(from) = self.unread_from.clone() else {
             return;
         };
@@ -919,6 +933,7 @@ impl ConversationView {
         self.moved.cursor = Some(self.cursor_row(cx) as u32);
     }
 
+    /// Puts the cursor on the dealt message once it is in the transcript.
     fn place_dealt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dealt_placed {
             return;
@@ -2327,7 +2342,7 @@ mod tests {
 
     use super::*;
     use crate::WorkspaceName;
-    use crate::types::{ChannelId, UserId};
+    use crate::types::{ChannelId, IMAGE_ROWS, UserId};
 
     fn model() -> Model {
         let mut model = Model::new(WorkspaceName("acme".into()));
@@ -2363,11 +2378,11 @@ mod tests {
         assert_eq!(waiting.line(), "image.png · 320 KB");
     }
 
-    fn render_messages(
-        messages: &[Message],
-        model: &Model,
-        in_thread: bool,
-    ) -> (String, Vec<(Class, Range<usize>)>, Vec<LineMeta>) {
+    /// What a rendered run of messages is: the text, the classes over it,
+    /// and one metadata entry per line.
+    type Rendered = (String, Vec<(Class, Range<usize>)>, Vec<LineMeta>);
+
+    fn render_messages(messages: &[Message], model: &Model, in_thread: bool) -> Rendered {
         let shown = messages
             .iter()
             .filter(|message| in_thread || message.is_top_level());
@@ -2972,7 +2987,8 @@ mod tests {
                 "title_link": "https://example.com/post",
             }],
         }));
-        let (text, styles, lines) = render_messages(&[preview.clone()], &model(), false);
+        let (text, styles, lines) =
+            render_messages(std::slice::from_ref(&preview), &model(), false);
         assert!(
             text.contains("\u{258e} Worth a read · example.com"),
             "the title names the page and the site says where it is: {text}"

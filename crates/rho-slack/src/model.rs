@@ -183,6 +183,12 @@ pub struct Model {
     followed: BTreeSet<ThreadKey>,
     /// The channels the user muted, whichever client they muted them in.
     muted: BTreeSet<ChannelId>,
+    /// Where the reader has read to in each conversation, and in each
+    /// followed thread. Slack keeps these two apart and so does rho: they
+    /// answer different questions, and folding them together marks a
+    /// channel read that nobody has looked at.
+    conversation_read: BTreeMap<ChannelId, Ts>,
+    thread_read: BTreeMap<ThreadKey, Ts>,
 }
 
 impl Names for Model {
@@ -227,6 +233,8 @@ impl Model {
             seen: BTreeSet::new(),
             followed: BTreeSet::new(),
             muted: BTreeSet::new(),
+            conversation_read: BTreeMap::new(),
+            thread_read: BTreeMap::new(),
         }
     }
 
@@ -260,6 +268,12 @@ impl Model {
 
     pub fn conversation(&self, channel: &ChannelId) -> Option<&Conversation> {
         self.conversations.get(channel)
+    }
+
+    /// Every conversation rho knows of, for a caller that has to visit them
+    /// all: seeding the read cursors off the mirror at startup is the case.
+    pub fn conversations(&self) -> Vec<ChannelId> {
+        self.conversations.keys().cloned().collect()
     }
 
     /// How a conversation reads everywhere the user meets it: the list, the
@@ -343,9 +357,25 @@ impl Model {
         self.custom_emoji.contains(name)
     }
 
+    /// Slack's unread bookkeeping, replacing what rho held.
+    ///
+    /// The cursor that comes with it is evidence like any other and goes
+    /// through the one rule, so an answer prepared before rho's own mark
+    /// reached the server cannot walk the unread rule back over messages
+    /// the reader has been through. A reconnect asks for this again, and
+    /// re-badging a conversation the reader read a second ago is the whole
+    /// of "mark read does not stick".
     pub fn set_counts(&mut self, counts: impl IntoIterator<Item = ConversationCount>) {
         for count in counts {
-            self.counts.insert(count.channel.clone(), count);
+            let (channel, cursor) = (count.channel.clone(), count.last_read.clone());
+            self.counts.insert(channel.clone(), count);
+            if let Some(cursor) = cursor {
+                self.mark_read(&channel, &cursor);
+            }
+            // The badge against whichever cursor won, because the one rho
+            // already had may be the newer of the two and `mark_read` says
+            // nothing about a badge when the cursor did not move.
+            self.refresh_badge(&channel);
         }
     }
 
@@ -642,17 +672,25 @@ impl Model {
     /// The follow list as Slack has it, from `subscriptions.thread.getView`
     /// on connect. It replaces whatever rho held: Slack is the truth, and a
     /// thread missing from it is one the user has unfollowed somewhere else.
+    /// Each thread arrives carrying the cursor Slack keeps inside it, which
+    /// is where its unread rule goes: a thread read on the phone is read
+    /// here after a restart because of this and nothing else.
+    ///
     /// Returns the tracked threads the list no longer names: unfollowed in
     /// another client, possibly while rho was away. Their cards are Slack's
     /// to discard.
     pub fn set_followed(
         &mut self,
-        threads: impl IntoIterator<Item = (ChannelId, Ts)>,
+        threads: impl IntoIterator<Item = (ChannelId, Ts, Option<Ts>)>,
     ) -> Vec<ThreadKey> {
-        let now = threads
-            .into_iter()
-            .map(|(channel, thread_ts)| self.key(&channel, &thread_ts))
-            .collect::<BTreeSet<_>>();
+        let mut now = BTreeSet::new();
+        for (channel, thread_ts, last_read) in threads {
+            let key = self.key(&channel, &thread_ts);
+            if let Some(last_read) = last_read {
+                self.mark_thread_read(&key, &last_read);
+            }
+            now.insert(key);
+        }
         let dropped = self
             .followed
             .difference(&now)
@@ -704,25 +742,89 @@ impl Model {
         self.followed.contains(key)
     }
 
-    /// Marks a conversation read locally. Called both when rho reads one and
-    /// when Slack says another client did. Reading is not a verdict: this
-    /// clears the unread counts and leaves every card exactly where it was.
-    pub fn mark_read(&mut self, channel: &ChannelId, ts: &Ts) {
-        if let Some(count) = self.counts.get_mut(channel) {
+    /// Marks a conversation read locally. Called when rho reads one, when
+    /// Slack says another client did, and when the mirror hands back what
+    /// the last run knew. Reading is not a verdict: this moves the cursor
+    /// and the badge and leaves every card exactly where it was.
+    ///
+    /// The cursor only ever rises, like every other fact here. A mark is
+    /// evidence that the user read this far, and a `channel_marked` frame
+    /// that overtakes rho's own request, or a `client.counts` answered
+    /// before it, would otherwise pull the rule back over messages the
+    /// reader has already dealt with.
+    ///
+    /// Returns whether the cursor moved, because the callers that have to
+    /// write it down should not write down a mark that changed nothing.
+    pub fn mark_read(&mut self, channel: &ChannelId, ts: &Ts) -> bool {
+        if self
+            .conversation_read
+            .get(channel)
+            .is_some_and(|held| !ts.is_newer_than(held))
+        {
+            return false;
+        }
+        self.conversation_read.insert(channel.clone(), ts.clone());
+        self.refresh_badge(channel);
+        true
+    }
+
+    /// Clears a conversation's badge once its cursor has caught up with the
+    /// newest message Slack knows about.
+    ///
+    /// The badge says what is still above the cursor, so a mark that did not
+    /// reach the newest message leaves it standing: `mark read before` marks
+    /// at a cutoff, and a conversation with something newer than the cutoff
+    /// has genuinely not been read. Separate from [`Model::mark_read`]
+    /// because a badge can need clearing when the cursor did not move — a
+    /// reconnect re-badging a conversation the reader is already through is
+    /// exactly that case.
+    fn refresh_badge(&mut self, channel: &ChannelId) {
+        let Some(cursor) = self.conversation_read.get(channel).cloned() else {
+            return;
+        };
+        let Some(count) = self.counts.get_mut(channel) else {
+            return;
+        };
+        let caught_up = count
+            .latest
+            .as_ref()
+            .is_none_or(|latest| !latest.is_newer_than(&cursor));
+        if caught_up {
             count.has_unreads = false;
             count.mention_count = 0;
             count.unread_count = 0;
-            // The cursor moves with the badge. A surface already open keeps
-            // its own copy of where the rule goes, so reading here never
-            // moves a rule out from under the reader.
-            count.last_read = Some(ts.clone());
         }
     }
 
     /// Slack's read cursor for the conversation: the message the unread
-    /// rule sits under.
+    /// rule sits under. Kept apart from the counts because it outlives
+    /// them — it comes back off the mirror at startup, before Slack has
+    /// said anything, which is what puts the rule in the right place on a
+    /// restart and offline.
     pub fn last_read(&self, channel: &ChannelId) -> Option<&Ts> {
-        self.counts.get(channel)?.last_read.as_ref()
+        self.conversation_read.get(channel)
+    }
+
+    /// Marks a thread read, at its own cursor. Slack keeps one per followed
+    /// thread and rho keeps it in the same shape: a thread read here or on
+    /// the phone says nothing about the conversation around it, and a
+    /// channel marked read says nothing about the threads hanging in it.
+    ///
+    /// Monotonic for the same reason the conversation's cursor is, and
+    /// answers the same question: did anything move?
+    pub fn mark_thread_read(&mut self, key: &ThreadKey, ts: &Ts) -> bool {
+        match self.thread_read.get(key) {
+            Some(held) if !ts.is_newer_than(held) => false,
+            _ => {
+                self.thread_read.insert(key.clone(), ts.clone());
+                true
+            }
+        }
+    }
+
+    /// The read cursor inside a followed thread, where its unread rule goes.
+    pub fn thread_last_read(&self, key: &ThreadKey) -> Option<&Ts> {
+        self.thread_read.get(key)
     }
 
     /// Fills in the author of a message rho already knows about. The feed
@@ -1154,7 +1256,7 @@ mod tests {
         // The thread the user answered from their phone: Slack follows it,
         // rho has never seen a message in it, and the reply is still theirs.
         let mut followed = model();
-        followed.set_followed([(ChannelId("C1".into()), Ts("500".into()))]);
+        followed.set_followed([(ChannelId("C1".into()), Ts("500".into()), None)]);
         assert!(matches!(
             followed.note_message(&reply("C1", "501", "500", "U1", "any update?"), 0),
             Some(Change::Raised(_))
@@ -1200,7 +1302,7 @@ mod tests {
         // And when the live reply did raise it, the feed item for the same
         // message is a no-op: one thread, raised once.
         let mut live_first = model();
-        live_first.set_followed([(ChannelId("C1".into()), Ts("800".into()))]);
+        live_first.set_followed([(ChannelId("C1".into()), Ts("800".into()), None)]);
         assert!(matches!(
             live_first.note_message(&reply("C1", "801", "800", "U1", "any update?"), 0),
             Some(Change::Raised(_))

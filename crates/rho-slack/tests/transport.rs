@@ -259,7 +259,7 @@ async fn a_thread_loads_and_a_reply_is_sent_into_it() {
             .await
             .unwrap()
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
     for message in client
         .conversations_replies(&ChannelId("C1".into()), &Ts("500.0".into()), None)
@@ -298,12 +298,6 @@ async fn history_marking_and_the_conversation_list_come_from_slack() {
         "the surface renders oldest first"
     );
 
-    client
-        .mark_read(&ChannelId("C1".into()), &Ts("600.0".into()))
-        .await
-        .unwrap();
-    assert_eq!(fake.marked(), vec![("C1".to_owned(), "600.0".to_owned())]);
-
     let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
     model.add_users(client.users().await.unwrap());
     model.add_conversations(client.conversations().await.unwrap());
@@ -313,6 +307,34 @@ async fn history_marking_and_the_conversation_list_come_from_slack() {
     assert_eq!(rows[0].mention_count, 2);
     assert!(rows[0].unread);
     assert_eq!(rows[1].label, "@ada", "a DM is named from the roster");
+
+    // Reading it is the end of it, on the server as well as here: the badge
+    // goes, and a client that asks Slack afresh is told the same.
+    client
+        .mark_read(&ChannelId("C1".into()), &Ts("600.0".into()))
+        .await
+        .unwrap();
+    assert_eq!(fake.marked(), vec![("C1".to_owned(), "600.0".to_owned())]);
+    assert_eq!(fake.last_read("C1"), Some("600.0".to_owned()));
+    assert_eq!(
+        fake.unread("C1"),
+        (false, 0, 0),
+        "the server works its badge out again from what is left above the cursor"
+    );
+
+    model.set_counts(client.counts().await.unwrap().conversations);
+    let rows = model.conversation_rows();
+    assert_eq!(rows[0].label, "#design");
+    assert!(
+        !rows[0].unread,
+        "the badge does not come back with the counts"
+    );
+    assert_eq!(rows[0].mention_count, 0);
+    assert_eq!(
+        model.last_read(&ChannelId("C1".into())),
+        Some(&Ts("600.0".into())),
+        "and the cursor the rule is drawn from came back with them"
+    );
 }
 
 /// Which threads are the user's comes from Slack: the list on connect, and
@@ -338,7 +360,7 @@ async fn the_follow_list_comes_from_slack_and_the_socket_keeps_it_current() {
     model.set_followed(
         followed
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
 
     let (sender, mut receiver) = mpsc::unbounded();
@@ -371,10 +393,10 @@ async fn the_follow_list_comes_from_slack_and_the_socket_keeps_it_current() {
     }
     let mut raised = 0;
     while raised < 2 {
-        if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await {
-            if let Some(Change::Raised(_)) = model.note_message(&message, 0) {
-                raised += 1;
-            }
+        if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
+            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+        {
+            raised += 1;
         }
     }
     assert_eq!(owed(&model, 0).len(), 2);
@@ -745,7 +767,7 @@ async fn marking_the_backlog_touches_only_what_is_older_than_the_cutoff() {
             .await
             .unwrap()
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
     for (channel, ts) in [("C1", "50.0"), ("C2", "800.0")] {
         model.note_message(
@@ -812,7 +834,7 @@ async fn ignoring_a_thread_travels_both_ways() {
             .await
             .unwrap()
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
 
     let (sender, mut receiver) = mpsc::unbounded();
@@ -861,7 +883,7 @@ async fn ignoring_a_thread_travels_both_ways() {
     let dropped = model.set_followed(
         followed
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
     assert_eq!(dropped.len(), 1);
     assert_eq!(dropped[0].channel, ChannelId("C1".into()));
@@ -925,7 +947,7 @@ async fn undoing_a_discard_follows_the_thread_again() {
             .await
             .unwrap()
             .into_iter()
-            .map(|thread| (thread.channel, thread.thread_ts)),
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
     );
     let key = model.key(&ChannelId("C1".into()), &Ts("500.0".into()));
     model.note_message(
@@ -1324,5 +1346,184 @@ async fn muting_and_the_dm_count_come_back_from_the_server() {
         client.muted_channels().await.unwrap(),
         Vec::new(),
         "unmuting elsewhere has to come back too"
+    );
+}
+
+/// A conversation read on the phone. Slack tells every client the user is
+/// signed in on, so rho's badge has to go out without the user touching
+/// anything here — and it has to stay out when the counts are asked for
+/// again, which is what a reconnect does.
+#[tokio::test]
+async fn a_mark_from_another_client_lands_here_and_survives_a_reconnect() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.set_count("C1", true, 1, "600.0");
+    fake.add_message(
+        "C1",
+        json!({"ts": "600.0", "user": "U1", "text": "<@ME> have a look"}),
+    );
+
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client(&fake),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    assert!(matches!(next_wire(&mut receiver).await, Wire::Connected(_)));
+    wait_until_live(&catch_up).await;
+
+    let client = client(&fake);
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_counts(client.counts().await.unwrap().conversations);
+    assert!(model.conversation_rows()[0].unread, "unread to begin with");
+
+    // The user reads it somewhere else. Nothing here asked for this.
+    let at = fake.live_mark("C1", None);
+    assert_eq!(at, "600.0");
+    let (channel, ts) = loop {
+        // Slack's greeting is on the wire ahead of it; the mark is what this
+        // is waiting for.
+        match next_wire(&mut receiver).await {
+            Wire::Frame(WsEvent::Marked { channel, ts }) => break (channel, ts),
+            _ => continue,
+        }
+    };
+    assert_eq!(channel, ChannelId("C1".into()));
+    model.mark_read(&channel, &ts);
+    assert!(
+        !model.conversation_rows()[0].unread,
+        "the badge goes without the user touching rho"
+    );
+
+    // The reconnect: the counts are asked for again, and the answer must not
+    // bring the badge back. This is the shape of "mark read does not stick".
+    model.set_counts(client.counts().await.unwrap().conversations);
+    assert!(
+        !model.conversation_rows()[0].unread,
+        "and it does not come back with the counts"
+    );
+    assert_eq!(
+        model.last_read(&ChannelId("C1".into())),
+        Some(&Ts("600.0".into()))
+    );
+}
+
+/// Reading a thread marks the thread. Slack keeps a cursor inside each
+/// followed thread and one on the conversation around it, and a reply's
+/// timestamp is a real timestamp in its channel — so a client that told
+/// Slack "the channel was read at this reply" would empty a channel the
+/// reader never opened.
+#[tokio::test]
+async fn reading_a_thread_marks_the_thread_and_not_its_channel() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.set_count("C1", true, 0, "900.0");
+    for ts in ["100.0", "200.0", "300.0"] {
+        fake.add_message(
+            "C1",
+            json!({"ts": ts, "user": "U1", "text": "channel talk"}),
+        );
+    }
+    fake.add_message(
+        "C1",
+        json!({"ts": "400.0", "user": "U1", "text": "the root"}),
+    );
+    fake.add_message(
+        "C1",
+        json!({"ts": "900.0", "user": "U1", "thread_ts": "400.0", "text": "a reply"}),
+    );
+    fake.follow_thread("C1", "400.0");
+    let client = client(&fake);
+
+    client
+        .mark_thread_read(
+            &ChannelId("C1".into()),
+            &Ts("400.0".into()),
+            &Ts("900.0".into()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.thread_last_read("C1", "400.0"),
+        Some("900.0".to_owned()),
+        "the thread's own cursor moved"
+    );
+    assert_eq!(
+        fake.last_read("C1"),
+        None,
+        "and the channel's did not: nobody read the channel"
+    );
+    assert_eq!(
+        fake.unread("C1"),
+        (true, 0, 0),
+        "so the channel is still unread"
+    );
+
+    // And it comes back as the thread's cursor after a restart, off the
+    // follow list rather than out of anything rho remembered.
+    let followed = client.followed_threads().await.unwrap();
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].last_read, Some(Ts("900.0".into())));
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_followed(
+        followed
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
+    );
+    let key = model.key(&ChannelId("C1".into()), &Ts("400.0".into()));
+    assert_eq!(model.thread_last_read(&key), Some(&Ts("900.0".into())));
+    assert_eq!(
+        model.last_read(&ChannelId("C1".into())),
+        None,
+        "the channel still has no cursor of its own"
+    );
+}
+
+/// The feed is paged, and a restart has to walk back through the pages until
+/// it reaches something it already knows. A feed that always came back whole
+/// in one answer would never make a client do that, so the tail rho replays
+/// after a restart would be exactly one page long however much it missed.
+#[tokio::test]
+async fn a_restart_walks_back_through_the_feed_until_it_reaches_what_it_knows() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    // More mentions than one page holds, oldest first.
+    for index in 0..120 {
+        let ts = format!("{}.0", 1000 + index);
+        fake.add_message("C1", json!({"ts": ts, "user": "U1", "text": "<@ME> ping"}));
+        fake.add_feed_mention("C1", &ts);
+    }
+    let client = client(&fake);
+
+    // A cold start knows nothing, so one page is all it takes: everything on
+    // it is news, and there is no gap to read back to.
+    let first = poll_feed(&client, None).await.unwrap();
+    assert_eq!(first.len(), 50, "one page");
+    assert_eq!(
+        first[0].ts,
+        Ts("1119.0".into()),
+        "newest first, the way Slack answers it"
+    );
+    assert_eq!(fake.calls("activity.feed"), 1);
+
+    // A restart that last saw the 30th-oldest has to page back to it, and
+    // that is more than one request.
+    let known = Ts("1030.0".into());
+    let caught_up = poll_feed(&client, Some(&known)).await.unwrap();
+    assert!(
+        fake.calls("activity.feed") > 2,
+        "it walked back through pages rather than taking the first one"
+    );
+    assert!(
+        caught_up.iter().any(|item| item.ts == Ts("1031.0".into())),
+        "and reached the first item it had not seen"
     );
 }

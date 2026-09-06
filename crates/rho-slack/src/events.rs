@@ -35,6 +35,16 @@ pub enum WsEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// A thread was read somewhere else. Slack keeps a cursor per thread,
+    /// apart from the one on the conversation around it, and so does rho:
+    /// reading one thread on the phone says nothing about the channel it
+    /// hangs in, and folding the two together would mark a channel read
+    /// that nobody has looked at.
+    ThreadMarked {
+        channel: ChannelId,
+        thread_ts: Ts,
+        ts: Ts,
+    },
     /// Slack started following a thread for the user: they posted in it,
     /// were mentioned, or followed it by hand on another client. The follow
     /// list is what makes a later reply theirs, so rho takes it from here
@@ -112,8 +122,9 @@ pub fn parse(frame: &Value) -> WsEvent {
             subscription(frame),
             frame["subscription"]["last_read"].as_str(),
         ) {
-            (Some((channel, _)), Some(last_read)) => WsEvent::Marked {
+            (Some((channel, thread_ts)), Some(last_read)) => WsEvent::ThreadMarked {
                 channel,
+                thread_ts,
                 ts: Ts(last_read.to_owned()),
             },
             _ => WsEvent::Ignored,
@@ -274,7 +285,9 @@ mod tests {
             }
         );
         // A thread read on another client moves the cursor inside the
-        // subscription, which is where the timestamp has to come from.
+        // subscription, which is where the timestamp has to come from. It
+        // names the thread as well as the channel: the conversation around
+        // it has a cursor of its own that this must not touch.
         assert_eq!(
             parse(&json!({
                 "type": "thread_marked",
@@ -283,8 +296,9 @@ mod tests {
                     "thread_ts": "500.0", "last_read": "501.0",
                 },
             })),
-            WsEvent::Marked {
+            WsEvent::ThreadMarked {
                 channel: ChannelId("C1".into()),
+                thread_ts: Ts("500.0".into()),
                 ts: Ts("501.0".into()),
             }
         );

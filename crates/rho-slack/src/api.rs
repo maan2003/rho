@@ -916,9 +916,11 @@ fn parse_followed_thread(thread: &Value) -> Option<FollowedThread> {
     Some(FollowedThread {
         channel: ChannelId(channel),
         thread_ts: Ts(thread_ts),
+        // Slack spells "read nothing in this thread" as a zero timestamp,
+        // which is an absent cursor and not a cursor at the epoch.
         last_read: string(&thread["last_read"])
             .or_else(|| string(&root["last_read"]))
-            .filter(|ts| !ts.is_empty())
+            .filter(|ts| !ts.is_empty() && ts.parse::<f64>() != Ok(0.0))
             .map(Ts),
     })
 }

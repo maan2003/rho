@@ -57,6 +57,11 @@ struct State {
     /// The threads Slack follows for the user, as
     /// `subscriptions.thread.getView` lists them: (channel, thread_ts).
     followed: Vec<(String, String)>,
+    /// The read cursor inside each followed thread, keyed by (channel,
+    /// thread_ts). Slack keeps this apart from the conversation's own
+    /// cursor, and so does this: reading a thread must not mark the
+    /// channel around it.
+    thread_read: BTreeMap<(String, String), String>,
     /// Requests that should fail with `ok: false`, by method name and how
     /// many times. This is how a poll-failure notice gets tested.
     failures: BTreeMap<String, usize>,
@@ -352,6 +357,16 @@ impl Fake {
         }));
     }
 
+    /// The user reading the conversation somewhere else. Returns the message
+    /// it was marked at, which is the newest one when none is named.
+    pub fn live_mark(&self, channel: &str, ts: Option<&str>) -> String {
+        self.live_ts(json!({
+            "kind": "mark",
+            "channel": channel,
+            "ts": ts.unwrap_or_default(),
+        }))
+    }
+
     pub fn live_edit(&self, channel: &str, ts: &str, text: &str) {
         self.live(json!({"kind": "edit", "channel": channel, "ts": ts, "text": text}));
     }
@@ -387,6 +402,50 @@ impl Fake {
 
     pub fn marked(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().marked.clone()
+    }
+
+    /// What the server itself says is unread in a conversation: whether
+    /// anything is, how much of it names the user, and how many messages.
+    /// A badge is proven against this rather than against the client's own
+    /// copy of it, which is the copy under test.
+    pub fn unread(&self, channel: &str) -> (bool, u64, u64) {
+        let state = self.state.lock().unwrap();
+        let Some(count) = state
+            .counts
+            .iter()
+            .find(|count| count["id"] == json!(channel))
+        else {
+            return (false, 0, 0);
+        };
+        (
+            count["has_unreads"].as_bool().unwrap_or(false),
+            count["mention_count"].as_u64().unwrap_or(0),
+            count["dm_count"].as_u64().unwrap_or(0),
+        )
+    }
+
+    /// Slack's read cursor for a conversation, as the next client to ask
+    /// would be told it.
+    pub fn last_read(&self, channel: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .conversations
+            .iter()
+            .find(|conversation| conversation["id"] == json!(channel))
+            .and_then(|conversation| conversation["last_read"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// The read cursor inside a followed thread, which is a different fact
+    /// from the conversation's.
+    pub fn thread_last_read(&self, channel: &str, thread_ts: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .thread_read
+            .get(&(channel.to_owned(), thread_ts.to_owned()))
+            .cloned()
     }
 
     /// A field of the last call to `method`, for asserting that a refresh
@@ -462,6 +521,10 @@ async fn serve_socket(
 /// Slack refuses an `xoxc` websocket handshake that does not carry the web
 /// session, and has since 2023. The fake refuses one too, so a client that
 /// forgets a header fails here rather than going silent in front of the user.
+///
+/// The wide `Err` is tungstenite's own handshake callback signature, not a
+/// shape this gets to choose.
+#[allow(clippy::result_large_err)]
 fn check_handshake(
     request: &tokio_tungstenite::tungstenite::handshake::server::Request,
     response: tokio_tungstenite::tungstenite::handshake::server::Response,
@@ -684,7 +747,7 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                 .iter()
                 .map(|(method, count)| (method.clone(), json!(count)))
                 .collect::<serde_json::Map<_, _>>();
-            return json!({"ok": true, "calls": calls});
+            json!({"ok": true, "calls": calls})
         }
         kind @ ("message" | "reply") => {
             let text = field("text");
@@ -742,11 +805,28 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
         // while it is still on its way.
         "file_delay" => {
             state.file_delay_ms = request["ms"].as_u64().unwrap_or_default();
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         "send_delay" => {
             state.send_delay_ms = request["ms"].as_u64().unwrap_or_default();
-            return json!({"ok": true});
+            json!({"ok": true})
+        }
+        // The user reading on their phone. The conversation is marked at
+        // its newest message unless one is named, and rho hears about it
+        // the only way it ever does: the frame Slack sends every client.
+        "mark" => {
+            let ts = match field("ts").as_str() {
+                "" => state
+                    .history
+                    .get(&channel)
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message["ts"].as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                ts => ts.to_owned(),
+            };
+            mark_conversation(state, frames, &channel, &ts);
+            json!({"ok": true, "ts": ts})
         }
         // Muting, which in Slack is a preference and not a fact about the
         // channel, so it lands in `users.prefs.get` and nowhere else.
@@ -755,14 +835,14 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             if request["mute"].as_bool().unwrap_or(true) {
                 state.muted.push(channel);
             }
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         // A network blip: every socket closes and the client has to come
         // back on its own. Nothing else about the workspace changes, which
         // is what makes it a clean test of what a reconnect re-raises.
         "drop_sockets" => {
             let _ = frames.send(Frame::Close(None));
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         // A feed entry for a thread, with the timestamps the caller chooses.
         // Slack's feed can name a thread whose newest message is older than
@@ -779,11 +859,11 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                     "channel_id": channel, "thread_ts": thread_ts, "latest_ts": latest,
                 }}}},
             }));
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         "send_fail" => {
             state.send_fails = request["fail"].as_bool().unwrap_or(true);
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         kind @ ("subscribe" | "unsubscribe") => {
             let thread_ts = field("thread_ts");
@@ -802,7 +882,7 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                 },
                 "event_ts": event_ts,
             }));
-            return json!({"ok": true});
+            json!({"ok": true})
         }
         "reaction" => {
             let ts = field("ts");
@@ -925,12 +1005,108 @@ fn png_size(bytes: &[u8]) -> (u32, u32) {
     }
 }
 
+/// When a feed item happened, from wherever its own shape keeps it: a
+/// mention carries the message, a thread bundle carries its latest reply.
+fn feed_ts(item: &Value) -> f64 {
+    let entry = &item["item"];
+    entry["message"]["ts"]
+        .as_str()
+        .or_else(|| entry["bundle_info"]["payload"]["thread_entry"]["latest_ts"].as_str())
+        .and_then(|ts| ts.parse().ok())
+        .unwrap_or(0.0)
+}
+
 fn message_mut<'a>(state: &'a mut State, channel: &str, ts: &str) -> Option<&'a mut Value> {
     state
         .history
         .get_mut(channel)?
         .iter_mut()
         .find(|message| message["ts"] == json!(ts))
+}
+
+/// Marks a conversation read at `ts`, the way the server does it: the cursor
+/// moves, the counters are worked out again from what is left above it, and
+/// the frame that tells the user's other clients goes out.
+///
+/// The counters are derived rather than zeroed because a mark is not always
+/// at the newest message — `mark read before` marks at a cutoff — and a
+/// badge that clears for messages still sitting above the rule is exactly
+/// the lie this is here to stop telling.
+fn mark_conversation(
+    state: &mut State,
+    frames: &broadcast::Sender<Frame>,
+    channel: &str,
+    ts: &str,
+) {
+    let Some(conversation) = state
+        .conversations
+        .iter_mut()
+        .find(|conversation| conversation["id"] == json!(channel))
+    else {
+        return;
+    };
+    let is_im = conversation["is_im"].as_bool().unwrap_or(false);
+    let is_group = conversation["is_mpim"].as_bool().unwrap_or(false);
+    conversation["last_read"] = json!(ts);
+    recount(state, channel, ts, is_im || is_group);
+    state.marked.push((channel.to_owned(), ts.to_owned()));
+    // Slack tells every client the user is signed in on, the one that asked
+    // included: the read cursor is the session's, not one client's.
+    let kind = match (is_im, is_group) {
+        (true, _) => "im_marked",
+        (_, true) => "group_marked",
+        _ => "channel_marked",
+    };
+    let _ = frames.send(Frame::Text(
+        json!({"type": kind, "channel": channel, "ts": ts})
+            .to_string()
+            .into(),
+    ));
+}
+
+/// What is still unread above the cursor: whether anything is, how much of
+/// it names the user, and how many messages it is.
+fn recount(state: &mut State, channel: &str, cursor: &str, counts_messages: bool) {
+    let floor = cursor.parse::<f64>().unwrap_or(0.0);
+    let above = state
+        .history
+        .get(channel)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        // The user's own messages are read by definition: they wrote them.
+        .filter(|message| message["user"] != json!("ME"))
+        .filter(|message| {
+            message["ts"]
+                .as_str()
+                .and_then(|ts| ts.parse::<f64>().ok())
+                .is_some_and(|ts| ts > floor)
+        })
+        .collect::<Vec<_>>();
+    let unread = above.len() as u64;
+    let mentions = above
+        .iter()
+        .filter(|message| {
+            message["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("<@ME>"))
+        })
+        .count() as u64;
+    let Some(count) = state
+        .counts
+        .iter_mut()
+        .find(|count| count["id"] == json!(channel))
+    else {
+        return;
+    };
+    count["has_unreads"] = json!(unread > 0);
+    count["mention_count"] = json!(mentions);
+    // Slack keeps a number only for DMs and group DMs; a channel arrives as
+    // `has_unreads` alone, and inventing one here would let a client pass a
+    // test the real server would fail it on.
+    if counts_messages {
+        count["dm_count"] = json!(unread);
+    }
 }
 
 /// Moves the unread counter the conversation list reads, the way the server
@@ -969,11 +1145,11 @@ fn handle(
 ) -> Value {
     let mut state = state.lock().unwrap();
     *state.calls.entry(method.to_owned()).or_default() += 1;
-    if let Some(remaining) = state.failures.get_mut(method) {
-        if *remaining > 0 {
-            *remaining -= 1;
-            return json!({"ok": false, "error": "fatal_error"});
-        }
+    if let Some(remaining) = state.failures.get_mut(method)
+        && *remaining > 0
+    {
+        *remaining -= 1;
+        return json!({"ok": false, "error": "fatal_error"});
     }
     let form = parse_form(body);
     state
@@ -1022,7 +1198,29 @@ fn handle(
         }),
         // Slack's own client sends this when a reader leaves a thread; it is
         // the only way to quiet a thread's unread badge without posting.
-        "subscriptions.thread.mark" => json!({"ok": true}),
+        // The cursor it moves is the thread's own — the conversation around
+        // it is untouched, which is the whole reason Slack has a separate
+        // call for it.
+        "subscriptions.thread.mark" => {
+            let (channel, thread_ts, ts) = (field("channel"), field("thread_ts"), field("ts"));
+            state
+                .thread_read
+                .insert((channel.clone(), thread_ts.clone()), ts.clone());
+            let _ = frames.send(Frame::Text(
+                json!({
+                    "type": "thread_marked",
+                    "subscription": {
+                        "type": "thread",
+                        "channel": channel,
+                        "thread_ts": thread_ts,
+                        "last_read": ts,
+                    },
+                })
+                .to_string()
+                .into(),
+            ));
+            json!({"ok": true})
+        }
         "subscriptions.thread.add" => {
             let entry = (field("channel"), field("thread_ts"));
             if !state.followed.contains(&entry) {
@@ -1044,11 +1242,20 @@ fn handle(
             "threads": state
                 .followed
                 .iter()
-                .map(|(channel, thread_ts)| json!({
-                    "root_msg": {"channel": channel, "ts": thread_ts, "thread_ts": thread_ts},
-                    "last_read": "0000000000.000000",
-                    "unread_replies": 0,
-                }))
+                .map(|(channel, thread_ts)| {
+                    // The thread's own cursor, so a thread read on the phone
+                    // is still read here after a restart.
+                    let read = state
+                        .thread_read
+                        .get(&(channel.clone(), thread_ts.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| "0000000000.000000".to_owned());
+                    json!({
+                        "root_msg": {"channel": channel, "ts": thread_ts, "thread_ts": thread_ts},
+                        "last_read": read,
+                        "unread_replies": 0,
+                    })
+                })
                 .collect::<Vec<_>>(),
         }),
         "client.counts" => {
@@ -1074,8 +1281,25 @@ fn handle(
             json!({"ok": true, "channels": counts, "mpims": [], "ims": []})
         }
         "activity.feed" => {
-            let items = state.feed.clone();
-            json!({"ok": true, "items": items})
+            // Newest first and paged, the way Slack answers it. A client
+            // catching up after a restart has to walk back through pages
+            // until it reaches something it already knows, and a feed that
+            // always came back whole in one answer would never make it
+            // do that.
+            let mut items = state.feed.clone();
+            items.sort_by(|left, right| feed_ts(right).total_cmp(&feed_ts(left)));
+            let limit = field("limit").parse::<usize>().unwrap_or(50).max(1);
+            let start = field("cursor").parse::<usize>().unwrap_or(0);
+            let end = (start + limit).min(items.len());
+            let page = items.get(start..end).unwrap_or_default().to_vec();
+            let has_more = end < items.len();
+            json!({
+                "ok": true,
+                "items": page,
+                "response_metadata": {
+                    "next_cursor": if has_more { end.to_string() } else { String::new() },
+                },
+            })
         }
         "conversations.history" => {
             let channel = field("channel");
@@ -1163,17 +1387,11 @@ fn handle(
             json!({"ok": true, "messages": messages, "has_more": false})
         }
         "conversations.mark" => {
-            let (channel, ts) = (field("channel"), field("ts"));
             // Reading moves the cursor, here as on the server: the next
-            // client to ask sees the conversation read up to this message.
-            if let Some(conversation) = state
-                .conversations
-                .iter_mut()
-                .find(|conversation| conversation["id"] == json!(channel))
-            {
-                conversation["last_read"] = json!(ts);
-            }
-            state.marked.push((channel, ts));
+            // client to ask sees the conversation read up to this message,
+            // its badge is worked out again from what is left above it, and
+            // every other client hears about it on the socket.
+            mark_conversation(&mut state, frames, &field("channel"), &field("ts"));
             json!({"ok": true})
         }
         // Slack's two-step upload: reserve a URL, POST the bytes to it, then

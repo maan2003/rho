@@ -435,5 +435,12 @@ async fn live_script(fake: &Fake) {
         tokio::time::sleep(BEAT).await;
         fake.live_message(GROUP, "UD", &format!("<@ME> round {round} is done"));
         println!("live: mention for {round}");
+
+        // The user reads the group DM somewhere else. Slack tells every
+        // client, so the badge here has to go out without anybody touching
+        // rho — and stay out when the counts are next asked for.
+        tokio::time::sleep(BEAT).await;
+        let at = fake.live_mark(GROUP, None);
+        println!("live: read on another client, through {at}");
     }
 }

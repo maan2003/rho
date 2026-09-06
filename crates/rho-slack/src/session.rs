@@ -422,6 +422,7 @@ impl Session {
         if let Some(id) = mirror.self_id(&workspace) {
             self.model.set_self(id);
         }
+        seed_read_cursors(&mut self.model, &mirror);
         self.derive_units_from_mirror();
     }
 
@@ -494,12 +495,16 @@ impl Session {
                     dropped = session.model.set_followed(
                         followed
                             .into_iter()
-                            .map(|thread| (thread.channel, thread.thread_ts)),
+                            .map(|thread| (thread.channel, thread.thread_ts, thread.last_read)),
                     );
                 }
                 // Now that the followed list is in, the replies in those
                 // threads are thread units rather than channel traffic.
                 session.derive_units_from_mirror();
+                // Slack's cursors have landed and been reconciled with the
+                // ones rho already had; the winner of each is what the next
+                // start should begin from.
+                session.record_cursors();
                 // A DM that arrived while rho was off is in the counts and
                 // nowhere else: the feed never carries one. Raised here,
                 // once the conversations are known, because whether a
@@ -594,7 +599,19 @@ impl Session {
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
                 // Read elsewhere. Only the badge is stale: reading is not a
                 // verdict, so every card stays exactly where it was.
-                self.model.mark_read(&channel, &ts);
+                self.note_read(&Source::Conversation(channel), &ts);
+                cx.notify();
+            }
+            Wire::Frame(WsEvent::ThreadMarked {
+                channel,
+                thread_ts,
+                ts,
+            }) => {
+                // A thread read elsewhere. Its own cursor moves and the
+                // conversation around it is left alone: nobody has said
+                // anything about the channel.
+                let key = self.model.key(&channel, &thread_ts);
+                self.note_read(&Source::Thread(key), &ts);
                 cx.notify();
             }
             Wire::Frame(_) => {}
@@ -1503,13 +1520,58 @@ impl Session {
         }));
     }
 
+    /// Records that the reader is through `ts` here, wherever the evidence
+    /// came from: rho's own mark, a frame saying another client marked it,
+    /// or the cursor Slack handed over at connect. The model keeps the
+    /// newer of what it holds and what arrived, and a cursor that actually
+    /// moved is written to the mirror, so the next start knows where the
+    /// unread rule goes before the network says a word.
+    ///
+    /// One place, because a cursor written down in three of the four paths
+    /// that move it is the bug this is here to close.
+    fn note_read(&mut self, source: &Source, ts: &Ts) -> bool {
+        let moved = match source {
+            Source::Conversation(channel) => self.model.mark_read(channel, ts),
+            Source::Thread(key) => self.model.mark_thread_read(key, ts),
+        };
+        if moved && let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_last_read(&self.scope(source), ts);
+        }
+        moved
+    }
+
+    /// Writes down every cursor the model holds, after Slack has handed
+    /// over its own at connect. Once per connect and bounded by the roster,
+    /// which is how the cursor for a conversation nobody has opened this
+    /// run still survives a restart.
+    fn record_cursors(&self) {
+        let Some(mirror) = self.mirror.as_ref() else {
+            return;
+        };
+        for channel in self.model.conversations() {
+            if let Some(ts) = self.model.last_read(&channel) {
+                mirror.set_last_read(&self.scope(&Source::Conversation(channel.clone())), ts);
+            }
+        }
+        for key in self.model.followed() {
+            if let Some(ts) = self.model.thread_last_read(&key) {
+                mirror.set_last_read(&self.scope(&Source::Thread(key.clone())), ts);
+            }
+        }
+    }
+
     /// Tells Slack the conversation has been read, so rho does not leave the
     /// phone showing a badge for something the user has already seen.
+    ///
+    /// A thread is marked as a thread. Slack keeps a cursor inside each
+    /// followed thread and one on the conversation around it, and a reply's
+    /// timestamp is a real timestamp in its channel — so telling Slack the
+    /// channel was read at one would mark every message older than that
+    /// reply read in a channel the reader never opened.
     pub fn mark_read(&mut self, source: &Source, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let channel = source.channel().clone();
         let Some(latest) = self
             .loaded
             .get(source)
@@ -1518,10 +1580,19 @@ impl Session {
         else {
             return;
         };
-        self.model.mark_read(&channel, &latest);
+        self.note_read(source, &latest);
         cx.notify();
-        let task =
-            gpui_tokio::Tokio::spawn(cx, async move { client.mark_read(&channel, &latest).await });
+        let source = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            match &source {
+                Source::Conversation(channel) => client.mark_read(channel, &latest).await,
+                Source::Thread(key) => {
+                    client
+                        .mark_thread_read(&key.channel, &key.thread_ts, &latest)
+                        .await
+                }
+            }
+        });
         self._tasks.push(cx.spawn(async move |this, cx| {
             if let Ok(Err(error)) = task.await {
                 tracing::warn!(error = %error, "slack mark-read failed");
@@ -1543,7 +1614,7 @@ impl Session {
             return;
         };
         let channel = unit.channel.clone();
-        self.model.mark_read(&channel, &latest);
+        self.note_read(&Source::Conversation(channel.clone()), &latest);
         cx.notify();
         let task =
             gpui_tokio::Tokio::spawn(cx, async move { client.mark_read(&channel, &latest).await });
@@ -1631,7 +1702,10 @@ impl Session {
             return;
         };
         for (channel, ts) in &plan.conversations {
-            self.model.mark_read(channel, ts);
+            self.note_read(&Source::Conversation(channel.clone()), ts);
+        }
+        for (key, ts) in &plan.threads {
+            self.note_read(&Source::Thread(key.clone()), ts);
         }
         cx.notify();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
@@ -1986,7 +2060,28 @@ const LANDING_WINDOW: usize = 200;
 /// history.
 const STARTUP_WINDOW: usize = 200;
 
-/// Which mirror scope holds a unit's messages.
+/// Where the reader had read to in each conversation, before Slack has said
+/// anything.
+///
+/// The unread rule is drawn from this cursor, so without it a conversation
+/// opened during the first seconds of a start — or opened at all while
+/// offline — shows no rule and reads as though none of it had ever been
+/// seen. Slack's own cursor overtakes this the moment `client.counts`
+/// answers and cannot walk it backwards, so the mirror is a head start and
+/// never a second opinion.
+///
+/// Conversations only: which threads are followed is Slack's list, and it
+/// arrives carrying each thread's own cursor, so there is nothing here for
+/// a thread to be seeded from.
+fn seed_read_cursors(model: &mut Model, mirror: &Mirror) {
+    let workspace = model.workspace().0.clone();
+    for channel in model.conversations() {
+        if let Some(ts) = mirror.last_read(&Scope::conversation(&workspace, &channel)) {
+            model.mark_read(&channel, &ts);
+        }
+    }
+}
+
 /// The units the mirror's own history implies, raised into the model.
 /// Every conversation the mirror knows and every followed thread is walked,
 /// and the model decides which messages are the user's business.
@@ -2237,7 +2332,7 @@ mod tests {
         let (_dir, mirror, mut model) = seeded();
         let scope = Scope::conversation("T1", &ChannelId("C1".into()));
         let mention = mentioning("100.0", "U1", "<@U9> can you look?");
-        mirror.insert_messages(&scope, &[mention.clone()]);
+        mirror.insert_messages(&scope, std::slice::from_ref(&mention));
         model.note_message(&mentioning("100.0", "U1", "hey <@ME> look"), 0);
         let unit = Unit::conversation(&ChannelId("C1".into()));
 
@@ -2267,7 +2362,7 @@ mod tests {
         let scope = Scope::conversation("T1", &ChannelId("C1".into()));
         for ts in ["100.0", "200.0", "300.0"] {
             let message = mentioning(ts, "U1", "hey <@ME> look");
-            mirror.insert_messages(&scope, &[message.clone()]);
+            mirror.insert_messages(&scope, std::slice::from_ref(&message));
             model.note_message(&message, 0);
         }
         mirror.insert_messages(&scope, &[mentioning("250.0", "ME", "on it")]);
@@ -2532,5 +2627,134 @@ mod tests {
         });
         loaded.settle_local(&message("101.0", "somebody else's"));
         assert!(loaded.is_pending(&local));
+    }
+
+    /// Where the unread rule goes after a restart. Slack's cursor is the
+    /// truth for reading, but it arrives with `client.counts`, and until it
+    /// does the reader is looking at a conversation with no rule in it —
+    /// every message reading as unseen, including the ones they answered
+    /// last night. The cursor the last run wrote down is what covers that
+    /// gap, and it is the only thing that covers it at all when the machine
+    /// is offline.
+    #[test]
+    fn the_read_cursor_survives_a_restart_and_slack_still_overtakes_it() {
+        let (_dir, mirror, mut model) = seeded();
+        mirror.put_conversations(
+            "T1",
+            &[crate::types::Conversation {
+                id: ChannelId("C1".into()),
+                kind: crate::types::ConversationKind::Channel,
+                name: "design".into(),
+                user: None,
+                members: Vec::new(),
+            }],
+        );
+        // What the last run left: the reader was through 500.0.
+        mirror.set_last_read(
+            &Scope::conversation("T1", &ChannelId("C1".into())),
+            &Ts("500.0".into()),
+        );
+
+        // The restart, before a single request has been answered.
+        seed_read_cursors(&mut model, &mirror);
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("500.0".into())),
+            "the rule is in the right place before the network says a word"
+        );
+
+        // Slack answers, and it has been read further somewhere else since.
+        model.set_counts([crate::api::ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 1,
+            unread_count: 1,
+            latest: Some(Ts("900.0".into())),
+            last_read: Some(Ts("700.0".into())),
+        }]);
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("700.0".into())),
+            "Slack's cursor is the truth and overtakes the mirror's"
+        );
+
+        // And an answer prepared before rho's own mark reached the server
+        // cannot walk the rule back over what the reader has been through.
+        model.set_counts([crate::api::ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 1,
+            unread_count: 1,
+            latest: Some(Ts("900.0".into())),
+            last_read: Some(Ts("600.0".into())),
+        }]);
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("700.0".into())),
+            "a stale answer does not move the rule backwards"
+        );
+    }
+
+    /// A thread's cursor is not its channel's. A reply's timestamp is a real
+    /// timestamp in the channel it hangs in, so folding the two together
+    /// marks every older message in that channel read on the strength of
+    /// the reader opening one thread — a channel they never looked at,
+    /// silently emptied.
+    #[test]
+    fn reading_a_thread_says_nothing_about_the_channel_around_it() {
+        let (_dir, _mirror, mut model) = seeded();
+        model.set_counts([crate::api::ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 2,
+            unread_count: 2,
+            latest: Some(Ts("900.0".into())),
+            last_read: Some(Ts("100.0".into())),
+        }]);
+        let key = model.key(&ChannelId("C1".into()), &Ts("400.0".into()));
+
+        assert!(model.mark_thread_read(&key, &Ts("800.0".into())));
+        assert_eq!(model.thread_last_read(&key), Some(&Ts("800.0".into())));
+        assert_eq!(
+            model.last_read(&ChannelId("C1".into())),
+            Some(&Ts("100.0".into())),
+            "the channel's own cursor did not move"
+        );
+        assert!(
+            model.conversation_rows()[0].unread,
+            "and the channel is still unread"
+        );
+
+        // The thread's cursor rises like every other fact here: a frame that
+        // overtakes rho's own mark cannot pull the rule back.
+        assert!(!model.mark_thread_read(&key, &Ts("700.0".into())));
+        assert_eq!(model.thread_last_read(&key), Some(&Ts("800.0".into())));
+    }
+
+    /// A mark that does not reach the newest message leaves the badge
+    /// standing. `mark read before` marks at a cutoff, and a conversation
+    /// with something newer than the cutoff has genuinely not been read: a
+    /// badge cleared here is a message the reader never learns about.
+    #[test]
+    fn a_mark_short_of_the_newest_message_leaves_the_badge_standing() {
+        let (_dir, _mirror, mut model) = seeded();
+        model.set_counts([crate::api::ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 3,
+            unread_count: 3,
+            latest: Some(Ts("900.0".into())),
+            last_read: None,
+        }]);
+
+        assert!(model.mark_read(&ChannelId("C1".into()), &Ts("500.0".into())));
+        assert!(
+            model.conversation_rows()[0].unread,
+            "there is still something above the cutoff"
+        );
+
+        assert!(model.mark_read(&ChannelId("C1".into()), &Ts("900.0".into())));
+        assert!(!model.conversation_rows()[0].unread);
+        assert_eq!(model.conversation_rows()[0].mention_count, 0);
     }
 }
