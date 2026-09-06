@@ -195,7 +195,7 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -295,7 +295,7 @@ fn the_phone_feed_opens_when_the_first_card_arrives_after_it_did(cx: &mut TestAp
     desk.due_note(None, "Arrived after the feed");
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -319,7 +319,7 @@ fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -358,7 +358,7 @@ fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -392,7 +392,7 @@ fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContex
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -429,7 +429,7 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -449,7 +449,8 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
             let stamp = take_desk_mutation(workspace, HostId::default())
                 .expect("verdict mutation")
                 .stamp;
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -501,7 +502,8 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
             let stamp = take_desk_mutation(workspace, HostId::default())
                 .expect("undo mutation")
                 .stamp;
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -534,7 +536,7 @@ fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext)
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
             assert_eq!(
                 workspace
@@ -563,7 +565,7 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -640,7 +642,8 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
 
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted {
                     stamp: verdict_stamp,
@@ -689,7 +692,8 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
                 window,
@@ -913,7 +917,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -977,7 +981,8 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     // `defer …`; it carries the words of the card it was written on.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -1041,7 +1046,7 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -1214,7 +1219,8 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
         .update(cx, |workspace, window, cx| {
             assert!(workspace.is_dashboard_mode(window, cx));
             let (response, _decision) = tokio::sync::oneshot::channel();
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::GitTransportApproval {
                     request_id: 1,
@@ -1242,7 +1248,8 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
         .update(cx, |workspace, window, cx| {
             assert!(!workspace.is_dashboard_mode(window, cx));
             let (response, _decision) = tokio::sync::oneshot::channel();
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::GitTransportApproval {
                     request_id: 2,
@@ -1253,7 +1260,8 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
                 cx,
             );
             assert!(!workspace.is_dashboard_mode(window, cx));
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::GitTransportDone { request_id: 2 },
                 window,
@@ -1343,7 +1351,8 @@ fn feed_frame(
             if workspace.is_startup_pane() {
                 workspace.select_agent(Some(agent_id), window, cx);
             }
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::Transcript { agent_id, state },
                 window,
@@ -1376,7 +1385,9 @@ fn feed_frames(
             {
                 workspace.select_agent(Some(agent_id), window, cx);
             }
-            workspace.handle_events(events, window, cx);
+            for HostEvent { host, event } in events {
+                story::feed(workspace, host, event, window, cx);
+            }
         })
         .expect("update workspace");
     cx.update_window((*workspace).into(), |_, window, cx| {
@@ -3244,13 +3255,15 @@ fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppCon
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::ServerError("first".to_owned()),
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::ServerError("second".to_owned()),
                 window,
@@ -3267,7 +3280,8 @@ fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppCon
 
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::ServerError("third".to_owned()),
                 window,
@@ -3469,7 +3483,13 @@ fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), ConnEvent::TurnCancelled, window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::TurnCancelled,
+                window,
+                cx,
+            );
         })
         .expect("handle cancellation acknowledgement");
 
@@ -3485,7 +3505,8 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::Recovering(std::time::Duration::from_secs(17)),
                 window,
@@ -3495,9 +3516,16 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
                 workspace.connection_status_label().as_deref(),
                 Some("recovering 17s")
             );
-            workspace.handle_event(HostId::default(), ConnEvent::Recovered, window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::Recovered,
+                window,
+                cx,
+            );
             assert_eq!(workspace.connection_status_label(), None);
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::Disconnected("timed out".to_owned()),
                 window,
@@ -3699,7 +3727,8 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
     let agent_id = agent(1);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
@@ -3820,7 +3849,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -3855,7 +3884,8 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -3892,7 +3922,7 @@ fn shift_held_for_a_letter_never_opens_the_verdicts(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -3950,7 +3980,7 @@ fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppConte
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -3993,8 +4023,9 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
@@ -4007,7 +4038,8 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story_wanting(agent_id, UnixMs(1)),
                 window,
@@ -4056,7 +4088,7 @@ fn a_bare_shift_keystroke_opens_nothing(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -4109,7 +4141,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         let workspace = test_workspace(cx);
         workspace
             .update(cx, |workspace, window, cx| {
-                workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+                story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
                 workspace.take_host_messages_for_test(HostId::default());
             })
@@ -4167,7 +4199,7 @@ fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
         })
         .unwrap();
@@ -4211,7 +4243,7 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -4252,7 +4284,7 @@ fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestApp
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -4311,7 +4343,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -4334,7 +4366,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                 .unwrap();
             workspace
                 .update(cx, |workspace, window, cx| {
-                    workspace.handle_event(
+                    story::feed(workspace,
                         HostId::default(),
                         ConnEvent::DeskMutationAccepted { stamp },
                         window,
@@ -4366,7 +4398,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                 .unwrap();
             workspace
                 .update(cx, |workspace, window, cx| {
-                    workspace.handle_event(
+                    story::feed(workspace,
                         HostId::default(),
                         ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
                         window,
@@ -4408,7 +4440,8 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp: delayed },
                 window,
@@ -5212,7 +5245,7 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -5396,7 +5429,8 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationRejected {
                     stamp: rejected,
@@ -5438,7 +5472,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
     for workspace in [&first, &second] {
         workspace
             .update(cx, |workspace, window, cx| {
-                workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+                story::feed(workspace, HostId::default(), desk.synced(), window, cx);
                 workspace.pull_card(window, cx);
                 workspace.take_host_messages_for_test(HostId::default());
             })
@@ -5455,7 +5489,8 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
         .unwrap();
     first
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted {
                     stamp: mutation.stamp,
@@ -5480,7 +5515,8 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                 Some(rho_desk::cells::State::Open),
                 "the poke has not arrived yet"
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskCellsAvailable { frontier },
                 window,
@@ -5491,7 +5527,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
                 .into_iter()
                 .any(|message| matches!(message, rho_ui_proto::ClientMessage::DeskSync { .. }));
             assert!(sync, "a poke asks for the delta rather than carrying it");
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             assert_eq!(
                 workspace
                     .desk_cells_snapshot_for_test(HostId::default())
@@ -5510,7 +5546,8 @@ fn unnamed_legacy_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContex
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::ChatGptUsage {
                     used_percent: 60.,
@@ -5647,7 +5684,7 @@ fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             // Opening the composer from the overview records Draft in
             // history, matching the state that exposed the human QA failure.
             workspace.select_agent(None, window, cx);
@@ -5710,7 +5747,7 @@ fn discarding_a_heading_draft_preserves_non_draft_history_cursor(cx: &mut TestAp
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.configure_surface_history_for_test(&["current"], window, cx);
             workspace.open_overview(window, cx);
             workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
@@ -6032,7 +6069,7 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
         })
         .unwrap();
@@ -6041,7 +6078,7 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
         .update(cx, |workspace, window, cx| {
             assert!(workspace.dashboard_deal_mode_for_test(cx));
             desk.set(dealt, rho_desk::cells::Property::DeferUntil(None));
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
 
@@ -6052,7 +6089,8 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
             let stamp = take_desk_mutation(workspace, HostId::default())
                 .expect("verdict mutation")
                 .stamp;
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -6084,7 +6122,7 @@ fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
         })
         .unwrap();
@@ -6122,7 +6160,7 @@ fn a_slack_verdict_is_read_from_the_store_not_from_slack(cx: &mut TestAppContext
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -6168,7 +6206,7 @@ fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.focus_tree_node_for_test(HostId::default(), context.clone(), window, cx);
         })
         .unwrap();
@@ -6235,8 +6273,9 @@ fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppCon
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
@@ -6358,7 +6397,7 @@ fn a_notes_title_is_its_first_line_and_the_body_is_the_note(cx: &mut TestAppCont
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6395,7 +6434,7 @@ fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppCo
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6432,8 +6471,9 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
@@ -6791,7 +6831,7 @@ fn a_cold_start_lands_on_home_and_says_what_is_waiting(cx: &mut TestAppContext) 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6820,7 +6860,7 @@ fn a_pull_opens_the_top_card_and_the_next_pull_passes_over_it(cx: &mut TestAppCo
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
@@ -6856,7 +6896,7 @@ fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mu
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             // Nothing else is waiting, so passing over the only card lands
             // on Home.
@@ -6887,7 +6927,7 @@ fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mu
                     precision: rho_desk::cells::TimestampPrecision::Day,
                 })),
             );
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             assert_eq!(
                 workspace.current_deal_card_for_test(cx).map(|card| card.0),
@@ -6910,7 +6950,7 @@ fn space_j_pulls_a_card_even_with_a_surface_ahead_in_history(cx: &mut TestAppCon
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             // Two surfaces recorded and one step back, so there is something
             // ahead of the reader for a forward step to land on.
             workspace.configure_surface_history_for_test(&["one", "two"], window, cx);
@@ -6951,7 +6991,7 @@ fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppCo
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -6995,7 +7035,7 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -7062,8 +7102,9 @@ fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(vec![head("wiring the flick recogniser")], 40),
                 window,
@@ -7090,7 +7131,8 @@ fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
     // The next line the agent says edits that row and nothing else.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(vec![head("unfurl box: background tint")], 40),
                 window,
@@ -7192,7 +7234,7 @@ fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -7227,8 +7269,14 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(HostId::default(), ready_with(Vec::new(), 1), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(Vec::new(), 1),
+                window,
+                cx,
+            );
             workspace.force_host_online(HostId::default());
         })
         .unwrap();
@@ -7320,7 +7368,7 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
         })
         .unwrap();
@@ -7354,7 +7402,7 @@ fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestAppCont
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -7479,7 +7527,7 @@ fn a_done_slack_unit_is_not_reopened_by_anything_slack_replays(cx: &mut TestAppC
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 source("600.0", "600.0"),
@@ -7571,7 +7619,7 @@ fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppConte
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
             assert!(workspace.apply_verdict_for_test(
                 HostId::default(),
@@ -7626,7 +7674,7 @@ fn a_done_on_another_device_closes_the_card_here(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -7646,7 +7694,7 @@ fn a_done_on_another_device_closes_the_card_here(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             assert!(
                 !workspace.dashboard.node_is_open(card),
                 "the cursor arrived, so the card is gone here too"
@@ -7688,7 +7736,7 @@ fn a_muted_slack_unit_stays_off_home_until_it_is_opened(cx: &mut TestAppContext)
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
             assert!(workspace.dashboard.node_is_open(card.clone()));
 
@@ -7759,20 +7807,23 @@ fn every_agent_under_a_note_is_its_own_card(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(vec![ui_head(asking), ui_head(dead)], 60),
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story_wanting(asking, UnixMs(1)),
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story::story(
                     dead,
@@ -7822,14 +7873,16 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(vec![ui_head(agent_id)], 50),
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story_wanting(agent_id, UnixMs(1)),
                 window,
@@ -7870,7 +7923,8 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
                 "the verdict handled everything the story had told"
             );
             // Something new past the cursor is the card again.
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story::story(
                     agent_id,
@@ -7918,7 +7972,7 @@ fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -7978,7 +8032,7 @@ fn undoing_a_mute_puts_the_unit_back_as_it_was(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -8050,7 +8104,7 @@ fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.set_slack_sources_for_test(
                 HostId::default(),
                 desk.slack_sources(),
@@ -8086,7 +8140,7 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.focus_tree_node_for_test(HostId::default(), on_the_map.clone(), window, cx);
         })
         .unwrap();
@@ -8135,7 +8189,7 @@ fn a_new_note_from_home_brings_the_map_into_view(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
             assert_eq!(workspace.current_surface_name_for_test(), "home");
             assert!(!workspace.overview_open_for_test());
@@ -8179,7 +8233,7 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -8222,7 +8276,7 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
@@ -8348,7 +8402,7 @@ fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
@@ -8395,7 +8449,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -8442,7 +8496,8 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,
@@ -8505,7 +8560,7 @@ fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContex
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -8545,7 +8600,7 @@ fn find_matches_a_thing_by_the_label_it_carries(cx: &mut TestAppContext) {
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
         })
         .unwrap();
@@ -8595,14 +8650,16 @@ fn find_reaches_an_unfiled_agent_by_what_the_user_said(cx: &mut TestAppContext) 
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(vec![ui_head(agent_id)], 70),
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story::story(
                     agent_id,
@@ -8703,7 +8760,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.sync_tree_dashboard(HostId::default(), window, cx);
         })
         .unwrap();
@@ -8829,7 +8886,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             // The reader opened the search page, which is what puts it on
             // the map; the tab ctrl-clicked out of it needs nothing written.
             workspace.file_page(
@@ -8986,6 +9043,108 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     );
 }
 
+/// An agent surface says what the agent is doing, from its head. Borrowing
+/// the Home card's words left a running agent's line blank, because a
+/// running agent has no card.
+#[test]
+fn an_agents_state_comes_from_its_head() {
+    use rho_registry::AgentFacts;
+
+    let now = chrono::Local::now().fixed_offset();
+    let running = AgentFacts {
+        turn_running: true,
+        turn_started_at: Some(UnixMs((now.timestamp_millis() - 5 * 60_000).unsigned_abs())),
+        ..AgentFacts::default()
+    };
+    assert_eq!(
+        crate::dashboard::agent_state_label(&running, now).as_deref(),
+        Some("working · 5m")
+    );
+    let running_since_before = AgentFacts {
+        turn_started_at: None,
+        ..running
+    };
+    assert_eq!(
+        crate::dashboard::agent_state_label(&running_since_before, now).as_deref(),
+        Some("working"),
+        "a head that says a turn runs without saying since when still reads as working"
+    );
+    let errored = AgentFacts {
+        turn_running: false,
+        turn_started_at: None,
+        errored: true,
+        last_turn_ended: Some(UnixMs((now.timestamp_millis() - 60_000).unsigned_abs())),
+        ..AgentFacts::default()
+    };
+    assert_eq!(
+        crate::dashboard::agent_state_label(&errored, now).as_deref(),
+        Some("errored · 1m ago")
+    );
+}
+
+/// A creation the daemon refuses says why on the draft. The echo area is
+/// two seconds long, so the whole cause used to be gone before the reader
+/// could act on it, and a creation just quietly did not happen.
+#[gpui::test]
+fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(Vec::new(), 0),
+                window,
+                cx,
+            );
+            workspace.new_agent_in_area(None, window, cx);
+        })
+        .expect("open a new-agent draft");
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("look at the readme", window, cx)
+            });
+            workspace
+                .draft_model_for_test()
+                .update(cx, |draft, cx| draft.set_workdir_text("/tmp/repo", cx));
+        })
+        .expect("write the draft");
+
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::ServerError(
+                    "create managed jj workspace: no such repository".to_owned(),
+                ),
+                window,
+                cx,
+            );
+        })
+        .expect("the daemon refuses");
+
+    let refusal = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .draft_model_for_test()
+                .read(cx)
+                .refusal()
+                .map(str::to_owned)
+        })
+        .expect("read the draft");
+    assert!(
+        refusal
+            .as_deref()
+            .is_some_and(|text| text.contains("no such repository")),
+        "the draft keeps the daemon's whole cause: {refusal:?}"
+    );
+}
+
 /// `n a` into a label makes the agent a member of it. Filing it as a child
 /// left the label empty on the map and the agent at the root.
 #[test]
@@ -9083,7 +9242,7 @@ fn a_draft_wears_no_other_cards_label(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -9188,8 +9347,9 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.handle_event(
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
                 HostId::default(),
                 ready_with(
                     vec![story::UiAgentHead {
@@ -9202,7 +9362,8 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 story_wanting(agent_id, UnixMs(1)),
                 window,
@@ -9230,7 +9391,8 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
+            story::feed(
+                workspace,
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp },
                 window,

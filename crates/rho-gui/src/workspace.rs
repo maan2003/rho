@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures::StreamExt as _;
+use futures::channel::mpsc as futures_mpsc;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
 use gpui::{
@@ -37,7 +38,7 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{ConnEvent, Connection, GitApprovalDecision, HostEvent};
+use crate::connection::{ConnEvent, Connection, GitApprovalDecision};
 use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
@@ -415,9 +416,9 @@ pub struct Workspace {
     /// Accumulated change summaries for materialized but hidden views; they
     /// render once, with the merged summary, when next selected.
     pending_syncs: HashMap<AgentId, FrameSummary>,
-    /// Each host's journal cursor, restored from the mirror and moved by
-    /// every `Log`.
-    mirror_hosts: HashMap<HostId, MirrorCursor>,
+    /// What the main thread asks of the model thread: which hosts exist,
+    /// and whose rows it wants. The journal cursor is the model's.
+    model: futures_mpsc::UnboundedSender<crate::model::ToModel>,
     /// The transcript fold of every active agent, in memory, so a `Log`
     /// entry folds into it without waiting on the disk copy.
     open_mirrors: HashMap<AgentId, rho_registry::TranscriptFold>,
@@ -563,6 +564,10 @@ pub struct Workspace {
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
     pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
+    /// What the finder's highlighted row opens, carried from the prompt to
+    /// its submit handler: the submitted text cannot tell two rows with the
+    /// same path apart.
+    pub(crate) pending_find_target: Option<crate::find::FindTarget>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     pub(crate) minibuffer: Option<Minibuffer>,
@@ -656,48 +661,45 @@ impl Workspace {
         );
     }
 
-    fn apply_ready(
-        &mut self,
-        host: HostId,
-        machine_seed: u64,
-        agent_counter: u64,
-        journal_head: rho_ui_proto::mirror::Seq,
-    ) -> bool {
+    fn apply_ready(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) -> bool {
         let first_ready = self.ready_hosts.insert(host);
-        let name = self.registry.host_name(host).to_owned();
-        let cursor = self.mirror_hosts.entry(host).or_insert(MirrorCursor {
-            machine_seed,
-            seq: rho_ui_proto::mirror::Seq(0),
-            head: journal_head,
-        });
-        cursor.head = journal_head;
-        // A daemon whose database is not the one this client mirrored, or
-        // whose journal is shorter than the copy: the copy starts over.
-        if cursor.machine_seed != machine_seed || cursor.seq > journal_head {
-            *cursor = MirrorCursor {
-                machine_seed,
-                seq: rho_ui_proto::mirror::Seq(0),
-                head: journal_head,
-            };
-            crate::mirror::reset_host(&name);
-            for agent_id in self.registry.host_agents(host) {
-                self.store.forget(agent_id);
-                self.open_mirrors.remove(&agent_id);
-                self.active.remove(agent_id);
-            }
-            self.registry.reset_host(host);
-        }
         self.registry
             .set_host_data(host, machine_seed, agent_counter);
         first_ready
     }
 
-    /// What `Follow` asks for: everything after the newest entry held.
-    fn journal_cursor(&self, host: HostId) -> rho_ui_proto::mirror::Seq {
-        self.mirror_hosts
-            .get(&host)
-            .map(|cursor| cursor.seq)
-            .unwrap_or_default()
+    /// What the model holds for a host is now all there is of it: the disk
+    /// copy read at startup, or nothing after the copy started over.
+    /// Whatever this client had of the host goes first.
+    fn loaded(
+        &mut self,
+        host: HostId,
+        agents: Vec<rho_registry::MirroredAgent>,
+        verdicts: Vec<(AgentId, rho_registry::Verdict)>,
+    ) {
+        for agent_id in self.registry.host_agents(host) {
+            self.store.forget(agent_id);
+            self.open_mirrors.remove(&agent_id);
+            self.active.remove(agent_id);
+        }
+        self.registry.reset_host(host);
+        self.registry.restore(agents);
+        for (agent_id, verdict) in verdicts {
+            self.registry.set_agent_verdict(agent_id, verdict);
+        }
+        self.note_followed();
+    }
+
+    /// The agents whose rows the model hands up: the transcripts this
+    /// client has open. Everything else it says as a digest.
+    pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
+        self.open_mirrors.keys().copied().collect()
+    }
+
+    fn note_followed(&self) {
+        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
+            crate::model::ModelCommand::Follow(self.followed()),
+        ));
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -721,38 +723,35 @@ impl Workspace {
         let fold = rho_registry::TranscriptFold::new(&events);
         self.store.set_fold(agent_id, fold.state());
         self.open_mirrors.insert(agent_id, fold);
+        self.note_followed();
         true
     }
 
-    /// Folds new rows into every open transcript they belong to.
-    fn refold_open_transcripts(
+    /// Rows of an agent whose transcript is open, folded into the copy
+    /// behind it. Positions already held are skipped, so the rows the
+    /// reader's own open read already picked up cost nothing.
+    fn refold_open_transcript(
         &mut self,
-        entries: &[rho_ui_proto::mirror::LogEntry],
+        agent_id: AgentId,
+        rows: &[(
+            rho_ui_proto::mirror::AgentPos,
+            rho_ui_proto::mirror::MirrorEvent,
+        )],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut refolded = Vec::new();
-        for entry in entries {
-            let Some(fold) = self.open_mirrors.get_mut(&entry.agent_id) else {
-                continue;
-            };
-            if !fold.tell(entry.pos, &entry.event) {
-                continue;
-            }
-            if !refolded.contains(&entry.agent_id) {
-                refolded.push(entry.agent_id);
-            }
+        let Some(fold) = self.open_mirrors.get_mut(&agent_id) else {
+            return;
+        };
+        let mut refolded = false;
+        for (pos, event) in rows {
+            refolded |= fold.tell(*pos, event);
         }
-        let frames = refolded
-            .into_iter()
-            .map(|agent_id| {
-                let state = self.open_mirrors[&agent_id].state();
-                (agent_id, TranscriptFrame::Fold(state))
-            })
-            .collect::<Vec<_>>();
-        if !frames.is_empty() {
-            self.handle_frame_batch(frames, window, cx);
+        if !refolded {
+            return;
         }
+        let state = self.open_mirrors[&agent_id].state();
+        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
     }
 
     fn apply_frame_state(
@@ -856,17 +855,6 @@ pub(crate) enum TranscriptFrame {
     Fold(rho_registry::render::UiAgentState),
 }
 
-/// Where this client stands in a host's journal, and whose database it
-/// counts in.
-#[derive(Clone, Copy, Debug)]
-struct MirrorCursor {
-    machine_seed: u64,
-    seq: rho_ui_proto::mirror::Seq,
-    /// The journal head `Ready` named: the catch-up is done once `seq`
-    /// reaches it.
-    head: rho_ui_proto::mirror::Seq,
-}
-
 /// Who a command speaks about: the rail row under the cursor, or the open
 /// agent. Both answer the same three questions, which is what lets one
 /// resolver serve every command.
@@ -890,7 +878,9 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (hosts, events) = Hosts::new();
+        let crate::model::ModelChannels { incoming, changes } = crate::model::spawn();
+        let model_commands = incoming.clone();
+        let hosts = Hosts::new(incoming);
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
@@ -911,14 +901,14 @@ impl Workspace {
             editor
         });
         let event_task = cx.spawn(async move |this, cx| {
-            let mut events: UnboundedReceiver<HostEvent> = events;
-            while let Some(event) = events.next().await {
-                let mut batch = vec![event];
-                while let Ok(event) = events.try_recv() {
-                    batch.push(event);
+            let mut changes: UnboundedReceiver<crate::model::ModelEvent> = changes;
+            while let Some(change) = changes.next().await {
+                let mut batch = vec![change];
+                while let Ok(change) = changes.try_recv() {
+                    batch.push(change);
                 }
                 let updated = this.update_in(cx, |this, window, cx| {
-                    this.handle_events(batch, window, cx);
+                    this.handle_model_events(batch, window, cx);
                 });
                 if updated.is_err() {
                     break;
@@ -1057,7 +1047,7 @@ impl Workspace {
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
-            mirror_hosts: HashMap::new(),
+            model: model_commands,
             open_mirrors: HashMap::new(),
             draft_model,
             message_log: MessageLog::default(),
@@ -1133,6 +1123,7 @@ impl Workspace {
             _slack_view_subscriptions: Vec::new(),
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
+            pending_find_target: None,
             scroll_journal_task: None,
             minibuffer: None,
             transient: None,
@@ -1158,7 +1149,6 @@ impl Workspace {
         for spec in specs {
             this.attach_host(spec, cx);
         }
-        this.restore_mirror();
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         this.overview_open = false;
@@ -1184,51 +1174,6 @@ impl Workspace {
         host
     }
 
-    /// What the last session made of every agent, read back before any
-    /// daemon answers. The rails are then whole from the first frame, and
-    /// the `Follow` this client sends on `Ready` asks only for what came
-    /// after. An agent whose host is no longer attached is dropped: it
-    /// belongs to a daemon this session does not have.
-    fn restore_mirror(&mut self) {
-        let hosts = self
-            .registry
-            .hosts()
-            .map(|(host, name)| (name.to_owned(), host))
-            .collect::<HashMap<_, _>>();
-        let loaded = crate::mirror::load();
-        for mirrored in loaded.hosts {
-            if let Some(&host) = hosts.get(&mirrored.name) {
-                self.mirror_hosts.insert(
-                    host,
-                    MirrorCursor {
-                        machine_seed: mirrored.machine_seed,
-                        seq: mirrored.seq,
-                        head: mirrored.seq,
-                    },
-                );
-            }
-        }
-        let mut agents = Vec::new();
-        let mut verdicts = Vec::new();
-        for (agent_id, mirrored) in loaded.agents {
-            let Some(&host) = hosts.get(&mirrored.host) else {
-                continue;
-            };
-            agents.push(rho_registry::MirroredAgent {
-                host,
-                identity: mirrored.snapshot.identity,
-                digest: mirrored.snapshot.digest,
-            });
-            if let Some(verdict) = mirrored.verdict {
-                verdicts.push((agent_id, verdict));
-            }
-        }
-        self.registry.restore(agents);
-        for (agent_id, verdict) in verdicts {
-            self.registry.set_agent_verdict(agent_id, verdict);
-        }
-    }
-
     /// Forgets a daemon: its transcripts, surfaces, and cached projects go
     /// with it, and its connection is torn down by the drop.
     pub(crate) fn detach_host(
@@ -1252,6 +1197,9 @@ impl Workspace {
             self.stop_voice();
         }
         self.hosts.detach(host);
+        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
+            crate::model::ModelCommand::DetachHost(host),
+        ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.quota_summaries.remove(&host);
@@ -1270,6 +1218,7 @@ impl Workspace {
             self.pending_syncs.remove(&agent_id);
             self.pending_diff_loads.remove(&agent_id);
         }
+        self.note_followed();
         self.contexts
             .retain(|context, _| !contexts.contains(context));
         self.surfaces
@@ -1744,23 +1693,14 @@ impl Workspace {
         }
     }
 
-    /// One desk rebuild per frame for a host's rows, and none while the
-    /// follow is still short of the journal head `Ready` named: a
-    /// catch-up is thousands of pages, and each would rebuild the whole
-    /// desk. The page that reaches the head schedules the one that runs.
+    /// One desk rebuild per frame for a host's rows. A catch-up says
+    /// nothing until it reaches the head, so this never runs per page.
     fn schedule_desk_sync(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
         if !self.desk_sync_pending.insert(host) {
             return;
         }
         cx.on_next_frame(window, move |this, window, cx| {
             this.desk_sync_pending.remove(&host);
-            if this
-                .mirror_hosts
-                .get(&host)
-                .is_some_and(|cursor| cursor.seq < cursor.head)
-            {
-                return;
-            }
             this.sync_tree_dashboard(host, window, cx);
             this.invalidate_dealer_signals(cx);
             cx.notify();
@@ -1888,14 +1828,45 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn handle_events(
+    pub(crate) fn handle_model_events(
         &mut self,
-        events: Vec<HostEvent>,
+        events: Vec<crate::model::ModelEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for HostEvent { host, event } in events {
-            self.handle_event(host, event, window, cx);
+        for crate::model::ModelEvent { host, msg } in events {
+            self.handle_model_event(host, msg, window, cx);
+        }
+    }
+
+    pub(crate) fn handle_model_event(
+        &mut self,
+        host: HostId,
+        msg: crate::model::ModelMsg,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match msg {
+            crate::model::ModelMsg::Loaded { agents, verdicts } => {
+                self.loaded(host, agents, verdicts);
+                self.refresh_dashboard(window, cx);
+                self.schedule_desk_sync(host, window, cx);
+                cx.notify();
+            }
+            crate::model::ModelMsg::Changed { agents } => {
+                let changed = self.registry.told(agents);
+                if changed.is_empty() {
+                    return;
+                }
+                // The log is a source of rows, not only of facts: an agent
+                // that has just asked for the user is on the map for its own
+                // sake, so the tree the dealer reads has to be made again.
+                self.schedule_desk_sync(host, window, cx);
+            }
+            crate::model::ModelMsg::Rows { agent_id, rows } => {
+                self.refold_open_transcript(agent_id, &rows, window, cx);
+            }
+            crate::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
         }
     }
 
@@ -2015,20 +1986,14 @@ impl Workspace {
                 auth,
                 machine_seed,
                 agent_counter,
-                journal_head,
+                journal_head: _,
             } => {
                 self.replay_hosts.remove(&host);
-                let first_ready = self.apply_ready(host, machine_seed, agent_counter, journal_head);
+                // The model asked for the journal this client lacks before
+                // this arrived: the cursor is its to keep.
+                let first_ready = self.apply_ready(host, machine_seed, agent_counter);
                 self.prune_contexts();
                 self.refresh_workdirs(host);
-                // Ask for every journal entry this client lacks. The daemon
-                // answers with the rest and then follows.
-                self.hosts.send(
-                    host,
-                    ClientMessage::Follow {
-                        since: self.journal_cursor(host),
-                    },
-                );
                 if let Some(entry) = self.hosts.get_mut(host) {
                     entry.auth = Some(auth);
                 }
@@ -2107,46 +2072,9 @@ impl Workspace {
                     self.handle_event(host, event, window, cx);
                 }
             }
-            ConnEvent::Log { entries } => {
-                let name = self.registry.host_name(host).to_owned();
-                let machine_seed = match (entries.last(), self.mirror_hosts.get_mut(&host)) {
-                    (Some(last), Some(cursor)) => {
-                        cursor.seq = cursor.seq.max(last.seq);
-                        cursor.machine_seed
-                    }
-                    _ => 0,
-                };
-                let changed = self.registry.tell(host, &entries);
-                // Rows of an agent whose creation this client never heard
-                // fold to nothing; the copy keeps only what the registry
-                // could make something of, with what it made.
-                let entries = entries
-                    .into_iter()
-                    .filter(|entry| self.registry.mirrored(entry.agent_id).is_some())
-                    .collect::<Vec<_>>();
-                let digests = changed
-                    .iter()
-                    .filter_map(|agent_id| {
-                        let mirrored = self.registry.mirrored(*agent_id)?;
-                        Some((
-                            *agent_id,
-                            crate::mirror::AgentSnapshot::new(
-                                mirrored.identity.clone(),
-                                mirrored.digest.clone(),
-                            ),
-                        ))
-                    })
-                    .collect();
-                crate::mirror::write_log(&name, machine_seed, entries.clone(), digests);
-                self.refold_open_transcripts(&entries, window, cx);
-                if changed.is_empty() {
-                    return;
-                }
-                // The log is a source of rows, not only of facts: an agent
-                // that has just asked for the user is on the map for its own
-                // sake, so the tree the dealer reads has to be made again.
-                self.schedule_desk_sync(host, window, cx);
-            }
+            // Rows never reach the main thread as rows: the model folds
+            // them and says which agents moved.
+            ConnEvent::Log { .. } => {}
             // Bodies on demand are not yet asked for; nothing to hold.
             ConnEvent::Detail { .. } => {}
             ConnEvent::ChatGptUsage {
@@ -2233,17 +2161,20 @@ impl Workspace {
             }
             ConnEvent::ServerError(message) => {
                 // A failed creation keeps the draft buffers; the user fixes
-                // the workdir and submits again.
-                if self.awaiting_draft_agent == Some(host) {
+                // the workdir and submits again. The daemon's whole cause is
+                // what the draft shows, so the reason a creation refused is
+                // readable for longer than an echo.
+                let refused_draft = self.awaiting_draft_agent == Some(host);
+                if refused_draft {
                     self.awaiting_draft_agent = None;
                 }
                 let source = self.error_source(host);
-                self.notice_on(
-                    None,
-                    &format!("[{source} error: {message}]"),
-                    StyleClass::SystemImportant,
-                    cx,
-                );
+                let text = format!("[{source} error: {message}]");
+                if refused_draft {
+                    self.refuse_draft(&text, cx);
+                } else {
+                    self.notice_on(None, &text, StyleClass::SystemImportant, cx);
+                }
             }
             ConnEvent::Recovering(elapsed) => {
                 let changed = !self
@@ -2859,6 +2790,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Why a submission did not become an agent. The echo area says it once,
+    /// and the draft keeps it: a refusal the reader has to act on outlives
+    /// the two seconds an echo lasts.
+    pub(crate) fn refuse_draft(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.notice_on(None, message, StyleClass::SystemImportant, cx);
+        self.draft_model.update(cx, |draft, cx| {
+            draft.set_refusal(Some(message.to_owned()), cx)
+        });
+    }
+
     /// Submitting the compose surface creates the agent: the workdir field
     /// picks the working directory, the topic is whatever the draft
     /// inherited. The buffers are not cleared here — they survive until the
@@ -2873,13 +2814,11 @@ impl Workspace {
             }
             return;
         };
+        // Whatever refused the last submission is answered by this one.
+        self.draft_model
+            .update(cx, |draft, cx| draft.set_refusal(None, cx));
         if !self.connected() {
-            self.notice_on(
-                None,
-                "not connected to rho-daemon",
-                StyleClass::SystemImportant,
-                cx,
-            );
+            self.refuse_draft("not connected to rho-daemon", cx);
             return;
         }
         let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
@@ -2889,7 +2828,7 @@ impl Workspace {
             match self.resolve_workdir(&field) {
                 Ok(workdir) => Some(workdir),
                 Err(message) => {
-                    self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                    self.refuse_draft(&message, cx);
                     return;
                 }
             }
@@ -2901,7 +2840,7 @@ impl Workspace {
             match self.parse_start(mode, &target, working_directory, None) {
                 Ok(start) => start,
                 Err(message) => {
-                    self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                    self.refuse_draft(&message, cx);
                     return;
                 }
             }
@@ -2909,7 +2848,7 @@ impl Workspace {
         let role = match parse_agent_role(self.draft_model.read(cx).role_text(cx).trim()) {
             Ok(role) => role,
             Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                self.refuse_draft(&message, cx);
                 return;
             }
         };
@@ -4277,6 +4216,7 @@ impl Workspace {
     /// pane still shows it. The digest stays; the rails read that.
     fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         self.open_mirrors.remove(&agent_id);
+        self.note_followed();
         self.store.forget(agent_id);
         self.pending_syncs.remove(&agent_id);
         self.registry.mark_not_live(agent_id);
@@ -7131,6 +7071,13 @@ impl Workspace {
         };
         let prompt = minibuffer.prompt().to_owned();
         self.pending_filing_selected = None;
+        self.pending_find_target = None;
+        // Which row is chosen has to be read before `accept_selected`
+        // rewrites the input into that row's text.
+        if prompt == "find:" && minibuffer.accepts_selected(cx) {
+            self.pending_find_target =
+                self.find_target_at(&minibuffer.input(cx), minibuffer.selected_row(), cx);
+        }
         if prompt == "file under:"
             && let Some((candidate, occurrence)) = minibuffer.selected_candidate()
         {
@@ -9435,8 +9382,16 @@ impl Workspace {
         // Otherwise the label is about whatever is in view: with a card
         // behind the surface it says which card and why, with the map open
         // it is the map's own breadcrumb.
+        // An agent surface's state comes from its head, never from the card
+        // that dealt it: the card says why the dealer raised the agent, and
+        // a running agent has no card at all, which left the line blank.
+        let agent_in_view = match (self.overview_open, &self.active_pane().surface.key) {
+            (false, SurfaceKey::Transcript(agent_id)) => Some(*agent_id),
+            _ => None,
+        };
         if let Some(card) = self.open_card_in_view(cx)
             && echo.is_none()
+            && agent_in_view.is_none()
         {
             return self.render_deal_why(&card, text_style, window, cx);
         }
@@ -9471,6 +9426,13 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
+        let state = agent_in_view
+            .filter(|_| echo.is_none())
+            .and_then(|agent_id| {
+                let facts = self.registry.agent_facts(agent_id);
+                crate::dashboard::agent_state_label(&facts, chrono::Local::now().fixed_offset())
+            });
+        let state = state.map(|state| div().text_color(cx.theme().status().warning).child(state));
         let left = echo.map_or_else(
             || self.render_status_path(&Self::truncate_outline_path(&path), cx),
             |echo| {
@@ -9490,7 +9452,7 @@ impl Workspace {
                 .child(format!("{unseen} new"))
         });
         self.status_row(
-            div().child(left).children(unseen),
+            div().child(left).children(state).children(unseen),
             right,
             text_style,
             window,

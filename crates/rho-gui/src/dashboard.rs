@@ -2156,22 +2156,12 @@ fn agent_card_facts(
     // A dead turn is not an FYI: reading it as one gave it a decaying
     // priority and the word "finished", so a crashed agent quietly aged
     // out of Home. Only the user can start it again.
-    let (base_priority, label) = if agent.facts.errored {
-        (
-            blocked_reply_priority(wait_days),
-            format!("errored · {} ago", age_label(wait_days)),
-        )
-    } else if agent.facts.needs_you_hint {
-        (
-            blocked_reply_priority(wait_days),
-            format!("waiting on reply · {}", age_label(wait_days)),
-        )
+    let base_priority = if agent.facts.errored || agent.facts.needs_you_hint {
+        blocked_reply_priority(wait_days)
     } else {
-        (
-            fyi_reply_priority(wait_days),
-            format!("finished · {} ago", age_label(wait_days)),
-        )
+        fyi_reply_priority(wait_days)
     };
+    let label = outcome_label(&agent.facts, wait_days);
     let recency_bonus = agent_interactions.get(&agent.agent_id).map_or(0.0, |last| {
         let elapsed = (now.timestamp_millis() - *last).clamp(0, AGENT_RECENCY_WINDOW_MS);
         let remaining = 1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
@@ -2179,6 +2169,40 @@ fn agent_card_facts(
     });
     let priority = base_priority + recency_bonus;
     (priority > DEAL_QUEUE_FLOOR).then_some((priority, label))
+}
+
+/// What an agent's own status line says, which is what its head is doing:
+/// a running turn and how long it has run, or else how the last one ended.
+/// Never a card's label; a card is the dealer's reason for showing the
+/// agent, and a running agent has no card at all.
+pub(crate) fn agent_state_label(
+    facts: &rho_registry::AgentFacts,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> Option<String> {
+    if facts.turn_running {
+        return Some(match facts.turn_started_at {
+            Some(started) => format!(
+                "working · {}",
+                crate::home::elapsed_label(started.0 as i64, now.timestamp_millis())
+            ),
+            // The head says a turn runs without saying since when, which is
+            // every turn that started before the client was listening.
+            None => "working".to_owned(),
+        });
+    }
+    let ended = facts.last_turn_ended?;
+    Some(outcome_label(facts, reply_wait_days(ended, now)))
+}
+
+/// How the last finished turn ended, in the words Home's cards use.
+fn outcome_label(facts: &rho_registry::AgentFacts, wait_days: f64) -> String {
+    if facts.errored {
+        format!("errored · {} ago", age_label(wait_days))
+    } else if facts.needs_you_hint {
+        format!("waiting on reply · {}", age_label(wait_days))
+    } else {
+        format!("finished · {} ago", age_label(wait_days))
+    }
 }
 
 fn reply_wait_days(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {

@@ -115,6 +115,10 @@ pub struct Digest {
     pub title: Option<String>,
     pub activity: Option<String>,
     pub turn_running: bool,
+    /// When the running turn began, so a reader is told how long it has
+    /// been working. `None` between turns, and while a turn the client
+    /// never saw start is running.
+    pub turn_started_at: Option<UnixMs>,
     pub last_active: UnixMs,
     pub last_user_message_at: UnixMs,
     pub last_user_message_text: String,
@@ -159,9 +163,10 @@ impl Digest {
             } => self.user_spoke(*at, text),
             MirrorEvent::Turn {
                 edge: TurnEdge::Started,
-                ..
+                at,
             } => {
                 self.turn_running = true;
+                self.turn_started_at = Some(*at);
                 self.errored = None;
                 self.wants = None;
             }
@@ -170,6 +175,7 @@ impl Digest {
                 at,
             } => {
                 self.turn_running = false;
+                self.turn_started_at = None;
                 self.last_turn_ended = Some(*at);
                 // The label described work that just stopped.
                 self.activity = None;

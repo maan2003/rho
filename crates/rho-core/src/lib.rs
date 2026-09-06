@@ -58,18 +58,6 @@ impl PrefixIdDomain for AgentIdDomain {
     }
 }
 
-/// What the user did about an agent's last finished turn.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentDisposition {
-    Pending,
-    #[default]
-    Done,
-    Snoozed {
-        until: UnixMs,
-    },
-    Hidden,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum AgentRole {
     Engineer {

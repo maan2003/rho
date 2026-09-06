@@ -12,7 +12,8 @@ use futures::channel::mpsc as futures_mpsc;
 use gpui::App;
 use rho_ui_proto::ClientMessage;
 
-use crate::connection::{Connection, HostEvent};
+use crate::connection::Connection;
+use crate::model::{ModelCommand, ToModel};
 use crate::registry::HostId;
 use crate::workspace::AttachTarget;
 
@@ -68,23 +69,18 @@ impl Host {
 pub struct Hosts {
     hosts: Vec<Host>,
     next_id: u32,
-    events: futures_mpsc::UnboundedSender<HostEvent>,
+    events: futures_mpsc::UnboundedSender<ToModel>,
 }
 
 impl Hosts {
-    /// Opens the shared event stream. Nothing is attached yet; the receiver
-    /// stays live for the workspace's lifetime because `Hosts` keeps the
-    /// sender.
-    pub fn new() -> (Self, futures_mpsc::UnboundedReceiver<HostEvent>) {
-        let (events, receiver) = futures_mpsc::unbounded();
-        (
-            Self {
-                hosts: Vec::new(),
-                next_id: 0,
-                events,
-            },
-            receiver,
-        )
+    /// Nothing is attached yet. Every connection's frames go to the model
+    /// thread, which is what the sender leads to.
+    pub fn new(events: futures_mpsc::UnboundedSender<ToModel>) -> Self {
+        Self {
+            hosts: Vec::new(),
+            next_id: 0,
+            events,
+        }
     }
 
     /// Dials a daemon and starts feeding its events into the shared stream.
@@ -93,7 +89,22 @@ impl Hosts {
     pub fn attach(&mut self, name: String, target: AttachTarget, cx: &App) -> HostId {
         let id = HostId(self.next_id);
         self.next_id += 1;
+        // Named to the model before it is dialled, and on the same
+        // channel its frames take: the model knows every host whose
+        // frames can reach it.
+        let _ = self
+            .events
+            .unbounded_send(ToModel::Command(ModelCommand::AttachHost {
+                host: id,
+                name: name.clone(),
+            }));
         let connection = crate::connection::spawn(id, target.clone(), self.events.clone(), cx);
+        let _ = self
+            .events
+            .unbounded_send(ToModel::Command(ModelCommand::HostCommands {
+                host: id,
+                commands: connection.commands(),
+            }));
         self.hosts.push(Host {
             id,
             name,

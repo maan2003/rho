@@ -19,6 +19,7 @@ pub(crate) mod image_view;
 pub mod journal;
 pub mod minibuffer;
 pub mod mirror;
+pub(crate) mod model;
 pub mod note_view;
 pub mod pane;
 pub(crate) mod realtime_client;

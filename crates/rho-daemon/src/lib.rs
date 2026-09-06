@@ -419,8 +419,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
-    let projects_converted = convert_projects(&agents).await;
-    drop_converted_tables(&agents.db, projects_converted).await;
+    drop_converted_tables(&agents.db).await;
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
@@ -1101,53 +1100,17 @@ impl AgentRegistry {
     }
 }
 
-/// Builds the story of every agent that predates it, in the background,
-/// so a restart is never held for the migration. Most-recently-touched
-/// first, one agent per transaction, resumable across restarts; a load
-/// jumps the queue on its own. Goes with the rest of the migration code.
-/// Moves the registered projects into the store, once, on the start that
-/// first has somewhere to put them. Deleted after the restart, with the
-/// table it reads.
-/// Returns whether the old table may now be dropped: it may once its rows
-/// are in the store, and a failed conversion keeps them where they are.
-async fn convert_projects(agents: &AgentRegistry) -> bool {
-    let projects = {
-        let mut projects = agents.db.read().list_projects();
-        projects.sort_by(|(_, left), (_, right)| left.name.cmp(&right.name));
-        projects
-    };
-    if projects.is_empty() {
-        return true;
-    }
-    match agents
-        .desk_cells
-        .convert_projects(agents.machine_seed, &projects)
-        .await
-    {
-        Ok(0) => true,
-        Ok(written) => {
-            eprintln!("rho daemon: filed {written} projects into the store");
-            true
-        }
-        Err(error) => {
-            eprintln!("rho daemon: project conversion failed: {error}");
-            false
-        }
-    }
-}
-
 /// The tables slice B leaves behind, dropped on the start that no longer
 /// needs them. `projects` goes only once this same start has put its rows
 /// in the store; `view_config` has been unread by every client since the
 /// fold toggle became session state, so there is nothing to convert.
 /// `agent_attention_until_slice_b` stays: the story backfill still reads
 /// it for an agent's spawner, and it goes with the conversion code.
-async fn drop_converted_tables(db: &RhoDb, projects_converted: bool) {
+async fn drop_converted_tables(db: &RhoDb) {
     let mut write = db.write().await;
-    if projects_converted {
-        write.delete_table("projects");
-    }
+    write.delete_table("projects");
     write.delete_table("view_config");
+    write.delete_table("agent_attention_until_slice_b");
     write.commit();
 }
 
@@ -3460,8 +3423,8 @@ mod tests {
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, PlatformSecrets, claude_quota_history, configure_octo_git_transport,
         hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
-        prepare_image_content, quota_burn, quota_summaries, rewind_destination_materialized,
-        rewind_source_prefix, start_runtime_sockets, validate_image_content,
+        prepare_image_content, quota_burn, quota_summaries, start_runtime_sockets,
+        validate_image_content,
     };
 
     #[tokio::test]
@@ -3553,73 +3516,6 @@ mod tests {
             std::io::ErrorKind::WouldBlock
         );
         drop(sockets);
-    }
-
-    fn assistant_message(uuid: uuid::Uuid, timestamp: &str) -> rho_claude::SessionMessage {
-        rho_claude::SessionMessage {
-            kind: rho_claude::SessionMessageKind::Assistant,
-            uuid,
-            session_id: uuid::Uuid::new_v4(),
-            message: serde_json::json!({}),
-            parent_tool_use_id: None,
-            timestamp: Some(timestamp.to_owned()),
-        }
-    }
-
-    #[test]
-    fn turn_end_backfill_honors_rewind_to_source_prefix() {
-        let retained = uuid::Uuid::new_v4();
-        let rewind = ClaudeRewind {
-            source_session_id: uuid::Uuid::new_v4(),
-            session_id: uuid::Uuid::new_v4(),
-            resume_at: Some(retained),
-        };
-        let source = vec![
-            assistant_message(retained, "2025-01-01T00:00:00Z"),
-            assistant_message(uuid::Uuid::new_v4(), "2025-01-02T00:00:00Z"),
-        ];
-
-        assert!(!rewind_destination_materialized(&rewind, &[]));
-        let selected = rewind_source_prefix(&rewind, &source).unwrap();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].uuid, retained);
-        assert_eq!(
-            selected[0].timestamp.as_deref(),
-            Some("2025-01-01T00:00:00Z")
-        );
-    }
-
-    #[test]
-    fn turn_end_backfill_honors_rewind_to_empty_transcript() {
-        let rewind = ClaudeRewind {
-            source_session_id: uuid::Uuid::new_v4(),
-            session_id: uuid::Uuid::new_v4(),
-            resume_at: None,
-        };
-        let source = vec![assistant_message(
-            uuid::Uuid::new_v4(),
-            "2025-01-02T00:00:00Z",
-        )];
-
-        assert!(!rewind_destination_materialized(&rewind, &[]));
-        assert!(rewind_source_prefix(&rewind, &source).unwrap().is_empty());
-    }
-
-    #[test]
-    fn turn_end_backfill_prefers_materialized_rewind_destination() {
-        let retained = uuid::Uuid::new_v4();
-        let rewind = ClaudeRewind {
-            source_session_id: uuid::Uuid::new_v4(),
-            session_id: uuid::Uuid::new_v4(),
-            resume_at: Some(retained),
-        };
-        let destination = vec![assistant_message(retained, "2025-01-03T00:00:00Z")];
-
-        assert!(rewind_destination_materialized(&rewind, &destination));
-        assert_eq!(
-            destination[0].timestamp.as_deref(),
-            Some("2025-01-03T00:00:00Z")
-        );
     }
 
     #[test]

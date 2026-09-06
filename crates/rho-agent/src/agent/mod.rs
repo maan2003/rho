@@ -239,8 +239,16 @@ impl AgentHandle {
         // multi-repo creation may leave an unreachable checkout for jj GC.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let entries = materialize_workdirs(start).await?;
-        let view = View::new(entries.clone())?;
+        let materialized = materialize_workdirs(start).await?;
+        let entries = materialized.entries.clone();
+        let view = match View::new(entries.clone()) {
+            Ok(view) => view,
+            Err(error) => {
+                drop(entries);
+                materialized.discard();
+                return Err(error);
+            }
+        };
         write.create_agent(
             UnixMillis::now(),
             agent_id,

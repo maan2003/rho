@@ -785,6 +785,9 @@ in `STORE-DESIGN.md`.
 - A surface borrowing a card it does not stand for: a why or a label
   read on a list, a log or a picker belongs to whatever the map's
   cursor last left behind, and a verdict pressed there takes it.
+- The daemon writing a verdict: what the user decided about an agent is
+  the user's store fact, written by their client; the daemon has no
+  device that writes verdicts.
 - A migration file still present after the user has restarted on it.
 - A story event written by hand beside a raw event, or a mirror event
   that is not `strip` of exactly one raw event.

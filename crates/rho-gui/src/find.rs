@@ -301,6 +301,16 @@ impl Workspace {
         candidates
     }
 
+    /// What the finder's `row`th match for `query` opens. Two agents can
+    /// share a name, and so a path: which of them the reader highlighted
+    /// is the row, never the text.
+    pub(crate) fn find_target_at(&self, query: &str, row: usize, cx: &App) -> Option<FindTarget> {
+        ranked_find_candidates(self.find_candidates(cx), query)
+            .into_iter()
+            .nth(row)
+            .map(|candidate| candidate.target)
+    }
+
     /// Slack's side of the tree: one path per conversation, and one per
     /// thread the client is tracking.
     fn slack_find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
@@ -329,17 +339,10 @@ impl Workspace {
     /// The finder itself: type a path, `enter` opens it.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, cx: &App| {
-            let candidates = workspace.find_candidates(cx);
-            let paths = candidates
-                .iter()
-                .map(|candidate| (candidate.names(), candidate.recency))
-                .collect::<Vec<_>>();
-            rank_names(&paths, input)
+            ranked_find_candidates(workspace.find_candidates(cx), input)
                 .into_iter()
-                .filter_map(|index| candidates.get(index))
-                .take(FIND_LIMIT)
                 .map(|candidate| Candidate {
-                    value: candidate.path.clone(),
+                    value: candidate.path,
                     description: candidate.kind.to_owned(),
                 })
                 .collect()
@@ -363,6 +366,12 @@ impl Workspace {
     /// Opens the target the chosen path names, the ordinary way each
     /// surface is opened from the dashboard.
     fn find_open(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The row the reader highlighted, when they chose one: rows can
+        // share a path, so the text alone would always open the first.
+        if let Some(target) = self.pending_find_target.take() {
+            self.open_find_target(target, window, cx);
+            return;
+        }
         let path = path.trim();
         if path.is_empty() {
             return;
@@ -386,7 +395,18 @@ impl Workspace {
             );
             return;
         };
-        match candidates[index].target.clone() {
+        self.open_find_target(candidates[index].target.clone(), window, cx);
+    }
+
+    /// What the row the reader chose names, opened the ordinary way each
+    /// surface is opened from the dashboard.
+    fn open_find_target(
+        &mut self,
+        target: FindTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
             FindTarget::Agent(agent_id) => self.open_agent(agent_id, window, cx),
             FindTarget::Page(page_id) => self.open_browser_page(page_id, window, cx),
             // A node opens its own surface, and a note's surface is the
@@ -403,6 +423,22 @@ impl Workspace {
     }
 }
 
+/// The finder's rows for a query, best first. This is the list the prompt
+/// shows, so the row a reader highlighted is this list's nth.
+fn ranked_find_candidates(candidates: Vec<FindCandidate>, query: &str) -> Vec<FindCandidate> {
+    let paths = candidates
+        .iter()
+        .map(|candidate| (candidate.names(), candidate.recency))
+        .collect::<Vec<_>>();
+    let order = rank_names(&paths, query);
+    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .take(FIND_LIMIT)
+        .filter_map(|index| candidates[index].take())
+        .collect()
+}
+
 /// The prompt shows a window of candidates; ranking past that is work the
 /// reader never sees.
 const FIND_LIMIT: usize = 50;
@@ -410,6 +446,36 @@ const FIND_LIMIT: usize = 50;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent_row(path: &str, id: u64) -> FindCandidate {
+        FindCandidate {
+            path: path.to_owned(),
+            kind: "agent",
+            target: FindTarget::Agent(
+                AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap(),
+            ),
+            labels: Vec::new(),
+            aka: Vec::new(),
+            recency: 0,
+        }
+    }
+
+    /// Two agents can be called the same thing, so the rows the prompt
+    /// shows can carry the same path. The row is what tells them apart:
+    /// picking the second must open the second, not the first again.
+    #[test]
+    fn rows_that_share_a_path_are_told_apart_by_their_row() {
+        let rows = ranked_find_candidates(
+            vec![
+                agent_row("rig › flaky test", 1),
+                agent_row("rig › flaky test", 2),
+            ],
+            "flaky",
+        );
+        assert_eq!(rows.len(), 2, "both rows are shown");
+        assert_eq!(rows[0].target, agent_row("", 1).target);
+        assert_eq!(rows[1].target, agent_row("", 2).target);
+    }
 
     #[test]
     fn a_run_of_initials_finds_the_path_it_names() {

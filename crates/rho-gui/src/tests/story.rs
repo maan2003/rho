@@ -233,3 +233,32 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
         .collect();
     ConnEvent::Log { entries }
 }
+
+thread_local! {
+    /// The model this test drives. One per test thread, so a test's own
+    /// fold and cursor are its own.
+    static MODEL: RefCell<(crate::model::Model, std::collections::HashSet<crate::registry::HostId>)> =
+        RefCell::new((crate::model::Model::new(), std::collections::HashSet::new()));
+}
+
+/// One frame, through the model and then into the workspace: the same
+/// `ingest` the model thread runs, called inline so a test stays in one
+/// thread and can assert in the frame it fed.
+pub fn feed(
+    workspace: &mut crate::workspace::Workspace,
+    host: crate::registry::HostId,
+    event: ConnEvent,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<crate::workspace::Workspace>,
+) {
+    let followed = workspace.followed();
+    let events = MODEL.with(|model| {
+        let (model, attached) = &mut *model.borrow_mut();
+        if attached.insert(host) {
+            model.attach(host, format!("host-{}", attached.len()));
+        }
+        model.command(crate::model::ModelCommand::Follow(followed));
+        model.ingest(host, event)
+    });
+    workspace.handle_model_events(events, window, cx);
+}

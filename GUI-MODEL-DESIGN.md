@@ -187,6 +187,26 @@ Each gets a landing note here.
    list (the cascade stays), but it runs once per `Changed` and never
    during catch-up. The cursor invariant is fixed here. Proof: reconnect
    on the rig, main-thread samples during catch-up ≈ 0.
+
+   *Landed.* `rho-gui/src/model.rs`: the fold, the journal cursor, the
+   catch-up gate and the `agent-mirror.redb` writes run on a std thread
+   named `rho-model`, with a channel each way. The socket stayed on the
+   tokio runtime, as agreed: the boundary is the fold. The main thread
+   receives `Loaded`, `Changed`, `Rows` and everything else forwarded
+   unchanged; `Workspace::handle_event`'s `Log` arm is gone, and so are
+   `mirror_hosts`, `MirrorCursor`, `journal_cursor` and `restore_mirror`.
+   `AgentRegistry::told` takes folded agents where `tell` took rows;
+   `tell` is now what the registry's own tests fold with.
+   The cursor invariant is fixed: `mirror::write_log` takes the page's
+   `seq` beside its rows and `apply` writes `StoredHost` for every page,
+   including one whose rows all filtered out.
+   `Model::ingest` is a plain function, so the tests drive it inline
+   (`tests/story.rs::feed`) and stay in one thread.
+   `Live` follows `Rows`: a tail for an agent no screen reads is dropped in
+   the model, O(1), and never reaches the channel. Without that a connect
+   cost one dashboard rebuild per agent: measured on the 2823-agent store,
+   134s of block-map rebuilds on the main thread with the journal already
+   caught up.
 2. **`Agents` replaces the registry.** Map plus indexes, per-change
    O(log n); the deletions listed above; selection into the window.
    Proof: a `Changed` of one agent costs one index update, no walk.
@@ -221,3 +241,10 @@ queued after slice 5 here; it fits the desk store as described.
 
 Raw-log purity (`at` on raw events), the daemon's own per-event bounds
 (LIVE-TAIL-PLAN), and the window split's detail.
+
+The daemon tells every agent's tail at connect (`pool.tell_tails`, then one
+`Live` per agent). Once the client drops the tails it does not read, that is
+O(agents) on the wire for nothing: on a store of 2823 agents it is 2823
+messages a client throws away. It belongs to LIVE-TAIL-PLAN's live set, where
+a tail is told only for agents some client holds. Daemon-side, later, and it
+needs a daemon restart to take effect.

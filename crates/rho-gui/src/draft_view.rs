@@ -77,6 +77,10 @@ pub struct DraftModel {
     body_end: text::Anchor,
     attachments: Vec<ContentPart>,
     attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
+    /// Why the last submission was refused, kept under the body until the
+    /// reader submits again.
+    refusal: Option<String>,
+    refusal_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     suppress_draft_activation: bool,
     /// Editors currently displaying the draft, weakly held: surfaces own
     /// their editors; the model reconciles whoever is still alive.
@@ -147,6 +151,8 @@ impl DraftModel {
             body_end,
             attachments: Vec::new(),
             attachment_blocks: Vec::new(),
+            refusal: None,
+            refusal_blocks: Vec::new(),
             suppress_draft_activation: false,
             editors: Vec::new(),
             _subscriptions: subscriptions,
@@ -202,6 +208,7 @@ impl DraftModel {
         self.pin_autoscroll_to(&editor, cx);
         self.apply_body_chrome_to(&editor, cx);
         self.refresh_attachment_blocks(cx);
+        self.refresh_refusal_blocks(cx);
         self.focus_body(&editor, window, cx);
         editor
     }
@@ -628,6 +635,54 @@ impl DraftModel {
             self.apply_body_chrome_to(&editor, cx);
         }
         cx.notify();
+    }
+
+    /// What the daemon said when it refused this draft, or nothing once the
+    /// reader submits again.
+    pub fn set_refusal(&mut self, message: Option<String>, cx: &mut Context<Self>) {
+        if self.refusal == message {
+            return;
+        }
+        self.refusal = message;
+        self.refresh_refusal_blocks(cx);
+        cx.notify();
+    }
+
+    /// Why the last submission was refused, while it is still on the draft.
+    pub fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    fn refresh_refusal_blocks(&mut self, cx: &mut Context<Self>) {
+        for (editor, block_id) in self.refusal_blocks.drain(..) {
+            if let Some(editor) = editor.upgrade() {
+                editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(
+                        std::iter::once(block_id).collect::<HashSet<_>>(),
+                        None,
+                        cx,
+                    );
+                });
+            }
+        }
+        let Some(message) = self.refusal.clone() else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.body_end)
+        else {
+            return;
+        };
+        for editor in self.live_editors() {
+            let block = style::refusal_block(anchor, message.clone());
+            let ids = editor.update(cx, |editor, cx| editor.insert_blocks([block], None, cx));
+            if let Some(block_id) = ids.into_iter().next() {
+                self.refusal_blocks.push((editor.downgrade(), block_id));
+            }
+        }
     }
 
     fn refresh_attachment_blocks(&mut self, cx: &mut Context<Self>) {

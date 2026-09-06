@@ -8,8 +8,7 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 pub use rho_core::{
-    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    MessageDelivery,
+    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
 };
 pub use rho_workspaces_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,

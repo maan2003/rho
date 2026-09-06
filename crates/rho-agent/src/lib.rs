@@ -437,25 +437,61 @@ pub enum StartWorkdir {
 
 /// Materializes a new agent's workdirs. Each jj repository allocates its own
 /// managed workspace id.
-pub(crate) async fn materialize_workdirs(
-    start: Vec<StartWorkdir>,
-) -> anyhow::Result<Vec<Arc<Workspace>>> {
+pub(crate) async fn materialize_workdirs(start: Vec<StartWorkdir>) -> anyhow::Result<Materialized> {
     anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
     let mut entries = Vec::with_capacity(start.len());
+    // Which checkouts this creation made, so a failure halfway through a
+    // multi-repo start hands them back rather than stranding them.
+    let mut made = Vec::new();
     for entry in start {
-        entries.push(match entry {
+        let created = match entry {
             StartWorkdir::Create {
                 repo,
                 parent_revset,
-            } => repo.create_workspace(&parent_revset).await?,
+            } => repo.create_workspace(&parent_revset).await,
             StartWorkdir::Sandbox {
                 repo,
                 parent_revset,
-            } => repo.create_sandbox(&parent_revset).await?,
-            StartWorkdir::Existing(workspace) => workspace,
-        });
+            } => repo.create_sandbox(&parent_revset).await,
+            // Joined, so not this creation's to give back.
+            StartWorkdir::Existing(workspace) => {
+                entries.push(workspace);
+                continue;
+            }
+        };
+        match created {
+            Ok(workspace) => {
+                made.push(workspace.checkout().to_owned());
+                entries.push(workspace);
+            }
+            Err(error) => {
+                Materialized { entries, made }.discard();
+                return Err(error);
+            }
+        }
     }
-    Ok(entries)
+    Ok(Materialized { entries, made })
+}
+
+/// The workdirs an agent starts with, and the checkouts this creation made.
+pub(crate) struct Materialized {
+    pub(crate) entries: Vec<Arc<Workspace>>,
+    made: Vec<camino::Utf8PathBuf>,
+}
+
+impl Materialized {
+    /// Gives back what this creation made, for a creation that will not
+    /// happen. Dropping the workspaces drops their leases first, which is
+    /// what makes the checkouts free to remove.
+    pub(crate) fn discard(self) {
+        let Self { entries, made } = self;
+        drop(entries);
+        for checkout in made {
+            if let Err(error) = rho_workspaces::discard_new_checkout(&checkout) {
+                eprintln!("rho-agent: {error:#}");
+            }
+        }
+    }
 }
 
 pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {

@@ -209,6 +209,34 @@ pub fn attachment_block(anchor: Anchor, attachments: &[ContentPart]) -> BlockPro
     }
 }
 
+/// Why the daemon refused a draft, shown where the draft is: the echo area
+/// is two seconds long, and a creation that failed has to stay readable
+/// while the reader fixes the field that caused it.
+pub fn refusal_block(anchor: Anchor, message: String) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Below(anchor),
+        // Measured, not one line: the whole cause is the point, and a jj
+        // failure is longer than the frame is wide.
+        height: None,
+        style: BlockStyle::Fixed,
+        render: Arc::new(move |cx| render_refusal_block(&message, cx).into_any_element()),
+        priority: 1,
+    }
+}
+
+fn render_refusal_block(message: &str, cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
+    let text_style = cx.editor_style.text.clone();
+    let color = cx.app.theme().status().error;
+    div()
+        .block_mouse_except_scroll()
+        .w_full()
+        .font_family(text_style.font_family.clone())
+        .text_size(text_style.font_size)
+        .line_height(text_style.line_height)
+        .text_color(color)
+        .child(message.to_owned())
+}
+
 fn render_attachment_block(labels: &[String], cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
     let text_style = cx.editor_style.text.clone();
     let colors = cx.app.theme().colors();

@@ -1377,6 +1377,19 @@ async fn run_managed_jj(command: tokio::process::Command) -> anyhow::Result<Mana
 /// Repo roots must be absolute, existing, UTF-8 jj repo roots. A path inside
 /// a secondary workspace resolves to its origin repo via the `.jj/repo`
 /// pointer.
+/// Removes the materialization of a workspace that was just created and will
+/// not be used, so a creation that failed leaves no checkout behind. jj keeps
+/// the allocation and rematerializes it if it is ever opened; the hourly GC
+/// snapshots before it deletes because an agent may have written there, and
+/// nothing has run in this one. The lease must already be dropped.
+pub fn discard_new_checkout(checkout: &Utf8Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(checkout) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("discard new checkout {checkout}")),
+    }
+}
+
 pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
     anyhow::ensure!(
         path.is_absolute(),

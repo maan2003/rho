@@ -56,7 +56,7 @@ pub struct HostEvent {
 #[derive(Clone)]
 pub(crate) struct EventSink {
     host: HostId,
-    events: futures_mpsc::UnboundedSender<HostEvent>,
+    events: futures_mpsc::UnboundedSender<crate::model::ToModel>,
 }
 
 impl EventSink {
@@ -65,10 +65,10 @@ impl EventSink {
     /// whatever the event was.
     pub(crate) fn unbounded_send(&self, event: ConnEvent) -> Result<(), ()> {
         self.events
-            .unbounded_send(HostEvent {
+            .unbounded_send(crate::model::ToModel::Event(HostEvent {
                 host: self.host,
                 event,
-            })
+            }))
             .map_err(|_| ())
     }
 }
@@ -569,6 +569,23 @@ pub struct Connection {
     sent: Arc<Mutex<Vec<ClientMessage>>>,
 }
 
+/// A command channel to one daemon, on its own: clonable, `Send`, and
+/// carrying nothing of the GUI.
+#[derive(Clone)]
+pub struct Commands {
+    commands: futures_mpsc::UnboundedSender<ClientMessage>,
+    #[cfg(test)]
+    sent: Arc<Mutex<Vec<ClientMessage>>>,
+}
+
+impl Commands {
+    pub fn send(&self, message: ClientMessage) {
+        #[cfg(test)]
+        self.sent.lock().unwrap().push(message.clone());
+        let _ = self.commands.unbounded_send(message);
+    }
+}
+
 pub struct VisualizationArtifact {
     pub mime_type: String,
     pub content: Vec<u8>,
@@ -752,9 +769,17 @@ impl Connection {
         }
     }
     pub fn send(&self, message: ClientMessage) {
-        #[cfg(test)]
-        self.sent.lock().unwrap().push(message.clone());
-        let _ = self.commands.unbounded_send(message);
+        self.commands().send(message);
+    }
+
+    /// The way to send this daemon a command without holding the
+    /// connection: the model thread asks for the journal itself.
+    pub(crate) fn commands(&self) -> Commands {
+        Commands {
+            commands: self.commands.clone(),
+            #[cfg(test)]
+            sent: Arc::clone(&self.sent),
+        }
     }
 
     #[cfg(test)]
@@ -886,7 +911,7 @@ impl Connection {
 pub fn spawn(
     host: HostId,
     target: AttachTarget,
-    events: futures_mpsc::UnboundedSender<HostEvent>,
+    events: futures_mpsc::UnboundedSender<crate::model::ToModel>,
     cx: &App,
 ) -> Connection {
     let iroh = matches!(&target, AttachTarget::Iroh { .. });

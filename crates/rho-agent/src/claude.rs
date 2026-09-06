@@ -69,8 +69,16 @@ impl ClaudeAgent {
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let entries = crate::materialize_workdirs(start).await?;
-        let view = rho_workspaces::View::new(entries.clone())?;
+        let materialized = crate::materialize_workdirs(start).await?;
+        let entries = materialized.entries.clone();
+        let view = match rho_workspaces::View::new(entries.clone()) {
+            Ok(view) => view,
+            Err(error) => {
+                drop(entries);
+                materialized.discard();
+                return Err(error);
+            }
+        };
         let session_id = Uuid::new_v4();
         write.create_agent(
             UnixMillis::now(),

@@ -276,6 +276,12 @@ impl Minibuffer {
         self.complete_whole_input = true;
     }
 
+    /// Which row is highlighted, for a caller that needs the row itself
+    /// rather than the text on it.
+    pub fn selected_row(&self) -> usize {
+        self.selected
+    }
+
     pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
         let candidate = self.candidates.get(self.selected)?.clone();
         let occurrence = self.candidates[..self.selected]

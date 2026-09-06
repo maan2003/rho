@@ -12,7 +12,9 @@ use std::fmt;
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{AgentWant, LogEntry};
+use rho_ui_proto::mirror::AgentWant;
+#[cfg(test)]
+use rho_ui_proto::mirror::LogEntry;
 
 pub use crate::fold::{
     AgentIdentity, Attention, AttentionFacts, DIGEST_VERSION, Digest, MirroredAgent,
@@ -111,6 +113,8 @@ impl AgentSummary {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     pub turn_running: bool,
+    /// When the running turn began, when the client saw it start.
+    pub turn_started_at: Option<rho_core::UnixMs>,
     pub last_turn_ended: Option<rho_core::UnixMs>,
     pub last_user_message_at: rho_core::UnixMs,
     /// The last turn said it wants something only the user can give.
@@ -250,12 +254,10 @@ impl AgentRegistry {
         }
     }
 
-    /// A run of a host's log, folded. Positions the client already holds
-    /// are skipped, so a repeated run is harmless. An agent's first row
-    /// creates it; a row for an agent this client has not seen created
-    /// is dropped, since without its creation nothing can be said of it.
-    ///
-    /// Returns the agents that changed.
+    /// A run of a host's log, folded. The client's own fold runs on the
+    /// model thread now; this is what the registry's tests fold with, and
+    /// what `told` is checked against.
+    #[cfg(test)]
     pub fn tell(&mut self, host: HostId, entries: &[LogEntry]) -> Vec<AgentId> {
         let mut changed = Vec::new();
         let mut attention_before = BTreeMap::new();
@@ -284,6 +286,40 @@ impl AgentRegistry {
         if !changed.is_empty() {
             self.rebuild(None);
         }
+        // A row can move attention on its own (a turn ends asking for
+        // the user); the dealer reads the revision to know.
+        if attention_before
+            .iter()
+            .any(|(agent_id, before)| self.attention(*agent_id) != *before)
+        {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
+        changed
+    }
+
+    /// The agents the model folded, as they now stand: what this client
+    /// held of each is replaced. The fold is the model thread's, so a
+    /// catch-up costs one of these and not one per page.
+    ///
+    /// Returns the agents that changed.
+    pub fn told(&mut self, agents: Vec<MirroredAgent>) -> Vec<AgentId> {
+        if agents.is_empty() {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        let mut attention_before = BTreeMap::new();
+        for mirrored in agents {
+            let agent_id = mirrored.agent_id();
+            attention_before
+                .entry(agent_id)
+                .or_insert_with(|| self.attention(agent_id));
+            if self.mirror.insert(agent_id, mirrored).is_none() {
+                self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+            }
+            self.agents.entry(agent_id).or_insert(AgentLife::Known);
+            changed.push(agent_id);
+        }
+        self.rebuild(None);
         // A row can move attention on its own (a turn ends asking for
         // the user); the dealer reads the revision to know.
         if attention_before
@@ -609,6 +645,7 @@ impl AgentRegistry {
         };
         AgentFacts {
             turn_running: digest.turn_running,
+            turn_started_at: digest.turn_started_at,
             last_turn_ended: digest.last_turn_ended,
             last_user_message_at: digest.last_user_message_at,
             needs_you_hint: digest

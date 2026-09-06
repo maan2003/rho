@@ -115,6 +115,11 @@ enum Write {
     Log {
         host: String,
         machine_seed: u64,
+        /// How far the page ran. "Seen through here", never "kept a row
+        /// here": a page whose rows this client could make nothing of has
+        /// still been seen, and asking for it again on the next start is
+        /// how the tail grew without bound.
+        seq: Seq,
         entries: Vec<LogEntry>,
         digests: Vec<(AgentId, AgentSnapshot)>,
     },
@@ -252,19 +257,20 @@ impl Mirror {
     }
 
     /// Rows heard from a host, with the digests they brought up to date.
+    /// `seq` is how far the page ran, not how far its rows did: a page
+    /// whose rows all fold to nothing still moves the cursor.
     pub fn write_log(
         &self,
         host: &str,
         machine_seed: u64,
+        seq: Seq,
         entries: Vec<LogEntry>,
         digests: Vec<(AgentId, AgentSnapshot)>,
     ) {
-        if entries.is_empty() {
-            return;
-        }
         self.send(Write::Log {
             host: host.to_owned(),
             machine_seed,
+            seq,
             entries,
             digests,
         });
@@ -347,13 +353,10 @@ fn apply(
         Write::Log {
             host,
             machine_seed,
+            seq,
             entries,
             digests,
         } => {
-            let Some(last) = entries.last() else {
-                return;
-            };
-            let seq = last.seq;
             {
                 let mut events = transaction.open_table(EVENTS);
                 for entry in &entries {
@@ -456,11 +459,12 @@ pub fn read_events(agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
 pub fn write_log(
     host: &str,
     machine_seed: u64,
+    seq: Seq,
     entries: Vec<LogEntry>,
     digests: Vec<(AgentId, AgentSnapshot)>,
 ) {
     if let Some(mirror) = GLOBAL.get() {
-        mirror.write_log(host, machine_seed, entries, digests);
+        mirror.write_log(host, machine_seed, seq, entries, digests);
     }
 }
 
@@ -549,7 +553,8 @@ mod tests {
 
     fn write(mirror: &Mirror, host: &str, machine_seed: u64, entries: Vec<LogEntry>) {
         let digests = vec![(entries[0].agent_id, snapshot(&entries))];
-        mirror.write_log(host, machine_seed, entries, digests);
+        let seq = entries.last().expect("a page with rows").seq;
+        mirror.write_log(host, machine_seed, seq, entries, digests);
     }
 
     /// What a transcript reads when it is opened: one agent's mirror,

@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use camino::Utf8PathBuf;
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
@@ -46,7 +45,6 @@ const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("jour
 const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
-const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
 const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
@@ -265,8 +263,7 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
 }
 
 pub use rho_core::{
-    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, AgentWorkflow,
-    EngineerIntelligence,
+    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWorkflow, EngineerIntelligence,
 };
 
 /// A position in one agent's log: dense from zero, never reused. Encoded
@@ -334,13 +331,6 @@ pub struct AgentPresentationCache {
 }
 
 pub type UnixMillis = UnixMs;
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct ProjectRecord {
-    pub name: String,
-    pub description: String,
-    pub created_at: UnixMillis,
-}
 
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
@@ -764,7 +754,6 @@ pub trait AgentReadTxnExt {
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
-    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
     /// The fold of one agent's log. Panics when there is no such agent.
     fn get_agent(&self, agent_id: AgentId) -> AgentHead;
     fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead>;
@@ -817,10 +806,6 @@ pub trait AgentReadTxnExt {
 #[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
-
-    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
-
-    fn remove_project(&mut self, path: &str);
 
     /// Appends one event at the agent's tail and names it in the journal.
     /// The tail is read from the table, not from a runtime's cursor, so
@@ -963,18 +948,6 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&CounterKey::LAST_AGENT_ID)
             .map(|counter| counter.value())
             .unwrap_or(0)
-    }
-
-    /// The rows the slice B conversion moves into the store. The table is
-    /// dropped once they are there, so a missing one means done.
-    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)> {
-        if !self.has_table("projects") {
-            return Vec::new();
-        }
-        self.open_table(PROJECTS)
-            .iter()
-            .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
-            .collect()
     }
 
     fn get_agent(&self, agent_id: AgentId) -> AgentHead {
@@ -1206,26 +1179,6 @@ impl AgentWriteTxnExt for WriteTxn {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
     }
-    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {
-        let mut projects = self.open_table(PROJECTS);
-        let created_at = projects
-            .get(&path.to_owned())
-            .map(|record| record.value().into_owned().created_at)
-            .unwrap_or(now);
-        projects.insert(
-            &path.to_owned(),
-            SenValue::borrowed(&ProjectRecord {
-                name,
-                description,
-                created_at,
-            }),
-        );
-    }
-
-    fn remove_project(&mut self, path: &str) {
-        self.open_table(PROJECTS).remove(&path.to_owned());
-    }
-
     fn append_agent_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) -> AgentEventPos {
         let pos = {
             let log = self.open_table(AGENT_LOG);

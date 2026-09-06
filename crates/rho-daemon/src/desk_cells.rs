@@ -250,53 +250,6 @@ impl DeskCellStore {
         projects
     }
 
-    pub(crate) async fn convert_projects(
-        &self,
-        machine_seed: u64,
-        projects: &[(camino::Utf8PathBuf, rho_agent::db::ProjectRecord)],
-    ) -> Result<usize, String> {
-        let mut write = self.db.write().await;
-        let mut meta = load_meta_from_write(&mut write)?;
-        let snapshot = read_snapshot_from_write(&mut write)?;
-        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
-        let mut written = 0;
-        for (path, record) in projects {
-            let id = Id::Label(project_label_id(path));
-            if store.property(&id, &PropertyKey::Project).is_some() {
-                continue;
-            }
-            written += 1;
-            store.write(
-                id.clone(),
-                rho_desk::cells::Property::Name(record.name.clone()),
-            )?;
-            store.write(
-                id.clone(),
-                rho_desk::cells::Property::Project(Some(rho_desk::cells::Project {
-                    host: machine_seed,
-                    path: path.clone(),
-                })),
-            )?;
-            store.write(
-                id,
-                rho_desk::cells::Property::CreatedAt(rho_desk::cells::Timestamp {
-                    unix_ms: record.created_at.0 as i64,
-                    precision: rho_desk::cells::TimestampPrecision::Millisecond,
-                }),
-            )?;
-        }
-        if written == 0 {
-            return Ok(0);
-        }
-        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
-        meta.frontier = store.version().clone();
-        write
-            .open_table(META)
-            .insert(&(), SenValue::borrowed(&meta));
-        write.commit();
-        Ok(written)
-    }
-
     /// Files a set of agents under one note, for a rig fixture: Home ranks
     /// agents through the note they sit under, so seeded agents nobody
     /// filed would never reach the queue.
@@ -1673,14 +1626,4 @@ mod tests {
                 .is_err()
         );
     }
-}
-
-/// A project's label id, derived from its path so the conversion is
-/// recognisable on a second run rather than duplicated.
-fn project_label_id(path: &camino::Utf8Path) -> rho_desk::cells::Uuid {
-    use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(path.as_str().as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    rho_desk::cells::Uuid(bytes)
 }
