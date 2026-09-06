@@ -28,11 +28,18 @@ connection to the screen, tested alone against its own fake server.
 
 ## The crates
 
-- **`rho-agents`.** The daemon connection and handshake, the model
-  thread (`Model::ingest`), the agent mirror on disk, the agents map and
-  its indexes (what remains of `rho-registry`), the transcript, creation,
-  Find over agents, and the agent screens. Tested end to end against a
-  fake daemon. Owner: eng-b8os.
+- **`rho-hosts`.** The daemon connection per host and its handshake,
+  reachability (one status for the status line), the command channel and
+  the event fan-out by kind, workdir labels, quota. Every crate that
+  reaches a machine (agents, the DAG sync, file, diff, shell and terminal
+  surfaces) goes through it; it owns no agent state. Cut out of
+  `rho-agents` by eng-b8os as the first step of the move.
+- **`rho-agents`.** The model thread (`Model::ingest`), the agent mirror
+  on disk, the agents map and its indexes (what remains of
+  `rho-registry`), the transcript, creation, Find over agents, and the
+  agent screens. Tested end to end against a fake daemon. Selection and
+  the active pane are not agent state and go to `rho-window`. Owner:
+  eng-b8os.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read
@@ -51,7 +58,11 @@ connection to the screen, tested alone against its own fake server.
   name is taken by the terminal shell; this one is `rho-window`.)
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
-  it claims attention. The dealer ranks across sources with one visible
+  it claims attention. A Find hit shares the reason type with a card but
+  is its own type: a card claims attention, a hit answers a query. The
+  map never touches another crate's store: a verdict on an agent card
+  is a command routed by the card's source to `rho-agents`, and a filing
+  of an agent is told to `rho-agents` the same way. The dealer ranks across sources with one visible
   rule set, Home and the lamp read it, and a verdict goes back to the
   crate that owns the card. Every card carries its reason to the screen.
 - `rho-browser` already has this shape and stays.
