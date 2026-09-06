@@ -34,6 +34,20 @@ connection to the screen, tested alone against its own fake server.
   reaches a machine (agents, the DAG sync, file, diff, shell and terminal
   surfaces) goes through it; it owns no agent state. Cut out of
   `rho-agents` by eng-b8os as the first step of the move.
+
+  *Landed.* `connection.rs`, `hosts.rs` and `realtime_client.rs` moved out
+  of `rho-gui` whole, with `HostId`, `AttachTarget`, `HostSpec`, `HostPath`
+  and the workdir and quota state that goes with them. The base crate names
+  nothing above it: where the connection used to send onto the model
+  thread's queue by name, it now sends through a `HostSink` trait the shell
+  implements, and `attach` hands back the command channel rather than
+  posting a `ModelCommand` itself. The two event kinds that existed only
+  for tests went with that rule: `ConnEvent::Transcript` named a
+  `rho-registry` type and is gone (a test seeds a transcript through the
+  workspace instead), and `ConnEvent::Many` and the sent-command recorder
+  sit behind a `test-support` feature. `rho-registry` re-exports
+  `rho_hosts::HostId` rather than defining its own. Gate green: rho-gui 277,
+  rho-hosts 14, rho-registry 14.
 - **`rho-agents`.** The model thread (`Model::ingest`), the agent mirror
   on disk, the agents map and its indexes (what remains of
   `rho-registry`), the transcript, creation, Find over agents, and the

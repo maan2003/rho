@@ -19,13 +19,13 @@ use gpui::{
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use path::rel_path::RelPath;
+use rho_hosts::connection::DiffClient;
 use rho_ui_proto::{
     WorkspaceDiffContent, WorkspaceDiffSnapshot, WorkspaceDiffTarget, WorkspaceInfo,
 };
 use text::OffsetRangeExt as _;
 use theme::ActiveTheme as _;
 
-use crate::connection::DiffClient;
 use crate::zed_remote::RemoteProject;
 
 const MAX_LIVE_FILE_BYTES: usize = 8 * 1024 * 1024;

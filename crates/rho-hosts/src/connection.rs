@@ -36,8 +36,7 @@ fn shell_request_id(message: &ClientMessage) -> Option<u64> {
     }
 }
 
-use crate::registry::HostId;
-use crate::workspace::AttachTarget;
+use crate::{AttachTarget, HostId, HostSink};
 
 /// Owns the transport pumps for a dedicated stream. Dropping it cancels both
 /// directions on every target.
@@ -56,20 +55,17 @@ pub struct HostEvent {
 #[derive(Clone)]
 pub(crate) struct EventSink {
     host: HostId,
-    events: futures_mpsc::UnboundedSender<crate::model::ToModel>,
+    events: std::sync::Arc<dyn HostSink>,
 }
 
 impl EventSink {
-    /// Mirrors [`futures_mpsc::UnboundedSender::unbounded_send`]; the error
-    /// carries nothing, since a closed GUI channel means the same thing
-    /// whatever the event was.
+    /// Hands one event to whoever is listening; the error carries nothing,
+    /// since a closed reader means the same thing whatever the event was.
     pub(crate) fn unbounded_send(&self, event: ConnEvent) -> Result<(), ()> {
-        self.events
-            .unbounded_send(crate::model::ToModel::Event(HostEvent {
-                host: self.host,
-                event,
-            }))
-            .map_err(|_| ())
+        self.events.send(HostEvent {
+            host: self.host,
+            event,
+        })
     }
 }
 
@@ -112,16 +108,9 @@ pub enum ConnEvent {
         agent_id: AgentId,
         live: Live,
     },
-    /// A transcript handed in whole, for tests that drive the view without
-    /// a mirror to fold.
-    #[cfg(test)]
-    Transcript {
-        agent_id: AgentId,
-        state: rho_registry::render::UiAgentState,
-    },
     /// Several events in order, for a test helper that stands for what a
     /// daemon sends in more than one message.
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     Many(Vec<ConnEvent>),
     TurnCancelled,
     /// A run of the host's journal, contiguous by seq: the answer to
@@ -558,14 +547,13 @@ async fn dial_shell(dialer: ChannelDialer, agent: String) -> anyhow::Result<Shel
 
 pub struct Connection {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
-    iroh: bool,
     /// `None` until the IO task connects; channels cannot open earlier.
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
     /// Dropping this aborts the IO task, tearing the connection down with the
     /// workspace.
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     sent: Arc<Mutex<Vec<ClientMessage>>>,
 }
 
@@ -574,13 +562,13 @@ pub struct Connection {
 #[derive(Clone)]
 pub struct Commands {
     commands: futures_mpsc::UnboundedSender<ClientMessage>,
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     sent: Arc<Mutex<Vec<ClientMessage>>>,
 }
 
 impl Commands {
     pub fn send(&self, message: ClientMessage) {
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         self.sent.lock().unwrap().push(message.clone());
         let _ = self.commands.unbounded_send(message);
     }
@@ -777,13 +765,15 @@ impl Connection {
     pub(crate) fn commands(&self) -> Commands {
         Commands {
             commands: self.commands.clone(),
-            #[cfg(test)]
+            #[cfg(feature = "test-support")]
             sent: Arc::clone(&self.sent),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn take_sent_for_test(&self) -> Vec<ClientMessage> {
+    /// Everything sent down this connection since it was last asked, for a
+    /// test that checks what the client said rather than what it drew.
+    #[cfg(feature = "test-support")]
+    pub fn take_sent_for_test(&self) -> Vec<ClientMessage> {
         std::mem::take(&mut *self.sent.lock().unwrap())
     }
 
@@ -911,10 +901,9 @@ impl Connection {
 pub fn spawn(
     host: HostId,
     target: AttachTarget,
-    events: futures_mpsc::UnboundedSender<crate::model::ToModel>,
+    events: std::sync::Arc<dyn HostSink>,
     cx: &App,
 ) -> Connection {
-    let iroh = matches!(&target, AttachTarget::Iroh { .. });
     let event_tx = EventSink { host, events };
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let command_rx = Arc::new(tokio::sync::Mutex::new(command_rx));
@@ -938,11 +927,10 @@ pub fn spawn(
     };
     Connection {
         commands: command_tx,
-        iroh,
         dialer,
         shell_requests,
         _io_task: io_task,
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         sent: Arc::new(Mutex::new(Vec::new())),
     }
 }

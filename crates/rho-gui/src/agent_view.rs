@@ -66,7 +66,7 @@ pub struct AgentModel {
 impl AgentModel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        visualization_client: crate::connection::VisualizationClient,
+        visualization_client: rho_hosts::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
         let prompt_buffer = cx.new(|cx| Buffer::local("", cx));

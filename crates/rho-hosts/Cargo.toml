@@ -1,0 +1,37 @@
+# The machines this client can reach: one connection per attached daemon,
+# the handshake, and the events it produces. Holds no agent, desk or window
+# state; everything that wants to say something to a machine goes through it.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-hosts"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+octo-types = { workspace = true }
+senax-encoder = { workspace = true }
+camino.workspace = true
+futures.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
+iroh = { workspace = true }
+rho-desk = { workspace = true }
+rho-iroh-auth = { workspace = true }
+rho-rpc = { workspace = true, features = ["native-client"] }
+rho-rtc = { workspace = true }
+rho-ui-proto = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# The event kinds only a test produces. rho-hosts never depends on the
+# crates that read its events, so anything a fixture needs of them is
+# built by the reader, not carried through here.
+test-support = []
+
+[dev-dependencies]
+rho-core = { workspace = true }

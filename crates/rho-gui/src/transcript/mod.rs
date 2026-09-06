@@ -37,11 +37,11 @@ use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, Weak
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
+use rho_hosts::connection::VisualizationClient;
 use rho_registry::render::UiAgentState;
 use rho_ui_proto::AgentId;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-use crate::connection::VisualizationClient;
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};

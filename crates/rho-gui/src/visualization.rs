@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{Context, Render, RenderImage, Task, Window, div, img};
+use rho_hosts::connection::VisualizationClient;
 use theme::ActiveTheme as _;
-
-use crate::connection::VisualizationClient;
 
 enum State {
     Pending,

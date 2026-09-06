@@ -10,6 +10,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+rho-hosts = { workspace = true }
 camino.workspace = true
 prefix-id = { workspace = true, default-features = false }
 rho-core.workspace = true

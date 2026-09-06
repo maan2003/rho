@@ -17,12 +17,11 @@ use gpui::{
     div,
 };
 use language::{Buffer, BufferEvent, Capability};
+use rho_hosts::connection::{Connection, WorkspaceChannel};
 use rho_ui_proto::{
     FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
 };
 use theme::{ActiveTheme as _, GlobalTheme};
-
-use crate::connection::{Connection, WorkspaceChannel};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RemoteProjectEvent {

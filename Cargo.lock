@@ -13907,6 +13907,7 @@ dependencies = [
  "rho-core",
  "rho-db",
  "rho-desk",
+ "rho-hosts",
  "rho-iroh-auth",
  "rho-profiling",
  "rho-registry",
@@ -13942,6 +13943,28 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
+]
+
+[[package]]
+name = "rho-hosts"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "futures 0.3.33",
+ "gpui",
+ "gpui_tokio",
+ "iroh",
+ "octo-types",
+ "rho-core",
+ "rho-desk",
+ "rho-iroh-auth",
+ "rho-rpc",
+ "rho-rtc",
+ "rho-ui-proto",
+ "senax-encoder",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -14056,6 +14079,7 @@ dependencies = [
  "camino",
  "prefix-id",
  "rho-core",
+ "rho-hosts",
  "rho-ui-proto",
  "senax-encoder",
 ]

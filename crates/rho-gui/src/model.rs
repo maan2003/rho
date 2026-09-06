@@ -15,11 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
 use rho_registry::Verdict;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 use rho_ui_proto::{AgentId, ClientMessage};
 
-use crate::connection::{Commands, ConnEvent, HostEvent};
 use crate::registry::HostId;
 
 /// What the main thread hears from the model.

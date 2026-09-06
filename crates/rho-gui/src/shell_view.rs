@@ -16,13 +16,13 @@ use gpui::prelude::*;
 use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use rho_hosts::connection::{ShellChannel, ShellSubmission};
 use rho_ui_proto::shell::{
     MAX_STYLE_SPANS, ShellClientFrame, ShellColor, ShellServerFrame, ShellStyleSpan,
     ShellTextStyle, command_fits,
 };
 use theme::ActiveTheme as _;
 
-use crate::connection::{ShellChannel, ShellSubmission};
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::style::{Region, StyleClass};
 

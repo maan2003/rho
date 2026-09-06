@@ -8,7 +8,6 @@ pub mod store;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
@@ -29,14 +28,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HostId(pub u32);
-
-impl fmt::Display for HostId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "host{}", self.0)
-    }
-}
+pub use rho_hosts::HostId;
 
 pub const HIDE_LABEL: &str = "hide";
 const LABEL_HEADROOM: u64 = 200;

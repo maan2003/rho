@@ -5,10 +5,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use rho_core::{MessageDelivery, UnixMs};
+use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge};
 use rho_ui_proto::{AgentId, AgentRole, WorkspaceInfo};
-
-use crate::connection::ConnEvent;
 
 pub type UiRuntimeKind = rho_ui_proto::mirror::RuntimeKind;
 pub type UiSpawnedBy = rho_ui_proto::mirror::SpawnedBy;

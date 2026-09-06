@@ -30,6 +30,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, ScrollDelta,
     ScrollWheelEvent, Styled as _, StyledText, Subscription, TextStyle, Window, canvas, div, px,
 };
+use rho_hosts::connection::TerminalChannel;
 use rho_ui_proto::term::{
     FrameApplied, ScrollbackItem, TermCell, TermCellFlags, TermClientFrame, TermColor,
     TermKeystroke, TermRow, TermServerFrame, WireScreen,
@@ -37,8 +38,6 @@ use rho_ui_proto::term::{
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
-
-use crate::connection::TerminalChannel;
 
 /// Client-side scrollback retention; the daemon replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;
@@ -57,7 +56,7 @@ pub struct TerminalModel {
     /// The stream ended without an `Exited` status (daemon or dial gone).
     disconnected: bool,
     _read_task: gpui::Task<()>,
-    _transport: crate::connection::ChannelTask,
+    _transport: rho_hosts::connection::ChannelTask,
 }
 
 impl TerminalModel {

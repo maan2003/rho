@@ -61,6 +61,7 @@ rho-browser = { workspace = true }
 rho-core.workspace = true
 rho-db = { workspace = true }
 rho-desk.workspace = true
+rho-hosts = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-profiling = { workspace = true }
 rho-registry.workspace = true
@@ -121,6 +122,7 @@ tikv-jemallocator = { version = "0.6", features = [
 
 [dev-dependencies]
 backtrace = "0.3"
+rho-hosts = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = [
   "wrap-test-support",

@@ -10,14 +10,13 @@ use gpui::{
     point, px, size,
 };
 use rho_core::UnixMs;
+use rho_hosts::connection::ConnEvent;
 use rho_registry::render::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
 use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
-
-use crate::connection::{ConnEvent, HostEvent};
 
 mod story;
 use crate::registry::HostId;
@@ -1351,13 +1350,7 @@ fn feed_frame(
             if workspace.is_startup_pane() {
                 workspace.select_agent(Some(agent_id), window, cx);
             }
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::Transcript { agent_id, state },
-                window,
-                cx,
-            );
+            workspace.seed_transcript_for_test(agent_id, state, window, cx);
         })
         .expect("update workspace");
     cx.run_until_parked();
@@ -1368,25 +1361,16 @@ fn feed_frames(
     cx: &mut TestAppContext,
     frames: impl IntoIterator<Item = (AgentId, UiAgentState)>,
 ) {
-    let events: Vec<_> = frames
-        .into_iter()
-        .map(|(agent_id, state)| HostEvent {
-            host: HostId::default(),
-            event: ConnEvent::Transcript { agent_id, state },
-        })
-        .collect();
+    let frames = frames.into_iter().collect::<Vec<_>>();
     workspace
         .update(cx, |workspace, window, cx| {
             if workspace.is_startup_pane()
-                && let Some(agent_id) = events.iter().find_map(|event| match &event.event {
-                    ConnEvent::Transcript { agent_id, .. } => Some(*agent_id),
-                    _ => None,
-                })
+                && let Some((agent_id, _)) = frames.first()
             {
-                workspace.select_agent(Some(agent_id), window, cx);
+                workspace.select_agent(Some(*agent_id), window, cx);
             }
-            for HostEvent { host, event } in events {
-                story::feed(workspace, host, event, window, cx);
+            for (agent_id, state) in frames {
+                workspace.seed_transcript_for_test(agent_id, state, window, cx);
             }
         })
         .expect("update workspace");

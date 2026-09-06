@@ -158,7 +158,10 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             .upgrade()
             .map(|workspace| {
                 let workspace = workspace.read(cx);
-                (workspace.workdir_table(), workspace.live_agent_targets())
+                (
+                    workspace.hosts.workdir_table(),
+                    workspace.live_agent_targets(),
+                )
             })
             .unwrap_or_default();
 

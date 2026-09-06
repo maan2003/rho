@@ -20,6 +20,7 @@ members = [
   "crates/rho-db",
   "crates/rho-desk",
   "crates/rho-gui",
+  "crates/rho-hosts",
   "crates/rho-image",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
@@ -124,6 +125,7 @@ rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
+rho-hosts = { path = "crates/rho-hosts" }
 rho-registry = { path = "crates/rho-registry" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }

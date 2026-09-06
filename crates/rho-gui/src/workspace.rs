@@ -14,7 +14,6 @@
 #[path = "workspace_phone.rs"]
 mod phone;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -30,6 +29,8 @@ use gpui::{
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
 use rho_core::ContentPart;
+use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
+use rho_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_ui_proto::AdvisorIntelligence;
 use rho_ui_proto::{AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery};
@@ -38,10 +39,8 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{ConnEvent, Connection, GitApprovalDecision};
 use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
-use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::ActiveAgents;
@@ -205,92 +204,23 @@ pub(crate) enum ContextId {
     Slack,
 }
 
-/// How to reach the daemon. Deliberately holds no client-local paths: the
-/// socket may be forwarded from another machine, so the GUI's own cwd and
-/// home mean nothing to the daemon and must never leak into agent working
-/// directories.
-#[derive(Clone)]
-pub enum AttachTarget {
-    Unix(PathBuf),
-    Iroh {
-        endpoint_id: iroh::EndpointId,
-        ssh_destination: String,
-        remote_rho: String,
-    },
-}
+pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 
-impl AttachTarget {
-    /// How the host reads in chrome and error text.
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Unix(path) => path.display().to_string(),
-            Self::Iroh {
-                ssh_destination, ..
-            } => format!("iroh via {ssh_destination}"),
-        }
+/// Where a host's events go from here: onto the model thread's queue, which
+/// is the one place that decides what a frame means. `rho-hosts` knows only
+/// that somebody is listening.
+struct ModelSink(futures::channel::mpsc::UnboundedSender<crate::model::ToModel>);
+
+impl rho_hosts::HostSink for ModelSink {
+    fn send(&self, event: rho_hosts::HostEvent) -> Result<(), ()> {
+        self.0
+            .unbounded_send(crate::model::ToModel::Event(event))
+            .map_err(|_| ())
     }
-}
 
-/// One daemon to attach: the short name it is known by in this client, and
-/// how to reach it.
-#[derive(Clone)]
-pub struct HostSpec {
-    pub name: String,
-    pub target: AttachTarget,
-}
-
-impl HostSpec {
-    /// Parses the one-line host form used both on the command line and in
-    /// the attach prompt: `<name>=unix:<socket>` or
-    /// `<name>=iroh:<endpoint-id>@<ssh-destination>`.
-    pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
-        let (name, target) = text
-            .trim()
-            .split_once('=')
-            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>@<ssh-dest>")?;
-        if name.is_empty() {
-            return Err("host name is empty".to_owned());
-        }
-        let target = match target.split_once(':') {
-            Some(("unix", path)) => AttachTarget::Unix(PathBuf::from(path)),
-            Some(("iroh", rest)) => {
-                let (endpoint_id, ssh_destination) = rest
-                    .split_once('@')
-                    .ok_or("iroh targets are <endpoint-id>@<ssh-dest>")?;
-                AttachTarget::Iroh {
-                    endpoint_id: endpoint_id
-                        .parse()
-                        .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
-                    ssh_destination: ssh_destination.to_owned(),
-                    remote_rho: remote_rho.to_owned(),
-                }
-            }
-            _ => return Err(format!("unknown host target scheme in `{target}`")),
-        };
-        Ok(Self {
-            name: name.to_owned(),
-            target,
-        })
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
-}
-
-/// A working directory on a specific daemon. Two machines can both offer
-/// `/home/you/src/rho`, so a bare path never identifies a project once more
-/// than one host is attached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostPath {
-    pub host: HostId,
-    pub path: Utf8PathBuf,
-}
-
-/// A registered workdir, with the daemon that offers it. A project is a
-/// label carrying a `Project` fact in the store; nothing on the wire
-/// carries one (`AGENT-LOG-DESIGN.md`).
-#[derive(Clone)]
-struct HostProject {
-    host: HostId,
-    name: String,
-    path: camino::Utf8PathBuf,
 }
 
 #[derive(Clone)]
@@ -439,9 +369,6 @@ pub struct Workspace {
     messages_applied_classes: HashSet<StyleClass>,
     message_evictions_since_rebase: usize,
     message_rebase_scheduled: bool,
-    /// Registered workdirs from every attached daemon; selection vocabulary
-    /// for new agents, and what decides which host a new agent lands on.
-    workdirs: Vec<HostProject>,
     /// Launch arguments for a configured Desk staffing or quick-spawn. The
     /// transient edits these; the writable dashboard row owns the message.
     /// Where `n a` files the agent the draft page is composing. `None`
@@ -468,11 +395,6 @@ pub struct Workspace {
     /// A routine registry refresh also sends `Ready`, so replay is armed
     /// separately and only by an actual disconnect.
     replay_hosts: HashSet<HostId>,
-    /// Per-host quota and usage answers. The chrome merges them (the
-    /// binding constraint is whichever host has least headroom); keeping
-    /// them apart means one host's refresh never blanks another's.
-    quota_summaries: HashMap<HostId, Vec<rho_ui_proto::QuotaSummary>>,
-    quota_history: HashMap<HostId, Vec<rho_ui_proto::QuotaSeries>>,
     quota_history_days: u64,
     global_usage: HashMap<HostId, Vec<rho_ui_proto::AgentUsageSeries>>,
     global_usage_days: u64,
@@ -632,7 +554,7 @@ impl Workspace {
             let visualization_client = self
                 .connection_for(agent_id)
                 .map(Connection::visualization_client)
-                .unwrap_or_else(crate::connection::VisualizationClient::detached);
+                .unwrap_or_else(rho_hosts::connection::VisualizationClient::detached);
             let model = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
             self.refresh_view_status(&agent_id, &model, cx);
             self.models.insert(agent_id, model.clone());
@@ -656,17 +578,13 @@ impl Workspace {
     /// The workdirs this daemon offers: the labels in its store that carry
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
-        self.workdirs.retain(|workdir| workdir.host != host);
-        self.workdirs.extend(
-            self.desk_cells
-                .projects(host)
-                .into_iter()
-                .map(|(name, project)| HostProject {
-                    host,
-                    name,
-                    path: project.path,
-                }),
-        );
+        let projects = self
+            .desk_cells
+            .projects(host)
+            .into_iter()
+            .map(|(name, project)| (name, project.path))
+            .collect();
+        self.hosts.set_workdirs(host, projects);
     }
 
     fn apply_ready(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) -> bool {
@@ -903,7 +821,7 @@ impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let crate::model::ModelChannels { incoming, changes } = crate::model::spawn();
         let model_commands = incoming.clone();
-        let hosts = Hosts::new(incoming);
+        let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
@@ -1093,15 +1011,12 @@ impl Workspace {
             messages_applied_classes: HashSet::new(),
             message_evictions_since_rebase: 0,
             message_rebase_scheduled: false,
-            workdirs: Vec::new(),
             draft_area: None,
             awaiting_draft_agent: None,
             insert_when_shown: false,
             pending_agent_filing: None,
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
-            quota_summaries: HashMap::new(),
-            quota_history: HashMap::new(),
             quota_history_days: 7,
             global_usage: HashMap::new(),
             global_usage_days: 7,
@@ -1204,7 +1119,18 @@ impl Workspace {
     /// that labels and chrome can qualify by host from the moment the host
     /// exists, not only once it answers.
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
-        let host = self.hosts.attach(spec.name.clone(), spec.target, cx);
+        let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
+        // The model is told the host exists, and how to speak to it, before
+        // any frame from it can arrive.
+        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
+            crate::model::ModelCommand::AttachHost {
+                host,
+                name: spec.name.clone(),
+            },
+        ));
+        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
+            crate::model::ModelCommand::HostCommands { host, commands },
+        ));
         self.registry.attach_host(host, spec.name);
         host
     }
@@ -1237,11 +1163,8 @@ impl Workspace {
         ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
-        self.quota_summaries.remove(&host);
-        self.quota_history.remove(&host);
         self.global_usage.remove(&host);
         self.agent_cost_usage.remove(&host);
-        self.workdirs.retain(|workdir| workdir.host != host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         self.registry.detach_host(host);
         self.refresh_dashboard(window, cx);
@@ -1304,20 +1227,6 @@ impl Workspace {
     /// host from user input rather than an existing agent.
     fn connected(&self) -> bool {
         self.hosts.any_online()
-    }
-
-    fn host_label(&self, host: HostId) -> String {
-        self.registry.host_name(host).to_owned()
-    }
-
-    /// Qualifies a daemon-side name with its host, but only when there is
-    /// more than one host for it to be confused with.
-    fn qualify(&self, host: HostId, name: &str) -> String {
-        if self.hosts.len() > 1 {
-            format!("{}/{name}", self.host_label(host))
-        } else {
-            name.to_owned()
-        }
     }
 
     pub(crate) fn active_pane(&self) -> &Pane<Surface> {
@@ -2091,8 +2000,8 @@ impl Workspace {
                     .is_some_and(|transient| transient.title() == "rate limit")
                 {
                     self.transient = Some(crate::transient::usage_menu(
-                        self.merged_quota_history(),
-                        self.active_quota_namespaces(),
+                        self.hosts.merged_quota_history(),
+                        self.hosts.active_quota_namespaces(),
                         self.quota_history_days,
                     ));
                 }
@@ -2116,7 +2025,7 @@ impl Workspace {
                     // and follow the new agent.
                     let label = self
                         .draft_default_workdir()
-                        .map(|path| self.workdir_label(&path))
+                        .map(|path| self.hosts.workdir_label(&path))
                         .unwrap_or_default();
                     self.draft_model.update(cx, |view, cx| {
                         view.set_body_text("", cx);
@@ -2133,10 +2042,6 @@ impl Workspace {
                 self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
             #[cfg(test)]
-            ConnEvent::Transcript { agent_id, state } => {
-                self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
-            }
-            #[cfg(test)]
             ConnEvent::Many(events) => {
                 for event in events {
                     self.handle_event(host, event, window, cx);
@@ -2151,7 +2056,7 @@ impl Workspace {
                 used_percent,
                 reset_at_unix,
             } => {
-                self.quota_summaries.insert(
+                self.hosts.set_quota_summaries(
                     host,
                     vec![rho_ui_proto::QuotaSummary {
                         model: "gpt".to_owned(),
@@ -2168,19 +2073,19 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::QuotaUsage(summaries) => {
-                self.quota_summaries.insert(host, summaries);
+                self.hosts.set_quota_summaries(host, summaries);
                 cx.notify();
             }
             ConnEvent::QuotaHistory(series) => {
-                self.quota_history.insert(host, series);
+                self.hosts.set_quota_history(host, series);
                 if self
                     .transient
                     .as_ref()
                     .is_some_and(|transient| transient.title() == "rate limit")
                 {
                     self.transient = Some(crate::transient::usage_menu(
-                        self.merged_quota_history(),
-                        self.active_quota_namespaces(),
+                        self.hosts.merged_quota_history(),
+                        self.hosts.active_quota_namespaces(),
                         self.quota_history_days,
                     ));
                 }
@@ -2253,7 +2158,7 @@ impl Workspace {
                     .is_some_and(|entry| matches!(entry.status, HostStatus::Recovering(_)));
                 self.hosts.set_status(host, HostStatus::Recovering(elapsed));
                 if changed {
-                    let source = self.host_label(host);
+                    let source = self.hosts.host_label(host);
                     self.notice_on(
                         None,
                         &format!("[{source} reconnecting]"),
@@ -2269,7 +2174,7 @@ impl Workspace {
                 // window: a reconnect asks only for what it is missing.
                 let sync = self.desk_cells.sync(host);
                 self.send_to_host(host, sync);
-                let source = self.host_label(host);
+                let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
                     &format!("[{source} connected]"),
@@ -2294,7 +2199,7 @@ impl Workspace {
                 self.hosts
                     .set_status(host, HostStatus::Disconnected(reason.clone()));
                 self.replay_hosts.insert(host);
-                let source = self.host_label(host);
+                let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,
                     &format!("[{source} disconnected: {reason}]"),
@@ -2336,7 +2241,7 @@ impl Workspace {
                 // The prompt names its host: approving an SSH Git operation
                 // is a decision about which machine reaches out.
                 let prompt = match self.hosts.len() > 1 {
-                    true => format!("{}: {prompt}", self.host_label(host)),
+                    true => format!("{}: {prompt}", self.hosts.host_label(host)),
                     false => prompt,
                 };
                 self.pending_git_approval = Some(PendingGitApproval {
@@ -2372,7 +2277,7 @@ impl Workspace {
     /// one, otherwise by host.
     fn error_source(&self, host: HostId) -> String {
         match self.hosts.len() > 1 {
-            true => format!("rho daemon {}", self.host_label(host)),
+            true => format!("rho daemon {}", self.hosts.host_label(host)),
             false => "rho daemon".to_owned(),
         }
     }
@@ -2381,105 +2286,6 @@ impl Workspace {
     /// ChatGPT's OAuth namespaces and Claude's accounts alike, since each is
     /// its own subscription. Unnamed rows keep the historical
     /// binding-constraint merge: they say nothing about whose quota they are.
-    fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
-        let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
-        for (host, summaries) in &self.quota_summaries {
-            for summary in summaries {
-                let Some(namespace) = &summary.auth_namespace else {
-                    match merged.iter_mut().find(|existing| {
-                        existing.model == summary.model && existing.auth_namespace.is_none()
-                    }) {
-                        Some(existing)
-                            if summary.remaining_percent < existing.remaining_percent =>
-                        {
-                            *existing = summary.clone();
-                        }
-                        Some(_) => {}
-                        None => merged.push(summary.clone()),
-                    }
-                    continue;
-                };
-                let mut summary = summary.clone();
-                if self.hosts.len() > 1 {
-                    summary.auth_namespace =
-                        Some(format!("{}/{}", self.host_label(*host), namespace));
-                }
-                merged.push(summary);
-            }
-        }
-        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
-        // An unnamed legacy entry and a named namespace can describe the
-        // same account; showing identical numbers twice says nothing.
-        merged.dedup_by(|a, b| {
-            a.model == b.model
-                && a.remaining_percent == b.remaining_percent
-                && a.reset_at_unix == b.reset_at_unix
-        });
-        merged
-    }
-
-    /// ChatGPT history is one line per host/namespace. Claude history keeps
-    /// the previous tightest-host merge because it has no named auth scope.
-    fn merged_quota_history(&self) -> Vec<rho_ui_proto::QuotaSeries> {
-        let mut merged: Vec<rho_ui_proto::QuotaSeries> = Vec::new();
-        for (host, series_set) in &self.quota_history {
-            for series in series_set {
-                if series.model == "gpt" {
-                    let Some(namespace) = &series.auth_namespace else {
-                        continue;
-                    };
-                    let mut series = series.clone();
-                    if self.hosts.len() > 1 {
-                        series.auth_namespace =
-                            Some(format!("{}/{}", self.host_label(*host), namespace));
-                    }
-                    merged.push(series);
-                    continue;
-                }
-                let Some(existing) = merged
-                    .iter_mut()
-                    .find(|existing| existing.model == series.model)
-                else {
-                    merged.push(series.clone());
-                    continue;
-                };
-                for point in &series.points {
-                    match existing
-                        .points
-                        .iter_mut()
-                        .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
-                    {
-                        Some(candidate)
-                            if point.remaining_percent < candidate.remaining_percent =>
-                        {
-                            *candidate = *point;
-                        }
-                        Some(_) => {}
-                        None => existing.points.push(*point),
-                    }
-                }
-                existing.points.sort_by_key(|point| point.observed_at_ms);
-            }
-        }
-        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
-        merged
-    }
-
-    fn active_quota_namespaces(&self) -> Vec<String> {
-        let qualify = self.hosts.len() > 1;
-        self.hosts
-            .iter()
-            .filter_map(|host| {
-                let namespace = host.auth.as_ref()?.active_namespace.as_ref()?;
-                Some(if qualify {
-                    format!("{}/{}", host.name, namespace)
-                } else {
-                    namespace.clone()
-                })
-            })
-            .collect()
-    }
-
     /// Spend and token usage sum across hosts: unlike quota headroom, cost
     /// incurred on two machines is cost incurred twice.
     fn merged_global_usage(&self) -> Vec<rho_ui_proto::AgentUsageSeries> {
@@ -2662,7 +2468,7 @@ impl Workspace {
         self.realtime_stop = Some(stop);
         self.realtime_input_muted = Some(input_muted);
         let starting = match self.hosts.len() > 1 {
-            true => format!("starting voice on {}…", self.host_label(host)),
+            true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
@@ -3077,8 +2883,8 @@ impl Workspace {
             {
                 return Err(format!(
                     "`{target}` is on {}, not the selected host {}",
-                    self.host_label(base),
-                    self.host_label(selected),
+                    self.hosts.host_label(base),
+                    self.hosts.host_label(selected),
                 ));
             }
         }
@@ -3087,8 +2893,8 @@ impl Workspace {
                 return Err(format!(
                     "`{target}` is on {}, but the working directory is on {}: \
                      an agent cannot start from a base on another host",
-                    self.host_label(base),
-                    self.host_label(workdir.host),
+                    self.hosts.host_label(base),
+                    self.hosts.host_label(workdir.host),
                 ));
             }
             (Some(base), _) => base,
@@ -3206,7 +3012,7 @@ impl Workspace {
         if !self.agent_online(agent_id) {
             let host = self
                 .host_of(agent_id)
-                .map(|host| self.host_label(host))
+                .map(|host| self.hosts.host_label(host))
                 .unwrap_or_else(|| "its daemon".to_owned());
             let message = format!("not connected to {host}");
             self.notice_on(Some(&agent_id), &message, StyleClass::SystemInfo, cx);
@@ -3657,10 +3463,11 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        match self.registered_workdir(&path) {
+        match self.hosts.registered_workdir(&path) {
             Some(workdir) => {
                 let Some(name) = self
-                    .workdirs
+                    .hosts
+                    .workdirs()
                     .iter()
                     .find(|candidate| {
                         candidate.host == workdir.host && candidate.path == workdir.path
@@ -4176,7 +3983,7 @@ impl Workspace {
                     &format!(
                         "{} account {name} on {}",
                         if enabled { "enabling" } else { "disabling" },
-                        workspace.host_label(host)
+                        workspace.hosts.host_label(host)
                     ),
                     StyleClass::SystemInfo,
                     cx,
@@ -4184,7 +3991,7 @@ impl Workspace {
             },
         );
         self.open_prompt(
-            format!("auth on {}:", self.host_label(host)),
+            format!("auth on {}:", self.hosts.host_label(host)),
             complete,
             on_submit,
             window,
@@ -4211,7 +4018,7 @@ impl Workspace {
                         return;
                     }
                 };
-                let label = self.workdir_label(&workdir);
+                let label = self.hosts.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
                     view.seed(&label, true, editor.as_ref(), window, cx)
@@ -4459,7 +4266,7 @@ impl Workspace {
     fn seed_draft(&mut self, force_header: bool, window: &mut Window, cx: &mut Context<Self>) {
         let label = self
             .draft_default_workdir()
-            .map(|path| self.workdir_label(&path))
+            .map(|path| self.hosts.workdir_label(&path))
             .unwrap_or_default();
         let editor = self.focused_draft_editor();
         self.draft_model.update(cx, |view, cx| {
@@ -4475,7 +4282,7 @@ impl Workspace {
             .copied()
             .and_then(|agent_id| self.agent_workdir(agent_id))
             .or_else(|| {
-                self.workdirs.first().map(|workdir| HostPath {
+                self.hosts.workdirs().first().map(|workdir| HostPath {
                     host: workdir.host,
                     path: workdir.path.clone(),
                 })
@@ -4494,62 +4301,6 @@ impl Workspace {
     /// How a workdir reads in the draft header: its registered project name
     /// when it has one, else the full path — qualified by host whenever more
     /// than one daemon could be meant.
-    fn workdir_label(&self, workdir: &HostPath) -> String {
-        let name = self
-            .workdirs
-            .iter()
-            .find(|candidate| candidate.host == workdir.host && candidate.path == workdir.path)
-            .map(|candidate| candidate.name.clone());
-        match name {
-            Some(name) => self.qualify(workdir.host, &name),
-            None if self.hosts.len() > 1 => {
-                format!("{}:{}", self.host_label(workdir.host), workdir.path)
-            }
-            None => workdir.path.to_string(),
-        }
-    }
-
-    /// Registered workdirs as the `(name, description)` table the shared
-    /// command layer expects. Names carry their host once more than one is
-    /// attached, since two machines can register the same project name.
-    pub fn workdir_table(&self) -> Vec<(String, String)> {
-        self.workdirs
-            .iter()
-            .map(|workdir| {
-                (
-                    self.qualify(workdir.host, &workdir.name),
-                    match self.hosts.len() > 1 {
-                        true => {
-                            format!("{}:{}", self.host_label(workdir.host), workdir.path)
-                        }
-                        false => workdir.path.to_string(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Matches an argument against the registered projects, by qualified
-    /// name, bare name, or path. A bare name that several hosts register is
-    /// ambiguous and matches nothing.
-    fn registered_workdir(&self, argument: &str) -> Option<HostPath> {
-        let workdir = |candidate: &HostProject| HostPath {
-            host: candidate.host,
-            path: candidate.path.clone(),
-        };
-        if let Some(exact) = self.workdirs.iter().find(|candidate| {
-            self.qualify(candidate.host, &candidate.name) == argument || candidate.path == argument
-        }) {
-            return Some(workdir(exact));
-        }
-        let mut bare = self
-            .workdirs
-            .iter()
-            .filter(|candidate| candidate.name == argument);
-        let first = bare.next()?;
-        bare.next().is_none().then(|| workdir(first))
-    }
-
     /// Resolves a workdir argument to a directory on a specific daemon. A
     /// registered project name resolves to its registration; anything else
     /// is a raw daemon-side path, which may name its host as `fern:/src/rho`.
@@ -4557,7 +4308,7 @@ impl Workspace {
     /// joins its own cwd or expands its own home — the daemon expands `~`
     /// and validates.
     fn resolve_workdir(&self, argument: &str) -> Result<HostPath, String> {
-        if let Some(registered) = self.registered_workdir(argument) {
+        if let Some(registered) = self.hosts.registered_workdir(argument) {
             return Ok(registered);
         }
         // A Windows-style drive letter is not a thing on a daemon host, so a
@@ -5950,7 +5701,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn force_host_online(&mut self, host: HostId) {
         self.hosts
-            .set_status(host, crate::hosts::HostStatus::Online);
+            .set_status(host, rho_hosts::hosts::HostStatus::Online);
     }
 
     #[cfg(test)]
@@ -5968,7 +5719,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn merged_quota_summaries_for_test(&self) -> Vec<rho_ui_proto::QuotaSummary> {
-        self.merged_quota_summaries()
+        self.hosts.merged_quota_summaries()
     }
 
     #[cfg(test)]
@@ -6457,6 +6208,20 @@ impl Workspace {
                 crate::mirror::write_verdict(agent_id, verdict);
             }
         }
+    }
+
+    /// A transcript handed in whole, for a test that drives the view
+    /// without a mirror to fold. Not an event: `rho-hosts` carries what a
+    /// daemon said, and no daemon says this.
+    #[cfg(test)]
+    pub(crate) fn seed_transcript_for_test(
+        &mut self,
+        agent_id: AgentId,
+        state: rho_registry::render::UiAgentState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Fold(state))], window, cx);
     }
 
     /// One verdict, applied the way the dealer applies it, for a test that
@@ -7658,6 +7423,7 @@ impl Workspace {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_lowercase();
             workspace
+                .hosts
                 .workdir_table()
                 .into_iter()
                 .filter(|(name, path)| {
@@ -8445,7 +8211,7 @@ impl Workspace {
             .or_else(|| self.only_workdir());
         let label = workdir
             .as_ref()
-            .map(|workdir| self.workdir_label(workdir))
+            .map(|workdir| self.hosts.workdir_label(workdir))
             .unwrap_or_default();
         self.select_agent_inner(None, true, window, cx);
         self.draft_area = area;
@@ -8464,7 +8230,7 @@ impl Workspace {
     /// The workdir to fall back on when nothing else names one: a single
     /// registered project is not a choice worth asking about.
     fn only_workdir(&self) -> Option<HostPath> {
-        match self.workdirs.as_slice() {
+        match self.hosts.workdirs() {
             [workdir] => Some(HostPath {
                 host: workdir.host,
                 path: workdir.path.clone(),
@@ -8504,9 +8270,9 @@ impl Workspace {
     ) {
         self.quota_history_days = days;
         self.hosts.broadcast(|| ClientMessage::QuotaHistory);
-        let history = self.merged_quota_history();
+        let history = self.hosts.merged_quota_history();
         self.open_transient(
-            crate::transient::usage_menu(history, self.active_quota_namespaces(), days),
+            crate::transient::usage_menu(history, self.hosts.active_quota_namespaces(), days),
             window,
             cx,
         );
@@ -9433,7 +9199,7 @@ impl Workspace {
         } else {
             colors.terminal_ansi_bright_cyan
         };
-        let quota = self.merged_quota_summaries();
+        let quota = self.hosts.merged_quota_summaries();
         div()
             .flex()
             .flex_row()
