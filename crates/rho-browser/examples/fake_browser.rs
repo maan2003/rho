@@ -297,7 +297,7 @@ fn title_for(url: &str) -> String {
     }
     match parsed
         .path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
     {
         Some(segment) => format!("{} · {stem}", segment.replace(['-', '_'], " ")),
         None => stem.to_owned(),
