@@ -213,10 +213,10 @@ pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 struct ModelSink(futures::channel::mpsc::UnboundedSender<crate::model::ToModel>);
 
 impl rho_hosts::HostSink for ModelSink {
-    fn send(&self, event: rho_hosts::HostEvent) -> Result<(), ()> {
+    fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
         self.0
             .unbounded_send(crate::model::ToModel::Event(event))
-            .map_err(|_| ())
+            .map_err(|_| rho_hosts::SinkClosed)
     }
 
     fn is_closed(&self) -> bool {

@@ -59,9 +59,9 @@ pub(crate) struct EventSink {
 }
 
 impl EventSink {
-    /// Hands one event to whoever is listening; the error carries nothing,
-    /// since a closed reader means the same thing whatever the event was.
-    pub(crate) fn unbounded_send(&self, event: ConnEvent) -> Result<(), ()> {
+    /// Hands one event to whoever is listening; the only way it fails is
+    /// that nobody is, which means the same thing whatever the event was.
+    pub(crate) fn unbounded_send(&self, event: ConnEvent) -> Result<(), crate::SinkClosed> {
         self.events.send(HostEvent {
             host: self.host,
             event,
@@ -1217,7 +1217,7 @@ async fn run(
             }
             result = read_frame(&mut reader) => match result {
                 Ok(message) => message,
-                Err(error) => break Some(error.into()),
+                Err(error) => break Some(error),
             },
         };
         let event = match message {

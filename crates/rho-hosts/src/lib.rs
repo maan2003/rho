@@ -95,11 +95,24 @@ impl HostSpec {
     }
 }
 
+/// Nobody is listening any more: the reader this sink writes to is gone,
+/// and every event after this one would go the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkClosed;
+
+impl std::fmt::Display for SinkClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("nothing is listening for this host's events")
+    }
+}
+
+impl std::error::Error for SinkClosed {}
+
 /// Where a host's events go. The crate does not know what a reader makes of
 /// them, only that one is listening: this is what keeps the connection from
 /// depending on the crates that consume it.
 pub trait HostSink: Send + Sync + 'static {
-    fn send(&self, event: HostEvent) -> Result<(), ()>;
+    fn send(&self, event: HostEvent) -> Result<(), SinkClosed>;
     /// Whether the reader has gone. A connection that finds nobody
     /// listening stops rather than dialling again for nothing.
     fn is_closed(&self) -> bool;
