@@ -274,8 +274,88 @@ buffer's text to build titles, on every desk sync. That is slice 4. Slice
    six-second freeze no longer fills the history with itself. The snapshot
    schema is version 10.
 4. **The ranked set.** Home and the lamp read it; `dealer_hand`,
-   `tree_dealer_queue`, the dealer signal task and the revision go;
-   time-based priorities on a timer. Proof: a change re-ranks one card.
+   `tree_dealer_queue` and the revision go; time-based priorities on a
+   timer. Proof: a change re-ranks one card.
+   *Landed, first half.* The dealer no longer walks the desk to answer a
+   question about it. Each host's map carries an index built once when the
+   source is set (id, children by parent, node by agent), which retires the
+   walk of every node per heading, the search for an agent's node per
+   agent, and the pass over every agent per agent in the spawn descent.
+   Note titles come from the desk rather than from ropes: `HostDeskCells`
+   keeps one per note and rereads only the buffers whose version moved, so
+   the ten `note_title(&buffer.read(cx).text())` calls are gone from every
+   sync path. Only the pickers read a buffer now, and only for derived
+   rows; `tree_dealer_queue` and `dealer_hand` no longer take a `cx` at
+   all, which is what makes that visible. The ranking is computed once and
+   shared by Home, the lamp and the map's depth counter, which built it
+   three times a frame; the map's copy was built with an empty interactions
+   map, so the depth counter and the dealer were ranking differently, and
+   they now agree. `deal_count_revision` is gone: field, fifteen bumps and
+   accessor, with no reader outside its own tests. `sync_tree` writes a
+   derived title only into the rows whose title moved.
+   The dealer signal task survives, and only as the expiry timer: its wake
+   is keyed to the soonest future `defer_until`, deadline or skip cooldown,
+   floored at a second and ceilinged at a minute. The ceiling stays because
+   a card's priority slides continuously with waiting, which no expiry
+   names.
+   Measured on the rig (49 GB store, debug, same journal position as the
+   slice 3.5 run): the warm start's Loaded gap went from 4.65s to 4.27s,
+   which is 8%. The dealer itself collapsed, from about 9% of main-thread
+   samples to about 2%: `tree_dealer_queue` 56 -> 13,
+   `dealer_hand` 27 -> 13, `evaluate_dealer_signals` 29 -> 5,
+   `refresh_home` 15 -> 1, out of 626 and 597 samples.
+   What did not move is the rest of the gap, and it is not the dealer's:
+   `on_buffer_event` 144 -> 142, `colorize_brackets` 95 -> 86,
+   `splice_inlays` 88 -> 96, `Composition::sync` 86 -> 87,
+   `set_excerpts_for_path` 85 -> 86, `ensure_headerless` 26 -> 26. Every
+   stack holding `on_buffer_event` has no rho-gui frame under it but the
+   workspace closure: it is gpui dispatching the editor's own subscription
+   to the multibuffer, deferred to the end of the update, raised by
+   `sync_tree` replacing the whole composition. That residual is slices 5
+   and 6, not this one. The decoration pass folded in here removed a rope
+   read per machine row per sync but not the writes, because during a warm
+   load the attention glyphs and activity text do change every sync.
+   *Landed, second half.* The ranking is kept rather than made again.
+   `DealerSet` holds the cards by the topic they are about, with an index
+   from each host and each agent to what it owns, and a card is made only
+   when the thing it is about changes: a `Changed` remakes exactly the
+   agents it names, and a desk that arrived or changed shape remakes that
+   host. `tree_dealer_queue`, the last pass over every node, is gone.
+   The part of a card that moves with the clock is separated from the card
+   as `PriorityCurve`, so a read brings a kept card up to the moment
+   without making it again: a dated mark carries its mark, time and pace, an
+   agent reply carries the agent it is about and reads its facts off the
+   cursor already stored beside it, and a Slack unit carries nothing
+   because its wait is the mirror's measurement, not the clock's. A card
+   the curve takes under the floor leaves at the read.
+   `dealer_hand` no longer takes a registry or the Slack facts, because a
+   read consults neither; that is what makes it visible that reading the
+   ranking cannot walk anything. A card is remade from the model event arm
+   that carries the fact, not from the frame-deferred desk sync, because a
+   fact moving is exactly when a card is made and every reader in between
+   has to see it.
+   Two curves do not key into bands, and neither needed to: the agent
+   recency bonus and the pace of a not-yet-due deadline are both applied at
+   read, along with every other card's slide, since Home renders the whole
+   ranking and so a read is bounded by the answer's own size either way.
+   The bounded thing is the making, and that is now what a change names.
+   The sort gained the card's identity as a last tie-break: a set has no
+   insertion order to fall back on, and two cards that tie on everything
+   else must still come out the same way every read.
+   Proof: `one_agents_change_makes_one_card` builds a desk of eight filed
+   agents, each asking, and asserts that the build makes a card per asking
+   agent and that a `Changed` for one of them makes exactly one more.
+   On the rig, a warm start of the 49 GB store: the whole dealer is now
+   3 samples of 417 in the busy block, all of them the one build at
+   `Loaded`, against 26 for the two walks in the first half and about 9%
+   of main before the slice. The block itself is 4.17 s against 4.27 s and
+   4.65 s, so the second half buys almost nothing on the clock and is not
+   meant to; the first half had already taken the dealer down, and what
+   this half buys is that no read and no change walks anything. The rest
+   of the block is where the first half left it, and is not the dealer's:
+   `sync_tree` 234 samples, the editor's own buffer subscription 145,
+   `splice_inlays` 91, `Composition` 88. That is the composition rebuild,
+   slices 5 and 6.
 5. **Desk deltas in place.** `rebuild_view` goes; `DeskSynced` and
    `DeskMutationAccepted` touch the nodes they name. Proof: one verdict
    costs the cells it writes.

@@ -5,8 +5,6 @@
 //! here and editing the same note on the map are the same edit; the child
 //! rows are generated, read-only, and named the way the map names them.
 
-use std::collections::BTreeMap;
-
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, Capability};
@@ -131,7 +129,7 @@ impl NoteView {
     pub fn sync(
         &mut self,
         nodes: &[crate::desk_view::DeskNode],
-        titles: &BTreeMap<rho_desk::cells::Id, String>,
+        titles: &std::collections::HashMap<rho_desk::cells::Id, String>,
         cx: &mut Context<Workspace>,
     ) {
         let children = nodes

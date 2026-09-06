@@ -152,13 +152,11 @@ pub struct AgentRegistry {
     tag_agents: TagAgents,
     announced_hosts: BTreeMap<AgentId, HostId>,
     active: ActivePane,
-    deal_count_revision: u64,
 }
 
 impl AgentRegistry {
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn detach_host(&mut self, host: HostId) {
@@ -178,7 +176,6 @@ impl AgentRegistry {
             .collect::<BTreeSet<_>>();
         self.forget_agents(&departed);
         self.rebuild(None);
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn host_name(&self, host: HostId) -> &str {
@@ -223,7 +220,6 @@ impl AgentRegistry {
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
         self.rebuild(Some(host));
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     /// Drops everything mirrored from a host that is still attached: for
@@ -237,7 +233,6 @@ impl AgentRegistry {
             .collect::<BTreeSet<_>>();
         self.forget_agents(&departed);
         self.rebuild(None);
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     fn forget_agents(&mut self, departed: &BTreeSet<AgentId>) {
@@ -273,7 +268,6 @@ impl AgentRegistry {
                         self.agents
                             .entry(entry.agent_id)
                             .or_insert(AgentLife::Known);
-                        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
                         true
                     }
                     None => false,
@@ -291,9 +285,7 @@ impl AgentRegistry {
         if attention_before
             .iter()
             .any(|(agent_id, before)| self.attention(*agent_id) != *before)
-        {
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-        }
+        {}
         changed
     }
 
@@ -313,9 +305,7 @@ impl AgentRegistry {
             attention_before
                 .entry(agent_id)
                 .or_insert_with(|| self.attention(agent_id));
-            if self.mirror.insert(agent_id, mirrored).is_none() {
-                self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-            }
+            if self.mirror.insert(agent_id, mirrored).is_none() {}
             self.agents.entry(agent_id).or_insert(AgentLife::Known);
             changed.push(agent_id);
         }
@@ -325,9 +315,7 @@ impl AgentRegistry {
         if attention_before
             .iter()
             .any(|(agent_id, before)| self.attention(*agent_id) != *before)
-        {
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-        }
+        {}
         changed
     }
 
@@ -359,7 +347,6 @@ impl AgentRegistry {
             return false;
         }
         self.rebuild(None);
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
         true
     }
 
@@ -380,7 +367,6 @@ impl AgentRegistry {
             self.agents.entry(agent_id).or_insert(AgentLife::Known);
         }
         self.rebuild(None);
-        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn mirrored(&self, agent_id: AgentId) -> Option<&MirroredAgent> {
@@ -493,9 +479,7 @@ impl AgentRegistry {
         }
         let before = self.attention(agent_id);
         self.verdicts.insert(agent_id, verdict);
-        if self.attention(agent_id) != before {
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-        }
+        if self.attention(agent_id) != before {}
         true
     }
 
@@ -722,20 +706,15 @@ impl AgentRegistry {
     pub fn mark_known(&mut self, agent_id: AgentId) {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.agents.entry(agent_id) {
             entry.insert(AgentLife::Known);
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
         }
     }
     pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
         let previous = self.agents.insert(agent_id, AgentLife::Live);
-        if previous.is_none() {
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-        }
+        if previous.is_none() {}
         previous != Some(AgentLife::Live)
     }
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
-        if self.agents.insert(agent_id, AgentLife::Known).is_none() {
-            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
-        }
+        if self.agents.insert(agent_id, AgentLife::Known).is_none() {}
     }
     pub fn active_pane(&self) -> ActivePane {
         self.active
@@ -791,13 +770,6 @@ impl AgentRegistry {
     }
     pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.agents.keys()
-    }
-
-    /// Changes only when inputs that can affect the Desk deal count change.
-    /// Activity text and last-active timestamps affect presentation/order, not
-    /// the number of cards, so streaming those fields leaves this stable.
-    pub fn deal_count_revision(&self) -> u64 {
-        self.deal_count_revision
     }
 }
 
@@ -856,31 +828,22 @@ mod tests {
             .map(|agent_id| (*agent_id, false, vec!["rho/agent".to_owned()]))
             .collect::<Vec<_>>();
 
-        let before = registry.deal_count_revision();
         assert!(registry.set_agent_filings(filings.clone()));
-        assert_eq!(
-            registry.deal_count_revision(),
-            before.wrapping_add(1),
-            "filing the desk rebuilt more than once"
-        );
 
         // A desk sync that files what is already filed says so, so what is
         // derived from filing is not made again.
-        let after = registry.deal_count_revision();
         assert!(!registry.set_agent_filings(filings));
-        assert_eq!(registry.deal_count_revision(), after);
     }
 
     #[test]
-    fn deal_count_revision_ignores_presentation_only_updates() {
+    fn a_verdict_said_twice_changes_nothing_the_second_time() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let mut registry = AgentRegistry::default();
 
         registry.mark_known(agent_id);
-        let known_revision = registry.deal_count_revision();
         registry.set_activity(agent_id, "writing tests".to_owned());
         registry.touch_agent(agent_id);
-        assert_eq!(registry.deal_count_revision(), known_revision);
+        assert_eq!(registry.attention(agent_id), Attention::Quiet);
 
         // A turn that ends asking for the user moves attention by itself.
         let host = HostId::default();
@@ -905,8 +868,6 @@ mod tests {
             ),
         );
         assert_eq!(registry.attention(agent_id), Attention::Pending);
-        let pending_revision = registry.deal_count_revision();
-        assert_ne!(pending_revision, known_revision);
 
         // Dealing with it is the user's verdict; saying it again is not.
         let handled = Verdict {
@@ -915,10 +876,8 @@ mod tests {
         };
         assert!(registry.set_agent_verdict(agent_id, handled));
         assert_eq!(registry.attention(agent_id), Attention::Quiet);
-        let handled_revision = registry.deal_count_revision();
-        assert_ne!(handled_revision, pending_revision);
         assert!(!registry.set_agent_verdict(agent_id, handled));
-        assert_eq!(registry.deal_count_revision(), handled_revision);
+        assert_eq!(registry.attention(agent_id), Attention::Quiet);
     }
 
     /// The rails read the log, not the daemon: a turn that starts and

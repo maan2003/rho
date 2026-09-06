@@ -104,6 +104,14 @@ struct WarmSurface {
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
 
+/// The longest the dealer's signals go unexamined. A card's priority grows
+/// with how long it has waited, so a wake is owed even when nothing on the
+/// desk comes due.
+const DEALER_SIGNAL_CEILING: Duration = Duration::from_secs(60);
+/// The shortest wait between two examinations, so that a desk full of
+/// deadlines a second apart does not spin.
+const DEALER_SIGNAL_FLOOR: Duration = Duration::from_secs(1);
+
 struct ShellTouchContact {
     start: Point<gpui::Pixels>,
     position: Point<gpui::Pixels>,
@@ -915,11 +923,23 @@ impl Workspace {
                 }
             }
         });
+        // The ranking only changes on its own when a dated thing comes
+        // due, so the wake is keyed to the next one rather than to a
+        // minute that is usually spent finding nothing has moved. A
+        // priority still slides with the clock between two of those,
+        // which is what the ceiling is for.
         let dealer_signal_task = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(60))
-                    .await;
+                let wait = this
+                    .read_with(cx, |this, _| {
+                        this.dashboard
+                            .next_deal_expiry(chrono::Local::now().fixed_offset())
+                            .and_then(|until| until.to_std().ok())
+                            .unwrap_or(DEALER_SIGNAL_CEILING)
+                            .clamp(DEALER_SIGNAL_FLOOR, DEALER_SIGNAL_CEILING)
+                    })
+                    .unwrap_or(DEALER_SIGNAL_CEILING);
+                cx.background_executor().timer(wait).await;
                 if this
                     .update(cx, |this, cx| this.invalidate_dealer_signals(cx))
                     .is_err()
@@ -1475,14 +1495,9 @@ impl Workspace {
 
     fn home_rows(&mut self, cx: &mut Context<Self>) -> crate::home::HomeRows {
         let now = chrono::Local::now().fixed_offset();
-        let threads = self.slack_thread_facts(cx);
-        let hand = self.dashboard.dealer_hand(
-            &self.registry,
-            &threads,
-            now,
-            &self.agent_last_interaction,
-            cx,
-        );
+        let hand = self
+            .dashboard
+            .dealer_hand(now, &self.agent_last_interaction);
         let registry = &self.registry;
         let mut rows = crate::home::split_hand(&hand.cards, |card| {
             crate::home::card_title(card, |agent_id| registry.agent_id_label(agent_id))
@@ -1744,14 +1759,9 @@ impl Workspace {
 
     fn evaluate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         let now = chrono::Local::now().fixed_offset();
-        let threads = self.slack_thread_facts(cx);
-        let mut candidates = self.dashboard.dealer_hand(
-            &self.registry,
-            &threads,
-            now,
-            &self.agent_last_interaction,
-            cx,
-        );
+        let mut candidates = self
+            .dashboard
+            .dealer_hand(now, &self.agent_last_interaction);
         // What the lamp is about is what is *not* in front of the reader:
         // the card they are already reading is not news.
         candidates
@@ -1870,6 +1880,7 @@ impl Workspace {
         match msg {
             crate::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
+                self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
                 self.refresh_dashboard(window, cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
@@ -1884,6 +1895,11 @@ impl Workspace {
                 // sake, so the tree the dealer reads has to be made again.
                 // Only for the agents that moved: the rest of the desk is
                 // what it was.
+                // The cards these agents own are made again here, not when
+                // the frame gets round to the map: a fact that has moved is
+                // exactly when a card is made, and everything that reads the
+                // ranking in between must see it.
+                self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(&changed), cx);
                 self.schedule_desk_sync(host, Some(changed), window, cx);
             }
             crate::model::ModelMsg::Rows { agent_id, rows } => {
@@ -4816,10 +4832,7 @@ impl Workspace {
         &self,
         host: HostId,
     ) -> Vec<crate::desk_view::DeskNode> {
-        self.desk_cells
-            .tree_source(host)
-            .map(|(nodes, _)| nodes)
-            .unwrap_or_default()
+        self.desk_cells.nodes(host)
     }
 
     #[cfg(test)]
@@ -5841,13 +5854,11 @@ impl Workspace {
         cx: &App,
     ) -> Vec<(rho_desk::cells::Id, Option<rho_desk::cells::Id>, String)> {
         self.desk_cells
-            .tree_source(host)
+            .nodes(host)
             .into_iter()
-            .flat_map(|(nodes, buffers)| {
-                nodes.into_iter().filter_map(move |node| {
-                    let text = buffers.get(&node.id)?.read(cx).text();
-                    Some((node.id, node.parent, text))
-                })
+            .filter_map(|node| {
+                let text = self.desk_cells.buffer(host, &node.id)?.read(cx).text();
+                Some((node.id, node.parent, text))
             })
             .collect()
     }
@@ -6198,6 +6209,26 @@ impl Workspace {
         self.sync_tree_rows(host, None, window, cx);
     }
 
+    /// Makes the cards `scope` names again, and leaves the rest of the
+    /// ranking standing.
+    fn refresh_deal_cards(
+        &mut self,
+        host: HostId,
+        scope: crate::dashboard::DealScope<'_>,
+        cx: &mut Context<Self>,
+    ) {
+        let now = chrono::Local::now().fixed_offset();
+        let threads = self.slack_thread_facts(cx);
+        self.dashboard.refresh_deal_cards(
+            host,
+            scope,
+            &self.registry,
+            &threads,
+            now,
+            &self.agent_last_interaction,
+        );
+    }
+
     /// The map for a host, made again from the desk. `moved` names the
     /// agents a `Changed` moved; everything else the sources hold stands.
     fn sync_tree_rows(
@@ -6213,8 +6244,18 @@ impl Workspace {
         // nothing written, so no store event will ever give it the buffer
         // the map draws it from. It gets one here.
         self.desk_cells.reconcile_buffers(host, cx);
-        if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
-            self.dashboard.set_tree_source(host, nodes, buffers, cx);
+        if let Some((nodes, buffers, titles)) = self.desk_cells.tree_source(host, cx) {
+            self.dashboard
+                .set_tree_source(host, nodes, buffers, titles, cx);
+            // The cards this moved, and only those. A `Changed` names its
+            // agents and costs them; a desk that arrived or changed shape
+            // names nothing and is made again.
+            let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
+            let scope = match &moved {
+                Some(agents) => crate::dashboard::DealScope::Agents(agents),
+                None => crate::dashboard::DealScope::Whole,
+            };
+            self.refresh_deal_cards(host, scope, cx);
             self.refresh_dashboard(window, cx);
             self.sync_note_views(host, cx);
         }
@@ -6387,20 +6428,21 @@ impl Workspace {
         if self.note_views.is_empty() {
             return;
         }
-        let Some((nodes, buffers)) = self.desk_cells.tree_source(host) else {
+        let Some((nodes, buffers, note_titles)) = self.desk_cells.tree_source(host, cx) else {
             return;
         };
-        // A note's title is the first line of its body; a machine row's
-        // buffer already holds the title the map derived for it.
-        let titles = buffers
-            .iter()
-            .map(|(id, buffer)| {
-                (
+        // A note's title is the first line of its body, which the desk
+        // keeps; a machine row's buffer holds the title the map derived
+        // for it, and only those are read here.
+        let mut titles = (*note_titles).clone();
+        for (id, buffer) in &buffers {
+            if !titles.contains_key(id) {
+                titles.insert(
                     id.clone(),
                     crate::dashboard::note_title(&buffer.read(cx).text()).to_owned(),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
+                );
+            }
+        }
         let mut views = std::mem::take(&mut self.note_views);
         for ((view_host, _), view) in views.iter_mut() {
             if *view_host != host {
@@ -6514,9 +6556,9 @@ impl Workspace {
         }
         let existing = self
             .desk_cells
-            .tree_source(host)
+            .tree_source(host, cx)
             .into_iter()
-            .flat_map(|(nodes, _)| nodes)
+            .flat_map(|(nodes, _, _)| nodes)
             .find(|node| node.parent == Some(node_id.clone()) && node.is_note())
             .map(|node| node.id);
         if let Some(existing) = existing {
@@ -6774,7 +6816,13 @@ impl Workspace {
 
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let threads = self.slack_thread_facts(cx);
-        self.dashboard.sync(&self.registry, &threads, window, cx);
+        self.dashboard.sync(
+            &self.registry,
+            &threads,
+            &self.agent_last_interaction,
+            window,
+            cx,
+        );
         {
             let pages = self.dashboard.page_ids();
             if pages != self.browser_pages {
@@ -7725,18 +7773,12 @@ impl Workspace {
         self.context_area(cx)
     }
 
-    /// The ranking as it stands. Nothing is kept between two of these: a
-    /// pull, Home, and a verdict all ask again and all see the same facts.
-    pub(crate) fn hand(&mut self, cx: &mut Context<Self>) -> crate::dashboard::DealQueue {
+    /// The ranking as it stands. A pull, Home and a verdict all read the
+    /// same kept set, brought up to the moment they read it.
+    pub(crate) fn hand(&mut self, _cx: &mut Context<Self>) -> crate::dashboard::DealQueue {
         let now = chrono::Local::now().fixed_offset();
-        let threads = self.slack_thread_facts(cx);
-        self.dashboard.dealer_hand(
-            &self.registry,
-            &threads,
-            now,
-            &self.agent_last_interaction,
-            cx,
-        )
+        self.dashboard
+            .dealer_hand(now, &self.agent_last_interaction)
     }
 
     /// The node a card in view is about: the row the map's cursor is on,

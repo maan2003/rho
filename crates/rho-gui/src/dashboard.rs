@@ -216,6 +216,79 @@ impl DealQueue {
     }
 }
 
+/// Everything a card is made of besides the node it is about.
+struct DealerFacts<'a> {
+    by_agent: HashMap<AgentId, &'a DealAgentFacts>,
+    spawned: HashMap<AgentId, Vec<AgentId>>,
+    threads: &'a HashMap<SlackUnit, SlackFacts>,
+    now: chrono::DateTime<chrono::FixedOffset>,
+    interactions: &'a HashMap<AgentId, i64>,
+}
+
+/// What a note lends the cards under it.
+struct HeadingContext {
+    breadcrumb: String,
+    room: Option<String>,
+    bindings: Vec<AgentId>,
+}
+
+/// The cards, kept rather than made again. A card is made when the thing
+/// it is about changes, and at no other time: a `Changed` remakes that
+/// agent's card, a desk that arrives whole remakes that host's. Reading
+/// the ranking never touches the desk, only what is already here.
+#[derive(Default)]
+struct DealerSet {
+    /// Every candidate that stands, by the topic it is about. A note with
+    /// two dated marks offers two, and the read picks one per topic the
+    /// way the old pass did.
+    cards: HashMap<DealCardId, Vec<RankedDealCard>>,
+    /// The topics a host contributed, so a whole remake retires exactly
+    /// those and leaves the other hosts alone.
+    of_host: HashMap<HostId, HashSet<DealCardId>>,
+    /// Where an agent's card sits, so a `Changed` can retire it without
+    /// looking through the map for it.
+    of_agent: HashMap<AgentId, DealCardId>,
+    /// How many cards have been made since this dashboard existed. The
+    /// point of the set is that this rises by what a change names and not
+    /// by the size of the desk, so a test can say exactly that.
+    #[cfg(test)]
+    made: usize,
+}
+
+impl DealerSet {
+    fn retire(&mut self, id: &DealCardId) {
+        self.cards.remove(id);
+        if let Some(topics) = self.of_host.get_mut(&id.host) {
+            topics.remove(id);
+        }
+    }
+
+    fn insert(&mut self, card: RankedDealCard) {
+        #[cfg(test)]
+        {
+            self.made += 1;
+        }
+        let id = card.card.identity.clone();
+        if let Some(agent_id) = card.card.agent_id
+            && card.card.kind == DealCardKind::Agent
+        {
+            self.of_agent.insert(agent_id, id.clone());
+        }
+        self.of_host.entry(id.host).or_default().insert(id.clone());
+        self.cards.entry(id).or_default().push(card);
+    }
+}
+
+/// What a refresh is allowed to leave standing.
+#[derive(Clone, Copy, Debug)]
+pub enum DealScope<'a> {
+    /// The desk itself is different: what is on it at all can have
+    /// changed, so the host's cards are made again.
+    Whole,
+    /// Only these agents moved. Every other card on the host stands.
+    Agents(&'a [AgentId]),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DealQueueDepth {
     pub dealt_count: usize,
@@ -354,6 +427,8 @@ pub struct Dashboard {
     phone_browse_mode: bool,
     skipped: HashMap<DealCardId, SkippedCard>,
     queue_depth: DealQueueDepth,
+    /// The ranking, kept between reads and maintained per change.
+    dealer: DealerSet,
     /// Portal occurrences whose complete runtime subtree is visible.
     /// This is transient display state and is never written to Desk.
     /// Move the cursor into this key's buffer on the next sync — how a
@@ -362,6 +437,12 @@ pub struct Dashboard {
     /// Move the cursor to this document offset on the next sync.
     /// Reply placeholder inlays currently spliced in.
     tree_inlay_ids: Vec<InlayId>,
+    /// The title last written into each machine row's buffer, against the
+    /// buffer it went into. A sync used to read every one of those ropes
+    /// back to find out it had not changed; on a desk of thousands of rows
+    /// that read, and the editor events the rewrites raised, were most of
+    /// what a sync cost.
+    derived_titles: HashMap<(HostId, rho_desk::cells::Id), (gpui::EntityId, String)>,
     tree_collapsed: HashSet<(HostId, rho_desk::cells::Id)>,
     pending_tree_cursor: Option<(HostId, rho_desk::cells::Id, usize)>,
     /// The previous pass's inputs and output, so a sync whose world is
@@ -375,6 +456,82 @@ pub struct Dashboard {
 struct TreeHostSource {
     nodes: Vec<crate::desk_view::DeskNode>,
     buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
+    /// Every note's title, kept by the desk so that naming a row never
+    /// reads a rope. Rows that are not notes have their title derived.
+    titles: std::rc::Rc<HashMap<rho_desk::cells::Id, String>>,
+    /// The map's edges, made once when the source is set. Walking every
+    /// node to find one node's children was the whole cost of dealing a
+    /// desk: quadratic in a map that only grows.
+    index: TreeIndex,
+}
+
+/// The lookups the map needs, built in one pass over the nodes.
+#[derive(Default)]
+struct TreeIndex {
+    by_id: HashMap<rho_desk::cells::Id, usize>,
+    children: HashMap<rho_desk::cells::Id, Vec<usize>>,
+    by_agent: HashMap<AgentId, usize>,
+}
+
+impl TreeIndex {
+    fn build(nodes: &[crate::desk_view::DeskNode]) -> Self {
+        let mut index = TreeIndex {
+            by_id: HashMap::with_capacity(nodes.len()),
+            children: HashMap::new(),
+            by_agent: HashMap::new(),
+        };
+        for (at, node) in nodes.iter().enumerate() {
+            index.by_id.insert(node.id.clone(), at);
+            if let Some(parent) = &node.parent {
+                index.children.entry(parent.clone()).or_default().push(at);
+            }
+            if let Some(agent) = node.agent() {
+                index.by_agent.insert(agent, at);
+            }
+        }
+        index
+    }
+}
+
+impl TreeHostSource {
+    fn node(&self, id: &rho_desk::cells::Id) -> Option<&crate::desk_view::DeskNode> {
+        self.index.by_id.get(id).map(|at| &self.nodes[*at])
+    }
+
+    fn children(
+        &self,
+        id: &rho_desk::cells::Id,
+    ) -> impl Iterator<Item = &crate::desk_view::DeskNode> {
+        self.index
+            .children
+            .get(id)
+            .into_iter()
+            .flatten()
+            .map(|at| &self.nodes[*at])
+    }
+
+    fn agent_node(&self, agent: AgentId) -> Option<&crate::desk_view::DeskNode> {
+        self.index.by_agent.get(&agent).map(|at| &self.nodes[*at])
+    }
+
+    /// What a row is called: a note's own first line, or the title the map
+    /// derives for everything else.
+    fn title(&self, id: &rho_desk::cells::Id) -> Option<&str> {
+        self.titles.get(id).map(String::as_str)
+    }
+
+    /// Every row's title, including the derived ones the map wrote into
+    /// read-only buffers. This reads those buffers, so it belongs to the
+    /// pickers a keystroke opens and not to anything a sync runs.
+    fn all_titles(&self, cx: &App) -> HashMap<rho_desk::cells::Id, String> {
+        let mut titles = (*self.titles).clone();
+        for (id, buffer) in &self.buffers {
+            if !titles.contains_key(id) {
+                titles.insert(id.clone(), note_title(&buffer.read(cx).text()).to_owned());
+            }
+        }
+        titles
+    }
 }
 
 fn nearest_tree_heading(
@@ -431,279 +588,341 @@ impl Dashboard {
         })
     }
 
-    pub fn tree_heading_named(
-        &self,
-        title: &str,
-        cx: &App,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub fn tree_heading_named(&self, title: &str) -> Option<(HostId, rho_desk::cells::Id)> {
         self.tree_hosts.iter().find_map(|(host, source)| {
             source.nodes.iter().find_map(|node| {
-                (node.is_note()
-                    && source
-                        .buffers
-                        .get(&node.id)
-                        .is_some_and(|buffer| note_title(&buffer.read(cx).text()) == title.trim()))
-                .then_some((*host, node.id.clone()))
+                (node.is_note() && source.title(&node.id) == Some(title.trim()))
+                    .then_some((*host, node.id.clone()))
             })
         })
     }
 
-    fn tree_dealer_queue(
+    /// Everything a card is made of that is not the node it is about,
+    /// gathered once so that making one card and making all of them read
+    /// the same facts.
+    fn dealer_facts<'a>(
         &self,
-        registry: &AgentRegistry,
-        threads: &HashMap<SlackUnit, SlackFacts>,
+        threads: &'a HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
-        agent_interactions: &HashMap<AgentId, i64>,
-        cx: &App,
-    ) -> DealQueue {
-        let facts = deal_agent_facts(registry);
-        let by_agent = facts
+        agent_interactions: &'a HashMap<AgentId, i64>,
+        agents: &'a [DealAgentFacts],
+    ) -> DealerFacts<'a> {
+        let by_agent = agents
             .iter()
             .map(|facts| (facts.agent_id, facts))
             .collect::<HashMap<_, _>>();
-        let mut ranked = Vec::new();
-        let mut order = 0usize;
-        // Filing decides where a card is shown, never whether it exists, so
-        // an agent reached through a note is only skipped by the pass below
-        // to keep it from being carded twice.
-        let mut carded = HashSet::new();
-        for (host, source) in &self.tree_hosts {
-            let nodes = source
-                .nodes
-                .iter()
-                .map(|node| (node.id.clone(), node))
-                .collect::<HashMap<_, _>>();
-            let titles = source
-                .buffers
-                .iter()
-                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
-                .collect::<HashMap<_, _>>();
-            for heading in source.nodes.iter().filter(|node| node.is_note()) {
-                let terminal = heading.state != rho_desk::cells::State::Open;
-                let ancestor_deferred = std::iter::successors(heading.parent.clone(), |parent| {
-                    nodes.get(parent).and_then(|node| node.parent.clone())
-                })
-                .filter_map(|parent| nodes.get(&parent))
-                .any(|node| desk_deferred(node, now.naive_local()));
-                let locally_deferred = desk_deferred(heading, now.naive_local());
-                if terminal || ancestor_deferred || locally_deferred {
-                    order += 1;
-                    continue;
-                }
-                let breadcrumb = tree_breadcrumb(&heading.id, &nodes, &titles);
-                let room = breadcrumb.split(" › ").next().map(str::to_owned);
-                let bindings = source
-                    .nodes
-                    .iter()
-                    .filter(|node| node.parent == Some(heading.id.clone()))
-                    .filter_map(|node| node.agent())
-                    .collect::<Vec<_>>();
-                for (mark, at) in desk_marks(heading) {
-                    let priority =
-                        desk_mark_priority(mark, at, heading.pace_days, now.naive_local());
-                    if priority <= DEAL_QUEUE_FLOOR {
-                        continue;
-                    }
-                    let identity = DealCardId {
-                        host: *host,
-                        node_id: heading.id.clone(),
-                    };
-                    ranked.push(RankedDealCard {
-                        priority,
-                        virtual_reply: false,
-                        order,
-                        cursor: CardCursor::Desk(mark, at),
-                        card: DealCard {
-                            label: desk_mark_label(mark, at, now.naive_local()),
-                            priority,
-                            host: *host,
-                            topic_node_id: heading.id.clone(),
-                            agent_id: bindings.first().copied(),
-                            agent_tag: None,
-                            breadcrumb: breadcrumb.clone(),
-                            room: room.clone(),
-                            kind: DealCardKind::Desk,
-                            identity,
-                            skipped: false,
-                        },
-                    });
-                }
-                // The old model gated a topic's agent cards on its todo
-                // mark not being ripe yet. With marks as fields the same
-                // gate is the note being deferred, which is checked above.
-                {
-                    for root_agent in bindings {
-                        let mut agents = vec![root_agent];
-                        let mut cursor = 0;
-                        while cursor < agents.len() {
-                            let parent = agents[cursor];
-                            agents.extend(
-                                facts
-                                    .iter()
-                                    .filter(|agent| agent.parent == Some(parent))
-                                    .map(|agent| agent.agent_id),
-                            );
-                            cursor += 1;
-                        }
-                        for agent_id in agents {
-                            let Some(agent) = by_agent.get(&agent_id).copied() else {
-                                continue;
-                            };
-                            // The user's verdict on the agent closes its
-                            // card wherever the card is shown; being
-                            // reached through a note does not exempt it.
-                            if agent_node_closed(source, agent_id, now) {
-                                carded.insert(agent_id);
-                                continue;
-                            }
-                            let Some((priority, label)) =
-                                agent_card_facts(agent, now, agent_interactions)
-                            else {
-                                continue;
-                            };
-                            carded.insert(agent_id);
-                            // Every agent is its own topic. Taking the
-                            // note as the topic made two agents filed
-                            // under one note compete for a single card,
-                            // so all but the loudest disappeared from
-                            // Home; a spawned child with no row of its
-                            // own shared its parent's identity as well.
-                            let node_id = source
-                                .nodes
-                                .iter()
-                                .find(|node| node.agent() == Some(agent_id))
-                                .map(|node| node.id.clone())
-                                .unwrap_or(rho_desk::cells::Id::Agent(agent_id));
-                            ranked.push(RankedDealCard {
-                                priority,
-                                virtual_reply: true,
-                                order,
-                                cursor: CardCursor::Agent(agent.facts, agent.attention),
-                                card: DealCard {
-                                    label,
-                                    priority,
-                                    host: *host,
-                                    topic_node_id: node_id.clone(),
-                                    agent_id: Some(agent_id),
-                                    agent_tag: None,
-                                    breadcrumb: breadcrumb.clone(),
-                                    room: room.clone(),
-                                    kind: DealCardKind::Agent,
-                                    skipped: false,
-                                    identity: DealCardId {
-                                        host: *host,
-                                        node_id,
-                                    },
-                                },
-                            });
-                        }
-                    }
-                }
-                order += 1;
-            }
-            // Slack units that started to matter are rows like any other, so
-            // they rank in the same queue. A conversation is a unit as much
-            // as a followed thread is: a direct message and a channel
-            // somebody named the user in each deal as one card. What the
-            // card says comes from the mirror; the store holds the unit's
-            // identity and its verdicts, never its words.
-            for node in source.nodes.iter().filter(|node| node.slack().is_some()) {
-                if node.state != rho_desk::cells::State::Open
-                    || desk_deferred(node, now.naive_local())
-                {
-                    order += 1;
-                    continue;
-                }
-                let Some(thread) = node.slack().and_then(|unit| threads.get(unit)) else {
-                    order += 1;
-                    continue;
-                };
-                let (label, priority) = thread_card_facts(&thread, now);
-                if priority <= DEAL_QUEUE_FLOOR {
-                    order += 1;
-                    continue;
-                }
-                ranked.push(RankedDealCard {
-                    priority,
-                    virtual_reply: false,
-                    order,
-                    cursor: CardCursor::Slack(rho_desk::cells::SlackTs(thread.latest.clone())),
-                    card: DealCard {
-                        label,
-                        priority,
-                        host: *host,
-                        topic_node_id: node.id.clone(),
-                        agent_id: None,
-                        agent_tag: None,
-                        breadcrumb: thread.title.clone(),
-                        room: Some(thread.conversation.clone()),
-                        kind: DealCardKind::Thread,
-                        skipped: false,
-                        identity: DealCardId {
-                            host: *host,
-                            node_id: node.id.clone(),
-                        },
-                    },
-                });
-                order += 1;
+        // Who each agent spawned, so that the walk down from a filed agent
+        // costs its own descendants rather than a pass over every agent
+        // for every agent.
+        let mut spawned: HashMap<AgentId, Vec<AgentId>> = HashMap::new();
+        for agent in agents {
+            if let Some(parent) = agent.parent {
+                spawned.entry(parent).or_default().push(agent.agent_id);
             }
         }
-        // An agent nobody filed is a card all the same: what makes one is
-        // the agent asking for the user, and filing is only the user's own
-        // labelling and placement. This is also the whole of Home before a
-        // daemon answers, when the client has its mirror of the agents and
-        // no Desk yet: the card ranks at the root, with no breadcrumb.
-        for agent in &facts {
-            if carded.contains(&agent.agent_id) {
+        DealerFacts {
+            by_agent,
+            spawned,
+            threads,
+            now,
+            interactions: agent_interactions,
+        }
+    }
+
+    /// What a note heading lends the cards under it, or nothing when the
+    /// heading is closed or waiting: a deferred note defers its whole
+    /// subtree, which is the gate the old model spelled as a ripe todo.
+    fn heading_context(
+        &self,
+        source: &TreeHostSource,
+        heading: &crate::desk_view::DeskNode,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Option<HeadingContext> {
+        if heading.state != rho_desk::cells::State::Open {
+            return None;
+        }
+        if desk_deferred(heading, now.naive_local()) {
+            return None;
+        }
+        let ancestor_deferred = std::iter::successors(heading.parent.clone(), |parent| {
+            source.node(parent).and_then(|node| node.parent.clone())
+        })
+        .filter_map(|parent| source.node(&parent))
+        .any(|node| desk_deferred(node, now.naive_local()));
+        if ancestor_deferred {
+            return None;
+        }
+        let breadcrumb = tree_breadcrumb(&heading.id, source);
+        let room = breadcrumb.split(" › ").next().map(str::to_owned);
+        let bindings = source
+            .children(&heading.id)
+            .filter_map(|node| node.agent())
+            .collect::<Vec<_>>();
+        Some(HeadingContext {
+            breadcrumb,
+            room,
+            bindings,
+        })
+    }
+
+    /// The cards a note's own dated marks make. The topic is the note.
+    fn desk_cards(
+        &self,
+        host: HostId,
+        heading: &crate::desk_view::DeskNode,
+        context: &HeadingContext,
+        order: usize,
+        facts: &DealerFacts<'_>,
+    ) -> Vec<RankedDealCard> {
+        let now = facts.now;
+        let mut cards = Vec::new();
+        for (mark, at) in desk_marks(heading) {
+            let priority = desk_mark_priority(mark, at, heading.pace_days, now.naive_local());
+            if priority <= DEAL_QUEUE_FLOOR {
                 continue;
             }
-            let node = self.tree_hosts.get(&agent.host).and_then(|source| {
-                source
-                    .nodes
-                    .iter()
-                    .find(|node| node.agent() == Some(agent.agent_id))
-            });
-            // A handled, muted or deferred agent is the user's verdict on
-            // this very card; without a Desk there is no verdict to read.
-            if node.is_some_and(|node| node_closed(node, now)) {
-                order += 1;
-                continue;
-            }
-            let Some((priority, label)) = agent_card_facts(agent, now, agent_interactions) else {
-                order += 1;
-                continue;
-            };
-            let node_id = node
-                .map(|node| node.id.clone())
-                .unwrap_or(rho_desk::cells::Id::Agent(agent.agent_id));
             let identity = DealCardId {
-                host: agent.host,
-                node_id: node_id.clone(),
+                host,
+                node_id: heading.id.clone(),
             };
-            ranked.push(RankedDealCard {
+            cards.push(RankedDealCard {
                 priority,
-                virtual_reply: true,
+                virtual_reply: false,
                 order,
-                cursor: CardCursor::Agent(agent.facts, agent.attention),
+                cursor: CardCursor::Desk(mark, at),
+                curve: PriorityCurve::DeskMark {
+                    mark,
+                    at,
+                    pace_days: heading.pace_days,
+                },
                 card: DealCard {
-                    label,
+                    label: desk_mark_label(mark, at, now.naive_local()),
                     priority,
-                    host: agent.host,
-                    topic_node_id: node_id,
-                    agent_id: Some(agent.agent_id),
+                    host,
+                    topic_node_id: heading.id.clone(),
+                    agent_id: context.bindings.first().copied(),
                     agent_tag: None,
-                    breadcrumb: String::new(),
-                    room: None,
-                    kind: DealCardKind::Agent,
-                    skipped: false,
+                    breadcrumb: context.breadcrumb.clone(),
+                    room: context.room.clone(),
+                    kind: DealCardKind::Desk,
                     identity,
+                    skipped: false,
                 },
             });
-            order += 1;
         }
+        cards
+    }
+
+    /// One agent's card, wherever it is shown from. `carded` records that
+    /// the agent has been accounted for, verdict or card, so the pass over
+    /// unfiled agents does not deal it twice.
+    fn agent_card(
+        &self,
+        host: HostId,
+        source: &TreeHostSource,
+        agent_id: AgentId,
+        breadcrumb: &str,
+        room: Option<&String>,
+        order: usize,
+        facts: &DealerFacts<'_>,
+        carded: &mut HashSet<AgentId>,
+    ) -> Option<RankedDealCard> {
+        let agent = facts.by_agent.get(&agent_id).copied()?;
+        // The user's verdict on the agent closes its card wherever the
+        // card is shown; being reached through a note does not exempt it.
+        if agent_node_closed(source, agent_id, facts.now) {
+            carded.insert(agent_id);
+            return None;
+        }
+        let (priority, label) =
+            agent_card_facts(&agent.facts, agent_id, facts.now, facts.interactions)?;
+        carded.insert(agent_id);
+        // Every agent is its own topic. Taking the note as the topic made
+        // two agents filed under one note compete for a single card, so all
+        // but the loudest disappeared from Home; a spawned child with no
+        // row of its own shared its parent's identity as well.
+        let node_id = source
+            .agent_node(agent_id)
+            .map(|node| node.id.clone())
+            .unwrap_or(rho_desk::cells::Id::Agent(agent_id));
+        Some(RankedDealCard {
+            priority,
+            virtual_reply: true,
+            order,
+            cursor: CardCursor::Agent(agent.facts, agent.attention),
+            curve: PriorityCurve::AgentReply { agent_id },
+            card: DealCard {
+                label,
+                priority,
+                host,
+                topic_node_id: node_id.clone(),
+                agent_id: Some(agent_id),
+                agent_tag: None,
+                breadcrumb: breadcrumb.to_owned(),
+                room: room.cloned(),
+                kind: DealCardKind::Agent,
+                skipped: false,
+                identity: DealCardId { host, node_id },
+            },
+        })
+    }
+
+    /// Every agent a heading holds: the ones filed under it and, through
+    /// them, the ones they spawned.
+    fn agent_cards_under(
+        &self,
+        host: HostId,
+        source: &TreeHostSource,
+        context: &HeadingContext,
+        order: usize,
+        facts: &DealerFacts<'_>,
+        carded: &mut HashSet<AgentId>,
+    ) -> Vec<RankedDealCard> {
+        let mut cards = Vec::new();
+        for root_agent in &context.bindings {
+            let mut agents = vec![*root_agent];
+            let mut cursor = 0;
+            while cursor < agents.len() {
+                let parent = agents[cursor];
+                agents.extend(facts.spawned.get(&parent).into_iter().flatten().copied());
+                cursor += 1;
+            }
+            for agent_id in agents {
+                if let Some(card) = self.agent_card(
+                    host,
+                    source,
+                    agent_id,
+                    &context.breadcrumb,
+                    context.room.as_ref(),
+                    order,
+                    facts,
+                    carded,
+                ) {
+                    cards.push(card);
+                }
+            }
+        }
+        cards
+    }
+
+    /// A Slack unit that started to matter is a row like any other, so it
+    /// ranks in the same queue. A conversation is a unit as much as a
+    /// followed thread is: a direct message and a channel somebody named
+    /// the user in each deal as one card. What the card says comes from the
+    /// mirror; the store holds the unit's identity and its verdicts, never
+    /// its words.
+    fn thread_card(
+        &self,
+        host: HostId,
+        node: &crate::desk_view::DeskNode,
+        order: usize,
+        facts: &DealerFacts<'_>,
+    ) -> Option<RankedDealCard> {
+        if node.state != rho_desk::cells::State::Open
+            || desk_deferred(node, facts.now.naive_local())
+        {
+            return None;
+        }
+        let thread = node.slack().and_then(|unit| facts.threads.get(unit))?;
+        let (label, priority) = thread_card_facts(thread, facts.now);
+        if priority <= DEAL_QUEUE_FLOOR {
+            return None;
+        }
+        Some(RankedDealCard {
+            priority,
+            virtual_reply: false,
+            order,
+            cursor: CardCursor::Slack(rho_desk::cells::SlackTs(thread.latest.clone())),
+            curve: PriorityCurve::Thread,
+            card: DealCard {
+                label,
+                priority,
+                host,
+                topic_node_id: node.id.clone(),
+                agent_id: None,
+                agent_tag: None,
+                breadcrumb: thread.title.clone(),
+                room: Some(thread.conversation.clone()),
+                kind: DealCardKind::Thread,
+                skipped: false,
+                identity: DealCardId {
+                    host,
+                    node_id: node.id.clone(),
+                },
+            },
+        })
+    }
+
+    /// An agent nobody filed is a card all the same: what makes one is the
+    /// agent asking for the user, and filing is only the user's own
+    /// labelling and placement. This is also the whole of Home before a
+    /// daemon answers, when the client has its mirror of the agents and no
+    /// Desk yet: the card ranks at the root, with no breadcrumb.
+    fn loose_agent_card(
+        &self,
+        agent: &DealAgentFacts,
+        order: usize,
+        facts: &DealerFacts<'_>,
+    ) -> Option<RankedDealCard> {
+        let node = self
+            .tree_hosts
+            .get(&agent.host)
+            .and_then(|source| source.agent_node(agent.agent_id));
+        // A handled, muted or deferred agent is the user's verdict on this
+        // very card; without a Desk there is no verdict to read.
+        if node.is_some_and(|node| node_closed(node, facts.now)) {
+            return None;
+        }
+        let (priority, label) =
+            agent_card_facts(&agent.facts, agent.agent_id, facts.now, facts.interactions)?;
+        let node_id = node
+            .map(|node| node.id.clone())
+            .unwrap_or(rho_desk::cells::Id::Agent(agent.agent_id));
+        let identity = DealCardId {
+            host: agent.host,
+            node_id: node_id.clone(),
+        };
+        Some(RankedDealCard {
+            priority,
+            virtual_reply: true,
+            order,
+            cursor: CardCursor::Agent(agent.facts, agent.attention),
+            curve: PriorityCurve::AgentReply {
+                agent_id: agent.agent_id,
+            },
+            card: DealCard {
+                label,
+                priority,
+                host: agent.host,
+                topic_node_id: node_id,
+                agent_id: Some(agent.agent_id),
+                agent_tag: None,
+                breadcrumb: String::new(),
+                room: None,
+                kind: DealCardKind::Agent,
+                skipped: false,
+                identity,
+            },
+        })
+    }
+
+    /// One winning card per topic, in priority order, with the skips
+    /// marked. This is the shaping every reading of the ranking ends with,
+    /// whether the candidates were all made again or only one of them was.
+    fn deal_queue_from(
+        &self,
+        mut candidates: Vec<RankedDealCard>,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) -> DealQueue {
+        // Kept cards were scored when they were made. Waiting is what moves
+        // them after that, and this is where the clock is applied: a card
+        // the curve has taken under the floor leaves here, and none of it
+        // needs the desk.
+        candidates.retain_mut(|candidate| candidate.rescore(now, agent_interactions));
         // One winning card per topic; a virtual reply wins an exact tie.
         let mut by_topic = HashMap::new();
-        for candidate in ranked {
+        for candidate in candidates {
             let topic = (candidate.card.host, candidate.card.topic_node_id.clone());
             by_topic
                 .entry(topic)
@@ -734,6 +953,10 @@ impl Dashboard {
                 .total_cmp(&a.priority)
                 .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
                 .then_with(|| a.order.cmp(&b.order))
+                // Last, the identity: two cards that tie on everything else
+                // must still come out in the same order every read, and a
+                // set has no insertion order to fall back on.
+                .then_with(|| a.card.identity.cmp(&b.card.identity))
         });
         DealQueue {
             total_alive: ranked.len(),
@@ -753,7 +976,7 @@ impl Dashboard {
         &self,
         host: HostId,
         node_id: rho_desk::cells::Id,
-        cx: &App,
+        _cx: &App,
     ) -> Option<DealCard> {
         let source = self.tree_hosts.get(&host)?;
         let node = source.nodes.iter().find(|node| node.id == node_id)?;
@@ -769,9 +992,9 @@ impl Dashboard {
             topic_node_id: node_id.clone(),
             agent_id: node_agent(node),
             agent_tag: None,
-            breadcrumb: self.breadcrumb_for_node(host, node_id.clone(), cx)?,
+            breadcrumb: self.breadcrumb_for_node(host, node_id.clone())?,
             room: self
-                .room_for_node(host, node_id.clone(), cx)
+                .room_for_node(host, node_id.clone())
                 .map(|room| room.name),
             kind,
             skipped: false,
@@ -779,32 +1002,12 @@ impl Dashboard {
         })
     }
 
-    fn breadcrumb_for_node(
-        &self,
-        host: HostId,
-        node_id: rho_desk::cells::Id,
-        cx: &App,
-    ) -> Option<String> {
+    fn breadcrumb_for_node(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<String> {
         let source = self.tree_hosts.get(&host)?;
-        let nodes = source
-            .nodes
-            .iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<HashMap<_, _>>();
-        let titles = source
-            .buffers
-            .iter()
-            .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
-            .collect::<HashMap<_, _>>();
-        Some(tree_breadcrumb(&node_id, &nodes, &titles))
+        Some(tree_breadcrumb(&node_id, source))
     }
 
-    fn room_for_node(
-        &self,
-        host: HostId,
-        mut node_id: rho_desk::cells::Id,
-        cx: &App,
-    ) -> Option<DeskRoom> {
+    fn room_for_node(&self, host: HostId, mut node_id: rho_desk::cells::Id) -> Option<DeskRoom> {
         let source = self.tree_hosts.get(&host)?;
         loop {
             let node = source.nodes.iter().find(|node| node.id == node_id)?;
@@ -815,7 +1018,7 @@ impl Dashboard {
             }
             node_id = parent.clone();
         }
-        let name = note_title(&source.buffers.get(&node_id)?.read(cx).text()).to_owned();
+        let name = source.title(&node_id)?.to_owned();
         Some(DeskRoom {
             host,
             node_id,
@@ -825,44 +1028,44 @@ impl Dashboard {
 
     pub fn cursor_room(&self, cx: &mut Context<Workspace>) -> Option<DeskRoom> {
         let (host, node_id) = self.cursor_topic(cx)?;
-        self.room_for_node(host, node_id, cx)
+        self.room_for_node(host, node_id)
     }
 
     pub fn cursor_breadcrumb(&self, cx: &mut Context<Workspace>) -> Option<String> {
         let (host, node_id) = self.cursor_topic(cx)?;
-        self.breadcrumb_for_node(host, node_id, cx)
+        self.breadcrumb_for_node(host, node_id)
     }
 
-    pub fn breadcrumb_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<String> {
+    pub fn breadcrumb_for_agent(&self, agent_id: AgentId, _cx: &App) -> Option<String> {
         let (host, node_id) = self
             .tree_heading_agents
             .iter()
             .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
-        self.breadcrumb_for_node(host, node_id, cx)
+        self.breadcrumb_for_node(host, node_id)
     }
 
-    pub fn breadcrumb_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<String> {
+    pub fn breadcrumb_for_page(&self, page_id: rho_browser::PageId, _cx: &App) -> Option<String> {
         let (host, node_id) = self
             .tree_heading_pages
             .iter()
             .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
-        self.breadcrumb_for_node(host, node_id, cx)
+        self.breadcrumb_for_node(host, node_id)
     }
 
-    pub fn room_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<DeskRoom> {
+    pub fn room_for_agent(&self, agent_id: AgentId, _cx: &App) -> Option<DeskRoom> {
         let (host, node_id) = self
             .tree_heading_agents
             .iter()
             .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
-        self.room_for_node(host, node_id, cx)
+        self.room_for_node(host, node_id)
     }
 
-    pub fn room_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<DeskRoom> {
+    pub fn room_for_page(&self, page_id: rho_browser::PageId, _cx: &App) -> Option<DeskRoom> {
         let (host, node_id) = self
             .tree_heading_pages
             .iter()
             .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
-        self.room_for_node(host, node_id, cx)
+        self.room_for_node(host, node_id)
     }
 
     pub fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
@@ -910,8 +1113,10 @@ impl Dashboard {
             phone_browse_mode: false,
             skipped: HashMap::new(),
             queue_depth: DealQueueDepth::default(),
+            dealer: DealerSet::default(),
             pending_cursor: None,
             tree_inlay_ids: Vec::new(),
+            derived_titles: HashMap::new(),
             tree_collapsed: HashSet::new(),
             pending_tree_cursor: None,
             headers_disabled: std::collections::HashSet::new(),
@@ -973,6 +1178,7 @@ impl Dashboard {
         host: HostId,
         nodes: Vec<crate::desk_view::DeskNode>,
         buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
+        titles: std::rc::Rc<HashMap<rho_desk::cells::Id, String>>,
         cx: &mut Context<Workspace>,
     ) {
         if self.pending_tree_cursor.is_none()
@@ -987,8 +1193,16 @@ impl Dashboard {
         {
             self.pending_tree_cursor = Some((host, node_id, offset));
         }
-        self.tree_hosts
-            .insert(host, TreeHostSource { nodes, buffers });
+        let index = TreeIndex::build(&nodes);
+        self.tree_hosts.insert(
+            host,
+            TreeHostSource {
+                nodes,
+                buffers,
+                titles,
+                index,
+            },
+        );
     }
 
     /// What a card's node is, which decides the surface it opens.
@@ -1167,6 +1381,12 @@ impl Dashboard {
         self.pending_tree_cursor = Some((host, node_id, offset));
     }
 
+    /// How many cards have been made in this dashboard's life.
+    #[cfg(test)]
+    pub(crate) fn cards_made_for_test(&self) -> usize {
+        self.dealer.made
+    }
+
     #[cfg(test)]
     pub fn deal_highlight_active_for_test(&self, cx: &App) -> bool {
         self.editor
@@ -1176,15 +1396,237 @@ impl Dashboard {
             .is_some()
     }
 
+    /// The ranking as it stands. Nothing is made here: the cards are
+    /// already in the set, and the clock is applied to them on the way
+    /// out. This is why Home, the lamp and the map's depth counter can
+    /// each ask, as often as they like, without any of them walking a
+    /// desk.
     pub fn dealer_hand(
         &self,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) -> DealQueue {
+        let candidates = self
+            .dealer
+            .cards
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.deal_queue_from(candidates, now, agent_interactions)
+    }
+
+    /// Makes again the cards `scope` says have moved, and leaves the rest
+    /// standing. `Whole` is a desk that arrived or changed shape;
+    /// `Agents` is a `Changed`, which is the one that arrives in
+    /// thousands and must cost what it names.
+    pub fn refresh_deal_cards(
+        &mut self,
+        host: HostId,
+        scope: DealScope<'_>,
         registry: &AgentRegistry,
         threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
-        cx: &App,
-    ) -> DealQueue {
-        self.tree_dealer_queue(registry, threads, now, agent_interactions, cx)
+    ) {
+        match scope {
+            DealScope::Whole => {
+                self.rebuild_host_cards(host, registry, threads, now, agent_interactions)
+            }
+            DealScope::Agents(agents) => {
+                for agent_id in agents {
+                    self.remake_agent_card(host, *agent_id, registry, now, agent_interactions);
+                }
+            }
+        }
+    }
+
+    /// Every card a host holds, made again. This is the only pass over a
+    /// host's nodes left, and only a desk that changed shape asks for it.
+    fn rebuild_host_cards(
+        &mut self,
+        host: HostId,
+        registry: &AgentRegistry,
+        threads: &HashMap<SlackUnit, SlackFacts>,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) {
+        for id in self.dealer.of_host.remove(&host).unwrap_or_default() {
+            self.dealer.cards.remove(&id);
+        }
+        self.dealer.of_agent.retain(|_, id| id.host != host);
+        let Some(source) = self.tree_hosts.get(&host) else {
+            return;
+        };
+        let agents = deal_agent_facts(registry);
+        let facts = self.dealer_facts(threads, now, agent_interactions, &agents);
+        let mut made = Vec::new();
+        // Filing decides where a card is shown, never whether it exists, so
+        // an agent reached through a note is only skipped by the pass below
+        // to keep it from being carded twice.
+        let mut carded = HashSet::new();
+        for (order, node) in source.nodes.iter().enumerate() {
+            if node.is_note() {
+                let Some(context) = self.heading_context(source, node, now) else {
+                    continue;
+                };
+                made.extend(self.desk_cards(host, node, &context, order, &facts));
+                made.extend(self.agent_cards_under(
+                    host,
+                    source,
+                    &context,
+                    order,
+                    &facts,
+                    &mut carded,
+                ));
+            } else if node.slack().is_some() {
+                made.extend(self.thread_card(host, node, order, &facts));
+            }
+        }
+        for agent in &agents {
+            if agent.host != host || carded.contains(&agent.agent_id) {
+                continue;
+            }
+            made.extend(self.loose_agent_card(
+                agent,
+                self.agent_order(host, agent.agent_id),
+                &facts,
+            ));
+        }
+        for card in made {
+            self.dealer.insert(card);
+        }
+    }
+
+    /// One agent's card, made again because that agent moved. Nothing else
+    /// on the desk is touched, and nothing is walked: the agent's place is
+    /// a lookup, and the note it hangs under is found by walking up its own
+    /// spawn chain, which is as deep as the agent is.
+    fn remake_agent_card(
+        &mut self,
+        host: HostId,
+        agent_id: AgentId,
+        registry: &AgentRegistry,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) {
+        if let Some(id) = self.dealer.of_agent.remove(&agent_id) {
+            self.dealer.retire(&id);
+        }
+        let Some(agent) = agent_deal_facts(registry, agent_id) else {
+            return;
+        };
+        if agent.host != host {
+            return;
+        }
+        let facts = DealerFacts {
+            by_agent: std::iter::once((agent_id, &agent)).collect(),
+            spawned: HashMap::new(),
+            threads: &EMPTY_THREADS,
+            now,
+            interactions: agent_interactions,
+        };
+        let order = self.agent_order(host, agent_id);
+        let mut carded = HashSet::new();
+        // Where the card is shown: the first note in the map's order that
+        // reaches this agent, through its own filing or through whoever
+        // spawned it. A note that is closed or waiting reaches nothing, and
+        // a host with no desk yet reaches nothing either, which is what
+        // makes the card a loose one at the root.
+        let context = self
+            .tree_hosts
+            .get(&host)
+            .and_then(|source| self.heading_for_agent(source, agent_id, registry, now));
+        let card = match (context, self.tree_hosts.get(&host)) {
+            (Some(context), Some(source)) => self.agent_card(
+                host,
+                source,
+                agent_id,
+                &context.breadcrumb,
+                context.room.as_ref(),
+                order,
+                &facts,
+                &mut carded,
+            ),
+            _ => self.loose_agent_card(&agent, order, &facts),
+        };
+        if let Some(card) = card {
+            self.dealer.insert(card);
+        }
+    }
+
+    /// The tie-break an agent's card carries: where its row sits in the
+    /// map, or after everything when it has no row.
+    fn agent_order(&self, host: HostId, agent_id: AgentId) -> usize {
+        self.tree_hosts
+            .get(&host)
+            .and_then(|source| source.index.by_agent.get(&agent_id).copied())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The note an agent's card hangs under: the earliest in the map's
+    /// order among its own filing and the filings of everyone who spawned
+    /// it. `None` when nothing live reaches it, which makes it a loose
+    /// card at the root.
+    fn heading_for_agent(
+        &self,
+        source: &TreeHostSource,
+        agent_id: AgentId,
+        registry: &AgentRegistry,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Option<HeadingContext> {
+        let mut best: Option<(usize, &crate::desk_view::DeskNode)> = None;
+        let mut cursor = Some(agent_id);
+        let mut guard = 0;
+        while let Some(agent) = cursor {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if let Some(node) = source.agent_node(agent)
+                && let Some(parent) = &node.parent
+                && let Some(heading) = source.node(parent)
+                && heading.is_note()
+                && let Some(at) = source.index.by_id.get(&heading.id).copied()
+                && best.is_none_or(|(held, _)| at < held)
+            {
+                best = Some((at, heading));
+            }
+            cursor = registry.agent_parent(agent);
+        }
+        let (_, heading) = best?;
+        self.heading_context(source, heading, now)
+    }
+
+    /// When the ranking changes next without anybody touching anything: a
+    /// deferral ripening, a deadline arriving, a skip's cooldown running
+    /// out. A priority also slides with the clock between these, which is
+    /// why the caller keeps a ceiling of its own; this is what says the
+    /// wake cannot be later than.
+    pub fn next_deal_expiry(
+        &self,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Option<chrono::TimeDelta> {
+        let now = now.naive_local();
+        let mut soonest: Option<chrono::NaiveDateTime> = None;
+        let mut consider = |at: chrono::NaiveDateTime| {
+            if at > now && soonest.is_none_or(|held| at < held) {
+                soonest = Some(at);
+            }
+        };
+        for source in self.tree_hosts.values() {
+            for node in &source.nodes {
+                for at in [node.defer_until, node.deadline].into_iter().flatten() {
+                    if let Some(at) = desk_time(at) {
+                        consider(at);
+                    }
+                }
+            }
+        }
+        for skip in self.skipped.values() {
+            consider((skip.at + SKIP_COOLDOWN).naive_local());
+        }
+        soonest.map(|at| at - now)
     }
 
     /// What the timeline records about a verdict. There is no session to
@@ -1375,8 +1817,11 @@ impl Dashboard {
             }
         }
         // Machine rows carry no stored text: their titles are derived from
-        // live metadata every reconcile.
-        for source in self.tree_hosts.values() {
+        // live metadata every reconcile. Only the rows whose title actually
+        // moved are written; the rest are left alone, buffer and all.
+        let mut written = HashMap::with_capacity(self.derived_titles.len());
+        let mut writes = Vec::new();
+        for (host, source) in &self.tree_hosts {
             for node in &source.nodes {
                 let Some(buffer) = source.buffers.get(&node.id) else {
                     continue;
@@ -1385,8 +1830,17 @@ impl Dashboard {
                     continue;
                 }
                 let title = derived_title(node, registry, threads);
-                crate::desk_view::write_derived_title(buffer, &title, cx);
+                let key = (*host, node.id.clone());
+                let held = self.derived_titles.get(&key);
+                if held != Some(&(buffer.entity_id(), title.clone())) {
+                    writes.push((buffer.clone(), title.clone()));
+                }
+                written.insert(key, (buffer.entity_id(), title));
             }
+        }
+        self.derived_titles = written;
+        for (buffer, title) in writes {
+            crate::desk_view::write_derived_title(&buffer, &title, cx);
         }
         let cursor_anchor = self.editor.update(cx, |editor, cx| {
             let head = editor.selections.newest_anchor().head();
@@ -1770,12 +2224,12 @@ impl Dashboard {
         &mut self,
         registry: &AgentRegistry,
         threads: &HashMap<SlackUnit, SlackFacts>,
+        agent_interactions: &HashMap<AgentId, i64>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let now = chrono::Local::now();
-        let queue =
-            self.tree_dealer_queue(registry, threads, now.fixed_offset(), &HashMap::new(), cx);
+        let queue = self.dealer_hand(now.fixed_offset(), agent_interactions);
         self.queue_depth = DealQueueDepth {
             dealt_count: queue.dealt_count,
             total_alive: queue.total_alive,
@@ -1947,7 +2401,7 @@ impl Dashboard {
         cx: &mut Context<Workspace>,
     ) -> Option<(HostId, rho_desk::cells::Id, String)> {
         let (host, node_id) = self.cursor_topic(cx)?;
-        let room = self.room_for_node(host, node_id.clone(), cx)?;
+        let room = self.room_for_node(host, node_id.clone())?;
         Some((host, node_id, room.name))
     }
 
@@ -2105,6 +2559,29 @@ pub struct DealAgentFacts {
     pub attention: rho_registry::Attention,
 }
 
+/// One agent's facts, for a remake that names exactly it.
+fn agent_deal_facts(registry: &AgentRegistry, agent_id: AgentId) -> Option<DealAgentFacts> {
+    Some(DealAgentFacts {
+        agent_id,
+        parent: registry.agent_parent(agent_id),
+        host: registry.host_of_agent(agent_id)?,
+        heading: registry
+            .agent_human_name(agent_id)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+        facts: registry.agent_facts(agent_id),
+        attention: registry.attention(agent_id),
+    })
+}
+
+/// An agent's card is never about a Slack unit, so the remake that makes
+/// one has no threads to offer.
+static EMPTY_THREADS: std::sync::LazyLock<HashMap<SlackUnit, SlackFacts>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
     registry
         .known_agents()
@@ -2144,25 +2621,26 @@ fn agent_aka(registry: &AgentRegistry, agent_id: AgentId, title: &str) -> Vec<St
 }
 
 fn agent_card_facts(
-    agent: &DealAgentFacts,
+    facts: &rho_registry::AgentFacts,
+    agent_id: AgentId,
     now: chrono::DateTime<chrono::FixedOffset>,
     agent_interactions: &HashMap<AgentId, i64>,
 ) -> Option<(f64, String)> {
-    let ended = agent.facts.last_turn_ended?;
-    if agent.facts.turn_running || ended <= agent.facts.last_user_message_at {
+    let ended = facts.last_turn_ended?;
+    if facts.turn_running || ended <= facts.last_user_message_at {
         return None;
     }
     let wait_days = reply_wait_days(ended, now);
     // A dead turn is not an FYI: reading it as one gave it a decaying
     // priority and the word "finished", so a crashed agent quietly aged
     // out of Home. Only the user can start it again.
-    let base_priority = if agent.facts.errored || agent.facts.needs_you_hint {
+    let base_priority = if facts.errored || facts.needs_you_hint {
         blocked_reply_priority(wait_days)
     } else {
         fyi_reply_priority(wait_days)
     };
-    let label = outcome_label(&agent.facts, wait_days);
-    let recency_bonus = agent_interactions.get(&agent.agent_id).map_or(0.0, |last| {
+    let label = outcome_label(facts, wait_days);
+    let recency_bonus = agent_interactions.get(&agent_id).map_or(0.0, |last| {
         let elapsed = (now.timestamp_millis() - *last).clamp(0, AGENT_RECENCY_WINDOW_MS);
         let remaining = 1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
         AGENT_RECENCY_BONUS * remaining * remaining
@@ -2290,9 +2768,7 @@ fn agent_node_closed(
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> bool {
     source
-        .nodes
-        .iter()
-        .find(|node| node.agent() == Some(agent_id))
+        .agent_node(agent_id)
         .is_some_and(|node| node_closed(node, now))
 }
 
@@ -2474,19 +2950,15 @@ fn is_note(node: &crate::desk_view::DeskNode) -> bool {
     node.is_note()
 }
 
-fn tree_breadcrumb(
-    id: &rho_desk::cells::Id,
-    nodes: &HashMap<rho_desk::cells::Id, &crate::desk_view::DeskNode>,
-    titles: &HashMap<rho_desk::cells::Id, String>,
-) -> String {
+fn tree_breadcrumb(id: &rho_desk::cells::Id, source: &TreeHostSource) -> String {
     let mut path = Vec::new();
     let mut cursor = Some(id.clone());
     while let Some(id) = cursor {
-        let Some(node) = nodes.get(&id) else {
+        let Some(node) = source.node(&id) else {
             break;
         };
         if node.is_note() {
-            path.push(titles.get(&id).map_or("", String::as_str));
+            path.push(source.title(&id).unwrap_or(""));
         }
         cursor = node.parent.clone();
     }
@@ -2501,12 +2973,76 @@ struct RankedDealCard {
     order: usize,
     cursor: CardCursor,
     card: DealCard,
+    /// How this card's priority and label move with waiting. A card is
+    /// made when the thing it is about changes; the clock moving is not
+    /// that, so a read brings the card up to date through this rather than
+    /// making it again.
+    curve: PriorityCurve,
+}
+
+/// The part of a card that slides with the clock, separated from the card
+/// so that keeping a card and keeping it current are different things.
+#[derive(Clone, Copy, Debug)]
+enum PriorityCurve {
+    /// A dated mark on a note. Rises as the mark ripens, or once it is
+    /// overdue; the note's pace is the scale.
+    DeskMark {
+        mark: DeskMark,
+        at: rho_desk::cells::Timestamp,
+        pace_days: u32,
+    },
+    /// An agent whose turn has ended. The curve is blocked or FYI by what
+    /// the turn said, and the user's own recent attention lifts it.
+    AgentReply { agent_id: AgentId },
+    /// A Slack unit. Its wait is the mirror's measurement, not the
+    /// clock's, so it stands still until the mirror says otherwise.
+    Thread,
+}
+
+impl RankedDealCard {
+    /// Brings the card up to the moment it is read at. Returns false when
+    /// the curve has taken it under the floor or the facts behind it no
+    /// longer make a card at all, which is the read's own way of dropping
+    /// what has aged out.
+    fn rescore(
+        &mut self,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) -> bool {
+        let (priority, label) = match self.curve {
+            PriorityCurve::Thread => return true,
+            PriorityCurve::DeskMark {
+                mark,
+                at,
+                pace_days,
+            } => (
+                desk_mark_priority(mark, at, pace_days, now.naive_local()),
+                desk_mark_label(mark, at, now.naive_local()),
+            ),
+            PriorityCurve::AgentReply { agent_id } => {
+                let CardCursor::Agent(ref facts, _) = self.cursor else {
+                    return true;
+                };
+                match agent_card_facts(facts, agent_id, now, agent_interactions) {
+                    Some(scored) => scored,
+                    None => return false,
+                }
+            }
+        };
+        if priority <= DEAL_QUEUE_FLOOR {
+            return false;
+        }
+        self.priority = priority;
+        self.card.priority = priority;
+        self.card.label = label;
+        true
+    }
 }
 
 impl Dashboard {
     pub fn heading_destination_candidates(
         &self,
-        cx: &App,
+        _cx: &App,
     ) -> Vec<(String, String, HostId, rho_desk::cells::Id)> {
         self.tree_hosts
             .iter()
@@ -2515,11 +3051,10 @@ impl Dashboard {
                     if !node.is_note() {
                         return None;
                     }
-                    let title =
-                        note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
+                    let title = source.title(&node.id)?.to_owned();
                     Some((
                         title.clone(),
-                        self.breadcrumb_for_node_for_source(node.id.clone(), source, cx)?,
+                        self.breadcrumb_for_node_for_source(node.id.clone(), source)?,
                         *host,
                         node.id.clone(),
                     ))
@@ -2540,18 +3075,9 @@ impl Dashboard {
     ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
         let mut areas = Vec::new();
         for (host, source) in &self.tree_hosts {
-            let nodes = source
-                .nodes
-                .iter()
-                .map(|node| (node.id.clone(), node))
-                .collect::<HashMap<_, _>>();
-            let titles = source
-                .buffers
-                .iter()
-                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
-                .collect::<HashMap<_, _>>();
+            let titles = source.all_titles(cx);
             for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(&node.id, &nodes, &titles);
+                let breadcrumb = tree_breadcrumb(&node.id, source);
                 // A note's breadcrumb already ends with the note itself;
                 // every other kind hangs its title under its parent's.
                 let path = if is_note(node) {
@@ -2600,11 +3126,7 @@ impl Dashboard {
                 .iter()
                 .map(|node| (node.id.clone(), node))
                 .collect::<HashMap<_, _>>();
-            let titles = source
-                .buffers
-                .iter()
-                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
-                .collect::<HashMap<_, _>>();
+            let titles = source.all_titles(cx);
             let title_of = |node_id: rho_desk::cells::Id| {
                 titles
                     .get(&node_id)
@@ -2615,7 +3137,7 @@ impl Dashboard {
             };
             let label_paths = label_paths(&nodes);
             for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(&node.id, &nodes, &titles);
+                let breadcrumb = tree_breadcrumb(&node.id, source);
                 let under = |title: String| {
                     if breadcrumb.is_empty() {
                         title
@@ -2726,7 +3248,7 @@ impl Dashboard {
         &self,
         _registry: &AgentRegistry,
         needle: &str,
-        cx: &App,
+        _cx: &App,
     ) -> Vec<(String, String)> {
         let needle = needle.to_lowercase();
         self.tree_hosts
@@ -2737,12 +3259,11 @@ impl Dashboard {
                     .iter()
                     .filter(|node| node.is_note())
                     .filter_map(|node| {
-                        let title =
-                            note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
+                        let title = source.title(&node.id)?.to_owned();
                         title.to_lowercase().contains(&needle).then(|| {
                             (
                                 title.clone(),
-                                self.breadcrumb_for_node_for_source(node.id.clone(), source, cx)
+                                self.breadcrumb_for_node_for_source(node.id.clone(), source)
                                     .unwrap_or(title),
                             )
                         })
@@ -2755,19 +3276,8 @@ impl Dashboard {
         &self,
         node_id: rho_desk::cells::Id,
         source: &TreeHostSource,
-        cx: &App,
     ) -> Option<String> {
-        let nodes = source
-            .nodes
-            .iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<HashMap<_, _>>();
-        let titles = source
-            .buffers
-            .iter()
-            .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
-            .collect::<HashMap<_, _>>();
-        Some(tree_breadcrumb(&node_id, &nodes, &titles))
+        Some(tree_breadcrumb(&node_id, source))
     }
 
     pub fn jump_to_heading(
@@ -2775,9 +3285,9 @@ impl Dashboard {
         query: &str,
         _registry: &AgentRegistry,
         _window: &mut Window,
-        cx: &mut Context<Workspace>,
+        _cx: &mut Context<Workspace>,
     ) -> bool {
-        let Some((host, node_id)) = self.tree_heading_named(query, cx) else {
+        let Some((host, node_id)) = self.tree_heading_named(query) else {
             return false;
         };
         self.move_to_tree_node_when_ready(host, node_id);

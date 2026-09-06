@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
@@ -23,6 +24,12 @@ struct HostDeskCells {
     /// Mutations sent and not yet visible in `confirmed`, oldest first.
     pending: Vec<CellMutation>,
     buffers: BTreeMap<Id, Entity<Buffer>>,
+    /// Every note's title, so that naming a row costs a read of this map
+    /// rather than a read of the note's rope. A title only changes when
+    /// its buffer does, and `refresh_titles` is what notices.
+    titles: Rc<HashMap<Id, String>>,
+    /// The buffer version each cached title was read at.
+    title_versions: HashMap<Id, clock::Global>,
     _subscriptions: Vec<gpui::Subscription>,
     /// What the sources say right now, recomputed by the workspace rather
     /// than stored: the registry's agents and the Slack mirror's units.
@@ -367,6 +374,8 @@ impl DeskCells {
                     view: Store::new(self.device),
                     pending: Vec::new(),
                     buffers: BTreeMap::new(),
+                    titles: Rc::default(),
+                    title_versions: HashMap::new(),
                     _subscriptions: Vec::new(),
                     sources: Sources::default(),
                     namespace,
@@ -761,12 +770,55 @@ impl DeskCells {
     }
 
     /// The nodes and buffers the dashboard renders.
+    /// Rereads the titles of the notes whose bodies have moved since the
+    /// last pass, and leaves the rest alone. A title is the note's first
+    /// line, so the only way it changes is an edit, and comparing versions
+    /// costs nothing next to walking a rope.
+    fn refresh_titles(&mut self, host: HostId, cx: &gpui::App) {
+        let Some(desk) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        let mut changed = desk.title_versions.len() != desk.buffers.len();
+        let mut titles = HashMap::with_capacity(desk.buffers.len());
+        let mut versions = HashMap::with_capacity(desk.buffers.len());
+        for (id, buffer) in &desk.buffers {
+            if !matches!(id, Id::Note(_)) {
+                continue;
+            }
+            let version = buffer.read(cx).version();
+            let title = match desk.title_versions.get(id) {
+                Some(seen) if *seen == version => desk.titles.get(id).cloned(),
+                _ => None,
+            };
+            let title = match title {
+                Some(title) => title,
+                None => {
+                    changed = true;
+                    crate::dashboard::note_title(&buffer.read(cx).text()).to_owned()
+                }
+            };
+            titles.insert(id.clone(), title);
+            versions.insert(id.clone(), version);
+        }
+        if changed || titles.len() != desk.titles.len() {
+            desk.titles = Rc::new(titles);
+            desk.title_versions = versions;
+        }
+    }
+
     pub fn tree_source(
-        &self,
+        &mut self,
         host: HostId,
-    ) -> Option<(Vec<DeskNode>, BTreeMap<Id, Entity<Buffer>>)> {
+        cx: &gpui::App,
+    ) -> Option<(
+        Vec<DeskNode>,
+        BTreeMap<Id, Entity<Buffer>>,
+        Rc<HashMap<Id, String>>,
+    )> {
+        self.refresh_titles(host, cx);
+        let nodes = self.nodes(host);
         let desk = self.hosts.get(&host)?;
-        Some((self.nodes(host), desk.buffers.clone()))
+        Some((nodes, desk.buffers.clone(), desk.titles.clone()))
     }
 
     pub fn buffer(&self, host: HostId, id: &Id) -> Option<&Entity<Buffer>> {

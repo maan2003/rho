@@ -1738,6 +1738,101 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
     );
 }
 
+/// The ranking is kept, not made again. A `Changed` for one agent makes
+/// that agent's card and nothing else: the desk it is filed on, the notes
+/// beside it and the other agents under the same note all stand. Before
+/// this the read rebuilt every card from a walk of every node, so the cost
+/// of one agent moving was the size of the desk.
+#[gpui::test]
+fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Desk");
+    let agents = (1..=8).map(agent).collect::<Vec<_>>();
+    for (nth, id) in agents.iter().enumerate() {
+        desk.agent_row(parent.clone(), *id);
+        desk.note(Some(parent.clone()), &format!("note {nth}"));
+    }
+
+    let workspace = overview_workspace(cx);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    agents
+                        .iter()
+                        .enumerate()
+                        .map(|(nth, id)| story::UiAgentHead {
+                            generated_title: Some(format!("agent {nth}")),
+                            ..ui_head(*id)
+                        })
+                        .collect(),
+                    100,
+                ),
+                window,
+                cx,
+            );
+            for id in &agents {
+                story::feed(
+                    workspace,
+                    HostId::default(),
+                    story_wanting(*id, UnixMs(1)),
+                    window,
+                    cx,
+                );
+            }
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+
+    // What the build costs is not this test's question; what one change
+    // costs after it is. Every agent is asking, so every one of them has a
+    // card to make again.
+    let before = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.cards_made_for_test()
+        })
+        .expect("read the count");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::Log {
+                    entries: story::head_entries(story::UiAgentHead {
+                        generated_title: Some("renamed".to_owned()),
+                        ..ui_head(agents[2])
+                    }),
+                },
+                window,
+                cx,
+            );
+        })
+        .expect("one agent's title changes");
+    cx.run_until_parked();
+
+    let after = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.cards_made_for_test()
+        })
+        .expect("read the count");
+    assert!(
+        before >= agents.len(),
+        "the desk was supposed to make a card per asking agent, made {before}"
+    );
+    assert_eq!(
+        after - before,
+        1,
+        "a change to one agent made {} cards",
+        after - before
+    );
+}
+
 fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
     let editor = active_editor(workspace, cx);
     editor_excerpt_boundary_count(workspace, &editor, cx)
