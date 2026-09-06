@@ -1,6 +1,5 @@
 //! The Rho GPUI client views and native application integration.
 
-pub mod agent_view;
 pub(crate) mod capture_carryover;
 pub(crate) mod chime;
 pub(crate) mod commands;
@@ -18,7 +17,6 @@ pub mod mirror;
 pub(crate) mod model;
 pub mod note_view;
 pub mod pane;
-pub mod render;
 pub mod rho_assets;
 #[cfg(test)]
 mod sampler;
@@ -27,20 +25,15 @@ pub mod slack;
 #[doc(hidden)]
 pub mod telemetry;
 pub(crate) mod terminal_view;
-pub mod transcript;
 pub mod transient;
 pub mod workspace;
 pub(crate) mod zed_remote;
 
-// The chrome every screen is drawn with belongs to the window
-// (`GUI-CRATES-DESIGN.md`). These aliases keep `rho_window::style::…` reading
-// the same at the several hundred use sites.
 // The registry and per-agent frame store live in a shared crate. These aliases
 // preserve the existing module paths in the client views.
 use gpui::{App, KeyBinding, actions};
 pub use rho_registry as registry;
 pub use rho_registry::store;
-pub use rho_window::{editor_config, highlights, style, visualization};
 
 actions!(
     rho_gui,

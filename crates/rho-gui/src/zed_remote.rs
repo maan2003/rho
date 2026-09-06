@@ -21,7 +21,7 @@ use rho_hosts::connection::{Connection, WorkspaceChannel};
 use rho_ui_proto::{
     FileReadResult, FileSaveResult, WorkspaceClientFrame, WorkspaceInfo, WorkspaceServerFrame,
 };
-use theme::{ActiveTheme as _, GlobalTheme};
+use theme::ActiveTheme as _;
 
 #[derive(Clone, Copy, Debug)]
 pub enum RemoteProjectEvent {
@@ -273,7 +273,7 @@ pub fn open_remote_project(
         } = channel_task
             .await
             .context("workspace channel dial failed")?;
-        let languages = cx.update(language_registry);
+        let languages = cx.update(rho_window::languages::registry);
         let state = cx.update(|cx| {
             cx.new(|_| RemoteProjectState {
                 outgoing,
@@ -774,35 +774,6 @@ impl Render for FileView {
             .bg(background)
             .child(self.editor.clone())
     }
-}
-
-struct RemoteLanguageRegistry(Arc<language::LanguageRegistry>);
-impl gpui::Global for RemoteLanguageRegistry {}
-
-pub(crate) fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
-    if !cx.has_global::<RemoteLanguageRegistry>() {
-        let languages = Arc::new(language::LanguageRegistry::new(
-            cx.background_executor().clone(),
-        ));
-        languages.set_theme(cx.theme().clone());
-        {
-            let fs: Arc<dyn fs::Fs> =
-                Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
-            languages::init(
-                languages.clone(),
-                fs,
-                node_runtime::NodeRuntime::unavailable(),
-                cx,
-            );
-        }
-        cx.observe_global::<GlobalTheme>({
-            let languages = languages.clone();
-            move |cx| languages.set_theme(cx.theme().clone())
-        })
-        .detach();
-        cx.set_global(RemoteLanguageRegistry(languages));
-    }
-    cx.global::<RemoteLanguageRegistry>().0.clone()
 }
 
 #[cfg(test)]

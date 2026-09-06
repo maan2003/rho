@@ -13642,10 +13642,25 @@ name = "rho-agents"
 version = "0.1.0"
 dependencies = [
  "camino",
+ "collections",
+ "editor",
+ "futures 0.3.33",
+ "gpui",
+ "json-stream",
+ "language",
+ "multi_buffer",
  "rho-core",
  "rho-hosts",
  "rho-registry",
  "rho-ui-proto",
+ "rho-window",
+ "rustc-hash 2.1.3",
+ "serde_json",
+ "text",
+ "theme",
+ "tree-sitter",
+ "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
+ "ui",
 ]
 
 [[package]]
@@ -13900,12 +13915,9 @@ dependencies = [
  "gpui_tokio",
  "image",
  "iroh",
- "json-stream",
  "language",
- "languages",
  "libc",
  "multi_buffer",
- "node_runtime",
  "octo-types",
  "org-element",
  "path",
@@ -13949,8 +13961,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
  "ui",
  "util",
  "uuid",
@@ -14302,13 +14312,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "editor",
+ "fs",
  "gpui",
  "language",
+ "languages",
  "multi_buffer",
+ "node_runtime",
  "rho-core",
  "rho-hosts",
  "text",
  "theme",
+ "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
 ]
 
 [[package]]

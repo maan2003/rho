@@ -1,7 +1,7 @@
 //! The draft compose model: pick a workdir, write the first message, submit
 //! to create the agent.
 //!
-//! Entirely separate from [`crate::agent_view::AgentModel`] — there is no
+//! Entirely separate from [`rho_agents::agent_view::AgentModel`] — there is no
 //! transcript here. The multibuffer composes the draft fields and message body.
 //! The excerpt boundary separates field from body, so there is no scaffold text
 //! to parse: submission just reads the two writable buffers.

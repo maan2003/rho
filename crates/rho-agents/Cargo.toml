@@ -12,10 +12,25 @@ version.workspace = true
 
 [dependencies]
 camino.workspace = true
+collections = { path = "../../vendor/zed/crates/collections" }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+futures.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+json-stream.workspace = true
+language = { path = "../../vendor/zed/crates/language" }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+rho-core.workspace = true
 rho-hosts = { workspace = true }
 rho-registry = { workspace = true }
 rho-ui-proto.workspace = true
+rho-window = { workspace = true }
+rustc-hash = "2.1.0"
+serde_json.workspace = true
+text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
+tree-sitter = "0.26"
+tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
+ui = { path = "../../vendor/zed/crates/ui" }
 
 [dev-dependencies]
-rho-core.workspace = true
 rho-hosts = { workspace = true, features = ["test-support"] }

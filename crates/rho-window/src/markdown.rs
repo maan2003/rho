@@ -37,10 +37,6 @@ impl Markdown {
 struct MarkdownLanguagesRegistered;
 impl Global for MarkdownLanguagesRegistered {}
 
-fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
-    crate::zed_remote::language_registry(cx)
-}
-
 /// Gives an assistant-message buffer Zed's persistent, background Markdown
 /// syntax pipeline. Concealment is part of the resulting syntax generation;
 /// non-Markdown transcript records live in separate source buffers.
@@ -49,7 +45,7 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
     let (Some(block), Some(inline)) = (markdown.block, markdown.inline) else {
         return;
     };
-    let registry = language_registry(cx);
+    let registry = crate::languages::registry(cx);
     if !cx.has_global::<MarkdownLanguagesRegistered>() {
         registry.add(block.clone());
         registry.add(inline.clone());
@@ -79,13 +75,9 @@ fn markdown_language(cx: &App) -> Option<&'static Arc<Language>> {
                 Some(tree_sitter_md::LANGUAGE.into()),
             )
             .with_queries(LanguageQueries {
-                highlights: Some(Cow::from(include_str!(
-                    "../grammars/markdown/highlights.scm"
-                ))),
-                injections: Some(Cow::from(include_str!(
-                    "../grammars/markdown/injections.scm"
-                ))),
-                conceals: Some(Cow::from(include_str!("../grammars/markdown/conceals.scm"))),
+                highlights: Some(Cow::from(include_str!("grammars/markdown/highlights.scm"))),
+                injections: Some(Cow::from(include_str!("grammars/markdown/injections.scm"))),
+                conceals: Some(Cow::from(include_str!("grammars/markdown/conceals.scm"))),
                 ..LanguageQueries::default()
             })
             .ok()?;
@@ -109,10 +101,10 @@ fn markdown_inline_language(cx: &App) -> Option<&'static Arc<Language>> {
             )
             .with_queries(LanguageQueries {
                 highlights: Some(Cow::from(include_str!(
-                    "../grammars/markdown-inline/highlights.scm"
+                    "grammars/markdown-inline/highlights.scm"
                 ))),
                 conceals: Some(Cow::from(include_str!(
-                    "../grammars/markdown-inline/conceals.scm"
+                    "grammars/markdown-inline/conceals.scm"
                 ))),
                 ..LanguageQueries::default()
             })

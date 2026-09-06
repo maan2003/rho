@@ -39,6 +39,7 @@ use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_hosts::connection::VisualizationClient;
 use rho_registry::render::UiAgentState;
+use rho_registry::store::{FrameSummary, IncrementalUpdate};
 use rho_ui_proto::AgentId;
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
@@ -47,7 +48,10 @@ use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
-use crate::store::{FrameSummary, IncrementalUpdate};
+
+mod store;
+
+pub use store::{FrameChange, TranscriptFrame, Transcripts};
 
 pub struct TranscriptModel {
     multi_buffer: Entity<MultiBuffer>,
@@ -255,7 +259,7 @@ impl TranscriptModel {
         debug_assert!(self.buffers.is_empty());
         debug_assert_eq!(prepared.chunks.len(), text_buffers.len());
 
-        self.turn_open = crate::store::turn_open(prepared.state.status);
+        self.turn_open = rho_registry::store::turn_open(prepared.state.status);
         let mut installed = Vec::with_capacity(prepared.chunks.len());
         // Register newest buffers first; syntax activation below follows the
         // same order so the visible tail leads the historical parser backlog.
@@ -265,7 +269,7 @@ impl TranscriptModel {
             let buffer = cx.insert_entity(reservation, |cx| {
                 let mut buffer = Buffer::build(text_buffer, None, language::Capability::Read);
                 if chunk.markdown {
-                    crate::render::markdown::configure_buffer(&mut buffer, cx);
+                    rho_window::markdown::configure_buffer(&mut buffer, cx);
                 }
                 buffer
             });
@@ -381,7 +385,7 @@ impl TranscriptModel {
         agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) {
-        self.turn_open = crate::store::turn_open(state.status);
+        self.turn_open = rho_registry::store::turn_open(state.status);
         let Some(first_changed) = summary.first_changed_block else {
             // Status alone can close the turn; the document tail follows,
             // and a replaced excerpt triggers the full re-apply inside.
@@ -528,7 +532,7 @@ impl TranscriptModel {
             let buffer = cx.new(|cx| {
                 let mut buffer = Buffer::local(&text, cx);
                 if markdown {
-                    crate::render::markdown::configure_buffer(&mut buffer, cx);
+                    rho_window::markdown::configure_buffer(&mut buffer, cx);
                 }
                 buffer.set_capability(language::Capability::Read, cx);
                 buffer
@@ -793,7 +797,7 @@ impl TranscriptModel {
             &state.blocks,
             first_changed_block,
             &visible,
-            crate::store::turn_open(state.status),
+            rho_registry::store::turn_open(state.status),
             |plan| plan_anchor_range(records, plan),
         );
     }

@@ -123,6 +123,65 @@ wrong at the design, not at the polish.
   reason becomes a type. Three tests run the crate alone, over a registry
   told an agent the way the model thread tells it one. Gate green: rho-gui
   276, rho-agents 10, rho-hosts 14, rho-registry 14.
+
+  *Landed, the screens (8).* The agent screen and the transcript under it
+  are the crate's: `agent_view` (the screen — the transcript multibuffer
+  with a prompt buffer under it, the attachments, the status), `transcript`
+  (the incremental composition: per-turn excerpts, the highlights, inlays
+  and display elisions reconciled against every attached editor) and
+  `render` (the pure projection from a block to styled spans, and the
+  elision plans over it). `transcript.rs` from cut (5) became
+  `transcript/store.rs` and is re-exported, so a transcript's model and the
+  buffer that shows it are one module, as they read.
+
+  Every screen here is a buffer and stayed one: the transcript is a
+  multibuffer of per-turn excerpts with the point in it, the prompt is a
+  buffer in the same multibuffer, the fold state is display elisions, the
+  running-tool lines are inlays, and the status is an editor right prompt
+  anchored at the prompt's end rather than a strip drawn beside it. Nothing
+  in the move needed a widget tree. One thing to say rather than carry
+  quietly: that right prompt is a primitive of the *vendored editor*, not
+  of `rho-window` — the screen reaches it through `editor`, so today the
+  window does not own every primitive its screens draw with.
+
+  Two pieces went to `rho-window` rather than to `rho-agents`, because two
+  source crates need them and a source crate must not name another:
+  `markdown` (the Markdown grammars and what a Markdown buffer is
+  configured as — the transcript uses it, and so does the Slack
+  conversation through `configure_markdown`) and `languages` (the one
+  language registry for the app, built on first ask and re-themed with the
+  window; it was `zed_remote`'s `pub(crate)` global, and the file view, the
+  diff view and the transcript all read from it). `rho-window` modules
+  touched: `markdown` and `languages`, both new; the four chrome modules
+  were not touched. Its one test only ever built because `rho-gui` was in
+  the same invocation and turned on `gpui`'s `test-support` for the whole
+  graph; `rho-window` now asks for it itself, so `cargo test -p rho-window`
+  alone builds. The chrome cut's re-export line in `rho-gui/src/lib.rs`
+  had no readers left and is gone with this cut, so the "no alias" claim in
+  the note above is now true of the manifest as well as the use sites.
+
+  What the screens still reach for is small and upward-free: the store's
+  `FrameSummary`, `IncrementalUpdate` and `turn_open` come from
+  `rho-registry` where they live, and `now_ms` from there too rather than
+  from `Workspace`. `rho-gui` names `rho_agents::agent_view::AgentModel`
+  and nothing else of the screens, and lost five dependencies it only had
+  for them (`tree-sitter`, `tree-sitter-md`, `json-stream`, `languages`,
+  `node_runtime`).
+
+  Cost: no numbers, and this is why. The cut is a move — every code path,
+  allocation and edit is byte-identical to what main ran, so a measurement
+  here would measure main and be labelled as the screens'. The desk rig was
+  held by another session's run while this landed, so I did not take one
+  either. The transcript's own numbers are owed with the map (4), which is
+  the crate held to the rule from its first line, and they will be taken on
+  `user-2026-09-06` as `QA-HANDBOOK.md` sets out (`draw_ms` p99/max and
+  `dirty_to_draw_ms` p99 from `frames.json`, each touched stage's
+  `duration_ms` p99 against its `input_rows` from `editor.json`).
+
+  Gate green: rho-gui 246, rho-agents 42 (the 32 transcript, render and
+  screen tests moved with their modules; no test was added, dropped or
+  rewritten), rho-window 1, rho-hosts 14, rho-registry 14; clippy
+  `-D warnings` green over the three crates.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

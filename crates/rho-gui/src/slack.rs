@@ -192,7 +192,7 @@ impl Workspace {
     pub(crate) fn slack_hooks() -> rho_slack::ui::Hooks {
         rho_slack::ui::Hooks {
             configure_editor: rho_window::editor_config::configure,
-            configure_markdown: crate::render::markdown::configure_buffer,
+            configure_markdown: rho_window::markdown::configure_buffer,
         }
     }
 

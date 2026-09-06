@@ -29,6 +29,7 @@ use gpui::{
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agents::TranscriptFrame;
+use rho_agents::agent_view::AgentModel;
 use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
 use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
@@ -40,7 +41,6 @@ use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 
-use crate::agent_view::AgentModel;
 use crate::chime::Chime;
 use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
@@ -569,7 +569,7 @@ impl Workspace {
             // means for the rest of the shell is decided here.
             self.agent_model_subscriptions
                 .push(cx.subscribe(&model, |workspace, _, event, cx| match event {
-                    crate::agent_view::AgentModelEvent::Loaded(agent_id) => {
+                    rho_agents::agent_view::AgentModelEvent::Loaded(agent_id) => {
                         workspace.finish_initial_agent_load(*agent_id, cx);
                     }
                 }));
@@ -2508,7 +2508,7 @@ impl Workspace {
     fn zulip_hooks() -> rho_zulip::ui::Hooks {
         rho_zulip::ui::Hooks {
             configure_editor: rho_window::editor_config::configure,
-            configure_markdown: crate::render::markdown::configure_buffer,
+            configure_markdown: rho_window::markdown::configure_buffer,
         }
     }
 

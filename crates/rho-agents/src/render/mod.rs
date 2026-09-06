@@ -6,7 +6,6 @@
 //! block rendering testable as plain string assertions.
 
 pub mod elision;
-pub mod markdown;
 
 use std::ops::Range;
 use std::time::Duration;

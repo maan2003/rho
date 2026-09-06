@@ -24,14 +24,14 @@ use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Wind
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
+use rho_registry::now_ms;
 use rho_registry::render::UiAgentState;
+use rho_registry::store::FrameSummary;
 use rho_ui_proto::AgentId;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
-use crate::store::FrameSummary;
 use crate::transcript::TranscriptModel;
-use crate::workspace::now_ms;
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
@@ -446,8 +446,8 @@ impl AgentModel {
         &self.status_spans
     }
 
-    #[cfg(test)]
-    pub(crate) fn status_span_text(&self) -> String {
+    /// The status line as one string, in span order: what a reader sees.
+    pub fn status_span_text(&self) -> String {
         self.status_spans
             .iter()
             .map(|(text, _)| text.as_str())

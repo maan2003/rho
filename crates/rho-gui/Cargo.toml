@@ -44,12 +44,9 @@ gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-featur
 ] }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
 iroh = { workspace = true }
-json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
-languages = { path = "../../vendor/zed/crates/languages", features = ["load-grammars"] }
 libc = { version = "0.2" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
 octo-types = { workspace = true }
 path = { path = "../../vendor/zed/crates/path" }
 project = { path = "../../vendor/zed/crates/project" }
@@ -105,8 +102,6 @@ tracing-subscriber = { version = "0.3", features = [
   "env-filter",
   "fmt",
 ] }
-tree-sitter = "0.26"
-tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { path = "../../vendor/zed/crates/ui" }
 uuid.workspace = true
 util = { path = "../../vendor/zed/crates/util" }
