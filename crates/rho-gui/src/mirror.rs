@@ -431,27 +431,88 @@ fn apply(
     }
 }
 
-static GLOBAL: std::sync::OnceLock<Mirror> = std::sync::OnceLock::new();
+/// Held behind a lock only so that `close` can take it: every reader
+/// takes the lock uncontended, and the writes go down a channel anyway.
+static GLOBAL: std::sync::OnceLock<std::sync::RwLock<Option<Mirror>>> = std::sync::OnceLock::new();
+
+fn global() -> std::sync::RwLockReadGuard<'static, Option<Mirror>> {
+    GLOBAL
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Where the session's mirror lives, said once by `main` before the model
+/// thread starts. `main` only names the file; opening it is the model
+/// thread's, so that no frame waits on it.
+static STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_state_dir(state_dir: PathBuf) {
+    let _ = STATE_DIR.set(state_dir);
+}
+
+/// Opens the mirror named by `set_state_dir`, if one was. Called from the
+/// model thread as its first act.
+pub fn open_stated() {
+    let Some(state_dir) = STATE_DIR.get() else {
+        return;
+    };
+    if let Err(error) = init(state_dir) {
+        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
+    }
+}
 
 /// Opens the mirror for this session. Without it every write below is a
 /// no-op and the GUI simply starts empty, which is what tests want.
+///
+/// Called on the model thread, never on the main one: opening a file this
+/// size is not free, and after a kill redb rebuilds its allocator from
+/// every page, which on the rig's 539 MB mirror was 17.1s in a debug
+/// build. Nothing on the main thread waits for it; a reader that arrives
+/// first reads an empty mirror and asks the daemon instead.
 pub fn init(state_dir: &Path) -> std::io::Result<()> {
     let mirror = Mirror::open(state_dir)?;
-    GLOBAL.set(mirror).map_err(|_| {
-        std::io::Error::new(
+    let mut global = GLOBAL
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if global.is_some() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "the agent mirror is already initialized",
-        )
-    })
+        ));
+    }
+    // A quit that beat the open closes nothing and installs nothing: the
+    // file this holds would otherwise outlive the session that asked for
+    // it, and be found unclean next time.
+    if CLOSED.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
+    *global = Some(mirror);
+    Ok(())
+}
+
+/// Drains the writer and closes the file, so that the next start finds it
+/// shut cleanly and skips redb's rebuild. A session that ends without
+/// this pays that rebuild once, off the main thread.
+pub fn close() {
+    CLOSED.store(true, std::sync::atomic::Ordering::Release);
+    let mirror = GLOBAL
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    drop(mirror);
 }
 
 pub fn load() -> Loaded {
-    GLOBAL.get().map(Mirror::load).unwrap_or_default()
+    global().as_ref().map(Mirror::load).unwrap_or_default()
 }
 
 pub fn read_events(agent_id: AgentId) -> Vec<(AgentPos, MirrorEvent)> {
-    GLOBAL
-        .get()
+    global()
+        .as_ref()
         .map(|mirror| mirror.read_events(agent_id))
         .unwrap_or_default()
 }
@@ -463,25 +524,25 @@ pub fn write_log(
     entries: Vec<LogEntry>,
     digests: Vec<(AgentId, AgentSnapshot)>,
 ) {
-    if let Some(mirror) = GLOBAL.get() {
+    if let Some(mirror) = global().as_ref() {
         mirror.write_log(host, machine_seed, seq, entries, digests);
     }
 }
 
 pub fn write_verdict(agent_id: AgentId, verdict: Verdict) {
-    if let Some(mirror) = GLOBAL.get() {
+    if let Some(mirror) = global().as_ref() {
         mirror.write_verdict(agent_id, verdict);
     }
 }
 
 pub fn reset_host(host: &str) {
-    if let Some(mirror) = GLOBAL.get() {
+    if let Some(mirror) = global().as_ref() {
         mirror.reset_host(host);
     }
 }
 
 pub fn flush() {
-    if let Some(mirror) = GLOBAL.get() {
+    if let Some(mirror) = global().as_ref() {
         mirror.flush();
     }
 }

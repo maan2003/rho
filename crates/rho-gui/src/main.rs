@@ -232,10 +232,9 @@ fn run() -> Result<()> {
     .browser_socket();
     rho_gui::journal::init(&client_state_dir).context("initialize client action journal")?;
     // The mirror is a cache: a session that cannot open it starts empty and
-    // asks the daemon for everything, which is the old behaviour.
-    if let Err(error) = rho_gui::mirror::init(&client_state_dir) {
-        tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
-    }
+    // asks the daemon for everything, which is the old behaviour. Only the
+    // path is settled here; the model thread opens it.
+    rho_gui::mirror::set_state_dir(client_state_dir.clone());
     rho_gui::telemetry::enable();
     if profiler.is_none()
         && let Err(error) = rho_gui::telemetry::enable_passive_cpu_profile()
@@ -293,7 +292,10 @@ fn run() -> Result<()> {
                 }
                 rho_gui::telemetry::shutdown_passive_cpu_profile();
                 rho_gui::journal::flush();
-                rho_gui::mirror::flush();
+                // Closing rather than flushing: a mirror left open is a
+                // file redb finds unclean, and the next start rebuilds its
+                // allocator from every page to be sure of it.
+                rho_gui::mirror::close();
                 std::future::ready(())
             })
             .detach();

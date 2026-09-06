@@ -403,6 +403,12 @@ async fn run(
     mut incoming: futures_mpsc::UnboundedReceiver<ToModel>,
     changes: futures_mpsc::UnboundedSender<ModelEvent>,
 ) {
+    // The mirror opens here, not in `main`: after an unclean stop redb
+    // rebuilds its allocator from every page, and on the rig's 539 MB
+    // mirror that was 17.1s of a blocked main thread before the window
+    // existed. Until it is open the GUI is simply a session with no copy,
+    // which is what the mirror has always promised to be.
+    crate::mirror::open_stated();
     let mut model = Model::new();
     while let Some(item) = incoming.next().await {
         let out = match item {
