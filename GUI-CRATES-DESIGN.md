@@ -101,7 +101,13 @@ connection to the screen, tested alone against its own fake server.
   fake Slack server (`fake.rs`) and against a copy of the user's real
   mirror. Read state: Slack's own cursor is the truth for reading and is
   written back when the user reads here; Rho's `SlackHandledThrough`
-  stays the dealing cursor only. Owner: eng-bgwk.
+  stays the dealing cursor only. Owner: eng-bgkw.
+  Ruling, 6 Sep: the Slack screens stay editor based. The conversation,
+  the thread, the list and compose are drawn with the editor primitives
+  the rest of Rho draws with (buffers, inlays, the composition), never a
+  separate widget tree beside them; where the editor lacks a primitive a
+  Slack screen needs, the primitive is built from the ground up and the
+  screen keeps using the editor.
   Order, set 6 Sep after the inventory: the crate already had the list, the
   thread view, compose and reply, and reactions on screen, so the work is
   (1) mark read that sticks, (2) the card rule into the crate as Slack's own
