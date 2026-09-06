@@ -15,12 +15,12 @@ use editor::{DisplayElisionId, DisplayElisionProperties, Editor};
 use gpui::prelude::*;
 use gpui::{Context, Entity};
 use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
-use rho_registry::render::UiBlock;
 use rho_window::highlights::excerpt_range;
 use text::Anchor;
 use ui::{Icon, IconName, IconSize, div};
 
 use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, turn_start_index};
+use crate::state::UiBlock;
 
 /// What one fold looks like, independent of its editor identity.
 #[derive(Clone, PartialEq)]

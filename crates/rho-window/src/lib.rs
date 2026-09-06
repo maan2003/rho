@@ -14,6 +14,7 @@ pub mod editor_config;
 pub mod highlights;
 pub mod languages;
 pub mod markdown;
+pub mod selection;
 pub mod style;
 pub mod transient;
 pub mod visualization;

@@ -28,15 +28,18 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
-use rho_agents::TranscriptFrame;
 use rho_agents::agent_view::AgentModel;
 use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
+use rho_agents::session::ActiveAgents;
+use rho_agents::store::FrameSummary;
+use rho_agents::{AgentMap, HostId, TranscriptFrame};
 use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
 #[cfg(test)]
 use rho_ui_proto::AdvisorIntelligence;
 use rho_ui_proto::{AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery};
+use rho_window::selection::{ActivePane, Selection};
 use rho_window::style::StyleClass;
 use settings::Settings as _;
 use theme::ActiveTheme as _;
@@ -46,9 +49,6 @@ use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{Pane, SurfaceKey};
-use crate::registry::session::ActiveAgents;
-use crate::registry::{ActivePane, AgentRegistry, HostId};
-use crate::store::FrameSummary;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
@@ -344,7 +344,9 @@ pub struct Workspace {
     /// screen draws from. `rho-agents` owns what a transcript is; the
     /// shell only says which agent and hands the rows on.
     transcripts: rho_agents::Transcripts,
-    pub(crate) registry: AgentRegistry,
+    pub(crate) registry: AgentMap,
+    /// Which pane the point is in. The window's, not the map's.
+    pub(crate) selection: Selection,
     models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by daemon-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
@@ -617,14 +619,16 @@ impl Workspace {
     fn loaded(
         &mut self,
         host: HostId,
-        agents: Vec<rho_registry::MirroredAgent>,
-        verdicts: Vec<(AgentId, rho_registry::Verdict)>,
+        agents: Vec<rho_agents::MirroredAgent>,
+        verdicts: Vec<(AgentId, rho_agents::Verdict)>,
     ) {
         for agent_id in self.registry.host_agents(host) {
             self.transcripts.forget(agent_id);
             self.active.remove(agent_id);
         }
-        self.registry.reset_host(host);
+        let departed = self.registry.reset_host(host);
+        self.selection
+            .forget(|agent_id| departed.contains(&agent_id));
         self.registry.restore(agents);
         for (agent_id, verdict) in verdicts {
             self.registry.set_agent_verdict(agent_id, verdict);
@@ -974,7 +978,8 @@ impl Workspace {
             hosts,
             active: ActiveAgents::default(),
             transcripts: rho_agents::Transcripts::default(),
-            registry: AgentRegistry::default(),
+            registry: AgentMap::default(),
+            selection: Selection::default(),
             models: HashMap::new(),
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
@@ -1156,7 +1161,8 @@ impl Workspace {
         self.global_usage.remove(&host);
         self.agent_cost_usage.remove(&host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
-        self.registry.detach_host(host);
+        let gone = self.registry.detach_host(host);
+        self.selection.forget(|agent_id| gone.contains(&agent_id));
         self.refresh_dashboard(window, cx);
         for agent_id in departed {
             self.active.remove(agent_id);
@@ -1965,7 +1971,7 @@ impl Workspace {
                 }
                 self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
-                if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
+                if first_ready && matches!(self.selection.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
@@ -2364,7 +2370,7 @@ impl Workspace {
             self.slack_submit(cx);
             return;
         }
-        match self.registry.selected_agent().copied() {
+        match self.selection.selected_agent() {
             Some(agent_id) => {
                 let Some(view) = self.models.get(&agent_id).cloned() else {
                     return;
@@ -2405,9 +2411,8 @@ impl Workspace {
         // Voice follows what the user is looking at: start on the selected
         // agent's daemon.
         let host = self
-            .registry
+            .selection
             .selected_agent()
-            .copied()
             .and_then(|agent_id| self.host_of(agent_id))
             .filter(|host| self.hosts.is_online(*host))
             .or_else(|| self.hosts.primary());
@@ -2836,7 +2841,7 @@ impl Workspace {
             }
         };
         if cleared {
-            let agent_id = self.registry.selected_agent().copied();
+            let agent_id = self.selection.selected_agent();
             self.notice_on(
                 agent_id.as_ref(),
                 "image attachments cleared",
@@ -3079,9 +3084,9 @@ impl Workspace {
         };
         let targets = self.subject(window, cx).agents;
         let hid_open_agent = self
-            .registry
+            .selection
             .selected_agent()
-            .is_some_and(|agent_id| targets.contains(agent_id));
+            .is_some_and(|agent_id| targets.contains(&agent_id));
         let sent = self.deal_agents(targets, "done", verdict, window, cx);
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
@@ -3575,7 +3580,7 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
-        let host = match self.registry.selected_agent().copied() {
+        let host = match self.selection.selected_agent() {
             Some(agent_id) => self.host_of(agent_id),
             None => self.hosts.primary(),
         };
@@ -3893,8 +3898,8 @@ impl Workspace {
     }
 
     pub(crate) fn mark_draft_active_from_edit(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.registry.active_pane(), ActivePane::Startup) {
-            self.registry.enter_draft();
+        if matches!(self.selection.active_pane(), ActivePane::Startup) {
+            self.selection.enter_draft();
             cx.notify();
         }
     }
@@ -4012,9 +4017,8 @@ impl Workspace {
             _ => None,
         };
         subject.unwrap_or_else(|| {
-            self.registry
+            self.selection
                 .selected_agent()
-                .copied()
                 .map_or_else(Subject::default, |agent_id| Subject {
                     agent: Some(agent_id),
                     agents: self.registry.agent_subtree(agent_id),
@@ -4083,7 +4087,7 @@ impl Workspace {
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
     /// the body. On agent views it does nothing.
     fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.registry.selected_agent().is_none()
+        if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
             self.draft_model
@@ -4097,7 +4101,7 @@ impl Workspace {
     /// of them; the values have `ctrl-tab` now. On agent views it does
     /// nothing.
     fn cycle_draft_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.registry.selected_agent().is_none()
+        if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
             self.draft_model
@@ -4109,7 +4113,7 @@ impl Workspace {
     /// field's mode (on top of → join → sandbox). Elsewhere in the draft it
     /// does nothing, there being no value to cycle.
     fn cycle_draft_value(&mut self, cx: &mut Context<Self>) {
-        if self.registry.selected_agent().is_none()
+        if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
             self.draft_model.update(cx, |view, cx| {
@@ -4139,9 +4143,8 @@ impl Workspace {
     /// Where a new agent works when the draft doesn't say: the selected
     /// agent sets the precedent, else the first registered workdir.
     fn draft_default_workdir(&self) -> Option<HostPath> {
-        self.registry
+        self.selection
             .selected_agent()
-            .copied()
             .and_then(|agent_id| self.agent_workdir(agent_id))
             .or_else(|| {
                 self.hosts.workdirs().first().map(|workdir| HostPath {
@@ -4533,14 +4536,14 @@ impl Workspace {
         }
         let (context, key) = match agent_id {
             Some(agent_id) => {
-                self.registry.select_agent(agent_id);
+                self.selection.select_agent(agent_id);
                 (
                     self.context_for_agent(agent_id),
                     SurfaceKey::Transcript(agent_id),
                 )
             }
             None => {
-                self.registry.enter_draft();
+                self.selection.enter_draft();
                 (ContextId::Draft, SurfaceKey::Draft)
             }
         };
@@ -5286,7 +5289,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.registry.next_agent(delta) else {
+        let Some(agent_id) = self
+            .registry
+            .next_agent(self.selection.selected_agent(), delta)
+        else {
             self.notice_on(
                 None,
                 "agent-switch: no visible agents available",
@@ -5295,7 +5301,7 @@ impl Workspace {
             );
             return;
         };
-        if self.registry.selected_agent() == Some(&agent_id) {
+        if self.selection.selected_agent() == Some(agent_id) {
             return;
         }
         self.select_agent(Some(agent_id), window, cx);
@@ -5821,7 +5827,7 @@ impl Workspace {
     pub(crate) fn seed_transcript_for_test(
         &mut self,
         agent_id: AgentId,
-        state: rho_registry::render::UiAgentState,
+        state: rho_agents::state::UiAgentState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6342,16 +6348,13 @@ impl Workspace {
     /// The transcript this workspace shows for an agent, for a test that
     /// feeds it back changed.
     #[cfg(test)]
-    pub(crate) fn transcript_for_test(
-        &self,
-        agent_id: AgentId,
-    ) -> rho_registry::render::UiAgentState {
+    pub(crate) fn transcript_for_test(&self, agent_id: AgentId) -> rho_agents::state::UiAgentState {
         self.transcripts
             .state(&agent_id)
             .cloned()
-            .unwrap_or_else(|| rho_registry::render::UiAgentState {
+            .unwrap_or_else(|| rho_agents::state::UiAgentState {
                 blocks: Vec::new(),
-                status: rho_registry::render::UiAgentStatus::Idle,
+                status: rho_agents::state::UiAgentStatus::Idle,
                 context_used: None,
                 usage: Default::default(),
             })
@@ -6361,13 +6364,13 @@ impl Workspace {
     /// startup pane is a state the shell moves out of on its own.
     #[cfg(test)]
     pub(crate) fn is_startup_pane(&self) -> bool {
-        matches!(self.registry.active_pane(), ActivePane::Startup)
+        matches!(self.selection.active_pane(), ActivePane::Startup)
     }
 
     pub(crate) fn active_agent_model(&self) -> Option<Entity<AgentModel>> {
-        self.registry
+        self.selection
             .selected_agent()
-            .and_then(|agent_id| self.models.get(agent_id))
+            .and_then(|agent_id| self.models.get(&agent_id))
             .cloned()
     }
 
@@ -6573,20 +6576,20 @@ impl Workspace {
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
         let selected = match self.active_pane().surface.key.clone() {
             SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
-                self.registry.select_agent(agent_id);
+                self.selection.select_agent(agent_id);
                 Some(agent_id)
             }
             SurfaceKey::Terminal { agent_id, .. } => {
-                self.registry.select_agent(agent_id);
+                self.selection.select_agent(agent_id);
                 Some(agent_id)
             }
             SurfaceKey::Browser(_) => None,
             SurfaceKey::Diff { agent_id } => {
-                self.registry.select_agent(agent_id);
+                self.selection.select_agent(agent_id);
                 Some(agent_id)
             }
             SurfaceKey::Draft => {
-                self.registry.enter_draft();
+                self.selection.enter_draft();
                 None
             }
             // Files and chat keep whatever agent context was current.
@@ -7101,7 +7104,7 @@ impl Workspace {
                 crate::journal::record(crate::journal::Event::AgentOpened {
                     agent_id: agent_id.into(),
                 });
-                self.registry.select_agent(agent_id);
+                self.selection.select_agent(agent_id);
                 self.active_context = self.context_for_agent(agent_id);
                 self.activate_agent(agent_id, cx);
                 self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)

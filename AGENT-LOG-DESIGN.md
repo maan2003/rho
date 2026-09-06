@@ -712,7 +712,7 @@ F. **The pure mirror and the journal** (the 6 Sep revision). In three
    `AgentHead` in memory, updated when it changes its own profile, and
    the daemon's tool, mail, shell and terminal paths load the agent
    and read that instead of folding the log. The render types moved to
-   `rho-registry::render`; the client's store keeps the tail from the
+   `rho-agents::state`; the client's store keeps the tail from the
    deltas. Still open, in `LIVE-TAIL-PLAN.md`: the incremental
    transcript fold, derived attention, batched mirror writes, the
    digest fold version (step 2); presentation into the loop, and with
@@ -723,7 +723,7 @@ F. **The pure mirror and the journal** (the 6 Sep revision). In three
    The transcript is folded incrementally: `TranscriptFold` takes one
    row at a time like the digest and gives the store its blocks; a
    `Log` entry for an active agent no longer refolds its events. The
-   attention table is gone; attention is `rho_registry::attention`
+   attention table is gone; attention is `rho_agents::attention`
    over the digest's facts (turn running, errored past, wants past)
    and one user verdict (`handled_through`, `muted`) kept in
    `gui_agent_verdict_v1` and written when it changes. The desk card

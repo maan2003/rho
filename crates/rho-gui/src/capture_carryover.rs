@@ -16,10 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Context, Window};
 use redb::TableDefinition;
+use rho_agents::HostId;
 use rho_db::{RhoDb, Sen};
 use senax_encoder::{Decode, Decoder as _, Encode};
 
-use crate::registry::HostId;
 use crate::workspace::Workspace;
 
 /// The old store's table, named as it was written. redb records the type

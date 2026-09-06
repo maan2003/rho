@@ -19,13 +19,12 @@ use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec};
 use multi_buffer::{MultiBuffer, MultiBufferRow};
+use rho_agents::{AgentMap, Attention as UiAttention, HostId};
 pub use rho_desk::cells::SlackUnit;
-use rho_registry::Attention as UiAttention;
 use rho_ui_proto::AgentId;
 use text::{Bias, BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
 
-use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
 
 /// Highlight-key space for dashboard classes, clear of the transcript's
@@ -132,7 +131,7 @@ pub enum CardTarget {
 
 /// The marker and name in front of an agent's row, keeping the indent the
 /// row was drawn with: only the agent's own part of the prefix moves.
-fn agent_prefix(drawn: &str, agent_id: AgentId, registry: &AgentRegistry) -> String {
+fn agent_prefix(drawn: &str, agent_id: AgentId, registry: &AgentMap) -> String {
     let indent = drawn
         .find('•')
         .map(|at| drawn[..at].to_owned())
@@ -419,7 +418,7 @@ pub enum CardCursor {
     /// The newest message in the unit, which is what a Slack verdict writes.
     Slack(rho_desk::cells::SlackTs),
     /// The agent's own chronology and what it is asking for.
-    Agent(rho_registry::AgentFacts, rho_registry::Attention),
+    Agent(rho_agents::AgentFacts, rho_agents::Attention),
     /// The dated mark the card stands on.
     Desk(DeskMark, rho_desk::cells::Timestamp),
 }
@@ -1564,7 +1563,7 @@ impl Dashboard {
         &mut self,
         host: HostId,
         scope: DealScope<'_>,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
@@ -1604,7 +1603,7 @@ impl Dashboard {
         host: HostId,
         touched: &BTreeSet<rho_desk::cells::Id>,
         nodes: &[crate::desk_view::DeskNode],
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         cx: &mut Context<Workspace>,
     ) -> bool {
@@ -1756,7 +1755,7 @@ impl Dashboard {
         &mut self,
         host: HostId,
         node_id: &rho_desk::cells::Id,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
@@ -1825,7 +1824,7 @@ impl Dashboard {
     fn rebuild_host_cards(
         &mut self,
         host: HostId,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
@@ -1878,7 +1877,7 @@ impl Dashboard {
         &mut self,
         host: HostId,
         agent_id: AgentId,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
     ) {
@@ -1938,7 +1937,7 @@ impl Dashboard {
         host: HostId,
         source: &TreeHostSource,
         agent_id: AgentId,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> Option<HeadingContext> {
         let mut best: Option<(usize, &crate::desk_view::DeskNode)> = None;
@@ -2154,7 +2153,7 @@ impl Dashboard {
     /// are display-only inlays, so structural state never leaks into text.
     fn sync_tree(
         &mut self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -2578,7 +2577,7 @@ impl Dashboard {
     /// its buffer through the rearrangement.
     pub fn sync(
         &mut self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         agent_interactions: &HashMap<AgentId, i64>,
         window: &mut Window,
@@ -2658,7 +2657,7 @@ impl Dashboard {
     pub fn target_at_window_position(
         &self,
         position: gpui::Point<gpui::Pixels>,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         cx: &mut Context<Workspace>,
     ) -> Option<RowTarget> {
         let place = self
@@ -2672,7 +2671,7 @@ impl Dashboard {
     /// The row under the cursor.
     pub fn cursor_target(
         &self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         cx: &mut Context<Workspace>,
     ) -> Option<RowTarget> {
         let place = self.cursor_place(cx)?;
@@ -2682,7 +2681,7 @@ impl Dashboard {
     fn target_for_place(
         &self,
         place: CursorPlace,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         _cx: &App,
     ) -> Option<RowTarget> {
         match place {
@@ -2918,12 +2917,12 @@ pub struct DealAgentFacts {
     pub parent: Option<AgentId>,
     pub host: HostId,
     pub heading: String,
-    pub facts: rho_registry::AgentFacts,
-    pub attention: rho_registry::Attention,
+    pub facts: rho_agents::AgentFacts,
+    pub attention: rho_agents::Attention,
 }
 
 /// One agent's facts, for a remake that names exactly it.
-fn agent_deal_facts(registry: &AgentRegistry, agent_id: AgentId) -> Option<DealAgentFacts> {
+fn agent_deal_facts(registry: &AgentMap, agent_id: AgentId) -> Option<DealAgentFacts> {
     Some(DealAgentFacts {
         agent_id,
         parent: registry.agent_parent(agent_id),
@@ -2945,7 +2944,7 @@ fn agent_deal_facts(registry: &AgentRegistry, agent_id: AgentId) -> Option<DealA
 static EMPTY_THREADS: std::sync::LazyLock<HashMap<SlackUnit, SlackFacts>> =
     std::sync::LazyLock::new(HashMap::new);
 
-fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
+fn deal_agent_facts(registry: &AgentMap) -> Vec<DealAgentFacts> {
     registry
         .known_agents()
         .filter_map(|agent_id| {
@@ -2974,7 +2973,7 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
 /// The names an agent answers to besides its title: its tag, and the last
 /// thing the user said to it.
 fn agent_card_facts(
-    facts: &rho_registry::AgentFacts,
+    facts: &rho_agents::AgentFacts,
     agent_id: AgentId,
     now: chrono::DateTime<chrono::FixedOffset>,
     agent_interactions: &HashMap<AgentId, i64>,
@@ -3007,7 +3006,7 @@ fn agent_card_facts(
 /// Never a card's label; a card is the dealer's reason for showing the
 /// agent, and a running agent has no card at all.
 pub(crate) fn agent_state_label(
-    facts: &rho_registry::AgentFacts,
+    facts: &rho_agents::AgentFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> Option<String> {
     if facts.turn_running {
@@ -3026,7 +3025,7 @@ pub(crate) fn agent_state_label(
 }
 
 /// How the last finished turn ended, in the words Home's cards use.
-fn outcome_label(facts: &rho_registry::AgentFacts, wait_days: f64) -> String {
+fn outcome_label(facts: &rho_agents::AgentFacts, wait_days: f64) -> String {
     if facts.errored {
         format!("errored · {} ago", age_label(wait_days))
     } else if facts.needs_you_hint {
@@ -3203,7 +3202,7 @@ pub(crate) fn node_file_path(
 /// row prefix already, so their buffer stays empty rather than repeating it.
 fn derived_title(
     node: &crate::desk_view::DeskNode,
-    _registry: &AgentRegistry,
+    _registry: &AgentMap,
     threads: &HashMap<SlackUnit, SlackFacts>,
 ) -> String {
     use rho_desk::cells::Id;
@@ -3426,7 +3425,7 @@ impl Dashboard {
     /// nothing readable to type at is left out.
     pub(crate) fn area_candidates(
         &self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
         cx: &App,
     ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
@@ -3471,7 +3470,7 @@ impl Dashboard {
     /// title under its parent's.
     pub(crate) fn find_candidates(
         &self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         cx: &App,
     ) -> Vec<crate::find::FindCandidate> {
         use crate::find::{FindCandidate, FindTarget};
@@ -3601,7 +3600,7 @@ impl Dashboard {
 
     pub fn heading_candidates(
         &self,
-        _registry: &AgentRegistry,
+        _registry: &AgentMap,
         needle: &str,
         _cx: &App,
     ) -> Vec<(String, String)> {
@@ -3638,7 +3637,7 @@ impl Dashboard {
     pub fn jump_to_heading(
         &mut self,
         query: &str,
-        _registry: &AgentRegistry,
+        _registry: &AgentMap,
         _window: &mut Window,
         _cx: &mut Context<Workspace>,
     ) -> bool {
@@ -3690,7 +3689,7 @@ impl Dashboard {
 
     pub fn next_now(
         &mut self,
-        registry: &AgentRegistry,
+        registry: &AgentMap,
         _window: &mut Window,
         _cx: &mut Context<Workspace>,
     ) -> Option<AgentId> {
@@ -3710,7 +3709,7 @@ impl Dashboard {
 
     pub fn back(
         &mut self,
-        _registry: &AgentRegistry,
+        _registry: &AgentMap,
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> bool {
@@ -3832,7 +3831,7 @@ mod tests {
             name: name.map(str::to_owned),
             created_at: None,
         };
-        let registry = AgentRegistry::default();
+        let registry = AgentMap::default();
         let facts = HashMap::from([(
             unit.clone(),
             SlackFacts {

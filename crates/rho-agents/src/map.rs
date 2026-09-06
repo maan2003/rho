@@ -1,34 +1,51 @@
-//! Agent lifecycle, selection, naming, and host ownership shared by Rho
-//! clients.
-
-pub mod fold;
-pub mod render;
-pub mod session;
-pub mod store;
+//! The map: every agent this client knows, and the indexes the screens
+//! read it through.
+//!
+//! The cost rule (`GUI-MODEL-DESIGN.md`) holds here from the first line:
+//! **an event costs what it touched plus a lookup, and a read costs what
+//! it draws.** That is what the indexes are for, and it is what the map
+//! is shaped around rather than something checked afterwards.
+//!
+//! Per event, for `k` agents changed in a map of `n`:
+//!
+//! - being told about agents (`told`, `restore`, `tell`) — `k log n` for the
+//!   rows and every index that mentions them, plus `k log k` to sort the ones
+//!   this client has never seen into the front of the order.
+//! - the user's filing (`set_agent_filings`) — `k log n`, and nothing at all
+//!   when the filing it is given is the filing already held.
+//! - a verdict, an activity, a touch, a life change — one lookup.
+//! - a host detaching or starting over — `k log n` in the agents that departed.
+//!   Nothing walks the agents that did not.
+//!
+//! Per read, the reads the screens actually make:
+//!
+//! - a row's own facts (`agent_facts`, `attention`, `agent_display_label`,
+//!   `agent_human_name`, `agent_hidden`, …) — one lookup each, so a frame costs
+//!   the rows it draws.
+//! - `agent_children` — the children, no search; `agent_subtree` — the subtree
+//!   it returns, plus sorting it.
+//! - `next_agent` — a lookup and the agents it steps over, never a pass over
+//!   the map to find where the point is.
+//! - `agent_by_tag` — a binary search of one host's agents of one role.
+//! - `host_agents` — the host's agents.
+//!
+//! The one read left that is the whole map is `agent_by_label`, which
+//! walks every agent asking what it is called. It answers what the user
+//! typed in the minibuffer, once per completion, and it is honest to say
+//! so here rather than to index it before anything is slow.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use camino::Utf8PathBuf;
+use rho_hosts::HostId;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::mirror::AgentWant;
 #[cfg(test)]
 use rho_ui_proto::mirror::LogEntry;
 
-pub use crate::fold::{
-    AgentIdentity, Attention, AttentionFacts, DIGEST_VERSION, Digest, MirroredAgent,
-    TranscriptFold, Verdict, Wants, attention, one_line, transcript,
-};
-
-pub fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-pub use rho_hosts::HostId;
+use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
+use crate::now_ms;
 
 pub const HIDE_LABEL: &str = "hide";
 const LABEL_HEADROOM: u64 = 200;
@@ -39,20 +56,11 @@ pub enum AgentLife {
     Live,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ActivePane {
-    #[default]
-    Startup,
-    Draft,
-    Agent(AgentId),
-}
-
 #[derive(Default)]
 struct HostSnapshot {
     name: String,
     machine_seed: u64,
     agent_counter: u64,
-    agents: Vec<AgentSummary>,
 }
 
 /// One agent as the rails read it: its head, what its story folded to, and
@@ -118,11 +126,16 @@ pub struct AgentFacts {
 
 type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;
 
+/// Where an agent sits in the order the user moves through. Keys are
+/// handed out once and never move again: a newly discovered agent takes a
+/// key below every key in use, which puts it at the front without
+/// renumbering anyone. Two agents that arrive together keep the order they
+/// were sorted into.
+type OrderKey = i64;
+
 #[derive(Default)]
-pub struct AgentRegistry {
+pub struct AgentMap {
     agents: BTreeMap<AgentId, AgentLife>,
-    /// What the view derived, pushed back in so every rail reads one
-    /// answer rather than each deriving its own.
     /// What the user said about each agent; attention is derived from
     /// this and the digest, never stored.
     verdicts: BTreeMap<AgentId, Verdict>,
@@ -131,34 +144,53 @@ pub struct AgentRegistry {
     mirror: BTreeMap<AgentId, MirroredAgent>,
     /// The user's filing, from the store: hidden agents and their labels.
     filing: BTreeMap<AgentId, (bool, Vec<String>)>,
-    order: Vec<AgentId>,
+    /// One row per agent, in agent-id order: what the rails read.
+    summaries: BTreeMap<AgentId, AgentSummary>,
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     hosts: BTreeMap<HostId, HostSnapshot>,
-    summaries: Vec<AgentSummary>,
-    agent_locations: BTreeMap<AgentId, usize>,
-    /// Parent → children (in summary order), rebuilt with `summaries`.
-    /// `agent_subtree` runs on every dashboard row every frame, so it
-    /// must not scan the whole registry per call.
-    children: BTreeMap<AgentId, Vec<AgentId>>,
+
+    // The indexes. Every one of them is kept as the agents that changed
+    // are written, never made again from the whole map: an event costs
+    // what it touched plus a lookup, and a screen reads what it draws.
+    /// Host → its agents. Detaching or resetting a host reads this rather
+    /// than walking every agent asking where it came from.
+    by_host: BTreeMap<HostId, BTreeSet<AgentId>>,
     agent_hosts: BTreeMap<AgentId, HostId>,
+    /// Parent → children, in agent-id order. `agent_subtree` runs on every
+    /// dashboard row every frame, so it must not scan the map per call.
+    children: BTreeMap<AgentId, Vec<AgentId>>,
+    /// Host → role prefix → the agents with that prefix, by encoded id.
+    /// What `@eng-b8os` is looked up in.
     tag_agents: TagAgents,
+    /// The order the user moves through, and each agent's place in it.
+    order: BTreeMap<OrderKey, AgentId>,
+    order_keys: BTreeMap<AgentId, OrderKey>,
+    /// The next key to hand out at the front. Only ever decreases.
+    order_front: OrderKey,
+    /// The agents a screen will draw, in order: everything not filed away.
+    /// `next_agent` steps through this without collecting it.
+    visible: BTreeSet<(OrderKey, AgentId)>,
     announced_hosts: BTreeMap<AgentId, HostId>,
-    active: ActivePane,
 }
 
-impl AgentRegistry {
+impl AgentMap {
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
     }
 
-    pub fn detach_host(&mut self, host: HostId) {
-        let Some(snapshot) = self.hosts.remove(&host) else {
-            return;
-        };
-        let departed = snapshot
-            .agents
-            .iter()
-            .map(|a| a.agent_id)
+    /// A host this client is no longer attached to: everything it told us
+    /// goes with it. Returns the agents that departed, so the window can
+    /// move the point off one it was in.
+    pub fn detach_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
+        if self.hosts.remove(&host).is_none() {
+            return BTreeSet::new();
+        }
+        let departed = self
+            .by_host
+            .get(&host)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
             .chain(
                 self.announced_hosts
                     .iter()
@@ -167,7 +199,7 @@ impl AgentRegistry {
             )
             .collect::<BTreeSet<_>>();
         self.forget_agents(&departed);
-        self.rebuild(None);
+        departed
     }
 
     pub fn host_name(&self, host: HostId) -> &str {
@@ -211,33 +243,30 @@ impl AgentRegistry {
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
-        self.rebuild(Some(host));
     }
 
     /// Drops everything mirrored from a host that is still attached: for
     /// a daemon whose database is not the one this client mirrored.
-    pub fn reset_host(&mut self, host: HostId) {
-        let departed = self
-            .mirror
-            .values()
-            .filter(|mirrored| mirrored.host == host)
-            .map(MirroredAgent::agent_id)
-            .collect::<BTreeSet<_>>();
+    pub fn reset_host(&mut self, host: HostId) -> BTreeSet<AgentId> {
+        let departed = self.by_host.get(&host).cloned().unwrap_or_default();
         self.forget_agents(&departed);
-        self.rebuild(None);
+        departed
     }
 
+    /// The agents named are gone: every table and every index that
+    /// mentions one drops it. Costs what departed and a lookup each, not a
+    /// pass over the map.
     fn forget_agents(&mut self, departed: &BTreeSet<AgentId>) {
-        self.agents.retain(|id, _| !departed.contains(id));
-        self.verdicts.retain(|id, _| !departed.contains(id));
-        self.activities.retain(|id, _| !departed.contains(id));
-        self.mirror.retain(|id, _| !departed.contains(id));
-        self.filing.retain(|id, _| !departed.contains(id));
-        self.last_active.retain(|id, _| !departed.contains(id));
-        self.announced_hosts.retain(|id, _| !departed.contains(id));
-        self.order.retain(|id| !departed.contains(id));
-        if matches!(self.active, ActivePane::Agent(id) if departed.contains(&id)) {
-            self.active = ActivePane::Draft;
+        for agent_id in departed {
+            self.unindex_agent(*agent_id);
+            self.agents.remove(agent_id);
+            self.verdicts.remove(agent_id);
+            self.activities.remove(agent_id);
+            self.mirror.remove(agent_id);
+            self.filing.remove(agent_id);
+            self.last_active.remove(agent_id);
+            self.announced_hosts.remove(agent_id);
+            self.summaries.remove(agent_id);
         }
     }
 
@@ -265,9 +294,7 @@ impl AgentRegistry {
                 changed.push(entry.agent_id);
             }
         }
-        if !changed.is_empty() {
-            self.rebuild(None);
-        }
+        self.refresh(changed.iter().copied());
         changed
     }
 
@@ -287,7 +314,7 @@ impl AgentRegistry {
             self.agents.entry(agent_id).or_insert(AgentLife::Known);
             changed.push(agent_id);
         }
-        self.rebuild(None);
+        self.refresh(changed.iter().copied());
         changed
     }
 
@@ -302,7 +329,7 @@ impl AgentRegistry {
         &mut self,
         filings: impl IntoIterator<Item = (AgentId, bool, Vec<String>)>,
     ) -> bool {
-        let mut moved = false;
+        let mut moved = Vec::new();
         for (agent_id, hidden, labels) in filings {
             let hidden = hidden || labels.iter().any(|label| label == HIDE_LABEL);
             if self
@@ -313,18 +340,18 @@ impl AgentRegistry {
                 continue;
             }
             self.filing.insert(agent_id, (hidden, labels));
-            moved = true;
+            moved.push(agent_id);
         }
-        if !moved {
+        if moved.is_empty() {
             return false;
         }
-        self.rebuild(None);
+        self.refresh(moved);
         true
     }
 
-    /// Every agent this client knows, oldest first.
-    pub fn summaries(&self) -> &[AgentSummary] {
-        &self.summaries
+    /// Every agent this client knows, in agent-id order.
+    pub fn summaries(&self) -> impl ExactSizeIterator<Item = &AgentSummary> {
+        self.summaries.values()
     }
 
     /// Agents read back from the client's own copy, digest and all, so
@@ -333,12 +360,14 @@ impl AgentRegistry {
         if agents.is_empty() {
             return;
         }
+        let mut restored = Vec::new();
         for mirrored in agents {
             let agent_id = mirrored.agent_id();
             self.mirror.insert(agent_id, mirrored);
             self.agents.entry(agent_id).or_insert(AgentLife::Known);
+            restored.push(agent_id);
         }
-        self.rebuild(None);
+        self.refresh(restored);
     }
 
     pub fn mirrored(&self, agent_id: AgentId) -> Option<&MirroredAgent> {
@@ -355,92 +384,178 @@ impl AgentRegistry {
             .map(|mirrored| &mirrored.identity)
     }
 
-    /// Every agent mirrored from a host.
+    /// Every agent mirrored from a host: a read of the index, so it costs
+    /// what the host has rather than what the map holds.
     pub fn host_agents(&self, host: HostId) -> Vec<AgentId> {
-        self.mirror
-            .values()
-            .filter(|mirrored| mirrored.host == host)
-            .map(MirroredAgent::agent_id)
-            .collect()
+        self.by_host
+            .get(&host)
+            .map(|agents| agents.iter().copied().collect())
+            .unwrap_or_default()
     }
 
-    fn rebuild(&mut self, refreshed: Option<HostId>) {
-        let _ = refreshed;
-        for snapshot in self.hosts.values_mut() {
-            snapshot.agents.clear();
+    /// The agents named have changed: their rows and every index that
+    /// mentions them are made again, and nothing else is looked at. Costs
+    /// one lookup per index per agent, plus sorting the ones that are new
+    /// to the map into the front of the order.
+    fn refresh(&mut self, changed: impl IntoIterator<Item = AgentId>) {
+        let changed = changed.into_iter().collect::<Vec<_>>();
+        if changed.is_empty() {
+            return;
         }
-        let mut summaries = Vec::new();
-        let mut unseen = Vec::new();
-        for mirrored in self.mirror.values() {
-            let mut summary = AgentSummary::of(mirrored);
-            if let Some((hidden, labels)) = self.filing.get(&summary.agent_id) {
-                summary.hidden = *hidden;
-                summary.labels = labels.clone();
+        let mut fresh = Vec::new();
+        for agent_id in &changed {
+            if !self.order_keys.contains_key(agent_id) && self.mirror.contains_key(agent_id) {
+                fresh.push(*agent_id);
             }
-            self.agents
-                .entry(summary.agent_id)
-                .or_insert(AgentLife::Known);
-            if let Some(activity) = &summary.activity {
-                self.activities.insert(summary.agent_id, activity.clone());
-            } else {
-                self.activities.remove(&summary.agent_id);
-            }
-            let active = self
-                .last_active
-                .entry(summary.agent_id)
-                .or_insert(rho_core::UnixMs(0));
-            *active = (*active).max(summary.last_active);
-            if !self.order.contains(&summary.agent_id) {
-                unseen.push((summary.last_active, summary.agent_id));
-            }
-            if let Some(snapshot) = self.hosts.get_mut(&mirrored.host) {
-                snapshot.agents.push(summary.clone());
-            }
-            summaries.push(summary);
+            self.refresh_row(*agent_id);
         }
-        self.verdicts.retain(|id, _| self.mirror.contains_key(id));
-        self.agent_hosts = self
-            .mirror
-            .iter()
-            .map(|(agent_id, mirrored)| (*agent_id, mirrored.host))
-            .collect();
-        unseen.sort_by_key(|(active, id)| (Reverse(*active), *id));
-        self.order
-            .splice(0..0, unseen.into_iter().map(|(_, id)| id));
-        self.order.retain(|id| self.agents.contains_key(id));
-        self.agent_locations = summaries
-            .iter()
-            .enumerate()
-            .map(|(i, agent)| (agent.agent_id, i))
-            .collect();
-        self.children = BTreeMap::new();
-        for agent in &summaries {
-            if let Some(parent) = agent.parent_agent {
-                self.children
-                    .entry(parent)
-                    .or_default()
-                    .push(agent.agent_id);
+        // Agents this client has not seen before go to the front, most
+        // recently active first, the way a whole run of them used to be
+        // spliced in after a rebuild.
+        fresh.sort_by_key(|agent_id| {
+            (
+                Reverse(self.last_active.get(agent_id).copied().unwrap_or_default()),
+                *agent_id,
+            )
+        });
+        self.order_front -= fresh.len() as OrderKey;
+        for (offset, agent_id) in fresh.into_iter().enumerate() {
+            let key = self.order_front + offset as OrderKey;
+            self.order.insert(key, agent_id);
+            self.order_keys.insert(agent_id, key);
+        }
+        for agent_id in changed {
+            self.reindex_visibility(agent_id);
+        }
+    }
+
+    /// One agent's row, and the indexes that depend on what the row says:
+    /// which host it is on, whose child it is, what it is tagged.
+    fn refresh_row(&mut self, agent_id: AgentId) {
+        let Some(mirrored) = self.mirror.get(&agent_id) else {
+            return;
+        };
+        let host = mirrored.host;
+        let mut summary = AgentSummary::of(mirrored);
+        if let Some((hidden, labels)) = self.filing.get(&agent_id) {
+            summary.hidden = *hidden;
+            summary.labels = labels.clone();
+        }
+        self.agents.entry(agent_id).or_insert(AgentLife::Known);
+        match &summary.activity {
+            Some(activity) => {
+                self.activities.insert(agent_id, activity.clone());
+            }
+            None => {
+                self.activities.remove(&agent_id);
             }
         }
-        self.tag_agents = BTreeMap::new();
-        for (agent_id, location) in &self.agent_locations {
-            let agent = &summaries[*location];
-            let Some(host) = self.agent_hosts.get(agent_id) else {
-                continue;
-            };
-            self.tag_agents
-                .entry(*host)
+        let active = self
+            .last_active
+            .entry(agent_id)
+            .or_insert(rho_core::UnixMs(0));
+        *active = (*active).max(summary.last_active);
+
+        let previous = self.summaries.get(&agent_id);
+        let was = previous.map(|row| (row.parent_agent, row.role.handle_prefix()));
+        let now = (summary.parent_agent, summary.role.handle_prefix());
+        let moved_host = self.agent_hosts.insert(agent_id, host) != Some(host);
+        if moved_host {
+            self.by_host.retain(|owner, agents| {
+                if *owner != host {
+                    agents.remove(&agent_id);
+                }
+                !agents.is_empty()
+            });
+            self.by_host.entry(host).or_default().insert(agent_id);
+        }
+        if was.map(|(parent, _)| parent) != Some(now.0) {
+            if let Some(parent) = was.and_then(|(parent, _)| parent) {
+                self.remove_child(parent, agent_id);
+            }
+            if let Some(parent) = now.0 {
+                let children = self.children.entry(parent).or_default();
+                if let Err(at) = children.binary_search(&agent_id) {
+                    children.insert(at, agent_id);
+                }
+            }
+        }
+        if was.map(|(_, tag)| tag) != Some(now.1) || moved_host {
+            if let Some((_, tag)) = was {
+                self.untag(agent_id, tag);
+            }
+            let tagged = self
+                .tag_agents
+                .entry(host)
                 .or_default()
-                .entry(agent.role.handle_prefix())
-                .or_default()
-                .push((agent_id.encoded(), *agent_id));
+                .entry(now.1)
+                .or_default();
+            let entry = (agent_id.encoded(), agent_id);
+            if let Err(at) = tagged.binary_search_by(|held| held.0.cmp(&entry.0)) {
+                tagged.insert(at, entry);
+            }
         }
+        self.summaries.insert(agent_id, summary);
+    }
+
+    /// Whether a screen draws this agent at all: the user's filing is the
+    /// only thing that says so, and moving through the map reads it.
+    fn reindex_visibility(&mut self, agent_id: AgentId) {
+        let Some(key) = self.order_keys.get(&agent_id).copied() else {
+            return;
+        };
+        let entry = (key, agent_id);
+        let hidden = self
+            .summaries
+            .get(&agent_id)
+            .is_some_and(|summary| summary.hidden);
+        if hidden {
+            self.visible.remove(&entry);
+        } else {
+            self.visible.insert(entry);
+        }
+    }
+
+    /// Everything an agent is in, dropped: for one that has departed.
+    fn unindex_agent(&mut self, agent_id: AgentId) {
+        if let Some(host) = self.agent_hosts.remove(&agent_id)
+            && let Some(agents) = self.by_host.get_mut(&host)
+        {
+            agents.remove(&agent_id);
+            if agents.is_empty() {
+                self.by_host.remove(&host);
+            }
+        }
+        if let Some(row) = self.summaries.get(&agent_id) {
+            let parent = row.parent_agent;
+            let tag = row.role.handle_prefix();
+            if let Some(parent) = parent {
+                self.remove_child(parent, agent_id);
+            }
+            self.untag(agent_id, tag);
+        }
+        self.children.remove(&agent_id);
+        if let Some(key) = self.order_keys.remove(&agent_id) {
+            self.order.remove(&key);
+            self.visible.remove(&(key, agent_id));
+        }
+    }
+
+    fn remove_child(&mut self, parent: AgentId, child: AgentId) {
+        if let Some(children) = self.children.get_mut(&parent) {
+            children.retain(|held| *held != child);
+            if children.is_empty() {
+                self.children.remove(&parent);
+            }
+        }
+    }
+
+    fn untag(&mut self, agent_id: AgentId, tag: &'static str) {
         for roles in self.tag_agents.values_mut() {
-            for agents in roles.values_mut() {
-                agents.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            if let Some(tagged) = roles.get_mut(tag) {
+                tagged.retain(|held| held.1 != agent_id);
             }
         }
-        self.summaries = summaries;
     }
 
     /// What the user last said about this agent. Returns whether it is
@@ -488,18 +603,6 @@ impl AgentRegistry {
             .is_some_and(|agent| agent.hidden)
     }
 
-    pub fn next_attention_agent(&self) -> Option<AgentId> {
-        let selected = self.selected_agent().copied();
-        self.order
-            .iter()
-            .copied()
-            .filter(|id| Some(*id) != selected && !self.agent_folded(*id))
-            .map(|id| (id, self.attention(id)))
-            .filter(|(_, a)| *a >= Attention::Pending)
-            .min_by_key(|(_, a)| Reverse(*a))
-            .map(|(id, _)| id)
-    }
-
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
         // Hidden agents are excluded from the result but still walked,
         // so descendants behind a hidden intermediate are found.
@@ -516,8 +619,8 @@ impl AgentRegistry {
                 }
             }
         }
-        // Callers see members in summary order, as before.
-        descendants.sort_by_key(|id| self.agent_locations.get(id).copied());
+        // Callers see members in summary order, which is agent-id order.
+        descendants.sort_unstable();
         let mut result = vec![agent_id];
         result.extend(descendants);
         result
@@ -630,9 +733,7 @@ impl AgentRegistry {
         }
     }
     fn agent_summary(&self, agent_id: AgentId) -> Option<&AgentSummary> {
-        self.agent_locations
-            .get(&agent_id)
-            .and_then(|i| self.summaries.get(*i))
+        self.summaries.get(&agent_id)
     }
     pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
         self.agent_summary(agent_id)
@@ -685,38 +786,37 @@ impl AgentRegistry {
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
         self.agents.insert(agent_id, AgentLife::Known);
     }
-    pub fn active_pane(&self) -> ActivePane {
-        self.active
-    }
-    pub fn selected_agent(&self) -> Option<&AgentId> {
-        if let ActivePane::Agent(id) = &self.active {
-            Some(id)
-        } else {
-            None
+    /// The agent `delta` steps from the one the user is in, through the
+    /// agents a screen draws, wrapping at either end. Where the point is
+    /// belongs to the window, so it is handed in rather than kept here.
+    ///
+    /// Each step is a lookup in the order, so a press costs what it moves
+    /// over and not what exists.
+    pub fn next_agent(&self, selected: Option<AgentId>, delta: isize) -> Option<AgentId> {
+        let first = self.visible.iter().next().copied()?;
+        let last = self.visible.iter().next_back().copied()?;
+        let Some(mut at) = selected
+            .and_then(|agent_id| Some((*self.order_keys.get(&agent_id)?, agent_id)))
+            .filter(|entry| self.visible.contains(entry))
+        else {
+            return Some(if delta < 0 { last.1 } else { first.1 });
+        };
+        for _ in 0..delta.unsigned_abs() {
+            at = if delta < 0 {
+                self.visible
+                    .range(..at)
+                    .next_back()
+                    .copied()
+                    .unwrap_or(last)
+            } else {
+                self.visible
+                    .range((std::ops::Bound::Excluded(at), std::ops::Bound::Unbounded))
+                    .next()
+                    .copied()
+                    .unwrap_or(first)
+            };
         }
-    }
-    pub fn select_agent(&mut self, agent_id: AgentId) {
-        self.active = ActivePane::Agent(agent_id);
-    }
-    pub fn enter_draft(&mut self) {
-        self.active = ActivePane::Draft;
-    }
-    pub fn next_agent(&self, delta: isize) -> Option<AgentId> {
-        let visible = self
-            .order
-            .iter()
-            .copied()
-            .filter(|id| !self.agent_folded(*id))
-            .collect::<Vec<_>>();
-        if visible.is_empty() {
-            return None;
-        }
-        let index = self
-            .selected_agent()
-            .and_then(|selected| visible.iter().position(|id| id == selected))
-            .map(|i| (i as isize + delta).rem_euclid(visible.len() as isize) as usize)
-            .unwrap_or_else(|| if delta < 0 { visible.len() - 1 } else { 0 });
-        visible.get(index).copied()
+        Some(at.1)
     }
     pub fn agent_by_label(&self, label: &str) -> Option<AgentId> {
         let label = label.strip_prefix('@').unwrap_or(label);
@@ -753,6 +853,10 @@ mod tests {
     use super::*;
 
     fn created(at: u64) -> MirrorEvent {
+        child_of(None, at)
+    }
+
+    fn child_of(parent: Option<AgentId>, at: u64) -> MirrorEvent {
         MirrorEvent::Created {
             role: rho_ui_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
@@ -761,10 +865,14 @@ mod tests {
             }],
             spawned_by: SpawnedBy::Direct,
             spawn_name: None,
-            parent: None,
+            parent,
             model: "sol".to_owned(),
             at: UnixMs(at),
         }
+    }
+
+    fn agent(nth: u64) -> AgentId {
+        AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap()
     }
 
     fn log(agent_id: AgentId, from: u64, events: Vec<MirrorEvent>) -> Vec<LogEntry> {
@@ -785,7 +893,7 @@ mod tests {
     /// was 3,120 of 3,395 main-thread samples on a first desk sync.
     #[test]
     fn filing_a_whole_desk_rebuilds_once() {
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
         let agents = (1..=32)
             .map(|nth| AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap())
             .collect::<Vec<_>>();
@@ -807,7 +915,7 @@ mod tests {
     #[test]
     fn a_verdict_said_twice_changes_nothing_the_second_time() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
 
         registry.mark_known(agent_id);
         registry.set_activity(agent_id, "writing tests".to_owned());
@@ -855,7 +963,7 @@ mod tests {
     fn the_log_is_what_the_rails_read() {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
         let host = HostId::default();
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
         registry.set_host_data(host, 0, 1);
         // A row before the creation says nothing.
         assert!(
@@ -949,6 +1057,111 @@ mod tests {
         assert_eq!(registry.agent_digest(agent_id).unwrap().newest, AgentPos(5));
 
         registry.reset_host(host);
-        assert!(registry.summaries().is_empty());
+        assert_eq!(registry.summaries().len(), 0);
+    }
+
+    /// The order is what the user moves through, and it is handed out
+    /// once: an agent that arrives later goes to the front and moves
+    /// nobody, and one that arrives again does not move at all. Before the
+    /// indexes this was a splice into a vector after a pass over the whole
+    /// map, and the positions of everyone already in it shifted.
+    #[test]
+    fn the_order_puts_the_newest_first_and_leaves_the_rest_where_they_were() {
+        let host = HostId::default();
+        let mut map = AgentMap::default();
+        map.set_host_data(host, 0, 3);
+        map.tell(host, &log(agent(1), 0, vec![created(10)]));
+        map.tell(host, &log(agent(2), 0, vec![created(20)]));
+
+        // Newest first: agent 2 arrived after agent 1, so it leads.
+        assert_eq!(map.next_agent(None, 1), Some(agent(2)));
+        assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(1)));
+        // And the ends wrap, in both directions.
+        assert_eq!(map.next_agent(Some(agent(1)), 1), Some(agent(2)));
+        assert_eq!(map.next_agent(Some(agent(2)), -1), Some(agent(1)));
+        assert_eq!(map.next_agent(None, -1), Some(agent(1)));
+
+        // A third agent takes the front and the other two keep their order.
+        map.tell(host, &log(agent(3), 0, vec![created(30)]));
+        assert_eq!(map.next_agent(None, 1), Some(agent(3)));
+        assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
+        assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(1)));
+
+        // Being told about an agent again is not arriving again.
+        map.tell(
+            host,
+            &log(
+                agent(1),
+                1,
+                vec![MirrorEvent::Turn {
+                    edge: TurnEdge::Started,
+                    at: UnixMs(40),
+                }],
+            ),
+        );
+        assert_eq!(map.next_agent(None, 1), Some(agent(3)));
+        assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
+    }
+
+    /// Filing an agent away takes it out of the way of the keys that move
+    /// through the map, and unfiling puts it back where it was rather than
+    /// at the end.
+    #[test]
+    fn a_filed_agent_is_stepped_over_and_comes_back_in_place() {
+        let host = HostId::default();
+        let mut map = AgentMap::default();
+        map.set_host_data(host, 0, 3);
+        for (nth, at) in [(1, 10), (2, 20), (3, 30)] {
+            map.tell(host, &log(agent(nth), 0, vec![created(at)]));
+        }
+        assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
+
+        assert!(map.set_agent_filings([(agent(2), true, Vec::new())]));
+        assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(1)));
+        // The agent the point is in can be one that is filed away; the
+        // step out of it starts from the front rather than nowhere.
+        assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(3)));
+
+        assert!(map.set_agent_filings([(agent(2), false, Vec::new())]));
+        assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
+    }
+
+    /// The indexes are what the screens read, so they must say the same
+    /// thing after a change as they would if they had been made from
+    /// scratch: a child reparented, an agent gone, a host reset.
+    #[test]
+    fn the_indexes_follow_what_changed() {
+        let host = HostId::default();
+        let mut map = AgentMap::default();
+        map.set_host_data(host, 0, 3);
+        map.tell(host, &log(agent(1), 0, vec![created(10)]));
+        map.tell(host, &log(agent(2), 0, vec![child_of(Some(agent(1)), 20)]));
+        map.tell(host, &log(agent(3), 0, vec![child_of(Some(agent(1)), 30)]));
+
+        // Children and subtree members come out in agent-id order, the
+        // order the rails have always drawn them in.
+        let mut children = vec![agent(2), agent(3)];
+        children.sort_unstable();
+        assert_eq!(map.agent_children(agent(1)), children);
+        assert_eq!(
+            map.agent_subtree(agent(1)),
+            [vec![agent(1)], children.clone()].concat()
+        );
+        let mut all = vec![agent(1), agent(2), agent(3)];
+        all.sort_unstable();
+        assert_eq!(map.host_agents(host), all);
+        // The tag index answers the handle the user types.
+        let handle = map.agent_id_label(agent(2));
+        let (_, tag) = handle.split_once('/').unwrap_or(("", &handle));
+        assert_eq!(map.agent_by_tag(host, tag), Some(agent(2)));
+
+        // A host that starts over takes its agents out of every index.
+        let departed = map.reset_host(host);
+        assert_eq!(departed.into_iter().collect::<Vec<_>>(), all);
+        assert_eq!(map.summaries().len(), 0);
+        assert!(map.agent_children(agent(1)).is_empty());
+        assert_eq!(map.host_agents(host), []);
+        assert_eq!(map.agent_by_tag(host, tag), None);
+        assert_eq!(map.next_agent(None, 1), None);
     }
 }

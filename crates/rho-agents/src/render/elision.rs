@@ -6,8 +6,9 @@
 
 use std::borrow::Borrow;
 
-use rho_registry::render::{UiBlock, UiMessagePhase};
 use rho_ui_proto::MessageDelivery;
+
+use crate::state::{UiBlock, UiMessagePhase};
 
 pub const LIMITED_TAIL_ROWS: u32 = 12;
 
@@ -159,9 +160,8 @@ fn block_is_working(block: &UiBlock) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_registry::render::{UiMessagePhase, UiTool, UiToolStatus};
-
     use super::*;
+    use crate::state::{UiMessagePhase, UiTool, UiToolStatus};
 
     fn user(text: &str) -> UiBlock {
         UiBlock::UserMessage {

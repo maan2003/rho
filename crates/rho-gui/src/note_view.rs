@@ -10,9 +10,9 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec, SectionSpec};
+use rho_agents::HostId;
 use text::{BufferId, ReplicaId};
 
-use crate::registry::HostId;
 use crate::workspace::Workspace;
 
 /// Generated row buffers share a multibuffer with a note's body, whose id

@@ -236,7 +236,7 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
 thread_local! {
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
-    static MODEL: RefCell<(crate::model::Model, std::collections::HashSet<crate::registry::HostId>)> =
+    static MODEL: RefCell<(crate::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
         RefCell::new((crate::model::Model::new(), std::collections::HashSet::new()));
 }
 
@@ -245,7 +245,7 @@ thread_local! {
 /// thread and can assert in the frame it fed.
 pub fn feed(
     workspace: &mut crate::workspace::Workspace,
-    host: crate::registry::HostId,
+    host: rho_agents::HostId,
     event: ConnEvent,
     window: &mut gpui::Window,
     cx: &mut gpui::Context<crate::workspace::Workspace>,

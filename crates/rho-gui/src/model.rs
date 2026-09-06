@@ -16,12 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(not(test))]
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
+use rho_agents::{HostId, Verdict};
 use rho_hosts::connection::{Commands, ConnEvent, HostEvent};
-use rho_registry::Verdict;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 use rho_ui_proto::{AgentId, ClientMessage};
-
-use crate::registry::HostId;
 
 /// What the main thread hears from the model.
 pub(crate) enum ModelMsg {
@@ -29,13 +27,13 @@ pub(crate) enum ModelMsg {
     /// after the copy started over. What the main thread had for the host
     /// is gone; this is what there is instead.
     Loaded {
-        agents: Vec<rho_registry::MirroredAgent>,
+        agents: Vec<rho_agents::MirroredAgent>,
         verdicts: Vec<(AgentId, Verdict)>,
     },
     /// The agents a run of the log moved, as they now stand. One message
     /// per page once caught up, and one for a whole catch-up.
     Changed {
-        agents: Vec<rho_registry::MirroredAgent>,
+        agents: Vec<rho_agents::MirroredAgent>,
     },
     /// Rows of an agent the main thread follows, for the fold behind its
     /// transcript. Nothing else carries rows.
@@ -119,7 +117,7 @@ impl HostModel {
 /// The fold of every agent, the cursors, and who is followed.
 pub(crate) struct Model {
     hosts: HashMap<HostId, HostModel>,
-    agents: BTreeMap<AgentId, rho_registry::MirroredAgent>,
+    agents: BTreeMap<AgentId, rho_agents::MirroredAgent>,
     followed: BTreeSet<AgentId>,
     /// The disk copy, read once: hosts are attached one at a time and each
     /// takes the agents filed under its name.
@@ -183,7 +181,7 @@ impl Model {
             if mirrored.host != name {
                 continue;
             }
-            agents.push(rho_registry::MirroredAgent {
+            agents.push(rho_agents::MirroredAgent {
                 host,
                 identity: mirrored.snapshot.identity.clone(),
                 digest: mirrored.snapshot.digest.clone(),
@@ -302,15 +300,13 @@ impl Model {
                 Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
                 // A row for an agent whose creation this client never
                 // heard says nothing; without it nothing can be folded.
-                None => {
-                    match rho_registry::MirroredAgent::new(host, entry.agent_id, &entry.event) {
-                        Some(mirrored) => {
-                            self.agents.insert(entry.agent_id, mirrored);
-                            true
-                        }
-                        None => false,
+                None => match rho_agents::MirroredAgent::new(host, entry.agent_id, &entry.event) {
+                    Some(mirrored) => {
+                        self.agents.insert(entry.agent_id, mirrored);
+                        true
                     }
-                }
+                    None => false,
+                },
             };
             if !told {
                 continue;

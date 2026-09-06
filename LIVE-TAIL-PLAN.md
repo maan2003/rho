@@ -9,7 +9,8 @@ and why. Proofs on a `cp` of the store only; never touch the live DB.
 - The log is the truth. Anything derivable from rows is derived on
   the client, never carried on the wire a second time.
 - Nothing on the wire is named `Ui*`. `rho-ui-proto` carries facts;
-  render types live in `rho-registry`.
+  render types live in `rho-agents::state` (they were `rho-registry`'s
+  `render` until the map cut absorbed that crate).
 - The daemon does not diff, snapshot, or project. The loop says what
   changed as it changes it.
 - Focus never loads. Commands load.
@@ -88,7 +89,7 @@ cancels (`Turn Ended(..)`), turn running, `context_used` (last
 Superseded in shape by `GUI-MODEL-DESIGN.md` (6 Sep): no registry, no per-event rebuilds, the model off the main thread. What landed here is recorded in the step notes below.
 
 - `UiAgentState`, `UiBlock`, `UiAgentStatus`, tool metadata types move
-  from `rho-ui-proto::remote` to `rho-registry` as the render model,
+  from `rho-ui-proto::remote` to `rho-agents::state` as the render model,
   built from rows and `Item`s. `UiAgentUsage` goes (cost is the digest).
 - Transcript fold becomes incremental: `TranscriptFold { state, next,
   open_calls: call_id -> block index, block_origin: Vec<AgentPos> }`
@@ -138,7 +139,7 @@ Landed as planned, with these deviations and leftovers:
 - Attention needs one more user fact than `handled_through`: whether
   the agent is muted. `Verdict { handled_through, muted }` is what the
   registry keeps and the mirror stores (`gui_agent_verdict_v1`); the
-  attention table is retired. `rho_registry::attention` is the one
+  attention table is retired. `rho_agents::attention` is the one
   decision; the desk card and the registry both call it.
 - A verdict is written in its own transaction, when it changes. It is
   the user's fact, not derived from rows, so nothing can diverge.

@@ -24,13 +24,13 @@ use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Wind
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
-use rho_registry::now_ms;
-use rho_registry::render::UiAgentState;
-use rho_registry::store::FrameSummary;
 use rho_ui_proto::AgentId;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
+use crate::now_ms;
+use crate::state::UiAgentState;
+use crate::store::FrameSummary;
 use crate::transcript::TranscriptModel;
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;

@@ -16,10 +16,10 @@
 //! scorer noticing.
 
 use gpui::{App, Context, Window};
+use rho_agents::HostId;
 use rho_core::AgentId;
 
 use crate::minibuffer::Candidate;
-use crate::registry::HostId;
 use crate::workspace::Workspace;
 
 /// A match is worth this much before bonuses.

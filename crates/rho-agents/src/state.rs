@@ -51,12 +51,12 @@ pub enum UiBlock {
         text: String,
         delivery: MessageDelivery,
         /// The sending agent; `None` for the user.
-        sender: Option<crate::AgentId>,
+        sender: Option<rho_ui_proto::AgentId>,
     },
     /// A delivered message from another agent.
     AgentMessage {
         /// The sending agent.
-        sender: crate::AgentId,
+        sender: rho_ui_proto::AgentId,
         text: String,
     },
 }

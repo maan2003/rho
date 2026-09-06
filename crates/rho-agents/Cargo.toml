@@ -11,6 +11,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 camino.workspace = true
 collections = { path = "../../vendor/zed/crates/collections" }
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
@@ -19,12 +20,13 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+prefix-id = { workspace = true, default-features = false }
 rho-core.workspace = true
 rho-hosts = { workspace = true }
-rho-registry = { workspace = true }
 rho-ui-proto.workspace = true
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
+senax-encoder.workspace = true
 serde_json.workspace = true
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }

@@ -78,8 +78,8 @@ wrong at the design, not at the polish.
   `rho_hosts::HostId` rather than defining its own. Gate green: rho-gui 277,
   rho-hosts 14, rho-registry 14.
 - **`rho-agents`.** The model thread (`Model::ingest`), the agent mirror
-  on disk, the agents map and its indexes (what remains of
-  `rho-registry`), the transcript, creation, Find over agents, and the
+  on disk, the agents map and its indexes (`rho-registry` is now part of
+  this crate), the transcript, creation, Find over agents, and the
   agent screens. Tested end to end against a fake daemon. Selection and
   the active pane are not agent state and go to `rho-window`. Owner:
   eng-b8os.
@@ -182,6 +182,123 @@ wrong at the design, not at the polish.
   screen tests moved with their modules; no test was added, dropped or
   rewritten), rho-window 1, rho-hosts 14, rho-registry 14; clippy
   `-D warnings` green over the three crates.
+
+  *Landed, the map and its indexes (4).* `rho-registry` is gone; what it
+  held is this crate's. The map is `AgentMap`: every agent the client
+  knows, what each one is and what happened to it, the user's filing over
+  the top, and the indexes the screens read it through. `fold`, `store`
+  and `session` came with it unchanged; the old `render` module is `state`
+  here, because this crate already has a `render` that turns a block into
+  spans and the two are not the same thing — one is what a client shows of
+  an agent, the other is how it is drawn.
+
+  This is the first crate held to the cost rule from its first line, so
+  the shape is the rule. What was there before made everything again on
+  every event: one told agent rebuilt every row, cloned every summary into
+  its host's snapshot, re-collected the parent and tag indexes, re-sorted
+  them, and swept the verdicts — and inside that pass, `order.contains`
+  per agent made a first sync quadratic. It is now one write per changed
+  agent into indexes that are kept, never remade.
+
+  What each event costs, for `k` changed in a map of `n`, all of it stated
+  at the top of `map.rs` where the next person will read it:
+
+  - told about agents (`told`, `restore`, `tell`): `k log n`, plus `k log
+    k` to sort the ones this client has never seen into the front of the
+    order.
+  - the user's filing (`set_agent_filings`): `k log n`, and nothing at all
+    when the filing offered is the filing already held.
+  - a verdict, an activity, a touch, a life change: one lookup.
+  - a host detaching or starting over: `k log n` in the agents that
+    departed, and nothing walks the agents that did not. `detach_host` and
+    `reset_host` now return the departed set rather than reaching into
+    the window to move the point.
+
+  And what each read a screen makes costs:
+
+  - a row's own facts (`agent_facts`, `attention`, `agent_display_label`,
+    `agent_human_name`, `agent_hidden`): one lookup each, so a frame costs
+    the rows it draws. The dashboard is synced on events and drawn from
+    its buffer, so a frame makes no pass over the map at all.
+  - `agent_children`: the children. `agent_subtree`: the subtree it
+    returns, plus sorting it.
+  - `next_agent`: a lookup and the agents it steps over. The order is an
+    index of keys handed out once — a newly discovered agent takes a key
+    below every key in use, so it goes to the front without renumbering
+    anyone, and stepping is a range on the visible set rather than
+    collecting the visible agents to find a position in them.
+  - `agent_by_tag`: a binary search of one host's agents of one role.
+    `host_agents`: the host's agents, from the host index rather than a
+    walk of the map asking each agent where it came from.
+
+  The one read still proportional to the map is `agent_by_label`, which
+  walks every agent asking what it is called; it answers what the user
+  typed in the minibuffer, and it is written down in `map.rs` rather than
+  indexed before anything is slow.
+
+  Two answers rather than quiet carrying. `HostSnapshot::agents` — a full
+  clone of every summary, per host, per event — was written and never
+  read: residue, deleted. `next_attention_agent` had no caller anywhere;
+  I built the attention index it would have read, found nothing reads it,
+  and deleted both rather than keep an index for decoration. The attention
+  reads the screens do make are per drawn row and per heading, and both
+  are lookups. One thing for the user rather than for me: `AgentNext` and
+  `AgentPrevious` have handlers and no key in the keymap, so the order
+  index serves an action the fingers cannot reach. Either they get keys or
+  they are residue.
+
+  `rho-window` modules touched: `selection`, new — `ActivePane` and the
+  point that goes with it are the window's, not the map's. The map no
+  longer knows which agent is selected: `next_agent` takes it as an
+  argument, and `Selection::forget` moves the point out of an agent that
+  departed. The workspace holds the `Selection` beside the map it reads.
+  `rho-window`'s other modules, `transient` included, were not touched.
+
+  The rig caught what no test could. On the user's snapshot the client
+  died on startup: redb records the Rust path of a table's value type, and
+  `gui_agent_verdict_v1` was written as
+  `rho-db::Sen<rho_registry::fold::Verdict>`. Renaming the crate renamed
+  the type, and every existing mirror — the user's included — would have
+  been refused with a `TableTypeMismatch` the first time the new client
+  opened it. The table now names itself through `rho_db::SenAs` with the
+  name it was written under, which is what that type exists for; the bytes
+  on disk never changed. Nothing in the unit tests could have found this,
+  because it only happens against a database written by an older build.
+
+  Measured on `user-2026-09-06`, desk rig session 8, moving through the
+  map on Home sixty times with the profiler on. The line `rig down`
+  printed, verbatim:
+
+  > 281 frames, draw p99 2.7 ms, 0 over 8 ms; worst gap 325 ms, p99 11 ms;
+  > 21798 events, slowest stage buffer_edit p99 0.12 ms at 2 rows; 192
+  > samples on rho-gui: `__syscall_cancel_arch_end` 5%,
+  > `__memcpy_avx512_unaligned_erms` 4%, `eq` 4%
+
+  Per frame: draw p99 2.7 ms, max 3.3 ms, nothing over the 8 ms bar. Per
+  event: the slowest editor stage in 21,798 events is the one that edited
+  two rows, and it cost 0.12 ms — time tracking what was touched and not
+  the 2.5 million rows behind it, which is the shape the rule asks for.
+  The worst gap of 325 ms is frame 4, the first sync of the whole desk
+  after startup; the p99 is 11 ms and every gap after frame 4 is under
+  5 ms. The map appears in the CPU profile only as B-tree searches for one
+  agent's row — `search_tree` over `AgentSummary` and `MirroredAgent` —
+  and never as a pass over the map. No map symbol is in the top three.
+
+  One number that fails, and it is not the map's. Session 7 opened and
+  closed an agent twenty times, one of them a 262k-token transcript: 281
+  frames, draw p99 12.3 ms, 5 over 8 ms, worst gap 500 ms, and the slowest
+  stage `wrap_map_update` p99 7,122 ms at 121,252 rows. That is the
+  editor wrapping a whole transcript buffer when the screen opens — it
+  predates this cut, nothing here touches it, and the wrap runs off the
+  frame loop so the window kept drawing. It is the transcript screen's
+  number and it fails the handbook's bar, so it is written down here
+  rather than left in a profile nobody reads.
+
+  Gate green: rho-agents 59 (the 14 that were rho-registry's, plus three
+  new ones over the order, the filing and what the indexes say after a
+  reparent and a host reset), rho-gui 243, rho-window 11 (`selection`
+  brought one), rho-hosts 14; workspace clippy `-D warnings` green; the
+  workspace has one crate fewer.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

@@ -2,9 +2,8 @@
 //! show.
 
 use camino::Utf8PathBuf;
+use rho_agents::HostId;
 use rho_ui_proto::AgentId;
-
-use crate::registry::HostId;
 
 /// Stable identity of a surface, independent of its live view entity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

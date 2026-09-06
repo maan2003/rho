@@ -3,16 +3,15 @@ use std::rc::Rc;
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
+use rho_agents::{Attention, HostId};
 use rho_desk::cells::{
     BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Project, Property, PropertyKey,
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
-use rho_registry::Attention;
 use rho_ui_proto::ClientMessage;
 use text::{BufferId, ReplicaId};
 
-use crate::registry::HostId;
 use crate::workspace::Workspace;
 
 struct HostDeskCells {
@@ -348,8 +347,8 @@ pub fn agent_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<AgentCard
     };
     let source = sources.agent(*agent)?;
     let cursor = facts.agent_handled_through.unwrap_or_default();
-    let attention = rho_registry::attention(
-        rho_registry::AttentionFacts {
+    let attention = rho_agents::attention(
+        rho_agents::AttentionFacts {
             turn_running: source.turn_running,
             errored: source.errored.map(agent_pos),
             wants_at: source.wants.map(|(_, at)| agent_pos(at)),
@@ -375,8 +374,8 @@ fn agent_pos(pos: StoryPos) -> rho_ui_proto::mirror::AgentPos {
 }
 
 /// The user's verdict on an agent, as the store holds it.
-fn verdict(facts: &Facts) -> rho_registry::Verdict {
-    rho_registry::Verdict {
+fn verdict(facts: &Facts) -> rho_agents::Verdict {
+    rho_agents::Verdict {
         handled_through: agent_pos(facts.agent_handled_through.unwrap_or_default()),
         muted: facts.state == State::Muted,
     }
@@ -955,7 +954,7 @@ impl DeskCells {
     /// the registry; this is where the registry gets it.
     /// The user's verdict on each agent of this host, for the registry
     /// to derive attention from.
-    pub fn agent_verdicts(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_registry::Verdict)> {
+    pub fn agent_verdicts(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_agents::Verdict)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };

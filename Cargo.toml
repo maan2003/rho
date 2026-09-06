@@ -29,7 +29,6 @@ members = [
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
   "crates/rho-qa",
-  "crates/rho-registry",
   "crates/rho-rpc",
   "crates/rho-rtc",
   "crates/rho-shell",
@@ -131,7 +130,6 @@ rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-hosts = { path = "crates/rho-hosts" }
 rho-window = { path = "crates/rho-window" }
-rho-registry = { path = "crates/rho-registry" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "crates/rho-shell" }

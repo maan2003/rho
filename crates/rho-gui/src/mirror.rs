@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use redb::TableDefinition;
-use rho_db::{RhoDb, Sen, SenValue};
-use rho_registry::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
+use rho_agents::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
+use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 
@@ -46,8 +46,21 @@ const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
 /// has it again.
-const VERDICTS: TableDefinition<AgentId, Sen<Verdict>> =
+const VERDICTS: TableDefinition<AgentId, SenAs<Verdict, VerdictName>> =
     TableDefinition::new("gui_agent_verdict_v1");
+
+/// The name this table was written under, from before `Verdict` moved
+/// with the registry into `rho-agents`. redb records the Rust path of a
+/// value type and refuses a database whose table says another one, so a
+/// crate that is renamed takes every user's mirror with it unless the
+/// name is pinned here. What is on disk is unchanged; only the path in
+/// the type's name moved.
+#[derive(Debug)]
+struct VerdictName;
+
+impl RecordedTypeName for VerdictName {
+    const NAME: &'static str = "rho-db::Sen<rho_registry::fold::Verdict>";
+}
 /// The rows the story kept, and the attention the view once stored.
 /// Nothing reads them.
 const RETIRED_TABLES: [&str; 3] = [
@@ -185,8 +198,8 @@ impl Mirror {
                 }
                 let events = self.read_events(agent_id);
                 let (first, rest) = events.split_first()?;
-                let mut fold = rho_registry::MirroredAgent::new(
-                    rho_registry::HostId::default(),
+                let mut fold = rho_agents::MirroredAgent::new(
+                    rho_agents::HostId::default(),
                     agent_id,
                     &first.1,
                 )?;
@@ -600,8 +613,8 @@ mod tests {
 
     /// What the registry makes of a run of one agent's rows.
     fn snapshot(entries: &[LogEntry]) -> AgentSnapshot {
-        let mut mirrored = rho_registry::MirroredAgent::new(
-            rho_registry::HostId::default(),
+        let mut mirrored = rho_agents::MirroredAgent::new(
+            rho_agents::HostId::default(),
             entries[0].agent_id,
             &entries[0].event,
         )

@@ -452,8 +452,9 @@ impl gpui::Render for HomeView {
 
 #[cfg(test)]
 mod tests {
+    use rho_agents::HostId;
+
     use super::*;
-    use crate::registry::HostId;
 
     fn card(title: &str, priority: f64) -> DealCard {
         DealCard {

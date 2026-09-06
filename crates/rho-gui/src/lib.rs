@@ -29,11 +29,7 @@ pub mod transient;
 pub mod workspace;
 pub(crate) mod zed_remote;
 
-// The registry and per-agent frame store live in a shared crate. These aliases
-// preserve the existing module paths in the client views.
 use gpui::{App, KeyBinding, actions};
-pub use rho_registry as registry;
-pub use rho_registry::store;
 
 actions!(
     rho_gui,

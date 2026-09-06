@@ -15,7 +15,7 @@ use rho_ui_proto::mirror::{
 use rho_ui_proto::{AgentUsageBucket, WorkspaceInfo};
 
 use crate::HostId;
-use crate::render::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiTool, UiToolStatus};
+use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiTool, UiToolStatus};
 
 /// How much an agent wants the user, as the view decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]

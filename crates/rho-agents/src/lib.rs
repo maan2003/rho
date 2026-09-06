@@ -18,10 +18,32 @@
 pub mod agent_view;
 pub mod create;
 pub mod find;
+pub mod fold;
+pub mod map;
 pub mod render;
+pub mod session;
+pub mod state;
+pub mod store;
 pub mod transcript;
 
 pub use agent_view::{AgentModel, AgentModelEvent};
 pub use create::{StartBase, StartFieldMode};
 pub use find::AgentHit;
+pub use fold::{
+    AgentIdentity, Attention, AttentionFacts, DIGEST_VERSION, Digest, MirroredAgent,
+    TranscriptFold, Verdict, Wants, attention, one_line, transcript,
+};
+pub use map::{AgentFacts, AgentLife, AgentMap, AgentSummary, HIDE_LABEL};
+pub use rho_hosts::HostId;
+
+/// Now, in Unix milliseconds, saturating rather than panicking on a clock
+/// that says something impossible.
+pub fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 pub use transcript::{FrameChange, TranscriptFrame, Transcripts};

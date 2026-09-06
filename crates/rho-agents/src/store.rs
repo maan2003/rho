@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::mirror::{Item, Live};
 
-use crate::render::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
+use crate::state::{UiAgentState, UiAgentStatus, UiBlock, UiTool, UiToolStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSummary {

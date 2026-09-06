@@ -6,8 +6,9 @@
 //! agent ended up with: they remember the label, or the thing they last
 //! asked for. Every one of those names finds it.
 
-use rho_registry::AgentRegistry;
 use rho_ui_proto::AgentId;
+
+use crate::map::AgentMap;
 
 /// One agent as an answer to a query: the name a row shows for it, the
 /// other names it answers to, and how recently it was used.
@@ -33,7 +34,7 @@ pub struct AgentHit {
 
 /// The agent as a hit, under the title the tree gives it. `None` means the
 /// tree has no title, and the agent's own name stands in.
-pub fn hit(registry: &AgentRegistry, agent_id: AgentId, title: Option<String>) -> AgentHit {
+pub fn hit(registry: &AgentMap, agent_id: AgentId, title: Option<String>) -> AgentHit {
     let title = title.unwrap_or_else(|| registry.agent_human_name(agent_id));
     let mut aka = vec![registry.agent_id_label(agent_id)];
     if let Some(said) = registry.agent_last_user_message(agent_id)
@@ -56,13 +57,13 @@ pub fn hit(registry: &AgentRegistry, agent_id: AgentId, title: Option<String>) -
 mod tests {
     use rho_core::{MessageDelivery, UnixMs};
     use rho_hosts::HostId;
-    use rho_registry::MirroredAgent;
     use rho_ui_proto::AgentIdDomain;
     use rho_ui_proto::mirror::{
         AgentPos, MirrorEvent, RuntimeKind, SpawnedBy, TurnEdge, TurnOutcome,
     };
 
     use super::*;
+    use crate::MirroredAgent;
 
     fn agent() -> AgentId {
         AgentId::from_counter(1, &AgentIdDomain(0)).expect("an agent id")
@@ -94,7 +95,7 @@ mod tests {
 
     /// The agent as the model thread hands it up: its first row, then the
     /// rows after it folded into the same digest.
-    fn told(registry: &mut AgentRegistry, events: Vec<MirrorEvent>) {
+    fn told(registry: &mut AgentMap, events: Vec<MirrorEvent>) {
         let host = HostId::default();
         registry.set_host_data(host, 0, 1);
         let mut rows = events.into_iter();
@@ -111,7 +112,7 @@ mod tests {
     /// name the agent answers to even though no row shows it.
     #[test]
     fn an_agent_answers_to_what_was_last_said_to_it() {
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
         told(
             &mut registry,
             vec![
@@ -140,7 +141,7 @@ mod tests {
     /// was last said is not repeated as an alias.
     #[test]
     fn a_title_is_not_repeated_as_an_alias() {
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
         told(&mut registry, vec![created(1), said("mirror test", 2)]);
 
         let hit = hit(&registry, agent(), Some("mirror test".to_owned()));
@@ -151,7 +152,7 @@ mod tests {
     /// name rather than showing it as untitled.
     #[test]
     fn an_untitled_agent_is_shown_by_its_own_name() {
-        let mut registry = AgentRegistry::default();
+        let mut registry = AgentMap::default();
         told(&mut registry, vec![created(1), said("write the note", 2)]);
 
         let hit = hit(&registry, agent(), None);

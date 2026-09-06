@@ -1124,7 +1124,7 @@ impl Workspace {
 fn cards_before(
     cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
     facts: &std::collections::HashMap<SlackUnit, SlackFacts>,
-    host: Option<crate::registry::HostId>,
+    host: Option<rho_agents::HostId>,
     before: f64,
 ) -> Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> {
     cards
@@ -1285,7 +1285,7 @@ mod tests {
     /// newest message is newer than it stays open, however old the card is.
     #[test]
     fn only_cards_older_than_the_cutoff_are_closed() {
-        let host = crate::registry::HostId::default();
+        let host = rho_agents::HostId::default();
         let node = |counter: u8| rho_desk::cells::Id::Note(rho_desk::cells::Uuid([counter; 16]));
         let card = |node_id| crate::dashboard::DealCardId { host, node_id };
         let cards = vec![

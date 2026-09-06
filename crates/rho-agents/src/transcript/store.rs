@@ -8,11 +8,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rho_registry::TranscriptFold;
-use rho_registry::render::UiAgentState;
-use rho_registry::store::{AgentStore, FrameSummary};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::mirror::{AgentPos, MirrorEvent};
+
+use crate::TranscriptFold;
+use crate::state::UiAgentState;
+use crate::store::{AgentStore, FrameSummary};
 
 /// One change to an agent's transcript: a delta to the runtime's live
 /// tail, or the fold of its mirror made again.
@@ -22,7 +23,7 @@ pub enum TranscriptFrame {
     /// nothing else: a transcript is handed once and appended to after.
     Fold(UiAgentState),
     /// The rows one telling of the mirror moved.
-    Folded(rho_registry::fold::FoldDelta),
+    Folded(crate::fold::FoldDelta),
 }
 
 /// What a frame did, for a caller deciding what to redraw.
@@ -99,7 +100,7 @@ impl Transcripts {
         &mut self,
         agent_id: AgentId,
         rows: &[(AgentPos, MirrorEvent)],
-    ) -> Option<rho_registry::fold::FoldDelta> {
+    ) -> Option<crate::fold::FoldDelta> {
         let fold = self.open.get_mut(&agent_id)?;
         let mut refolded = false;
         for (pos, event) in rows {

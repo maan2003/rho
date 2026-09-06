@@ -9,17 +9,18 @@ use gpui::{
     MouseDownEvent, MouseUpEvent, TestAppContext, TouchEvent, TouchId, TouchPhase, WindowHandle,
     point, px, size,
 };
-use rho_core::UnixMs;
-use rho_hosts::connection::ConnEvent;
-use rho_registry::render::{
+use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
+use rho_core::UnixMs;
+use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod story;
-use crate::registry::HostId;
+use rho_agents::HostId;
+
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
 #[test]
@@ -3910,7 +3911,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
         },
     );
     feed_edit(&workspace, cx, agent(1), |state| {
-        state.usage = rho_registry::render::UiAgentUsage {
+        state.usage = rho_agents::state::UiAgentUsage {
             provider: "fable".to_owned(),
             total: rho_ui_proto::AgentUsageBucket {
                 input_tokens: 1_000_000,
@@ -3969,7 +3970,7 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
             blocks: vec![Arc::new(user("go"))],
             status: UiAgentStatus::Idle,
             context_used: Some(62_300),
-            usage: rho_registry::render::UiAgentUsage {
+            usage: rho_agents::state::UiAgentUsage {
                 provider: "fable".to_owned(),
                 total: rho_ui_proto::AgentUsageBucket {
                     input_tokens: 1_000_000,
@@ -9256,7 +9257,7 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
 /// running agent has no card.
 #[test]
 fn an_agents_state_comes_from_its_head() {
-    use rho_registry::AgentFacts;
+    use rho_agents::AgentFacts;
 
     let now = chrono::Local::now().fixed_offset();
     let running = AgentFacts {

@@ -10,9 +10,10 @@ pub mod elision;
 use std::ops::Range;
 use std::time::Duration;
 
-use rho_registry::render::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 use rho_ui_proto::{AgentId, MessageDelivery};
 use rho_window::style::StyleClass;
+
+use crate::state::{UiBlock, UiMessagePhase, UiTool, UiToolStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
