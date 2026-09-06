@@ -5142,6 +5142,85 @@ fn searching_a_transcript_composes_the_history_it_looks_through(cx: &mut TestApp
     );
 }
 
+/// A search that cannot be repeated is half a search: `n` runs the last
+/// query again from the point, and `shift-n` runs it the other way.
+#[gpui::test]
+fn n_repeats_a_transcript_search_and_shift_n_runs_it_backwards(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+
+    cx.simulate_keystrokes(*workspace, "escape / l i n e space t w o enter");
+    cx.run_until_parked();
+    let first = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on a match");
+
+    cx.simulate_keystrokes(*workspace, "n");
+    cx.run_until_parked();
+    let second = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on a match");
+    assert!(
+        second > first,
+        "`n` moves on to the next match, not back to the same one"
+    );
+
+    cx.simulate_keystrokes(*workspace, "shift-n");
+    cx.run_until_parked();
+    assert_eq!(
+        transcript_point_block(&workspace, cx, agent(1)),
+        Some(first),
+        "`shift-n` runs the same search the other way"
+    );
+}
+
+/// The one thing a reader has to be told about a repeat is that it went
+/// round the end of the buffer.
+#[gpui::test]
+fn a_repeat_that_wraps_says_so(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+
+    // The last turn's third line occurs once, so the repeat has nowhere to
+    // go but round.
+    cx.simulate_keystrokes(
+        *workspace,
+        "escape / t u r n space 1 9 9 space l i n e space t h r e e enter",
+    );
+    cx.run_until_parked();
+    let only = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on the match");
+
+    cx.simulate_keystrokes(*workspace, "n");
+    cx.run_until_parked();
+    assert_eq!(
+        transcript_point_block(&workspace, cx, agent(1)),
+        Some(only),
+        "the only match is where a wrapped search lands"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .echo_text_for_test()
+                .map(str::to_owned))
+            .expect("read the echo line"),
+        Some("search: wrapped to the top".to_owned()),
+        "the echo line says a search wrapped"
+    );
+}
+
+/// `n` with nothing to repeat is vim's `n`, which does nothing here: the
+/// action gives the key back rather than moving the point.
+#[gpui::test]
+fn n_with_nothing_to_repeat_leaves_the_point_alone(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    cx.run_until_parked();
+
+    let before = transcript_point_block(&workspace, cx, agent(1));
+    cx.simulate_keystrokes(*workspace, "escape n");
+    cx.run_until_parked();
+    assert_eq!(transcript_point_block(&workspace, cx, agent(1)), before);
+}
+
 #[gpui::test]
 fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

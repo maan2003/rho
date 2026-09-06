@@ -341,9 +341,17 @@ wrong at the design, not at the polish.
     this cut. Vim emits `EditorEvent::SearchRequested` because this app
     has no zed pane, and the only listener was the dashboard's. The
     surface now hosts one, the same minibuffer search the dashboard has.
-    What it does not yet have is `n`/`N` to repeat, which is vim's and
-    needs the same treatment; it is written down here rather than
-    discovered.
+    `n` and `N` repeat it, landed straight after this cut: a search runs
+    from the point rather than from the top of the buffer, wraps once and
+    says so in the echo line when it does, and the query is the
+    workspace's — one search register, as vim has one, so a query typed in
+    a transcript repeats on the desk and the other way about. Vim's own
+    `n` does nothing in this app, because it goes through a pane's search
+    bar and there is no pane, which is the same reason `/` is the host's;
+    the binding sits before the surfaces that want `n` for themselves (the
+    Zulip inbox and the Slack rooms, for the next unread), so those keep
+    it, and everywhere else the action gives the key back when there is
+    nothing to repeat.
   - **The point survives leaving and returning**, and it survives as a
     store position — which block, and how far into it — never a buffer
     offset. `AgentModel` remembers it whenever the point moves in the
