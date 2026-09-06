@@ -1617,14 +1617,17 @@ impl ClaudeLoop {
             // to be): its row comes from there. The live tail empties
             // first, so a reader never holds the message twice.
             rho_claude::ClaudeEvent::Assistant(message) => {
-                self.pending_response = PendingInferenceResponse::default();
-                self.stream_items.clear();
                 let line = message
                     .parent_tool_use_id
                     .is_none()
                     .then(|| line_uuid(message.uuid.as_deref()))
                     .flatten();
+                // The row first, then the live tail lets go of the same
+                // text: a reader holds it twice for an instant rather than
+                // not at all while the file catches up.
                 self.sync_transcript(line).await;
+                self.pending_response = PendingInferenceResponse::default();
+                self.stream_items.clear();
                 self.set_streaming_kind();
             }
             rho_claude::ClaudeEvent::User(message) => {

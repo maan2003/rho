@@ -10,7 +10,7 @@ use std::sync::Arc;
 use rho_core::{AgentId, AgentRole, UnixMs};
 use rho_ui_proto::mirror::{
     AgentPos, AgentWant, MirrorEvent, PresentationField, RuntimeKind, SpawnedBy, Speaker,
-    ToolStatus, TurnEdge, TurnOutcome,
+    ToolOutcome, ToolStatus, TurnEdge, TurnOutcome,
 };
 use rho_ui_proto::{AgentUsageBucket, WorkspaceInfo};
 
@@ -222,6 +222,7 @@ impl Digest {
             | MirrorEvent::CompactionRequested { .. }
             | MirrorEvent::QueueCleared { .. }
             | MirrorEvent::Sent { .. }
+            | MirrorEvent::Results { .. }
             | MirrorEvent::Replied { .. }
             | MirrorEvent::Failed { .. } => {}
         }
@@ -356,6 +357,8 @@ pub struct TranscriptFold {
     queue: Vec<(AgentPos, UiBlock)>,
     turn_running: bool,
     errored: bool,
+    /// What the last reply said the context holds, and where it said it.
+    context_used: Option<(AgentPos, u64)>,
     digest: Digest,
 }
 
@@ -376,6 +379,27 @@ impl TranscriptFold {
     fn push(&mut self, pos: AgentPos, block: UiBlock) {
         self.blocks.push(Arc::new(block));
         self.told_at.push(pos);
+    }
+
+    /// Each result lands on the call it answers.
+    fn finish_calls(&mut self, results: &[ToolOutcome]) {
+        for result in results {
+            let called = self
+                .blocks
+                .iter()
+                .rposition(|block| matches!(&**block, UiBlock::Tool(tool) if tool.id == result.id));
+            if let Some(index) = called
+                && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
+            {
+                tool.status = match result.status {
+                    ToolStatus::Success => UiToolStatus::Success,
+                    ToolStatus::Error => UiToolStatus::Error,
+                    ToolStatus::Cancelled => UiToolStatus::Cancelled,
+                };
+                tool.started_at = Some(result.started_at);
+                tool.finished_at = Some(result.finished_at);
+            }
+        }
     }
 
     /// Folds one row. Positions already held are skipped, so a repeated
@@ -426,30 +450,20 @@ impl TranscriptFold {
                         },
                     );
                 }
-                for result in results {
-                    let called = self.blocks.iter().rposition(
-                        |block| matches!(&**block, UiBlock::Tool(tool) if tool.id == result.id),
-                    );
-                    if let Some(index) = called
-                        && let UiBlock::Tool(tool) = Arc::make_mut(&mut self.blocks[index])
-                    {
-                        tool.status = match result.status {
-                            ToolStatus::Success => UiToolStatus::Success,
-                            ToolStatus::Error => UiToolStatus::Error,
-                            ToolStatus::Cancelled => UiToolStatus::Cancelled,
-                        };
-                        tool.started_at = Some(result.started_at);
-                        tool.finished_at = Some(result.finished_at);
-                    }
-                }
+                self.finish_calls(results);
             }
+            MirrorEvent::Results { results, .. } => self.finish_calls(results),
             MirrorEvent::Replied {
                 text,
                 calls,
                 compacted,
+                context_used,
                 at,
                 ..
             } => {
+                if let Some(used) = context_used {
+                    self.context_used = Some((pos, *used));
+                }
                 if !text.is_empty() {
                     self.push(
                         pos,
@@ -573,6 +587,9 @@ impl TranscriptFold {
                 self.blocks.truncate(kept);
                 self.told_at.truncate(kept);
                 self.queue.retain(|(queued_at, _)| queued_at < to);
+                if self.context_used.is_some_and(|(said_at, _)| said_at >= *to) {
+                    self.context_used = None;
+                }
             }
             MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
@@ -603,7 +620,7 @@ impl TranscriptFold {
             } else {
                 UiAgentStatus::Idle
             },
-            context_used: None,
+            context_used: self.context_used.map(|(_, used)| used),
             usage: UiAgentUsage {
                 provider: self.digest.usage_model.clone(),
                 total: self.digest.usage.clone(),
@@ -736,6 +753,53 @@ mod tests {
             MirrorEvent::QueueCleared { at: UnixMs(2) },
         ]);
         assert!(state.blocks.is_empty());
+    }
+
+    /// A Claude agent's tool results carry nothing out of the queue: the
+    /// message waits until Claude's own echo of it.
+    #[test]
+    fn results_alone_leave_the_queue_where_it_is() {
+        let state = told(vec![
+            user("later", 1),
+            MirrorEvent::Results {
+                results: Vec::new(),
+                at: UnixMs(2),
+            },
+        ]);
+        assert_eq!(state.blocks.len(), 1);
+        assert!(matches!(*state.blocks[0], UiBlock::QueuedMessage { .. }));
+    }
+
+    fn replied_with_context(used: u64, at: u64) -> MirrorEvent {
+        MirrorEvent::Replied {
+            text: String::new(),
+            calls: Vec::new(),
+            compacted: false,
+            usage: None,
+            context_used: Some(used),
+            at: UnixMs(at),
+        }
+    }
+
+    #[test]
+    fn the_last_reply_says_how_full_the_context_is() {
+        let state = told(vec![
+            replied_with_context(10, 1),
+            replied_with_context(12, 2),
+        ]);
+        assert_eq!(state.context_used, Some(12));
+        let state = told(vec![
+            replied_with_context(10, 1),
+            replied_with_context(12, 2),
+            MirrorEvent::Rewound {
+                to: AgentPos(1),
+                at: UnixMs(3),
+            },
+        ]);
+        assert_eq!(
+            state.context_used, None,
+            "said by a reply the rewind took back"
+        );
     }
 
     /// The error text is the trailing notice, which is what `Error` status

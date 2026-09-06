@@ -213,6 +213,13 @@ pub enum MirrorEvent {
         compaction: bool,
         at: UnixMs,
     },
+    /// Calls came back with these results and nothing else moved: what
+    /// was queued is still queued. A Claude agent's tool results; a Rho
+    /// request, which carries the queue, is `Sent`.
+    Results {
+        results: Vec<ToolOutcome>,
+        at: UnixMs,
+    },
     /// The model answered.
     Replied {
         /// What it said, whole. Empty when it only called tools.
@@ -272,6 +279,7 @@ impl MirrorEvent {
             | Self::CompactionRequested { at }
             | Self::QueueCleared { at }
             | Self::Sent { at, .. }
+            | Self::Results { at, .. }
             | Self::Replied { at, .. }
             | Self::Turn { at, .. }
             | Self::Presented { at, .. }

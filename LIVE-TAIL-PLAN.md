@@ -310,8 +310,12 @@ live tail and the bell:
   { uuid, offset, line, at }`, with `TranscriptLine::{User, Assistant,
   ToolResults, Compacted}`: whole bodies, the wire strips them. `strip`
   tells them in the words a reader already knows (`ClaudeMessage`,
-  `Replied`, `Sent`), so the client is unchanged and never learns which
-  runtime it is looking at. Claude writes one line per content block, so
+  `Replied`, and `Results` for tool results, which unlike `Sent` carry
+  nothing out of the queue: a Claude message waits there until Claude's
+  own echo of it), so the client is unchanged and never learns which
+  runtime it is looking at. The summary Claude writes after compacting
+  (`isCompactSummary`, `isVisibleInTranscriptOnly`) is not a row; the
+  `compact_boundary` is. Claude writes one line per content block, so
   a text and the call after it are two rows; usage rides on the first
   row of a message only.
 - **A cursor, not a re-read.** `claude_transcript_cursors` holds `(session,
@@ -334,9 +338,10 @@ live tail and the bell:
   row it follows. `result`, `compact_boundary` and a command's `completed`
   read the tail too. A `notify` watch on the session directory is the
   fallback bell for a file changed while the stream says nothing.
-- **The live tail empties when a message is told whole** (`Requesting`),
-  so a reader never holds a message twice; the row for it arrives from
-  the file right after.
+- **The live tail empties once the message's row is in.** The loop reads
+  the file first, then lets the streamed text go, so a reader holds the
+  text twice for an instant rather than not at all while the file catches
+  up (the wait can be most of a second).
 - **Rho's own facts stay Rho's rows.** `Accepted` when a send is taken,
   `QueueCleared` on cancel, `Failed`, `Turn`, `Wants`, `Presented`. The
   echo of a send (its uuid) is when it leaves the queue; the file's row is

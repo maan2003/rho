@@ -62,6 +62,9 @@ struct TranscriptEntry {
     #[serde(alias = "isSynthetic")]
     is_synthetic: Option<bool>,
     is_sidechain: Option<bool>,
+    /// The summary Claude writes after compacting, in the user's seat.
+    is_compact_summary: Option<bool>,
+    is_visible_in_transcript_only: Option<bool>,
     team_name: Option<String>,
     subtype: Option<String>,
     compact_metadata: Option<CompactMetadata>,
@@ -120,6 +123,8 @@ impl TranscriptEntry {
             && !self.is_replay.unwrap_or(false)
             && !self.is_synthetic.unwrap_or(false)
             && !self.is_sidechain.unwrap_or(false)
+            && !self.is_compact_summary.unwrap_or(false)
+            && !self.is_visible_in_transcript_only.unwrap_or(false)
             && self.team_name.is_none()
     }
 }
@@ -747,6 +752,8 @@ mod tests {
             is_replay: None,
             is_synthetic: None,
             is_sidechain: None,
+            is_compact_summary: None,
+            is_visible_in_transcript_only: None,
             team_name: None,
             subtype: None,
             compact_metadata: None,

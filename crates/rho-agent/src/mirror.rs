@@ -109,6 +109,17 @@ fn usage(bucket: &AgentUsageBucket) -> Usage {
 /// left behind. Pure, per event; the position is the raw event's own.
 /// `None` for rows that say nothing a client uses.
 pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
+    // Rows copied before the file's `isCompactSummary` flag was read hold
+    // Claude's post-compaction summary as a user line. The log is never
+    // rewritten, so the reader is the one that leaves them out.
+    if let AgentEvent::Transcript {
+        line: crate::TranscriptLine::User { text },
+        ..
+    } = event
+        && is_compaction_summary(text)
+    {
+        return None;
+    }
     let message = |sender: &MessageSender, content: &[rho_core::ContentPart], delivery, at| {
         MirrorEvent::Message {
             from: match sender {
@@ -213,9 +224,8 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 context_used: *context_used,
                 at: *at,
             },
-            crate::TranscriptLine::ToolResults { results } => MirrorEvent::Sent {
+            crate::TranscriptLine::ToolResults { results } => MirrorEvent::Results {
                 results: results.iter().map(tool_outcome).collect(),
-                compaction: false,
                 at: *at,
             },
             crate::TranscriptLine::Compacted { context_used } => MirrorEvent::Replied {
@@ -405,6 +415,12 @@ pub fn tool_line(arguments: &str) -> ToolLine {
     ToolLine::Nothing
 }
 
+/// The opening Claude Code gives the summary it writes after compacting.
+fn is_compaction_summary(text: &str) -> bool {
+    text.trim_start()
+        .starts_with("This session is being continued from a previous conversation")
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -479,6 +495,28 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn an_older_rows_compaction_summary_is_not_told() {
+        let summary = AgentEvent::Transcript {
+            uuid: uuid::Uuid::nil(),
+            offset: 0,
+            line: crate::TranscriptLine::User {
+                text: "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.".to_owned(),
+            },
+            at: UnixMs(1),
+        };
+        assert_eq!(strip(&summary), None);
+        let spoken = AgentEvent::Transcript {
+            uuid: uuid::Uuid::nil(),
+            offset: 0,
+            line: crate::TranscriptLine::User {
+                text: "This session is fine".to_owned(),
+            },
+            at: UnixMs(1),
+        };
+        assert!(strip(&spoken).is_some());
     }
 
     #[test]
