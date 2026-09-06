@@ -465,6 +465,46 @@ wrong at the design, not at the polish.
   change the rig proves.
   Gate green: rho-window 11 tests (10 new), clippy `-D warnings` clean,
   `cargo fmt --check` clean.
+
+  *Landed, the verdict menu on it (`rho-gui`'s `transient` and `workspace`,
+  `rho_window::transient`).* The first menu wired, and the one a tap of
+  `shift` opens. `verdict_menu` and `verdict_snooze_menu` are now data over a
+  `VerdictAction` enum — done, mute, snooze, the room, todo, file, undo, pull,
+  and a unit — and `Workspace::run_verdict` is the only place in the program
+  that knows what those mean. The menu is a block under the point in the
+  active editor: the bottom strip holds nothing but the keyboard while it is
+  up, an element with the focus on it and no size of its own. `s` replaces the
+  menu with the snooze units over the same row and `escape` goes back to the
+  verdicts rather than out, so back returns here too; a second `escape` leaves.
+  The other 17 menus are untouched and still draw in the strip.
+  Two things the rig caught that no test could. The block was created with
+  `height: None`, and the menu painted over the rows below instead of moving
+  them down — `Block::has_height` is what turns the editor's measuring on, so
+  a block with no height starts at zero rows and stays there; it wants
+  `Some(1)` and the editor resizes it to what the element drew. (The same is
+  true of `style::refusal_block`, which is still `None`: that is a real defect
+  in the chrome, filed here rather than fixed in this change.) And the Magit
+  column layout was drawing as one column however it was chunked, so the
+  chunking went: one item per row, which is what a buffer is anyway.
+  Also removed: moving counts into the menu left `Workspace::transient_count`,
+  `take_transient_count` and `Transient::counted`/`takes_count` with no reader,
+  since the verdict menus were the only counted ones. The path is deleted
+  rather than left write-only, the count digit in the strip's render with it.
+  Proven on the desk rig, session 12, on `user-2026-09-06`: `shift` over a
+  running agent opens the verdicts under that row with the rest of Home
+  readable below them, `s` swaps in the units, `escape` `escape` leaves the
+  point exactly where it was, and `x` mutes the row the point was on and says
+  so in the echo line. Emacs-feel checks: the point survives back, nothing
+  needed the mouse, no modal appeared and nothing dimmed, one key ran and
+  closed. The rig-down line for that session:
+  `113 frames, draw p99 4.1 ms, 0 over 8 ms; worst gap 161 ms, p99 8 ms;
+  12909 events, slowest stage multi_buffer_sync p99 0.11 ms at 0 rows; 126
+  samples on rho-gui: __memcpy_avx512_unaligned_erms 9%,
+  __syscall_cancel_arch_end 5%, eq 5%`. Opening the menu costs one block
+  insert and one measured element of eight rows; a press is one pass over
+  those rows. Nothing here grows with the desk.
+  Gate green: rho-gui 245 passed and 3 ignored (248 total, against main's
+  246), rho-window 11, clippy `-D warnings` clean, `cargo fmt --check` clean.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but

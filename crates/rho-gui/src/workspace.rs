@@ -238,6 +238,22 @@ struct VerdictUndo {
     state: VerdictUndoState,
 }
 
+/// The verdict menu while it is open: the menu itself, and the block it was
+/// put into the buffer as. The anchor is the point it opened over, kept so a
+/// count can redraw the menu without moving it.
+struct VerdictBuffer {
+    menu: crate::transient::VerdictMenu,
+    editor: gpui::WeakEntity<editor::Editor>,
+    block: editor::display_map::CustomBlockId,
+    anchor: multi_buffer::Anchor,
+    /// A count typed in this menu that belongs to the one it opened: `45 s m`
+    /// is forty-five minutes, and the digits were typed before the `s`.
+    carried_count: Option<u32>,
+    /// The menu this one replaced, if any. Escape goes back to it rather
+    /// than out: back returns, here as everywhere.
+    parent: Option<Box<crate::transient::VerdictMenu>>,
+}
+
 /// The unit half of the snooze operator (`s` then `m`, `h`, `d`, `w` or `s`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SnoozeUnit {
@@ -514,9 +530,10 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
-    /// The digits typed inside a counted transient, waiting for the item
-    /// they qualify: `45` then `m` is forty-five minutes.
-    transient_count: Option<usize>,
+    /// The verdict menu, which is not in the strip: it is a transient buffer
+    /// under the point (`rho_window::transient`). The strip menus above it
+    /// have not moved yet.
+    verdict_buffer: Option<VerdictBuffer>,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
     git_approval_focus: gpui::FocusHandle,
@@ -1063,7 +1080,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
-            transient_count: None,
+            verdict_buffer: None,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
             echo: None,
@@ -6710,6 +6727,7 @@ impl Workspace {
         let mut minibuffer = Minibuffer::open(prompt, &text_style, complete, on_submit, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
+        self.remove_verdict_block(cx);
         self.drop_transient();
         // The strip is single-occupancy; a stale message reappearing after
         // the prompt closes would be confusing.
@@ -6723,6 +6741,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The strip is single-occupancy and so is the keyboard: a menu in
+        // the strip takes it from the menu under the point.
+        self.remove_verdict_block(cx);
         self.capture_overlay_focus(window, cx);
         let subject = self.subject(window, cx);
         transient.retain_applicable(&subject);
@@ -6783,7 +6804,7 @@ impl Workspace {
         // on screen saying so.
         if self.verdict_transient_open() {
             self.last_shift_tap = None;
-            self.close_transient(window, cx);
+            self.close_verdict_menu(window, cx);
             self.toggle_overview(window, cx);
         } else if self.has_modal_overlay() {
             // A menu or a prompt is already holding the keyboard: shift
@@ -6814,23 +6835,203 @@ impl Workspace {
         if self.label_target(cx).is_none() {
             return false;
         }
-        self.open_transient(crate::transient::verdict_menu(), window, cx);
+        if self.verdict_buffer.is_some() {
+            return true;
+        }
+        self.capture_overlay_focus(window, cx);
+        if !self.show_verdict_menu(crate::transient::verdict_menu(), None, None, cx) {
+            return false;
+        }
+        self.minibuffer = None;
+        self.echo = None;
+        window.focus(&self.transient_focus, cx);
+        cx.notify();
         true
     }
 
-    /// The count an item was given, if any. Taken rather than read: a count
-    /// belongs to one keystroke, and leaving it behind would silently
-    /// qualify the next one.
-    pub(crate) fn take_transient_count(&mut self) -> Option<usize> {
-        self.transient_count.take()
+    /// Put a menu into the buffer under the point. Replaces whatever menu is
+    /// there, which is how `s` becomes the snooze units without the menu
+    /// leaving the row it opened over.
+    fn show_verdict_menu(
+        &mut self,
+        menu: crate::transient::VerdictMenu,
+        carried_count: Option<u32>,
+        parent: Option<Box<crate::transient::VerdictMenu>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let anchor = match self.verdict_buffer.as_ref().map(|open| open.anchor) {
+            Some(anchor) => anchor,
+            None => self
+                .active_editor(cx)
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head(),
+        };
+        let editor = self.active_editor(cx);
+        self.remove_verdict_block(cx);
+        let block = editor
+            .update(cx, |editor, cx| {
+                editor.insert_blocks([menu.block(anchor)], None, cx)
+            })
+            .into_iter()
+            .next();
+        let Some(block) = block else {
+            return false;
+        };
+        self.verdict_buffer = Some(VerdictBuffer {
+            menu,
+            editor: editor.downgrade(),
+            block,
+            anchor,
+            carried_count,
+            parent,
+        });
+        true
+    }
+
+    /// Redraw the menu where it is: the block renders the count it was built
+    /// with, so a digit is the same menu drawn again over the same anchor.
+    fn reinsert_verdict_block(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.verdict_buffer.as_ref() else {
+            return;
+        };
+        let (Some(editor), anchor) = (open.editor.upgrade(), open.anchor) else {
+            return;
+        };
+        let properties = open.menu.block(anchor);
+        let old = open.block;
+        let block = editor
+            .update(cx, |editor, cx| {
+                editor.remove_blocks(std::iter::once(old).collect(), None, cx);
+                editor.insert_blocks([properties], None, cx)
+            })
+            .into_iter()
+            .next();
+        if let (Some(open), Some(block)) = (self.verdict_buffer.as_mut(), block) {
+            open.block = block;
+        }
+    }
+
+    fn remove_verdict_block(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.verdict_buffer.take() else {
+            return;
+        };
+        if let Some(editor) = open.editor.upgrade() {
+            editor.update(cx, |editor, cx| {
+                editor.remove_blocks(std::iter::once(open.block).collect(), None, cx);
+            });
+        }
+    }
+
+    /// Close the menu and give the keyboard back to the surface it opened
+    /// over. The point has not moved: the menu was a block beside it.
+    fn close_verdict_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.verdict_buffer.is_none() {
+            return;
+        }
+        self.remove_verdict_block(cx);
+        self.finish_overlay_focus(window, cx);
+        cx.notify();
+    }
+
+    /// A key while the verdict menu is open. The menu says what the key
+    /// meant; the doing is here, which is the whole point of the primitive.
+    fn verdict_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Bare modifiers arrive as key events too; holding shift for an
+        // uppercase key must not dismiss the menu.
+        if matches!(
+            event.keystroke.key.as_str(),
+            "shift" | "control" | "alt" | "platform" | "function"
+        ) {
+            return;
+        }
+        let Some(open) = self.verdict_buffer.as_mut() else {
+            return;
+        };
+        let press = open.menu.press(&event.keystroke);
+        let carried = open.carried_count;
+        match press {
+            rho_window::transient::Press::Count(_) => {
+                self.reinsert_verdict_block(cx);
+                cx.notify();
+            }
+            rho_window::transient::Press::Dismiss => match open.parent.take() {
+                // Out of the submenu, back to the menu it came from, over
+                // the same row.
+                Some(parent) => {
+                    let count = open.carried_count;
+                    self.show_verdict_menu(*parent, count, None, cx);
+                    cx.notify();
+                }
+                None => self.close_verdict_menu(window, cx),
+            },
+            rho_window::transient::Press::Unbound => {}
+            rho_window::transient::Press::Run {
+                item,
+                count,
+                closes,
+            } => {
+                let action = *open.menu.items()[item].action();
+                let count = count.or(carried);
+                if let crate::transient::VerdictAction::OpenSnooze = action {
+                    let parent = Some(Box::new(crate::transient::verdict_menu()));
+                    self.show_verdict_menu(
+                        crate::transient::verdict_snooze_menu(),
+                        count,
+                        parent,
+                        cx,
+                    );
+                    cx.notify();
+                } else {
+                    if closes {
+                        // Focus goes back to the surface before the action
+                        // runs, so the action sees normal focus the way the
+                        // strip menus do.
+                        self.close_verdict_menu(window, cx);
+                    }
+                    self.run_verdict(action, count.map(|count| count as usize), window, cx);
+                }
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// The only place that knows what a verdict item means.
+    fn run_verdict(
+        &mut self,
+        action: crate::transient::VerdictAction,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::transient::VerdictAction;
+        match action {
+            VerdictAction::Done => self.verdict_done(window, cx),
+            VerdictAction::Mute => self.verdict_mute(window, cx),
+            VerdictAction::RoomSnooze => self.verdict_room_snooze(count, window, cx),
+            VerdictAction::Todo => self.verdict_todo(count, window, cx),
+            VerdictAction::File => self.prompt_file_deal_card(window, cx),
+            VerdictAction::Undo => self.undo_verdict(window, cx),
+            VerdictAction::Pull => self.pull_card(window, cx),
+            VerdictAction::Snooze(None) => {
+                self.deal_snooze(SnoozeUnit::Days, None, window, cx);
+            }
+            VerdictAction::Snooze(Some(unit)) => self.deal_snooze(unit, count, window, cx),
+            // Handled where the menu is replaced rather than run.
+            VerdictAction::OpenSnooze => {}
+        }
     }
 
     /// Whether the strip is showing the verdicts, which is what makes the
     /// next `shift` Home rather than another open.
     pub(crate) fn verdict_transient_open(&self) -> bool {
-        self.transient
-            .as_ref()
-            .is_some_and(|transient| transient.title() == "verdict")
+        self.verdict_buffer.is_some()
     }
 
     /// What the bar will say once the daemon takes the verdict. The echo
@@ -6845,7 +7046,10 @@ impl Workspace {
     }
 
     fn has_modal_overlay(&self) -> bool {
-        self.minibuffer.is_some() || self.transient.is_some() || self.pending_git_approval.is_some()
+        self.minibuffer.is_some()
+            || self.transient.is_some()
+            || self.verdict_buffer.is_some()
+            || self.pending_git_approval.is_some()
     }
 
     /// Captures normal focus on the first overlay in a chain. Replacements
@@ -6874,7 +7078,6 @@ impl Workspace {
     /// Clears the menu without touching focus.
     fn drop_transient(&mut self) {
         self.transient = None;
-        self.transient_count = None;
         self.transient_stack.clear();
     }
 
@@ -6907,18 +7110,6 @@ impl Workspace {
         let Some(transient) = &self.transient else {
             return;
         };
-        if transient.takes_count()
-            && let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|_| {
-                keystroke.key.len() == 1
-                    && !keystroke.modifiers.shift
-                    && !keystroke.modifiers.control
-            })
-        {
-            self.transient_count = Some(self.transient_count.unwrap_or(0) * 10 + digit);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         if keystroke.key == "escape" {
             match self.transient_stack.pop() {
                 Some(parent) => {
@@ -9902,6 +10093,14 @@ impl Render for Workspace {
             } else {
                 None
             })
+            // The verdict menu is a block in the buffer, not a strip, so
+            // what it needs down here is the keyboard and nothing else:
+            // an element with the focus on it and no size of its own.
+            .children(self.verdict_buffer.as_ref().map(|_| {
+                div()
+                    .track_focus(&self.transient_focus)
+                    .on_key_down(cx.listener(Self::verdict_key))
+            }))
             .children(
                 match (
                     &self.pending_git_approval,
@@ -9970,7 +10169,7 @@ impl Render for Workspace {
                                 div()
                                     .track_focus(&self.transient_focus)
                                     .on_key_down(cx.listener(Self::transient_key))
-                                    .child(transient.render(self.transient_count, &text_style, cx))
+                                    .child(transient.render(&text_style, cx))
                                     .into_any_element(),
                             )
                         }

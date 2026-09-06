@@ -32,11 +32,6 @@ use gpui::{Keystroke, div};
 use multi_buffer::Anchor;
 use theme::ActiveTheme as _;
 
-/// How many rows a column of the menu holds before the next column starts.
-/// Magit's layout: items flow down short columns so the eye scans vertically
-/// rather than reading a paragraph of keys.
-const COLUMN_ROWS: usize = 4;
-
 /// What an item does to the menu when it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -250,9 +245,12 @@ impl<A> Transient<A> {
             .collect();
         BlockProperties {
             placement: BlockPlacement::Below(anchor),
-            // Measured: a menu is as tall as it has rows, and a menu cut off
-            // at a guessed height is a menu with keys the reader cannot see.
-            height: None,
+            // A starting height, not the real one: the editor measures the
+            // element and resizes the block to what it drew. `None` would
+            // mean no height at all — `Block::has_height` is what turns the
+            // measuring on — and the menu would be painted over the rows
+            // below rather than moving them down.
+            height: Some(1),
             style: BlockStyle::Fixed,
             render: Arc::new(move |cx| render(&title, count, &rows, cx).into_any_element()),
             priority: 1,
@@ -272,44 +270,40 @@ fn render(
     let muted = colors.text_muted;
     let value_color = colors.terminal_ansi_green;
 
-    let mut columns = Vec::new();
-    for chunk in rows.chunks(COLUMN_ROWS) {
-        let mut column = div().flex().flex_col();
-        for (key, description, value) in chunk {
-            let mut row = div()
-                .flex()
-                .gap_1()
-                .h(cx.line_height)
-                .child(div().text_color(accent).child(key.clone()))
-                .child(div().child(description.clone()));
-            if let Some(value) = value {
-                row = row.child(div().text_color(value_color).child(value.clone()));
-            }
-            column = column.child(row);
+    // One item per row, which is what a buffer is: the reader scans down the
+    // keys the way they scan down anything else on the screen.
+    let mut rendered = Vec::new();
+    for (key, description, value) in rows {
+        let mut row = div()
+            .flex()
+            .gap_1()
+            .h(cx.line_height)
+            .child(div().text_color(accent).child(key.clone()))
+            .child(div().child(description.clone()));
+        if let Some(value) = value {
+            row = row.child(div().text_color(value_color).child(value.clone()));
         }
-        columns.push(column);
+        rendered.push(row);
     }
 
     let heading = match count {
         Some(count) => format!("{title} {count}"),
         None => title.to_owned(),
     };
+    // A column, explicitly: a gpui div lays its children in a row, and a
+    // block whose element has no height of its own is drawn over the rows
+    // below it instead of moving them down.
     div()
         .block_mouse_except_scroll()
+        .flex()
+        .flex_col()
         .w_full()
         .pl(cx.anchor_x)
         .font_family(text_style.font_family.clone())
         .text_size(text_style.font_size)
         .line_height(cx.line_height)
         .child(div().h(cx.line_height).text_color(muted).child(heading))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap_x_6()
-                .children(columns),
-        )
+        .children(rendered)
 }
 
 /// `escape` and `ctrl-g` mean the same thing everywhere, so they mean it here

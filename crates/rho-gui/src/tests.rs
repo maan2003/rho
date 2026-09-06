@@ -4405,6 +4405,121 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
     }
 }
 
+/// The verdicts are a buffer under the point, not a strip at the bottom:
+/// nothing goes into the strip when they open, and the point does not move
+/// to make room for them. Both halves matter — a menu that stole the point
+/// would answer about the wrong card when it closed.
+#[gpui::test]
+fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let before = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .active_editor(cx)
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+        })
+        .unwrap();
+
+    tap_shift(&workspace, cx);
+    cx.run_until_parked();
+    let after = workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.verdict_transient_open(), "the verdicts are open");
+            assert!(
+                !workspace.has_transient_for_test(),
+                "the strip stays empty: the menu is in the buffer"
+            );
+            workspace
+                .active_editor(cx)
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+        })
+        .unwrap();
+    assert_eq!(before, after, "the point did not move to open the menu");
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "escape closes the verdicts"
+            );
+            assert_eq!(
+                workspace
+                    .active_editor(cx)
+                    .read(cx)
+                    .selections
+                    .newest_anchor()
+                    .head(),
+                before,
+                "and the point came back to where it was"
+            );
+        })
+        .unwrap();
+}
+
+/// Escape out of the snooze units goes back to the verdicts, not out of the
+/// menu: back returns, here as everywhere.
+#[gpui::test]
+fn escape_in_a_submenu_returns_to_the_menu_it_came_from(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    tap_shift(&workspace, cx);
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "escape left the units and came back to the verdicts"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the second escape leaves the menu"
+            );
+        })
+        .unwrap();
+}
+
 /// The second tap of `shift` is Home: the first tap put the verdicts on
 /// screen and the menu's own `shift` row says the next one leaves. There
 /// is no timer on it, unlike the old double tap, because the menu is on
