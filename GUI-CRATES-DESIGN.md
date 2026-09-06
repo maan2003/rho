@@ -276,6 +276,26 @@ work on it.
   with the fake's Slack cards beside them, and a CPU profile and frame log
   written on the way down.
 
+- **The fake Slack fed from a real mirror.** `rho-qa fake-slack --mirror` reads
+  a copy of a `slack.redb` and hands the fake what it holds — roster,
+  conversations with their kinds, each history, the threads under it, Slack's
+  own read cursor — using the same `add_*` calls the fixture uses, so `fake.rs`
+  is untouched. `rig up` feeds the fake from the rig's own mirror whenever it
+  has one and falls back to the fixture with a line in the log. The user's own
+  id is remapped onto the fake's `ME`, so "me" stays "me"; the mirror is copied
+  before it is opened, because the rig's GUI holds that same file. `rho-slack`
+  gains one additive accessor, `Mirror::workspaces`.
+  What this turned up: the snapshot's Slack mirror holds only the fixture
+  workspace — 5 conversations, 211 messages, the fake's own `acme` — so the
+  flood the QA premise names is not in the mirror on disk. The loader is right
+  and the data is not there yet; a snapshot taken after a real Slack session
+  will carry it.
+  Also fixed here: `rig up` started its daemon before the last one had let go
+  of the store, so the new daemon died with `DatabaseAlreadyOpen` after its
+  socket was already on disk and the GUI sat on "reconnecting". It now waits
+  for the old process to exit, kills it if it will not, and checks the new one
+  is alive rather than trusting the socket.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

@@ -18,6 +18,7 @@
 mod build;
 mod paths;
 mod rig;
+mod slack;
 mod snapshot;
 
 use anyhow::Result;
@@ -37,6 +38,8 @@ struct Args {
 enum Command {
     /// Build the binaries a rig runs, with the linker the rig needs.
     Build(rig::BuildArgs),
+    /// Run a fake Slack fed from a copy of a real mirror.
+    FakeSlack(slack::FakeSlackArgs),
     /// Copy the live state into a named, dated snapshot and verify it.
     Snapshot(snapshot::SnapshotArgs),
     /// List the snapshots taken so far.
@@ -49,6 +52,7 @@ enum Command {
 fn main() -> Result<()> {
     match Args::parse().command {
         Command::Build(args) => rig::build(args),
+        Command::FakeSlack(args) => slack::run(args),
         Command::Snapshot(args) => snapshot::take(args),
         Command::Snapshots => snapshot::list(),
         Command::Rig(command) => rig::run(command),

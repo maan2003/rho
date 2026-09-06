@@ -14092,8 +14092,10 @@ dependencies = [
  "clap",
  "dirs",
  "redb",
+ "rho-slack",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

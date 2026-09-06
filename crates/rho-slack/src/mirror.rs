@@ -449,6 +449,26 @@ impl Mirror {
             .collect()
     }
 
+    /// Every workspace the mirror holds conversations for. A reader that was
+    /// handed the file rather than the session — the QA rig feeding its fake
+    /// Slack from a copy of this mirror — has no other way to know whose
+    /// workspace it is looking at.
+    pub fn workspaces(&self) -> Vec<String> {
+        let txn = self.db.read();
+        let table = txn.open_table(CONVERSATIONS);
+        let mut names: Vec<String> = table
+            .range::<&str>(..)
+            .filter_map(|(key, _)| {
+                key.value()
+                    .split(SEPARATOR)
+                    .next()
+                    .map(std::borrow::ToOwned::to_owned)
+            })
+            .collect();
+        names.dedup();
+        names
+    }
+
     pub fn put_conversations(&self, workspace: &str, conversations: &[Conversation]) {
         if conversations.is_empty() {
             return;

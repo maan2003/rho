@@ -24,6 +24,8 @@ use crate::snapshot::human;
 
 /// How long to wait for the daemon's socket and the fake's readiness line.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the last session's daemon gets to let go of the store.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Subcommand)]
 pub enum RigCommand {
@@ -230,9 +232,19 @@ fn up(args: UpArgs) -> Result<()> {
         .stderr(log)
         .spawn()
         .with_context(|| format!("start {}", bin.daemon().display()))?;
-    fs::write(root.join("run").join("daemon.pid"), daemon.id().to_string())?;
+    let pid = daemon.id();
+    fs::write(root.join("run").join("daemon.pid"), pid.to_string())?;
     wait_for(&socket, "the daemon's socket")?;
-    println!("daemon  up on {} (pid {})", socket.display(), daemon.id());
+    // A socket on disk is not a daemon: the last one's may still be there, and
+    // this one may have died opening the store. Ask the process.
+    if !alive(pid) {
+        bail!(
+            "the daemon exited at startup; the last lines of {}:\n{}",
+            root.join("logs").join("daemon.log").display(),
+            tail(&root.join("logs").join("daemon.log"), 5)
+        );
+    }
+    println!("daemon  up on {} (pid {pid})", socket.display());
 
     let slack = start_fake_slack(&root, &bin)?;
     println!("slack   fake on {slack}");
@@ -332,10 +344,28 @@ fn list() -> Result<()> {
 
 /// The fake Slack, started on the rig's own ports, with the API base it prints
 /// read back out of its log.
+///
+/// Fed from the rig's own Slack mirror when it has one, which is the point of
+/// running on a snapshot: the client meets the conversations the user has
+/// rather than a fixture's five. The fixture is the fallback, and says so in
+/// the log.
 fn start_fake_slack(root: &Path, bin: &Build) -> Result<String> {
     let path = root.join("logs").join("fake-slack.log");
     let log = fs::File::create(&path)?;
-    let child = command(bin.fake_slack(), root)
+    let mirror = root.join("state").join("rho").join("slack.redb");
+    let mut process = if mirror.exists() {
+        let mut loader = command(std::env::current_exe()?, root);
+        loader
+            .arg("fake-slack")
+            .arg("--mirror")
+            .arg(&mirror)
+            .arg("--scratch")
+            .arg(root.join("run").join("slack-seed.redb"));
+        loader
+    } else {
+        command(bin.fake_slack(), root)
+    };
+    let child = process
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
@@ -411,11 +441,28 @@ fn stop_gui(root: &Path, bin: &Build, session: &str) {
         .status();
 }
 
+/// Stop the daemon and the fake, and wait for them to be gone.
+///
+/// Waiting is the point. redb allows one writer process, so a daemon started
+/// while the last one is still shutting down dies with `DatabaseAlreadyOpen` —
+/// and it dies after its socket is already on disk, so everything downstream
+/// looks up and the GUI simply says "reconnecting" for ever.
 fn stop_daemon(root: &Path) {
     for name in ["daemon.pid", "fake-slack.pid"] {
         let path = root.join("run").join(name);
         if let Some(pid) = read_pid(&path) {
             terminate(pid);
+            let deadline = Instant::now() + EXIT_TIMEOUT;
+            while alive(pid) {
+                if Instant::now() > deadline {
+                    println!("killing {name} pid {pid}: it did not stop on TERM");
+                    let _ = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
         let _ = fs::remove_file(path);
     }
@@ -599,6 +646,14 @@ fn wait_for(path: &Path, what: &str) -> Result<()> {
 
 fn daemon_pid(root: &Path) -> Option<u32> {
     read_pid(&root.join("run").join("daemon.pid"))
+}
+
+/// The last `lines` lines of a log, for an error that should not need the
+/// reader to go and look.
+fn tail(path: &Path, lines: usize) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let kept: Vec<&str> = text.lines().rev().take(lines).collect();
+    kept.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
 fn read_pid(path: &Path) -> Option<u32> {
