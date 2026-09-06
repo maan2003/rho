@@ -375,9 +375,9 @@ fn replied(
     }
 }
 
-/// The one line a call shows, read out of its arguments: the first of
-/// the fields a person would recognise. Never the whole argument blob,
-/// which is as long as the model made it.
+/// What a call shows next to its name, read out of its arguments: the
+/// first of the fields a person would recognise, whole. The rest of the
+/// arguments are a body, asked for by position.
 pub fn tool_line(arguments: &str) -> ToolLine {
     let Ok(serde_json::Value::Object(fields)) =
         serde_json::from_str::<serde_json::Value>(arguments)
@@ -394,24 +394,15 @@ pub fn tool_line(arguments: &str) -> ToolLine {
         return ToolLine::Path(path.into());
     }
     if let Some(command) = text("command").or_else(|| text("cmd")) {
-        return ToolLine::Command(cut(&command));
+        return ToolLine::Command(command);
     }
     if let Some(query) = text("query").or_else(|| text("pattern")) {
-        return ToolLine::Query(cut(&query));
+        return ToolLine::Query(query);
     }
     if let Some(agent) = text("agent_id").or_else(|| text("engineer_id")) {
         return ToolLine::Query(agent);
     }
     ToolLine::Nothing
-}
-
-/// One line's worth, cut on a character boundary.
-fn cut(text: &str) -> String {
-    let line = text.lines().next().unwrap_or_default();
-    match line.char_indices().nth(200) {
-        Some((limit, _)) => format!("{}…", &line[..limit]),
-        None => line.to_owned(),
-    }
 }
 
 #[cfg(test)]
@@ -494,7 +485,8 @@ mod tests {
     fn tool_lines_read_the_recognisable_field() {
         assert_eq!(
             tool_line(r#"{"command":"ls -la\nmore"}"#),
-            ToolLine::Command("ls -la".into())
+            ToolLine::Command("ls -la\nmore".into()),
+            "the whole command, every line"
         );
         assert_eq!(
             tool_line(r#"{"file_path":"/tmp/a"}"#),

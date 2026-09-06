@@ -70,7 +70,7 @@ pub enum SpawnedBy {
     Engineer,
 }
 
-/// The one line a tool call shows: what it acted on, never its output.
+/// What a tool call shows: what it acted on, whole, never its output.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum ToolLine {
     Path(Utf8PathBuf),
@@ -137,8 +137,8 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
-/// One call a response made: enough to draw its row, never its arguments
-/// whole.
+/// One call a response made: enough to draw its row. `what` is the
+/// argument a person recognises, whole; the rest is a body.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ToolCallLine {
     pub id: String,
