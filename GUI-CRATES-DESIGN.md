@@ -887,6 +887,32 @@ work on it.
   fault; the tool that reads a run can no longer be older than the run.
   Gate green: rho-qa 4 tests (2 new), clippy `-D warnings` clean,
   `cargo fmt --check` clean.
+- **The rig's GUI has a Slack session, and a rig that is up says who holds
+  it** (`crates/rho-qa`, `rig.rs`). No rig's GUI has ever had a Slack
+  session. `rig up` wrote `credentials.json` for a workspace it named
+  itself, `rig`, while the fake comes up as `acme`, and the credential
+  store is keyed by workspace name — so the lookup missed and the client
+  ran sessionless on every rig that has existed. Nothing said so: the fake
+  was listening, the daemon was up, the GUI dealt, and Slack rows simply
+  stayed Open forever, which reads as a dealing bug. `rig up` now reads
+  the workspace out of what the fake printed and writes credentials for
+  that name, and refuses to start the GUI at all when the fake never
+  reports one, saying that a sessionless client shows every row as Open
+  and no rule can close them. Proven on desk sessions 26 and 27: `slack
+  fake on … as workspace `acme``, credentials keyed by `acme`, and a
+  `#design` row taking a `done` verdict — leaving `next` and being
+  replaced by the next row of the flood, which no rig could do before.
+  This closes handbook R2.
+  The other half: `rig up` refuses when the rig is already up and names
+  the session, whoever started it (`RHO_MCP_AGENT_ID`, falling back to
+  `RHO_AGENT_ID` then `USER`) and the daemon pid that holds it, with
+  `--take` to stop what is running and take it. The lock is the live
+  daemon pid recorded in the last `rig.json` session, not a poll. Two of
+  us drove the same desk twice in one evening, seconds apart, in both
+  directions; an overlapped run's numbers are noise and the screenshots
+  do not show it.
+  Gate green: rho-qa 6 tests (2 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
 
 ## Order
 

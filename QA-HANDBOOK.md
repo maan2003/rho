@@ -22,7 +22,12 @@ rho-qa rig up desk                        # daemon, fakes, headless GUI, profile
 rho-qa rig down desk                      # stop; the state stays as the run left it
 ```
 
-`rig up` ends by printing the line that drives the session it just started.
+`rig up` ends by printing the line that drives the session it just started. It
+refuses when the rig is already up, naming the session, whoever started it and
+the daemon pid holding it; `--take` stops what is running and takes it. Two
+agents drove the same desk twice in one evening, seconds apart in both
+directions, so the refusal is not politeness — an overlapped run's numbers are
+noise and neither party can tell from the screenshots.
 
 Driving the GUI, with the rig's own runtime dir:
 
@@ -100,7 +105,26 @@ no rule can close them. The fake is that session. `rig up` must refuse to start
 the GUI when the fake did not come up as the workspace, rather than start it
 anyway — a GUI in that state looks exactly like a dealing bug.
 
-*Closed by:* not yet — the refusal is not built.
+No rig ever had one. `rig up` wrote `credentials.json` for a workspace it
+named itself, `rig`, while the fake comes up as `acme`; the store is keyed by
+workspace name, so the lookup missed and the client ran with no session on
+every rig that has ever existed. Nothing said so: the fake was listening, the
+daemon was up, the GUI came up and dealt, and the Slack rows simply never
+closed. Any Slack row count taken on a rig before 6 Sep was taken without a
+session.
+
+The shape of the bug is worth more than the fix. A name written on both sides
+of a lookup by different code is not checked by anything — the writer is
+happy, the reader is happy, and the only symptom is a screen that looks
+plausible. So the rig no longer names the workspace: it reads the name out of
+what the fake printed and writes credentials for that, and if the fake never
+printed one it refuses to start the GUI and says why.
+
+*Closed by:* 6 Sep 2026, desk sessions 26 and 27. 26 printed ``slack   fake on
+http://127.0.0.1:46871/api as workspace `acme` `` and left `credentials.json`
+keyed by `acme`; 27 put the point on `#design › @Manmeet can you look at the
+deploy before the release?`, took `d` from the verdict transient, and the row
+took the verdict, left `next`, and was replaced by the next row of the flood.
 
 ### R3. The Slack mirror is the user's, not QA's
 

@@ -82,6 +82,11 @@ pub struct UpArgs {
     /// Run the GUI without the CPU profiler.
     #[arg(long)]
     no_profile: bool,
+
+    /// Take a rig that is already up, stopping whatever is running on it.
+    /// Without this, `up` refuses and says whose session holds it.
+    #[arg(long)]
+    take: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -128,6 +133,12 @@ struct Rig {
 #[derive(Serialize, Deserialize)]
 struct Session {
     at: String,
+    /// Who brought it up. A desk is shared and two engineers took it from
+    /// each other twice in one afternoon, each time by seconds; a session
+    /// that says whose it is turns that into a message instead of a
+    /// killed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
     binaries: String,
     tree_commit: Option<String>,
     /// What the GUI was told to profile to, so `rig down` knows which files
@@ -218,7 +229,8 @@ fn new(args: NewArgs) -> Result<()> {
     }
     // The runtime dir has to be private or the compositor refuses it.
     fs::set_permissions(root.join("run"), permissions(0o700))?;
-    write_credentials(&root)?;
+    // A placeholder until the first `up` learns the fake's real workspace.
+    write_credentials(&root, "rig")?;
 
     let rig = Rig {
         name: name.clone(),
@@ -240,6 +252,15 @@ fn up(args: UpArgs) -> Result<()> {
     let mut rig = load(&root)?;
     let bin = binaries(args.binaries, !args.no_gui)?;
 
+    // A desk is shared. Anything still running is somebody's session, and
+    // taking it silently is how a run gets killed mid-drive — which has
+    // happened, twice in one afternoon, in both directions. Say whose it is
+    // and let them be asked; `--take` is the deliberate version.
+    if !args.take
+        && let Some(held) = holding_session(&root, &rig)
+    {
+        bail!("{held}");
+    }
     // Anything still running from the last session is the last session's, not
     // this one's.
     stop_gui(&root, &bin, &args.name);
@@ -275,7 +296,15 @@ fn up(args: UpArgs) -> Result<()> {
     println!("daemon  up on {} (pid {pid})", socket.display());
 
     let slack = start_fake_slack(&root, &bin)?;
-    println!("slack   fake on {slack}");
+    println!(
+        "slack   fake on {} as workspace `{}`",
+        slack.api_base, slack.workspace
+    );
+    // The client's session is the fake, and a session is per workspace: the
+    // credentials have to name the workspace the fake actually came up as,
+    // not the one a rig was created with. Written on every `up`, because the
+    // mirror can change under a rig and the workspace with it.
+    write_credentials(&root, &slack.workspace)?;
 
     let mut profile_path = None;
     if !args.no_gui {
@@ -286,7 +315,14 @@ fn up(args: UpArgs) -> Result<()> {
             ))
         });
         profile_path = profile.clone();
-        start_gui(&root, &bin, &args.name, &socket, &slack, profile.as_deref())?;
+        start_gui(
+            &root,
+            &bin,
+            &args.name,
+            &socket,
+            &slack.api_base,
+            profile.as_deref(),
+        )?;
         println!(
             "gui     up in the `{}` wayland session{}",
             args.name,
@@ -299,6 +335,7 @@ fn up(args: UpArgs) -> Result<()> {
 
     rig.sessions.push(Session {
         at: chrono::Local::now().to_rfc3339(),
+        by: holder(),
         binaries: bin.label.clone(),
         tree_commit: crate::snapshot::tree_commit(),
         profile: profile_path.clone(),
@@ -435,7 +472,15 @@ fn list() -> Result<()> {
 /// running on a snapshot: the client meets the conversations the user has
 /// rather than a fixture's five. The fixture is the fallback, and says so in
 /// the log.
-fn start_fake_slack(root: &Path, bin: &Build) -> Result<String> {
+/// The fake, once it is serving: where it listens and which workspace it came
+/// up as. Both are read back from its log, because the fake chooses the
+/// workspace itself when the mirror holds more than one.
+struct FakeSlack {
+    api_base: String,
+    workspace: String,
+}
+
+fn start_fake_slack(root: &Path, bin: &Build) -> Result<FakeSlack> {
     let path = root.join("logs").join("fake-slack.log");
     let log = fs::File::create(&path)?;
     let mirror = root.join("state").join("rho").join("slack.redb");
@@ -461,23 +506,87 @@ fn start_fake_slack(root: &Path, bin: &Build) -> Result<String> {
         child.id().to_string(),
     )?;
 
+    // Both lines, not just the first: a fake that is listening but came up as
+    // no workspace is not a session, and a GUI started against it shows every
+    // Slack row as Open. Waiting for `workspace=` is the refusal.
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         let text = fs::read_to_string(&path).unwrap_or_default();
-        if let Some(base) = text
-            .lines()
-            .find_map(|line| line.strip_prefix("RHO_SLACK_API_BASE="))
-        {
-            return Ok(base.to_owned());
+        if let Some(fake) = fake_slack_from_log(&text) {
+            return Ok(fake);
         }
         if Instant::now() > deadline {
             bail!(
-                "the fake Slack never printed its API base; see {}",
-                path.display()
+                "the fake Slack never came up as a workspace, so the GUI was not \
+                 started: a client with no Slack session shows every row the desk \
+                 ever held as Open and no rule can close them, which reads as a \
+                 dealing bug. The last lines of {}:\n{}",
+                path.display(),
+                tail(&path, 8)
             );
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// What the fake said about itself, or `None` while it is still saying it.
+/// Both lines are required: an API base without a workspace is a server, not
+/// a session.
+fn fake_slack_from_log(text: &str) -> Option<FakeSlack> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    Some(FakeSlack {
+        api_base: field("RHO_SLACK_API_BASE=")?,
+        workspace: field("workspace=")?,
+    })
+}
+
+/// Who is running this rig, for the session line. The agent handle if this is
+/// an agent's shell, the user otherwise, and nothing rather than a guess.
+fn holder() -> Option<String> {
+    ["RHO_MCP_AGENT_ID", "RHO_AGENT_ID", "USER"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// Whether something is already running on this rig, and what to say about
+/// it. The daemon's pid is the lock: it is written by `up` and outlives the
+/// shell that started it, and `rig.json`'s last session says whose it is.
+fn holding_session(root: &Path, rig: &Rig) -> Option<String> {
+    let pid = read_pid(&root.join("run").join("daemon.pid")).filter(|pid| alive(*pid))?;
+    let last = rig.sessions.last();
+    let at = last.map_or("at an unknown time", |session| session.at.as_str());
+    let binaries = last.map_or("unknown", |session| session.binaries.as_str());
+    let held = last.and_then(|session| session.by.as_deref());
+    let mine = held.is_some() && held == holder().as_deref();
+    let whose = match held {
+        Some(who) if mine => format!("you ({who}), in another shell"),
+        Some(who) => who.to_owned(),
+        None => "someone who did not say so".to_owned(),
+    };
+    let what_to_do = if mine {
+        format!(
+            "If that shell is finished with it, `rho-qa rig down {}`; `--take` \
+             stops whatever is running and takes it.",
+            rig.name
+        )
+    } else {
+        format!(
+            "Ask them before taking it — a `rig up` on a rig someone is driving \
+             kills their run. `rho-qa rig down {}` once they say they are down, \
+             or `--take` to take it anyway.",
+            rig.name
+        )
+    };
+    Some(format!(
+        "rig {} is already up: session {}, held by {whose}, started {at} on \
+         {binaries} binaries (daemon pid {pid}).\n{what_to_do}",
+        rig.name,
+        rig.sessions.len(),
+    ))
 }
 
 fn start_gui(
@@ -672,13 +781,20 @@ fn repo_root() -> Result<PathBuf> {
 
 /// The fake takes any token; what matters is that the client finds a file
 /// where it looks, so nothing reaches for the user's real Slack session.
-fn write_credentials(root: &Path) -> Result<()> {
+/// The client's Slack session, written where `RHO_SLACK_CREDENTIALS` points.
+///
+/// Keyed by workspace name, and the name has to be the one the fake came up
+/// as: a session is per workspace, so credentials for `rig` against a fake
+/// serving `acme` leave the client with no session for anything it can see,
+/// and every Slack row the desk ever held reads as Open with no rule able to
+/// close it. That looks exactly like a dealing bug and is not one.
+fn write_credentials(root: &Path, workspace: &str) -> Result<()> {
     let path = root.join("credentials.json");
-    fs::write(
-        &path,
-        r#"{"workspaces":{"rig":{"token":"xoxc-fake","cookie":"fake"}}}"#,
-    )
-    .with_context(|| format!("write {}", path.display()))?;
+    let stored = serde_json::json!({
+        "workspaces": { workspace: { "token": "xoxc-fake", "cookie": "fake" } }
+    });
+    fs::write(&path, serde_json::to_string(&stored)?)
+        .with_context(|| format!("write {}", path.display()))?;
     fs::set_permissions(&path, permissions(0o600))?;
     Ok(())
 }
@@ -763,4 +879,37 @@ fn terminate(pid: u32) {
 fn permissions(mode: u32) -> fs::Permissions {
     use std::os::unix::fs::PermissionsExt as _;
     fs::Permissions::from_mode(mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fake_that_is_listening_but_holds_no_workspace_is_not_a_session() {
+        let listening = "RHO_SLACK_API_BASE=http://127.0.0.1:1/api\nws=ws://127.0.0.1:2\n";
+        assert!(
+            fake_slack_from_log(listening).is_none(),
+            "a fake with no workspace must not be taken for a Slack session"
+        );
+
+        let serving =
+            format!("{listening}control=http://127.0.0.1:1/control\nworkspace=acme\nready\n");
+        let fake = fake_slack_from_log(&serving).expect("a workspace and an api base");
+        assert_eq!(fake.workspace, "acme");
+        assert_eq!(fake.api_base, "http://127.0.0.1:1/api");
+    }
+
+    /// The session a rig writes for the client has to name the workspace the
+    /// fake came up as, or the client has no session for what it can see.
+    #[test]
+    fn the_credentials_name_the_fake_s_workspace() {
+        let dir = std::env::temp_dir().join(format!("rho-qa-credentials-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        write_credentials(&dir, "acme").expect("write credentials");
+        let written = fs::read_to_string(dir.join("credentials.json")).expect("read back");
+        assert!(written.contains("\"acme\""), "{written}");
+        assert!(!written.contains("\"rig\""), "{written}");
+        fs::remove_dir_all(&dir).ok();
+    }
 }
