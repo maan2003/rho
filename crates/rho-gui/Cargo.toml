@@ -61,6 +61,7 @@ rho-browser = { workspace = true }
 rho-core.workspace = true
 rho-db = { workspace = true }
 rho-desk.workspace = true
+rho-agents = { workspace = true }
 rho-hosts = { workspace = true }
 rho-iroh-auth = { workspace = true }
 rho-profiling = { workspace = true }

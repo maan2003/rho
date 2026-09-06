@@ -1,0 +1,18 @@
+# What the client knows about agents: their transcripts, the map of them
+# and the screens that show them. Cut out of `rho-gui` one piece at a
+# time (`GUI-CRATES-DESIGN.md`); the transcript came first.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-agents"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rho-registry = { workspace = true }
+rho-ui-proto.workspace = true
+
+[dev-dependencies]
+rho-core.workspace = true

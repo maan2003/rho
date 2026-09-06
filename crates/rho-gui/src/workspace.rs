@@ -28,6 +28,7 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
+use rho_agents::TranscriptFrame;
 use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
@@ -339,7 +340,10 @@ pub struct Workspace {
     /// them, and the daemon's live tail. Also the focus set every host
     /// is told. Everyone else is a digest in the registry.
     active: ActiveAgents,
-    store: AgentStore,
+    /// Every transcript this client holds open, and the rendered state a
+    /// screen draws from. `rho-agents` owns what a transcript is; the
+    /// shell only says which agent and hands the rows on.
+    transcripts: rho_agents::Transcripts,
     pub(crate) registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by daemon-side workspace identity, qualified
@@ -357,9 +361,6 @@ pub struct Workspace {
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
     model: futures_mpsc::UnboundedSender<crate::model::ToModel>,
-    /// The transcript fold of every active agent, in memory, so a `Log`
-    /// entry folds into it without waiting on the disk copy.
-    open_mirrors: HashMap<AgentId, rho_registry::TranscriptFold>,
     draft_model: Entity<DraftModel>,
     message_log: MessageLog,
     messages_buffer: Entity<language::Buffer>,
@@ -604,8 +605,7 @@ impl Workspace {
         verdicts: Vec<(AgentId, rho_registry::Verdict)>,
     ) {
         for agent_id in self.registry.host_agents(host) {
-            self.store.forget(agent_id);
-            self.open_mirrors.remove(&agent_id);
+            self.transcripts.forget(agent_id);
             self.active.remove(agent_id);
         }
         self.registry.reset_host(host);
@@ -619,7 +619,7 @@ impl Workspace {
     /// The agents whose rows the model hands up: the transcripts this
     /// client has open. Everything else it says as a digest.
     pub(crate) fn followed(&self) -> std::collections::BTreeSet<AgentId> {
-        self.open_mirrors.keys().copied().collect()
+        self.transcripts.open_agents()
     }
 
     fn note_followed(&self) {
@@ -636,22 +636,16 @@ impl Workspace {
     /// holds: the fold, for a reader who opened it before any live frame,
     /// or with the daemon down. The live frame rides on its tail.
     fn seed_transcript_from_mirror(&mut self, agent_id: AgentId) -> bool {
-        if self.open_mirrors.contains_key(&agent_id) {
+        if self.transcripts.is_open(&agent_id) {
             return false;
         }
         // The disk copy may trail the rows just heard by a queued write;
         // waiting for it is what makes the fold whole.
         crate::mirror::flush();
         let events = crate::mirror::read_events(agent_id);
-        if events.is_empty() {
+        if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
-        let mut fold = rho_registry::TranscriptFold::new(&events);
-        // The one time a transcript is handed whole: nothing was here to
-        // append to. Every telling after this hands the rows it moved.
-        self.store.set_fold(agent_id, fold.state());
-        fold.delta();
-        self.open_mirrors.insert(agent_id, fold);
         self.note_followed();
         true
     }
@@ -669,22 +663,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(fold) = self.open_mirrors.get_mut(&agent_id) else {
-            return;
-        };
-        let mut refolded = false;
-        for (pos, event) in rows {
-            refolded |= fold.tell(*pos, event);
-        }
-        if !refolded {
-            return;
-        }
         // The rows the telling moved, not the transcript they are in.
-        let Some(delta) = self
-            .open_mirrors
-            .get_mut(&agent_id)
-            .and_then(|fold| fold.delta())
-        else {
+        let Some(delta) = self.transcripts.refold(agent_id, rows) else {
             return;
         };
         self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Folded(delta))], window, cx);
@@ -695,21 +675,15 @@ impl Workspace {
         agent_id: AgentId,
         frame: TranscriptFrame,
     ) -> Option<(FrameSummary, Option<u64>, bool, bool)> {
-        let old_context = self
-            .store
-            .get(&agent_id)
-            .and_then(|state| state.context_used);
-        let old_usage = self.store.get(&agent_id).map(|state| state.usage.clone());
-        let (summary, live_changed) = match frame {
-            TranscriptFrame::Live(live) => (
-                self.store.apply_live(agent_id, live),
-                self.registry.mark_live(agent_id),
-            ),
-            TranscriptFrame::Fold(state) => (self.store.set_fold(agent_id, state), false),
-            TranscriptFrame::Folded(delta) => (self.store.apply_fold_delta(agent_id, delta), false),
-        };
-        let usage_changed = old_usage.as_ref() != self.store.get(&agent_id).map(|s| &s.usage);
-        Some((summary, old_context, usage_changed, live_changed))
+        let change = self.transcripts.apply(agent_id, frame);
+        // Liveness is the map's fact about an agent, not the transcript's.
+        let live_changed = change.was_live && self.registry.mark_live(agent_id);
+        Some((
+            change.summary,
+            change.context_before,
+            change.usage_changed,
+            live_changed,
+        ))
     }
 
     fn start_initial_agent_load(
@@ -721,7 +695,7 @@ impl Workspace {
         if model.read(cx).initial_load_started() {
             return false;
         }
-        let Some(state) = self.store.get(&agent_id).cloned() else {
+        let Some(state) = self.transcripts.state(&agent_id).cloned() else {
             return false;
         };
         let labels = self
@@ -752,7 +726,7 @@ impl Workspace {
                 .entry(agent_id)
                 .and_modify(|pending| *pending = pending.merge(summary))
                 .or_insert(summary);
-        } else if let Some(state) = self.store.get(&agent_id) {
+        } else if let Some(state) = self.transcripts.state(&agent_id) {
             model.update(cx, |model, cx| {
                 model.sync(
                     state,
@@ -770,7 +744,7 @@ impl Workspace {
             return;
         };
         if let Some(summary) = self.pending_syncs.remove(&agent_id)
-            && let Some(state) = self.store.get(&agent_id)
+            && let Some(state) = self.transcripts.state(&agent_id)
         {
             model.update(cx, |model, cx| {
                 model.sync(
@@ -783,17 +757,6 @@ impl Workspace {
             });
         }
     }
-}
-
-/// One change to an agent's transcript: a delta to the runtime's live
-/// tail, or the fold of its mirror made again.
-pub(crate) enum TranscriptFrame {
-    Live(rho_ui_proto::mirror::Live),
-    /// The mirror's fold, whole. What an agent's first read hands, and
-    /// nothing else: a transcript is handed once and appended to after.
-    Fold(rho_registry::render::UiAgentState),
-    /// The rows one telling of the mirror moved.
-    Folded(rho_registry::fold::FoldDelta),
 }
 
 /// Who a command speaks about: the rail row under the cursor, or the open
@@ -994,14 +957,13 @@ impl Workspace {
         let mut this = Self {
             hosts,
             active: ActiveAgents::default(),
-            store: AgentStore::default(),
+            transcripts: rho_agents::Transcripts::default(),
             registry: AgentRegistry::default(),
             models: HashMap::new(),
             remote_projects: HashMap::new(),
             pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
             model: model_commands,
-            open_mirrors: HashMap::new(),
             draft_model,
             message_log: MessageLog::default(),
             messages_buffer,
@@ -1170,8 +1132,7 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
         for agent_id in departed {
             self.active.remove(agent_id);
-            self.open_mirrors.remove(&agent_id);
-            self.store.forget(agent_id);
+            self.transcripts.forget(agent_id);
             self.models.remove(&agent_id);
             self.pending_syncs.remove(&agent_id);
             self.pending_diff_loads.remove(&agent_id);
@@ -1868,10 +1829,7 @@ impl Workspace {
 
         for agent_id in &order {
             let old_context = changes[agent_id].1;
-            let new_context = self
-                .store
-                .get(agent_id)
-                .and_then(|state| state.context_used);
+            let new_context = self.transcripts.context_used(agent_id);
             if old_context != new_context
                 && let Some(view) = self.models.get(agent_id).cloned()
             {
@@ -2041,7 +1999,6 @@ impl Workspace {
             ConnEvent::Live { agent_id, live } => {
                 self.handle_frame_batch(vec![(agent_id, TranscriptFrame::Live(live))], window, cx);
             }
-            #[cfg(test)]
             ConnEvent::Many(events) => {
                 for event in events {
                     self.handle_event(host, event, window, cx);
@@ -4081,9 +4038,8 @@ impl Workspace {
     /// its events, its transcript, its live tail, and the view unless a
     /// pane still shows it. The digest stays; the rails read that.
     fn release_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        self.open_mirrors.remove(&agent_id);
+        self.transcripts.forget(agent_id);
         self.note_followed();
-        self.store.forget(agent_id);
         self.pending_syncs.remove(&agent_id);
         self.registry.mark_not_live(agent_id);
         if let Some(model) = self.models.get(&agent_id).cloned() {
@@ -5570,7 +5526,7 @@ impl Workspace {
         if view.read(cx).initial_load_ready()
             && let (Some(summary), Some(state)) = (
                 self.pending_syncs.remove(agent_id),
-                self.store.get(agent_id),
+                self.transcripts.state(agent_id),
             )
         {
             view.update(cx, |view, cx| {
@@ -5593,10 +5549,7 @@ impl Workspace {
         view: &Entity<AgentModel>,
         cx: &mut Context<Self>,
     ) {
-        let context_used = self
-            .store
-            .get(agent_id)
-            .and_then(|state| state.context_used);
+        let context_used = self.transcripts.context_used(agent_id);
         view.update(cx, |view, cx| {
             view.set_status("", None, None, None, context_used, cx)
         });
@@ -6741,8 +6694,8 @@ impl Workspace {
         &self,
         agent_id: AgentId,
     ) -> rho_registry::render::UiAgentState {
-        self.store
-            .get(&agent_id)
+        self.transcripts
+            .state(&agent_id)
             .cloned()
             .unwrap_or_else(|| rho_registry::render::UiAgentState {
                 blocks: Vec::new(),

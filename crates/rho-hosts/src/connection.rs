@@ -108,9 +108,8 @@ pub enum ConnEvent {
         agent_id: AgentId,
         live: Live,
     },
-    /// Several events in order, for a test helper that stands for what a
-    /// daemon sends in more than one message.
-    #[cfg(feature = "test-support")]
+    /// Several events in order, delivered as one. A daemon sends them
+    /// separately; a test that stands for one stands for the batch.
     Many(Vec<ConnEvent>),
     TurnCancelled,
     /// A run of the host's journal, contiguous by seq: the answer to

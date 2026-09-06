@@ -54,6 +54,20 @@ connection to the screen, tested alone against its own fake server.
   agent screens. Tested end to end against a fake daemon. Selection and
   the active pane are not agent state and go to `rho-window`. Owner:
   eng-b8os.
+
+  *Landed, the transcript (5).* `Transcripts` owns what a transcript is:
+  the fold of an agent's mirror, the runtime's live tail, and the rendered
+  state a screen draws. The workspace held two fields (`store` and
+  `open_mirrors`) and four functions that walked between them; it now holds
+  one field and says which agent. Which agents are open is answered here
+  too, because it is the same question as which agents this client asks the
+  model thread for rows about. What crosses out is a state and a summary of
+  what changed — nothing above knows there is a fold underneath. Liveness
+  stayed in the shell: it is the map's fact about an agent, not the
+  transcript's. The mirror on disk (3) is still read by the workspace and
+  the events handed in, so this cut does not drag the model thread with it;
+  it follows with (4). Three tests run the crate alone. Gate green: rho-gui
+  277, rho-agents 3, rho-hosts 14, rho-registry 14.
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

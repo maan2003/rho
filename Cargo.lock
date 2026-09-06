@@ -13638,6 +13638,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-agents"
+version = "0.1.0"
+dependencies = [
+ "rho-core",
+ "rho-registry",
+ "rho-ui-proto",
+]
+
+[[package]]
 name = "rho-browser"
 version = "0.1.0"
 dependencies = [
@@ -13903,6 +13912,7 @@ dependencies = [
  "redb",
  "redb-derive",
  "release_channel",
+ "rho-agents",
  "rho-browser",
  "rho-core",
  "rho-db",
