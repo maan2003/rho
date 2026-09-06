@@ -26,6 +26,35 @@ The boundary that lets engineers work apart is not a function boundary.
 It is vertical: one crate per source, owning everything from the
 connection to the screen, tested alone against its own fake server.
 
+## It feels like Emacs
+
+Ruling, 6 Sep, over every crate below. Rho is an editor the way Emacs is
+one, and every screen a source crate builds obeys that:
+
+- Every screen is a buffer. Agents, the map, a Slack conversation, a
+  thread, Find's results, a draft: text in an editor, drawn with the
+  editor primitives (buffers, inlays, the composition), with the point
+  in it. The user moves through it, searches it, selects and copies from
+  it, as in any buffer. There is no widget tree beside the editor; when
+  a screen needs a primitive the editor lacks, the primitive is built
+  from the ground up and the screen stays a buffer.
+- Keys do everything, and a key means one thing per context. Each buffer
+  kind has its key context; the same key does the same kind of thing in
+  every buffer (open, act, back, next, previous). Nothing needs the
+  mouse.
+- The minibuffer asks and the echo line answers. A question to the user
+  (Find, a name, a confirmation) is asked in the minibuffer; what just
+  happened is said in the echo line, in words, never in a modal.
+- Actions with choices are transients. A verdict, a filing, a reply with
+  options: a transient shows the keys and their meanings, as Magit does,
+  and goes away.
+- Surfaces have a history. Back is always a key away and returns to the
+  buffer as it was, point included.
+
+`rho-window` owns these primitives; source crates use them and add no
+others. A design that reaches for a different UI model for one screen is
+wrong at the design, not at the polish.
+
 ## The crates
 
 - **`rho-hosts`.** The daemon connection per host and its handshake,
