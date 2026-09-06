@@ -1476,31 +1476,6 @@ where
     Ok(())
 }
 
-#[cfg(test)]
-fn rewind_destination_materialized(
-    rewind: &rho_agent::db::ClaudeRewind,
-    messages: &[rho_claude::SessionMessage],
-) -> bool {
-    match rewind.resume_at {
-        Some(resume_at) => {
-            rho_claude::session_messages_through_assistant(messages, resume_at).is_some()
-        }
-        None => !messages.is_empty(),
-    }
-}
-
-#[cfg(test)]
-fn rewind_source_prefix(
-    rewind: &rho_agent::db::ClaudeRewind,
-    messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<Vec<rho_claude::SessionMessage>> {
-    match rewind.resume_at {
-        Some(resume_at) => rho_claude::session_messages_through_assistant(messages, resume_at)
-            .context("Claude rewind point is no longer in the transcript"),
-        None => Ok(Vec::new()),
-    }
-}
-
 /// Durable presentation changes refresh the normal snapshot for every
 /// connection. Broadcast loss is harmless because `Ready` is reconstructed
 /// from the agent cache, including after daemon restart.
@@ -2039,18 +2014,14 @@ async fn handle_message(
         }
         ClientMessage::DeskMutationApply { mutation } => {
             let stamp = mutation.stamp;
-            let Some((device, namespace)) = *desk_session else {
+            let Some((device, _)) = *desk_session else {
                 let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
                     stamp,
                     reason: "Desk connection must sync before writing".into(),
                 });
                 return Ok(Refresh::None);
             };
-            match agents
-                .desk_cells
-                .apply_mutation(device, namespace, mutation)
-                .await
-            {
+            match agents.desk_cells.apply_mutation(device, mutation).await {
                 Ok(()) => {
                     let _ = outgoing_tx.send(ServerMessage::DeskMutationAccepted { stamp });
                     let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
@@ -3466,9 +3437,7 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
-    use rho_agent::db::{
-        AgentWriteTxnExt, ClaudeRewind, QuotaModel, QuotaObservationRecord, QuotaProvider,
-    };
+    use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
     use rho_core::ContentPart;
     use rho_db::RhoDb;
     use rho_ui_proto::ServerMessage;

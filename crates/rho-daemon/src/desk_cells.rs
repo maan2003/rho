@@ -302,7 +302,6 @@ impl DeskCellStore {
     pub(crate) async fn apply_mutation(
         &self,
         session_device: DeviceId,
-        session_namespace: u16,
         mutation: CellMutation,
     ) -> Result<(), String> {
         validate_mutation_bounds(&mutation)?;
@@ -930,7 +929,6 @@ mod tests {
         store
             .apply_mutation(
                 device,
-                namespace,
                 CellMutation {
                     stamp: Stamp { device, version },
                     writes: vec![
@@ -969,7 +967,6 @@ mod tests {
         let device = DeviceId([9; 16]);
         let id = seed_note(&store, device).await;
         let initial = store.sync_since(&Version::new()).unwrap();
-        let namespace = store.node_namespace(device).await.unwrap();
         let label = Id::Label(Uuid::random());
         let version = next_version(&store);
         let mutation = CellMutation {
@@ -984,11 +981,11 @@ mod tests {
             verdict: None,
         };
         store
-            .apply_mutation(device, namespace, mutation.clone())
+            .apply_mutation(device, mutation.clone())
             .await
             .unwrap();
         store
-            .apply_mutation(device, namespace, mutation.clone())
+            .apply_mutation(device, mutation.clone())
             .await
             .unwrap();
         let delta = store.sync_since(&initial.version).unwrap();
@@ -1000,15 +997,10 @@ mod tests {
             label,
             present: false,
         };
+        assert!(store.apply_mutation(device, conflict).await.is_err());
         assert!(
             store
-                .apply_mutation(device, namespace, conflict)
-                .await
-                .is_err()
-        );
-        assert!(
-            store
-                .apply_mutation(DeviceId([8; 16]), namespace, mutation)
+                .apply_mutation(DeviceId([8; 16]), mutation)
                 .await
                 .is_err()
         );
@@ -1016,7 +1008,6 @@ mod tests {
         // A device that was away writes from its own version, but never
         // from one the frontier cannot explain.
         let offline = DeviceId([7; 16]);
-        let offline_namespace = store.node_namespace(offline).await.unwrap();
         let name = |id: &Id, text: &str| CellWrite {
             id: id.clone(),
             property: Property::Name(text.into()),
@@ -1024,7 +1015,6 @@ mod tests {
         store
             .apply_mutation(
                 offline,
-                offline_namespace,
                 CellMutation {
                     stamp: Stamp {
                         device: offline,
@@ -1041,7 +1031,6 @@ mod tests {
             store
                 .apply_mutation(
                     offline,
-                    offline_namespace,
                     CellMutation {
                         stamp: Stamp {
                             device: offline,
@@ -1062,7 +1051,6 @@ mod tests {
     async fn a_todo_verdict_on_a_slack_unit_files_its_new_note_under_it() {
         let store = fixture_store().await;
         let device = DeviceId([12; 16]);
-        let namespace = store.node_namespace(device).await.unwrap();
         let unit = Id::Slack(rho_desk::cells::SlackUnit {
             workspace: "rho".into(),
             channel: "C1".into(),
@@ -1136,7 +1124,6 @@ mod tests {
             store
                 .apply_mutation(
                     device,
-                    namespace,
                     CellMutation {
                         stamp,
                         writes: writes(None),
@@ -1156,7 +1143,6 @@ mod tests {
         store
             .apply_mutation(
                 device,
-                namespace,
                 CellMutation {
                     stamp,
                     writes: writes(Some(unit.clone())),
@@ -1191,14 +1177,12 @@ mod tests {
     async fn a_defer_verdict_zeroes_the_pace() {
         let store = fixture_store().await;
         let device = DeviceId([13; 16]);
-        let namespace = store.node_namespace(device).await.unwrap();
         let id = seed_note(&store, device).await;
 
         // The note is a todo first, so the pace has something to zero.
         store
             .apply_mutation(
                 device,
-                namespace,
                 CellMutation {
                     stamp: Stamp {
                         device,
@@ -1252,15 +1236,12 @@ mod tests {
         let only_the_wake_time = defer(next_version(&store), vec![wakes.clone()]);
         assert!(
             store
-                .apply_mutation(device, namespace, only_the_wake_time)
+                .apply_mutation(device, only_the_wake_time)
                 .await
                 .is_err()
         );
         let whole = defer(next_version(&store), vec![wakes, paced_to_zero]);
-        store
-            .apply_mutation(device, namespace, whole)
-            .await
-            .unwrap();
+        store.apply_mutation(device, whole).await.unwrap();
 
         let facts = Store::from_snapshot(
             DeviceId([0; 16]),
@@ -1276,7 +1257,6 @@ mod tests {
     async fn a_label_verdict_puts_a_label_on_and_takes_it_off() {
         let store = fixture_store().await;
         let device = DeviceId([17; 16]);
-        let namespace = store.node_namespace(device).await.unwrap();
         let id = seed_note(&store, device).await;
         let label = Id::Label(Uuid::random());
 
@@ -1319,7 +1299,7 @@ mod tests {
         };
 
         store
-            .apply_mutation(device, namespace, label_verdict(true, false))
+            .apply_mutation(device, label_verdict(true, false))
             .await
             .unwrap();
         let labels = |store: &DeskCellStore| {
@@ -1338,7 +1318,7 @@ mod tests {
         // Taking the label off is the same verdict, so it goes through the
         // same check rather than around it.
         store
-            .apply_mutation(device, namespace, label_verdict(false, true))
+            .apply_mutation(device, label_verdict(false, true))
             .await
             .unwrap();
         assert!(labels(&store).is_empty());
@@ -1350,12 +1330,7 @@ mod tests {
             label: id.clone(),
             present: true,
         };
-        assert!(
-            store
-                .apply_mutation(device, namespace, nonsense)
-                .await
-                .is_err()
-        );
+        assert!(store.apply_mutation(device, nonsense).await.is_err());
     }
 
     /// A row a newer build wrote, in this build's tables, encoded exactly
