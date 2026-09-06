@@ -621,6 +621,42 @@ wrong at the design, not at the polish.
   those rows. Nothing here grows with the desk.
   Gate green: rho-gui 245 passed and 3 ignored (248 total, against main's
   246), rho-window 11, clippy `-D warnings` clean, `cargo fmt --check` clean.
+- **Landed, the refusal block is measured too** (`rho-window` module touched:
+  `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
+  the other `height: None` in the chrome, filed in the change above and fixed
+  here with the same word: `Some(1)`, and the editor resizes it to the two or
+  three rows a jj failure actually draws.
+  What the rig said about it is worth more than the fix. The picture asked for
+  — a refused draft pushing the rows below it down — cannot exist on that
+  surface. The refusal anchors at the end of the draft body, so nothing is
+  under it; the attachment chip that shares the anchor has the lower priority
+  and takes the row above. I drove the same script twice on the desk, once on
+  a build with `height: None` restored (session 19) and once on the fix
+  (session 25) — new agent, three-line body, a workdir the daemon refuses, an
+  image pasted so the chip is there too — and the two screenshots are
+  byte-identical. So this defect is invisible until something is drawn below
+  the block: the verdict transient had rows under it and showed it at once,
+  this one would have waited for whatever is added under a refusal next. That
+  is now C9 in the handbook, with the rule that finds it — read `rho-window`
+  for `height: None` — rather than the picture that does not.
+  Three driving facts came out of taking it, and are in the handbook's
+  "Running anything": `rho wayland` has no resize for a running session, so
+  sway's own ipc socket and `output HEADLESS-1 mode 1024x600@60Hz` is the way
+  (eng-b8os, who measured the resize case with it); an image reaches the
+  clipboard with `wl-copy --type image/png` against the session's `runtime`
+  dir, and the paste is `ctrl+shift+v` because `ctrl+v` is visual block; and
+  `rho-qa build` does not build `rho-qa`, so a stale `target/profiling/rho-qa`
+  silently writes no summary into the session — sessions 23 to 25 have none
+  for that reason.
+  The rig-down line for session 25, the fixed build:
+  `969 frames, draw p99 2.6 ms, 0 over 8 ms; worst gap 278 ms, p99 8 ms;
+  53355 events, slowest stage buffer_edit p99 0.12 ms at 2 rows; 458 samples
+  on rho-gui: __memcpy_avx512_unaligned_erms 8%, __syscall_cancel_arch_end 4%,
+  compare 2%`. A refusal costs one block insert and one measured element;
+  nothing here grows with the desk.
+  Gate green on main dca5c374 (rebased onto b8os's transcript tail): rho-gui
+  250 passed and 3 ignored, rho-window 11, clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but

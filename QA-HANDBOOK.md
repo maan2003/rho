@@ -33,6 +33,22 @@ rho wayland --session desk screenshot --output /tmp/case.png
 rho wayland --session desk tree                               # the window tree
 ```
 
+Three things the driver does not do, and what to do instead.
+
+- **Resize.** There is no resize for a running session. Sway's own ipc socket
+  is the way: the path is `ipc_socket` in the session's `session.json`, and
+  `output HEADLESS-1 mode 1024x600@60Hz` through it takes effect at once and
+  the client resizes. That is a real width change through `set_wrap_width`,
+  which is how the wrap-on-resize case can be driven at all.
+- **The clipboard.** `wl-copy --type image/png < file.png`, with
+  `XDG_RUNTIME_DIR` pointed at the session's own `runtime` directory and
+  `WAYLAND_DISPLAY=wayland-1`, puts an image where the GUI can paste it. In
+  the GUI the paste is `ctrl+shift+v`; `ctrl+v` is visual block.
+- **Its own binary.** `rho-qa build` builds what a rig runs, not `rho-qa`
+  itself, so `target/profiling/rho-qa` can be older than main — an old one
+  quietly writes no summary into the session. Run it through `cargo run -p
+  rho-qa` when the line matters, and check `rho-qa --help` lists `profile`.
+
 Three rules for every run.
 
 1. **The desk is never reset.** `rho-qa rig new` refuses to overwrite one.
@@ -225,10 +241,43 @@ still counts it, or the walk differs after the restart.
 
 *Closed by:* —
 
+### C9. A block under the point moves the rows below it
+
+*Why it is tricky.* Anything the GUI draws into a buffer — a transient menu, a
+refusal, an inline note — is an editor block, and a block is only measured and
+given rows when it has a height to start from (`Block::has_height` is
+`height.is_some()`; with `None` the editor resizes nothing and the block keeps
+zero rows forever). A block with no height still paints, on top of whatever is
+below it. Every unit test passes: the point did not move, the block is in the
+editor, the strip is empty. Only a picture shows the row underneath being
+covered instead of pushed down.
+
+The half of this that hides the defect: a block that is *last* in its buffer
+looks the same either way, because nothing is under it to cover. The draft's
+refusal is one of those — it sits at the end of the body, and the attachment
+chip that shares its anchor has the lower priority, so it takes the row above.
+Two builds of `refusal_block`, one with `Some(1)` and one with `None`, driven
+the same way, produce byte-identical screenshots. So a block with no height is
+a defect waiting for a neighbour, and the way to find it is to read the code
+for `height: None`, not to wait for a picture.
+
+*Run.* On the desk rig, open each thing that draws under the point — the
+verdict transient on a Home row, a refused draft with an image attached — and
+screenshot the frame. Where a picture has to settle it, build the same drive
+twice, once with the block's height forced to `None`, and compare the two PNGs
+byte for byte.
+
+*Passes if* the row that was under the point before is still readable below the
+block, moved down by the block's height, and no `BlockProperties` in
+`rho-window` asks for `height: None`. *Fails if* the block is painted over the
+row below, or the rows below shift by fewer rows than the block drew.
+
+*Closed by:* the verdict transient (main 8601e048) and `style::refusal_block`.
+
 ## Does it feel like Emacs
 
 From the user's ruling. These run over whatever case you were already running —
-they are not separate sessions, they are what you check while doing C1 to C8.
+they are not separate sessions, they are what you check while doing C1 to C9.
 
 ### E1. The point survives back
 

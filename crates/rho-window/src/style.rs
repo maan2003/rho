@@ -216,8 +216,12 @@ pub fn refusal_block(anchor: Anchor, message: String) -> BlockProperties<Anchor>
     BlockProperties {
         placement: BlockPlacement::Below(anchor),
         // Measured, not one line: the whole cause is the point, and a jj
-        // failure is longer than the frame is wide.
-        height: None,
+        // failure is longer than the frame is wide. A starting height is
+        // what turns the measuring on — `Block::has_height` is
+        // `height.is_some()`, and a block without one is never measured,
+        // so `None` leaves the refusal painted over the rows below it
+        // instead of moving them down.
+        height: Some(1),
         style: BlockStyle::Fixed,
         render: Arc::new(move |cx| render_refusal_block(&message, cx).into_any_element()),
         priority: 1,
