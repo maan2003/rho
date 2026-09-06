@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
-use rho_core::{
-    ContentPart, ContextBlock, ContextItemEvent, InferenceResponseItem, PendingInferenceResponse,
+use notify::Watcher as _;
+use rho_claude::{
+    ClaudeCode, ClaudeCodeOptions, Effort, Model, Session, TailLine, TailRead, TranscriptTail,
 };
+use rho_core::{ContentPart, ContextItemEvent, PendingInferenceResponse};
 use rho_db::{RhoDb, WriteTxn};
 use rho_inference::Inference;
 use tokio::sync::{mpsc, oneshot};
@@ -24,21 +25,19 @@ use uuid::Uuid;
 use crate::db::{
     AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
     AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
-    AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
+    AgentRuntime, AgentWriteTxnExt, ClaudeRewind, ClaudeTranscriptCursor, EngineerIntelligence,
+    SessionBinding, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
     AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
-    InputQueues, MessageDelivery, PresentationSpeaker, QueuedInput, StartWorkdir, system_prompt,
+    InputQueues, MessageDelivery, QueuedInput, StartWorkdir, TranscriptLine, system_prompt,
 };
 
+pub(crate) mod backfill;
 pub(crate) mod projection;
 
-use projection::{
-    ClaudeStreamItem, assistant_message_to_block, assistant_presentation_source,
-    presentation_source, queued_user_presentation_source, transcript_messages_to_context,
-    user_output_to_block,
-};
+use projection::{ClaudeStreamItem, transcript_line};
 
 use crate::lazy::Lazy;
 
@@ -100,6 +99,7 @@ impl ClaudeAgent {
             .upgrade()
             .map(|_| MultiAgentTools::new(pool, agent_id, parent));
         let head = db.read().get_agent(agent_id);
+        let primary_repo = head.primary_workdir().repo().to_owned();
         let state = AgentState {
             blocks: Vec::new(),
             queued_inputs: InputQueues::default(),
@@ -120,6 +120,7 @@ impl ClaudeAgent {
                 inference,
                 agent_id,
                 Arc::new(Lazy::ready(view)),
+                primary_repo,
                 model,
                 effort,
                 session_id,
@@ -129,7 +130,6 @@ impl ClaudeAgent {
                 multi_agent,
                 pool_events,
                 role,
-                HashSet::new(),
                 head,
             ),
         ))
@@ -157,7 +157,10 @@ impl ClaudeAgent {
                 anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
             })?;
         let primary_repo = record.primary_workdir().repo().to_owned();
-        let (session_id, messages, start_mode, pending_rewind, context_used) = if let Some(rewind) =
+        // The transcript's rows come from the file when the loop starts
+        // (`sync_transcript`); a load reads the file only to settle a
+        // rewind that was cut short.
+        let (session_id, start_mode, pending_rewind) = if let Some(rewind) =
             record.config.claude_rewind
         {
             let resumed = rho_claude::read_session_messages_by_id(
@@ -176,16 +179,7 @@ impl ClaudeAgent {
                 let mut write = db.write().await;
                 write.complete_agent_claude_rewind(agent_id, rewind.session_id);
                 write.commit();
-                let context_used =
-                    rho_claude::read_session_context_used_by_id(rewind.session_id, &primary_repo)
-                        .await?;
-                (
-                    rewind.session_id,
-                    resumed,
-                    ClaudeStartMode::Resume,
-                    false,
-                    context_used,
-                )
+                (rewind.session_id, ClaudeStartMode::Resume, false)
             } else {
                 // A hard-killed fork can leave a partial JSONL that reserves
                 // its session id without containing the copied boundary.
@@ -204,13 +198,13 @@ impl ClaudeAgent {
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;
-                let messages = match rewind.resume_at {
-                    Some(resume_at) => {
+                if let Some(resume_at) = rewind.resume_at {
+                    anyhow::ensure!(
                         rho_claude::session_messages_through_assistant(&source, resume_at)
-                            .context("Claude rewind point is no longer in the transcript")?
-                    }
-                    None => Vec::new(),
-                };
+                            .is_some(),
+                        "Claude rewind point is no longer in the transcript"
+                    );
+                }
                 let start_mode = match rewind.resume_at {
                     Some(resume_at) => ClaudeStartMode::Fork {
                         source_session_id: rewind.source_session_id,
@@ -218,34 +212,22 @@ impl ClaudeAgent {
                     },
                     None => ClaudeStartMode::New,
                 };
-                let context_used =
-                    rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
-                (session_id, messages, start_mode, true, context_used)
+                (session_id, start_mode, true)
             }
         } else {
-            let messages = rho_claude::read_session_messages_by_id(
-                session_id,
-                &primary_repo,
-                rho_claude::SessionMessagesOptions::default(),
-            )
-            .await?;
-            let start_mode = if messages.is_empty() {
-                ClaudeStartMode::New
-            } else {
-                ClaudeStartMode::Resume
-            };
-            let context_used =
-                rho_claude::read_session_context_used_by_id(session_id, &primary_repo).await?;
-            (session_id, messages, start_mode, false, context_used)
+            // A file for the session means it has been spoken to.
+            let start_mode =
+                match rho_claude::find_session_transcript(session_id, &primary_repo).await? {
+                    Some(_) => ClaudeStartMode::Resume,
+                    None => ClaudeStartMode::New,
+                };
+            (session_id, start_mode, false)
         };
-        let (known_presentation_sources, _) =
-            reconcile_claude_presentation_sources(&db, agent_id, &messages).await?;
-        let blocks = transcript_messages_to_context(&messages)?;
         let state = AgentState {
-            blocks,
+            blocks: Vec::new(),
             queued_inputs: InputQueues::default(),
             kind: AgentStateKind::Idle,
-            context_used,
+            context_used: None,
             total_usage: db.read().agent_usage_total(agent_id),
             usage_provider: match model {
                 rho_claude::Model::Opus => crate::db::AgentUsageModel::OPUS,
@@ -260,6 +242,7 @@ impl ClaudeAgent {
             inference,
             agent_id,
             view,
+            primary_repo,
             model,
             effort,
             session_id,
@@ -270,7 +253,6 @@ impl ClaudeAgent {
                 .map(|_| MultiAgentTools::new(pool, agent_id, parent_agent)),
             pool_events,
             record.config.role,
-            known_presentation_sources,
             head,
         ))
     }
@@ -281,6 +263,7 @@ impl ClaudeAgent {
         inference: Inference,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+        primary_repo: Utf8PathBuf,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -290,7 +273,6 @@ impl ClaudeAgent {
         multi_agent: Option<MultiAgentTools>,
         pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
-        known_presentation_sources: HashSet<Uuid>,
         head: crate::db::AgentHead,
     ) -> Self {
         let status = Arc::new(RwLock::new(AgentStatus {
@@ -315,6 +297,7 @@ impl ClaudeAgent {
             presentation_session,
             agent_id,
             view,
+            primary_repo,
             model,
             effort,
             session_id,
@@ -325,7 +308,6 @@ impl ClaudeAgent {
             stream_items: BTreeMap::new(),
             queued_turns: VecDeque::new(),
             turn_usage: None,
-            reply_usage: None,
             cancelling: false,
             pending_rewind,
             execution_generation: 0,
@@ -334,13 +316,14 @@ impl ClaudeAgent {
             head: Arc::clone(&head),
             teller: std::sync::Mutex::new(crate::live::Teller::default()),
             control_rx,
-            presentation_control: control.downgrade(),
+            control: control.downgrade(),
             multi_agent,
             pool_events,
             role,
-            known_presentation_sources,
             presentation: ClaudePresentationState::default(),
             last_presentation_source,
+            transcript: None,
+            transcript_watch: None,
         };
         tokio::spawn(loop_state.run());
         Self {
@@ -495,6 +478,8 @@ enum ClaudeControl {
     },
     /// Tell the live tail whole, for a client that just started looking.
     TellTail,
+    /// The transcript file changed (the watch saw it).
+    TranscriptChanged,
 }
 
 struct ClaudeLoop {
@@ -504,6 +489,9 @@ struct ClaudeLoop {
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
     view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+    /// The primary workdir's repo, which is where Claude files the
+    /// session. Known without materializing the view.
+    primary_repo: Utf8PathBuf,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -518,9 +506,6 @@ struct ClaudeLoop {
     /// `input_tokens` is a streaming placeholder). Snapshots are taken as-is,
     /// never accumulated — stream-json repeats usage per content block.
     turn_usage: Option<rho_claude::protocol::TokenUsage>,
-    /// The last message's cost, held from its stop until the assistant
-    /// message it belongs to is persisted with it.
-    reply_usage: Option<crate::db::AgentUsageBucket>,
     cancelling: bool,
     pending_rewind: bool,
     execution_generation: u64,
@@ -532,13 +517,279 @@ struct ClaudeLoop {
     /// what changed.
     teller: std::sync::Mutex<crate::live::Teller>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
-    presentation_control: mpsc::WeakUnboundedSender<ClaudeControl>,
+    /// The loop's own address, for the tasks it starts (the sidecar, the
+    /// file watch).
+    control: mpsc::WeakUnboundedSender<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
     pool_events: std::sync::Weak<crate::pool::AgentPool>,
     role: crate::db::AgentRole,
-    known_presentation_sources: HashSet<Uuid>,
     presentation: ClaudePresentationState,
     last_presentation_source: Option<AgentEventPos>,
+    /// The session's transcript, copied into the log as it grows; `None`
+    /// until the first sync, and again whenever the session changes
+    /// under it.
+    transcript: Option<TranscriptCopy>,
+    transcript_watch: Option<notify::RecommendedWatcher>,
+}
+
+/// The session's transcript copied into the log: the file read as it
+/// grows, and what a read from its start must not tell twice.
+struct TranscriptCopy {
+    agent_id: AgentId,
+    session_id: Uuid,
+    tail: TranscriptTail,
+    /// The file was there when the path was worked out; a guessed path
+    /// is worked out again while the file is missing.
+    found: bool,
+    /// A read from the file's start in progress: the lines the log
+    /// already holds. `None` once past the start.
+    told: Option<HashSet<Uuid>>,
+    /// The API message whose usage a row already carries.
+    usage_told: Option<String>,
+    /// The uuids of the last lines read, so a sync asked to wait for one
+    /// that is already in does not.
+    recent_lines: VecDeque<Uuid>,
+}
+
+/// What one copy did.
+#[derive(Debug, PartialEq)]
+enum Copied {
+    /// Lines were read and the cursor moved (the log may already have
+    /// held every one of them): the last row said by a person or the
+    /// model, and the context occupancy the last one reported.
+    Read {
+        spoke: Option<AgentEventPos>,
+        context_used: Option<u64>,
+    },
+    /// Nothing new.
+    Nothing,
+    /// No file at the path.
+    Missing,
+}
+
+impl TranscriptCopy {
+    /// A copier for the session's file at `path`, starting where the
+    /// cursor says; from the start when the cursor is another session's
+    /// or there is none.
+    fn open(
+        db: &RhoDb,
+        agent_id: AgentId,
+        session_id: Uuid,
+        path: Utf8PathBuf,
+        found: bool,
+    ) -> Self {
+        let end = cursor_end(db.read().claude_transcript_cursor(agent_id), session_id);
+        let mut copy = Self {
+            agent_id,
+            session_id,
+            tail: TranscriptTail::new(path, end),
+            found,
+            told: None,
+            usage_told: None,
+            recent_lines: VecDeque::new(),
+        };
+        copy.reopen(db, end);
+        copy
+    }
+
+    /// Reads from `end` on; from the start, what the log holds is
+    /// skipped.
+    fn reopen(&mut self, db: &RhoDb, end: u64) {
+        self.tail = TranscriptTail::new(self.tail.path().to_owned(), end);
+        self.told = (end == 0).then(|| told_lines(&db.read(), self.agent_id));
+        self.usage_told = None;
+    }
+
+    fn path(&self) -> &camino::Utf8Path {
+        self.tail.path()
+    }
+
+    /// Whether a recent read saw this line.
+    fn has_line(&self, uuid: Uuid) -> bool {
+        self.recent_lines.contains(&uuid)
+    }
+
+    /// One read from the cursor: the lines since, as rows, and the cursor
+    /// after them, in one transaction. A file shorter than the cursor is
+    /// read from its start, skipping what the log holds. A cursor moved
+    /// by another writer since the read (the copy at daemon start) is
+    /// read from again.
+    async fn copy(
+        &mut self,
+        db: &RhoDb,
+        usage_model: crate::db::AgentUsageModel,
+    ) -> anyhow::Result<Copied> {
+        let mut restarts = 0;
+        loop {
+            let from = self.tail.end();
+            let lines = match self.tail.read().await? {
+                TailRead::Missing => return Ok(Copied::Missing),
+                TailRead::Truncated => {
+                    restarts += 1;
+                    anyhow::ensure!(restarts <= 2, "Claude transcript keeps shrinking");
+                    let mut write = db.write().await;
+                    write.set_claude_transcript_cursor(
+                        self.agent_id,
+                        &ClaudeTranscriptCursor {
+                            session_id: self.session_id,
+                            end: 0,
+                        },
+                    );
+                    write.commit();
+                    self.reopen(db, 0);
+                    continue;
+                }
+                TailRead::Lines(lines) => lines,
+            };
+            if lines.is_empty() {
+                return Ok(Copied::Nothing);
+            }
+            let end = self.tail.end();
+            for line in &lines {
+                if self.recent_lines.len() >= 128 {
+                    self.recent_lines.pop_front();
+                }
+                self.recent_lines.push_back(line.uuid());
+            }
+            let rows = project_rows(
+                self.agent_id,
+                &lines,
+                self.told.as_ref(),
+                usage_model,
+                &mut self.usage_told,
+            );
+            let mut write = db.write().await;
+            let stored = cursor_end(
+                write.claude_transcript_cursor(self.agent_id),
+                self.session_id,
+            );
+            if stored != from {
+                drop(write);
+                restarts += 1;
+                anyhow::ensure!(restarts <= 2, "Claude transcript cursor keeps moving");
+                self.reopen(db, stored);
+                continue;
+            }
+            let (spoke, context_used) = append_rows(&mut write, self.agent_id, rows);
+            write.set_claude_transcript_cursor(
+                self.agent_id,
+                &ClaudeTranscriptCursor {
+                    session_id: self.session_id,
+                    end,
+                },
+            );
+            write.commit();
+            return Ok(Copied::Read {
+                spoke,
+                context_used,
+            });
+        }
+    }
+}
+
+/// Where a cursor says this session's copy stops: zero when it is
+/// another session's or there is none.
+fn cursor_end(cursor: Option<ClaudeTranscriptCursor>, session_id: Uuid) -> u64 {
+    match cursor {
+        Some(cursor) if cursor.session_id == session_id => cursor.end,
+        _ => 0,
+    }
+}
+
+/// The uuid of every `Transcript` row in the log.
+pub(super) fn told_lines(read: &rho_db::ReadTxn, agent_id: AgentId) -> HashSet<Uuid> {
+    read.agent_event_records(agent_id)
+        .1
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            AgentEvent::Transcript { uuid, .. } => Some(uuid),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One line of the file, as the row it makes.
+pub(super) struct LineRow {
+    uuid: Uuid,
+    offset: u64,
+    line: TranscriptLine,
+    at: rho_core::UnixMs,
+}
+
+/// The rows for lines read: none for a line in `told`, a hidden one, or
+/// one that does not parse (said on stderr).
+pub(super) fn project_rows(
+    agent_id: AgentId,
+    lines: &[TailLine],
+    told: Option<&HashSet<Uuid>>,
+    usage_model: crate::db::AgentUsageModel,
+    usage_told: &mut Option<String>,
+) -> Vec<LineRow> {
+    let mut rows = Vec::with_capacity(lines.len());
+    for line in lines {
+        let uuid = line.uuid();
+        if told.is_some_and(|told| told.contains(&uuid)) {
+            continue;
+        }
+        match transcript_line(&line.row, usage_model, usage_told) {
+            Ok(Some((uuid, row, at))) => rows.push(LineRow {
+                uuid,
+                offset: line.offset,
+                line: row,
+                at,
+            }),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "rho-agent: Claude transcript line {uuid} of {} skipped: {error:#}",
+                agent_id.encoded()
+            ),
+        }
+    }
+    rows
+}
+
+/// Appends the rows: the last one said by a person or the model, and the
+/// context occupancy the last one reported.
+pub(super) fn append_rows(
+    write: &mut WriteTxn,
+    agent_id: AgentId,
+    rows: Vec<LineRow>,
+) -> (Option<AgentEventPos>, Option<u64>) {
+    let mut spoke = None;
+    let mut context_used = None;
+    for row in rows {
+        match &row.line {
+            TranscriptLine::Assistant {
+                context_used: reported,
+                ..
+            }
+            | TranscriptLine::Compacted {
+                context_used: reported,
+            } => {
+                if reported.is_some() {
+                    context_used = *reported;
+                }
+            }
+            TranscriptLine::User { .. } | TranscriptLine::ToolResults { .. } => {}
+        }
+        let said = matches!(
+            &row.line,
+            TranscriptLine::User { .. } | TranscriptLine::Assistant { .. }
+        );
+        let pos = write.append_agent_event(
+            agent_id,
+            &AgentEvent::Transcript {
+                uuid: row.uuid,
+                offset: row.offset,
+                line: row.line,
+                at: row.at,
+            },
+        );
+        if said {
+            spoke = Some(pos);
+        }
+    }
+    (spoke, context_used)
 }
 
 #[derive(Default)]
@@ -563,145 +814,11 @@ struct ClaudeTurn {
     content: Arc<Vec<ContentPart>>,
 }
 
-#[derive(Clone, Debug, Eq)]
-struct ClaudePresentationSource {
-    source_id: Uuid,
-    speaker: PresentationSpeaker,
-    /// The canonical (capped) text: what identity is compared on, so rows
-    /// written before the log kept messages whole still match.
-    text: String,
-    /// The message whole, which is what the row holds.
-    whole: String,
-}
-
-impl PartialEq for ClaudePresentationSource {
-    fn eq(&self, other: &Self) -> bool {
-        self.source_id == other.source_id
-            && self.speaker == other.speaker
-            && self.text == other.text
-    }
-}
-
-struct ClaudePresentationReconciliation {
-    sources: Vec<ClaudePresentationSource>,
-    persisted: Vec<(AgentEventPos, ClaudePresentationSource)>,
-    common: usize,
-}
-
-fn claude_presentation_sources(
-    messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<Vec<ClaudePresentationSource>> {
-    messages
-        .iter()
-        .filter_map(|message| presentation_source(message).transpose())
-        .filter_map(|source| match source {
-            Ok((source_id, speaker, whole)) => crate::presentation::canonical_source_text(&whole)
-                .map(|text| {
-                    Ok(ClaudePresentationSource {
-                        source_id,
-                        speaker,
-                        text,
-                        whole: whole.trim().to_owned(),
-                    })
-                }),
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
-}
-
-/// Plan reconciliation of the selected external Claude JSONL chain into
-/// durable, bounded source events. A crash between Claude's JSONL write and
-/// our event write is repaired on load; a shortened/diverged selected chain
-/// forks the same lineage that validates Luna cache updates.
-fn prepare_claude_presentation_reconciliation(
-    db: &RhoDb,
-    agent_id: AgentId,
-    messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<ClaudePresentationReconciliation> {
-    let sources = claude_presentation_sources(messages)?;
-    let read = db.read();
-    let (_, records) = read.agent_event_records(agent_id);
-    let persisted = records
-        .iter()
-        .filter_map(|(position, event)| match event {
-            AgentEvent::ClaudePresentationSource {
-                source_id,
-                speaker,
-                text,
-                ..
-            } => Some((
-                *position,
-                ClaudePresentationSource {
-                    source_id: *source_id,
-                    speaker: *speaker,
-                    text: crate::presentation::canonical_source_text(text)?,
-                    whole: text.to_string(),
-                },
-            )),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let common = persisted
-        .iter()
-        .zip(&sources)
-        .take_while(|((_, persisted), source)| persisted == *source)
-        .count();
-    Ok(ClaudePresentationReconciliation {
-        sources,
-        persisted,
-        common,
-    })
-}
-
-impl ClaudePresentationReconciliation {
-    /// A shortened or diverged transcript is a rewind of our mirror of
-    /// it, told like any other; the title and activity already told
-    /// still stand.
-    fn apply(&self, write: &mut WriteTxn, now: UnixMillis, agent_id: AgentId) {
-        if self.common < self.persisted.len() {
-            write.rewind_agent(now, agent_id, self.persisted[self.common].0);
-        }
-        for source in self.sources.iter().skip(self.common) {
-            write.append_agent_event(
-                agent_id,
-                &AgentEvent::ClaudePresentationSource {
-                    source_id: source.source_id,
-                    speaker: source.speaker,
-                    text: Cow::Borrowed(&source.whole),
-                    at: now,
-                },
-            );
-        }
-    }
-
-    fn state(&self, db: &RhoDb, agent_id: AgentId) -> (HashSet<Uuid>, Option<AgentEventPos>) {
-        let records = db
-            .read()
-            .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
-        let last = crate::presentation_sources(agent_id, &records)
-            .last()
-            .map(|source| source.through);
-        (
-            self.sources.iter().map(|source| source.source_id).collect(),
-            last,
-        )
-    }
-}
-
-async fn reconcile_claude_presentation_sources(
-    db: &RhoDb,
-    agent_id: AgentId,
-    messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<(HashSet<Uuid>, Option<AgentEventPos>)> {
-    let reconciliation = prepare_claude_presentation_reconciliation(db, agent_id, messages)?;
-    let mut write = db.write().await;
-    reconciliation.apply(&mut write, UnixMillis::now(), agent_id);
-    write.commit();
-    Ok(reconciliation.state(db, agent_id))
-}
-
 impl ClaudeLoop {
     async fn run(mut self) {
+        // The file is the history: whatever it says that the log does
+        // not yet, first.
+        self.sync_transcript(None).await;
         loop {
             let initial_kind = self.state.kind.clone();
             let initial_execution_generation = self.execution_generation;
@@ -952,6 +1069,7 @@ impl ClaudeLoop {
                 self.teller.lock().expect("poison").reset();
                 self.published();
             }
+            ClaudeControl::TranscriptChanged => self.sync_transcript(None).await,
             ClaudeControl::PresentationFinished { generation, result } => {
                 if self.presentation.generation != generation {
                     return;
@@ -988,37 +1106,6 @@ impl ClaudeLoop {
         Some(cache)
     }
 
-    async fn persist_presentation_source(
-        &mut self,
-        source_id: Uuid,
-        speaker: PresentationSpeaker,
-        text: String,
-    ) {
-        let whole = text.trim().to_owned();
-        if crate::presentation::canonical_source_text(&whole).is_none() {
-            return;
-        }
-        if !self.known_presentation_sources.insert(source_id) {
-            return;
-        }
-        // The row carries the whole message: for a Claude agent it is the
-        // durable copy a reader gets. Luna's prompt caps it when built.
-        let mut write = self.db.write().await;
-        let event_pos = write.append_agent_event(
-            self.agent_id,
-            &AgentEvent::ClaudePresentationSource {
-                source_id,
-                speaker,
-                text: Cow::Borrowed(&whole),
-                at: UnixMillis::now(),
-            },
-        );
-        write.commit();
-        self.last_presentation_source = Some(event_pos);
-        self.presentation.dirty = true;
-        self.schedule_presentation();
-    }
-
     fn reset_presentation(&mut self) {
         if let Some(task) = self.presentation.task.take() {
             task.abort();
@@ -1049,7 +1136,7 @@ impl ClaudeLoop {
         let db = self.db.clone();
         let session = Arc::clone(&self.presentation_session);
         let agent_id = self.agent_id;
-        let control = self.presentation_control.clone();
+        let control = self.control.clone();
         self.presentation.task = Some(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let result = if !crate::presentation::has_input(&db, agent_id) {
@@ -1351,9 +1438,23 @@ impl ClaudeLoop {
         };
         let (messages, resume_at) =
             rho_claude::rewind_session_messages(&messages, turns).context("nothing to rewind")?;
-        let reconciliation =
-            prepare_claude_presentation_reconciliation(&self.db, self.agent_id, &messages)?;
-        let blocks = transcript_messages_to_context(&messages)?;
+        // The rows from the first line the fork leaves behind are told
+        // taken back now; the fork's own file, once it exists, is read
+        // from its start and adds only what the log does not hold.
+        let kept = messages
+            .iter()
+            .map(|message| message.uuid)
+            .collect::<HashSet<_>>();
+        let dropped = self
+            .db
+            .read()
+            .agent_event_records(self.agent_id)
+            .1
+            .into_iter()
+            .find_map(|(pos, event)| match event {
+                AgentEvent::Transcript { uuid, .. } if !kept.contains(&uuid) => Some(pos),
+                _ => None,
+            });
         let context_used =
             rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
 
@@ -1371,7 +1472,9 @@ impl ClaudeLoop {
             None => ClaudeStartMode::New,
         };
         let mut write = self.db.write().await;
-        reconciliation.apply(&mut write, UnixMillis::now(), self.agent_id);
+        if let Some(to) = dropped {
+            write.rewind_agent(UnixMillis::now(), self.agent_id, to);
+        }
         write.set_agent_claude_rewind(
             self.agent_id,
             Some(ClaudeRewind {
@@ -1381,9 +1484,9 @@ impl ClaudeLoop {
             }),
         );
         write.commit();
-        let (known_sources, last_source) = reconciliation.state(&self.db, self.agent_id);
-        self.known_presentation_sources = known_sources;
-        self.last_presentation_source = last_source;
+        self.transcript = None;
+        self.transcript_watch = None;
+        self.last_presentation_source = None;
         self.reset_presentation();
         self.schedule_presentation();
         if let Some(pool) = self.pool_events.upgrade() {
@@ -1396,7 +1499,6 @@ impl ClaudeLoop {
         }
         self.pending_rewind = true;
 
-        self.state.blocks = blocks;
         self.state.queued_inputs.clear();
         self.state.kind = AgentStateKind::Idle;
         self.state.context_used = context_used;
@@ -1405,43 +1507,6 @@ impl ClaudeLoop {
         self.turn_usage = None;
         self.published();
         Ok(())
-    }
-
-    /// Routes a user-output block. With --replay-user-messages the CLI echoes
-    /// every user message when it enters context: an echo confirms a mirrored
-    /// queued message and promotes it to history. Anything else (tool
-    /// results, CLI-injected user content) passes through.
-    async fn handle_user_block(&mut self, block: Arc<ContextBlock>) {
-        if let ContextBlock::ToolResults { .. } = &*block {
-            // What the calls came back with, so a reader's mirror learns
-            // how each ended; the bodies stay here for `Detail`.
-            let mut write = self.db.write().await;
-            write.append_agent_event(
-                self.agent_id,
-                &AgentEvent::Sent {
-                    blocks: Cow::Borrowed(std::slice::from_ref(&*block)),
-                    at: UnixMillis::now(),
-                },
-            );
-            write.commit();
-        }
-        if let ContextBlock::UserMessage { content, .. } = &*block {
-            let matched = self
-                .state
-                .queued_inputs
-                .remove_first(|queued| match &queued.kind {
-                    InputKind::Message { content: queued } => {
-                        queued_user_content_matches(queued, content)
-                    }
-                    InputKind::Compaction => false,
-                });
-            if matched.is_some() {
-                self.state.blocks.push(block);
-                self.published();
-                return;
-            }
-        }
-        self.push_block(block);
     }
 
     async fn ensure_process(&mut self) -> anyhow::Result<()> {
@@ -1539,50 +1604,33 @@ impl ClaudeLoop {
                 self.handle_system_message(message).await;
             }
             rho_claude::ClaudeEvent::ControlResponse(_) => {}
+            // A message the stream tells whole is in the file (or about
+            // to be): its row comes from there. The live tail empties
+            // first, so a reader never holds the message twice.
             rho_claude::ClaudeEvent::Assistant(message) => {
-                let source = assistant_presentation_source(&message);
-                match assistant_message_to_block(message) {
-                    Ok(block) => {
-                        self.pending_response = PendingInferenceResponse::default();
-                        self.stream_items.clear();
-                        // The text first, then the calls: the order a
-                        // reader sees them in.
-                        match source {
-                            Ok(Some((source_id, speaker, text))) => {
-                                self.persist_presentation_source(source_id, speaker, text)
-                                    .await;
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                self.fail(error).await;
-                                return;
-                            }
-                        }
-                        self.persist_inference_block(&block).await;
-                        self.push_block(block);
-                        self.set_streaming_kind();
-                    }
-                    Err(error) => self.fail(error).await,
-                }
+                self.pending_response = PendingInferenceResponse::default();
+                self.stream_items.clear();
+                let line = message
+                    .parent_tool_use_id
+                    .is_none()
+                    .then(|| line_uuid(message.uuid.as_deref()))
+                    .flatten();
+                self.sync_transcript(line).await;
+                self.set_streaming_kind();
             }
             rho_claude::ClaudeEvent::User(message) => {
-                let source_id = message
-                    .uuid
-                    .as_deref()
-                    .and_then(|uuid| Uuid::parse_str(uuid).ok());
-                let promoted_queued = self
-                    .activate_turn_from_user_echo(message.uuid.as_deref(), source_id)
-                    .await;
-                if promoted_queued {
-                    return;
-                }
-                match user_output_to_block(message) {
-                    Ok(Some(block)) => self.handle_user_block(block).await,
-                    Ok(None) => {}
-                    Err(error) => self.fail(error).await,
-                }
+                self.activate_turn_from_user_echo(message.uuid.as_deref());
+                // Synthetic and sidechain lines are not in the visible
+                // file; only wait for one that is.
+                let line = (message.parent_tool_use_id.is_none()
+                    && !message.is_synthetic.unwrap_or(false))
+                .then(|| line_uuid(message.uuid.as_deref()))
+                .flatten();
+                self.sync_transcript(line).await;
             }
             rho_claude::ClaudeEvent::Result(message) => {
+                // Whatever the turn wrote last, before its end is told.
+                self.sync_transcript(None).await;
                 let successful = !message.is_error;
                 if self.cancelling {
                     self.pending_response = PendingInferenceResponse::default();
@@ -1662,7 +1710,6 @@ impl ClaudeLoop {
                         requests: 1,
                         ..crate::db::AgentUsageBucket::default()
                     };
-                    self.reply_usage = Some(turn_usage.clone());
                     self.state.total_usage.add(&turn_usage);
                     if let Some(pool) = self.pool_events.upgrade() {
                         pool.record_agent_usage(self.agent_id, turn_usage).await;
@@ -1698,14 +1745,8 @@ impl ClaudeLoop {
                     .expect("index came from position");
 
                 if message.state == "completed" {
-                    if let Some(source_id) = Uuid::parse_str(&message.command_uuid).ok()
-                        && let Some((source_id, speaker, text)) =
-                            queued_user_presentation_source(source_id, &turn.content)
-                    {
-                        self.persist_presentation_source(source_id, speaker, text)
-                            .await;
-                    }
-                    promote_queued_user_message(&mut self.state, &turn.content);
+                    promote_queued_user_message(&mut self.state);
+                    self.sync_transcript(None).await;
                 } else {
                     self.state
                         .queued_inputs
@@ -1733,42 +1774,130 @@ impl ClaudeLoop {
         }
     }
 
-    /// The calls a Claude message made and what it cost, as a `Replied`
-    /// row. The reply text is not in it: the durable mirror
-    /// (`persist_presentation_source`) is the one place it comes from, so
-    /// a message is never told twice.
-    async fn persist_inference_block(&mut self, block: &Arc<ContextBlock>) {
-        let ContextBlock::InferenceResponse {
-            items,
-            provider_response_id,
-        } = block.as_ref()
+    /// Copies the transcript's new lines into the log. `line` is one the
+    /// stream just announced: Claude writes the file and tells the stream
+    /// in an order it does not promise, so the copy waits (briefly) until
+    /// that line is in, and anything told after it (a turn end, a want)
+    /// follows its row.
+    async fn sync_transcript(&mut self, line: Option<Uuid>) {
+        const TRIES: u32 = 40;
+        const PAUSE: Duration = Duration::from_millis(25);
+        for attempt in 0..TRIES {
+            if let Err(error) = self.copy_transcript_lines().await {
+                eprintln!(
+                    "rho-agent: Claude transcript of {} not read: {error:#}",
+                    self.agent_id.encoded()
+                );
+                return;
+            }
+            let Some(uuid) = line else { return };
+            if self
+                .transcript
+                .as_ref()
+                .is_some_and(|transcript| transcript.has_line(uuid))
+            {
+                return;
+            }
+            if attempt + 1 == TRIES {
+                eprintln!(
+                    "rho-agent: Claude transcript line {uuid} of {} not in the file after {:?}",
+                    self.agent_id.encoded(),
+                    PAUSE * TRIES
+                );
+                return;
+            }
+            tokio::time::sleep(PAUSE).await;
+        }
+    }
+
+    async fn copy_transcript_lines(&mut self) -> anyhow::Result<()> {
+        if self.transcript.is_none() {
+            let (path, found) =
+                rho_claude::session_transcript_path(self.session_id, &self.primary_repo).await?;
+            self.transcript = Some(TranscriptCopy::open(
+                &self.db,
+                self.agent_id,
+                self.session_id,
+                path,
+                found,
+            ));
+            self.watch_transcript();
+        }
+        let transcript = self.transcript.as_mut().expect("set above");
+        match transcript.copy(&self.db, self.state.usage_provider).await? {
+            Copied::Read {
+                spoke,
+                context_used,
+            } => {
+                if context_used.is_some() {
+                    self.state.context_used = context_used;
+                }
+                if let Some(pos) = spoke {
+                    self.last_presentation_source = Some(pos);
+                    self.presentation.dirty = true;
+                    self.schedule_presentation();
+                }
+            }
+            Copied::Nothing => {}
+            // Not written yet. A guessed path is worked out again next
+            // time, in case Claude put the file elsewhere.
+            Copied::Missing => {
+                if !transcript.found {
+                    self.transcript = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Follows the transcript's directory, so a change to the file made
+    /// while the stream says nothing (or after it is gone) is still
+    /// copied. Best effort: the stream is the usual bell.
+    fn watch_transcript(&mut self) {
+        if self.transcript_watch.is_some() {
+            return;
+        }
+        let Some(path) = self
+            .transcript
+            .as_ref()
+            .map(|transcript| transcript.path().to_owned())
         else {
             return;
         };
-        let usage = self.reply_usage.take();
-        let items = items
-            .iter()
-            .filter(|item| !matches!(item, InferenceResponseItem::AssistantMessage { .. }))
-            .cloned()
-            .collect::<Vec<_>>();
-        if items.is_empty() && usage.is_none() {
+        let Some(dir) = path.parent().map(|dir| dir.to_owned()) else {
             return;
-        }
-        let context_used = self.state.context_used;
-        let mut write = self.db.write().await;
-        write.append_agent_event(
-            self.agent_id,
-            &AgentEvent::Replied {
-                blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
-                    items,
-                    provider_response_id: provider_response_id.clone(),
-                }]),
-                context_used,
-                usage,
-                at: UnixMillis::now(),
+        };
+        let control = self.control.clone();
+        let file = path.clone();
+        let watcher = notify::RecommendedWatcher::new(
+            move |event: Result<notify::Event, notify::Error>| {
+                let Ok(event) = event else { return };
+                if !event
+                    .paths
+                    .iter()
+                    .any(|changed| changed.as_path() == file.as_std_path())
+                {
+                    return;
+                }
+                if let Some(control) = control.upgrade() {
+                    let _ = control.send(ClaudeControl::TranscriptChanged);
+                }
             },
+            notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
         );
-        write.commit();
+        match watcher {
+            // A missing directory is made with the file; tried again with
+            // the next sync.
+            Ok(mut watcher) => {
+                if watcher
+                    .watch(dir.as_std_path(), notify::RecursiveMode::NonRecursive)
+                    .is_ok()
+                {
+                    self.transcript_watch = Some(watcher);
+                }
+            }
+            Err(error) => eprintln!("rho-agent: Claude transcript watch not started: {error}"),
+        }
     }
 
     async fn complete_rewind(&mut self) -> anyhow::Result<()> {
@@ -1830,28 +1959,16 @@ impl ClaudeLoop {
         }
     }
 
-    async fn activate_turn_from_user_echo(
-        &mut self,
-        uuid: Option<&str>,
-        source_id: Option<Uuid>,
-    ) -> bool {
+    /// With --replay-user-messages the CLI echoes every user message when
+    /// it enters context: the echo of a queued send is that send leaving
+    /// the queue. Its row is the file's.
+    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) -> bool {
         let Some(uuid) = uuid else { return false };
         let Some(index) = self.queued_turns.iter().position(|turn| turn.uuid == uuid) else {
             return false;
         };
-        let turn = self
-            .queued_turns
-            .remove(index)
-            .expect("index came from position");
-
-        if let Some((source_id, speaker, text)) = source_id
-            .and_then(|source_id| queued_user_presentation_source(source_id, &turn.content))
-        {
-            self.persist_presentation_source(source_id, speaker, text)
-                .await;
-        }
-
-        promote_queued_user_message(&mut self.state, &turn.content);
+        self.queued_turns.remove(index);
+        promote_queued_user_message(&mut self.state);
         self.published();
         true
     }
@@ -1869,11 +1986,7 @@ impl ClaudeLoop {
             self.state.context_used = Some(post_tokens);
         }
         self.published();
-    }
-
-    fn push_block(&mut self, block: Arc<ContextBlock>) {
-        self.state.blocks.push(block);
-        self.published();
+        self.sync_transcript(None).await;
     }
 
     /// The loop's state changed: publish the status, and say what changed
@@ -2042,22 +2155,16 @@ fn remove_compact_commands(inputs: &mut InputQueues) {
     });
 }
 
-fn promote_queued_user_message(state: &mut AgentState, content: &[ContentPart]) -> bool {
-    let matched = state
+/// The oldest queued message left the queue: it is in the file now.
+fn promote_queued_user_message(state: &mut AgentState) -> bool {
+    state
         .queued_inputs
-        .remove_first(|queued| matches!(queued.kind, InputKind::Message { .. }));
-    if matched.is_none() {
-        return false;
-    }
-    state.blocks.push(Arc::new(ContextBlock::UserMessage {
-        sender: crate::MessageSender::User,
-        content: content.to_vec(),
-    }));
-    true
+        .remove_first(|queued| matches!(queued.kind, InputKind::Message { .. }))
+        .is_some()
 }
 
-fn queued_user_content_matches(queued: &[ContentPart], echoed: &[ContentPart]) -> bool {
-    rho_core::text_content(queued) == rho_core::text_content(echoed)
+fn line_uuid(uuid: Option<&str>) -> Option<Uuid> {
+    uuid.and_then(|uuid| Uuid::parse_str(uuid).ok())
 }
 
 fn is_compact_command(content: &[ContentPart]) -> bool {
@@ -2101,164 +2208,7 @@ fn write_claude_prompt_source(
 
 #[cfg(test)]
 mod tests {
-    use rho_db::RhoDb;
-    use rho_inference::PromptCacheKey;
-    use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
-    use serde_json::json;
-
     use super::*;
-
-    async fn presentation_test_agent() -> (tempfile::TempDir, RhoDb, AgentId) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(temp.path().join("rho.redb"));
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent_id = write.alloc_agent_id();
-        write.create_agent(
-            rho_core::UnixMs(1),
-            agent_id,
-            None,
-            vec![WorkspaceInfo::Workspace {
-                repo: "/home/user/src/rho".into(),
-                id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
-            }],
-            crate::db::AgentRole::default(),
-            SessionBinding::ResponsesSol(crate::db::InferenceProfile::default()),
-            AgentRuntime::Rho {
-                prompt_cache_key: PromptCacheKey::generate(),
-            },
-            None,
-        );
-        write.commit();
-        (temp, db, agent_id)
-    }
-
-    fn presentation_message(
-        kind: rho_claude::SessionMessageKind,
-        uuid: Uuid,
-        text: &str,
-    ) -> rho_claude::SessionMessage {
-        rho_claude::SessionMessage {
-            kind,
-            uuid,
-            session_id: uuid::uuid!("00000000-0000-4000-8000-000000000099"),
-            message: json!({
-                "role": match kind {
-                    rho_claude::SessionMessageKind::User => "user",
-                    rho_claude::SessionMessageKind::Assistant => "assistant",
-                    rho_claude::SessionMessageKind::System => "system",
-                },
-                "content": [{"type": "text", "text": text}],
-            }),
-            parent_tool_use_id: None,
-            timestamp: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn reconciliation_appends_only_the_missing_suffix() {
-        let (_temp, db, agent_id) = presentation_test_agent().await;
-        let first = presentation_message(
-            rho_claude::SessionMessageKind::User,
-            uuid::uuid!("00000000-0000-4000-8000-000000000001"),
-            "first",
-        );
-        let second = presentation_message(
-            rho_claude::SessionMessageKind::Assistant,
-            uuid::uuid!("00000000-0000-4000-8000-000000000002"),
-            "second",
-        );
-        reconcile_claude_presentation_sources(&db, agent_id, std::slice::from_ref(&first))
-            .await
-            .unwrap();
-        let (sources, last) =
-            reconcile_claude_presentation_sources(&db, agent_id, &[first, second])
-                .await
-                .unwrap();
-
-        assert!(last.is_some());
-        assert_eq!(sources.len(), 2);
-        assert_eq!(
-            db.read()
-                .agent_event_records(agent_id)
-                .1
-                .into_iter()
-                .filter(|(_, event)| matches!(event, AgentEvent::ClaudePresentationSource { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[tokio::test]
-    async fn reconciliation_divergence_keeps_the_story_and_discards_stale_updates() {
-        let (_temp, db, agent_id) = presentation_test_agent().await;
-        let first = presentation_message(
-            rho_claude::SessionMessageKind::User,
-            uuid::uuid!("00000000-0000-4000-8000-000000000001"),
-            "first",
-        );
-        let discarded = presentation_message(
-            rho_claude::SessionMessageKind::Assistant,
-            uuid::uuid!("00000000-0000-4000-8000-000000000002"),
-            "discarded",
-        );
-        let replacement = presentation_message(
-            rho_claude::SessionMessageKind::Assistant,
-            uuid::uuid!("00000000-0000-4000-8000-000000000003"),
-            "replacement",
-        );
-        reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), discarded])
-            .await
-            .unwrap();
-        let discarded_position = db
-            .read()
-            .agent_event_records(agent_id)
-            .1
-            .into_iter()
-            .find_map(|(position, event)| match event {
-                AgentEvent::ClaudePresentationSource { source_id, .. }
-                    if source_id == uuid::uuid!("00000000-0000-4000-8000-000000000002") =>
-                {
-                    Some(position)
-                }
-                _ => None,
-            })
-            .unwrap();
-        let update = AgentPresentationUpdate {
-            generated_title: crate::db::PresentationField::Set("discarded-title".to_owned()),
-            activity: crate::db::PresentationField::Unchanged,
-            through: discarded_position,
-        };
-        let mut write = db.write().await;
-        assert!(
-            write
-                .apply_agent_presentation(rho_core::UnixMs(2), agent_id, &update)
-                .is_some()
-        );
-        write.commit();
-
-        reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
-            .await
-            .unwrap();
-        // A rewind takes back history, not configuration: the head folds
-        // hidden rows too, so the title stands until the sidecar retitles.
-        assert_eq!(
-            db.read().get_agent(agent_id).generated_title,
-            Some("discarded-title".to_owned())
-        );
-        let mut write = db.write().await;
-        assert!(
-            write
-                .apply_agent_presentation(rho_core::UnixMs(3), agent_id, &update)
-                .is_none()
-        );
-        write.commit();
-
-        let (sources, _) = reconcile_claude_presentation_sources(&db, agent_id, &[first])
-            .await
-            .unwrap();
-        assert_eq!(sources.len(), 1);
-    }
 
     #[test]
     fn rewrites_claude_prompt_without_replacing_bind_source() {
@@ -2270,21 +2220,195 @@ mod tests {
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");
     }
 
-    #[test]
-    fn raw_image_queue_matches_claude_textual_echo() {
-        let queued = vec![
-            ContentPart::Text {
-                text: "inspect".to_owned(),
+    pub(super) async fn claude_test_agent(session_id: Uuid) -> (tempfile::TempDir, RhoDb, AgentId) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent_id = write.alloc_agent_id();
+        write.create_agent(
+            rho_core::UnixMs(1),
+            agent_id,
+            None,
+            vec![rho_workspaces::WorkspaceInfo::Workspace {
+                repo: "/home/user/src/rho".into(),
+                id: rho_workspaces::WorkspaceId::from_counter(
+                    1,
+                    &rho_workspaces::WorkspaceIdDomain(0),
+                )
+                .unwrap(),
+            }],
+            crate::db::AgentRole::default(),
+            SessionBinding::ClaudeOpus {
+                effort: crate::db::ClaudeEffort::High,
             },
-            ContentPart::Image {
-                media_type: "image/png".to_owned(),
-                data: vec![1, 2, 3],
-            },
-        ];
-        let echoed = vec![ContentPart::Text {
-            text: "inspect\n[image: PNG]".to_owned(),
-        }];
-        assert!(queued_user_content_matches(&queued, &echoed));
+            AgentRuntime::Claude { session_id },
+            None,
+        );
+        write.commit();
+        (temp, db, agent_id)
+    }
+
+    pub(super) fn user_json(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","timestamp":"2026-09-06T10:00:00.000Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    pub(super) fn assistant_json(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","timestamp":"2026-09-06T10:00:01.000Z","message":{{"role":"assistant","id":"msg_{uuid}","usage":{{"input_tokens":1,"output_tokens":2}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    pub(super) fn transcript_rows(db: &RhoDb, agent_id: AgentId) -> Vec<(AgentEventPos, String)> {
+        db.read()
+            .agent_event_records(agent_id)
+            .1
+            .into_iter()
+            .filter_map(|(pos, event)| match event {
+                AgentEvent::Transcript { line, .. } => Some((
+                    pos,
+                    match line {
+                        TranscriptLine::User { text } => format!("user: {text}"),
+                        TranscriptLine::Assistant { text, .. } => format!("assistant: {text}"),
+                        TranscriptLine::ToolResults { .. } => "results".to_owned(),
+                        TranscriptLine::Compacted { .. } => "compacted".to_owned(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn told(rows: &[(AgentEventPos, String)]) -> Vec<&str> {
+        rows.iter().map(|(_, line)| line.as_str()).collect()
+    }
+
+    pub(super) const U1: &str = "00000000-0000-4000-8000-000000000011";
+    pub(super) const A1: &str = "00000000-0000-4000-8000-000000000012";
+    const U2: &str = "00000000-0000-4000-8000-000000000013";
+    const A2: &str = "00000000-0000-4000-8000-000000000014";
+
+    #[tokio::test]
+    async fn the_file_is_copied_as_it_grows_and_the_cursor_follows() {
+        let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000002");
+        let (temp, db, agent_id) = claude_test_agent(session_id).await;
+        let path = Utf8PathBuf::try_from(temp.path().join("session.jsonl")).unwrap();
+        let usage = crate::db::AgentUsageModel::OPUS;
+
+        let mut copy = TranscriptCopy::open(&db, agent_id, session_id, path.clone(), false);
+        assert_eq!(copy.copy(&db, usage).await.unwrap(), Copied::Missing);
+
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", user_json(U1, "hello"), assistant_json(A1, "hi")),
+        )
+        .unwrap();
+        let Copied::Read {
+            spoke,
+            context_used,
+        } = copy.copy(&db, usage).await.unwrap()
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(context_used, Some(3));
+        let rows = transcript_rows(&db, agent_id);
+        assert_eq!(told(&rows), ["user: hello", "assistant: hi"]);
+        assert_eq!(spoke, Some(rows[1].0));
+        assert!(copy.has_line(Uuid::parse_str(A1).unwrap()));
+        let cursor = db.read().claude_transcript_cursor(agent_id).unwrap();
+        assert_eq!(cursor.session_id, session_id);
+        assert_eq!(cursor.end, std::fs::metadata(&path).unwrap().len());
+
+        // Nothing new: no transaction, same cursor.
+        assert_eq!(copy.copy(&db, usage).await.unwrap(), Copied::Nothing);
+
+        // A line appended is one row more; a copier opened later starts
+        // at the cursor and finds only what came after that.
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", user_json(U2, "more")).unwrap();
+        assert!(matches!(
+            copy.copy(&db, usage).await.unwrap(),
+            Copied::Read { .. }
+        ));
+        assert_eq!(
+            told(&transcript_rows(&db, agent_id)),
+            ["user: hello", "assistant: hi", "user: more"]
+        );
+        writeln!(file, "{}", assistant_json(A2, "done")).unwrap();
+        let mut later = TranscriptCopy::open(&db, agent_id, session_id, path.clone(), true);
+        assert!(later.told.is_none(), "past the start: nothing to skip");
+        assert!(matches!(
+            later.copy(&db, usage).await.unwrap(),
+            Copied::Read { .. }
+        ));
+        assert_eq!(
+            told(&transcript_rows(&db, agent_id)),
+            [
+                "user: hello",
+                "assistant: hi",
+                "user: more",
+                "assistant: done"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_file_is_read_from_its_start_without_telling_a_line_twice() {
+        let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000002");
+        let (temp, db, agent_id) = claude_test_agent(session_id).await;
+        let path = Utf8PathBuf::try_from(temp.path().join("session.jsonl")).unwrap();
+        let usage = crate::db::AgentUsageModel::OPUS;
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", user_json(U1, "hello"), assistant_json(A1, "hi")),
+        )
+        .unwrap();
+        let mut copy = TranscriptCopy::open(&db, agent_id, session_id, path.clone(), true);
+        assert!(matches!(
+            copy.copy(&db, usage).await.unwrap(),
+            Copied::Read { .. }
+        ));
+
+        // The file is rewritten shorter, then grows past the old cursor:
+        // the first line is known, the new one is not.
+        std::fs::write(&path, format!("{}\n", user_json(U1, "hello"))).unwrap();
+        assert_eq!(
+            copy.copy(&db, usage).await.unwrap(),
+            Copied::Read {
+                spoke: None,
+                context_used: None
+            }
+        );
+        assert_eq!(
+            db.read().claude_transcript_cursor(agent_id).unwrap().end,
+            std::fs::metadata(&path).unwrap().len(),
+            "the cursor follows a known line too"
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                user_json(U1, "hello"),
+                assistant_json(A2, "again")
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            copy.copy(&db, usage).await.unwrap(),
+            Copied::Read { .. }
+        ));
+        assert_eq!(
+            told(&transcript_rows(&db, agent_id)),
+            ["user: hello", "assistant: hi", "assistant: again"]
+        );
+        let cursor = db.read().claude_transcript_cursor(agent_id).unwrap();
+        assert_eq!(cursor.end, std::fs::metadata(&path).unwrap().len());
     }
 
     fn text(text: &str) -> Arc<Vec<ContentPart>> {
@@ -2311,19 +2435,9 @@ mod tests {
             delivery: MessageDelivery::Immediate,
             at: rho_core::UnixMs(0),
         });
-        let turn_content = vec![ContentPart::Text {
-            text: "original text".to_owned(),
-        }];
-
-        assert!(promote_queued_user_message(&mut state, &turn_content));
+        assert!(promote_queued_user_message(&mut state));
 
         assert!(state.queued_inputs.is_empty());
-        assert_eq!(
-            state.blocks,
-            vec![Arc::new(ContextBlock::UserMessage {
-                sender: crate::MessageSender::User,
-                content: turn_content,
-            })]
-        );
+        assert!(!promote_queued_user_message(&mut state));
     }
 }

@@ -304,6 +304,27 @@ pub async fn find_session_transcript(
     Ok(None)
 }
 
+/// Where the session's transcript is, or will be: the file found for the
+/// session (`true`), else the path Claude writes for `cwd` once it has
+/// something to say (`false`).
+pub async fn session_transcript_path(
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<(Utf8PathBuf, bool)> {
+    if let Some(path) = find_session_transcript(session_id, cwd).await? {
+        return Ok((path, true));
+    }
+    let projects_dir =
+        claude_projects_dir().context("Claude projects directory cannot be located (no HOME)")?;
+    let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
+    Ok((
+        projects_dir
+            .join(project_key(&cwd))
+            .join(format!("{session_id}.jsonl")),
+        false,
+    ))
+}
+
 const MAX_PROJECT_KEY_LEN: usize = 200;
 
 fn claude_projects_dir() -> Option<Utf8PathBuf> {
@@ -527,6 +548,187 @@ fn to_session_message(entry: &TranscriptEntry) -> Option<SessionMessage> {
         parent_tool_use_id: entry.parent_tool_use_id.clone(),
         timestamp: entry.timestamp.clone(),
     })
+}
+
+/// One line of a transcript, with where it lies in the file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TailLine {
+    /// The byte the line starts at.
+    pub offset: u64,
+    /// One past its newline: where the next line starts.
+    pub end: u64,
+    pub row: TranscriptRow,
+}
+
+impl TailLine {
+    /// The line's uuid, Claude's name for it.
+    pub fn uuid(&self) -> Uuid {
+        match &self.row {
+            TranscriptRow::Message(message) => message.uuid,
+            TranscriptRow::CompactBoundary { uuid, .. } => *uuid,
+        }
+    }
+}
+
+/// A line the tail reader hands back: a visible message, or the boundary
+/// Claude writes when it compacts the context.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranscriptRow {
+    Message(SessionMessage),
+    CompactBoundary {
+        uuid: Uuid,
+        post_tokens: Option<u64>,
+        timestamp: Option<String>,
+    },
+}
+
+/// What a tail read found.
+#[derive(Debug, PartialEq)]
+pub enum TailRead {
+    /// The whole lines written since the cursor, none included.
+    Lines(Vec<TailLine>),
+    /// The file is shorter than the cursor: replaced or truncated, so the
+    /// cursor means nothing any more.
+    Truncated,
+    /// No file at the path yet.
+    Missing,
+}
+
+/// A transcript read as it grows: holds the file and the end of the last
+/// whole line read, so each read costs the bytes written since. The file
+/// is taken as a straight line: Claude appends to a session file, and the
+/// branching a transcript can hold (`parentUuid`) is never made under Rho,
+/// which forks a new session instead.
+pub struct TranscriptTail {
+    path: Utf8PathBuf,
+    file: Option<tokio::fs::File>,
+    end: u64,
+}
+
+impl TranscriptTail {
+    /// A reader positioned at `end`: zero for a fresh read, or where an
+    /// earlier reader stopped.
+    pub fn new(path: Utf8PathBuf, end: u64) -> Self {
+        Self {
+            path,
+            file: None,
+            end,
+        }
+    }
+
+    pub fn path(&self) -> &Utf8Path {
+        &self.path
+    }
+
+    /// One past the last whole line read.
+    pub fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// Reads the whole lines written since the cursor and moves it past
+    /// them. A half-written last line waits for the next read.
+    pub async fn read(&mut self) -> Result<TailRead> {
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+        if self.file.is_none() {
+            match tokio::fs::File::open(&self.path).await {
+                Ok(file) => self.file = Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(TailRead::Missing);
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("open Claude transcript {}", self.path));
+                }
+            }
+        }
+        let file = self.file.as_mut().expect("opened above");
+        let len = file
+            .metadata()
+            .await
+            .with_context(|| format!("stat Claude transcript {}", self.path))?
+            .len();
+        if len < self.end {
+            self.file = None;
+            return Ok(TailRead::Truncated);
+        }
+        if len == self.end {
+            return Ok(TailRead::Lines(Vec::new()));
+        }
+        let mut buffer = vec![0_u8; (len - self.end) as usize];
+        file.seek(std::io::SeekFrom::Start(self.end))
+            .await
+            .with_context(|| format!("seek Claude transcript {}", self.path))?;
+        file.read_exact(&mut buffer)
+            .await
+            .with_context(|| format!("read Claude transcript {}", self.path))?;
+        let Some(last_newline) = buffer.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(TailRead::Lines(Vec::new()));
+        };
+        let whole = &buffer[..=last_newline];
+        let mut lines = Vec::new();
+        let mut start = 0_usize;
+        for (index, byte) in whole.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            let offset = self.end + start as u64;
+            let end = self.end + index as u64 + 1;
+            let line = &whole[start..index];
+            start = index + 1;
+            match tail_row(line) {
+                Ok(Some(row)) => lines.push(TailLine { offset, end, row }),
+                Ok(None) => {}
+                Err(error) => {
+                    // A line Rho cannot read is skipped, never a reason to
+                    // stop following the file.
+                    eprintln!(
+                        "rho-claude: skipping transcript line at {offset} in {}: {error:#}",
+                        self.path
+                    );
+                }
+            }
+        }
+        self.end += last_newline as u64 + 1;
+        Ok(TailRead::Lines(lines))
+    }
+}
+
+/// The row one line holds, `None` when it is nothing a reader sees.
+fn tail_row(line: &[u8]) -> Result<Option<TranscriptRow>> {
+    let line = std::str::from_utf8(line).context("transcript line is not UTF-8")?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(line).context("parse transcript line")?;
+    let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !matches!(kind, "user" | "assistant" | "system") {
+        return Ok(None);
+    }
+    let entry: TranscriptEntry =
+        serde_json::from_value(value).context("parse transcript message")?;
+    if !entry.is_message_like() {
+        return Ok(None);
+    }
+    if entry.kind == TranscriptEntryKind::System {
+        if entry.subtype.as_deref() != Some("compact_boundary") {
+            return Ok(None);
+        }
+        return Ok(entry.uuid().map(|uuid| TranscriptRow::CompactBoundary {
+            uuid,
+            post_tokens: entry
+                .compact_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.post_tokens),
+            timestamp: entry.timestamp.clone(),
+        }));
+    }
+    if !entry.visible(false) {
+        return Ok(None);
+    }
+    Ok(to_session_message(&entry).map(TranscriptRow::Message))
 }
 
 #[cfg(test)]
@@ -861,5 +1063,166 @@ mod tests {
                 .collect::<Vec<_>>(),
             [b]
         );
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    fn user_line(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    fn assistant_line(uuid: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","message":{{"role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    fn scratch(name: &str) -> Utf8PathBuf {
+        let dir = Utf8PathBuf::try_from(std::env::temp_dir())
+            .unwrap()
+            .join(format!("rho-claude-tail-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("session.jsonl")
+    }
+
+    #[tokio::test]
+    async fn reads_whole_lines_and_waits_for_a_half_written_one() {
+        let path = scratch("half");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let first = user_line("00000000-0000-4000-8000-000000000011", "hello");
+        writeln!(file, "{first}").unwrap();
+        write!(file, "{{\"type\":\"assistant\"").unwrap();
+        file.flush().unwrap();
+
+        let mut tail = TranscriptTail::new(path.clone(), 0);
+        let TailRead::Lines(lines) = tail.read().await.unwrap() else {
+            panic!("expected lines");
+        };
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].offset, 0);
+        assert_eq!(lines[0].end, first.len() as u64 + 1);
+        assert_eq!(tail.end(), first.len() as u64 + 1);
+
+        // Nothing whole was added: the cursor stays.
+        assert_eq!(tail.read().await.unwrap(), TailRead::Lines(Vec::new()));
+
+        // The rest of the line lands, and a whole line after it.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            r#","uuid":"00000000-0000-4000-8000-000000000012","sessionId":"00000000-0000-4000-8000-000000000002","message":{{"role":"assistant","content":[{{"type":"text","text":"hi"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            user_line("00000000-0000-4000-8000-000000000013", "more")
+        )
+        .unwrap();
+        let TailRead::Lines(lines) = tail.read().await.unwrap() else {
+            panic!("expected lines");
+        };
+        let uuids = lines
+            .iter()
+            .map(|line| match &line.row {
+                TranscriptRow::Message(message) => message.uuid.to_string(),
+                TranscriptRow::CompactBoundary { .. } => panic!("no boundary written"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uuids,
+            [
+                "00000000-0000-4000-8000-000000000012",
+                "00000000-0000-4000-8000-000000000013"
+            ]
+        );
+        assert_eq!(lines[0].offset, first.len() as u64 + 1);
+        assert_eq!(lines[1].end, tail.end());
+    }
+
+    #[tokio::test]
+    async fn hidden_rows_and_compaction_boundaries() {
+        let path = scratch("hidden");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","uuid":"00000000-0000-4000-8000-000000000021","sessionId":"00000000-0000-4000-8000-000000000002","isMeta":true,"message":{{"role":"user","content":"hidden"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"progress","uuid":"00000000-0000-4000-8000-000000000022"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"system","subtype":"compact_boundary","uuid":"00000000-0000-4000-8000-000000000023","sessionId":"00000000-0000-4000-8000-000000000002","compactMetadata":{{"postTokens":1234}}}}"#
+        )
+        .unwrap();
+        writeln!(file, "not json at all").unwrap();
+        writeln!(
+            file,
+            "{}",
+            assistant_line("00000000-0000-4000-8000-000000000024", "after")
+        )
+        .unwrap();
+
+        let mut tail = TranscriptTail::new(path, 0);
+        let TailRead::Lines(lines) = tail.read().await.unwrap() else {
+            panic!("expected lines");
+        };
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].row,
+            TranscriptRow::CompactBoundary {
+                uuid: uuid::uuid!("00000000-0000-4000-8000-000000000023"),
+                post_tokens: Some(1234),
+                timestamp: None,
+            }
+        );
+        assert!(
+            matches!(&lines[1].row, TranscriptRow::Message(message) if message.kind == SessionMessageKind::Assistant)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shorter_file_is_truncated_and_a_missing_one_is_missing() {
+        let path = scratch("short");
+        let mut tail = TranscriptTail::new(path.clone(), 0);
+        assert_eq!(tail.read().await.unwrap(), TailRead::Missing);
+
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                user_line("00000000-0000-4000-8000-000000000031", "a")
+            ),
+        )
+        .unwrap();
+        assert!(matches!(tail.read().await.unwrap(), TailRead::Lines(lines) if lines.len() == 1));
+
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(tail.read().await.unwrap(), TailRead::Truncated);
+        // A reader started over reads the new file from its start.
+        let mut tail = TranscriptTail::new(path.clone(), 0);
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                user_line("00000000-0000-4000-8000-000000000032", "b")
+            ),
+        )
+        .unwrap();
+        assert!(matches!(tail.read().await.unwrap(), TailRead::Lines(lines) if lines.len() == 1));
     }
 }

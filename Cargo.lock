@@ -13596,6 +13596,7 @@ dependencies = [
  "dirs",
  "futures 0.3.33",
  "image",
+ "notify",
  "prefix-id",
  "rand 0.8.7",
  "redb",

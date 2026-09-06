@@ -29,6 +29,7 @@ use crate::db::{
 pub mod agent;
 mod claude;
 pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
+pub use claude::backfill::backfill_claude_transcripts;
 
 pub mod db;
 mod image_tool;
@@ -52,8 +53,9 @@ pub struct RenderedAgentSurface {
 /// One event of an agent's raw log.
 ///
 /// The Rho runtime writes `Accepted`, `QueueCleared`, `Sent`, `Replied` and
-/// `Failed`; the Claude runtime `ClaudePresentationSource`; the head's
-/// config events are written by the store on the agent's behalf.
+/// `Failed`; the Claude runtime `Accepted`, `QueueCleared`, `Failed` and
+/// `Transcript`; the head's config events are written by the store on the
+/// agent's behalf.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum AgentEvent<'a> {
     /// An input entered a queue: user text, mail, or a `/compact`. It becomes
@@ -126,10 +128,24 @@ pub enum AgentEvent<'a> {
         at: UnixMs,
     },
 
+    /// One line of Claude Code's transcript, as Rho read it. The file is
+    /// the Claude runtime's history; these rows are Rho's copy of the
+    /// lines a reader sees, cheap to sync and bound to the file by a
+    /// cursor (`AGENT-LOG-DESIGN.md`). Written from the file alone, never
+    /// from the stream, so a restart and a live run agree.
+    Transcript {
+        /// The line's uuid in the file.
+        uuid: uuid::Uuid,
+        /// Where the line starts in the file.
+        offset: u64,
+        line: TranscriptLine,
+        at: UnixMs,
+    },
+
     // -- the runtimes' shared config log --------------------------------------
-    /// A text-only message confirmed in Claude Code's external transcript.
-    /// It gives the shared presentation sidecar a durable, rewindable
-    /// source without treating Claude's protocol state as native inference.
+    /// A text-only message confirmed in Claude Code's external transcript,
+    /// as the Claude runtime wrote it before `Transcript` (6 Sep). Never
+    /// written now; read so older logs still fold.
     ClaudePresentationSource {
         source_id: uuid::Uuid,
         speaker: PresentationSpeaker,
@@ -234,6 +250,36 @@ pub enum PresentationSpeaker {
     User,
     Agent,
     Assistant,
+}
+
+/// What one transcript line says, as far as a reader needs. Bodies are
+/// whole: the wire strips them, the file keeps them.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum TranscriptLine {
+    /// The person spoke (an agent's mail reaches Claude the same way).
+    User { text: String },
+    /// The model spoke or called. One line per content block, so a text
+    /// and the call after it are two rows. Usage rides on the first row
+    /// of a message only, so a reader counts each request once.
+    Assistant {
+        text: String,
+        calls: Vec<TranscriptCall>,
+        usage: Option<db::AgentUsageBucket>,
+        /// Context-window occupancy after this message.
+        context_used: Option<u64>,
+    },
+    /// What the calls came back with.
+    ToolResults { results: Vec<rho_core::ToolResult> },
+    /// Claude compacted the context here.
+    Compacted { context_used: Option<u64> },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct TranscriptCall {
+    pub id: String,
+    pub name: String,
+    /// The arguments as JSON, whole.
+    pub arguments: String,
 }
 
 /// A text-only, durably committed transcript source for the presentation
@@ -587,7 +633,16 @@ pub(crate) fn presentation_sources(
             AgentEvent::ClaudePresentationSource { speaker, text, .. } => {
                 found(through, *speaker, text.to_string())
             }
-            AgentEvent::Accepted(_)
+            AgentEvent::Transcript {
+                line: TranscriptLine::User { text },
+                ..
+            } => found(through, PresentationSpeaker::User, text.clone()),
+            AgentEvent::Transcript {
+                line: TranscriptLine::Assistant { text, .. },
+                ..
+            } => found(through, PresentationSpeaker::Assistant, text.clone()),
+            AgentEvent::Transcript { .. }
+            | AgentEvent::Accepted(_)
             | AgentEvent::Sent { .. }
             | AgentEvent::QueueCleared
             | AgentEvent::Cleared { .. }
@@ -669,6 +724,21 @@ mod encoding_tests {
                 speaker: PresentationSpeaker::Assistant,
                 text: Cow::Borrowed("confirmed response"),
                 at: UnixMs(16),
+            },
+            AgentEvent::Transcript {
+                uuid: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
+                offset: 1234,
+                line: TranscriptLine::Assistant {
+                    text: "read it".to_owned(),
+                    calls: vec![TranscriptCall {
+                        id: "toolu_1".to_owned(),
+                        name: "Read".to_owned(),
+                        arguments: "{\"path\":\"a.rs\"}".to_owned(),
+                    }],
+                    usage: None,
+                    context_used: Some(4321),
+                },
+                at: UnixMs(17),
             },
         ];
         for event in events {

@@ -184,6 +184,49 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             text: text.to_string(),
             at: *at,
         },
+        // Claude's transcript, told in the runtime-neutral words a reader
+        // already knows: a person's line is a message, the model's a
+        // reply, the results a request that carried them.
+        AgentEvent::Transcript { line, at, .. } => match line {
+            crate::TranscriptLine::User { text } => MirrorEvent::ClaudeMessage {
+                speaker: rho_ui_proto::mirror::Speaker::User,
+                text: text.clone(),
+                at: *at,
+            },
+            crate::TranscriptLine::Assistant {
+                text,
+                calls,
+                usage: cost,
+                context_used,
+            } => MirrorEvent::Replied {
+                text: text.clone(),
+                calls: calls
+                    .iter()
+                    .map(|call| ToolCallLine {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        what: tool_line(&call.arguments),
+                    })
+                    .collect(),
+                compacted: false,
+                usage: cost.as_ref().map(usage),
+                context_used: *context_used,
+                at: *at,
+            },
+            crate::TranscriptLine::ToolResults { results } => MirrorEvent::Sent {
+                results: results.iter().map(tool_outcome).collect(),
+                compaction: false,
+                at: *at,
+            },
+            crate::TranscriptLine::Compacted { context_used } => MirrorEvent::Replied {
+                text: String::new(),
+                calls: Vec::new(),
+                compacted: true,
+                usage: None,
+                context_used: *context_used,
+                at: *at,
+            },
+        },
         AgentEvent::Created {
             role,
             binding,

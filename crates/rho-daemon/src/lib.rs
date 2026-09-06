@@ -420,6 +420,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
     drop_converted_tables(&agents.db).await;
+    // One-off, in the background so a restart is never held for it:
+    // Claude agents from before 6 Sep get their session files copied.
+    tokio::spawn(rho_agent::backfill_claude_transcripts(agents.db.clone()));
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
@@ -3302,6 +3305,28 @@ fn agent_detail(
                 })
                 .collect(),
         ),
+        Some(rho_agent::AgentEvent::Transcript { line, .. }) => match line {
+            rho_agent::TranscriptLine::Assistant { text, calls, .. } => DetailBody::Response(
+                (!text.is_empty())
+                    .then_some(rho_ui_proto::mirror::Item::Text { text, phase: None })
+                    .into_iter()
+                    .chain(
+                        calls
+                            .into_iter()
+                            .map(|call| rho_ui_proto::mirror::Item::ToolCall {
+                                id: call.id,
+                                name: call.name,
+                                arguments: call.arguments,
+                            }),
+                    )
+                    .collect(),
+            ),
+            rho_agent::TranscriptLine::ToolResults { results } => {
+                DetailBody::Results(results.iter().map(detail_result).collect())
+            }
+            rho_agent::TranscriptLine::User { .. }
+            | rho_agent::TranscriptLine::Compacted { .. } => DetailBody::Nothing,
+        },
         Some(rho_agent::AgentEvent::Failed { partial, .. }) => DetailBody::Response(
             partial
                 .items

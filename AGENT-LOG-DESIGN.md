@@ -320,6 +320,13 @@ every append: `Turn { Started | Ended(outcome), at }`, `Presented
 from the turn-report sidecar (later the tag parser), and `Rewound { to,
 at }`. The Claude runtime writes the same events from its stream.
 
+Since 6 Sep (night) the Claude runtime's history rows are `Transcript
+{ uuid, offset, line, at }`, copied from Claude Code's session file
+behind a per-agent cursor, never from its stream; `strip` tells them as
+`ClaudeMessage`, `Replied` and `Sent`, so the wire and the client did not
+change. The stream is the live tail and the bell to read the file. See
+"The Claude runtime reads its file" in `LIVE-TAIL-PLAN.md`.
+
 `Replied` carries `usage: Option<AgentUsageBucket>` beside
 `context_used`. Why there: usage is provider-reported per model
 response (input, cache read, cache write, output) and cannot be

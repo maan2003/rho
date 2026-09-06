@@ -292,3 +292,69 @@ Standing rule for what comes after: work done per event, on either side, is
 bounded by something like `O(log(agents × events))`. A row must not walk every
 agent, every fact, or every node; dealing and the tree sync are where that is
 still broken.
+
+## The Claude runtime reads its file (6 Sep, night)
+
+Claude Code's session file (`~/.claude/projects/<cwd>/<session>.jsonl`) is
+the Claude runtime's history. Until now the loop wrote rows from the
+stream (`ClaudePresentationSource` for text, `Replied` for calls, `Sent`
+for results) and, on load, read the whole file and matched it against
+those rows by uuid, speaker and a text prefix. Two copies of one truth,
+reconciled by heuristic. That was the last place a Claude agent felt
+unlike a native one.
+
+Now the file is the only source of the rows, and the stream is only the
+live tail and the bell:
+
+- **One row per line, from the file alone.** `AgentEvent::Transcript
+  { uuid, offset, line, at }`, with `TranscriptLine::{User, Assistant,
+  ToolResults, Compacted}`: whole bodies, the wire strips them. `strip`
+  tells them in the words a reader already knows (`ClaudeMessage`,
+  `Replied`, `Sent`), so the client is unchanged and never learns which
+  runtime it is looking at. Claude writes one line per content block, so
+  a text and the call after it are two rows; usage rides on the first
+  row of a message only.
+- **A cursor, not a re-read.** `claude_transcript_cursors` holds `(session,
+  end)` per agent, written in the transaction with the rows. `TranscriptTail`
+  (rho-claude) keeps the file open and reads only the bytes past the
+  cursor, whole lines only; a half-written line waits. A file shorter than
+  the cursor, or another session (a rewind forks one), is read from its
+  start, skipping every uuid the log already holds. A writer checks the
+  cursor again inside its transaction and reads again if it moved, so two
+  writers never tell a line twice. The file is taken as a straight line:
+  Rho never branches a session file, it forks.
+- **The older rows are taken back once, at daemon start.**
+  `backfill_claude_transcripts` (`claude/backfill.rs`) walks every Claude
+  agent without a cursor in the background, newest first, one agent per
+  transaction: one `Rewound` over the rows the loop before 6 Sep wrote
+  from the stream, then the file's rows, then the cursor. An agent whose
+  file is gone (Claude deletes old sessions) keeps its rows and gets a
+  cursor at zero so it is not asked again. A load that gets there first
+  wins; the cursor is the lock. Delete the module once every store has
+  started under this build; the loop does not know it ran.
+- **The stream is the bell.** After each `assistant` and `user` message
+  the loop reads the tail and waits (25 ms steps, 1 s at most) until that
+  message's uuid is in, so a turn end or a want is never told ahead of the
+  row it follows. `result`, `compact_boundary` and a command's `completed`
+  read the tail too. A `notify` watch on the session directory is the
+  fallback bell for a file changed while the stream says nothing.
+- **The live tail empties when a message is told whole** (`Requesting`),
+  so a reader never holds a message twice; the row for it arrives from
+  the file right after.
+- **Rho's own facts stay Rho's rows.** `Accepted` when a send is taken,
+  `QueueCleared` on cancel, `Failed`, `Turn`, `Wants`, `Presented`. The
+  echo of a send (its uuid) is when it leaves the queue; the file's row is
+  what the reader sees.
+
+What is gone: the reconciliation and its prefix matching, the in-memory
+`ContextBlock` copy of the transcript (nothing read it), `Sent` and
+`Replied` writes from the Claude loop, the whole-file read on every load.
+`ClaudePresentationSource` stays in the enum, read-only, so older logs
+still fold; dropping it needs a log-rewriting format hop, since the rows
+stay in the log behind their `Rewound`.
+
+Not done here: the user echo is still matched to its queued copy by text
+on the client (`TranscriptFold`), the way it always was; the `Message`
+wire event has no uuid yet. Tool-result bodies are stored whole in the
+row rather than read back from the file at `offset` on demand; `offset`
+is recorded so that can change without a migration.

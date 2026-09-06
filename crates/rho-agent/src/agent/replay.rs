@@ -50,6 +50,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             // business, never context. A `Rewound` never reaches replay:
             // the read that hands over the visible log has applied it.
             AgentEvent::ClaudePresentationSource { .. }
+            | AgentEvent::Transcript { .. }
             | AgentEvent::Turn { .. }
             | AgentEvent::Presented { .. }
             | AgentEvent::Wants { .. }

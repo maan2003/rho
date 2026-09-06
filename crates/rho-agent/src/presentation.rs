@@ -263,24 +263,6 @@ pub(crate) fn has_input(db: &RhoDb, agent_id: AgentId) -> bool {
     presentation_input(db, agent_id).is_some()
 }
 
-/// Canonical durable representation of one external Claude transcript item.
-/// Keeping the cap at the mirror boundary prevents an unbounded JSONL record
-/// from becoming a second unbounded local persistence path.
-pub(crate) fn canonical_source_text(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut capped = String::new();
-    for character in text.chars() {
-        if capped.len() + character.len_utf8() > MAX_MESSAGE_BYTES {
-            break;
-        }
-        capped.push(character);
-    }
-    Some(capped)
-}
-
 pub(crate) async fn generate(
     db: RhoDb,
     session: Arc<TokioMutex<Session>>,
@@ -816,8 +798,7 @@ fn xml_escape_capped(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, MAX_STATUS_BYTES, MAX_SUMMARY_BYTES, bounded_status, bounded_summary,
-        bounded_title, canonical_source_text,
+        MAX_STATUS_BYTES, MAX_SUMMARY_BYTES, bounded_status, bounded_summary, bounded_title,
     };
 
     #[test]
@@ -848,13 +829,5 @@ mod tests {
         let capped = bounded_summary(&"é".repeat(MAX_SUMMARY_BYTES)).unwrap();
         assert!(capped.len() <= MAX_SUMMARY_BYTES);
         assert!(capped.is_char_boundary(capped.len()));
-    }
-
-    #[test]
-    fn canonical_source_text_trims_and_caps_unicode() {
-        assert_eq!(canonical_source_text("  \n "), None);
-        let text = canonical_source_text(&"é".repeat(MAX_MESSAGE_BYTES)).unwrap();
-        assert!(text.len() <= MAX_MESSAGE_BYTES);
-        assert!(text.is_char_boundary(text.len()));
     }
 }
