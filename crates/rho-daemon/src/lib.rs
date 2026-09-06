@@ -398,24 +398,33 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     spawn_inference_projection(Arc::clone(&agents));
-    let quota_environment = agents.user_environment.clone();
-    spawn_claude_quota_recorder(
-        rho_claude_usage::spawn_poller(
-            move || {
-                let mut command = tokio::process::Command::new("claude");
-                quota_environment.apply(&mut command);
-                let path = quota_environment
-                    .get("PATH")
-                    .context("user environment has no PATH")?;
-                command.env("PATH", quota_path_overrides.add_to(path));
-                Ok(command)
-            },
-            default_db_path()?.with_file_name("claude-quota-probe"),
-        ),
-        agents.db.clone(),
-        agents.inference.clone(),
-        agents.events.clone(),
-    );
+    // One probe per account: a subscription's headroom is the account's, and
+    // agents move between accounts. The probe has no view to mount an
+    // account into, so it names the account directory outright.
+    for account in rho_claude::accounts::list()? {
+        let quota_environment = agents.user_environment.clone();
+        let quota_path_overrides = quota_path_overrides.clone();
+        let account_dir = rho_claude::accounts::account_dir(&account)?;
+        spawn_claude_quota_recorder(
+            rho_claude_usage::spawn_poller(
+                move || {
+                    let mut command = tokio::process::Command::new("claude");
+                    quota_environment.apply(&mut command);
+                    let path = quota_environment
+                        .get("PATH")
+                        .context("user environment has no PATH")?;
+                    command.env("PATH", quota_path_overrides.add_to(path));
+                    command.env("CLAUDE_CONFIG_DIR", account_dir.as_str());
+                    Ok(command)
+                },
+                default_db_path()?.with_file_name(format!("claude-quota-probe-{account}")),
+            ),
+            account,
+            agents.db.clone(),
+            agents.inference.clone(),
+            agents.events.clone(),
+        );
+    }
 
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
@@ -1802,8 +1811,16 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
         .saturating_sub(epoch_start.used_percent) as u16
 }
 
+fn claude_accounts_message(db: &RhoDb) -> anyhow::Result<ServerMessage> {
+    Ok(ServerMessage::ClaudeAccounts {
+        accounts: rho_claude::accounts::list()?,
+        current: db.read().claude_account(),
+    })
+}
+
 fn spawn_claude_quota_recorder(
     mut updates: tokio::sync::mpsc::Receiver<anyhow::Result<rho_claude_usage::ClaudeUsage>>,
+    account: String,
     db: RhoDb,
     inference: Inference,
     events: broadcast::Sender<ServerMessage>,
@@ -1813,7 +1830,7 @@ fn spawn_claude_quota_recorder(
             let usage = match update {
                 Ok(usage) => usage,
                 Err(error) => {
-                    tracing::warn!(%error, "Claude quota probe failed");
+                    tracing::warn!(%error, %account, "Claude quota probe failed");
                     continue;
                 }
             };
@@ -1822,7 +1839,7 @@ fn spawn_claude_quota_recorder(
             let mut changed = write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
-                auth_namespace: None,
+                auth_namespace: Some(account.clone()),
                 observed_at,
                 used_percent: usage.all_models.used_percent,
                 reset_at_unix: Some(usage.all_models.reset_at_unix),
@@ -1830,7 +1847,7 @@ fn spawn_claude_quota_recorder(
             changed |= write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::FABLE,
-                auth_namespace: None,
+                auth_namespace: Some(account.clone()),
                 observed_at,
                 used_percent: usage.fable.used_percent,
                 reset_at_unix: Some(usage.fable.reset_at_unix),
@@ -2075,6 +2092,21 @@ async fn handle_message(
                     transaction,
                 });
             }
+            Ok(Refresh::None)
+        }
+        ClientMessage::ClaudeAccounts => {
+            let _ = outgoing_tx.send(claude_accounts_message(&agents.db)?);
+            Ok(Refresh::None)
+        }
+        ClientMessage::SetClaudeAccount { name } => {
+            // The account has to be there before an agent tries to mount it;
+            // a switch to a name with no directory would fail at the next
+            // turn of every agent at once.
+            rho_claude::accounts::bootstrap(&name)?;
+            let mut write = agents.db.write().await;
+            write.set_claude_account(&name);
+            write.commit();
+            let _ = outgoing_tx.send(claude_accounts_message(&agents.db)?);
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {
@@ -3673,7 +3705,7 @@ mod tests {
             assert!(write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
-                auth_namespace: None,
+                auth_namespace: Some("default".to_owned()),
                 observed_at: rho_core::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),

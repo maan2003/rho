@@ -13730,6 +13730,7 @@ dependencies = [
  "prefix-id",
  "rho-agent",
  "rho-ci",
+ "rho-claude",
  "rho-daemon",
  "rho-desk",
  "rho-inference",

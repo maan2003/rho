@@ -1063,10 +1063,7 @@ impl Session {
             .env("JJ_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
-        spawn
-            .view
-            .prepare_command(&mut command, None, Vec::new())
-            .await?;
+        spawn.view.prepare_command(&mut command, None).await?;
         if cfg!(test) {
             command.env("RHO_SHELL_TEST_CHILD", "1");
         }

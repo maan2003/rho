@@ -606,7 +606,7 @@ impl ShellTools {
                 command.current_dir(cwd.as_std_path());
             }
             ExecContext::View(view) => {
-                view.prepare_command(&mut command, cwd, Vec::new()).await?;
+                view.prepare_command(&mut command, cwd).await?;
             }
         }
 

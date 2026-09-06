@@ -7,12 +7,13 @@
 use std::io;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
+use rho_ui_proto::{ClientMessage, ServerMessage};
 
 mod land;
 mod mcp_agent_tools;
@@ -70,6 +71,7 @@ async fn run(command: Command) -> Result<()> {
             run_auth_cli(auth)?;
             Ok(())
         }
+        Command::ClaudeAccount(args) => run_claude_account(args).await,
         Command::Daemon(_) => unreachable!("daemon runs before the shared async runtime"),
         Command::Debug(args) => {
             rho_daemon::debug::run(args).await?;
@@ -177,6 +179,7 @@ struct Args {
 #[derive(Clone)]
 enum Command {
     Auth(AuthArgs),
+    ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
     Iroh(IrohArgs),
@@ -201,6 +204,8 @@ enum CliCommand {
         #[command(subcommand)]
         command: AuthArgs,
     },
+    /// Manage the Claude accounts agents run on.
+    ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
     Iroh(IrohArgs),
@@ -212,6 +217,66 @@ enum CliCommand {
     ProtocolLog(ProtocolLogArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct ClaudeAccountArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: ClaudeAccountCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum ClaudeAccountCommand {
+    /// List the accounts agents can run on, marking the current one.
+    List,
+    /// Open Claude against one account so it can be logged in, creating the
+    /// account if it is new. Run `/login` in the session that opens.
+    Login { name: String },
+    /// Put new agents on an account. Running agents keep theirs.
+    Use { name: String },
+}
+
+/// Accounts are directories, so making one is a local matter; which one
+/// agents run on is the daemon's, so listing and switching go through it.
+/// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
+/// view namespace outside an agent; agents get the same directory by mount.
+async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
+    let request = match &args.command {
+        ClaudeAccountCommand::List => ClientMessage::ClaudeAccounts,
+        ClaudeAccountCommand::Use { name } => {
+            ClientMessage::SetClaudeAccount { name: name.clone() }
+        }
+        ClaudeAccountCommand::Login { name } => {
+            let dir = rho_claude::accounts::prepare(name)?;
+            eprintln!("rho: opening Claude on account {name} ({dir}); run /login");
+            let status = std::process::Command::new("claude")
+                .env("CLAUDE_CONFIG_DIR", dir.as_str())
+                .status()
+                .context("run claude for account login")?;
+            anyhow::ensure!(status.success(), "claude exited with {status}");
+            return Ok(());
+        }
+    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
+    daemon.send(&request).await?;
+    loop {
+        match daemon.recv().await? {
+            ServerMessage::ClaudeAccounts { accounts, current } => {
+                for name in accounts {
+                    let mark = if name == current { "*" } else { " " };
+                    println!("{mark} {name}");
+                }
+                return Ok(());
+            }
+            ServerMessage::Error { message } => anyhow::bail!(message),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, clap::Args)]
@@ -330,6 +395,7 @@ impl Args {
         let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
         let command = match cli.command {
             CliCommand::Auth { command } => Command::Auth(command),
+            CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
             CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Iroh(args) => Command::Iroh(args),

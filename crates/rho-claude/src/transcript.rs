@@ -327,16 +327,11 @@ pub async fn session_transcript_path(
 
 const MAX_PROJECT_KEY_LEN: usize = 200;
 
+/// Every account shares one `projects/` tree, bind-mounted into each
+/// account directory, so the daemon reads transcripts from a single host
+/// path whatever account the agent runs on.
 fn claude_projects_dir() -> Option<Utf8PathBuf> {
-    let config_dir = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(Utf8PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Utf8PathBuf::from(home).join(".claude"))
-        })?;
-    Some(config_dir.join("projects"))
+    Some(crate::accounts::config_home().ok()?.join("projects"))
 }
 
 async fn canonical_utf8(path: &Utf8Path) -> Option<Utf8PathBuf> {

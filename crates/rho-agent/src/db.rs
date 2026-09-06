@@ -54,7 +54,10 @@ const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
 const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_time_provider");
-const CURRENT_AGENT_DB_FORMAT: &str = "50351c18";
+/// The Claude account every agent runs on. One row: the account is global,
+/// and switching it moves every agent at its next turn.
+const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
+const CURRENT_AGENT_DB_FORMAT: &str = "3ac1e7d4";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -63,7 +66,37 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "50351c18",
+    to: "3ac1e7d4",
+    migrate: name_claude_quota_observations_after_the_default_account,
+}];
+
+/// Claude quota was observed for whatever account the host was logged into,
+/// and bootstrap makes that the default account, so every observation
+/// written before accounts existed belongs to it. Naming it keeps one
+/// account's history in one series instead of splitting at the change.
+///
+/// Temporary: delete with the format hop once developer databases have run
+/// it (`.agents/skills/temp-migration`).
+fn name_claude_quota_observations_after_the_default_account(write: &mut WriteTxn) {
+    let mut table = write.open_table(QUOTA_OBSERVATIONS);
+    let stale: Vec<_> = table
+        .iter()
+        .filter_map(|(key, value)| {
+            let record = value.value().into_owned();
+            matches!(
+                (&record.provider, &record.auth_namespace),
+                (QuotaProvider::Claude, None)
+            )
+            .then(|| (key.value(), record))
+        })
+        .collect();
+    for (key, mut record) in stale {
+        record.auth_namespace = Some(rho_claude::accounts::DEFAULT_ACCOUNT.to_owned());
+        table.insert(&key, SenValue::borrowed(&record));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -802,6 +835,9 @@ pub trait AgentReadTxnExt {
     fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
     fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
+    /// The Claude account agents run on, which is the default account until
+    /// someone switches it.
+    fn claude_account(&self) -> String;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -864,6 +900,9 @@ pub trait AgentWriteTxnExt {
     );
     /// Records a changed whole-percentage weekly quota sample.
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
+    /// Puts every agent on `account` from its next turn. Running processes
+    /// keep the account their namespace has mounted until then.
+    fn set_claude_account(&mut self, account: &str);
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket);
     fn replace_agent_usage(
         &mut self,
@@ -1156,6 +1195,13 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or_default()
     }
 
+    fn claude_account(&self) -> String {
+        self.open_table(CLAUDE_ACCOUNT)
+            .get(&())
+            .map(|value| value.value())
+            .unwrap_or_else(|| rho_claude::accounts::DEFAULT_ACCOUNT.to_owned())
+    }
+
     fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)> {
         self.open_table(GLOBAL_AGENT_USAGE)
             .range(
@@ -1188,6 +1234,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
         self.open_table(GLOBAL_AGENT_USAGE);
+        self.open_table(CLAUDE_ACCOUNT);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
@@ -1368,6 +1415,11 @@ impl AgentWriteTxnExt for WriteTxn {
             subscriptions.remove(&key);
         }
     }
+    fn set_claude_account(&mut self, account: &str) {
+        self.open_table(CLAUDE_ACCOUNT)
+            .insert(&(), account.to_owned());
+    }
+
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
         let mut key = QuotaObservationKey {
             model: observation.model,

@@ -304,6 +304,7 @@ impl ClaudeAgent {
             start_mode,
             process: None,
             claude_prompt_path: None,
+            claude_account: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
             queued_turns: VecDeque::new(),
@@ -498,6 +499,9 @@ struct ClaudeLoop {
     start_mode: ClaudeStartMode,
     process: Option<ClaudeCode>,
     claude_prompt_path: Option<tempfile::TempPath>,
+    /// The account the running process was spawned on, so a switch is
+    /// noticed at the next turn.
+    claude_account: Option<String>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
     queued_turns: VecDeque<ClaudeTurn>,
@@ -1510,8 +1514,20 @@ impl ClaudeLoop {
     }
 
     async fn ensure_process(&mut self) -> anyhow::Result<()> {
+        // The account is global and switching it moves every agent. It lands
+        // here, at a turn boundary, rather than the moment it is switched:
+        // the process holds a namespace with the old account mounted, and
+        // killing it mid-turn would throw away the answer in flight.
+        let account = self.db.read().claude_account();
         if self.process.is_some() {
-            return Ok(());
+            if self.claude_account.as_deref() == Some(account.as_str()) {
+                return Ok(());
+            }
+            eprintln!(
+                "rho-agent: restarting {} on Claude account {account}",
+                self.agent_id.encoded()
+            );
+            self.close_process().await;
         }
         let view = Arc::clone(self.view.get().await?);
         let session = match self.start_mode {
@@ -1541,10 +1557,10 @@ impl ClaudeLoop {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
             options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
-        let file_mounts = self.write_claude_prompt_mount(&view)?.into_iter().collect();
-        let mut command = options.command().await?;
-        view.prepare_command(&mut command, None, file_mounts)
+        self.configure_claude_home(&view, &mut options, &account)
             .await?;
+        let mut command = options.command().await?;
+        view.prepare_command(&mut command, None).await?;
         self.process = Some(ClaudeCode::spawn_command(command).await?);
         if !self.pending_rewind {
             self.start_mode = ClaudeStartMode::Resume;
@@ -1552,50 +1568,45 @@ impl ClaudeLoop {
         Ok(())
     }
 
-    fn write_claude_prompt_mount(
+    /// Gives the view the Claude configuration this agent runs against: its
+    /// account, when it has one, and its own generated `CLAUDE.md`. Both are
+    /// mounted at `~/.claude` when the view's namespace is built, so this
+    /// has to run before the first spawn; a respawn only rewrites the prompt
+    /// the standing mount already points at.
+    async fn configure_claude_home(
         &mut self,
         view: &rho_workspaces::View,
-    ) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
-        // A view whose entries are all live checkouts has no private mount
-        // namespace to bind the generated prompt into.
-        if view
-            .entries()
-            .iter()
-            .all(|workspace| workspace.is_user_checkout())
-        {
-            eprintln!(
-                "rho-agent: not bind-mounting generated CLAUDE.md for Claude live-checkout view"
-            );
-            return Ok(None);
-        }
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory not found"))?;
-        let target = Utf8PathBuf::try_from(home)
-            .context("home directory path is not valid UTF-8")?
-            .join(".claude")
-            .join("CLAUDE.md");
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create Claude config directory {parent}"))?;
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("create Claude prompt bind target {target}"));
-            }
-        }
+        options: &mut rho_claude::ClaudeCodeOptions,
+        account: &str,
+    ) -> anyhow::Result<()> {
+        let config_home = rho_claude::accounts::config_home()?;
+        // The namespace mounts these, and a missing mount source or target
+        // there fails namespace creation rather than the spawn.
+        std::fs::create_dir_all(config_home.join("projects"))
+            .with_context(|| format!("create Claude config directory {config_home}"))?;
+        let account_dir = rho_claude::accounts::prepare(account)?;
+        // Claude keeps `.claude.json` (the account itself, and its
+        // credentials) in `$HOME`, not in the config directory, so no mount
+        // over `~/.claude` alone could switch accounts. Naming the mount
+        // point as the config directory is what pulls that file inside it.
+        // The value is the same for every account: only the mount underneath
+        // it differs.
+        options.set_env("CLAUDE_CONFIG_DIR", config_home.as_str());
         let prompt = system_prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
         // Keep one source inode alive for the lifetime of the view namespace.
         // Unlinking a bind-mounted source makes the target pathname disappear
-        // inside that namespace, so a later cold respawn cannot mount a new
-        // prompt over it (the pre-exec hook fails with ENOENT).
+        // inside that namespace, so a rewrite has to reuse this file rather
+        // than replace it.
         let source = write_claude_prompt_source(&mut self.claude_prompt_path, &prompt)?;
-        Ok(Some((source, target)))
+        view.set_claude_home(rho_workspaces::ns::ClaudeHome {
+            account: account_dir.into_std_path_buf(),
+            shared_projects: config_home.join("projects").into_std_path_buf(),
+            config_home: config_home.into_std_path_buf(),
+            prompt: source.into_std_path_buf(),
+        })
+        .await?;
+        self.claude_account = Some(account.to_owned());
+        Ok(())
     }
 
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {

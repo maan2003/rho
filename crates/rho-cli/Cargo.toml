@@ -17,6 +17,7 @@ libc.workspace = true
 prefix-id.workspace = true
 rho-agent = { workspace = true, features = ["code-mode"] }
 rho-ci.workspace = true
+rho-claude.workspace = true
 rho-daemon.workspace = true
 rho-desk.workspace = true
 rho-inference.workspace = true

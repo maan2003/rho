@@ -365,6 +365,14 @@ pub enum ClientMessage {
     AgentCostDistribution {
         since_ms: u64,
     },
+    /// Asks which Claude accounts exist and which one agents run on, and
+    /// replies with [`ServerMessage::ClaudeAccounts`].
+    ClaudeAccounts,
+    /// Puts every agent on `name` from its next turn, replying with
+    /// [`ServerMessage::ClaudeAccounts`] as it stands after the switch.
+    SetClaudeAccount {
+        name: String,
+    },
     /// Stores an immutable visualization snapshot and replies with
     /// [`ServerMessage::VisualizationRecorded`].
     RecordVisualization {
@@ -744,6 +752,10 @@ pub enum ServerMessage {
     },
     AgentCostDistribution {
         series: Vec<AgentCostSeries>,
+    },
+    ClaudeAccounts {
+        accounts: Vec<String>,
+        current: String,
     },
     VisualizationRecorded {
         id: String,

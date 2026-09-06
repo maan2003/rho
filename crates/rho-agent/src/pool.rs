@@ -123,6 +123,11 @@ impl AgentPool {
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare(&db).await;
+        // The account agents run on has to exist before the first spawn.
+        let account = db.read().claude_account();
+        if let Err(error) = rho_claude::accounts::bootstrap(&account) {
+            panic!("Claude account {account} could not be prepared: {error:#}");
+        }
         let pool = Arc::new(Self {
             db,
             inference: inference.clone(),

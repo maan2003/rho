@@ -13,6 +13,7 @@ use rho_workspaces::PathOverrides;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+pub mod accounts;
 pub mod protocol;
 mod transcript;
 

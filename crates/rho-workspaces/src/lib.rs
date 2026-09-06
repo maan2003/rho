@@ -34,7 +34,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
 
 mod diff;
-mod ns;
+pub mod ns;
 mod sandbox;
 
 pub use ns::init_daemon_namespace;
@@ -963,11 +963,18 @@ impl Workspace {
 #[derive(Debug)]
 pub struct View {
     entries: WorkingSet,
-    /// Present once a command needed a cover mount. Holding the fd keeps the
-    /// namespace alive; commands enter it with `setns` from `pre_exec`.
+    /// The namespace and what has to be mounted into it when it is built.
     /// The lock serializes namespace creation, so the namespace is built
     /// exactly once.
-    mnt_ns: Mutex<Option<OwnedFd>>,
+    ns: Mutex<NsState>,
+}
+
+/// Holding the fd keeps the namespace alive; commands enter it with `setns`
+/// from `pre_exec`. The fd is present once a command needed a cover mount.
+#[derive(Debug, Default)]
+struct NsState {
+    fd: Option<OwnedFd>,
+    claude: Option<Arc<ns::ClaudeHome>>,
 }
 
 /// A nonempty working set of workdirs with pairwise-disjoint origin roots,
@@ -1034,7 +1041,7 @@ impl View {
         );
         Ok(Arc::new(Self {
             entries: WorkingSet::new(entries)?,
-            mnt_ns: Mutex::new(None),
+            ns: Mutex::new(NsState::default()),
         }))
     }
 
@@ -1053,18 +1060,37 @@ impl View {
     /// (relative to the primary workdir; absolute used as-is; `None` for the
     /// primary itself).
     ///
-    /// `file_mounts` are `(source, target)` absolute file paths to bind
-    /// inside the namespace; targets must already exist. A view whose
-    /// entries are all live checkouts has no private namespace, so file
-    /// mounts are rejected rather than leaking mounts into the daemon
-    /// namespace.
+    /// Fixes which Claude account this view's processes run as, by mounting
+    /// the account directory over `~/.claude` when the namespace is built.
+    ///
+    /// Changing it drops the namespace, so the next prepared command builds
+    /// a fresh one with the new account mounted. Processes already running
+    /// stay in the old namespace: the caller stops them.
+    pub async fn set_claude_home(&self, home: ns::ClaudeHome) -> anyhow::Result<()> {
+        let mut ns_guard = self.ns.lock().await;
+        anyhow::ensure!(
+            self.entries.iter().any(|entry| entry.needs_mount()),
+            "Claude cannot run in a live-checkout view: it has no private \
+             mount namespace to hold the account configuration"
+        );
+        if ns_guard.claude.as_deref() == Some(&home) {
+            return Ok(());
+        }
+        ns_guard.claude = Some(Arc::new(home));
+        ns_guard.fd = None;
+        Ok(())
+    }
+
+    /// Anything the view has to mount (each entry's checkout, and a Claude
+    /// account when one was set) is mounted when the namespace is built, not
+    /// here: a mount made after `setns` would land in the shared namespace
+    /// and stack again on every respawn.
     pub async fn prepare_command(
         &self,
         command: &mut tokio::process::Command,
         cwd: Option<&Utf8Path>,
-        file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
     ) -> anyhow::Result<()> {
-        let mut ns_guard = self.mnt_ns.lock().await;
+        let mut ns_guard = self.ns.lock().await;
         let entries = self.entries();
         let primary = &entries[0];
         let base_path = if let Some(environment) = &primary.repo.user_environment {
@@ -1104,8 +1130,8 @@ impl View {
         let cwd = cwd.map_or_else(|| primary.repo().to_owned(), |cwd| primary.repo().join(cwd));
         if !entries.iter().any(|entry| entry.needs_mount()) {
             anyhow::ensure!(
-                file_mounts.is_empty(),
-                "live-checkout views have no private mount namespace for file mounts"
+                ns_guard.claude.is_none(),
+                "live-checkout views have no private mount namespace for a Claude account"
             );
             command.current_dir(cwd.as_std_path());
             return Ok(());
@@ -1113,18 +1139,9 @@ impl View {
         let ns_fd = std::os::fd::AsRawFd::as_raw_fd(ensure_ns(&mut ns_guard, entries).await);
         let cwd = CString::new(cwd.as_str().as_bytes())
             .map_err(|_| anyhow::anyhow!("workspace path contains a NUL byte"))?;
-        let mut mounts = Vec::with_capacity(file_mounts.len());
-        for (source, target) in file_mounts {
-            mounts.push((
-                CString::new(source.as_str().as_bytes())
-                    .map_err(|_| anyhow::anyhow!("file mount source contains a NUL byte"))?,
-                CString::new(target.as_str().as_bytes())
-                    .map_err(|_| anyhow::anyhow!("file mount target contains a NUL byte"))?,
-            ));
-        }
         unsafe {
             command.pre_exec(move || {
-                enter_workspace_ns(ns_fd, &cwd, &mounts)?;
+                enter_workspace_ns(ns_fd, &cwd)?;
                 if let Some(policy) = &landlock {
                     policy.restrict_self()?;
                 }
@@ -1287,11 +1304,8 @@ fn open_beneath(root: &Path, path: &Path) -> anyhow::Result<File> {
 /// [`init_daemon_namespace`] never ran): an agent whose real cwd contradicts
 /// the paths baked into its context would silently corrupt every later turn,
 /// so there is deliberately no degraded mode.
-async fn ensure_ns<'ns>(
-    ns_guard: &'ns mut Option<OwnedFd>,
-    entries: &[Arc<Workspace>],
-) -> &'ns OwnedFd {
-    if ns_guard.is_none() {
+async fn ensure_ns<'ns>(ns_guard: &'ns mut NsState, entries: &[Arc<Workspace>]) -> &'ns OwnedFd {
+    if ns_guard.fd.is_none() {
         let mounts = entries
             .iter()
             .filter(|entry| entry.needs_mount())
@@ -1306,24 +1320,23 @@ async fn ensure_ns<'ns>(
                 }),
             })
             .collect::<Vec<_>>();
-        let ns = tokio::task::spawn_blocking(move || ns::create_view_ns(mounts))
-            .await
-            .expect("namespace task panicked")
-            .expect("view mount namespace setup failed");
-        *ns_guard = Some(ns);
+        let claude = ns_guard.claude.clone();
+        let ns = tokio::task::spawn_blocking(move || {
+            ns::create_view_ns(mounts, claude.map(|home| (*home).clone()))
+        })
+        .await
+        .expect("namespace task panicked")
+        .expect("view mount namespace setup failed");
+        ns_guard.fd = Some(ns);
     }
-    ns_guard.as_ref().expect("namespace just ensured")
+    ns_guard.fd.as_ref().expect("namespace just ensured")
 }
 
 /// Runs between fork and exec: enter the workspace's mount namespace, move
 /// to the working directory (whose path only resolves inside it), and shed
 /// the daemon's in-namespace privileges. Must not allocate — the forked
 /// child could deadlock on the allocator lock.
-fn enter_workspace_ns(
-    ns_fd: RawFd,
-    cwd: &CStr,
-    file_mounts: &[(CString, CString)],
-) -> std::io::Result<()> {
+fn enter_workspace_ns(ns_fd: RawFd, cwd: &CStr) -> std::io::Result<()> {
     use rustix::thread::{CapabilitySet, CapabilitySets, LinkNameSpaceType};
 
     // SAFETY: the fd is kept alive by the `View` held by the spawning
@@ -1331,9 +1344,6 @@ fn enter_workspace_ns(
     // dropped once created).
     let fd = unsafe { BorrowedFd::borrow_raw(ns_fd) };
     rustix::thread::move_into_link_name_space(fd, Some(LinkNameSpaceType::Mount))?;
-    for (source, target) in file_mounts {
-        rustix::mount::mount_bind(source, target)?;
-    }
     rustix::process::chdir(cwd)?;
     rustix::thread::set_no_new_privs(true)?;
     let empty = CapabilitySet::empty();

@@ -2307,45 +2307,34 @@ impl Workspace {
         }
     }
 
-    /// Quota headroom across hosts. ChatGPT namespaces remain independent;
-    /// Claude retains the historical binding-constraint merge.
+    /// Quota headroom across hosts. A named account stands on its own -
+    /// ChatGPT's OAuth namespaces and Claude's accounts alike, since each is
+    /// its own subscription. Unnamed rows keep the historical
+    /// binding-constraint merge: they say nothing about whose quota they are.
     fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
         let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
         for (host, summaries) in &self.quota_summaries {
             for summary in summaries {
-                if summary.model == "gpt" {
-                    let Some(namespace) = &summary.auth_namespace else {
-                        match merged.iter_mut().find(|existing| {
-                            existing.model == summary.model && existing.auth_namespace.is_none()
-                        }) {
-                            Some(existing)
-                                if summary.remaining_percent < existing.remaining_percent =>
-                            {
-                                *existing = summary.clone();
-                            }
-                            Some(_) => {}
-                            None => merged.push(summary.clone()),
+                let Some(namespace) = &summary.auth_namespace else {
+                    match merged.iter_mut().find(|existing| {
+                        existing.model == summary.model && existing.auth_namespace.is_none()
+                    }) {
+                        Some(existing)
+                            if summary.remaining_percent < existing.remaining_percent =>
+                        {
+                            *existing = summary.clone();
                         }
-                        continue;
-                    };
-                    let mut summary = summary.clone();
-                    if self.hosts.len() > 1 {
-                        summary.auth_namespace =
-                            Some(format!("{}/{}", self.host_label(*host), namespace));
+                        Some(_) => {}
+                        None => merged.push(summary.clone()),
                     }
-                    merged.push(summary);
                     continue;
+                };
+                let mut summary = summary.clone();
+                if self.hosts.len() > 1 {
+                    summary.auth_namespace =
+                        Some(format!("{}/{}", self.host_label(*host), namespace));
                 }
-                match merged
-                    .iter_mut()
-                    .find(|existing| existing.model == summary.model)
-                {
-                    Some(existing) if summary.remaining_percent < existing.remaining_percent => {
-                        *existing = summary.clone();
-                    }
-                    Some(_) => {}
-                    None => merged.push(summary.clone()),
-                }
+                merged.push(summary);
             }
         }
         merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));

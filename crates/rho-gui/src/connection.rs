@@ -1369,6 +1369,7 @@ async fn run(
                 None
             }
             ServerMessage::Pong
+            | ServerMessage::ClaudeAccounts { .. }
             | ServerMessage::VisualizationRecorded { .. }
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }

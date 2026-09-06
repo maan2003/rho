@@ -62,6 +62,26 @@ pub struct ViewMount {
     pub metadata_masks: Option<(PathBuf, PathBuf)>,
 }
 
+/// The Claude config directory an agent's processes see at `config_home`.
+///
+/// Mounted once, when the view's namespace is built, rather than per spawn:
+/// a spawn-time mount would enter the namespace through `setns` and stack
+/// another mount on the same target at every respawn, forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeHome {
+    /// The account directory bound over `config_home`. It owns the
+    /// credentials and `.claude.json` that decide which account this is.
+    pub account: PathBuf,
+    /// Where Claude looks: `~/.claude`, the same path for every account.
+    pub config_home: PathBuf,
+    /// The transcript tree shared by all accounts, so the daemon reads one
+    /// host path and an agent stays resumable across an account change.
+    pub shared_projects: PathBuf,
+    /// The agent's generated `CLAUDE.md`. Per agent, not per account: two
+    /// agents on one account each need their own working set in it.
+    pub prompt: PathBuf,
+}
+
 /// Creates the mount namespace for one agent view: a copy of the daemon's
 /// namespace with each entry's managed checkout mounted over its origin repo
 /// path, and each origin bound back in at `.jj/ws-parent` for the checkout's
@@ -69,7 +89,10 @@ pub struct ViewMount {
 /// permanently inside the new namespace — the returned
 /// `/proc/thread-self/ns/mnt` fd is what keeps it alive after the thread
 /// exits.
-pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
+pub fn create_view_ns(
+    mounts: Vec<ViewMount>,
+    claude_home: Option<ClaudeHome>,
+) -> anyhow::Result<OwnedFd> {
     std::thread::spawn(move || -> anyhow::Result<OwnedFd> {
         // SAFETY: NEWNS implies unsharing fs state for this thread only; the
         // thread exits immediately after and shares nothing else.
@@ -90,11 +113,44 @@ pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
                 }
             }
         }
+        if let Some(home) = &claude_home {
+            mount_claude_home(home)?;
+        }
         let fd = File::open("/proc/thread-self/ns/mnt").context("open mount namespace fd")?;
         Ok(fd.into())
     })
     .join()
     .expect("view namespace thread panicked")
+}
+
+/// Gives this namespace one account's Claude config at the ordinary
+/// `~/.claude`: the account directory covers it, the shared transcript tree
+/// is put back on top of the account's own `projects/`, and the agent's
+/// generated prompt covers the account's `CLAUDE.md`.
+fn mount_claude_home(home: &ClaudeHome) -> anyhow::Result<()> {
+    // The shared tree must be cloned before the account covers the path it
+    // lives under, or the source would resolve inside the account.
+    let projects = open_tree(
+        CWD,
+        &home.shared_projects,
+        OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::AT_RECURSIVE
+            | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    )
+    .context("open shared Claude transcript tree")?;
+    rustix::mount::mount_bind(&home.account, &home.config_home)
+        .context("mount Claude account over the config directory")?;
+    move_mount(
+        projects.as_fd(),
+        "",
+        CWD,
+        home.config_home.join("projects"),
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .context("mount shared Claude transcripts")?;
+    rustix::mount::mount_bind(&home.prompt, home.config_home.join("CLAUDE.md"))
+        .context("mount generated CLAUDE.md")?;
+    Ok(())
 }
 
 /// The per-entry mount dance, in whatever namespace this thread is in:

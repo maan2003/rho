@@ -316,10 +316,7 @@ impl Session {
         }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        spawn
-            .view
-            .prepare_command(&mut command, None, Vec::new())
-            .await?;
+        spawn.view.prepare_command(&mut command, None).await?;
         command.stdin(std::process::Stdio::from(slave.try_clone()?));
         command.stdout(std::process::Stdio::from(slave.try_clone()?));
         command.stderr(std::process::Stdio::from(slave));
