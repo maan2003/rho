@@ -35,6 +35,7 @@ actions!(
     rho_gui,
     [
         SubmitPrompt,
+        TranscriptTop,
         PastePrompt,
         AgentPrevious,
         AgentNext,
@@ -578,6 +579,17 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             // desk. Bound here so it outranks vim's own `shift-u`.
             KeyBinding::new("shift-u", UndoVerdict, Some(context)),
         ]);
+    }
+    // The top of a transcript is the top of its history, and history is
+    // composed as it is asked for, so `gg` here is the transcript's own:
+    // it composes everything on the way. Anywhere else the action gives
+    // the key back and vim keeps it. Not bound with an operator pending —
+    // `y g g` stays vim's.
+    for context in [
+        "RhoGui > Editor && vim_mode == normal && vim_operator == none",
+        "RhoGui > Editor && vim_mode == helix_normal && vim_operator == none",
+    ] {
+        cx.bind_keys([KeyBinding::new("g g", TranscriptTop, Some(context))]);
     }
     // Vim is vim on every surface: a card is read, searched and yanked like
     // any buffer, and the verdicts live in the transient one tap of `shift`

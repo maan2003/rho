@@ -299,6 +299,122 @@ wrong at the design, not at the polish.
   reparent and a host reset), rho-gui 243, rho-window 11 (`selection`
   brought one), rho-hosts 14; workspace clippy `-D warnings` green; the
   workspace has one crate fewer.
+  *Landed, the transcript opens on its tail (9).* Session 7's failing
+  number was this crate's: `wrap_map_update` p99 7,122 ms at 121,252 rows
+  when a 262k-token transcript opened. Measured before designing, as
+  ruled, and three things were true. The whole history was composed at
+  open: `prepare_initial` rendered every block the agent had ever produced
+  and `install_initial` put every one of them in the multibuffer before
+  the first frame — 121,252 rows to show about 41. The transcript's own
+  elisions could not help, because `DisplayElision` is a block-map
+  construct and the block map sits *above* the wrap map (buffer, inlay,
+  fold, tab, wrap, block), so eliding history hides rows that have already
+  been wrapped. And the wrap is not a one-off: `WrapMap::set_wrap_width`
+  rewraps the whole buffer on every width, so every resize paid the seven
+  seconds again.
+
+  Both halves are lazy now, in both senses the ruling asked for: history
+  above the opening tail is neither rendered nor composed until a reader
+  asks for it. The blocks themselves stay whole in memory — they are the
+  fold's, shared by pointer, so the model's own list of them copies no
+  text — and `records` and `buffers` cover `blocks[uncomposed..]`, growing
+  upward. A transcript opens on the last 200 rows of it (`OPENING_ROWS`),
+  which is a desk window twice over; reading upward composes another 400
+  rows (`HISTORY_CHUNK_ROWS`) each time the reader comes within 40 rows of
+  the top of what is composed. The separator a chunk's first block carries
+  is the one it would have carried with all of history above it, so
+  composing that history later leaves every chunk's text byte-identical —
+  no excerpt is replaced, no anchor moves, and nothing below the new rows
+  is laid out again.
+
+  The three verbs the ruling named, and what each one costs:
+
+  - **`gg`** composes everything, because the reader asked for everything,
+    and the point lands when the top exists. Composition runs off the
+    frame loop a chunk at a time — a step, then back to the window, which
+    keeps drawing — and the echo line says "composing history" while it
+    runs.
+  - **`/`** is the buffer's search, so it searches the whole transcript:
+    the history it has not composed yet is composed while the reader is
+    still typing the query, and the search runs when it is all there.
+    Worth saying plainly: `/` in a transcript did nothing at all before
+    this cut. Vim emits `EditorEvent::SearchRequested` because this app
+    has no zed pane, and the only listener was the dashboard's. The
+    surface now hosts one, the same minibuffer search the dashboard has.
+    What it does not yet have is `n`/`N` to repeat, which is vim's and
+    needs the same treatment; it is written down here rather than
+    discovered.
+  - **The point survives leaving and returning**, and it survives as a
+    store position — which block, and how far into it — never a buffer
+    offset. `AgentModel` remembers it whenever the point moves in the
+    transcript, and remembers `None` while the point is in the prompt, so
+    a surface left at the prompt comes back to the prompt and one left
+    deep in history composes what it needs and comes back to the same
+    block. A test asserts exactly that: open, `gg` to the top, close the
+    surface, open it again, the point is on the block it was left on.
+
+  The elision-covered fraction, measured because it was asked for even
+  though folds are the fallback and not the plan: on the same transcript,
+  off the rig's own mirror, 12,348 blocks, 121,114 rendered rows, 697
+  elision plans covering 118,403 of those rows — 97.8 per cent. So the
+  fallback would have worked, and it is still worth having later for a
+  different reason than this cut: after a `gg` the whole transcript is
+  composed and all 121k rows are wrapped again, and only a real fold, in
+  the fold map below the wrap, takes them out of the wrap's input. That is
+  the next thing to do here, not a thing this cut needed.
+
+  One sentence worth keeping because it is what makes the whole thing
+  safe: a chunk's first block is rendered with the separator it would have
+  carried with all of history above it, so composing that history later
+  leaves the chunk's text byte-identical.
+
+  Owed, and not this cut's to fix: the editor rewrapping the whole buffer
+  on every width change fails the cost rule on its own. Tail-first shrinks
+  what it sees but does not fix it, and it is a vendored-editor primitive,
+  so it goes on `rho-window`'s list beside the right prompt. And `y g g` —
+  a yank with an operator pending — stays vim's own, so it copies what is
+  composed rather than composing first; `gg` is bound only with
+  `vim_operator == none`.
+
+  Numbers, on the desk rig's `user-2026-09-06` snapshot, profiling
+  binaries, one run per thing measured so each number belongs to one
+  thing. Before, session 7 on the same agent: 281 frames, draw p99 12.3
+  ms, 5 over 8 ms, worst gap 500 ms, `wrap_map_update` p99 7,122 ms at
+  121,252 rows.
+
+  - *Twenty opens and closes of the 262k agent* (session 24): 621 frames,
+    draw p50 2.4 ms, p99 4.7 ms, max 8.1 ms, 1 frame over 8 ms and none
+    over 16; worst gap 290 ms, p99 15 ms; `wrap_map_update` p99 7.9 ms
+    over 432 input rows at its largest — the tail, not the history —
+    and `block_map_sync` p99 0.02 ms. The seven seconds are gone because
+    the rows are not there.
+  - *Four width changes with the transcript open* (session 21): 83
+    frames, draw p99 10.2 ms, 5 over 8 ms; the wrap still redoes the
+    whole buffer on every width, but the whole buffer is now 432 rows,
+    p99 7.5 ms. The primitive is still wrong and still owed; tail-first
+    is what makes it survivable meanwhile. Driven with sway's own ipc
+    socket (`output HEADLESS-1 mode WxH`), because `rho wayland` has no
+    resize for a running session — worth knowing, and now in the QA
+    handbook.
+  - *`gg`, composing the whole history* (session 22): 265 frames, draw
+    p99 16.3 ms, max 32.4 ms, 70 over 8 ms; worst gap 486 ms, p99 357
+    ms. This one fails the frame bars while it runs, and it is the only
+    one that does. Two things are true of it: the reader asked for
+    everything, and the layer it costs is not the wrap — the wrap never
+    saw more than 2,543 rows in one update, because composition arrives
+    in chunks — but `block_map_sync`, p99 18.3 ms over a p95 of 50,045
+    input rows. That is the argument for the real fold below the wrap
+    being the next change here, and it says which layer to watch.
+  - *A small agent, five opens* (session 23): draw p99 8.1 ms, wrap p99
+    3.0 ms over 213 rows. Unchanged, which was the point of measuring it.
+
+  Held by tests, not by the rig alone: a long transcript opens with
+  history uncomposed, scrolling into it composes it, `gg` composes every
+  row, a surface left deep in history returns to the same block, a search
+  composes the history it looks through, and the cheap "does this block
+  render to anything" predicate agrees with rendering it for every block
+  there is.
+
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

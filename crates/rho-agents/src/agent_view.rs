@@ -31,9 +31,51 @@ use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 use crate::now_ms;
 use crate::state::UiAgentState;
 use crate::store::FrameSummary;
-use crate::transcript::TranscriptModel;
+use crate::transcript::{StorePoint, TranscriptModel};
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
+
+/// How much history one composition step takes on. Small enough that a
+/// step is not a frame, large enough that composing a long transcript is
+/// a few hundred steps.
+const HISTORY_CHUNK_ROWS: usize = 400;
+
+/// How close to the top of what is composed the reader comes before the
+/// next screenful of history is composed.
+const PRELOAD_ROWS: f64 = 40.0;
+
+/// What the reader has asked the transcript's history for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HistoryWant {
+    /// Enough to keep scrolling up into.
+    Screenful,
+    /// Down to the block the reader is going to.
+    ToBlock(usize),
+    /// All of it: the reader asked for something only the whole
+    /// transcript answers.
+    All,
+}
+
+impl HistoryWant {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::ToBlock(one), Self::ToBlock(other)) => Self::ToBlock(one.min(other)),
+            (Self::ToBlock(block), _) | (_, Self::ToBlock(block)) => Self::ToBlock(block),
+            _ => Self::Screenful,
+        }
+    }
+
+    /// Whether this much history is composed, `uncomposed` blocks being
+    /// what is not.
+    fn met_by(self, uncomposed: usize) -> bool {
+        match self {
+            Self::Screenful => true,
+            Self::ToBlock(block) => uncomposed <= block,
+            Self::All => uncomposed == 0,
+        }
+    }
+}
 
 pub struct PromptGutter;
 
@@ -58,6 +100,19 @@ pub struct AgentModel {
     initial_load_started: bool,
     initial_load_ready: bool,
     initial_load: Option<Task<()>>,
+    /// The agent this model is of, once its bulk load has started.
+    agent_id: Option<AgentId>,
+    /// What history the reader has asked for and has not been given yet.
+    history_want: Option<HistoryWant>,
+    /// Whether a composition loop is running; it composes a chunk, lets
+    /// the window draw, and comes back.
+    composing: bool,
+    history_task: Option<Task<()>>,
+    /// A point waiting for the history that holds it to be composed.
+    pending_point: Option<(WeakEntity<Editor>, StorePoint)>,
+    /// Where the point was when an editor over this model last moved it,
+    /// as a store position: what returning to the surface goes back to.
+    remembered_point: Option<StorePoint>,
     /// Full-multibuffer editors currently displaying this agent, weakly
     /// held: surfaces own their editors; the model only reconciles whoever
     /// is still alive. The preview editor lives apart — prompt chrome
@@ -71,6 +126,8 @@ pub struct AgentModel {
 pub enum AgentModelEvent {
     /// The transcript is composed and the screen is ready to draw.
     Loaded(AgentId),
+    /// The history the reader asked for is composed; nothing is waiting.
+    HistoryComposed(AgentId),
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
@@ -121,6 +178,12 @@ impl AgentModel {
             initial_load_started: false,
             initial_load_ready: false,
             initial_load: None,
+            agent_id: None,
+            history_want: None,
+            composing: false,
+            history_task: None,
+            pending_point: None,
+            remembered_point: None,
             editors: Vec::new(),
             _subscriptions: subscriptions,
         }
@@ -148,6 +211,7 @@ impl AgentModel {
             return;
         }
         self.initial_load_started = true;
+        self.agent_id = Some(agent_id);
         let background = cx.background_executor().clone();
         self.initial_load = Some(cx.spawn(async move |this, cx| {
             let mut prepared = background
@@ -272,11 +336,179 @@ impl AgentModel {
         }
 
         self.transcript.attach(&editor, now_ms(), cx);
+        // History is composed as the reader moves into it, and the point
+        // is remembered where the store can name it, so a surface opened
+        // again comes back to the block it was left on.
+        self._subscriptions.push(cx.subscribe_in(
+            &editor,
+            window,
+            |this, editor, event: &editor::EditorEvent, window, cx| match event {
+                editor::EditorEvent::ScrollPositionChanged { .. } => {
+                    this.editor_scrolled(&editor.clone(), window, cx);
+                }
+                editor::EditorEvent::SelectionsChanged { local: true } => {
+                    // `None` when the point is in the prompt rather than
+                    // the transcript, which is where a reopened surface
+                    // should then start.
+                    this.remembered_point = this.store_point(&editor.clone(), cx);
+                }
+                _ => {}
+            },
+        ));
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
         self.apply_prompt_chrome_to(&editor, cx);
         self.refresh_attachment_blocks(cx);
+        if let Some(point) = self.remembered_point {
+            self.go_to_store_point(&editor, point, window, cx);
+        }
         editor
+    }
+
+    /// How much of the transcript is composed nowhere yet, in blocks.
+    pub fn uncomposed_blocks(&self) -> usize {
+        self.transcript.uncomposed_blocks()
+    }
+
+    /// Whether history is still being composed: what the echo line says
+    /// while a verb waits for the whole transcript.
+    pub fn composing_history(&self) -> bool {
+        self.composing
+    }
+
+    /// Asks for more of the transcript's history. Composition runs off the
+    /// frame loop, a chunk at a time, so the window keeps drawing while it
+    /// catches up and the point lands when what holds it exists.
+    pub fn request_history(
+        &mut self,
+        want: HistoryWant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.history_want = Some(match self.history_want {
+            Some(current) => current.merge(want),
+            None => want,
+        });
+        if self.composing {
+            return;
+        }
+        self.composing = true;
+        self.history_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let Ok(more) = this.update_in(cx, |this, window, cx| this.compose_step(window, cx))
+                else {
+                    return;
+                };
+                if !more {
+                    return;
+                }
+                // Off the frame loop: a step, then back to the window,
+                // which draws while the rest of history catches up.
+                cx.background_executor().spawn(async {}).await;
+            }
+        }));
+    }
+
+    /// One composition step. Answers whether another is wanted.
+    fn compose_step(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(want) = self.history_want else {
+            self.composing = false;
+            return false;
+        };
+        let more = self
+            .transcript
+            .compose_history(HISTORY_CHUNK_ROWS, now_ms(), cx);
+        if more && !want.met_by(self.transcript.uncomposed_blocks()) {
+            return true;
+        }
+        self.history_want = None;
+        self.composing = false;
+        if let Some((editor, point)) = self.pending_point.take()
+            && let Some(editor) = editor.upgrade()
+        {
+            self.place_point(&editor, point, window, cx);
+        }
+        if let Some(agent_id) = self.agent_id {
+            cx.emit(AgentModelEvent::HistoryComposed(agent_id));
+        }
+        false
+    }
+
+    /// Puts the point at a store position, composing whatever history is
+    /// needed to place it. The point lands when the block it names exists.
+    pub fn go_to_store_point(
+        &mut self,
+        editor: &Entity<Editor>,
+        point: StorePoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.place_point(editor, point, window, cx) {
+            return;
+        }
+        self.pending_point = Some((editor.downgrade(), point));
+        self.request_history(HistoryWant::ToBlock(point.block), window, cx);
+    }
+
+    /// Where the point of an editor over this model is, as the store sees
+    /// it. `None` when the point is in the prompt rather than the
+    /// transcript.
+    pub fn store_point(&self, editor: &Entity<Editor>, cx: &App) -> Option<StorePoint> {
+        let head = editor.read(cx).selections.newest_anchor().head();
+        self.transcript.store_point(&head, cx)
+    }
+
+    /// The point this model's editors last had in the transcript.
+    pub fn remembered_point(&self) -> Option<StorePoint> {
+        self.remembered_point
+    }
+
+    /// Places the point, answering whether the block it names was composed.
+    fn place_point(
+        &mut self,
+        editor: &Entity<Editor>,
+        point: StorePoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(anchor) = self.transcript.place_store_point(point, cx) else {
+            return false;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(anchor)
+        else {
+            return false;
+        };
+        editor.update(cx, |editor, cx| {
+            // The point the reader asked for outranks the pin that keeps
+            // a live transcript at its tail.
+            editor.clear_autoscroll_pin(cx);
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        true
+    }
+
+    /// Composes the next screenful of history when the reader comes close
+    /// to the top of what is composed.
+    fn editor_scrolled(
+        &mut self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transcript.has_uncomposed() || self.composing {
+            return;
+        }
+        let top = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+        if top > PRELOAD_ROWS {
+            return;
+        }
+        self.request_history(HistoryWant::Screenful, window, cx);
     }
 
     /// The editors still alive, pruning dropped ones.

@@ -4927,9 +4927,13 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
     let folds = concealed_ranges(&workspace, &editor, cx);
     assert!(
         folds.len() >= 1_000,
-        "the whole transcript should be concealed"
+        "every composed row is concealed: {}",
+        folds.len()
     );
 
+    // Scrolling to the top composes the history above the opening tail,
+    // which is more text and so more concealment; what it must not do is
+    // remove and recreate the concealment already there.
     workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| {
@@ -4938,7 +4942,14 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
         })
         .expect("scroll to transcript start");
     cx.run_until_parked();
-    assert_eq!(concealed_ranges(&workspace, &editor, cx), folds);
+    let composed = concealed_ranges(&workspace, &editor, cx);
+    assert!(
+        composed.len() >= folds.len(),
+        "history composed on the way up is concealed too: {} then {}",
+        folds.len(),
+        composed.len()
+    );
+    let folds = composed;
 
     workspace
         .update(cx, |_, window, cx| {
@@ -4949,6 +4960,186 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
         .expect("scroll through transcript");
     cx.run_until_parked();
     assert_eq!(concealed_ranges(&workspace, &editor, cx), folds);
+}
+
+/// Two hundred turns of transcript, the shape a long-running agent has.
+fn long_history() -> UiAgentState {
+    let mut blocks = Vec::new();
+    for turn in 0..200 {
+        blocks.push(user(&format!("ask {turn}")));
+        blocks.push(assistant(
+            &format!("turn {turn} line one\nturn {turn} line two\nturn {turn} line three\n"),
+            Some(UiMessagePhase::FinalAnswer),
+        ));
+    }
+    state(blocks, Vec::new())
+}
+
+fn uncomposed_blocks(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> usize {
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .agent_model_for_test(agent_id)
+                .read(cx)
+                .uncomposed_blocks()
+        })
+        .expect("read how much history is composed nowhere")
+}
+
+fn transcript_point_block(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> Option<usize> {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .agent_model_for_test(agent_id)
+                .read(cx)
+                .store_point(&editor, cx)
+                .map(|point| point.block)
+        })
+        .expect("read the point as the store sees it")
+}
+
+/// A screen opens at the cost of what it draws. The tail is composed and
+/// laid out; the history above it is rendered nowhere and laid out nowhere
+/// until a reader asks for it.
+#[gpui::test]
+fn a_long_transcript_opens_on_its_tail(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("turn 199 line one"),
+        "the tail is what a transcript opens on"
+    );
+    assert!(
+        !text.contains("turn 0 line one"),
+        "history the reader has not asked for is composed nowhere"
+    );
+    assert!(
+        uncomposed_blocks(&workspace, cx, agent(1)) > 0,
+        "history is waiting to be composed"
+    );
+}
+
+/// Reading upward composes history as the reader reaches it, and what was
+/// already composed keeps its place.
+#[gpui::test]
+fn scrolling_into_history_composes_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    let opened = uncomposed_blocks(&workspace, cx, agent(1));
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+            });
+        })
+        .expect("scroll to the top of what is composed");
+    cx.run_until_parked();
+
+    let after = uncomposed_blocks(&workspace, cx, agent(1));
+    assert!(
+        after < opened,
+        "reaching the top composes more history: {opened} then {after}"
+    );
+    assert!(
+        buffer_text(&workspace, cx).contains("turn 199 line one"),
+        "the tail is still where it was"
+    );
+}
+
+/// `gg` is the top of the transcript, which is the top of its history: the
+/// reader asked for everything, so everything is composed, and the point
+/// lands when the top exists.
+#[gpui::test]
+fn going_to_the_top_composes_every_row(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    assert!(uncomposed_blocks(&workspace, cx, agent(1)) > 0);
+
+    cx.simulate_keystrokes(*workspace, "escape g g");
+    cx.run_until_parked();
+
+    assert_eq!(
+        uncomposed_blocks(&workspace, cx, agent(1)),
+        0,
+        "everything the reader asked for is composed"
+    );
+    assert!(
+        buffer_text(&workspace, cx).contains("turn 0 line one"),
+        "the top of the history is in the buffer"
+    );
+    assert_eq!(
+        transcript_point_block(&workspace, cx, agent(1)),
+        Some(0),
+        "the point is on the first block"
+    );
+}
+
+/// A surface remembers the point as a store position, never a buffer
+/// offset: left deep in history and returned to, the point is on the same
+/// block, whatever had to be composed again to place it.
+#[gpui::test]
+fn returning_to_a_transcript_returns_to_the_block_it_was_left_on(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+
+    cx.simulate_keystrokes(*workspace, "escape g g");
+    cx.run_until_parked();
+    let left_on = transcript_point_block(&workspace, cx, agent(1)).expect("a point in history");
+
+    cx.simulate_keystrokes(*workspace, "ctrl-shift-backspace");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_agent(agent(1), window, cx);
+        })
+        .expect("open the transcript again");
+    cx.run_until_parked();
+
+    assert_eq!(
+        transcript_point_block(&workspace, cx, agent(1)),
+        Some(left_on),
+        "returning puts the point back on the block it was left on"
+    );
+}
+
+/// `/` in a transcript is the buffer's search, so it searches the whole
+/// transcript: the history it has not composed yet is composed first, and
+/// the point lands on the match.
+#[gpui::test]
+fn searching_a_transcript_composes_the_history_it_looks_through(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    assert!(uncomposed_blocks(&workspace, cx, agent(1)) > 0);
+
+    cx.simulate_keystrokes(*workspace, "escape / t u r n space 3 space l i n e enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        uncomposed_blocks(&workspace, cx, agent(1)),
+        0,
+        "a search looks through the whole transcript"
+    );
+    let block = transcript_point_block(&workspace, cx, agent(1)).expect("the point is on a match");
+    assert_eq!(
+        block, 7,
+        "the point is on the answer of the fourth turn, which is where the match is"
+    );
 }
 
 #[gpui::test]

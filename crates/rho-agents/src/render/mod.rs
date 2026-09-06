@@ -110,6 +110,23 @@ pub fn block_kind(block: &UiBlock) -> BlockKind {
     }
 }
 
+/// Whether a block renders to anything at all, answered without rendering
+/// it. History is composed only when a reader asks for it, so the shape of
+/// the transcript — which blocks a reader could see, which turn an elision
+/// plan covers — has to be answerable for blocks whose spans do not exist.
+/// [`RenderedBlock::visible`] is the same question asked of the spans.
+pub fn block_visible(block: &UiBlock) -> bool {
+    match block {
+        UiBlock::Reasoning { .. } => false,
+        UiBlock::Tool(_) => true,
+        UiBlock::UserMessage { text }
+        | UiBlock::AssistantMessage { text, .. }
+        | UiBlock::Notice { text }
+        | UiBlock::AgentMessage { text, .. }
+        | UiBlock::QueuedMessage { text, .. } => !text.is_empty(),
+    }
+}
+
 /// Separator inserted before a block, given the previous visible block's kind.
 fn separator(prev: Option<BlockKind>, current: BlockKind) -> Option<Span> {
     match (prev, current) {
@@ -849,5 +866,65 @@ mod tests {
             }),
             BlockKind::QueuedUser
         );
+    }
+
+    /// Composition is lazy, so visibility is answered from the block
+    /// rather than from spans that may never be rendered. The two answers
+    /// are the same answer, for every kind of block there is.
+    #[test]
+    fn block_visibility_agrees_with_rendering() {
+        let sender = AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).expect("an agent");
+        let blocks = [
+            UiBlock::UserMessage {
+                text: "said".to_owned(),
+            },
+            UiBlock::UserMessage {
+                text: String::new(),
+            },
+            UiBlock::AssistantMessage {
+                text: "answered".to_owned(),
+                phase: None,
+            },
+            UiBlock::AssistantMessage {
+                text: String::new(),
+                phase: None,
+            },
+            UiBlock::Reasoning {
+                text: "thought".to_owned(),
+            },
+            UiBlock::Tool(tool(UiToolStatus::Running)),
+            UiBlock::Notice {
+                text: "notice".to_owned(),
+            },
+            UiBlock::Notice {
+                text: String::new(),
+            },
+            UiBlock::AgentMessage {
+                sender,
+                text: "from another".to_owned(),
+            },
+            UiBlock::AgentMessage {
+                sender,
+                text: String::new(),
+            },
+            UiBlock::QueuedMessage {
+                text: "queued".to_owned(),
+                delivery: MessageDelivery::NextRequest,
+                sender: None,
+            },
+            UiBlock::QueuedMessage {
+                text: String::new(),
+                delivery: MessageDelivery::NextRequest,
+                sender: None,
+            },
+        ];
+        for block in blocks {
+            let rendered = render_block_with_agent_labels(&block, None, 0, &|_| "a".to_owned());
+            assert_eq!(
+                block_visible(&block),
+                rendered.visible(),
+                "visibility of {block:?}"
+            );
+        }
     }
 }

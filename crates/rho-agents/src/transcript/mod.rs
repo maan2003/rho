@@ -14,6 +14,13 @@
 //! against the desired state — so every view over the transcript stays
 //! correct without owning any of it.
 //!
+//! A screen opens at the cost of what it draws, so history is lazy in
+//! both senses: the blocks above the opening tail are neither rendered nor
+//! composed into the multibuffer until a reader asks for them, by scrolling
+//! into them or by a verb that needs the whole transcript. The blocks
+//! themselves stay whole in memory — they are the fold's, shared by
+//! pointer — and `records` and `buffers` cover `blocks[uncomposed..]`.
+//!
 //! Highlights are bucketed per [`StyleClass`] into two editor highlight keys
 //! each, split at the start of the live turn (after the last user message) —
 //! history ranges change at most once per turn; live-turn ranges are small,
@@ -45,8 +52,10 @@ use rho_window::visualization::Visualization;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
 use crate::render::elision::ElisionPlan;
-use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
-use crate::state::UiAgentState;
+use crate::render::{
+    BlockKind, RenderedBlock, block_kind, block_visible, render_block_with_agent_labels,
+};
+use crate::state::{UiAgentState, UiBlock};
 use crate::store::{FrameSummary, IncrementalUpdate};
 
 mod store;
@@ -65,6 +74,20 @@ pub struct TranscriptModel {
     /// Whether the last-synced state had an open turn; decides the
     /// document tail policy between syncs (e.g. at attach time).
     turn_open: bool,
+    /// Every block of the transcript, shared with the fold that made them:
+    /// a clone copies pointers, never text. The model keeps them so the
+    /// history a reader asks for is composed without asking for it again.
+    blocks: Vec<Arc<UiBlock>>,
+    /// Whether each block renders to anything, kept beside `blocks` so an
+    /// elision refresh never re-renders history to find out.
+    visible: Vec<bool>,
+    /// How many leading blocks are composed nowhere: `records` and
+    /// `buffers` cover `blocks[uncomposed..]`, and composition grows
+    /// upward as the reader moves into history.
+    uncomposed: usize,
+    /// What other agents' messages are labelled, kept so history composed
+    /// later reads the same as history composed at open.
+    agent_labels: HashMap<AgentId, String>,
     records: Vec<BlockRecord>,
     /// First record of the live turn as of the last sync. Records before it
     /// carry their highlights in the history region, records from it onward
@@ -115,6 +138,11 @@ struct TranscriptBuffer {
 
 pub(crate) struct PreparedInitialTranscript {
     state: UiAgentState,
+    visible: Vec<bool>,
+    /// The first block the opening tail composes; everything before it is
+    /// history the reader has not asked for yet.
+    first_block: usize,
+    agent_labels: HashMap<AgentId, String>,
     chunks: Vec<PreparedChunk>,
 }
 
@@ -187,6 +215,10 @@ impl TranscriptModel {
             document_multi_buffer,
             document_tail: None,
             turn_open: false,
+            blocks: Vec::new(),
+            visible: Vec::new(),
+            uncomposed: 0,
+            agent_labels: HashMap::new(),
             records: Vec::new(),
             turn_boundary: 0,
             buffers: Vec::new(),
@@ -201,48 +233,42 @@ impl TranscriptModel {
     /// Pure initial projection. This runs on a worker before the subscribed
     /// agent is considered ready, so first focus never pays transcript
     /// rendering or text concatenation costs.
+    ///
+    /// Only the tail is rendered: a screen opens at the cost of what it
+    /// draws, and history above the opening tail is rendered when the
+    /// reader asks for it.
     pub(crate) fn prepare_initial(
         state: UiAgentState,
         now_ms: u64,
         agent_labels: HashMap<AgentId, String>,
     ) -> PreparedInitialTranscript {
-        let mut previous = None;
-        let rendered_blocks = state
+        let label = |id: AgentId| agent_labels.get(&id).cloned().unwrap_or_default();
+        let visible = state
             .blocks
             .iter()
-            .map(|block| {
-                let rendered = render_block_with_agent_labels(block, previous, now_ms, &|id| {
-                    agent_labels.get(&id).cloned().unwrap_or_default()
-                });
-                if rendered.visible() {
-                    previous = Some(rendered.kind);
-                }
-                rendered
-            })
+            .map(|b| block_visible(b))
             .collect::<Vec<_>>();
-
-        let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
-        for (block_index, rendered) in rendered_blocks.into_iter().enumerate() {
-            let markdown = rendered.markdown;
-            if chunks
-                .last()
-                .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
-            {
-                chunks.push((block_index, markdown, Vec::new()));
-            }
-            chunks.last_mut().unwrap().2.push(rendered);
+        let first_block = tail_start(
+            &state.blocks,
+            state.blocks.len(),
+            OPENING_ROWS,
+            now_ms,
+            &label,
+        );
+        let chunks = render_chunks(
+            &state.blocks,
+            &visible,
+            first_block..state.blocks.len(),
+            now_ms,
+            &label,
+        );
+        PreparedInitialTranscript {
+            state,
+            visible,
+            first_block,
+            agent_labels,
+            chunks,
         }
-        let chunks = chunks
-            .into_iter()
-            .map(|(start_block, markdown, rendered)| PreparedChunk {
-                start_block,
-                markdown,
-                terminal_record: rendered.iter().rposition(RenderedBlock::visible),
-                text: rendered.iter().map(rendered_text).collect(),
-                rendered,
-            })
-            .collect();
-        PreparedInitialTranscript { state, chunks }
     }
 
     /// Installs a worker-prepared initial transcript into its reserved GPUI
@@ -260,6 +286,10 @@ impl TranscriptModel {
         debug_assert_eq!(prepared.chunks.len(), text_buffers.len());
 
         self.turn_open = crate::store::turn_open(prepared.state.status);
+        self.blocks = prepared.state.blocks;
+        self.visible = prepared.visible;
+        self.uncomposed = prepared.first_block;
+        self.agent_labels = prepared.agent_labels;
         let mut installed = Vec::with_capacity(prepared.chunks.len());
         // Register newest buffers first; syntax activation below follows the
         // same order so the visible tail leads the historical parser backlog.
@@ -316,7 +346,7 @@ impl TranscriptModel {
         self.reset_full_excerpts(cx);
         self.document_tail = None;
         self.reset_document_excerpts(cx);
-        self.refresh_elision_plans(&prepared.state, 0);
+        self.refresh_elision_plans(self.uncomposed);
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
         self.apply_to_attachments(now_ms, &history, &live, gutters_changed, cx);
@@ -386,29 +416,42 @@ impl TranscriptModel {
         cx: &mut Context<V>,
     ) {
         self.turn_open = crate::store::turn_open(state.status);
-        let Some(first_changed) = summary.first_changed_block else {
+        let Some(first_changed_block) = summary.first_changed_block else {
             // Status alone can close the turn; the document tail follows,
             // and a replaced excerpt triggers the full re-apply inside.
             let empty = HashSet::new();
             self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
             return;
         };
+        self.remember_blocks(state, first_changed_block, agent_label);
+
+        if first_changed_block < self.uncomposed {
+            // The change is under what is composed, so what is composed no
+            // longer describes the transcript: the screen opens again on
+            // its tail, at the cost of what it draws.
+            self.recompose(now_ms, cx);
+            return;
+        }
+        let first_changed = first_changed_block - self.uncomposed;
 
         if let Some(incremental) = summary.incremental
-            && self.try_incremental_sync(state, first_changed, incremental, now_ms, agent_label, cx)
+            && self.try_incremental_sync(first_changed, incremental, now_ms, cx)
         {
             return;
         }
 
         let requested_start = first_changed.min(self.records.len());
-        let start = self.rebuild_start(requested_start, state);
+        let start = self.rebuild_start(requested_start);
 
-        let changed_blocks = state.blocks.get(start..).unwrap_or(&[]);
         let mut prev_kind = last_visible_kind(&self.records[..start]);
-        let rendered_blocks = changed_blocks
+        let label = |id| self.label(id);
+        let rendered_blocks = self
+            .blocks
+            .get(self.uncomposed + start..)
+            .unwrap_or(&[])
             .iter()
             .map(|block| {
-                let block = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label);
+                let block = render_block_with_agent_labels(block, prev_kind, now_ms, &label);
                 if block.visible() {
                     prev_kind = Some(block.kind);
                 }
@@ -458,22 +501,25 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
-        self.refresh_elision_plans(state, start);
+        self.refresh_elision_plans(self.uncomposed + start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
     }
 
-    fn rebuild_start(&self, requested: usize, state: &UiAgentState) -> usize {
+    /// Where a suffix rebuild has to start, in record space: a buffer is
+    /// replaced whole, so a change inside one starts at that buffer.
+    fn rebuild_start(&self, requested: usize) -> usize {
         if let Some(record) = self.records.get(requested) {
             return self
                 .buffers
                 .iter()
                 .find(|turn| turn.buffer == record.buffer)
-                .map_or(requested, |turn| turn.start_block);
+                .map_or(requested, |turn| turn.start_block - self.uncomposed);
         }
-        let next_is_response = state.blocks.get(requested).is_some_and(|block| {
-            matches!(crate::render::block_kind(block), BlockKind::Response { .. })
-        });
+        let next_is_response = self
+            .blocks
+            .get(self.uncomposed + requested)
+            .is_some_and(|block| matches!(block_kind(block), BlockKind::Response { .. }));
         if next_is_response
             && self
                 .records
@@ -481,7 +527,7 @@ impl TranscriptModel {
                 .is_some_and(|record| matches!(record.kind, BlockKind::Response { .. }))
             && let Some(turn) = self.buffers.last()
         {
-            return turn.start_block;
+            return turn.start_block - self.uncomposed;
         }
         requested
     }
@@ -498,10 +544,11 @@ impl TranscriptModel {
             .iter()
             .rfind(|turn| turn.composed)
             .map(|turn| turn.start_block);
+        let start_block = self.uncomposed + start;
         let first_removed = self
             .buffers
             .iter()
-            .position(|turn| turn.start_block >= start)
+            .position(|turn| turn.start_block >= start_block)
             .unwrap_or(self.buffers.len());
         let removed = self.buffers.split_off(first_removed);
         let removed_buffers = removed
@@ -511,7 +558,7 @@ impl TranscriptModel {
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
-            let block_index = start + offset;
+            let block_index = start_block + offset;
             let markdown = rendered.markdown;
             let starts_chunk = chunks
                 .last()
@@ -679,29 +726,32 @@ impl TranscriptModel {
         }
     }
 
+    /// `first_changed` and the returned index are in record space.
     fn try_incremental_sync<V: 'static>(
         &mut self,
-        state: &UiAgentState,
         first_changed: usize,
         incremental: IncrementalUpdate,
         now_ms: u64,
-        agent_label: &impl Fn(rho_ui_proto::AgentId) -> String,
         cx: &mut Context<V>,
     ) -> bool {
-        let index = match incremental {
+        let block_index = match incremental {
             IncrementalUpdate::AssistantText { index }
             | IncrementalUpdate::ReasoningText { index }
             | IncrementalUpdate::Tool { index } => index,
+        };
+        let Some(index) = block_index.checked_sub(self.uncomposed) else {
+            return false;
         };
         if index != first_changed || index >= self.records.len() {
             return false;
         }
 
         let prev_kind = last_visible_kind(&self.records[..index]);
-        let Some(block) = state.blocks.get(index) else {
+        let Some(block) = self.blocks.get(block_index) else {
             return false;
         };
-        let rendered = render_block_with_agent_labels(block, prev_kind, now_ms, agent_label);
+        let rendered =
+            render_block_with_agent_labels(block, prev_kind, now_ms, &|id| self.label(id));
         let old_record = &self.records[index];
         if old_record.kind != rendered.kind || old_record.visible != rendered.visible() {
             return false;
@@ -761,7 +811,7 @@ impl TranscriptModel {
         } else {
             (&changed, &empty)
         };
-        self.refresh_elision_plans(state, index);
+        self.refresh_elision_plans(block_index);
         self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
         true
@@ -784,22 +834,311 @@ impl TranscriptModel {
             .any(InlayRecord::ticks)
     }
 
-    fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {
-        let visible = self
+    fn refresh_elision_plans(&mut self, first_changed_block: usize) {
+        let Self {
+            records,
+            elisions,
+            blocks,
+            visible,
+            uncomposed,
+            turn_open,
+            ..
+        } = self;
+        let uncomposed = *uncomposed;
+        elisions.refresh(blocks, first_changed_block, visible, *turn_open, |plan| {
+            plan_anchor_range(records, uncomposed, plan)
+        });
+    }
+
+    /// The label another agent's messages are rendered under.
+    fn label(&self, id: AgentId) -> String {
+        self.agent_labels.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Keeps the model's own block list current at the cost of what
+    /// changed. Blocks are pointers into the fold that made them, so this
+    /// copies no text.
+    fn remember_blocks(
+        &mut self,
+        state: &UiAgentState,
+        first_changed: usize,
+        agent_label: &impl Fn(AgentId) -> String,
+    ) {
+        let first_changed = first_changed.min(self.blocks.len()).min(state.blocks.len());
+        self.blocks.truncate(first_changed);
+        self.visible.truncate(first_changed);
+        for block in &state.blocks[first_changed..] {
+            self.visible.push(block_visible(block));
+            if let UiBlock::AgentMessage { sender, .. }
+            | UiBlock::QueuedMessage {
+                sender: Some(sender),
+                ..
+            } = &**block
+            {
+                self.agent_labels.insert(*sender, agent_label(*sender));
+            }
+            self.blocks.push(block.clone());
+        }
+    }
+
+    /// How many blocks are rendered and composed nowhere.
+    pub fn uncomposed_blocks(&self) -> usize {
+        self.uncomposed
+    }
+
+    pub fn has_uncomposed(&self) -> bool {
+        self.uncomposed > 0
+    }
+
+    /// Renders and composes the history immediately above what is composed
+    /// — at least `rows` more rows of it — and answers whether any history
+    /// is still uncomposed. Composing costs the rows it composes: the
+    /// excerpts below it keep their ids, their anchors and their layout.
+    pub fn compose_history<V: 'static>(
+        &mut self,
+        rows: usize,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) -> bool {
+        if self.uncomposed == 0 {
+            return false;
+        }
+        let from = {
+            let label = |id| self.label(id);
+            tail_start(&self.blocks, self.uncomposed, rows, now_ms, &label)
+        };
+        let chunks = {
+            let label = |id| self.label(id);
+            render_chunks(
+                &self.blocks,
+                &self.visible,
+                from..self.uncomposed,
+                now_ms,
+                &label,
+            )
+        };
+        let mut gutters_changed = false;
+        let (new_buffers, new_records) = Self::build_chunks(chunks, &mut gutters_changed, cx);
+        let added_buffers = new_buffers.len();
+        let added_records = new_records.len();
+        self.buffers.splice(0..0, new_buffers);
+        self.records.splice(0..0, new_records);
+        self.uncomposed = from;
+
+        let buffer_ids = self.buffers[..added_buffers]
+            .iter()
+            .filter(|turn| turn.composed)
+            .map(|turn| turn.buffer.read(cx).remote_id())
+            .collect::<Vec<_>>();
+        for attachment in &self.attachments {
+            if let Some(editor) = attachment.editor.upgrade() {
+                let buffer_ids = buffer_ids.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.disable_headers_for_buffers(buffer_ids, cx)
+                });
+            }
+        }
+
+        let last_composed = self.buffers.iter().rposition(|turn| turn.composed);
+        let mut document_tail = None;
+        let turn_open = self.turn_open;
+        let entries = self.buffers[..added_buffers]
+            .iter()
+            .enumerate()
+            .filter(|(_, turn)| turn.composed)
+            .map(|(index, turn)| {
+                let buffer = turn.buffer.read(cx);
+                let full_end = if Some(index) == last_composed {
+                    prompt_gap_excerpt_end(buffer)
+                } else {
+                    composed_excerpt_end(buffer)
+                };
+                let document_end = if Some(index) == last_composed {
+                    let (tail, end) = desired_document_tail(buffer, turn_open);
+                    document_tail = Some(tail);
+                    end
+                } else {
+                    composed_excerpt_end(buffer)
+                };
+                (
+                    transcript_path(turn.start_block),
+                    turn.buffer.clone(),
+                    full_end,
+                    document_end,
+                )
+            })
+            .collect::<Vec<_>>();
+        if document_tail.is_some() {
+            self.document_tail = document_tail;
+        }
+        self.multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_paths(
+                entries
+                    .iter()
+                    .map(|(path, buffer, end, _)| {
+                        (path.clone(), buffer.clone(), vec![Point::zero()..*end])
+                    })
+                    .collect::<Vec<_>>(),
+                0,
+                cx,
+            );
+        });
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_paths(
+                entries
+                    .iter()
+                    .map(|(path, buffer, _, end)| {
+                        (path.clone(), buffer.clone(), vec![Point::zero()..*end])
+                    })
+                    .collect::<Vec<_>>(),
+                0,
+                cx,
+            );
+        });
+
+        self.turn_boundary = turn_boundary(&self.records);
+        let boundary = self.turn_boundary.min(added_records);
+        let changed_history = classes_in(&self.records[..boundary]);
+        let changed_live = classes_in(&self.records[boundary..added_records]);
+        self.refresh_elision_plans(from);
+        self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
+        let composed = self.buffers[..added_buffers]
+            .iter()
+            .map(|turn| turn.buffer.clone())
+            .collect::<Vec<_>>();
+        Self::warm_syntax(composed, cx);
+        cx.notify();
+        self.uncomposed > 0
+    }
+
+    /// Opens the transcript again on its tail, dropping everything that was
+    /// composed. A change under the composed tail rewrites history the
+    /// model holds no records for, and reopening costs what it draws.
+    fn recompose<V: 'static>(&mut self, now_ms: u64, cx: &mut Context<V>) {
+        let removed = self
+            .buffers
+            .drain(..)
+            .map(|turn| (transcript_path(turn.start_block), turn.buffer))
+            .collect::<Vec<_>>();
+        self.records.clear();
+        self.uncomposed = self.blocks.len();
+        self.turn_boundary = 0;
+        self.elisions = ElisionSync::default();
+        self.document_tail = None;
+        for multi_buffer in [
+            self.multi_buffer.clone(),
+            self.document_multi_buffer.clone(),
+        ] {
+            let removed = removed.clone();
+            multi_buffer.update(cx, |multi_buffer, cx| {
+                multi_buffer.set_excerpts_for_paths(
+                    removed
+                        .into_iter()
+                        .map(|(path, buffer)| (path, buffer, Vec::new())),
+                    0,
+                    cx,
+                );
+            });
+        }
+        self.compose_history(OPENING_ROWS, now_ms, cx);
+        let history = classes_in(&self.records[..self.turn_boundary]);
+        let live = classes_in(&self.records[self.turn_boundary..]);
+        self.apply_to_attachments(now_ms, &history, &live, true, cx);
+        cx.notify();
+    }
+
+    /// Builds the buffers and records for prepared chunks, newest first so
+    /// the visible tail leads the historical parser backlog.
+    fn build_chunks<V: 'static>(
+        chunks: Vec<PreparedChunk>,
+        gutters_changed: &mut bool,
+        cx: &mut Context<V>,
+    ) -> (Vec<TranscriptBuffer>, Vec<BlockRecord>) {
+        let mut prepared = Vec::with_capacity(chunks.len());
+        for chunk in chunks.into_iter().rev() {
+            let buffer = cx.new(|cx| {
+                let mut buffer = Buffer::local(&chunk.text, cx);
+                if chunk.markdown {
+                    rho_window::markdown::configure_buffer(&mut buffer, cx);
+                }
+                buffer.set_capability(language::Capability::Read, cx);
+                buffer
+            });
+            prepared.push((chunk, buffer));
+        }
+        let mut buffers = Vec::with_capacity(prepared.len());
+        let mut records = Vec::new();
+        for (chunk, buffer) in prepared.into_iter().rev() {
+            let mut offset = 0;
+            {
+                let snapshot = buffer.read(cx);
+                for (record_index, rendered) in chunk.rendered.into_iter().enumerate() {
+                    let record = block_record(
+                        &buffer,
+                        snapshot,
+                        offset,
+                        rendered,
+                        chunk.terminal_record == Some(record_index),
+                    );
+                    offset += record.text.len();
+                    *gutters_changed |= record.gutter.is_some();
+                    records.push(record);
+                }
+            }
+            let composed = !buffer.read(cx).is_empty();
+            buffers.push(TranscriptBuffer {
+                start_block: chunk.start_block,
+                composed,
+                buffer,
+            });
+        }
+        (buffers, records)
+    }
+
+    /// Where a point in an attached editor sits in the store: which block,
+    /// and how far into it. A buffer offset does not survive a transcript
+    /// whose history is composed on demand; this does. Costs the buffer it
+    /// lands in, not the transcript.
+    pub fn store_point(&self, anchor: &multi_buffer::Anchor, cx: &gpui::App) -> Option<StorePoint> {
+        let buffer_id = anchor.buffer_id()?;
+        let text_anchor = anchor.raw_text_anchor()?;
+        let turn = self
+            .buffers
+            .iter()
+            .find(|turn| turn.buffer.read(cx).remote_id() == buffer_id)?;
+        let buffer = turn.buffer.read(cx);
+        let offset = text_anchor.to_offset(buffer);
+        let mut found = None;
+        for (index, record) in self
             .records
             .iter()
-            .map(|record| record.visible)
-            .collect::<Vec<_>>();
-        let Self {
-            records, elisions, ..
-        } = self;
-        elisions.refresh(
-            &state.blocks,
-            first_changed_block,
-            &visible,
-            crate::store::turn_open(state.status),
-            |plan| plan_anchor_range(records, plan),
-        );
+            .enumerate()
+            .skip(turn.start_block.checked_sub(self.uncomposed)?)
+        {
+            if record.buffer != turn.buffer {
+                break;
+            }
+            let start = record.range.start.to_offset(buffer);
+            if start > offset {
+                break;
+            }
+            found = Some(StorePoint {
+                block: self.uncomposed + index,
+                offset: offset - start,
+            });
+        }
+        found
+    }
+
+    /// The buffer anchor a store point names, if its block is composed.
+    pub fn place_store_point(&self, point: StorePoint, cx: &gpui::App) -> Option<text::Anchor> {
+        let record = self
+            .records
+            .get(point.block.checked_sub(self.uncomposed)?)?;
+        let buffer = record.buffer.read(cx);
+        let start = record.range.start.to_offset(buffer);
+        let end = record.range.end.to_offset(buffer);
+        Some(buffer.anchor_before((start + point.offset).min(end)))
     }
 
     fn reset_full_excerpts<V: 'static>(&self, cx: &mut Context<V>) {
@@ -1028,6 +1367,87 @@ impl TranscriptModel {
     }
 }
 
+/// How many rows the tail composes when a transcript opens: enough to
+/// fill a window twice over, so opening and the first page of scrolling
+/// draw without composing anything more.
+pub const OPENING_ROWS: usize = 200;
+
+/// A point in the transcript as the store sees it: which block, and how
+/// far into that block's rendered text. What a surface remembers when the
+/// reader leaves it, so returning places the point where it was even when
+/// the block it names has to be composed again first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorePoint {
+    pub block: usize,
+    pub offset: usize,
+}
+
+/// The first block of the last `rows` rows of `blocks[..end]`, never fewer
+/// than one block. Rendering a block to count its rows is cheap beside
+/// laying it out, and what this bounds is what gets laid out.
+fn tail_start(
+    blocks: &[Arc<UiBlock>],
+    end: usize,
+    rows: usize,
+    now_ms: u64,
+    label: &impl Fn(AgentId) -> String,
+) -> usize {
+    let mut counted = 0;
+    let mut start = end;
+    while start > 0 && counted < rows {
+        start -= 1;
+        let rendered = render_block_with_agent_labels(&blocks[start], None, now_ms, label);
+        counted += rendered
+            .spans
+            .iter()
+            .map(|span| span.text.matches('\n').count())
+            .sum::<usize>();
+    }
+    start
+}
+
+/// Renders `range` into per-buffer chunks, split where the syntax changes.
+/// The separator the first block carries is the one it would have carried
+/// with all of history above it, so composing that history later leaves
+/// every chunk's text exactly as it is.
+fn render_chunks(
+    blocks: &[Arc<UiBlock>],
+    visible: &[bool],
+    range: Range<usize>,
+    now_ms: u64,
+    label: &impl Fn(AgentId) -> String,
+) -> Vec<PreparedChunk> {
+    let mut prev = visible[..range.start]
+        .iter()
+        .rposition(|visible| *visible)
+        .map(|index| block_kind(&blocks[index]));
+    let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
+    for index in range {
+        let rendered = render_block_with_agent_labels(&blocks[index], prev, now_ms, label);
+        if rendered.visible() {
+            prev = Some(rendered.kind);
+        }
+        let markdown = rendered.markdown;
+        if chunks
+            .last()
+            .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
+        {
+            chunks.push((index, markdown, Vec::new()));
+        }
+        chunks.last_mut().unwrap().2.push(rendered);
+    }
+    chunks
+        .into_iter()
+        .map(|(start_block, markdown, rendered)| PreparedChunk {
+            start_block,
+            markdown,
+            terminal_record: rendered.iter().rposition(RenderedBlock::visible),
+            text: rendered.iter().map(rendered_text).collect(),
+            rendered,
+        })
+        .collect()
+}
+
 /// Every style class appearing in `records` — the "all changed" set for a
 /// full application to a freshly attached editor.
 fn classes_in(records: &[BlockRecord]) -> HashSet<StyleClass> {
@@ -1073,9 +1493,19 @@ fn last_visible_kind(records: &[BlockRecord]) -> Option<BlockKind> {
         .map(|record| record.kind)
 }
 
-fn plan_anchor_range(records: &[BlockRecord], plan: &ElisionPlan) -> Option<Range<Anchor>> {
-    let start = records.get(plan.start_block)?.range.start;
-    let end = records.get(plan.end_block)?.range.end;
+fn plan_anchor_range(
+    records: &[BlockRecord],
+    uncomposed: usize,
+    plan: &ElisionPlan,
+) -> Option<Range<Anchor>> {
+    let start = records
+        .get(plan.start_block.checked_sub(uncomposed)?)?
+        .range
+        .start;
+    let end = records
+        .get(plan.end_block.checked_sub(uncomposed)?)?
+        .range
+        .end;
     Some(start..end)
 }
 

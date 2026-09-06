@@ -66,8 +66,8 @@ use crate::{
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
     ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage,
     SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch, SlackWatchChannel,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -514,6 +514,9 @@ pub struct Workspace {
     /// One per agent screen, for as long as the screen lives: what it says
     /// when its transcript is ready.
     agent_model_subscriptions: Vec<gpui::Subscription>,
+    /// A transcript search waiting for the history it has to look through
+    /// to be composed: the agent, the query, and which way it runs.
+    pending_transcript_search: Option<(AgentId, String, bool)>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
     pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
     /// What the finder's highlighted row opens, carried from the prompt to
@@ -586,12 +589,18 @@ impl Workspace {
             let model = cx.new(|cx| AgentModel::new(completions, visualization_client, cx));
             // The screen says when its transcript is composed; what that
             // means for the rest of the shell is decided here.
-            self.agent_model_subscriptions
-                .push(cx.subscribe(&model, |workspace, _, event, cx| match event {
+            self.agent_model_subscriptions.push(cx.subscribe_in(
+                &model,
+                window,
+                |workspace, _, event, window, cx| match event {
                     rho_agents::agent_view::AgentModelEvent::Loaded(agent_id) => {
                         workspace.finish_initial_agent_load(*agent_id, cx);
                     }
-                }));
+                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
+                        workspace.finish_transcript_search(*agent_id, window, cx);
+                    }
+                },
+            ));
             self.refresh_view_status(&agent_id, &model, cx);
             self.models.insert(agent_id, model.clone());
             model
@@ -1072,6 +1081,7 @@ impl Workspace {
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
             agent_model_subscriptions: Vec::new(),
+            pending_transcript_search: None,
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             pending_find_target: None,
@@ -4444,6 +4454,13 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn agent_model_for_test(&self, agent_id: AgentId) -> Entity<AgentModel> {
+        self.models
+            .get(&agent_id)
+            .cloned()
+            .expect("an agent model for this agent")
+    }
+
     pub(crate) fn echo_text_for_test(&self) -> Option<&str> {
         self.echo.as_ref().map(|echo| echo.text())
     }
@@ -6538,6 +6555,17 @@ impl Workspace {
                 let agent_id = *agent_id;
                 let model = self.materialize_model(&agent_id, window, cx);
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                // `/` is the buffer's search here as everywhere; nothing
+                // else in this app hosts one, so the surface does.
+                self.agent_model_subscriptions.push(cx.subscribe_in(
+                    &editor,
+                    window,
+                    |this, _, event: &editor::EditorEvent, window, cx| {
+                        if let editor::EditorEvent::SearchRequested { backwards } = event {
+                            this.prompt_transcript_search(*backwards, window, cx);
+                        }
+                    },
+                ));
                 SurfaceView::Transcript { model, editor }
             }
             SurfaceKey::File { .. } => {
@@ -8670,6 +8698,149 @@ impl Workspace {
         self.open_prompt("Note:", complete, on_submit, window, cx);
     }
 
+    /// The transcript model and editor of the surface the reader is on.
+    fn active_transcript(&self) -> Option<(Entity<AgentModel>, Entity<editor::Editor>)> {
+        match &self.active_pane().surface.view {
+            SurfaceView::Transcript { model, editor } => Some((model.clone(), editor.clone())),
+            _ => None,
+        }
+    }
+
+    /// `gg` in a transcript: the top of the transcript, which is the top of
+    /// its history, so everything is composed on the way. The reader asked
+    /// for everything; the echo line says so while it happens.
+    pub(crate) fn transcript_top(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((model, editor)) = self.active_transcript() else {
+            return false;
+        };
+        if model.read(cx).uncomposed_blocks() > 0 {
+            self.echo("composing history", StyleClass::SystemInfo, cx);
+        }
+        model.update(cx, |model, cx| {
+            model.go_to_store_point(
+                &editor,
+                rho_agents::transcript::StorePoint {
+                    block: 0,
+                    offset: 0,
+                },
+                window,
+                cx,
+            );
+        });
+        true
+    }
+
+    /// `/` in a transcript. The buffer's search, as everywhere: history it
+    /// has not composed yet is composed first, so what the reader is
+    /// looking through is the whole transcript.
+    fn prompt_transcript_search(
+        &mut self,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((model, _)) = self.active_transcript() else {
+            return;
+        };
+        let Some(agent_id) = self.selection.selected_agent() else {
+            return;
+        };
+        if model.read(cx).uncomposed_blocks() > 0 {
+            // The reader is typing a query; the history they will look
+            // through is composed while they do.
+            self.echo("composing history", StyleClass::SystemInfo, cx);
+            model.update(cx, |model, cx| {
+                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+            });
+        }
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let query = input.trim().to_owned();
+                if query.is_empty() {
+                    return;
+                }
+                workspace.run_transcript_search(agent_id, query, backwards, window, cx);
+            },
+        );
+        self.open_prompt(
+            if backwards {
+                "search backward:"
+            } else {
+                "search:"
+            },
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
+    /// Runs a transcript search once every row it could match is composed;
+    /// until then it waits, and the composition that is already running
+    /// finishes it.
+    fn run_transcript_search(
+        &mut self,
+        agent_id: AgentId,
+        query: String,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((model, editor)) = self.active_transcript() else {
+            return;
+        };
+        if model.read(cx).uncomposed_blocks() > 0 {
+            self.pending_transcript_search = Some((agent_id, query, backwards));
+            model.update(cx, |model, cx| {
+                model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
+            });
+            return;
+        }
+        let text = editor.read(cx).text(cx);
+        let found = if backwards {
+            text.rfind(&query)
+        } else {
+            text.find(&query)
+        };
+        let Some(start) = found else {
+            self.notice_on(
+                Some(&agent_id),
+                "search: no match",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.clear_autoscroll_pin(cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([editor::MultiBufferOffset(start)
+                    ..editor::MultiBufferOffset(start + query.len())]);
+            });
+        });
+        window.focus(&editor.read(cx).focus_handle(cx), cx);
+    }
+
+    /// A search that was waiting for history runs now that it is composed.
+    fn finish_transcript_search(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((waiting, query, backwards)) = self.pending_transcript_search.take() else {
+            return;
+        };
+        if waiting != agent_id {
+            self.pending_transcript_search = Some((waiting, query, backwards));
+            return;
+        }
+        self.run_transcript_search(agent_id, query, backwards, window, cx);
+    }
+
     fn prompt_dashboard_search(
         &mut self,
         backwards: bool,
@@ -9637,6 +9808,13 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackWatchChannel, window, cx| {
                 this.toggle_slack_watch(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TranscriptTop, window, cx| {
+                // Only a transcript composes its way to the top; anywhere
+                // else `gg` is vim's own.
+                if !this.transcript_top(window, cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
