@@ -102,6 +102,15 @@ Reactions are the known case: a transient over a message, one key per emoji,
 the point staying on the message it reacted to. Anything else they need goes
 here before the cut, not after.
 
+### Built
+
+The primitive is in `rho_window::transient`: the data shape kept, the actions
+values of the caller's type, the drawing a measured block under the point, one
+presentation path, applicability at open, and one key then closed. `Kind::Infix`
+is there for the open question above and unused until it is answered. What is
+not done is the wiring: `rho-gui`'s menus still run through its own
+`transient.rs`, and the verdict menu is the first to move.
+
 ### How it will be proven
 
 On the QA rig, on the user's snapshot, with the handbook's Emacs-feel checks:

@@ -15,6 +15,7 @@ pub mod highlights;
 pub mod languages;
 pub mod markdown;
 pub mod style;
+pub mod transient;
 pub mod visualization;
 
 pub use style::{Region, StyleClass};

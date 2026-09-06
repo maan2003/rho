@@ -319,6 +319,35 @@ wrong at the design, not at the polish.
   transients, the minibuffer, selection and the active pane — follows here.
   Gate green: rho-gui 275 and rho-window 1 (the style test moved with its
   module), workspace clippy `-D warnings` green.
+
+  *Landed, the transient buffer (`rho_window::transient`).* The primitive,
+  built the way the design note settled it and touching no other module in the
+  crate. A `Transient<A>` is a title and rows of key, meaning and an optional
+  value; `A` is the caller's own action type, so the crate names nothing above
+  it and a source crate puts an item in a menu without naming the workspace.
+  A press is answered rather than performed: `press` returns run this item,
+  take this digit as a count, dismiss, or nothing is bound, and the caller does
+  the doing — which is what lets the menu be tested without a window and drawn
+  by anything. It opens as a measured block under the point's anchor, with the
+  editor's own text style, the way `style::refusal_block` already does: buffer
+  text under the row the reader is on, not a strip at the bottom of the window.
+  One presentation path, `items()`; there is no by-index second API for the
+  phone. Applicability is at open — an item with nothing to act on is not in
+  the menu rather than in it and failing when pressed. `escape` and `ctrl-g`
+  dismiss, because they mean that everywhere else. An unbound key keeps the
+  menu: a mistype is not a reason to lose it.
+  The rule is one key and closed. `Kind::Infix` exists so an item can declare
+  itself a toggle and the press says `closes: false`, but no menu declares one
+  yet and none will until the user rules on the open question in
+  `RHO-WINDOW-DESIGN.md` — the mechanism is there, the chaining is not.
+  Cost: a press is one pass over the rows on screen, a draw is O(rows in the
+  menu); nothing behind either grows with the desk. Numbers come with the
+  wiring, because a primitive nothing opens has no frames to measure.
+  Not yet wired: `rho-gui`'s 19 menus still run through its own
+  `transient.rs`. The verdict menu moves first, on its own, and that is the
+  change the rig proves.
+  Gate green: rho-window 11 tests (10 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but
