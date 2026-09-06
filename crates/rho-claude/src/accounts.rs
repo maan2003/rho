@@ -11,7 +11,7 @@
 //! account file inside the directory Rho controls.
 
 use anyhow::{Context as _, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 
 /// Where account directories live, relative to `$HOME`.
 const ACCOUNTS_DIR_NAME: &str = ".claude-accounts";
@@ -68,6 +68,50 @@ pub fn list() -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Rho's own MCP server, under the name Claude records it by.
+const MCP_SERVER_NAME: &str = "rho";
+
+/// Registers Rho's MCP server in the account, if it is not there already.
+///
+/// Claude keeps MCP registrations in `.claude.json`, the same file that
+/// carries the login, so the registration is per account: an account made by
+/// `rho claude-account login` would otherwise start its agents without their
+/// Rho tools. Written by rename and only when missing, since Claude writes
+/// that file too.
+fn ensure_mcp_server(dir: &Utf8Path) -> Result<()> {
+    let path = dir.join(".claude.json");
+    let mut config: serde_json::Value = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse Claude account configuration {path}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error).with_context(|| format!("read {path}")),
+    };
+    let servers = config
+        .as_object_mut()
+        .with_context(|| format!("Claude account configuration {path} is not an object"))?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .with_context(|| format!("mcpServers in {path} is not an object"))?;
+    if servers.contains_key(MCP_SERVER_NAME) {
+        return Ok(());
+    }
+    servers.insert(
+        MCP_SERVER_NAME.to_owned(),
+        serde_json::json!({
+            "type": "stdio",
+            "command": "rho",
+            "args": ["mcp-agent-tools"],
+            "env": {},
+        }),
+    );
+    let staged = dir.join(".claude.json.rho-staged");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("stage {staged}"))?;
+    std::fs::rename(&staged, &path).with_context(|| format!("write {path}"))?;
+    Ok(())
+}
+
 /// Makes the account directory and the paths the namespace mounts land on.
 /// Bind mounts need their targets to exist already, and `projects/` must be
 /// a real directory for the shared transcript tree to cover it.
@@ -88,6 +132,7 @@ pub fn prepare(name: &str) -> Result<Utf8PathBuf> {
                 .with_context(|| format!("create Claude prompt mount target {prompt}"));
         }
     }
+    ensure_mcp_server(&dir)?;
     Ok(dir)
 }
 
