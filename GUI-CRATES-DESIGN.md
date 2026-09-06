@@ -172,6 +172,14 @@ wrong at the design, not at the polish.
   contexts, the echo line, surfaces and their history, transients and
   the minibuffer, the shift tap, telemetry, chime. (`rho-shell` the crate
   name is taken by the terminal shell; this one is `rho-window`.)
+  Its primitives are designed one at a time in `RHO-WINDOW-DESIGN.md`, held
+  against the user's ruling. First is the transient buffer, which `rho-slack`
+  needs for reactions: the note's finding is that today's transient has the
+  right data shape and the wrong everything else — it draws into the bottom
+  strip rather than under the point, its actions are `&mut Workspace`
+  closures, and 791 of its 2,101 lines are agent quota and cost charts that
+  are not a window primitive at all. The shape is kept, the primitive is
+  replaced. Owner: eng-8gpr, after eng-b8os's chrome cut creates the crate.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but
