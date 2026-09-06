@@ -419,8 +419,9 @@ buffer's text to build titles, on every desk sync. That is slice 4. Slice
    transcript rows rather than a fifth path bolted on here.
 6. **Transcript rows append.** `refold_open_transcripts` hands deltas.
    Proof: a page for the open agent costs its rows.
-7. **The window split.** `Workspace` (10,685 lines, 106 fields) becomes
-   window state plus screens as entities. Its own document when reached.
+7. **The window split.** Replaced by `GUI-CRATES-DESIGN.md` (6 Sep): the
+   GUI becomes vertical crates by source, and the window keeps only
+   window state.
 
 `STORE-DESIGN.md` slice 5 (the client keeps the store) is unchanged and
 queued after slice 5 here; it fits the desk store as described.
