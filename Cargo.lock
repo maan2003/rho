@@ -14082,6 +14082,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-qa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "redb",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rho-registry"
 version = "0.1.0"
 dependencies = [

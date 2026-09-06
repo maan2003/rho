@@ -134,6 +134,34 @@ work on it.
 - **Proof numbers come from here.** Per-event and per-frame costs, frame
   gaps and main-thread samples, on the user's data.
 
+### Landed
+
+- **The snapshot and the rig** (`crates/rho-qa`). `rho-qa snapshot` copies the
+  live state while the daemon runs and verifies the copy by opening it and
+  counting rows; the live directory is read from and never written, never
+  opened by a database. The first snapshot, `user-2026-09-06`, is 42.8 GiB and
+  holds 2,582,646 rows across 38 tables of store, plus the agent mirror, the
+  action journal, the inbox and the Slack mirror. What is not copied is an
+  allow list with reasons: no `auth.d` or iroh key, because a rig daemon is its
+  own node and runs without `--iroh`; no logs; no `sandboxes`, which is dead
+  bubblewrap scaffolding the user does not use.
+  `rho-qa rig new` clones a snapshot into a runnable rig — a reflink clone on
+  bcachefs, so 42.8 GiB costs 16s and no disk, and the base snapshot stays
+  pristine. `rho-qa rig up` stands the rig up: the daemon on the copied store
+  under the rig's own XDG dirs, the fake Slack with its API base read back from
+  its log, the fake browser as the client's Brave, and `rho-gui` headless in
+  the `rho wayland` session with the CPU profiler on, from `target/profiling`
+  by default or the nix binaries the user runs with `--binaries nix`.
+  The desk accumulates: `rig new` refuses to overwrite a rig, nothing resets
+  one, and every `rig up` appends a session line to its `rig.json`.
+  `rho-qa build` builds the five binaries a rig runs in one command, with the
+  shell's own rustflags; `RHO_QA_LD` replaces the linker when a dev shell pins
+  one that cannot link an optimised binary.
+  Proven end to end on the desk: daemon, fake Slack, headless GUI and profiler
+  up on the 42.8 GiB copy, Home drawing the user's real agents and desk cells
+  with the fake's Slack cards beside them, and a CPU profile and frame log
+  written on the way down.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists
