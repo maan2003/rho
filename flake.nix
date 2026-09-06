@@ -42,6 +42,10 @@
           ];
         };
         projectName = "rho";
+        # The dev shell's linker. Flakebox's overlay pins wild 0.9.0, which
+        # cannot link the optimised profiles (see the shellHook); take wild
+        # from nixpkgs itself, without the overlay.
+        wildLinker = nixpkgs.legacyPackages.${system}.wild;
         octoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ./nix/patches/git-http-unix-socket.patch
@@ -420,11 +424,17 @@
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''
             ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
-            # Flakebox sets target-specific RUSTFLAGS (wild linker), which
-            # shadow build.rustflags from .cargo/config.toml; re-add the
-            # flags that dial9-tokio-telemetry and CPU stack capture need.
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable -Cforce-frame-pointers=yes"
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable -Cforce-frame-pointers=yes"
+            # Flakebox sets target-specific RUSTFLAGS (its own wild 0.9.0 plus
+            # --compress-debug-sections=zstd), which shadow build.rustflags
+            # from .cargo/config.toml. Replace them outright: wild 0.9.0
+            # compresses the SHF_ALLOC section .debug_gdb_scripts and every
+            # optimised binary with line tables then fails to link
+            # ("Insufficient space allocated to section .debug_gdb_scripts");
+            # wild 0.10.0 from plain nixpkgs no longer compresses allocated
+            # debug sections (#2119). The tokio_unstable and frame-pointer
+            # flags are what dial9-tokio-telemetry and CPU stack capture need.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${wildLinker}/bin/wild -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes"
           '';
         };
       }
