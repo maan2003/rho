@@ -1988,13 +1988,13 @@ impl Workspace {
                 delta,
                 bodies,
             } => {
-                if let Some(again) = self
-                    .desk_cells
-                    .synced(host, node_namespace, delta, bodies, cx)
-                {
+                let (again, delta) =
+                    self.desk_cells
+                        .synced(host, node_namespace, delta, bodies, cx);
+                if let Some(again) = again {
                     self.send_to_host(host, again);
                 }
-                self.sync_tree_dashboard(host, window, cx);
+                self.sync_tree_delta(host, &delta, window, cx);
                 self.carry_over_captures(host, window, cx);
             }
             ConnEvent::DeskCellsAvailable { frontier } => {
@@ -2007,9 +2007,11 @@ impl Workspace {
                 self.send_to_host(host, sync);
             }
             ConnEvent::DeskMutationAccepted { stamp } => {
+                // The cells are already in the view and the map: the write
+                // that made them went through this client. Nothing about
+                // the map has moved, so nothing about it is drawn again.
                 self.desk_cells.mutation_accepted(host, stamp);
                 self.complete_desk_mutation(host, stamp, window, cx);
-                self.sync_tree_dashboard(host, window, cx);
             }
             ConnEvent::DeskMutationRejected { stamp, reason } => {
                 self.desk_cells.mutation_rejected(host, stamp, cx);
@@ -4832,7 +4834,7 @@ impl Workspace {
         &self,
         host: HostId,
     ) -> Vec<crate::desk_view::DeskNode> {
-        self.desk_cells.nodes(host)
+        self.desk_cells.nodes(host).to_vec()
     }
 
     #[cfg(test)]
@@ -5858,7 +5860,7 @@ impl Workspace {
             .into_iter()
             .filter_map(|node| {
                 let text = self.desk_cells.buffer(host, &node.id)?.read(cx).text();
-                Some((node.id, node.parent, text))
+                Some((node.id.clone(), node.parent.clone(), text))
             })
             .collect()
     }
@@ -6229,6 +6231,44 @@ impl Workspace {
         );
     }
 
+    /// The map brought up to a desk delta. A delta that kept the shape
+    /// costs the rows it names: the desk has already patched them, the
+    /// dashboard draws those rows again where they sit, and the cards of
+    /// those rows are made again. A shape that moved is the one case that
+    /// composes the map, and it says so.
+    fn sync_tree_delta(
+        &mut self,
+        host: HostId,
+        delta: &crate::desk_view::DeskDelta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if delta.is_quiet() {
+            return;
+        }
+        if !delta.shape {
+            let nodes = self.desk_cells.nodes(host).to_vec();
+            let threads = self.slack_thread_facts(cx);
+            if self.dashboard.redraw_tree_rows(
+                host,
+                &delta.touched,
+                &nodes,
+                &self.registry,
+                &threads,
+                cx,
+            ) {
+                let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
+                self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
+                // The deal bar reads the hand; the map is not composed.
+                self.dashboard.sync_hand(&self.agent_last_interaction);
+                self.sync_note_views(host, cx);
+                cx.notify();
+                return;
+            }
+        }
+        self.sync_tree_dashboard(host, window, cx);
+    }
+
     /// The map for a host, made again from the desk. `moved` names the
     /// agents a `Changed` moved; everything else the sources hold stands.
     fn sync_tree_rows(
@@ -6239,6 +6279,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.refresh_desk_sources(host, moved, cx);
+        // The sources decide who is on the desk at all, so the map is
+        // built again here and the delta paths patch what it left.
+        self.desk_cells.rebuild_map(host);
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
@@ -6656,15 +6699,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_desk::cells::Stamp> {
-        let message = self.desk_cells.apply(host, writes, verdict)?;
+        let (message, delta) = self.desk_cells.apply(host, writes, verdict)?;
         let ClientMessage::DeskMutationApply { mutation } = &message else {
             return None;
         };
         let stamp = mutation.stamp;
         // A created note needs its buffer before anything can be typed into
         // it, and the daemon's answer may be a frame away.
-        self.desk_cells.reconcile_buffers(host, cx);
-        self.sync_tree_dashboard(host, window, cx);
+        self.desk_cells.give_buffers(host, &delta, cx);
+        self.sync_tree_delta(host, &delta, window, cx);
         self.send_to_host(host, message);
         Some(stamp)
     }

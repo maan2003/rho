@@ -1744,6 +1744,73 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
 /// this the read rebuilt every card from a walk of every node, so the cost
 /// of one agent moving was the size of the desk.
 #[gpui::test]
+async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Desk");
+    let notes = (0..16)
+        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
+        .collect::<Vec<_>>();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+
+    // What the build costs is not the question; what one verdict costs
+    // after it is. Marking a note done writes that note's cells and
+    // nothing else, so it must draw that note's row and nothing else.
+    let (composed, redrawn) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.map_work_for_test()
+        })
+        .expect("read the map's work");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &notes[7],
+                crate::desk_view::DeskVerdict::Done,
+                window,
+                cx,
+            ));
+        })
+        .expect("mark one note done");
+    cx.run_until_parked();
+
+    let (composed_after, redrawn_after) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.map_work_for_test()
+        })
+        .expect("read the map's work");
+    assert_eq!(
+        composed_after, composed,
+        "a verdict composes nothing: the rows and their order did not move"
+    );
+    assert_eq!(
+        redrawn_after - redrawn,
+        1,
+        "a verdict draws the row it wrote, and no other"
+    );
+    // And it is the verdict the reader sees, not just cheap work.
+    workspace
+        .update(cx, |workspace, _, _| {
+            let node = workspace
+                .desk_cells
+                .node(HostId::default(), &notes[7])
+                .expect("the note is still on the map");
+            assert_eq!(
+                node.state,
+                rho_desk::cells::State::Done,
+                "the row the verdict named says so"
+            );
+        })
+        .expect("read the map");
+}
+
+#[gpui::test]
 fn one_agents_change_makes_one_card(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let parent = desk.note(None, "Desk");

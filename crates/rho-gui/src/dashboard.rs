@@ -10,7 +10,7 @@
 //! and drafts sit between document slices — a refresh rearranges excerpts
 //! but can never eat what the user typed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
@@ -130,6 +130,90 @@ pub enum CardTarget {
     Missing,
 }
 
+/// The marker and name in front of an agent's row, keeping the indent the
+/// row was drawn with: only the agent's own part of the prefix moves.
+fn agent_prefix(drawn: &str, agent_id: AgentId, registry: &AgentRegistry) -> String {
+    let indent = drawn
+        .find('•')
+        .map(|at| drawn[..at].to_owned())
+        .unwrap_or_default();
+    format!(
+        "{indent}• {} {} ",
+        match registry.attention(agent_id) {
+            UiAttention::Quiet => "○",
+            UiAttention::Working => "·",
+            UiAttention::Pending => "●",
+            UiAttention::NeedsInput => "!",
+        },
+        registry.agent_human_name(agent_id)
+    )
+}
+
+/// What is hinted after a row: what the user said about it and where it
+/// stands. A verdict is exactly a change to this, which is why it is a
+/// function of the row rather than something the drawing keeps.
+fn row_hint(node: &crate::desk_view::DeskNode) -> Option<gpui::SharedString> {
+    let mut hints = Vec::new();
+    match node.state {
+        rho_desk::cells::State::Done => hints.push("done".to_owned()),
+        rho_desk::cells::State::Muted => hints.push("muted".to_owned()),
+        rho_desk::cells::State::Open => {}
+    }
+    if let Some(at) = node.defer_until {
+        hints.push(format!("defer {} · {}d", desk_date(at), node.pace_days));
+    }
+    if let Some(at) = node.deadline {
+        hints.push(format!("due {} · {}d", desk_date(at), node.pace_days));
+    }
+    if node.page().is_some() {
+        hints.push("page".to_owned());
+    }
+    if let Some(path) = node.path() {
+        hints.push(path.to_string());
+    }
+    (!hints.is_empty()).then(|| hints.join(" · ").into())
+}
+
+/// The hint as the editor paints it.
+fn eol_hint(text: gpui::SharedString) -> editor::EolHintRenderer {
+    std::sync::Arc::new(move |_, cx| {
+        use gpui::Styled as _;
+        use settings::Settings as _;
+        use theme::ActiveTheme as _;
+        let settings = theme_settings::ThemeSettings::get_global(cx);
+        gpui::div()
+            .font(settings.buffer_font.clone())
+            .text_size(settings.buffer_font_size(cx))
+            .line_height(gpui::relative(settings.line_height()))
+            .text_color(cx.theme().colors().text_muted)
+            .child(text.clone())
+            .into_any_element()
+    })
+}
+
+/// One row of the map as it was drawn: where it sits in the composition,
+/// what is written in front of it and what is hinted after it. Keeping
+/// this is what lets a verdict cost its own row.
+struct TreeRowDraw {
+    host: HostId,
+    node_id: rho_desk::cells::Id,
+    /// Where the row starts and ends in the map, as anchors that survive
+    /// an edit inside the row.
+    start: editor::Anchor,
+    end: editor::Anchor,
+    /// The heading prefix as an inlay, and the padding inlays under it.
+    prefix: String,
+    inlays: Vec<InlayId>,
+    /// The base the row's inlay ids were minted from, so a redraw can mint
+    /// the same ones again.
+    at: usize,
+    /// The end-of-line hint, when the row has one.
+    hint: Option<gpui::SharedString>,
+    /// A closed ancestor hides the row, and a hidden row is drawn with
+    /// neither prefix nor hint.
+    hidden_by_fold: bool,
+}
+
 /// Every card is a thing on the desk, on the host that holds it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DealCardId {
@@ -227,6 +311,9 @@ struct DealerFacts<'a> {
 
 /// What a note lends the cards under it.
 struct HeadingContext {
+    /// The row that lends the place. An agent's card is remade when this
+    /// row moves, so the set knows which cards a heading holds.
+    heading: rho_desk::cells::Id,
     breadcrumb: String,
     room: Option<String>,
     bindings: Vec<AgentId>,
@@ -248,6 +335,9 @@ struct DealerSet {
     /// Where an agent's card sits, so a `Changed` can retire it without
     /// looking through the map for it.
     of_agent: HashMap<AgentId, DealCardId>,
+    /// The agents each heading lends a place to, so that a verdict on a
+    /// note costs the cards under it and no others.
+    of_heading: HashMap<(HostId, rho_desk::cells::Id), HashSet<AgentId>>,
     /// How many cards have been made since this dashboard existed. The
     /// point of the set is that this rises by what a change names and not
     /// by the size of the desk, so a test can say exactly that.
@@ -257,7 +347,13 @@ struct DealerSet {
 
 impl DealerSet {
     fn retire(&mut self, id: &DealCardId) {
-        self.cards.remove(id);
+        for card in self.cards.remove(id).into_iter().flatten() {
+            if let (Some(agent_id), Some(heading)) = (card.card.agent_id, card.heading)
+                && let Some(held) = self.of_heading.get_mut(&(id.host, heading))
+            {
+                held.remove(&agent_id);
+            }
+        }
         if let Some(topics) = self.of_host.get_mut(&id.host) {
             topics.remove(id);
         }
@@ -273,6 +369,12 @@ impl DealerSet {
             && card.card.kind == DealCardKind::Agent
         {
             self.of_agent.insert(agent_id, id.clone());
+            if let Some(heading) = card.heading.clone() {
+                self.of_heading
+                    .entry((id.host, heading))
+                    .or_default()
+                    .insert(agent_id);
+            }
         }
         self.of_host.entry(id.host).or_default().insert(id.clone());
         self.cards.entry(id).or_default().push(card);
@@ -287,6 +389,11 @@ pub enum DealScope<'a> {
     Whole,
     /// Only these agents moved. Every other card on the host stands.
     Agents(&'a [AgentId]),
+    /// Only these rows moved: the cells a desk delta named. Each row's own
+    /// cards are made again, and so are the cards of the agents the row
+    /// heads, since a heading that closes or defers takes its subtree out
+    /// of the hand with it.
+    Nodes(&'a [rho_desk::cells::Id]),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -437,6 +544,19 @@ pub struct Dashboard {
     /// Move the cursor to this document offset on the next sync.
     /// Reply placeholder inlays currently spliced in.
     tree_inlay_ids: Vec<InlayId>,
+    /// What each row of the map is drawn as, in the order the composition
+    /// put them. A delta that keeps the shape redraws the rows it names
+    /// out of this and leaves the rest of the map alone; without it the
+    /// only way to move one row's hint was to draw every row again.
+    tree_draw: Vec<TreeRowDraw>,
+    tree_draw_at: HashMap<(HostId, rho_desk::cells::Id), Vec<usize>>,
+    /// How many times the map has been composed, and how many rows have
+    /// been drawn again in place. The rule this slice is about is a
+    /// difference between these two, so a test can read it.
+    #[cfg(test)]
+    composed: usize,
+    #[cfg(test)]
+    redrawn: usize,
     /// The title last written into each machine row's buffer, against the
     /// buffer it went into. A sync used to read every one of those ropes
     /// back to find out it had not changed; on a desk of thousands of rows
@@ -659,6 +779,7 @@ impl Dashboard {
             .filter_map(|node| node.agent())
             .collect::<Vec<_>>();
         Some(HeadingContext {
+            heading: heading.id.clone(),
             breadcrumb,
             room,
             bindings,
@@ -687,6 +808,7 @@ impl Dashboard {
             };
             cards.push(RankedDealCard {
                 priority,
+                heading: None,
                 virtual_reply: false,
                 order,
                 cursor: CardCursor::Desk(mark, at),
@@ -721,12 +843,13 @@ impl Dashboard {
         host: HostId,
         source: &TreeHostSource,
         agent_id: AgentId,
-        breadcrumb: &str,
-        room: Option<&String>,
+        context: &HeadingContext,
         order: usize,
         facts: &DealerFacts<'_>,
         carded: &mut HashSet<AgentId>,
     ) -> Option<RankedDealCard> {
+        let breadcrumb = context.breadcrumb.as_str();
+        let room = context.room.as_ref();
         let agent = facts.by_agent.get(&agent_id).copied()?;
         // The user's verdict on the agent closes its card wherever the
         // card is shown; being reached through a note does not exempt it.
@@ -747,6 +870,7 @@ impl Dashboard {
             .unwrap_or(rho_desk::cells::Id::Agent(agent_id));
         Some(RankedDealCard {
             priority,
+            heading: Some(context.heading.clone()),
             virtual_reply: true,
             order,
             cursor: CardCursor::Agent(agent.facts, agent.attention),
@@ -788,16 +912,9 @@ impl Dashboard {
                 cursor += 1;
             }
             for agent_id in agents {
-                if let Some(card) = self.agent_card(
-                    host,
-                    source,
-                    agent_id,
-                    &context.breadcrumb,
-                    context.room.as_ref(),
-                    order,
-                    facts,
-                    carded,
-                ) {
+                if let Some(card) =
+                    self.agent_card(host, source, agent_id, context, order, facts, carded)
+                {
                     cards.push(card);
                 }
             }
@@ -830,6 +947,7 @@ impl Dashboard {
         }
         Some(RankedDealCard {
             priority,
+            heading: None,
             virtual_reply: false,
             order,
             cursor: CardCursor::Slack(rho_desk::cells::SlackTs(thread.latest.clone())),
@@ -884,6 +1002,7 @@ impl Dashboard {
         };
         Some(RankedDealCard {
             priority,
+            heading: None,
             virtual_reply: true,
             order,
             cursor: CardCursor::Agent(agent.facts, agent.attention),
@@ -1116,6 +1235,12 @@ impl Dashboard {
             dealer: DealerSet::default(),
             pending_cursor: None,
             tree_inlay_ids: Vec::new(),
+            tree_draw: Vec::new(),
+            tree_draw_at: HashMap::new(),
+            #[cfg(test)]
+            composed: 0,
+            #[cfg(test)]
+            redrawn: 0,
             derived_titles: HashMap::new(),
             tree_collapsed: HashSet::new(),
             pending_tree_cursor: None,
@@ -1387,6 +1512,13 @@ impl Dashboard {
         self.dealer.made
     }
 
+    /// How many times the whole map has been composed, and how many rows
+    /// have been drawn again where they sit.
+    #[cfg(test)]
+    pub(crate) fn map_work_for_test(&self) -> (usize, usize) {
+        (self.composed, self.redrawn)
+    }
+
     #[cfg(test)]
     pub fn deal_highlight_active_for_test(&self, cx: &App) -> bool {
         self.editor
@@ -1438,6 +1570,228 @@ impl Dashboard {
                     self.remake_agent_card(host, *agent_id, registry, now, agent_interactions);
                 }
             }
+            DealScope::Nodes(nodes) => {
+                for node_id in nodes {
+                    self.remake_node_cards(
+                        host,
+                        node_id,
+                        registry,
+                        threads,
+                        now,
+                        agent_interactions,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rows a delta named, drawn again where they sit. Nothing is
+    /// composed: the excerpts, the folds and the highlights are the same
+    /// rows in the same order, so what one verdict moves is the hint at
+    /// the end of its row, the marker in front of it, and the title of a
+    /// machine row. Answers false when a row the delta names was never
+    /// drawn, which is the caller's cue that the shape moved after all.
+    pub fn redraw_tree_rows(
+        &mut self,
+        host: HostId,
+        touched: &BTreeSet<rho_desk::cells::Id>,
+        nodes: &[crate::desk_view::DeskNode],
+        registry: &AgentRegistry,
+        threads: &HashMap<SlackUnit, SlackFacts>,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(source) = self.tree_hosts.get_mut(&host) else {
+            return false;
+        };
+        // The map the dashboard holds is the desk's, one step behind: the
+        // rows the delta named are copied across, and nothing else is read.
+        for id in touched {
+            let Some(at) = source.index.by_id.get(id).copied() else {
+                return false;
+            };
+            let Some(fresh) = nodes.get(at) else {
+                return false;
+            };
+            if fresh.id != *id {
+                return false;
+            }
+            source.nodes[at] = fresh.clone();
+        }
+        let mut remove = Vec::new();
+        let mut insert = Vec::new();
+        let mut hints_moved = false;
+        let mut titles = Vec::new();
+        for id in touched {
+            let Some(draws) = self.tree_draw_at.get(&(host, id.clone())) else {
+                return false;
+            };
+            for at in draws.clone() {
+                #[cfg(test)]
+                {
+                    self.redrawn += 1;
+                }
+                let Some(node) = self
+                    .tree_hosts
+                    .get(&host)
+                    .and_then(|source| source.node(id))
+                    .cloned()
+                else {
+                    return false;
+                };
+                let draw = &self.tree_draw[at];
+                if draw.hidden_by_fold {
+                    continue;
+                }
+                let hint = row_hint(&node);
+                if hint != draw.hint {
+                    hints_moved = true;
+                    self.tree_draw[at].hint = hint;
+                }
+                // A machine row's words are derived, so a verdict that
+                // moves them moves the row's own text.
+                if !is_note(&node)
+                    && let Some(buffer) = self
+                        .tree_hosts
+                        .get(&host)
+                        .and_then(|source| source.buffers.get(id))
+                        .cloned()
+                {
+                    let title = derived_title(&node, registry, threads);
+                    let key = (host, id.clone());
+                    if self.derived_titles.get(&key) != Some(&(buffer.entity_id(), title.clone())) {
+                        self.derived_titles
+                            .insert(key, (buffer.entity_id(), title.clone()));
+                        titles.push((buffer, title));
+                    }
+                }
+                // The marker in front of an agent row is its attention and
+                // its name, and both can move without the map moving.
+                let draw = &self.tree_draw[at];
+                if let Some(agent_id) = node.agent() {
+                    let prefix = agent_prefix(&draw.prefix, agent_id, registry);
+                    if prefix != draw.prefix {
+                        remove.extend(draw.inlays.iter().copied());
+                        let padding = " ".repeat(prefix.chars().count());
+                        let mut ids = Vec::with_capacity(draw.inlays.len());
+                        let head = Inlay::custom(
+                            TREE_INLAY_ID_BASE + draw.at * 2,
+                            draw.start,
+                            prefix.clone(),
+                        );
+                        ids.push(head.id);
+                        insert.push(head);
+                        for (line, _) in draw.inlays.iter().skip(1).enumerate() {
+                            let inlay = Inlay::custom(
+                                CONTINUATION_INLAY_ID_BASE + draw.at * 256 + line,
+                                draw.start,
+                                padding.clone(),
+                            );
+                            ids.push(inlay.id);
+                            insert.push(inlay);
+                        }
+                        self.tree_draw[at].prefix = prefix;
+                        self.tree_draw[at].inlays = ids;
+                    }
+                }
+            }
+        }
+        for (buffer, title) in titles {
+            crate::desk_view::write_derived_title(&buffer, &title, cx);
+        }
+        if !remove.is_empty() || !insert.is_empty() {
+            self.tree_inlay_ids.retain(|id| !remove.contains(id));
+            self.tree_inlay_ids
+                .extend(insert.iter().map(|inlay| inlay.id));
+            self.editor
+                .update(cx, |editor, cx| editor.splice_inlays(&remove, insert, cx));
+        }
+        if hints_moved {
+            // The editor takes its hints as a set, so the ones that did not
+            // move are handed back as they were. Nothing is measured or
+            // anchored again: this is the kept drawing, read out.
+            let hints = self
+                .tree_draw
+                .iter()
+                .filter_map(|draw| {
+                    let text = draw.hint.clone()?;
+                    Some((draw.end, eol_hint(text)))
+                })
+                .collect::<Vec<_>>();
+            self.editor
+                .update(cx, |editor, cx| editor.set_eol_hints(hints, cx));
+        }
+        true
+    }
+
+    /// The cards of one row, made again. What it costs is the row and the
+    /// agents it heads: a note that was deferred or closed stops lending
+    /// its subtree a place in the hand, and that is the whole of what one
+    /// verdict on a heading can move.
+    fn remake_node_cards(
+        &mut self,
+        host: HostId,
+        node_id: &rho_desk::cells::Id,
+        registry: &AgentRegistry,
+        threads: &HashMap<SlackUnit, SlackFacts>,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        agent_interactions: &HashMap<AgentId, i64>,
+    ) {
+        let identity = DealCardId {
+            host,
+            node_id: node_id.clone(),
+        };
+        self.dealer.retire(&identity);
+        let Some(source) = self.tree_hosts.get(&host) else {
+            return;
+        };
+        let Some(order) = source.index.by_id.get(node_id).copied() else {
+            return;
+        };
+        let node = source.nodes[order].clone();
+        // The row's own cards need no agent facts: a dated mark is the
+        // note's, and a thread's wait is the mirror's.
+        let facts = DealerFacts {
+            by_agent: HashMap::new(),
+            spawned: HashMap::new(),
+            threads,
+            now,
+            interactions: agent_interactions,
+        };
+        let made = if node.is_note() {
+            match self.heading_context(source, &node, now) {
+                Some(context) => self.desk_cards(host, &node, &context, order, &facts),
+                None => Vec::new(),
+            }
+        } else if node.slack().is_some() {
+            self.thread_card(host, &node, order, &facts)
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for card in made {
+            self.dealer.insert(card);
+        }
+        // Whoever the row lends a place to: the agents filed under it, and
+        // the ones already carded there, which is where a spawned agent
+        // reached through its parent's filing shows up.
+        let mut agents = self
+            .tree_hosts
+            .get(&host)
+            .into_iter()
+            .flat_map(|source| source.children(node_id))
+            .filter_map(|child| child.agent())
+            .collect::<HashSet<_>>();
+        agents.extend(
+            self.dealer
+                .of_heading
+                .get(&(host, node_id.clone()))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        for agent_id in agents {
+            self.remake_agent_card(host, agent_id, registry, now, agent_interactions);
         }
     }
 
@@ -1538,16 +1892,9 @@ impl Dashboard {
             .get(&host)
             .and_then(|source| self.heading_for_agent(source, agent_id, registry, now));
         let card = match (context, self.tree_hosts.get(&host)) {
-            (Some(context), Some(source)) => self.agent_card(
-                host,
-                source,
-                agent_id,
-                &context.breadcrumb,
-                context.room.as_ref(),
-                order,
-                &facts,
-                &mut carded,
-            ),
+            (Some(context), Some(source)) => {
+                self.agent_card(host, source, agent_id, &context, order, &facts, &mut carded)
+            }
             _ => self.loose_agent_card(&agent, order, &facts),
         };
         if let Some(card) = card {
@@ -1967,6 +2314,12 @@ impl Dashboard {
             return;
         }
         let mut inlays = Vec::new();
+        #[cfg(test)]
+        {
+            self.composed += 1;
+        }
+        self.tree_draw.clear();
+        self.tree_draw_at.clear();
         let mut eol_hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
         let mut highlights = DashClass::ALL
             .into_iter()
@@ -2091,13 +2444,15 @@ impl Dashboard {
             {
                 ranges.push(start..end);
             }
+            let mut row_inlays = Vec::new();
             if !hidden_by_fold && !prefix.is_empty() {
                 // A body runs to as many lines as it wants, and only its
                 // first carries the bullet. The rest are padded to the same
                 // column so the note reads as one block under it.
                 let padding = " ".repeat(prefix.chars().count());
-                let inlay = Inlay::custom(TREE_INLAY_ID_BASE + index * 2, start, prefix);
+                let inlay = Inlay::custom(TREE_INLAY_ID_BASE + index * 2, start, prefix.clone());
                 self.tree_inlay_ids.push(inlay.id);
+                row_inlays.push(inlay.id);
                 inlays.push(inlay);
                 for (line, row) in (start_row.0 + 1..=end_row.0).enumerate() {
                     let anchor = snapshot.anchor_after(Point::new(row, 0));
@@ -2107,45 +2462,29 @@ impl Dashboard {
                         padding.clone(),
                     );
                     self.tree_inlay_ids.push(inlay.id);
+                    row_inlays.push(inlay.id);
                     inlays.push(inlay);
                 }
             }
-            let mut hints = Vec::new();
-            match node.state {
-                rho_desk::cells::State::Done => hints.push("done".to_owned()),
-                rho_desk::cells::State::Muted => hints.push("muted".to_owned()),
-                rho_desk::cells::State::Open => {}
+            let hint = (!hidden_by_fold).then(|| row_hint(node)).flatten();
+            if let Some(text) = &hint {
+                eol_hints.push((end, eol_hint(text.clone())));
             }
-            if let Some(at) = node.defer_until {
-                hints.push(format!("defer {} · {}d", desk_date(at), node.pace_days));
-            }
-            if let Some(at) = node.deadline {
-                hints.push(format!("due {} · {}d", desk_date(at), node.pace_days));
-            }
-            if node.page().is_some() {
-                hints.push("page".to_owned());
-            }
-            if let Some(path) = node.path() {
-                let path = path.to_string();
-                hints.push(path);
-            }
-            if !hidden_by_fold && !hints.is_empty() {
-                let text: gpui::SharedString = hints.join(" · ").into();
-                let renderer: editor::EolHintRenderer = std::sync::Arc::new(move |_, cx| {
-                    use gpui::Styled as _;
-                    use settings::Settings as _;
-                    use theme::ActiveTheme as _;
-                    let settings = theme_settings::ThemeSettings::get_global(cx);
-                    gpui::div()
-                        .font(settings.buffer_font.clone())
-                        .text_size(settings.buffer_font_size(cx))
-                        .line_height(gpui::relative(settings.line_height()))
-                        .text_color(cx.theme().colors().text_muted)
-                        .child(text.clone())
-                        .into_any_element()
-                });
-                eol_hints.push((end, renderer));
-            }
+            self.tree_draw_at
+                .entry((*host, node.id.clone()))
+                .or_default()
+                .push(self.tree_draw.len());
+            self.tree_draw.push(TreeRowDraw {
+                host: *host,
+                node_id: node.id.clone(),
+                start,
+                end,
+                prefix,
+                inlays: row_inlays,
+                at: index,
+                hint,
+                hidden_by_fold,
+            });
         }
         self.editor.update(cx, |editor, cx| {
             editor.splice_inlays(&[], inlays, cx);
@@ -2228,13 +2567,20 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        self.sync_hand(agent_interactions);
+        self.sync_tree(registry, threads, window, cx);
+    }
+
+    /// What the hand says, without touching the map. A delta that only
+    /// redrew its own rows still moves the depth the deal bar shows, and
+    /// that is a read of the ranking rather than a composition.
+    pub fn sync_hand(&mut self, agent_interactions: &HashMap<AgentId, i64>) {
         let now = chrono::Local::now();
         let queue = self.dealer_hand(now.fixed_offset(), agent_interactions);
         self.queue_depth = DealQueueDepth {
             dealt_count: queue.dealt_count,
             total_alive: queue.total_alive,
         };
-        self.sync_tree(registry, threads, window, cx);
     }
 
     fn select_buffer_anchor(
@@ -2978,6 +3324,10 @@ struct RankedDealCard {
     /// that, so a read brings the card up to date through this rather than
     /// making it again.
     curve: PriorityCurve,
+    /// The row this card hangs under, when a row lends it one. A verdict on
+    /// a heading moves every card it holds, and this is how the set finds
+    /// them without looking at the others.
+    heading: Option<rho_desk::cells::Id>,
 }
 
 /// The part of a card that slides with the clock, separated from the card

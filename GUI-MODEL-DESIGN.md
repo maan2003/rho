@@ -339,6 +339,13 @@ buffer's text to build titles, on every desk sync. That is slice 4. Slice
    read, along with every other card's slide, since Home renders the whole
    ranking and so a read is bounded by the answer's own size either way.
    The bounded thing is the making, and that is now what a change names.
+   That read happens on a change or on the expiry timer and never on a
+   frame: Home holds the rows it was handed and its render only draws
+   them, and the three readers (`refresh_home`, the signal evaluation, and
+   a pull) all hang off an event or a keypress. Top N and the two explicit
+   sets, the recency window and the not-yet-due deadlines, layer on the
+   day a screen stops rendering the whole hand; until then they would key
+   nothing that is not already bounded.
    The sort gained the card's identity as a last tie-break: a set has no
    insertion order to fall back on, and two cards that tie on everything
    else must still come out the same way every read.
@@ -359,6 +366,57 @@ buffer's text to build titles, on every desk sync. That is slice 4. Slice
 5. **Desk deltas in place.** `rebuild_view` goes; `DeskSynced` and
    `DeskMutationAccepted` touch the nodes they name. Proof: one verdict
    costs the cells it writes.
+
+   *Landed.* The map is kept rather than made. The desk cells hold the
+   ordered nodes and where each id is drawn, and a delta says two things:
+   the ids it named, and whether the shape can have moved. Only four
+   properties move a shape — where a row is filed, what labels it carries,
+   whether it exists and how old it is — so a verdict never does, and a
+   delta that keeps the shape patches the rows it named and walks nothing.
+   `synced` merges the delta into the confirmed store and the view and
+   stops there: the replay was a walk that answered a question the merge
+   had already answered, and it survives only on the rejection path, which
+   is the one case that takes a write out of the middle. `reconcile_buffers`
+   likewise survives only where the shape moved; a row a delta brings gets
+   its buffer from the delta, which is what "a new node gets its buffer
+   when it appears" means. `DeskMutationAccepted` now does nothing to the
+   map at all: the cells went in when this client wrote them, and the
+   daemon agreeing is not news the map has to be told.
+   On the drawing side the dashboard keeps what each row was drawn as —
+   where it sits, the marker in front of it, the hint after it — so a
+   redraw is of that row. A verdict composes nothing: the excerpts, the
+   folds, the highlight ranges and the row depths are the same rows in the
+   same order. What moves is the hint at the end of the row, the marker in
+   front of an agent row when its attention moves, and the derived title of
+   a machine row. The cards move with it: `DealScope::Nodes` makes the
+   cards of the rows a delta named, and of the agents those rows lend a
+   place to, which the dealer set now indexes by heading so that finding
+   them is not a pass over the hand.
+   One thing this slice does not take, and it is the editor's shape rather
+   than the map's: `highlight_text` and `set_eol_hints` take their whole
+   set at once, and `HighlightKey` is a closed enum, so a row's hint cannot
+   be replaced without handing back the hints of the rows that did not
+   move. Inlays are already incremental and are spliced per row. So one
+   verdict costs its own row plus a pass that clones the kept hints; no
+   anchor is computed, no snapshot is scanned, nothing is composed, and no
+   buffer is read. Making that last pass a delta needs an incremental
+   decoration API in the editor, which is not this document's to write.
+   Proof: `one_verdict_costs_its_own_row` builds a desk of seventeen rows,
+   marks one note done, and asserts that the map is composed no further
+   times and exactly one row is drawn again.
+   What this does to the Loaded gap: nothing, and it was not going to. On
+   the rig the busy block is 411 samples against slice 4's 417 and 427,
+   which is noise — a `Loaded` is still one build, and the one build is
+   still `sync_tree` at 232 samples of 411, the buffer subscription at 143,
+   `splice_inlays` at 91 and `Composition` at 89. What did leave the warm
+   start is the walking either side of it: `rebuild_view` is gone from the
+   trace entirely, `reconcile_buffers` is down to 2 samples and the map is
+   built 4. The gap this slice moves is the one no warm start shows, the
+   verdict, and the test is what says so.
+   `DeskTextApplied` still composes. A body edit from another device does
+   not move a row's place, but it does move the words a card's breadcrumb
+   is made of, and following that through is slice 6's work with the
+   transcript rows rather than a fifth path bolted on here.
 6. **Transcript rows append.** `refold_open_transcripts` hands deltas.
    Proof: a page for the open agent costs its rows.
 7. **The window split.** `Workspace` (10,685 lines, 106 fields) becomes

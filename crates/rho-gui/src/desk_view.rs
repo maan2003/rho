@@ -24,6 +24,11 @@ struct HostDeskCells {
     /// Mutations sent and not yet visible in `confirmed`, oldest first.
     pending: Vec<CellMutation>,
     buffers: BTreeMap<Id, Entity<Buffer>>,
+    /// The map as it stands, in the order it is drawn, and where each id
+    /// sits in it. Kept rather than made: a delta patches the rows it
+    /// names, and only a change of shape walks the facts again.
+    nodes: Vec<DeskNode>,
+    node_at: HashMap<Id, Vec<usize>>,
     /// Every note's title, so that naming a row costs a read of this map
     /// rather than a read of the note's rope. A title only changes when
     /// its buffer does, and `refresh_titles` is what notices.
@@ -180,6 +185,53 @@ pub struct DeskNode {
     pub labels: BTreeSet<Id>,
     pub name: Option<String>,
     pub created_at: Option<Timestamp>,
+}
+
+/// What a delta named, and whether the map can have changed shape.
+/// Everything the GUI does to the desk arrives as one of these, and it is
+/// what lets a verdict cost the cells it writes.
+#[derive(Clone, Debug, Default)]
+pub struct DeskDelta {
+    /// The rows the delta named. Each is made again where it sits.
+    pub touched: BTreeSet<Id>,
+    /// A place, a label, a birth or a deletion: the set of rows or the
+    /// order they are drawn in can differ, so the map is built again
+    /// rather than patched. A verdict never sets this.
+    pub shape: bool,
+}
+
+impl DeskDelta {
+    /// A delta that says nothing about the map, for the paths that only
+    /// move text.
+    pub fn quiet() -> Self {
+        Self::default()
+    }
+
+    /// The whole map may have moved: a load, a host reset, a source that
+    /// changed who is on the desk at all.
+    pub fn whole() -> Self {
+        Self {
+            touched: BTreeSet::new(),
+            shape: true,
+        }
+    }
+
+    pub fn is_quiet(&self) -> bool {
+        !self.shape && self.touched.is_empty()
+    }
+
+    fn write(&mut self, id: &Id, property: &Property) {
+        self.touched.insert(id.clone());
+        // Where a row is drawn, what it carries, whether it exists at all
+        // and how old it is are the four things the order is made of.
+        self.shape |= matches!(
+            property,
+            Property::Parent(_)
+                | Property::Labeled { .. }
+                | Property::Deleted(_)
+                | Property::CreatedAt(_)
+        );
+    }
 }
 
 impl DeskNode {
@@ -363,8 +415,17 @@ impl DeskCells {
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
         cx: &mut Context<Workspace>,
-    ) -> Option<ClientMessage> {
+    ) -> (Option<ClientMessage>, DeskDelta) {
         let frontier = delta.version.clone();
+        let mut delta_ids = DeskDelta::default();
+        for cell in &delta.cells {
+            delta_ids.write(&cell.id, &cell.property);
+        }
+        for (id, _, _) in &delta.verdicts {
+            // A verdict says what the user did about a thing, never where
+            // it is drawn.
+            delta_ids.touched.insert(id.clone());
+        }
         let existing = self.hosts.contains_key(&host);
         if !existing {
             self.hosts.insert(
@@ -374,6 +435,8 @@ impl DeskCells {
                     view: Store::new(self.device),
                     pending: Vec::new(),
                     buffers: BTreeMap::new(),
+                    nodes: Vec::new(),
+                    node_at: HashMap::new(),
                     titles: Rc::default(),
                     title_versions: HashMap::new(),
                     _subscriptions: Vec::new(),
@@ -384,29 +447,39 @@ impl DeskCells {
                 },
             );
         }
+        if !existing {
+            delta_ids.shape = true;
+        }
         {
-            let desk = self.hosts.get_mut(&host)?;
+            let Some(desk) = self.hosts.get_mut(&host) else {
+                return (None, DeskDelta::quiet());
+            };
             desk.namespace = namespace;
             desk.syncing = false;
             if let Err(error) = desk.confirmed.merge(delta.clone()) {
                 tracing::error!(%error, "Desk cell delta did not merge");
-                return None;
+                return (None, DeskDelta::quiet());
             }
             if let Err(error) = desk.view.merge(delta) {
                 tracing::error!(%error, "Desk cell delta did not merge into the view");
             }
             desk.prune_pending();
-            desk.rebuild_view(self.device);
         }
+        // The delta is already in both stores, so there is nothing to
+        // replay: the pending writes it confirmed merged as themselves,
+        // and the ones it did not are still in the view where they were
+        // put. Only a rejection takes a write back out of the middle,
+        // and that is the one path that replays.
+        self.apply_to_map(host, &delta_ids);
         self.merge_bodies(host, bodies, cx);
-        self.reconcile_buffers(host, cx);
-        let desk = self.hosts.get_mut(&host)?;
-        match desk.poked.take() {
+        self.give_buffers(host, &delta_ids, cx);
+        let again = match self.hosts.get_mut(&host).and_then(|desk| desk.poked.take()) {
             // The answer already carries everything the poke announced.
             Some(poke) if covers(&frontier, &poke) => None,
             Some(_) => Some(self.sync(host)),
             None => None,
-        }
+        };
+        (again, delta_ids)
     }
 
     /// `DeskCellsAvailable`: a poke, not a delta. One handshake is in flight
@@ -447,6 +520,9 @@ impl DeskCells {
         };
         desk.pending.retain(|mutation| mutation.stamp != stamp);
         desk.rebuild_view(device);
+        // A write taken out of the middle can be the one that put a row
+        // somewhere, so the map is built again rather than patched.
+        self.rebuild_map(host);
         self.reconcile_buffers(host, cx);
     }
 
@@ -543,6 +619,41 @@ impl DeskCells {
         cx.new(|_| Buffer::remote(buffer_id, ReplicaId::new(0), Capability::ReadOnly, ""))
     }
 
+    /// Gives the rows a delta named their buffers, and takes back the
+    /// buffers of the rows it removed. This is the walk's replacement: a
+    /// node gets its buffer when it appears, so nothing has to look at
+    /// every node to find out that all of them already have one.
+    pub fn give_buffers(&mut self, host: HostId, delta: &DeskDelta, cx: &mut Context<Workspace>) {
+        if delta.is_quiet() {
+            return;
+        }
+        // A shape that moved can have taken rows away as well as brought
+        // them, and which ones is not in the delta: that is the one case
+        // the reconcile still answers.
+        if delta.shape {
+            self.reconcile_buffers(host, cx);
+            return;
+        }
+        let Some(desk) = self.hosts.get(&host) else {
+            return;
+        };
+        let missing = delta
+            .touched
+            .iter()
+            .filter(|id| desk.node_at.contains_key(*id) && !desk.buffers.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in missing {
+            let buffer = match id {
+                Id::Note(_) => self.new_note_buffer(host, id.clone(), Vec::new(), cx),
+                _ => self.new_derived_buffer(cx),
+            };
+            if let Some(desk) = self.hosts.get_mut(&host) {
+                desk.buffers.insert(id, buffer);
+            }
+        }
+    }
+
     /// Gives every shown thing a buffer and drops the buffers of things
     /// that are gone. Notes get theirs from the daemon's body history;
     /// everything else gets an empty local one the dashboard fills with a
@@ -553,8 +664,8 @@ impl DeskCells {
         };
         let live = self
             .nodes(host)
-            .into_iter()
-            .map(|node| node.id)
+            .iter()
+            .map(|node| node.id.clone())
             .collect::<BTreeSet<_>>();
         let stale = desk
             .buffers
@@ -610,7 +721,97 @@ impl DeskCells {
     /// The map, as a rule over facts: everything that matters, each under
     /// the user's filing or the edge into its source context, parents
     /// before children and siblings oldest first.
-    pub fn nodes(&self, host: HostId) -> Vec<DeskNode> {
+    pub fn nodes(&self, host: HostId) -> &[DeskNode] {
+        self.hosts
+            .get(&host)
+            .map(|desk| desk.nodes.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Brings the kept map up to a delta. The rows the delta names are
+    /// made again where they sit, which costs the cells the delta carried;
+    /// only a shape that moved builds the map again.
+    fn apply_to_map(&mut self, host: HostId, delta: &DeskDelta) {
+        if delta.is_quiet() {
+            return;
+        }
+        let unseen = self.hosts.get(&host).is_none_or(|desk| {
+            desk.nodes.is_empty()
+                || delta
+                    .touched
+                    .iter()
+                    .any(|id| !desk.node_at.contains_key(id))
+        });
+        if delta.shape || unseen {
+            self.rebuild_map(host);
+            return;
+        }
+        let made = delta
+            .touched
+            .iter()
+            .filter_map(|id| Some((id.clone(), self.node_facts(host, id)?)))
+            .collect::<Vec<_>>();
+        let Some(desk) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        for (id, fresh) in made {
+            // A thing filed under a label is drawn in both places, and both
+            // rows are of the same facts.
+            for at in desk.node_at.get(&id).into_iter().flatten() {
+                let node = &mut desk.nodes[*at];
+                node.state = fresh.state;
+                node.defer_until = fresh.defer_until;
+                node.deadline = fresh.deadline;
+                node.pace_days = fresh.pace_days;
+                node.name = fresh.name.clone();
+            }
+        }
+    }
+
+    /// The map from scratch, and where each id landed in it.
+    pub fn rebuild_map(&mut self, host: HostId) {
+        let nodes = self.compute_nodes(host);
+        let mut node_at: HashMap<Id, Vec<usize>> = HashMap::with_capacity(nodes.len());
+        for (at, node) in nodes.iter().enumerate() {
+            node_at.entry(node.id.clone()).or_default().push(at);
+        }
+        if let Some(desk) = self.hosts.get_mut(&host) {
+            desk.nodes = nodes;
+            desk.node_at = node_at;
+        }
+    }
+
+    /// What one row says of itself now: the fields a delta that kept the
+    /// shape can have moved. Where it hangs is not among them.
+    fn node_facts(&self, host: HostId, id: &Id) -> Option<DeskNode> {
+        let desk = self.hosts.get(&host)?;
+        let fact = desk.view.facts(id);
+        let slack = slack_card(id, &fact, &desk.sources);
+        let agent = agent_card(id, &fact, &desk.sources);
+        Some(DeskNode {
+            id: id.clone(),
+            under: None,
+            parent: None,
+            state: match (slack, agent) {
+                (Some(card), _) => card.state,
+                (_, Some(card)) => card.state,
+                _ => fact.state,
+            },
+            defer_until: match slack {
+                Some(card) if card.voided => None,
+                _ => fact.defer_until,
+            },
+            deadline: fact.deadline,
+            pace_days: fact.pace_days,
+            labels: fact.labels.clone(),
+            name: fact.name.clone(),
+            created_at: fact.created_at,
+        })
+    }
+
+    /// Builds the map again from every fact and every source. This is the
+    /// walk: a load and a change of shape are what may call it.
+    fn compute_nodes(&self, host: HostId) -> Vec<DeskNode> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -761,7 +962,7 @@ impl DeskCells {
     }
 
     pub fn node(&self, host: HostId, id: &Id) -> Option<DeskNode> {
-        self.nodes(host).into_iter().find(|node| &node.id == id)
+        self.nodes(host).iter().find(|node| &node.id == id).cloned()
     }
 
     /// The facts the store holds about one thing, with nothing derived.
@@ -818,7 +1019,7 @@ impl DeskCells {
         self.refresh_titles(host, cx);
         let nodes = self.nodes(host);
         let desk = self.hosts.get(&host)?;
-        Some((nodes, desk.buffers.clone(), desk.titles.clone()))
+        Some((nodes.to_vec(), desk.buffers.clone(), desk.titles.clone()))
     }
 
     pub fn buffer(&self, host: HostId, id: &Id) -> Option<&Entity<Buffer>> {
@@ -833,12 +1034,16 @@ impl DeskCells {
 
     /// Sends a mutation and shows it at once. The daemon's answer either
     /// confirms it or takes it back.
+    /// A write this GUI makes. The view takes it at once and the map with
+    /// it, so a verdict shows before the round trip and costs its own
+    /// cells; the delta goes back to the caller, which is what the map and
+    /// the dealer are brought up on.
     pub fn apply(
         &mut self,
         host: HostId,
         writes: Vec<CellWrite>,
         verdict: Option<(Id, VerdictEvent)>,
-    ) -> Option<ClientMessage> {
+    ) -> Option<(ClientMessage, DeskDelta)> {
         let device = self.device;
         let desk = self.hosts.get_mut(&host)?;
         if writes.is_empty() {
@@ -868,7 +1073,15 @@ impl DeskCells {
             return None;
         }
         desk.pending.push(mutation.clone());
-        Some(ClientMessage::DeskMutationApply { mutation })
+        let mut delta = DeskDelta::default();
+        for write in &mutation.writes {
+            delta.write(&write.id, &write.property);
+        }
+        if let Some((id, _)) = &mutation.verdict {
+            delta.touched.insert(id.clone());
+        }
+        self.apply_to_map(host, &delta);
+        Some((ClientMessage::DeskMutationApply { mutation }, delta))
     }
 
     /// Rho mints ids for notes and labels and for nothing else.
@@ -1450,8 +1663,8 @@ impl DeskCells {
                     .get(&node.id)
                     .map(|buffer| buffer.read(cx).text())
                     .unwrap_or_default(),
-                id: node.id,
-                parent: node.parent,
+                id: node.id.clone(),
+                parent: node.parent.clone(),
             });
         }
         (!captured.is_empty()).then_some(DeskCapture { nodes: captured })
