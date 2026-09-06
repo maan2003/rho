@@ -22,9 +22,10 @@ use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 
+use crate::model::{Unit, UnitFacts};
 use crate::types::{
-    Attachment, ChannelId, Conversation, ConversationKind, FileSummary, Message, Reaction, Ts,
-    User, UserId,
+    Attachment, ChannelId, Conversation, ConversationKind, FileSummary, Message, Reaction, Reason,
+    Ts, User, UserId,
 };
 
 /// Keys are composed strings rather than encoded tuples, because redb orders
@@ -41,6 +42,19 @@ const CONVERSATIONS: TableDefinition<&str, Sen<StoredConversation>> =
     TableDefinition::new("rho_slack_conversations_v1");
 const CURSORS: TableDefinition<&str, Sen<StoredCursor>> =
     TableDefinition::new("rho_slack_cursors_v1");
+/// What rho knows about each unit it tracks: one row per conversation or
+/// followed thread, not one per message.
+///
+/// This is what makes a start cost the units rather than the history. The
+/// facts are derived from messages exactly once, when a mirror that predates
+/// this table is first opened or when a rebuild is asked for; after that
+/// they are written on the event that moves them and read back whole.
+const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_slack_units_v1");
+/// The channels the reader opted into. Its own table rather than a flag in
+/// `CURSORS`, because the question asked of it is "which ones", and that is
+/// a range scan over a workspace rather than a lookup per channel.
+const WATCHED: TableDefinition<&str, Sen<StoredWatch>> =
+    TableDefinition::new("rho_slack_watched_v1");
 
 /// One run of history: a conversation, or one thread inside it. A thread is
 /// its own run because Slack pages it separately.
@@ -126,6 +140,8 @@ impl Mirror {
             write.open_table(USERS);
             write.open_table(CONVERSATIONS);
             write.open_table(CURSORS);
+            write.open_table(WATCHED);
+            write.open_table(UNITS);
             write.commit();
         });
         #[cfg(unix)]
@@ -500,6 +516,109 @@ impl Mirror {
             .collect()
     }
 
+    /// Records the reader opting into a channel, or out of it. Opting out
+    /// deletes the row: the file says which channels are watched, and a row
+    /// saying "not this one" would be a second way to say the same nothing.
+    pub fn set_watched(&self, workspace: &str, channel: &ChannelId, watching: bool) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(WATCHED);
+            let key = format!("{workspace}{SEPARATOR}{}", channel.as_str());
+            match watching {
+                true => {
+                    table.insert(
+                        key.as_str(),
+                        SenValue::owned(StoredWatch {
+                            channel: channel.0.clone(),
+                        }),
+                    );
+                }
+                false => {
+                    table.remove(key.as_str());
+                }
+            }
+        }
+        txn.commit();
+    }
+
+    /// The channels the reader opted into, read back at startup. This is
+    /// what makes an opt-in outlive the session that made it.
+    pub fn watched(&self, workspace: &str) -> Vec<ChannelId> {
+        let txn = self.db.read();
+        let table = txn.open_table(WATCHED);
+        let prefix = format!("{workspace}{SEPARATOR}");
+        let end = format!(
+            "{workspace}{}",
+            char::from_u32(SEPARATOR as u32 + 1).unwrap()
+        );
+        table
+            .range(prefix.as_str()..end.as_str())
+            .map(|(_, value)| ChannelId(value.value().as_ref().channel.clone()))
+            .collect()
+    }
+
+    /// Writes one unit's facts. Called on the event that moved them, and
+    /// on nothing else: the cost of a message is the unit it landed in.
+    pub fn put_unit(&self, workspace: &str, unit: &Unit, facts: &UnitFacts) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(UNITS);
+            table.insert(
+                unit_key(workspace, unit).as_str(),
+                SenValue::owned(StoredUnit::of(unit, facts)),
+            );
+        }
+        txn.commit();
+    }
+
+    /// Forgets a unit: a thread unfollowed here or in another client. The
+    /// messages stay — the reader can still find them — but rho has no
+    /// standing claim to make about the thread any more.
+    pub fn remove_unit(&self, workspace: &str, unit: &Unit) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(UNITS);
+            table.remove(unit_key(workspace, unit).as_str());
+        }
+        txn.commit();
+    }
+
+    /// Every unit the last run left, for the start that installs them. One
+    /// range scan over one workspace, and it reads units rather than
+    /// messages: a mirror holding a million messages and four hundred units
+    /// costs four hundred rows here.
+    pub fn units(&self, workspace: &str) -> Vec<(Unit, UnitFacts)> {
+        let txn = self.db.read();
+        let table = txn.open_table(UNITS);
+        let prefix = format!("{workspace}{SEPARATOR}");
+        let end = format!(
+            "{workspace}{}",
+            char::from_u32(SEPARATOR as u32 + 1).unwrap()
+        );
+        table
+            .range(prefix.as_str()..end.as_str())
+            .filter_map(|(_, value)| value.value().as_ref().restore())
+            .collect()
+    }
+
+    /// Whether the units table has been filled in at all. A mirror written
+    /// before it existed has messages and no units, and says so here rather
+    /// than by being empty — a workspace genuinely without units would look
+    /// the same and be re-derived on every start.
+    pub fn units_derived(&self, workspace: &str) -> bool {
+        matches!(
+            self.cursor(&format!("{workspace}{SEPARATOR}units")),
+            Some(StoredCursor::Flag(true))
+        )
+    }
+
+    pub fn set_units_derived(&self, workspace: &str) {
+        self.put_cursor(
+            &format!("{workspace}{SEPARATOR}units"),
+            StoredCursor::Flag(true),
+        );
+    }
+
     /// Every write goes through one lock; the mirror is small and the GUI is
     /// the only writer, so blocking on it is cheaper than threading async
     /// through every surface.
@@ -526,6 +645,81 @@ impl Mirror {
 /// The timestamp part of a composed key.
 fn ts_of(key: &str) -> Option<Ts> {
     key.rsplit(SEPARATOR).next().map(Ts::from)
+}
+
+/// One tracked unit's facts, as they go on disk. The reason is a number
+/// rather than a name because it is a closed set the code owns, and an
+/// unknown number is a row from a newer rho, which is dropped rather than
+/// guessed at.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredUnit {
+    channel: String,
+    thread: Option<String>,
+    reason: u8,
+    newest: String,
+    newest_from_other: Option<String>,
+    newest_from_you: bool,
+    first_seen_ms: i64,
+}
+
+impl StoredUnit {
+    fn of(unit: &Unit, facts: &UnitFacts) -> Self {
+        Self {
+            channel: unit.channel.0.clone(),
+            thread: unit.thread.as_ref().map(|ts| ts.0.clone()),
+            reason: match facts.reason {
+                Reason::Mention => 0,
+                Reason::DirectMessage => 1,
+                Reason::Thread => 2,
+                Reason::Watched => 3,
+            },
+            newest: facts.newest.0.clone(),
+            newest_from_other: facts.newest_from_other.as_ref().map(|ts| ts.0.clone()),
+            newest_from_you: facts.newest_from_you,
+            first_seen_ms: facts.first_seen_ms,
+        }
+    }
+
+    fn restore(&self) -> Option<(Unit, UnitFacts)> {
+        let reason = match self.reason {
+            0 => Reason::Mention,
+            1 => Reason::DirectMessage,
+            2 => Reason::Thread,
+            3 => Reason::Watched,
+            _ => return None,
+        };
+        Some((
+            Unit {
+                channel: ChannelId(self.channel.clone()),
+                thread: self.thread.as_ref().map(|ts| Ts(ts.clone())),
+            },
+            UnitFacts {
+                reason,
+                newest: Ts(self.newest.clone()),
+                newest_from_other: self.newest_from_other.as_ref().map(|ts| Ts(ts.clone())),
+                newest_from_you: self.newest_from_you,
+                first_seen_ms: self.first_seen_ms,
+            },
+        ))
+    }
+}
+
+/// A unit's key: the conversation, then the thread when there is one. A
+/// conversation and a thread whose root is empty cannot collide, because a
+/// timestamp is never empty.
+fn unit_key(workspace: &str, unit: &Unit) -> String {
+    let thread = unit.thread.as_ref().map(Ts::as_str).unwrap_or("");
+    format!(
+        "{workspace}{SEPARATOR}{}{SEPARATOR}{thread}",
+        unit.channel.as_str()
+    )
+}
+
+/// A watched channel. The id is in the key already; it is repeated in the
+/// value so a reader of the table never has to take a key apart.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredWatch {
+    channel: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

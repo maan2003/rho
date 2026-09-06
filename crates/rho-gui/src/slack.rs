@@ -365,6 +365,45 @@ impl Workspace {
         }
     }
 
+    /// Opts the channel under the point into being handed to the reader, or
+    /// out of it, and says which in the echo line.
+    ///
+    /// The verdict is about a channel, so it is only asked of a channel:
+    /// the row under the point in the list. Nothing is sent to Slack — this
+    /// is rho's own standing word about whose traffic it hands over — and
+    /// the desk is rebuilt at once, so a channel opted into now shows the
+    /// cards its unread traffic has already earned.
+    pub(crate) fn toggle_slack_watch(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackList(view) = &self.active_pane().surface.view else {
+            return;
+        };
+        let source = view.clone().update(cx, |view, cx| view.cursor_source(cx));
+        let Some(Source::Conversation(channel)) = source else {
+            return;
+        };
+        let Some(session) = self.slack.clone() else {
+            return;
+        };
+        let (watching, label) = session.update(cx, |session, cx| {
+            let watching = !session.watches(&channel);
+            session.set_watching(&channel, watching, cx);
+            (watching, session.model().label(&channel))
+        });
+        let said = match watching {
+            true => format!("{label}: handing over what lands here"),
+            false => format!("{label}: back to the list"),
+        };
+        self.echo(&said, StyleClass::SystemInfo, cx);
+        if let Some(host) = self.hosts.primary() {
+            self.sync_tree_dashboard(host, window, cx);
+        }
+        self.invalidate_dealer_signals(cx);
+    }
+
     /// A picture opens in rho, not in the desktop's viewer: the bytes are
     /// already cached for the thumbnail, so this is usually instant.
     fn open_slack_image(
@@ -1027,8 +1066,14 @@ fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> crate::journal::Sl
 }
 
 impl Workspace {
-    /// What every tracked thread is currently about. The dealer reads this
+    /// What every tracked unit is currently about. The dealer reads this
     /// live from the mirror rather than storing any of it in the tree.
+    ///
+    /// Whether a unit is a *card* is not decided here any more: each one
+    /// carries `reason`, which is the crate's answer to whether Slack
+    /// itself would be badging it, and the desk closes the ones it says
+    /// nothing for. A mention read on the phone this morning has a reason
+    /// of `None` and is not handed to anybody.
     pub(crate) fn slack_thread_facts(
         &self,
         cx: &gpui::App,
@@ -1045,6 +1090,7 @@ impl Workspace {
             .filter_map(|unit| {
                 let card = model.card(&unit, now.timestamp_millis())?;
                 let facts = model.unit(&unit)?;
+                let reason = card.attention;
                 let raised_at = chrono::DateTime::from_timestamp_millis(facts.first_seen_ms)?
                     .with_timezone(&now.timezone())
                     .fixed_offset();
@@ -1056,6 +1102,7 @@ impl Workspace {
                         // landed shows as `@ada` rather than `<@U123>`.
                         title: session.unit_summary(&unit),
                         conversation: card.conversation.clone(),
+                        reason,
                         raised_at,
                         wait_days: card.wait_days,
                         waiting_on: match card.waiting {
@@ -1230,6 +1277,7 @@ mod tests {
             waiting_on: None,
             latest: latest.to_owned(),
             newest_from_other: None,
+            reason: Some(rho_slack::model::Attention::FollowedThread),
         }
     }
 

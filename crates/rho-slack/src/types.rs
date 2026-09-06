@@ -91,6 +91,10 @@ pub enum Reason {
     DirectMessage,
     /// A reply in a thread the user has posted in.
     Thread,
+    /// Ordinary traffic in a channel the reader asked rho to watch. Slack
+    /// would not badge it as a ping, but the reader said this channel is
+    /// one they want handed to them, and that opt-in is rho's own fact.
+    Watched,
 }
 
 /// Where a conversation lives, for the one line of chrome above a thread.

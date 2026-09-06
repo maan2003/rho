@@ -28,6 +28,49 @@ pub enum Waiting {
     OnThem,
 }
 
+/// Why a unit is asking for the reader right now: the fact behind a card,
+/// never the sentence.
+///
+/// This is Slack's own notion of attention, which is the whole of the rule.
+/// Slack badges a DM, a mention, and a reply in a thread it follows for the
+/// user; a channel with ordinary unread traffic it counts but does not
+/// press, and neither does rho. The one addition is a channel the reader
+/// opted into here, which is rho's own fact and no less the reader's word
+/// for it.
+///
+/// The words are rendered from this at the moment a card is drawn, by
+/// [`reason_text`], so a conversation named after the message landed reads
+/// as `#design` rather than by its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    /// The reader was named, by handle, group, or a channel-wide broadcast.
+    Mentioned,
+    /// Something unread in a direct or group message. Being in the room is
+    /// the address: nobody is in a group DM by accident.
+    DirectMessage,
+    /// A reply, since the reader last looked, in a thread Slack follows for
+    /// them.
+    FollowedThread,
+    /// Unread traffic in a channel the reader asked rho to hand them. The
+    /// only one of the four Slack itself would not badge.
+    WatchedChannel,
+}
+
+/// What a card says it is for, in the words the reader reads. Built when
+/// the card is drawn and never stored: `conversation` is the label the
+/// roster gives now, so a name learned late is not baked into a stale
+/// sentence.
+pub fn reason_text(reason: Attention, conversation: &str) -> String {
+    match reason {
+        Attention::Mentioned => format!("mentioned in {conversation}"),
+        Attention::DirectMessage => format!("unread in {conversation}"),
+        Attention::FollowedThread => {
+            format!("a reply in a followed thread in {conversation}")
+        }
+        Attention::WatchedChannel => format!("unread in {conversation}, watched here"),
+    }
+}
+
 /// The thing rho deals: a conversation or a followed thread, never a
 /// message. Slack keeps the identity, so rho only has to say which ones
 /// matter. One card per unit at most, so a channel with three unhandled
@@ -110,6 +153,11 @@ pub struct UnitCard {
     pub unit: Unit,
     /// `#design` or `@ada`.
     pub conversation: String,
+    /// Why this unit is asking now, or `None` when nothing is: a unit rho
+    /// tracks whose messages have all been read is still a unit — Find
+    /// reaches it — but it is not a card, and this is the one field that
+    /// says which.
+    pub attention: Option<Attention>,
     pub waiting: Waiting,
     pub wait_days: f64,
     /// The newest message; a change here is what re-raises the card.
@@ -161,6 +209,10 @@ pub struct ConversationRow {
     /// Muted in Slack, from any client. These sit at the bottom of the list
     /// and never pull the reader with `shift-n`.
     pub muted: bool,
+    /// The reader opted into this channel, so its traffic is handed to them
+    /// rather than left here with a count. Shown so the opt-in is visible
+    /// where it was made.
+    pub watched: bool,
     pub latest: Option<Ts>,
 }
 
@@ -189,6 +241,20 @@ pub struct Model {
     /// channel read that nobody has looked at.
     conversation_read: BTreeMap<ChannelId, Ts>,
     thread_read: BTreeMap<ThreadKey, Ts>,
+    /// The channels the reader opted into: the ones whose ordinary traffic
+    /// they asked to be handed rather than left in the list. rho's own
+    /// fact, not Slack's, so it lives in rho's own file and comes back off
+    /// it at startup.
+    watched: BTreeSet<ChannelId>,
+    /// The units asking for the reader right now, and what for.
+    ///
+    /// Kept rather than worked out, because working it out is a pass over
+    /// every unit and drawing a frame may not cost that. Every event that
+    /// can change the answer — a message, a mark, a mute, a follow, an
+    /// opt-in, Slack's counts — rewrites the units it touches here and no
+    /// others, through [`Model::refresh_attention`], and every one of those
+    /// events already knows which units those are.
+    asking: BTreeMap<Unit, Attention>,
 }
 
 impl Names for Model {
@@ -235,6 +301,8 @@ impl Model {
             muted: BTreeSet::new(),
             conversation_read: BTreeMap::new(),
             thread_read: BTreeMap::new(),
+            watched: BTreeSet::new(),
+            asking: BTreeMap::new(),
         }
     }
 
@@ -376,13 +444,26 @@ impl Model {
             // already had may be the newer of the two and `mark_read` says
             // nothing about a badge when the cursor did not move.
             self.refresh_badge(&channel);
+            self.refresh_channel(&channel);
         }
     }
 
     /// Slack's muted list, replacing whatever rho held: unmuting elsewhere
     /// has to bring a conversation back up out of the muted section.
     pub fn set_muted(&mut self, muted: impl IntoIterator<Item = ChannelId>) {
-        self.muted = muted.into_iter().collect();
+        let now = muted.into_iter().collect::<BTreeSet<_>>();
+        // Only the conversations whose mute changed: muting is a verdict
+        // about one room, and a roster of four thousand that says the same
+        // as last time costs nothing.
+        let touched = self
+            .muted
+            .symmetric_difference(&now)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.muted = now;
+        for channel in touched {
+            self.refresh_channel(&channel);
+        }
     }
 
     /// Moves the list's own counters for a message off the socket. This is
@@ -470,6 +551,7 @@ impl Model {
                     mention_count: count.map_or(0, |count| count.mention_count),
                     unread_count: count.map_or(0, |count| count.unread_count),
                     muted: self.muted.contains(&conversation.id),
+                    watched: self.watched.contains(&conversation.id),
                     latest: count.and_then(|count| count.latest.clone()),
                 }
             })
@@ -697,16 +779,29 @@ impl Model {
             .filter(|key| self.units.contains_key(&unit_of(key)))
             .cloned()
             .collect::<Vec<_>>();
+        // Slack's follow list is one of the five facts the rule reads, so a
+        // thread that has just become followed asks from now on. Only the
+        // threads whose follow actually changed are visited: the list comes
+        // again on every reconnect and is nearly always the same list.
+        let added = now
+            .difference(&self.followed)
+            .map(unit_of)
+            .collect::<Vec<_>>();
         self.followed = now;
         for key in &dropped {
+            self.asking.remove(&unit_of(key));
             self.units.remove(&unit_of(key));
+        }
+        for unit in added {
+            self.refresh_attention(&unit);
         }
         dropped
     }
 
     pub fn follow(&mut self, channel: &ChannelId, thread_ts: &Ts) {
         let key = self.key(channel, thread_ts);
-        self.followed.insert(key);
+        self.followed.insert(key.clone());
+        self.refresh_attention(&unit_of(&key));
     }
 
     /// A thread unfollowed anywhere stops being the user's business. The
@@ -717,6 +812,7 @@ impl Model {
     /// which an unfollow from Slack's side cannot promise.
     pub fn ignore(&mut self, key: &ThreadKey) {
         self.followed.remove(key);
+        self.refresh_attention(&unit_of(key));
     }
 
     /// Returns whether rho is tracking the thread, which is the difference
@@ -728,6 +824,7 @@ impl Model {
         // The thread goes with the follow. Nothing here remembers that it
         // was ever raised, so following it again in Slack raises it only
         // when somebody writes in it.
+        self.asking.remove(&unit_of(&key));
         self.units.remove(&unit_of(&key)).is_some()
     }
 
@@ -740,6 +837,49 @@ impl Model {
 
     pub fn follows(&self, key: &ThreadKey) -> bool {
         self.followed.contains(key)
+    }
+
+    /// The channels the reader opted into, as the mirror handed them back.
+    /// Replaces whatever the model held, because the file is the record.
+    pub fn set_watched(&mut self, channels: impl IntoIterator<Item = ChannelId>) {
+        let now = channels.into_iter().collect::<BTreeSet<_>>();
+        let touched = self
+            .watched
+            .symmetric_difference(&now)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.watched = now;
+        for channel in touched {
+            self.refresh_channel(&channel);
+        }
+    }
+
+    /// Opts into a channel, or out of it, and says whether that changed
+    /// anything — the caller writes the file only when it did.
+    ///
+    /// Opting out stops the channel asking, and leaves the unit it raised
+    /// standing: Find still reaches it, and the desk row the reader may
+    /// have half filed is not pulled out from under them. What goes is the
+    /// standing claim on their attention, which is what they said.
+    pub fn set_watching(&mut self, channel: &ChannelId, watching: bool) -> bool {
+        let moved = match watching {
+            true => self.watched.insert(channel.clone()),
+            false => self.watched.remove(channel),
+        };
+        if moved {
+            self.refresh_channel(channel);
+        }
+        moved
+    }
+
+    pub fn watches(&self, channel: &ChannelId) -> bool {
+        self.watched.contains(channel)
+    }
+
+    /// Every channel the reader opted into, for the caller that writes them
+    /// down and the list that marks them.
+    pub fn watched(&self) -> Vec<ChannelId> {
+        self.watched.iter().cloned().collect()
     }
 
     /// Marks a conversation read locally. Called when rho reads one, when
@@ -765,6 +905,9 @@ impl Model {
         }
         self.conversation_read.insert(channel.clone(), ts.clone());
         self.refresh_badge(channel);
+        // The cursor moved past somebody's message, so the units in this
+        // conversation may have stopped asking. Only this conversation's.
+        self.refresh_channel(channel);
         true
     }
 
@@ -817,6 +960,7 @@ impl Model {
             Some(held) if !ts.is_newer_than(held) => false,
             _ => {
                 self.thread_read.insert(key.clone(), ts.clone());
+                self.refresh_attention(&unit_of(key));
                 true
             }
         }
@@ -854,6 +998,23 @@ impl Model {
 
     pub fn unit(&self, unit: &Unit) -> Option<&UnitFacts> {
         self.units.get(unit)
+    }
+
+    /// Installs a unit the last run wrote down, without going near a
+    /// message. The facts are already the answer; deriving them again from
+    /// history is the pass over the mirror the cost rule forbids.
+    ///
+    /// The message ids are marked seen for the same reason they would have
+    /// been when they landed: the feed replaying an item rho already has
+    /// must not raise it a second time.
+    pub fn restore_unit(&mut self, unit: Unit, facts: UnitFacts) {
+        self.seen
+            .insert((unit.channel.clone(), facts.newest.clone()));
+        if let Some(other) = facts.newest_from_other.clone() {
+            self.seen.insert((unit.channel.clone(), other));
+        }
+        self.units.insert(unit.clone(), facts);
+        self.refresh_attention(&unit);
     }
 
     /// The unit a message belongs to: a followed thread when Slack says the
@@ -972,16 +1133,28 @@ impl Model {
             Some(Reason::Mention)
         } else if unit.thread.is_some() {
             Some(Reason::Thread)
+        } else if self.watches(&message.channel) {
+            // The opt-in is the address. Without it this line is where the
+            // twenty unrelated messages after a mention stop being anyone's
+            // business, and that is the whole of the flood.
+            Some(Reason::Watched)
         } else {
             None
         };
         // The user's own message counts in any unit rho already tracks: it
         // is what flips whose turn it is, whatever it says.
         let existing = self.units.get(unit).map(|facts| facts.reason);
-        match from_you {
+        let held = match from_you {
             true => existing.or(reason),
             false => reason.and(existing.or(reason)),
-        }
+        };
+        // A watched channel the reader is then named in is a mention from
+        // then on: the reason a unit carries is the strongest thing that
+        // has happened in it, not the first.
+        Some(match (held?, reason) {
+            (Reason::Watched, Some(stronger)) => stronger,
+            (held, _) => held,
+        })
     }
 
     /// Whether a message is one the user is meant to answer: any message
@@ -990,7 +1163,10 @@ impl Model {
     /// dealt card lands on: the ordinary chatter in a channel is not what
     /// the reader was brought here for.
     pub fn concerns_you(&self, message: &Message, unit: &Unit) -> bool {
-        unit.thread.is_some() || self.is_dm(&message.channel) || self.mentions_you(message)
+        unit.thread.is_some()
+            || self.is_dm(&message.channel)
+            || self.mentions_you(message)
+            || self.watches(&message.channel)
     }
 
     /// Whether the conversation is a DM: one person or a group of them.
@@ -1055,6 +1231,7 @@ impl Model {
                 first_seen_ms,
             },
         );
+        self.refresh_attention(&unit);
         Some(match (was_waiting, from_you) {
             // Answering is not closing. The card keeps its place in the tree
             // and drops onto the fyi curve; only the user's own `d` ends it.
@@ -1074,11 +1251,123 @@ impl Model {
         Some(UnitCard {
             unit: unit.clone(),
             conversation: self.label(&unit.channel),
+            attention: self.attention(unit),
             waiting: facts.waiting(),
             wait_days: wait_days(facts, now_ms),
             newest: facts.newest.clone(),
             newest_from_other: facts.newest_from_other.clone(),
         })
+    }
+
+    /// Whether Slack itself would be badging this unit right now, and what
+    /// for. This is the one place the question is answered, and it is the
+    /// difference between an inbox and a firehose.
+    ///
+    /// Everything here is asked of Slack's own read state rather than of
+    /// rho's dealing cursor: a mention read on the phone this morning is
+    /// not asking for anything, and the flood was rho going on asking about
+    /// it. A channel with plain unread traffic and nothing addressed to the
+    /// reader is in the list with its count and is not a card, unless the
+    /// reader opted into it.
+    pub fn attention(&self, unit: &Unit) -> Option<Attention> {
+        let facts = self.units.get(unit)?;
+        // Muted is the reader's standing "not this room", said in Slack and
+        // honoured here. Nothing in a muted conversation is a card, however
+        // unread it is.
+        if self.muted.contains(&unit.channel) {
+            return None;
+        }
+        // Nothing from anyone else since the reader last looked: whoever
+        // else has written, they have read it.
+        let newest = facts.newest_from_other.as_ref()?;
+        match &unit.thread {
+            Some(root) => {
+                let key = self.key(&unit.channel, root);
+                // Slack owns the follow list. A thread it stopped following
+                // is not the reader's business, whatever rho once raised.
+                if !self.followed.contains(&key) {
+                    return None;
+                }
+                self.thread_read
+                    .get(&key)
+                    .is_none_or(|read| newest.is_newer_than(read))
+                    .then_some(Attention::FollowedThread)
+            }
+            None => {
+                if self
+                    .conversation_read
+                    .get(&unit.channel)
+                    .is_some_and(|read| !newest.is_newer_than(read))
+                {
+                    return None;
+                }
+                match facts.reason {
+                    Reason::DirectMessage => Some(Attention::DirectMessage),
+                    Reason::Mention => Some(Attention::Mentioned),
+                    // A thread reply that landed before the follow list
+                    // did, so it is filed against the conversation. The feed
+                    // only carries threads that are the reader's, so it asks
+                    // for them as surely as one filed against its thread.
+                    Reason::Thread => Some(Attention::FollowedThread),
+                    Reason::Watched => self
+                        .watched
+                        .contains(&unit.channel)
+                        .then_some(Attention::WatchedChannel),
+                }
+            }
+        }
+    }
+
+    /// Every unit asking for the reader, longest wait first. The dealer's
+    /// whole input: a unit missing from here is one Slack is not badging,
+    /// and a unit in here carries the words for why.
+    ///
+    /// Costs the cards, not the units: the set is maintained on the events
+    /// that change it, so a workspace with four thousand conversations and
+    /// nine cards draws nine.
+    pub fn cards(&self, now_ms: i64) -> Vec<UnitCard> {
+        let mut cards = self
+            .asking
+            .keys()
+            .filter_map(|unit| self.card(unit, now_ms))
+            .collect::<Vec<_>>();
+        cards.sort_by(|left, right| right.wait_days.total_cmp(&left.wait_days));
+        cards
+    }
+
+    /// Works the rule out for one unit and records the answer. The only
+    /// way into `asking`, so the kept set and the rule cannot drift.
+    fn refresh_attention(&mut self, unit: &Unit) {
+        match self.attention(unit) {
+            Some(reason) => {
+                self.asking.insert(unit.clone(), reason);
+            }
+            None => {
+                self.asking.remove(unit);
+            }
+        }
+    }
+
+    /// The same, for every unit in one conversation: the conversation
+    /// itself and the followed threads hanging in it, and nothing else.
+    ///
+    /// Units are keyed by (channel, thread), so this is a range scan over
+    /// one channel's own entries — the cost of a mark is the threads in the
+    /// channel that was marked, not the workspace.
+    fn refresh_channel(&mut self, channel: &ChannelId) {
+        let units = self.units_in(channel).cloned().collect::<Vec<_>>();
+        for unit in units {
+            self.refresh_attention(&unit);
+        }
+    }
+
+    /// Every unit rho tracks in one conversation, in key order. The upper
+    /// bound is the channel id with a null byte after it, which no channel
+    /// id can be and every unit in this channel sorts before.
+    fn units_in(&self, channel: &ChannelId) -> impl Iterator<Item = &Unit> {
+        let start = Unit::conversation(channel);
+        let end = Unit::conversation(&ChannelId(format!("{}\0", channel.as_str())));
+        self.units.range(start..end).map(|(unit, _)| unit)
     }
 }
 
@@ -1116,14 +1405,11 @@ mod tests {
     /// the model for directly, now derived here because the store is what
     /// deals.
     fn owed(model: &Model, now_ms: i64) -> Vec<UnitCard> {
-        let mut cards = model
-            .tracked()
+        model
+            .cards(now_ms)
             .into_iter()
-            .filter_map(|unit| model.card(&unit, now_ms))
             .filter(|card| card.waiting == Waiting::OnYou)
-            .collect::<Vec<_>>();
-        cards.sort_by(|left, right| right.wait_days.total_cmp(&left.wait_days));
-        cards
+            .collect()
     }
 
     #[test]
@@ -1224,6 +1510,220 @@ mod tests {
             thread_ts: Some(Ts(thread.into())),
             ..message(channel, ts, user, text)
         }
+    }
+
+    /// The flood, and the fix. A channel nobody addressed the reader in is
+    /// in the list with its count, where they can go and read it; it never
+    /// asks. Opting into it is the reader's own word that it should, and
+    /// opting back out takes only the asking away.
+    #[test]
+    fn a_channel_with_plain_unreads_is_in_the_list_and_never_a_card() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        assert_eq!(
+            model.note_message(&message("C1", "100", "U1", "shipping today"), 0),
+            None,
+            "traffic in a channel is not a unit at all"
+        );
+        model.set_counts([ConversationCount {
+            channel: design.clone(),
+            has_unreads: true,
+            mention_count: 0,
+            unread_count: 1,
+            latest: Some(Ts("100".into())),
+            last_read: None,
+        }]);
+        let row = model
+            .conversation_rows()
+            .into_iter()
+            .find(|row| row.id == design)
+            .expect("the channel is in the list");
+        assert!(row.unread, "with its count, which is where unreads belong");
+        assert_eq!(row.unread_count, 1);
+        assert!(!row.watched);
+        assert!(model.cards(0).is_empty(), "and nothing is handed over");
+
+        // The reader opts in. What already landed is theirs from now on.
+        assert!(model.set_watching(&design, true));
+        assert_eq!(
+            model.note_message(&message("C1", "101", "U1", "and again"), 0),
+            Some(Change::Raised(Unit::conversation(&design)))
+        );
+        let cards = model.cards(0);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].attention, Some(Attention::WatchedChannel));
+        assert_eq!(
+            reason_text(cards[0].attention.unwrap(), &cards[0].conversation),
+            "unread in #design, watched here"
+        );
+        assert!(
+            model
+                .conversation_rows()
+                .into_iter()
+                .any(|row| row.id == design && row.watched),
+            "and the opt-in reads on the line it was made on"
+        );
+
+        // Opting out stops the asking. The unit stays, so Find still
+        // reaches it and a row the reader filed is not pulled away.
+        assert!(model.set_watching(&design, false));
+        assert!(model.cards(0).is_empty());
+        assert!(model.unit(&Unit::conversation(&design)).is_some());
+    }
+
+    /// The other half of the flood: a mention the reader read on their
+    /// phone this morning. Slack's cursor is past it, so Slack is not
+    /// badging it, so neither is rho — whatever rho's own dealing cursor
+    /// says, which is a different question about a different thing.
+    #[test]
+    fn a_mention_read_in_another_client_stops_asking() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        assert_eq!(
+            model.cards(0).first().and_then(|card| card.attention),
+            Some(Attention::Mentioned)
+        );
+        assert_eq!(
+            reason_text(Attention::Mentioned, "#design"),
+            "mentioned in #design"
+        );
+
+        // The phone marked it read at the mention itself.
+        model.mark_read(&design, &Ts("100".into()));
+        assert!(model.cards(0).is_empty());
+
+        // And a later mention asks again: the cursor is a place, not a
+        // verdict on the channel.
+        model.note_message(&message("C1", "200", "U1", "<@ME> still?"), 0);
+        assert_eq!(
+            model.cards(0).first().and_then(|card| card.attention),
+            Some(Attention::Mentioned)
+        );
+    }
+
+    /// A followed thread answers to its own cursor. Reading the channel
+    /// around it says nothing about it, which is the whole reason Slack
+    /// keeps the two apart.
+    #[test]
+    fn a_followed_thread_asks_until_its_own_cursor_passes_the_reply() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        model.follow(&design, &Ts("100".into()));
+        model.note_message(&reply("C1", "150", "100", "U1", "one more thing"), 0);
+        let key = model.key(&design, &Ts("100".into()));
+        let unit = Unit::thread(&design, &Ts("100".into()));
+        assert_eq!(model.attention(&unit), Some(Attention::FollowedThread));
+        assert_eq!(
+            reason_text(Attention::FollowedThread, "#design"),
+            "a reply in a followed thread in #design"
+        );
+
+        model.mark_read(&design, &Ts("999".into()));
+        assert_eq!(
+            model.attention(&unit),
+            Some(Attention::FollowedThread),
+            "reading the channel is not reading the thread"
+        );
+        model.mark_thread_read(&key, &Ts("150".into()));
+        assert_eq!(model.attention(&unit), None);
+    }
+
+    /// Muting is the reader saying "not this room", in Slack, from any
+    /// client. Nothing in a muted conversation is handed over, however
+    /// unread it is.
+    #[test]
+    fn a_muted_conversation_asks_for_nothing() {
+        let mut model = model();
+        model.note_message(&message("D1", "100", "U1", "lunch?"), 0);
+        assert_eq!(
+            model.cards(0).first().and_then(|card| card.attention),
+            Some(Attention::DirectMessage)
+        );
+        assert_eq!(
+            reason_text(Attention::DirectMessage, "@ada"),
+            "unread in @ada"
+        );
+        model.set_muted([ChannelId("D1".into())]);
+        assert!(model.cards(0).is_empty());
+    }
+
+    /// A channel the reader was named in and then opted into says the
+    /// stronger of the two things: the mention is what they will want to
+    /// answer, and it stands until the cursor passes it.
+    #[test]
+    fn a_mention_in_a_watched_channel_still_reads_as_a_mention() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        model.set_watching(&design, true);
+        model.note_message(&message("C1", "100", "U1", "shipping today"), 0);
+        assert_eq!(
+            model.attention(&Unit::conversation(&design)),
+            Some(Attention::WatchedChannel)
+        );
+        model.note_message(&message("C1", "200", "U1", "<@ME> can you look?"), 0);
+        assert_eq!(
+            model.attention(&Unit::conversation(&design)),
+            Some(Attention::Mentioned)
+        );
+    }
+
+    /// The kept set and the rule must say the same thing after anything
+    /// that can move either. A card that is asked for and never kept is a
+    /// card that never appears; one that is kept and no longer asked for is
+    /// the flood coming back the other way.
+    #[test]
+    fn what_is_kept_and_what_the_rule_says_never_drift() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        let direct = ChannelId("D1".into());
+        let agrees = |model: &Model, at: &str| {
+            let kept = model.cards(0).into_iter().map(|card| card.unit);
+            let asked = model
+                .tracked()
+                .into_iter()
+                .filter(|unit| model.attention(unit).is_some());
+            let mut kept = kept.collect::<Vec<_>>();
+            let mut asked = asked.collect::<Vec<_>>();
+            kept.sort();
+            asked.sort();
+            assert_eq!(kept, asked, "{at}");
+        };
+
+        model.note_message(&message("C1", "100", "U1", "hey <@ME>"), 0);
+        agrees(&model, "a mention arrives");
+        model.note_message(&message("D1", "110", "U1", "lunch?"), 0);
+        agrees(&model, "a direct message arrives");
+        model.follow(&design, &Ts("100".into()));
+        model.note_message(&reply("C1", "120", "100", "U1", "and?"), 0);
+        agrees(&model, "a followed thread gets a reply");
+        model.mark_read(&design, &Ts("100".into()));
+        agrees(&model, "the channel is read");
+        model.mark_thread_read(&model.key(&design, &Ts("100".into())), &Ts("120".into()));
+        agrees(&model, "the thread is read at its own cursor");
+        model.set_watching(&design, true);
+        model.note_message(&message("C1", "200", "U1", "unrelated"), 0);
+        agrees(&model, "the channel is opted into");
+        model.set_muted([design.clone()]);
+        agrees(&model, "and then muted");
+        model.set_muted([]);
+        agrees(&model, "and unmuted somewhere else");
+        model.set_watching(&design, false);
+        agrees(&model, "and opted back out");
+        model.set_counts([ConversationCount {
+            channel: direct.clone(),
+            has_unreads: false,
+            mention_count: 0,
+            unread_count: 0,
+            latest: Some(Ts("110".into())),
+            last_read: Some(Ts("110".into())),
+        }]);
+        agrees(
+            &model,
+            "and Slack says the direct message was read elsewhere",
+        );
+        model.unfollow(&design, &Ts("100".into()));
+        agrees(&model, "and the thread is unfollowed");
     }
 
     #[test]
@@ -1521,15 +2021,33 @@ mod tests {
         assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnThem);
     }
 
+    /// Reading is not a verdict, and this is where the two stop being
+    /// confused. A verdict — done, skip, defer — is the reader's own key
+    /// and only theirs, and the desk keeps those cursors untouched. Reading
+    /// is a fact about a message, Slack records it from whichever client
+    /// did it, and a message everyone can see the reader has read is not
+    /// something to go on handing them.
+    ///
+    /// The unit stays: it is still a conversation, Find still reaches it,
+    /// and the facts on it are unchanged. What goes is the asking.
     #[test]
-    fn reading_elsewhere_clears_the_badge_and_keeps_the_card() {
-        // Verdicts are the user's keys only. Reading on the phone means the
-        // unread badge is stale, nothing more: the ping still owes an answer.
+    fn reading_elsewhere_clears_the_badge_and_stops_the_asking() {
         let mut model = model();
         model.note_message(&message("D1", "600", "U1", "ping"), 0);
         let key = Unit::conversation(&ChannelId("D1".into()));
+        assert_eq!(owed(&model, 0).len(), 1);
+
         model.mark_read(&ChannelId("D1".into()), &Ts("600".into()));
-        assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnYou);
+        assert_eq!(
+            model.unit(&key).unwrap().waiting(),
+            Waiting::OnYou,
+            "whose turn it is has not changed; nobody answered"
+        );
+        assert!(model.attention(&key).is_none());
+        assert!(owed(&model, 0).is_empty());
+
+        // And the next thing they say asks again.
+        model.note_message(&message("D1", "700", "U1", "still there?"), 0);
         assert_eq!(owed(&model, 0).len(), 1);
     }
 

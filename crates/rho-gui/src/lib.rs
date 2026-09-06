@@ -135,6 +135,7 @@ actions!(
         SlackCompose,
         SlackSearch,
         SlackMarkReadBefore,
+        SlackWatchChannel,
         SlackNextUnread,
         SlackEditMessage,
         SlackEditLast,
@@ -474,12 +475,18 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ]);
     }
     // Marking the old backlog is a list-wide verb, so it lives on the list
-    // and not inside a conversation.
+    // and not inside a conversation, and so is watching the row under the
+    // point.
     for context in [
         "RhoSlackList > Editor && vim_mode == normal && !VimDeal",
         "RhoSlackList > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
-        cx.bind_keys([KeyBinding::new("m", SlackMarkReadBefore, Some(context))]);
+        cx.bind_keys([
+            KeyBinding::new("m", SlackMarkReadBefore, Some(context)),
+            // Opting a channel into being handed to the reader is a verdict
+            // about the channel, so it is made on the channel's own line.
+            KeyBinding::new("w", SlackWatchChannel, Some(context)),
+        ]);
     }
     cx.bind_keys([
         KeyBinding::new(

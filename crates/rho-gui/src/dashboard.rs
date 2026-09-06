@@ -234,6 +234,14 @@ pub enum DealCardKind {
 pub struct SlackFacts {
     pub title: String,
     pub conversation: String,
+    /// Why Slack is asking for the reader here, or `None` when it is not
+    /// asking at all: a unit whose messages have all been read is still a
+    /// unit — Find reaches it — but it is no longer a card. The fact, not
+    /// the sentence.
+    /// The words are made from this and `conversation` when the card is
+    /// drawn, so a conversation named late reads as `#design` and never as
+    /// a stale line written when the message landed.
+    pub reason: Option<rho_slack::model::Attention>,
     pub raised_at: chrono::DateTime<chrono::FixedOffset>,
     /// How long the ball has been where it is, counted from the newest
     /// message: the wait a `needs reply` card rises on, and the age a
@@ -3766,15 +3774,21 @@ impl Dashboard {
     }
 }
 
-/// What a thread's card says and how hard it pushes. The state, then how
-/// long it has been in that state: whose turn it is is the whole of what a
-/// thread's card says. Somebody waiting outranks a note of the same age,
-/// the way a blocked agent outranks an FYI.
+/// What a thread's card says and how hard it pushes. Why it is here, then
+/// whose turn it is, then how long it has been that way. Somebody waiting
+/// outranks a note of the same age, the way a blocked agent outranks an FYI.
+///
+/// The reason is made here rather than carried, out of the fact and the
+/// conversation's name as it reads now: a card that says `mentioned in
+/// #design` is a card the reader can answer without opening it.
 fn thread_card_facts(
     thread: &SlackFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> (String, f64) {
     let _ = now;
+    let reason = thread
+        .reason
+        .map(|reason| rho_slack::model::reason_text(reason, &thread.conversation));
     let (state, priority) = match thread.waiting_on.is_some() {
         // The user answered: the thread is theirs to carry now, so the card
         // is a reminder that fades, not a demand that grows.
@@ -3784,10 +3798,12 @@ fn thread_card_facts(
             THREAD_REPLY_HEAD_START + BLOCKED_REPLY_SLOPE_PER_DAY * thread.wait_days,
         ),
     };
-    (
-        format!("{state} · {}", age_label(thread.wait_days)),
-        priority,
-    )
+    let age = age_label(thread.wait_days);
+    let line = match reason {
+        Some(reason) => format!("{reason} · {state} · {age}"),
+        None => format!("{state} · {age}"),
+    };
+    (line, priority)
 }
 
 #[cfg(test)]
@@ -3827,6 +3843,7 @@ mod tests {
                 waiting_on: None,
                 latest: "500.0".to_owned(),
                 newest_from_other: Some("500.0".to_owned()),
+                reason: Some(rho_slack::model::Attention::FollowedThread),
             },
         )]);
         assert_eq!(
@@ -3855,10 +3872,14 @@ mod tests {
             waiting_on: waiting_on.map(str::to_owned),
             latest: "500.0".into(),
             newest_from_other: Some("500.0".into()),
+            reason: Some(rho_slack::model::Attention::FollowedThread),
         };
 
         let (label, priority) = thread_card_facts(&thread(None, 2.0), now);
-        assert_eq!(label, "needs reply · 2.0d");
+        assert_eq!(
+            label, "a reply in a followed thread in #design · needs reply · 2.0d",
+            "the card says why it is here before it says whose turn it is"
+        );
         // Nothing addressed to the machine reaches what the reader sees.
         assert!(!label.contains("C1"));
         assert!(!label.contains("500.0"));
@@ -3870,7 +3891,10 @@ mod tests {
         // Answering flips the word and the curve: the card fades from the
         // reply instead of rising, and is under the floor after three days.
         let (label, replied) = thread_card_facts(&thread(Some("#design"), 2.0), now);
-        assert_eq!(label, "replied · 2.0d");
+        assert_eq!(
+            label,
+            "a reply in a followed thread in #design · replied · 2.0d"
+        );
         assert_eq!(replied, fyi_reply_priority(2.0));
         assert!(replied > DEAL_QUEUE_FLOOR);
         assert!(thread_card_facts(&thread(Some("#design"), 3.5), now).1 <= DEAL_QUEUE_FLOOR);

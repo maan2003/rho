@@ -6890,6 +6890,7 @@ impl DeskFixture {
                 title: "any update?".to_owned(),
                 newest: rho_desk::cells::SlackTs(newest.clone()),
                 newest_from_other: Some(rho_desk::cells::SlackTs(newest.clone())),
+                reason: Some(rho_slack::model::Attention::FollowedThread),
             })
             .collect()
     }
@@ -7725,6 +7726,7 @@ fn a_done_slack_unit_is_not_reopened_by_anything_slack_replays(cx: &mut TestAppC
             title: "any update?".to_owned(),
             newest: rho_desk::cells::SlackTs(newest.to_owned()),
             newest_from_other: Some(rho_desk::cells::SlackTs(from_other.to_owned())),
+            reason: Some(rho_slack::model::Attention::FollowedThread),
         }]
     };
 
@@ -7817,6 +7819,7 @@ fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppConte
             title: "any update?".to_owned(),
             newest: rho_desk::cells::SlackTs("600.0".to_owned()),
             newest_from_other: Some(rho_desk::cells::SlackTs(from_other.to_owned())),
+            reason: Some(rho_slack::model::Attention::FollowedThread),
         }]
     };
 
@@ -7934,6 +7937,7 @@ fn a_muted_slack_unit_stays_off_home_until_it_is_opened(cx: &mut TestAppContext)
             title: "lunch?".to_owned(),
             newest: rho_desk::cells::SlackTs(newest.to_owned()),
             newest_from_other: Some(rho_desk::cells::SlackTs(newest.to_owned())),
+            reason: Some(rho_slack::model::Attention::FollowedThread),
         }]
     };
 

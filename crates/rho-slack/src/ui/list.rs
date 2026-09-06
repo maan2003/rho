@@ -264,6 +264,12 @@ fn render_rows(rows: &[ConversationRow], filter: &str) -> (Vec<Vec<Span>>, Vec<O
             }));
             spans.push(span);
         }
+        // The opt-in reads where it was made, and reads as a word rather
+        // than a glyph: a mark nobody can name is a mark nobody undoes.
+        if row.watched {
+            spans.push(Span::plain("  "));
+            spans.push(Span::styled("watched", Class::Muted));
+        }
         if let Some(latest) = &row.latest {
             spans.push(Span::plain("  "));
             spans.push(Span::styled(
@@ -300,6 +306,7 @@ mod tests {
             mention_count: mentions,
             unread_count: 0,
             muted: false,
+            watched: false,
             latest: None,
         }
     }

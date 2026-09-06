@@ -422,8 +422,36 @@ impl Session {
         if let Some(id) = mirror.self_id(&workspace) {
             self.model.set_self(id);
         }
+        // Before the units are read, because a channel the reader opted
+        // into is one whose ordinary traffic raises units: read the opt-in
+        // after and a restart would forget every card it earned.
+        self.model.set_watched(mirror.watched(&workspace));
         seed_read_cursors(&mut self.model, &mirror);
+        // The units as the last run left them: one range scan, one row per
+        // unit, no messages read. A mirror written before rho kept them has
+        // to work them out from history the once, and says so afterwards so
+        // that no later start pays it again.
+        match mirror.units_derived(&workspace) {
+            true => restore_units(&mut self.model, &mirror),
+            false => self.rebuild_units_from_mirror(),
+        }
+    }
+
+    /// Works the units out from the mirror's own history and writes them
+    /// down. The one pass over messages rho makes, on a mirror that predates
+    /// the units table or when a rebuild is asked for.
+    fn rebuild_units_from_mirror(&mut self) {
+        let Some(mirror) = self.mirror.clone() else {
+            return;
+        };
         self.derive_units_from_mirror();
+        let workspace = self.model.workspace().0.clone();
+        for unit in self.model.tracked() {
+            if let Some(facts) = self.model.unit(&unit) {
+                mirror.put_unit(&workspace, &unit, facts);
+            }
+        }
+        mirror.set_units_derived(&workspace);
     }
 
     /// A restart is another source of the same messages, and like every
@@ -852,8 +880,33 @@ impl Session {
     }
 
     fn announce(&mut self, changes: Vec<Change>, cx: &mut Context<Self>) {
-        if !changes.is_empty() {
-            cx.emit(SessionEvent::Changed(changes));
+        if changes.is_empty() {
+            return;
+        }
+        self.write_units(&changes);
+        cx.emit(SessionEvent::Changed(changes));
+    }
+
+    /// Puts the units a change moved on disk, and only those.
+    ///
+    /// This is what a start reads instead of the history: the facts are
+    /// written when they move, so opening rho costs the units rho tracks
+    /// rather than the messages it holds. A muted thread's row goes, since
+    /// the follow that made it a unit is gone.
+    fn write_units(&self, changes: &[Change]) {
+        let Some(mirror) = self.mirror.as_ref() else {
+            return;
+        };
+        let workspace = self.model.workspace().0.clone();
+        for change in changes {
+            match change {
+                Change::Raised(unit) | Change::Updated(unit) | Change::Replied(unit) => {
+                    if let Some(facts) = self.model.unit(unit) {
+                        mirror.put_unit(&workspace, unit, facts);
+                    }
+                }
+                Change::Muted(unit) => mirror.remove_unit(&workspace, unit),
+            }
         }
     }
 
@@ -1626,6 +1679,38 @@ impl Session {
         }));
     }
 
+    /// Opts the reader into a channel, or out of it: the standing word that
+    /// this channel's ordinary traffic is to be handed to them rather than
+    /// left in the list with a count.
+    ///
+    /// Slack has nothing to say about this, so nothing is sent: it is rho's
+    /// own fact and it goes straight to rho's own file. Opting in takes
+    /// effect on what the mirror already holds, so a channel opted into
+    /// this second raises the cards its unread traffic has earned rather
+    /// than waiting for the next message to arrive.
+    pub fn set_watching(
+        &mut self,
+        channel: &ChannelId,
+        watching: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.model.set_watching(channel, watching) {
+            return false;
+        }
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_watched(&self.model.workspace().0.clone(), channel, watching);
+        }
+        if watching {
+            self.derive_units_from_mirror();
+        }
+        cx.notify();
+        true
+    }
+
+    pub fn watches(&self, channel: &ChannelId) -> bool {
+        self.model.watches(channel)
+    }
+
     /// Slack's ignore thread: the mute the user just made here, made
     /// everywhere they read Slack. One request, and rho keeps no
     /// subscription state of its own, so the socket's `thread_unsubscribed`
@@ -2073,7 +2158,7 @@ const STARTUP_WINDOW: usize = 200;
 /// Conversations only: which threads are followed is Slack's list, and it
 /// arrives carrying each thread's own cursor, so there is nothing here for
 /// a thread to be seeded from.
-fn seed_read_cursors(model: &mut Model, mirror: &Mirror) {
+pub fn seed_read_cursors(model: &mut Model, mirror: &Mirror) {
     let workspace = model.workspace().0.clone();
     for channel in model.conversations() {
         if let Some(ts) = mirror.last_read(&Scope::conversation(&workspace, &channel)) {
@@ -2082,10 +2167,22 @@ fn seed_read_cursors(model: &mut Model, mirror: &Mirror) {
     }
 }
 
+/// The units the last run wrote down, installed as they stand.
+///
+/// Free, like [`derive_units`], so the start can be proven without standing
+/// a session up: the thing being proven is that this reads units and never
+/// messages, and a test of it should not need a socket.
+pub fn restore_units(model: &mut Model, mirror: &Mirror) {
+    let workspace = model.workspace().0.clone();
+    for (unit, facts) in mirror.units(&workspace) {
+        model.restore_unit(unit, facts);
+    }
+}
+
 /// The units the mirror's own history implies, raised into the model.
 /// Every conversation the mirror knows and every followed thread is walked,
 /// and the model decides which messages are the user's business.
-fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
+pub fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
     let workspace = model.workspace().0.clone();
     let mut scopes = mirror
         .conversations(&workspace)
@@ -2231,6 +2328,80 @@ mod tests {
             members: Vec::new(),
         }]);
         (dir, mirror, model)
+    }
+
+    /// The start that does not read history. The units the last run wrote
+    /// are the answer already; walking the messages again to reach the same
+    /// answer is the cost the rule forbids, and on a real mirror it is the
+    /// difference between a start you notice and one you do not.
+    ///
+    /// Proven by leaving the mirror's history empty: nothing here could be
+    /// derived, so a unit that comes back came back off its own row.
+    #[test]
+    fn a_start_reads_the_units_the_last_run_wrote_and_never_its_messages() {
+        let (_dir, mirror, mut model) = seeded();
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+        mirror.put_unit(
+            "T1",
+            &unit,
+            &crate::model::UnitFacts {
+                reason: crate::types::Reason::Mention,
+                newest: Ts("300.0".into()),
+                newest_from_other: Some(Ts("300.0".into())),
+                newest_from_you: false,
+                first_seen_ms: 1_000,
+            },
+        );
+        assert!(
+            mirror
+                .newest_chunk(&Scope::conversation("T1", &ChannelId("C1".into())), 10)
+                .is_empty(),
+            "the history is empty, so nothing below can have been derived"
+        );
+
+        restore_units(&mut model, &mirror);
+        assert_eq!(model.tracked(), vec![unit.clone()]);
+        assert_eq!(model.unit(&unit).unwrap().first_seen_ms, 1_000);
+        assert_eq!(
+            model.attention(&unit),
+            Some(crate::model::Attention::Mentioned),
+            "and it asks, off its own row, with no message read"
+        );
+
+        // The feed replaying what the row already holds does not raise it
+        // twice: the row's timestamps are marked seen when it is installed.
+        assert_eq!(
+            model.note_activity(
+                &crate::api::ActivityItem {
+                    channel: ChannelId("C1".into()),
+                    ts: Ts("300.0".into()),
+                    thread_ts: None,
+                    kind: crate::api::ActivityKind::Mention,
+                    unread: true,
+                },
+                0
+            ),
+            None
+        );
+    }
+
+    /// The opt-in is the reader's standing word, so it outlives the session
+    /// that made it. It is rho's own fact and lives in rho's own file.
+    #[test]
+    fn the_opt_in_comes_back_off_the_file_after_a_restart() {
+        let (_dir, mirror, mut model) = seeded();
+        let design = ChannelId("C1".into());
+        assert!(model.set_watching(&design, true));
+        mirror.set_watched("T1", &design, true);
+
+        let mut next = Model::new(crate::config::WorkspaceName("T1".into()));
+        next.set_watched(mirror.watched("T1"));
+        assert!(next.watches(&design));
+
+        mirror.set_watched("T1", &design, false);
+        let mut after = Model::new(crate::config::WorkspaceName("T1".into()));
+        after.set_watched(mirror.watched("T1"));
+        assert!(!after.watches(&design));
     }
 
     /// A restart is another source of the same messages and may only raise

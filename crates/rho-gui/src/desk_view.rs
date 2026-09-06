@@ -132,6 +132,10 @@ pub struct SlackSource {
     /// The newest message from someone else that concerns the user. The
     /// card is open exactly while this is past the cursor.
     pub newest_from_other: Option<SlackTs>,
+    /// Why Slack is asking for the reader here, or `None` when it is not.
+    /// Decided in rho-slack against Slack's own read state, and the first
+    /// of the two conditions a card has to meet.
+    pub reason: Option<rho_slack::model::Attention>,
 }
 
 /// What the browser says about one open tab. A tab is never created in
@@ -278,8 +282,14 @@ struct SlackCard {
 }
 
 /// A Slack unit's card, derived and never stored. It is open exactly while
-/// someone else has written past the cursor the user's last verdict left,
-/// which is the one comparison a replayed history page cannot change.
+/// two things hold at once: Slack itself is asking about the unit, and
+/// someone else has written past the cursor the user's last verdict left.
+///
+/// The first is the crate's answer and the flood fix — a channel with plain
+/// unread traffic is in the conversation list with its count and is not a
+/// card, and a mention already read elsewhere has stopped asking. The
+/// second is the desk's own, and is the one comparison a replayed history
+/// page cannot change.
 fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
     let Id::Slack(unit) = id else {
         return None;
@@ -294,10 +304,21 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
         // A mute is the one verdict the cursor cannot express: the user said
         // "not this unit", not "not up to here", so nothing arriving past the
         // cursor reopens it. Opening the unit is what clears the state.
-        state: match (facts.state, past(facts.slack_handled_through.as_ref())) {
-            (State::Muted, _) => State::Muted,
-            (_, true) => State::Open,
-            (_, false) => State::Done,
+        state: match (
+            facts.state,
+            source.reason,
+            past(facts.slack_handled_through.as_ref()),
+        ) {
+            (State::Muted, _, _) => State::Muted,
+            // Slack is not badging this unit, so nothing here is owed: read
+            // on the phone, or ordinary traffic in a channel nobody opted
+            // into. The desk's cursor has nothing to say about a question
+            // that is no longer being asked.
+            (_, None, _) => State::Done,
+            (_, Some(_), past) => match past {
+                true => State::Open,
+                false => State::Done,
+            },
         },
         // The snooze recorded where the unit stood; anything from someone
         // else past that arrived while it was snoozed, and that is what

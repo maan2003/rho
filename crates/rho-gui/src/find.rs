@@ -566,6 +566,7 @@ mod tests {
                 mention_count: 0,
                 unread_count: 0,
                 muted: false,
+                watched: false,
                 latest: Some(Ts::from("120.000000")),
             }],
             vec![(
@@ -573,6 +574,7 @@ mod tests {
                 UnitCard {
                     unit: Unit::thread(&key.channel, &key.thread_ts),
                     conversation: "#design".to_owned(),
+                    attention: None,
                     waiting: Waiting::OnYou,
                     wait_days: 0.0,
                     newest: Ts::from("140.000000"),

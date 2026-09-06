@@ -765,6 +765,34 @@ done right after the transcript primitive (2.4) and before 2.10:
       thread read leaving its channel alone, a mark short of the newest
       message leaving the badge standing, and the feed walked back through
       its pages.
+- [x] 2.25 A card is a card only when Slack would badge it. The user's
+      report: Slack cards flood dealing to uselessness. Landed as the
+      second change of the crate order. The rule is `Model::attention`, one
+      place, asked of Slack's own read state and not of rho's dealing
+      cursor: a DM or group DM with something unread, a mention, a reply in
+      a followed thread since the reader last looked, or unread traffic in
+      a channel the reader opted into. A channel with plain unreads is in
+      the list with its count and is never a card, which is the flood.
+      Every card says what it is for in the words a reader reads —
+      `mentioned in #design`, `a reply in a followed thread in #design`,
+      `unread in @ada`, `unread in #random, watched here` — built at draw
+      time from the fact and the roster's current label, never stored, so a
+      conversation named late is not left reading a stale sentence.
+      This reverses something the crate used to hold, and it should be read
+      as a decision rather than a bug fix: reading on the phone used to
+      leave the card standing, on the ground that verdicts are the user's
+      keys only. Reading is not a verdict. It is a fact about a message,
+      Slack records it from whichever client did it, and a message everyone
+      can see the reader has read is not something to go on handing them. A
+      verdict — done, skip, defer — is still the reader's key alone and the
+      desk's cursors are untouched.
+- [x] 2.26 Opting a channel in. A channel whose ordinary traffic the reader
+      does want handed to them: `w` on its row in the list, echoed, and the
+      word `watched` on the line from then on. rho's own fact and not
+      Slack's, so it lives in rho's own file — a typed table in
+      `slack.redb` — and comes back at startup. Opting out stops the
+      asking and leaves the unit standing, so Find still reaches it and a
+      row the reader half filed is not pulled out from under them.
 
 ## Phase 3: composing
 

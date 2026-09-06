@@ -1527,3 +1527,108 @@ async fn a_restart_walks_back_through_the_feed_until_it_reaches_what_it_knows() 
         "and reached the first item it had not seen"
     );
 }
+
+/// The flood, proven where it lives: against a server that badges the way
+/// Slack badges.
+///
+/// Three conversations arrive with unread traffic in all three. Slack
+/// itself presses for two of them — the mention and the direct message —
+/// and counts the third without pressing. rho hands over exactly what Slack
+/// presses for; the channel nobody addressed the reader in is in the list
+/// with its count and is not a card.
+#[tokio::test]
+async fn only_what_slack_would_badge_is_handed_over() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.add_dm("D1", "U1");
+    fake.add_message(
+        "C1",
+        json!({"ts": "600.0", "user": "U1", "text": "hey <@ME>"}),
+    );
+    fake.add_message(
+        "C2",
+        json!({"ts": "610.0", "user": "U1", "text": "deploy is green"}),
+    );
+    fake.add_message(
+        "C2",
+        json!({"ts": "611.0", "user": "U1", "text": "and out"}),
+    );
+    fake.add_message("D1", json!({"ts": "620.0", "user": "U1", "text": "lunch?"}));
+    fake.set_count("C1", true, 1, "600.0");
+    fake.set_count("C2", true, 0, "611.0");
+    fake.set_count("D1", true, 0, "620.0");
+    let client = client(&fake);
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.set_self(rho_slack::types::UserId("ME".into()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_counts(client.counts().await.unwrap().conversations);
+    for channel in ["C1", "C2", "D1"] {
+        let history = client
+            .conversations_history(&ChannelId(channel.into()), None)
+            .await
+            .unwrap();
+        for message in &history.messages {
+            model.note_message(message, 0);
+        }
+    }
+
+    // All three are in the list, all three unread. Reading is not the
+    // question; being handed over is.
+    let rows = model.conversation_rows();
+    assert_eq!(rows.iter().filter(|row| row.unread).count(), 3);
+    assert!(
+        rows.iter().any(|row| row.label == "#random" && row.unread),
+        "the channel nobody addressed the reader in is in the list, with its count"
+    );
+
+    let cards = model.cards(0);
+    let reasons = cards
+        .iter()
+        .map(|card| rho_slack::model::reason_text(card.attention.unwrap(), &card.conversation))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        vec![
+            "mentioned in #design".to_owned(),
+            "unread in @ada".to_owned()
+        ],
+        "two cards, longest wait first, each saying what it is for; #random is not among them"
+    );
+
+    // The reader reads the mention on their phone. Slack recomputes its own
+    // badge, rho asks Slack, and the card goes.
+    fake.live_mark("C1", None);
+    model.set_counts(client.counts().await.unwrap().conversations);
+    assert_eq!(
+        fake.unread("C1"),
+        (false, 0, 0),
+        "the server is the one that stopped badging it"
+    );
+    assert_eq!(
+        model
+            .cards(0)
+            .into_iter()
+            .map(|card| card.conversation)
+            .collect::<Vec<_>>(),
+        vec!["@ada".to_owned()]
+    );
+
+    // And the reader opts into #random, which is the one way a channel with
+    // plain traffic becomes theirs.
+    let random = ChannelId("C2".into());
+    assert!(model.set_watching(&random, true));
+    let history = client.conversations_history(&random, None).await.unwrap();
+    for message in &history.messages {
+        model.note_message(message, 0);
+    }
+    let cards = model.cards(0);
+    assert!(
+        cards.iter().any(|card| card.conversation == "#random"
+            && card.attention == Some(rho_slack::model::Attention::WatchedChannel)),
+        "opted into, so what lands there is handed over"
+    );
+}

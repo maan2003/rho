@@ -164,6 +164,71 @@ wrong at the design, not at the polish.
   `SlackHandledThrough` was not touched. Six proofs against the fake, one
   of them replacing a test that had been asserting the bug. Gate green:
   rho-slack 144.
+  *2 landed.* The card rule, in the crate, as Slack's own notion of
+  attention. `Model::attention` is the one place the question is answered
+  and it asks Slack's own read state, not rho's dealing cursor: a unit is a
+  card when it is a DM or group DM with something unread, a mention, a reply
+  in a followed thread since the reader last looked, or unread traffic in a
+  channel the reader opted into. A channel with plain unreads is in the list
+  with its count and is never a card. Every card carries the fact of why —
+  `Attention`, not a sentence — and the words are made at draw time by
+  `reason_text` out of the roster's current label, so a conversation named
+  late reads `mentioned in #design` rather than a line written when the
+  message landed. `slack_thread_facts` no longer decides what a card is; it
+  carries the crate's answer, and `desk_view::slack_card` closes what the
+  crate says nothing for. The desk's two cursors are untouched.
+  On the record, because it reverses a documented behaviour: reading is a
+  fact about a message and Slack's cursor is the truth for it, so a card
+  read on the phone leaves. A verdict is the reader's key alone, and the
+  desk's cursors are untouched. The test that asserted the old behaviour is
+  rewritten to assert the new one and says why.
+  The opt-in is rho's own fact, not Slack's, so it lives in rho's own file:
+  a typed `rho_slack_watched_v1` table in `slack.redb`, written where the
+  reader opts in with `w` on the row in the list, read back at startup, and
+  shown as the word `watched` on the line it was made on.
+  Under the cost rule. The rule keeps `asking`, the set of units currently
+  a card, maintained by every event that can change it — a message, a mark,
+  a mute, a follow, an opt-in, Slack's counts — each touching only the units
+  it names; a channel-level event reaches its own units by a range scan over
+  one channel's keys and no further. Drawing the cards costs the cards. And
+  a start no longer reads history: the per-unit facts live in a typed
+  `rho_slack_units_v1` table, written on the event that moves them, so a
+  start is one range scan of one row per unit. History is walked exactly
+  once, on a mirror written before the table existed, and the mirror says
+  so afterwards so no later start pays it again.
+  Numbers, from `cargo run --example card_rule` over a reflinked copy of the
+  snapshot's `slack.redb` (5 conversations, 211 messages, 4 units): start
+  reading messages 3.20 ms, start reading units 156 µs — 20× on a fixture,
+  and the gap grows with history because one side is O(messages) and the
+  other O(units). One mark 1.3 µs. One draw of the cards 4.8 µs. One draw
+  of the conversation list 4.2 µs for 5 rows, which is the O(n log n) per
+  draw that change 2b removes. Card counts old rule 4, new rule 4: on this
+  fixture every unit is a mention or a DM, so there is no plain-traffic
+  channel for the new rule to drop, and the fixture cannot show the flood.
+  The real-mirror numbers wait for a snapshot taken after the mirror
+  persists — the file we have holds only the QA fixture, because no Slack
+  workspace is registered on the machine, so no session has ever run to
+  write it. Proven instead against the fake, which badges the way Slack
+  badges: `only_what_slack_would_badge_is_handed_over` serves three unread
+  conversations and gets two cards.
+  Found while looking for the flood, and left for the dealing composition
+  rather than patched here: **a Slack row can be shown Open by a client
+  that has no session**. `Sources` is in memory, so at a start with no
+  session it is empty; `slack_card` has no source to derive from and the
+  node falls back to the state the store holds, which no rule can then
+  move. The composition must make that impossible: a Slack card exists
+  while `rho-slack` asks and not otherwise, verdicts stay the desk's, and
+  the map never decides a source's attention. `Model::attention` and the
+  `asking` set are what it composes. This is also why the machine looked
+  flooded with no session running: the user's GUI runs on their own device
+  and its state, with the real credentials and the real mirror, is there
+  rather than on the devbox the snapshot was taken from. rho now says as
+  much at startup instead of deciding in silence that it has no Slack.
+  Wanted from `rho-window`, for change 3: a transient buffer — opens under
+  the point, lists keys and their meanings, takes one key, closes, leaves
+  the surface behind it undisturbed, and back returns to it. Reactions and
+  search are shaped around it and it is not built in `rho-slack`.
+  Gate green: rho-slack 153 (119 lib, 8 mirror, 26 transport), rho-gui 276.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is

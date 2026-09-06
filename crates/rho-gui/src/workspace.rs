@@ -65,9 +65,9 @@ use crate::{
     MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus,
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
     ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage,
-    SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
-    ZulipNextUnread, ZulipOpenRow,
+    SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch, SlackWatchChannel,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -1089,8 +1089,19 @@ impl Workspace {
         this.refresh_dashboard(window, cx);
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
-        // looking at Slack.
-        this.slack_session(window, cx);
+        // looking at Slack. And when there is no session it says so: rho
+        // deciding in silence that it has no Slack is how a device with no
+        // workspace on it looks exactly like one whose Slack went quiet.
+        if this.slack_session(window, cx).is_none() {
+            // In the log and not the echo line: startup does not get to put
+            // a line in the place the next thing the reader does will
+            // answer in.
+            this.append_message(
+                "no slack workspace on this device".to_owned(),
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
         this
     }
 
@@ -5767,6 +5778,7 @@ impl Workspace {
                     title: facts.title,
                     newest: rho_desk::cells::SlackTs(facts.latest),
                     newest_from_other: facts.newest_from_other.map(rho_desk::cells::SlackTs),
+                    reason: facts.reason,
                 })
                 .collect()
         } else {
@@ -9428,6 +9440,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackWatchChannel, window, cx| {
+                this.toggle_slack_watch(window, cx);
             }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
