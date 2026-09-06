@@ -247,11 +247,7 @@ impl AgentRegistry {
     #[cfg(test)]
     pub fn tell(&mut self, host: HostId, entries: &[LogEntry]) -> Vec<AgentId> {
         let mut changed = Vec::new();
-        let mut attention_before = BTreeMap::new();
         for entry in entries {
-            attention_before
-                .entry(entry.agent_id)
-                .or_insert_with(|| self.attention(entry.agent_id));
             let told = match self.mirror.get_mut(&entry.agent_id) {
                 Some(mirrored) => mirrored.tell(entry.pos, &entry.event),
                 None => match MirroredAgent::new(host, entry.agent_id, &entry.event) {
@@ -272,12 +268,6 @@ impl AgentRegistry {
         if !changed.is_empty() {
             self.rebuild(None);
         }
-        // A row can move attention on its own (a turn ends asking for
-        // the user); the dealer reads the revision to know.
-        if attention_before
-            .iter()
-            .any(|(agent_id, before)| self.attention(*agent_id) != *before)
-        {}
         changed
     }
 
@@ -291,23 +281,13 @@ impl AgentRegistry {
             return Vec::new();
         }
         let mut changed = Vec::new();
-        let mut attention_before = BTreeMap::new();
         for mirrored in agents {
             let agent_id = mirrored.agent_id();
-            attention_before
-                .entry(agent_id)
-                .or_insert_with(|| self.attention(agent_id));
-            if self.mirror.insert(agent_id, mirrored).is_none() {}
+            self.mirror.insert(agent_id, mirrored);
             self.agents.entry(agent_id).or_insert(AgentLife::Known);
             changed.push(agent_id);
         }
         self.rebuild(None);
-        // A row can move attention on its own (a turn ends asking for
-        // the user); the dealer reads the revision to know.
-        if attention_before
-            .iter()
-            .any(|(agent_id, before)| self.attention(*agent_id) != *before)
-        {}
         changed
     }
 
@@ -469,9 +449,7 @@ impl AgentRegistry {
         if self.verdicts.get(&agent_id) == Some(&verdict) {
             return false;
         }
-        let before = self.attention(agent_id);
         self.verdicts.insert(agent_id, verdict);
-        if self.attention(agent_id) != before {}
         true
     }
 
@@ -702,11 +680,10 @@ impl AgentRegistry {
     }
     pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
         let previous = self.agents.insert(agent_id, AgentLife::Live);
-        if previous.is_none() {}
         previous != Some(AgentLife::Live)
     }
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
-        if self.agents.insert(agent_id, AgentLife::Known).is_none() {}
+        self.agents.insert(agent_id, AgentLife::Known);
     }
     pub fn active_pane(&self) -> ActivePane {
         self.active
