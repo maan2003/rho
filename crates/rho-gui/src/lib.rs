@@ -385,19 +385,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     ]);
     // `n` and `N` repeat the last search. Vim's own do nothing in this app:
     // they go through a pane's search bar and there is no pane, which is why
-    // `/` is the host's in the first place. Bound before the surfaces below,
-    // deliberately: a surface that wants `n` for itself — the Zulip inbox
-    // and the Slack rooms want it for the next unread — binds it after this
-    // and wins, and everywhere else the action gives the key back when there
-    // is nothing to repeat.
-    for context in [
-        "RhoGui > Editor && vim_mode == normal && vim_operator == none",
-        "RhoGui > Editor && vim_mode == helix_normal && vim_operator == none",
-    ] {
-        cx.bind_keys([
-            KeyBinding::new("n", SearchRepeat, Some(context)),
-            KeyBinding::new("shift-n", SearchRepeatReverse, Some(context)),
-        ]);
+    // `/` is the host's in the first place. Bound in the two contexts that
+    // have a buffer search and nowhere else — a key means one thing per
+    // context, and the Zulip inbox and the Slack rooms keep `n` and `N` for
+    // the next unread by their own binding, not by being loaded after this
+    // one.
+    for surface in ["RhoTranscript", "RhoDashboard"] {
+        for mode in ["normal", "helix_normal"] {
+            let context =
+                format!("{surface} > Editor && vim_mode == {mode} && vim_operator == none");
+            cx.bind_keys([
+                KeyBinding::new("n", SearchRepeat, Some(&context)),
+                KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
+            ]);
+        }
     }
     for context in [
         "RhoZulipInbox > Editor && vim_mode == normal",

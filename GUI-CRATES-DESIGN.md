@@ -347,11 +347,13 @@ wrong at the design, not at the polish.
     workspace's — one search register, as vim has one, so a query typed in
     a transcript repeats on the desk and the other way about. Vim's own
     `n` does nothing in this app, because it goes through a pane's search
-    bar and there is no pane, which is the same reason `/` is the host's;
-    the binding sits before the surfaces that want `n` for themselves (the
-    Zulip inbox and the Slack rooms, for the next unread), so those keep
-    it, and everywhere else the action gives the key back when there is
-    nothing to repeat.
+    bar and there is no pane, which is the same reason `/` is the host's.
+    A key means one thing per context, and a context is named: `n` and `N`
+    are bound in `RhoTranscript` and `RhoDashboard`, the two surfaces that
+    have a search, and the Zulip inbox and the Slack rooms keep them for
+    the next unread by their own contexts rather than by being loaded
+    later. A test asserts both halves; load order carrying a rule was the
+    fragility it replaces.
   - **The point survives leaving and returning**, and it survives as a
     store position — which block, and how far into it — never a buffer
     offset. `AgentModel` remembers it whenever the point moves in the

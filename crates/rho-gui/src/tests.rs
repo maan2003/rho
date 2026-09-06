@@ -5142,6 +5142,72 @@ fn searching_a_transcript_composes_the_history_it_looks_through(cx: &mut TestApp
     );
 }
 
+/// A key means one thing per context. `n` and `N` are the search repeat on
+/// the two surfaces that have a search, and the next unread on the two that
+/// read rooms — by their own contexts, not by which binding was loaded
+/// last.
+#[gpui::test]
+fn n_is_the_search_repeat_where_there_is_a_search_and_the_next_unread_where_there_is_a_room(
+    cx: &mut TestAppContext,
+) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let routes = |key: &str, contexts: &[KeyContext]| {
+            let stroke = Keystroke::parse(key).unwrap();
+            keymap
+                .bindings_for_input(&[stroke], contexts)
+                .0
+                .first()
+                .map(|binding| binding.action().name())
+        };
+        let surface = |name: &str, mode: &str| {
+            [
+                KeyContext::parse("RhoGui").unwrap(),
+                KeyContext::parse(name).unwrap(),
+                KeyContext::parse(&format!(
+                    "Editor VimControl vim_mode={mode} vim_operator=none"
+                ))
+                .unwrap(),
+            ]
+        };
+        for mode in ["normal", "helix_normal"] {
+            for name in ["RhoTranscript", "RhoDashboard"] {
+                let searchable = surface(name, mode);
+                assert_eq!(
+                    routes("n", &searchable),
+                    Some("rho_gui::SearchRepeat"),
+                    "`n` repeats the search on {name}"
+                );
+                assert_eq!(
+                    routes("shift-n", &searchable),
+                    Some("rho_gui::SearchRepeatReverse"),
+                    "`shift-n` repeats it backwards on {name}"
+                );
+            }
+
+            let room = surface("RhoSlackConversation", mode);
+            assert_eq!(routes("shift-n", &room), Some("rho_gui::SlackNextUnread"));
+            assert_ne!(routes("n", &room), Some("rho_gui::SearchRepeat"));
+
+            let inbox = [
+                KeyContext::parse("RhoGui").unwrap(),
+                KeyContext::parse("RhoZulipInbox").unwrap(),
+                KeyContext::parse(&format!("Editor VimControl vim_mode={mode}")).unwrap(),
+            ];
+            assert_eq!(routes("n", &inbox), Some("rho_gui::ZulipNextUnread"));
+
+            // A surface with neither a search nor a room keeps vim's own,
+            // which in this app means nothing at all.
+            let note = surface("RhoNote", mode);
+            assert_ne!(routes("n", &note), Some("rho_gui::SearchRepeat"));
+        }
+    });
+}
+
 /// A search that cannot be repeated is half a search: `n` runs the last
 /// query again from the point, and `shift-n` runs it the other way.
 #[gpui::test]

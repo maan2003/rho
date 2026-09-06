@@ -9596,6 +9596,10 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::Transcript { editor, .. } => div()
                 .id("rho-surface-transcript")
+                // Named because keys are bound to it: a transcript is one of
+                // the two surfaces with a search of its own, so it is one of
+                // the two that has `n`.
+                .key_context("RhoTranscript")
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
