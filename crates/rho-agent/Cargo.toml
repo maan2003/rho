@@ -43,4 +43,3 @@ uuid.workspace = true
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
-zstd = "0.13"

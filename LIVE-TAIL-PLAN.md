@@ -192,27 +192,14 @@ Landed with these deviations:
 
 ## The old loop's rows (6 Sep)
 
-The previous Rho loop wrote five variants the runtime no longer
-writes: `InferenceResponse`, `ToolResult`, `Queued`, `Dequeued` and
-`PresentationUpdated`. The migration rewrites them into the current
-vocabulary so nothing after it reads the old world: `Queued` becomes
-`Accepted`; the `ToolResult` rows of a turn and the items a `Dequeued`
-delivered become one `Sent` (a `NextTurn` item held back at a
-`NextRequest` boundary is accepted again at the end of the log, as the
-old replay queued it); `InferenceResponse` becomes `Replied`, carrying
-the context the old replay would have shown (a compaction clears it,
-`Some` overrides it, `None` keeps the last); `PresentationUpdated`
-becomes `Presented`. Old rows carried no time, so a translated row
-takes the last time seen on the lineage (a tool result's `finished_at`
-counts), or the agent's creation. The old enum and its payload types
-live only in `db/legacy_events.rs`, read through `SenAs` under the old
-type name, and go with the migration in the cleanup landing; the
-runtime `AgentEvent` has no legacy variant. The layout proof replays
-every agent both ways, the old replay over the old rows and the
-current one over the translation, and holds history, owed calls,
-context use and the queues equal: on a copy (6 Sep) 2824 agents
-replay the same context with 1,054,194 old-loop rows translated, in
-37 s including the migration.
+The previous Rho loop wrote five variants the runtime no longer writes.
+The migration `b1e40c93 -> 50351c18` rewrote them into the current
+vocabulary (`Accepted`, `Sent`, `Replied`, `Presented`) by the old
+replay's rules; a proof on a copy replayed every agent both ways and
+held history, owed calls, context use and the queues equal (2824
+agents, 1,054,194 rows translated). It ran on the live store on 6 Sep
+and was removed with the old types in the landing after; nothing in
+the tree reads or names the old world now.
 
 ## Rolling back (6 Sep)
 
@@ -223,14 +210,9 @@ any table is touched, records the id under the hop in
 (daemon stopped) restores that savepoint and drops it; the store is
 then at the old layout for an older build. `rho debug savepoints`
 lists what the store holds. While a savepoint exists redb frees no
-page it covers, so the file grows by what the migration rewrote; drop
-it with the migration once the new build has run.
-
-Proven on a copy (release build, 6 Sep): the migration rewrites 2824
-agents and 1.11M rows in 16s and commits in 4s, 21s in all; rollback
-restores the old format, heads and the exact table set in 60ms; the
-layout proof then replays every agent unchanged from the rolled-back
-store.
+page it covers, so the file grows by what the migration rewrote;
+`rho debug forget-savepoints` drops it once the new build is verified.
+This stays for every migration to come; the 6 Sep one is gone.
 
 Found on the way: the live store holds ten persistent savepoints
 (ids 11 to 29) left by migrations of older builds whose code was

@@ -21,9 +21,6 @@ use uuid::Uuid;
 use crate::AgentEvent;
 use crate::mirror::{Feed, Journal, LogAppended};
 
-mod fused_migration;
-mod legacy_events;
-
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
 /// [`PrefixIdDomain::machine_seed`]), generated once at init.
@@ -62,14 +59,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-/// The one hop the user's store makes: from records, lineages and the
-/// presentation table straight to the per-agent log and the journal.
-/// Removed once it has run on that store.
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "b1e40c93",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: fused_migration::migrate,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -266,14 +256,9 @@ pub use rho_core::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWorkflow, EngineerIntelligence,
 };
 
-/// A position in one agent's log: dense from zero, never reused. Encoded
-/// as a named struct so the positions the old lineage log wrote inside
-/// its `PresentationUpdated` rows (`db/legacy_events.rs`) still decode
-/// for the migration (their fields are skipped and this one defaults;
-/// nothing reads them). The default goes with the migration.
+/// A position in one agent's log: dense from zero, never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct AgentEventPos {
-    #[senax(default)]
     pub pos: u64,
 }
 

@@ -623,8 +623,9 @@ F. **The pure mirror and the journal** (the 6 Sep revision). In three
    previous Rho loop wrote (`InferenceResponse`, `ToolResult`,
    `Queued`, `Dequeued`, `PresentationUpdated`) are rewritten as
    `Replied`, `Sent`, `Accepted` and `Presented` by the old replay's
-   rules, so the runtime enum has no legacy variant; the old enum
-   lives in `db/legacy_events.rs` and leaves with the migration. A title the sidecar
+   rules, so the runtime enum has no legacy variant; the old enum and
+   the migration were removed in the landing after (6 Sep), once the
+   user's store had made the hop. A title the sidecar
    gave an agent with a spawn name stays in the log now, where the old
    head dropped it; a reader prefers the spawn name on its own. On a
    `cp` of the store: 2824 agents, 1,109,932 rows, 110 forks, 146 heads
