@@ -29,7 +29,6 @@ use crate::db::{
 pub mod agent;
 mod claude;
 pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
-pub use claude::backfill::backfill_claude_transcripts;
 
 pub mod db;
 mod image_tool;

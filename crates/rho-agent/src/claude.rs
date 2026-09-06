@@ -34,7 +34,6 @@ use crate::{
     InputQueues, MessageDelivery, QueuedInput, StartWorkdir, TranscriptLine, system_prompt,
 };
 
-pub(crate) mod backfill;
 pub(crate) mod projection;
 
 use projection::{ClaudeStreamItem, transcript_line};
@@ -616,8 +615,7 @@ impl TranscriptCopy {
     /// One read from the cursor: the lines since, as rows, and the cursor
     /// after them, in one transaction. A file shorter than the cursor is
     /// read from its start, skipping what the log holds. A cursor moved
-    /// by another writer since the read (the copy at daemon start) is
-    /// read from again.
+    /// by another writer since the read is read from again.
     async fn copy(
         &mut self,
         db: &RhoDb,
@@ -701,7 +699,7 @@ fn cursor_end(cursor: Option<ClaudeTranscriptCursor>, session_id: Uuid) -> u64 {
 }
 
 /// The uuid of every `Transcript` row in the log.
-pub(super) fn told_lines(read: &rho_db::ReadTxn, agent_id: AgentId) -> HashSet<Uuid> {
+fn told_lines(read: &rho_db::ReadTxn, agent_id: AgentId) -> HashSet<Uuid> {
     read.agent_event_records(agent_id)
         .1
         .into_iter()
@@ -713,7 +711,7 @@ pub(super) fn told_lines(read: &rho_db::ReadTxn, agent_id: AgentId) -> HashSet<U
 }
 
 /// One line of the file, as the row it makes.
-pub(super) struct LineRow {
+struct LineRow {
     uuid: Uuid,
     offset: u64,
     line: TranscriptLine,
@@ -722,7 +720,7 @@ pub(super) struct LineRow {
 
 /// The rows for lines read: none for a line in `told`, a hidden one, or
 /// one that does not parse (said on stderr).
-pub(super) fn project_rows(
+fn project_rows(
     agent_id: AgentId,
     lines: &[TailLine],
     told: Option<&HashSet<Uuid>>,
@@ -754,7 +752,7 @@ pub(super) fn project_rows(
 
 /// Appends the rows: the last one said by a person or the model, and the
 /// context occupancy the last one reported.
-pub(super) fn append_rows(
+fn append_rows(
     write: &mut WriteTxn,
     agent_id: AgentId,
     rows: Vec<LineRow>,
@@ -2231,7 +2229,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");
     }
 
-    pub(super) async fn claude_test_agent(session_id: Uuid) -> (tempfile::TempDir, RhoDb, AgentId) {
+    async fn claude_test_agent(session_id: Uuid) -> (tempfile::TempDir, RhoDb, AgentId) {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
         let mut write = db.write().await;
@@ -2260,19 +2258,19 @@ mod tests {
         (temp, db, agent_id)
     }
 
-    pub(super) fn user_json(uuid: &str, text: &str) -> String {
+    fn user_json(uuid: &str, text: &str) -> String {
         format!(
             r#"{{"type":"user","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","timestamp":"2026-09-06T10:00:00.000Z","message":{{"role":"user","content":"{text}"}}}}"#
         )
     }
 
-    pub(super) fn assistant_json(uuid: &str, text: &str) -> String {
+    fn assistant_json(uuid: &str, text: &str) -> String {
         format!(
             r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"00000000-0000-4000-8000-000000000002","timestamp":"2026-09-06T10:00:01.000Z","message":{{"role":"assistant","id":"msg_{uuid}","usage":{{"input_tokens":1,"output_tokens":2}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#
         )
     }
 
-    pub(super) fn transcript_rows(db: &RhoDb, agent_id: AgentId) -> Vec<(AgentEventPos, String)> {
+    fn transcript_rows(db: &RhoDb, agent_id: AgentId) -> Vec<(AgentEventPos, String)> {
         db.read()
             .agent_event_records(agent_id)
             .1
@@ -2292,12 +2290,12 @@ mod tests {
             .collect()
     }
 
-    pub(super) fn told(rows: &[(AgentEventPos, String)]) -> Vec<&str> {
+    fn told(rows: &[(AgentEventPos, String)]) -> Vec<&str> {
         rows.iter().map(|(_, line)| line.as_str()).collect()
     }
 
-    pub(super) const U1: &str = "00000000-0000-4000-8000-000000000011";
-    pub(super) const A1: &str = "00000000-0000-4000-8000-000000000012";
+    const U1: &str = "00000000-0000-4000-8000-000000000011";
+    const A1: &str = "00000000-0000-4000-8000-000000000012";
     const U2: &str = "00000000-0000-4000-8000-000000000013";
     const A2: &str = "00000000-0000-4000-8000-000000000014";
 

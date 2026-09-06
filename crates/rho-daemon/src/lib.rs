@@ -429,9 +429,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
     drop_converted_tables(&agents.db).await;
-    // One-off, in the background so a restart is never held for it:
-    // Claude agents from before 6 Sep get their session files copied.
-    tokio::spawn(rho_agent::backfill_claude_transcripts(agents.db.clone()));
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(

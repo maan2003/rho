@@ -323,15 +323,11 @@ live tail and the bell:
   cursor again inside its transaction and reads again if it moved, so two
   writers never tell a line twice. The file is taken as a straight line:
   Rho never branches a session file, it forks.
-- **The older rows are taken back once, at daemon start.**
-  `backfill_claude_transcripts` (`claude/backfill.rs`) walks every Claude
-  agent without a cursor in the background, newest first, one agent per
-  transaction: one `Rewound` over the rows the loop before 6 Sep wrote
-  from the stream, then the file's rows, then the cursor. An agent whose
-  file is gone (Claude deletes old sessions) keeps its rows and gets a
-  cursor at zero so it is not asked again. A load that gets there first
-  wins; the cursor is the lock. Delete the module once every store has
-  started under this build; the loop does not know it ran.
+- **The older rows were taken back once.** A one-off at daemon start
+  (`backfill_claude_transcripts`, gone with the 7 Sep cleanup) put one
+  `Rewound` over the rows the loop before 6 Sep wrote from the stream and
+  copied each file behind a cursor; an agent whose file was gone kept its
+  rows.
 - **The stream is the bell.** After each `assistant` and `user` message
   the loop reads the tail and waits (25 ms steps, 1 s at most) until that
   message's uuid is in, so a turn end or a want is never told ahead of the
