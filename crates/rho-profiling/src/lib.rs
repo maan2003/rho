@@ -103,6 +103,25 @@ struct RhoEditorStageV1 {
     flags: u64,
 }
 
+/// The newest rolling segments a running profiler has on disk, oldest first.
+pub struct RollingSegments {
+    pub segments: Vec<Vec<u8>>,
+    /// Whether the last segment is the one the writer had not sealed yet, so
+    /// a reader can say how much of its tail is a real hole and how much is
+    /// simply the newest thing recorded.
+    pub tail_unsealed: bool,
+}
+
+/// Reads the segment the writer is still appending to, up to whatever the
+/// flush thread has put on disk. `None` when there is nothing usable there:
+/// a just-rotated file has no header yet, and an unreadable one is no worse
+/// than the sealed-only snapshot we used to take.
+fn read_unsealed_segment(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    dial9_trace_format::decoder::Decoder::new(&bytes)?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
 impl CpuProfiler {
     pub fn start(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let path = absolute_path(path.into())?;
@@ -164,11 +183,19 @@ impl CpuProfiler {
         })
     }
 
-    /// Copies the newest sealed rolling segments, oldest first.
-    pub fn snapshot_segments(&self, limit: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+    /// Copies the newest rolling segments, oldest first, including the one
+    /// still being written.
+    ///
+    /// The unsealed tail is where the stalls we chase end up: a segment is
+    /// sealed by write activity, so a freeze that stops the world leaves its
+    /// own samples in the active file, and taking only sealed segments loses
+    /// exactly the seconds worth having. Truncation costs nothing, since the
+    /// decoder stops at the last whole frame.
+    pub fn snapshot_segments(&self, limit: usize) -> anyhow::Result<RollingSegments> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
         let mut segments = BTreeMap::<u32, (Option<PathBuf>, Option<PathBuf>)>::new();
+        let mut active: Option<(u32, PathBuf)> = None;
         for entry in std::fs::read_dir(parent)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -183,12 +210,20 @@ impl CpuProfiler {
             let Some((index, suffix)) = rest.split_once(".bin") else {
                 continue;
             };
-            if !suffix.is_empty() && suffix != ".gz" {
+            if !suffix.is_empty() && suffix != ".gz" && suffix != ".active" {
                 continue;
             }
-            let Ok(index) = index.parse() else {
+            let Ok(index) = index.parse::<u32>() else {
                 continue;
             };
+            if suffix == ".active" {
+                // Newest wins: a rotation between two read_dir entries can
+                // leave a stale active file behind.
+                if active.as_ref().is_none_or(|(at, _)| *at < index) {
+                    active = Some((index, path));
+                }
+                continue;
+            }
             let paths = segments.entry(index).or_default();
             if suffix == ".gz" {
                 paths.1 = Some(path);
@@ -196,10 +231,10 @@ impl CpuProfiler {
                 paths.0 = Some(path);
             }
         }
-        // Active files end in `.bin.active`, which the suffix filter above
-        // intentionally excludes. Only self-contained sealed segments remain.
-        let skip = segments.len().saturating_sub(limit);
-        segments
+        let tail = active.and_then(|(_, path)| read_unsealed_segment(&path));
+        let sealed_limit = limit.saturating_sub(usize::from(tail.is_some()));
+        let skip = segments.len().saturating_sub(sealed_limit);
+        let mut segments = segments
             .into_values()
             .skip(skip)
             .filter_map(|(raw, compressed)| {
@@ -218,7 +253,13 @@ impl CpuProfiler {
                 // between read_dir and read. A missing segment is harmless.
                 None
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let tail_unsealed = tail.is_some();
+        segments.extend(tail);
+        Ok(RollingSegments {
+            segments,
+            tail_unsealed,
+        })
     }
 
     /// Stops a rolling profiler and flushes its current segment.
@@ -454,5 +495,32 @@ mod tests {
             .unwrap();
         assert_eq!(output, directory.path().join("cpu.0.bin.gz"));
         assert!(std::fs::metadata(output).unwrap().len() > 0);
+    }
+
+    /// A freeze is recorded in the segment still being written, because the
+    /// writes that would seal it are what the freeze stopped. Sealed-only
+    /// snapshots dropped exactly that, so the tail comes back marked.
+    #[test]
+    fn a_rolling_snapshot_keeps_the_unsealed_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cpu.bin");
+        let profiler = super::CpuProfiler::start_rolling(
+            &path,
+            std::time::Duration::from_millis(100),
+            1024 * 1024,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            std::hint::black_box((1..1000).sum::<u64>());
+        }
+        let snapshot = profiler.snapshot_segments(8).unwrap();
+        assert!(snapshot.tail_unsealed, "the active segment was dropped");
+        let tail = snapshot.segments.last().expect("a tail to read");
+        assert!(
+            dial9_trace_format::decoder::Decoder::new(tail).is_some(),
+            "the unsealed tail does not decode"
+        );
+        profiler.shutdown().unwrap();
     }
 }

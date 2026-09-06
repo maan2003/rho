@@ -331,16 +331,36 @@ impl AgentRegistry {
         changed
     }
 
-    /// The user's filing of an agent, from the store: hidden, and the
-    /// labels they put on it. Nothing on the wire carries either.
-    pub fn set_agent_filing(&mut self, agent_id: AgentId, hidden: bool, labels: Vec<String>) {
-        let hidden = hidden || labels.iter().any(|label| label == HIDE_LABEL);
-        if self.filing.get(&agent_id) == Some(&(hidden, labels.clone())) {
-            return;
+    /// The user's filing of the agents named, from the store: hidden, and
+    /// the labels they put on them. Nothing on the wire carries either.
+    ///
+    /// The desk files them all at once, so they are taken all at once: one
+    /// rebuild for the lot. Filed one by one, a first desk sync of n agents
+    /// cost n rebuilds of n agents. Says whether any filing moved, so that
+    /// what is derived from filing is made again only when it did.
+    pub fn set_agent_filings(
+        &mut self,
+        filings: impl IntoIterator<Item = (AgentId, bool, Vec<String>)>,
+    ) -> bool {
+        let mut moved = false;
+        for (agent_id, hidden, labels) in filings {
+            let hidden = hidden || labels.iter().any(|label| label == HIDE_LABEL);
+            if self
+                .filing
+                .get(&agent_id)
+                .is_some_and(|filed| filed.0 == hidden && filed.1 == labels)
+            {
+                continue;
+            }
+            self.filing.insert(agent_id, (hidden, labels));
+            moved = true;
         }
-        self.filing.insert(agent_id, (hidden, labels));
+        if !moved {
+            return false;
+        }
         self.rebuild(None);
         self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        true
     }
 
     /// Every agent this client knows, oldest first.
@@ -817,6 +837,38 @@ mod tests {
                 event,
             })
             .collect()
+    }
+
+    /// The desk files every agent in one go, so the registry rebuilds once.
+    /// Filed one at a time this was a rebuild of n agents per agent, and it
+    /// was 3,120 of 3,395 main-thread samples on a first desk sync.
+    #[test]
+    fn filing_a_whole_desk_rebuilds_once() {
+        let mut registry = AgentRegistry::default();
+        let agents = (1..=32)
+            .map(|nth| AgentId::from_counter(nth, &AgentIdDomain(0)).unwrap())
+            .collect::<Vec<_>>();
+        for agent_id in &agents {
+            registry.mark_known(*agent_id);
+        }
+        let filings = agents
+            .iter()
+            .map(|agent_id| (*agent_id, false, vec!["rho/agent".to_owned()]))
+            .collect::<Vec<_>>();
+
+        let before = registry.deal_count_revision();
+        assert!(registry.set_agent_filings(filings.clone()));
+        assert_eq!(
+            registry.deal_count_revision(),
+            before.wrapping_add(1),
+            "filing the desk rebuilt more than once"
+        );
+
+        // A desk sync that files what is already filed says so, so what is
+        // derived from filing is not made again.
+        let after = registry.deal_count_revision();
+        assert!(!registry.set_agent_filings(filings));
+        assert_eq!(registry.deal_count_revision(), after);
     }
 
     #[test]

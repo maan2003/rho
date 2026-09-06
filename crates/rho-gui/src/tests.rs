@@ -1646,6 +1646,98 @@ fn dashboard_has_no_persistent_masthead_block(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// Slice 3's claim, read off the display map itself: a `Changed` for one
+/// agent costs no display-map resync at all. Before the slice it rebuilt the
+/// whole tree, and every buffer disabled its header one at a time.
+#[gpui::test]
+fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
+    // The trace is a process-wide ring shared with any test running beside
+    // this one, so the counting is by thread. Nothing turns it back off:
+    // the flag is only ever set, and the ring is bounded.
+    gpui::profiler::set_editor_trace_enabled(true);
+    // SAFETY: gettid has no arguments or memory-safety preconditions.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
+    let mut timings = gpui::profiler::EditorTimingCollector::new();
+    let mut block_map_syncs = move || {
+        let mine = timings
+            .collect_unseen()
+            .into_iter()
+            .filter(|timing| {
+                timing.tid == tid
+                    && matches!(timing.kind, gpui::profiler::EditorTimingKind::BlockMapSync)
+            })
+            .collect::<Vec<_>>();
+        let rows: u64 = mine
+            .iter()
+            .map(|timing| timing.old_rows.max(timing.new_rows))
+            .sum();
+        (mine.len(), rows)
+    };
+
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Desk");
+    let agents = (1..=8).map(agent).collect::<Vec<_>>();
+    for (nth, id) in agents.iter().enumerate() {
+        desk.agent_row(parent.clone(), *id);
+        desk.note(Some(parent.clone()), &format!("note {nth}"));
+    }
+
+    let workspace = overview_workspace(cx);
+    cx.run_until_parked();
+    block_map_syncs();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    agents
+                        .iter()
+                        .enumerate()
+                        .map(|(nth, id)| story::UiAgentHead {
+                            generated_title: Some(format!("agent {nth}")),
+                            ..ui_head(*id)
+                        })
+                        .collect(),
+                    100,
+                ),
+                window,
+                cx,
+            );
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+    // What the build costs is the rig's question, not this test's: the
+    // pathology needed thousands of filed agents, not eight.
+    block_map_syncs();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::Log {
+                    entries: story::head_entries(story::UiAgentHead {
+                        generated_title: Some("renamed".to_owned()),
+                        ..ui_head(agents[2])
+                    }),
+                },
+                window,
+                cx,
+            );
+        })
+        .expect("one agent's title changes");
+    cx.run_until_parked();
+    let (syncs, rows) = block_map_syncs();
+    assert_eq!(
+        (syncs, rows),
+        (0, 0),
+        "a change to one agent resynced the display map"
+    );
+}
+
 fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
     let editor = active_editor(workspace, cx);
     editor_excerpt_boundary_count(workspace, &editor, cx)

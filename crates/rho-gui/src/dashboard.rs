@@ -932,10 +932,10 @@ impl Dashboard {
             .map(|buffer| buffer.read(cx).remote_id())
             .filter(|id| !self.headers_disabled.contains(id))
             .collect::<Vec<_>>();
+        // One call, not one per buffer: each of these resyncs the display
+        // map, so a build of n rows cost n block-map syncs of n rows.
         self.editor.update(cx, |editor, cx| {
-            for id in &new_ids {
-                editor.disable_header_for_buffer(*id, cx);
-            }
+            editor.disable_headers_for_buffers(new_ids.iter().copied(), cx);
         });
         self.headers_disabled.extend(new_ids);
     }

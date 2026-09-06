@@ -7,8 +7,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 const CPU_ROTATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-const CPU_TRACE_DISK_BUDGET: u64 = 2 * 1024 * 1024;
-const CPU_SNAPSHOT_SEGMENTS: usize = 5;
+const CPU_TRACE_DISK_BUDGET: u64 = 8 * 1024 * 1024;
+// Half a minute of history, because the stalls worth a snapshot last
+// seconds: five segments were ten seconds, and a six-second freeze filled
+// most of the window with itself and pushed out what led up to it.
+const CPU_SNAPSHOT_SEGMENTS: usize = 16;
 
 const MAX_SNAPSHOT_FRAMES: usize = 8_192;
 const MAX_SNAPSHOT_EDITOR_EVENTS: usize = 4_096;
@@ -107,6 +110,7 @@ struct CpuProfileSnapshot {
     sampling_hz: u64,
     history_seconds: u64,
     maximum_tail_gap_ms: u64,
+    tail_unsealed: bool,
     format: &'static str,
     encoding: &'static str,
     segments: Vec<String>,
@@ -271,12 +275,16 @@ pub(crate) fn snapshot() -> anyhow::Result<Vec<u8>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .map(|passive| passive.profiler.snapshot_segments(CPU_SNAPSHOT_SEGMENTS))
-        .transpose()?
-        .unwrap_or_default();
-    snapshot_with_cpu_profiles(&cpu_profiles)
+        .transpose()?;
+    let tail_unsealed = cpu_profiles.as_ref().is_some_and(|cpu| cpu.tail_unsealed);
+    let cpu_profiles = cpu_profiles.map(|cpu| cpu.segments).unwrap_or_default();
+    snapshot_with_cpu_profiles(&cpu_profiles, tail_unsealed)
 }
 
-fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8>> {
+fn snapshot_with_cpu_profiles(
+    cpu_profiles: &[Vec<u8>],
+    tail_unsealed: bool,
+) -> anyhow::Result<Vec<u8>> {
     let started = *STARTED.get_or_init(Instant::now);
     let frames = gpui::profiler::snapshot_frame_timings();
     let editor = gpui::profiler::snapshot_editor_timings();
@@ -418,7 +426,7 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
         .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
-        version: 9,
+        version: 10,
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -439,7 +447,14 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
             CpuProfileSnapshot {
                 sampling_hz: 100,
                 history_seconds: CPU_ROTATION_PERIOD.as_secs() * CPU_SNAPSHOT_SEGMENTS as u64,
-                maximum_tail_gap_ms: CPU_ROTATION_PERIOD.as_millis() as u64,
+                // With the unsealed segment in hand the newest sample is as
+                // new as the last flush, not as old as the last rotation.
+                maximum_tail_gap_ms: if tail_unsealed {
+                    0
+                } else {
+                    CPU_ROTATION_PERIOD.as_millis() as u64
+                },
+                tail_unsealed,
                 format: "dial9-trace-v4",
                 encoding: "base64",
                 segments: cpu_profiles
@@ -527,11 +542,11 @@ mod tests {
             None,
             Some(std::time::Duration::from_millis(3)),
         );
-        let bytes = super::snapshot_with_cpu_profiles(&[]).unwrap();
+        let bytes = super::snapshot_with_cpu_profiles(&[], false).unwrap();
         assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
-        assert_eq!(value["version"], 9);
+        assert_eq!(value["version"], 10);
         assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
         assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
         assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));
@@ -566,7 +581,7 @@ mod tests {
 
     #[test]
     fn snapshot_embeds_dial9_profile() {
-        let bytes = super::snapshot_with_cpu_profiles(&[vec![1, 2, 3]]).unwrap();
+        let bytes = super::snapshot_with_cpu_profiles(&[vec![1, 2, 3]], false).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["cpu_profile"]["format"], "dial9-trace-v4");
         assert_eq!(value["cpu_profile"]["encoding"], "base64");
@@ -574,5 +589,21 @@ mod tests {
             value["cpu_profile"]["segments"],
             serde_json::json!(["AQID"])
         );
+        assert_eq!(value["cpu_profile"]["tail_unsealed"], false);
+        assert_eq!(
+            value["cpu_profile"]["maximum_tail_gap_ms"],
+            super::CPU_ROTATION_PERIOD.as_millis() as u64
+        );
+    }
+
+    /// The unsealed tail is the part that holds a stall, so a reader must be
+    /// able to tell it apart from the sealed history and know there is no
+    /// rotation-sized hole in front of it.
+    #[test]
+    fn an_unsealed_tail_is_marked_and_leaves_no_gap() {
+        let bytes = super::snapshot_with_cpu_profiles(&[vec![1, 2, 3]], true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["cpu_profile"]["tail_unsealed"], true);
+        assert_eq!(value["cpu_profile"]["maximum_tail_gap_ms"], 0);
     }
 }

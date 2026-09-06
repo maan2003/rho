@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -501,7 +501,7 @@ pub struct Workspace {
     dealer_signal_eval_scheduled: bool,
     /// Hosts whose desk is rebuilt on the next frame: rows arrive one
     /// `Log` at a time, and the rebuild walks every agent.
-    desk_sync_pending: HashSet<HostId>,
+    desk_sync_pending: HashMap<HostId, Option<BTreeSet<AgentId>>>,
     _dealer_signal_task: Task<()>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
@@ -1089,7 +1089,7 @@ impl Workspace {
             deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
-            desk_sync_pending: HashSet::new(),
+            desk_sync_pending: HashMap::new(),
             _dealer_signal_task: dealer_signal_task,
             lamp_on: false,
             dealer_signals_initialized: false,
@@ -1695,13 +1695,34 @@ impl Workspace {
 
     /// One desk rebuild per frame for a host's rows. A catch-up says
     /// nothing until it reaches the head, so this never runs per page.
-    fn schedule_desk_sync(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.desk_sync_pending.insert(host) {
+    ///
+    /// `moved` names the agents a `Changed` moved, and `None` asks for the
+    /// whole desk: a `Loaded`, a host reset, or a desk delta, where what is
+    /// on the desk at all can be different. Scopes merge, and a whole one
+    /// swallows the rest.
+    fn schedule_desk_sync(
+        &mut self,
+        host: HostId,
+        moved: Option<Vec<AgentId>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scheduled = self.desk_sync_pending.contains_key(&host);
+        let pending = self
+            .desk_sync_pending
+            .entry(host)
+            .or_insert_with(|| Some(BTreeSet::new()));
+        match (pending.as_mut(), moved) {
+            (Some(pending), Some(moved)) => pending.extend(moved),
+            (Some(_), None) => *pending = None,
+            (None, _) => {}
+        }
+        if scheduled {
             return;
         }
         cx.on_next_frame(window, move |this, window, cx| {
-            this.desk_sync_pending.remove(&host);
-            this.sync_tree_dashboard(host, window, cx);
+            let moved = this.desk_sync_pending.remove(&host).flatten();
+            this.sync_tree_rows(host, moved.as_ref(), window, cx);
             this.invalidate_dealer_signals(cx);
             cx.notify();
         });
@@ -1850,7 +1871,7 @@ impl Workspace {
             crate::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_dashboard(window, cx);
-                self.schedule_desk_sync(host, window, cx);
+                self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
             crate::model::ModelMsg::Changed { agents } => {
@@ -1861,7 +1882,9 @@ impl Workspace {
                 // The log is a source of rows, not only of facts: an agent
                 // that has just asked for the user is on the map for its own
                 // sake, so the tree the dealer reads has to be made again.
-                self.schedule_desk_sync(host, window, cx);
+                // Only for the agents that moved: the rest of the desk is
+                // what it was.
+                self.schedule_desk_sync(host, Some(changed), window, cx);
             }
             crate::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
@@ -4335,7 +4358,7 @@ impl Workspace {
             };
             self.apply_desk_writes(host, writes, Some(verdict_entry), window, cx);
         }
-        self.refresh_desk_sources(host, cx);
+        self.refresh_desk_sources(host, None, cx);
         self.invalidate_dealer_signals(cx);
         cx.notify();
         true
@@ -6172,7 +6195,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.refresh_desk_sources(host, cx);
+        self.sync_tree_rows(host, None, window, cx);
+    }
+
+    /// The map for a host, made again from the desk. `moved` names the
+    /// agents a `Changed` moved; everything else the sources hold stands.
+    fn sync_tree_rows(
+        &mut self,
+        host: HostId,
+        moved: Option<&BTreeSet<AgentId>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_desk_sources(host, moved, cx);
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
@@ -6185,46 +6220,79 @@ impl Workspace {
         }
     }
 
-    /// What the sources say right now, handed to the store's views. None
-    /// of it is written: an agent's spawner is the registry's fact and a
-    /// thread's conversation is the mirror's, and a copy could only go
-    /// stale.
-    fn refresh_desk_sources(&mut self, host: HostId, cx: &Context<Self>) {
+    /// What the desk knows of one agent, or nothing when the agent is not
+    /// this host's or the user filed it away.
+    fn agent_source(&self, host: HostId, agent: AgentId) -> Option<crate::desk_view::AgentSource> {
         /// The log's positions and the store's are the same number; the
         /// two crates just name it themselves.
         fn story_pos(pos: rho_ui_proto::mirror::AgentPos) -> rho_desk::cells::StoryPos {
             rho_desk::cells::StoryPos(pos.0)
         }
 
-        for (agent_id, hidden, labels) in self.desk_cells.agent_filing(host) {
-            self.registry.set_agent_filing(agent_id, hidden, labels);
+        if self.registry.host_of_agent(agent) != Some(host) || self.registry.agent_hidden(agent) {
+            return None;
         }
-        let agents = self
+        let digest = self.registry.agent_digest(agent);
+        Some(crate::desk_view::AgentSource {
+            agent,
+            spawned_by: self.registry.agent_parent(agent),
+            workdir: self.registry.working_directory(agent),
+            newest: digest
+                .map(|digest| story_pos(digest.newest))
+                .unwrap_or_default(),
+            turn_running: digest.is_some_and(|digest| digest.turn_running),
+            errored: digest.and_then(|digest| digest.errored).map(story_pos),
+            wants: digest.and_then(|digest| {
+                digest
+                    .wants
+                    .as_ref()
+                    .map(|wants| (wants.want, story_pos(wants.at)))
+            }),
+        })
+    }
+
+    /// What the sources say right now, handed to the store's views. None
+    /// of it is written: an agent's spawner is the registry's fact and a
+    /// thread's conversation is the mirror's, and a copy could only go
+    /// stale.
+    fn refresh_desk_sources(
+        &mut self,
+        host: HostId,
+        moved: Option<&BTreeSet<AgentId>>,
+        cx: &Context<Self>,
+    ) {
+        // A filing that moved changes who is on the desk at all, so the
+        // whole set is built again; otherwise only the agents named are.
+        let filed = self
             .registry
-            .known_agents()
-            .copied()
-            .filter(|agent| self.registry.host_of_agent(*agent) == Some(host))
-            .filter(|agent| !self.registry.agent_hidden(*agent))
-            .map(|agent| {
-                let digest = self.registry.agent_digest(agent);
-                crate::desk_view::AgentSource {
-                    agent,
-                    spawned_by: self.registry.agent_parent(agent),
-                    workdir: self.registry.working_directory(agent),
-                    newest: digest
-                        .map(|digest| story_pos(digest.newest))
-                        .unwrap_or_default(),
-                    turn_running: digest.is_some_and(|digest| digest.turn_running),
-                    errored: digest.and_then(|digest| digest.errored).map(story_pos),
-                    wants: digest.and_then(|digest| {
-                        digest
-                            .wants
-                            .as_ref()
-                            .map(|wants| (wants.want, story_pos(wants.at)))
-                    }),
+            .set_agent_filings(self.desk_cells.agent_filing(host));
+        let held = self
+            .desk_cells
+            .sources(host)
+            .map(|sources| sources.agents.clone());
+        let agents = match (moved, held) {
+            (Some(moved), Some(mut agents)) if !filed => {
+                for agent in moved {
+                    let place = agents.binary_search_by(|source| source.agent.cmp(agent));
+                    let source = self.agent_source(host, *agent);
+                    match (place, source) {
+                        (Ok(at), Some(source)) => agents[at] = source,
+                        (Ok(at), None) => {
+                            agents.remove(at);
+                        }
+                        (Err(at), Some(source)) => agents.insert(at, source),
+                        (Err(_), None) => {}
+                    }
                 }
-            })
-            .collect::<Vec<_>>();
+                agents
+            }
+            _ => self
+                .registry
+                .known_agents()
+                .copied()
+                .filter_map(|agent| self.agent_source(host, agent))
+                .collect::<Vec<_>>(),
+        };
         // The Slack mirror lives on this client, and its conversations are
         // the primary host's desk.
         // With no session there is nothing new to say about Slack, which is

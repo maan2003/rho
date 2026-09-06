@@ -181,6 +181,20 @@ agent count are the user's; the GUI in the isolated `/tmp/rho-slack-ux`
 environment) showing the per-event cost it claims.
 Each gets a landing note here.
 
+The order is 1, 3, 4, 2. Slice 3 and slice 4 come before slice 2 because
+a profile said so, twice. On the rig, 89% of the main thread was in
+`sync_tree_dashboard` and the registry was 19 samples, so the registry
+that slice 2 replaces is not what costs. A snapshot the user then took on
+their own machine
+(`gui-telemetry-1788709749665-0.json`, release aarch64, 9,744 rows) put a
+number on it: a 6,350ms frozen frame, and every sample through it in
+`ensure_headerless` calling `disable_headers_for_buffers` one buffer at a
+time, 69% of the main thread. That is slice 3. Once it is gone, what is
+left is `tree_dealer_queue` at 16%, quadratic for its own reason: per note
+heading it walks every node again to find children and reads every note
+buffer's text to build titles, on every desk sync. That is slice 4. Slice
+2 is still worth doing, and it is still cheap to do after both.
+
 1. **The model task and the change channel.** Connection, decode, fold and
    mirror writes move to the model thread; the main thread receives
    `Loaded`, `Changed`, `Rows`, `Live`. The screens still take the full
@@ -213,6 +227,52 @@ Each gets a landing note here.
 3. **Map per-row updates.** `sync_tree` only at `Loaded` and reset;
    `refresh_desk_sources` per changed agent. Proof: one row changed, one
    buffer written, no display-map resync.
+
+   *Landed.* Two loops were quadratic and both are gone.
+   `Dashboard::ensure_headerless` disabled headers one buffer at a time and
+   each call resynced the display map, so a build of n buffers was n
+   resyncs of n rows; it now hands the editor every new buffer in one call.
+   `AgentRegistry::set_agent_filing` rebuilt the whole registry once per
+   agent, and the desk files them all at once; `set_agent_filings` takes
+   the lot, rebuilds once, and says whether any filing moved so that what
+   is derived from filing is made again only when it did.
+   On top of that the scope is carried: `Workspace::schedule_desk_sync`
+   takes the agents a `Changed` moved (`None` asks for the whole desk, and
+   a whole one swallows the scopes it merges with), `sync_tree_rows` passes
+   them to `refresh_desk_sources`, and that splices the named agents into
+   the held source list through `agent_source` instead of rebuilding it
+   from `known_agents`. `Loaded` and a host reset are what still ask for
+   the whole desk.
+   Measured on the rig (2,823 agents, debug build, llvmpipe), the warm-start
+   `Loaded` frame gap went 163.4s -> 35.8s with the headerless batch ->
+   4.50s with the filing batch. Editor stages across the whole gap are now
+   0.157s of 4.50s: 2,073 block-map syncs, largest 0.337ms, largest row
+   move 2 -> 10, where the same gap used to hold 126.4s of block-map sync
+   and one 259ms sync of 1 -> 1,956 rows. The rest of the 4.50s is not the
+   display map, and the trace on the user's own machine says what it is:
+   slice 4.
+   `one_agents_change_costs_no_display_map_resync` reads the editor's own
+   timing ring and asserts the change side: a `Changed` for one agent costs
+   zero block-map syncs over zero rows.
+   Not done here, deliberately: `sync_tree`'s per-row decoration pass still
+   builds inlays, end-of-line hints and highlights for every row rather
+   than for the rows that moved. It costs about six display-map syncs per
+   row, but over the rows actually composed, which is around ten on this
+   store, so it does not show; splitting it means touching the anchor and
+   fold code for no measured gain. It belongs with slice 4, which walks the
+   same nodes.
+   The passive profiler was fixed alongside, because it hid exactly this
+   kind of stall. `CpuProfiler::snapshot_segments` took only sealed
+   segments, and a segment is sealed by write activity, so a freeze left
+   its own samples in the active file and the snapshot threw them away: in
+   `gui-telemetry-1788709749665-0.json` that was the newest 3.17s, which
+   swallowed a whole 2.17s stall. The unsealed tail now comes through,
+   marked by `cpu_profile.tail_unsealed`, and `maximum_tail_gap_ms` reads 0
+   when it is there; truncation costs nothing because the decoder stops at
+   the last whole frame. The rolling window went from 10s to about 32s
+   (`CPU_SNAPSHOT_SEGMENTS` 5 -> 16, the trace budget 2 MB -> 8 MB), so a
+   six-second freeze no longer fills the history with itself. The snapshot
+   schema is version 10.
 4. **The ranked set.** Home and the lamp read it; `dealer_hand`,
    `tree_dealer_queue`, the dealer signal task and the revision go;
    time-based priorities on a timer. Proof: a change re-ranks one card.
