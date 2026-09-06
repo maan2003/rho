@@ -792,13 +792,6 @@ impl ClaudeLoop {
                 if !busy {
                     self.execution_generation = self.execution_generation.wrapping_add(1);
                 }
-                if let Err(error) = self.ensure_process().await {
-                    if let Some(accepted) = accepted {
-                        let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
-                    }
-                    self.fail(error).await;
-                    return;
-                }
                 // Every message mirrors into the queue until its
                 // --replay-user-messages echo confirms it entered context and
                 // promotes it into history. Mid-turn sends wait on the CLI's
@@ -811,18 +804,39 @@ impl ClaudeLoop {
                     MessageDelivery::Immediate
                 };
                 let content = Arc::new(content);
-                self.queued_turns.push_back(ClaudeTurn {
-                    uuid: uuid.clone(),
-                    content: Arc::clone(&content),
-                });
-                self.state.queued_inputs.push(QueuedInput {
+                let input = QueuedInput {
                     source: crate::MessageSender::User,
                     kind: InputKind::Message {
                         content: (*content).clone(),
                     },
                     delivery,
                     at: rho_core::UnixMs::now(),
+                };
+                // The row is what a reader sees the moment the message is
+                // taken, ahead of a cold spawn; the echo's own row confirms
+                // it (a reader matches the text) and a cancel clears it. A
+                // `/compact` is the CLI's own command, never echoed, so no
+                // row would ever confirm it.
+                if !is_compact_command(&content) {
+                    let mut write = self.db.write().await;
+                    write.append_agent_event(self.agent_id, &AgentEvent::Accepted(input.clone()));
+                    write.commit();
+                }
+                if let Err(error) = self.ensure_process().await {
+                    let mut write = self.db.write().await;
+                    write.append_agent_event(self.agent_id, &AgentEvent::QueueCleared);
+                    write.commit();
+                    if let Some(accepted) = accepted {
+                        let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
+                    }
+                    self.fail(error).await;
+                    return;
+                }
+                self.queued_turns.push_back(ClaudeTurn {
+                    uuid: uuid.clone(),
+                    content: Arc::clone(&content),
                 });
+                self.state.queued_inputs.push(input);
                 self.published();
                 // A turn-opening send starts the turn now: waiting for the
                 // CLI's first stream event (seconds on a cold spawn) leaves
@@ -861,8 +875,14 @@ impl ClaudeLoop {
                     .iter()
                     .map(|turn| turn.uuid.clone())
                     .collect::<Vec<_>>();
+                let had_queued = !self.state.queued_inputs.is_empty();
                 self.state.queued_inputs.clear();
                 self.queued_turns.clear();
+                if had_queued {
+                    let mut write = self.db.write().await;
+                    write.append_agent_event(self.agent_id, &AgentEvent::QueueCleared);
+                    write.commit();
+                }
                 self.cancelling = busy;
                 if busy && self.process.is_some() {
                     let result =

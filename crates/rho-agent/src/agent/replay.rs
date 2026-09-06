@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rho_core::{ContextBlock, InferenceResponseItem, MessageSender, ToolCall, UnixMs};
+use rho_core::{ContextBlock, InferenceResponseItem, MessageSender, ToolCall};
 
 use super::MailItem;
 use crate::{AgentEvent, InputKind, QueuedInput};
@@ -126,7 +126,7 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<ToolCall> {
 mod tests {
     use std::borrow::Cow;
 
-    use rho_core::{ContentPart, MessageDelivery};
+    use rho_core::{ContentPart, MessageDelivery, UnixMs};
     use senax_encoder::{Decode, Encode};
 
     use super::*;
