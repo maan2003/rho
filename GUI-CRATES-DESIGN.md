@@ -194,6 +194,32 @@ wrong at the design, not at the polish.
 Nothing else crosses. No crate reads another crate's state; the window
 holds no source state; `&mut Workspace` appears in no crate.
 
+### The cost rule holds in every crate, from the first line
+
+Ruling, 6 Sep. The rule of GUI-MODEL-DESIGN is not the agents crate's
+rule, it is every source crate's, and it is designed in rather than
+fixed after: per event, O(rows the event touches) plus O(log n) to place
+them; per frame, O(rows drawn); never a pass over a crate's whole mirror,
+list or set on an event, a keypress or a frame. Agents were built the
+other way and cost a 163 s start; Slack is not built that way at all.
+
+What it means when a crate is written:
+
+- The mirror is indexed for every question a screen asks (by
+  conversation, by time, by thread, by read cursor), so an answer is a
+  lookup and a bounded scan, not a walk.
+- Counts, badges, the unread rule and the ranked list are maintained on
+  the event that changes them and read when a screen draws; nothing is
+  recomputed from the mirror to draw.
+- The card rule is incremental: an event moves the cards it touches and
+  no others. A rule that needs the whole mirror to decide is the wrong
+  rule.
+- Screens draw the rows in view and fold the rest; a conversation of
+  fifty thousand messages opens as fast as one of fifty.
+- Every one of these is proven, not assumed, on the user's snapshot in
+  the rig, with the per-event and per-frame numbers in the landing note.
+  A landing note without the numbers is not a landing.
+
 ## QA that is the user's world
 
 Owner: eng-8gpr, first deliverable, because the other two prove their
