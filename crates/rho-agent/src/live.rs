@@ -61,6 +61,15 @@ impl Teller {
                         out.push(Live::Requesting);
                     }
                 }
+                // A response the loop started over within the request
+                // (Claude's next message, whose rows now carry the last
+                // one) has fewer items than were told. The client would
+                // keep the stale ones under the rows, so empty its tail
+                // and say the response again.
+                if self.items.len() > pending_response.items.len() {
+                    self.items.clear();
+                    out.push(Live::Requesting);
+                }
                 for (index, slot) in pending_response.items.iter().enumerate() {
                     let (StreamingContextItemState::Pending(item)
                     | StreamingContextItemState::Finished(item)) = slot
@@ -298,6 +307,45 @@ mod tests {
             },
             previous_attempt: None,
         }
+    }
+
+    /// Claude starts a new message within one request once the last is
+    /// in the log: the tail told for the last one must go, or the client
+    /// shows it twice.
+    #[test]
+    fn a_response_started_over_empties_the_tail_first() {
+        let mut teller = Teller::default();
+        let first = AppendString::from("first".to_owned());
+        assert_eq!(
+            teller.tell(&streaming(vec![message(&[&first], None)])),
+            vec![
+                Live::Requesting,
+                Live::Item {
+                    index: 0,
+                    item: Item::Text {
+                        text: "first".to_owned(),
+                        phase: None
+                    }
+                }
+            ]
+        );
+        assert_eq!(teller.tell(&streaming(vec![])), vec![Live::Requesting]);
+        let second = AppendString::from("second".to_owned());
+        assert_eq!(
+            teller.tell(&streaming(vec![message(&[&second], None)])),
+            vec![Live::Item {
+                index: 0,
+                item: Item::Text {
+                    text: "second".to_owned(),
+                    phase: None
+                }
+            }]
+        );
+        // The same length told again is not a start-over.
+        assert_eq!(
+            teller.tell(&streaming(vec![message(&[&second], None)])),
+            Vec::<Live>::new()
+        );
     }
 
     #[test]

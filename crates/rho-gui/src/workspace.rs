@@ -498,6 +498,9 @@ pub struct Workspace {
     deal_controls_visible: bool,
     agent_last_interaction: HashMap<AgentId, i64>,
     dealer_signal_eval_scheduled: bool,
+    /// Hosts whose desk is rebuilt on the next frame: rows arrive one
+    /// `Log` at a time, and the rebuild walks every agent.
+    desk_sync_pending: HashSet<HostId>,
     _dealer_signal_task: Task<()>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
@@ -665,13 +668,16 @@ impl Workspace {
         let cursor = self.mirror_hosts.entry(host).or_insert(MirrorCursor {
             machine_seed,
             seq: rho_ui_proto::mirror::Seq(0),
+            head: journal_head,
         });
+        cursor.head = journal_head;
         // A daemon whose database is not the one this client mirrored, or
         // whose journal is shorter than the copy: the copy starts over.
         if cursor.machine_seed != machine_seed || cursor.seq > journal_head {
             *cursor = MirrorCursor {
                 machine_seed,
                 seq: rho_ui_proto::mirror::Seq(0),
+                head: journal_head,
             };
             crate::mirror::reset_host(&name);
             for agent_id in self.registry.host_agents(host) {
@@ -856,6 +862,9 @@ pub(crate) enum TranscriptFrame {
 struct MirrorCursor {
     machine_seed: u64,
     seq: rho_ui_proto::mirror::Seq,
+    /// The journal head `Ready` named: the catch-up is done once `seq`
+    /// reaches it.
+    head: rho_ui_proto::mirror::Seq,
 }
 
 /// Who a command speaks about: the rail row under the cursor, or the open
@@ -1090,6 +1099,7 @@ impl Workspace {
             deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
+            desk_sync_pending: HashSet::new(),
             _dealer_signal_task: dealer_signal_task,
             lamp_on: false,
             dealer_signals_initialized: false,
@@ -1193,6 +1203,7 @@ impl Workspace {
                     MirrorCursor {
                         machine_seed: mirrored.machine_seed,
                         seq: mirrored.seq,
+                        head: mirrored.seq,
                     },
                 );
             }
@@ -1733,6 +1744,29 @@ impl Workspace {
         }
     }
 
+    /// One desk rebuild per frame for a host's rows, and none while the
+    /// follow is still short of the journal head `Ready` named: a
+    /// catch-up is thousands of pages, and each would rebuild the whole
+    /// desk. The page that reaches the head schedules the one that runs.
+    fn schedule_desk_sync(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.desk_sync_pending.insert(host) {
+            return;
+        }
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.desk_sync_pending.remove(&host);
+            if this
+                .mirror_hosts
+                .get(&host)
+                .is_some_and(|cursor| cursor.seq < cursor.head)
+            {
+                return;
+            }
+            this.sync_tree_dashboard(host, window, cx);
+            this.invalidate_dealer_signals(cx);
+            cx.notify();
+        });
+    }
+
     pub(crate) fn invalidate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         if self.dealer_signal_eval_scheduled {
             return;
@@ -2111,9 +2145,7 @@ impl Workspace {
                 // The log is a source of rows, not only of facts: an agent
                 // that has just asked for the user is on the map for its own
                 // sake, so the tree the dealer reads has to be made again.
-                self.sync_tree_dashboard(host, window, cx);
-                self.invalidate_dealer_signals(cx);
-                cx.notify();
+                self.schedule_desk_sync(host, window, cx);
             }
             // Bodies on demand are not yet asked for; nothing to hold.
             ConnEvent::Detail { .. } => {}

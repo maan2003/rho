@@ -1163,6 +1163,14 @@ fn hold_shift(workspace: &WindowHandle<Workspace>, down: bool, cx: &mut TestAppC
     cx.run_until_parked();
 }
 
+/// A frame, so what a row put off to the next one (the desk rebuild it
+/// schedules) has run before the test reads the desk.
+fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("draw a frame");
+    cx.run_until_parked();
+}
+
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     story::reset();
     cx.update(init_test_app);
@@ -4005,8 +4013,11 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
                 window,
                 cx,
             );
-            workspace.pull_card(window, cx);
         })
+        .unwrap();
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
         .unwrap();
     cx.run_until_parked();
     workspace
@@ -7824,8 +7835,11 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
                 window,
                 cx,
             );
-            workspace.pull_card(window, cx);
         })
+        .unwrap();
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
         .unwrap();
     cx.run_until_parked();
 
@@ -7875,8 +7889,11 @@ fn done_on_a_filed_agent_closes_its_card_until_the_story_moves(cx: &mut TestAppC
                 window,
                 cx,
             );
-            workspace.pull_card(window, cx);
         })
+        .unwrap();
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| workspace.pull_card(window, cx))
         .unwrap();
     cx.run_until_parked();
 
@@ -9191,6 +9208,11 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
             workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })

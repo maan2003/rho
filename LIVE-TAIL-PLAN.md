@@ -285,3 +285,26 @@ was considered and rejected: commits would pay for it every time.
 Order for the live store, daemon stopped: `drop-stale-savepoints`, start the
 daemon (it migrates, ~20 s, behind savepoint), verify, `forget-savepoints`,
 `compact`. `rho debug savepoints` lists what is pinned at any point.
+
+## After the first restart (6 Sep, evening)
+
+Seen on the live store after the migration, both in the GUI, neither in
+the daemon or the wire (the qlog showed both connections got the whole
+catch-up in 20 s, then idled):
+
+- A resync rebuilt the whole desk once per `Log` page (`sync_tree_dashboard`
+  plus the dealer, ~2170 pages of 512 rows), and every steady-state row did
+  the same, which is what made sending feel slow. Now one rebuild per frame
+  per host, and none while the follow is short of the journal head `Ready`
+  named. The rebuild itself is still a full walk of every agent, facts and
+  node, three times over in places, with the editor torn down and recomposed;
+  that is the next rethink, not a patch.
+- A Claude loop that starts a new message within one request (its rows now
+  carrying the last one) told nothing, so the client kept the old tail under
+  the rows and showed the message twice. The teller now empties the tail
+  (`Requesting`) whenever the pending response has fewer items than were told.
+
+Standing rule for what comes after: work done per event, on either side, is
+bounded by something like `O(log(agents × events))`. A row must not walk every
+agent, every fact, or every node; dealing and the tree sync are where that is
+still broken.
