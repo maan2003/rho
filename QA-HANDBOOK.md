@@ -462,6 +462,21 @@ was a control on a different build (eng-b8os, desk sessions 29 and 33). Say in
 the note, and in the message when you hand numbers to someone else, which
 sessions were controls and what they are controls for.
 
+*A slow stage with nothing against it is not a fast stage.* `input_rows` is
+what makes O(touched) checkable, so a stage line with a large p99 and `0 rows`
+beside it is not evidence of cheap work on nothing: it usually means the
+expensive thing inside that stage has no stage of its own, and its cost is
+being billed to whichever stage happened to be on the stack. Desk session 45
+is the worked case — `multi_buffer_sync p99 104.32 ms at 0 rows`, which no
+amount of reading multi-buffer syncing explains, because what the session
+actually did was two resizes, and on main the whole-buffer rewrap they cause
+was not a stage at all. eng-b8os measured it over desk sessions 43, 44 and 46
+through 55, two drives a side and three runs of each, and the fix was to name
+it: since `wrap_map_rewrap` exists, a resize's cost has its own line and its
+own row count instead of hiding under a neighbour. So when a stage's p99 is
+large and its rows are zero or implausible, do not report the stage — find
+what ran inside it and give that its own stage first, then measure.
+
 *What fails it.*
 
 - `draw_ms` p99 above 8 ms, or max above 16 ms: a frame that misses at 60 Hz.
