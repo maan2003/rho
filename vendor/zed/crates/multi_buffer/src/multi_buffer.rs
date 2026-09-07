@@ -39,7 +39,7 @@ use smallvec::SmallVec;
 use std::{
     any::type_name,
     borrow::Cow,
-    cell::{Cell, OnceCell, Ref, RefCell},
+    cell::{OnceCell, Ref, RefCell},
     cmp::{self, Ordering},
     fmt,
     future::Future,
@@ -90,7 +90,12 @@ pub struct MultiBuffer {
     title: Option<String>,
     /// The writing capability of the multi-buffer.
     capability: Capability,
-    buffer_changed_since_sync: Rc<Cell<bool>>,
+    /// Which buffers have changed since the last sync, written by the
+    /// buffers themselves as they change. A sync visits these and not every
+    /// buffer it holds: a multi buffer with a buffer per composed chunk has
+    /// as many buffers as the document has chunks, and asking all of them
+    /// what changed is per-edit work in the size of the document.
+    changed_buffers: Rc<language::ChangedBuffers>,
     /// When true, one buffer's excerpts may live under multiple path keys
     /// simultaneously. Setting excerpts for a path no longer evicts the
     /// buffer's excerpts from other paths; callers manage path removal
@@ -687,6 +692,18 @@ impl DiffState {
     }
 }
 
+/// What one buffer contributes to the multi buffer's own dirty, conflicted
+/// and deleted-on-disk flags.
+///
+/// The flags are kept per buffer, and counted, so that a sync visiting only
+/// the buffers that changed can still answer for every buffer it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BufferFileFlags {
+    is_dirty: bool,
+    has_conflict: bool,
+    has_deleted_file: bool,
+}
+
 #[derive(Clone)]
 struct BufferStateSnapshot {
     /// The path keys this buffer's excerpts live under, sorted by path key.
@@ -694,6 +711,66 @@ struct BufferStateSnapshot {
     /// multibuffer has enabled [`MultiBuffer::set_multiple_paths_per_buffer`].
     paths: SmallVec<[(PathKey, PathKeyIndex); 1]>,
     buffer_snapshot: BufferSnapshot,
+    file_flags: BufferFileFlags,
+}
+
+/// How many of a multi buffer's buffers are dirty, in conflict, or deleted
+/// on disk.
+///
+/// Counts rather than flags: a sync that visits only the buffers that
+/// changed can add and subtract one buffer's contribution without asking
+/// the others what theirs is.
+#[derive(Clone, Copy, Debug, Default)]
+struct BufferFileFlagCounts {
+    dirty: usize,
+    conflicted: usize,
+    deleted: usize,
+}
+
+impl BufferFileFlagCounts {
+    fn add(&mut self, flags: BufferFileFlags) {
+        self.dirty += usize::from(flags.is_dirty);
+        self.conflicted += usize::from(flags.has_conflict);
+        self.deleted += usize::from(flags.has_deleted_file);
+    }
+
+    fn subtract(&mut self, flags: BufferFileFlags) {
+        self.dirty -= usize::from(flags.is_dirty);
+        self.conflicted -= usize::from(flags.has_conflict);
+        self.deleted -= usize::from(flags.has_deleted_file);
+    }
+}
+
+/// Adds or replaces one buffer's state, keeping the counts in step with it.
+///
+/// Every write to a snapshot's `buffers` goes through this or
+/// [`remove_buffer_state`], and the flags derived from the counts are
+/// refreshed by [`MultiBufferSnapshot::refresh_file_flags`] once the
+/// caller is done; the counts are only right if nothing writes to the map
+/// directly. It takes the two fields rather than the snapshot so that it
+/// can be called while a cursor holds the excerpts.
+fn insert_buffer_state(
+    buffers: &mut TreeMap<BufferId, BufferStateSnapshot>,
+    counts: &mut BufferFileFlagCounts,
+    buffer_id: BufferId,
+    state: BufferStateSnapshot,
+) {
+    if let Some(previous) = buffers.get(&buffer_id) {
+        counts.subtract(previous.file_flags);
+    }
+    counts.add(state.file_flags);
+    buffers.insert(buffer_id, state);
+}
+
+/// Drops one buffer's state, keeping the counts in step with it.
+fn remove_buffer_state(
+    buffers: &mut TreeMap<BufferId, BufferStateSnapshot>,
+    counts: &mut BufferFileFlagCounts,
+    buffer_id: BufferId,
+) {
+    if let Some(previous) = buffers.remove(&buffer_id) {
+        counts.subtract(previous.file_flags);
+    }
 }
 
 impl BufferStateSnapshot {
@@ -741,9 +818,10 @@ pub struct MultiBufferSnapshot {
     diff_transforms: SumTree<DiffTransform>,
     non_text_state_update_count: usize,
     edit_count: usize,
-    is_dirty: bool,
-    has_deleted_file: bool,
-    has_conflict: bool,
+    /// How many of `buffers` carry each flag. The three booleans beside
+    /// them are these counts being non-zero; they are counts so that a
+    /// buffer changing can be accounted for without asking the others.
+    file_flag_counts: BufferFileFlagCounts,
     has_inverted_diff: bool,
     singleton: bool,
     trailing_excerpt_update_count: usize,
@@ -1298,7 +1376,7 @@ impl MultiBuffer {
             singleton: false,
             capability,
             title: None,
-            buffer_changed_since_sync: Default::default(),
+            changed_buffers: Default::default(),
             history: History::default(),
             multiple_paths_per_buffer: false,
         }
@@ -1318,11 +1396,12 @@ impl MultiBuffer {
 
     pub fn clone(&self, new_cx: &mut Context<Self>) -> Self {
         let mut buffers = BTreeMap::default();
-        let buffer_changed_since_sync = Rc::new(Cell::new(false));
+        let changed_buffers: Rc<language::ChangedBuffers> = Default::default();
         for (buffer_id, buffer_state) in self.buffers.iter() {
             buffer_state.buffer.update(new_cx, |buffer, _| {
-                buffer.record_changes(Rc::downgrade(&buffer_changed_since_sync));
+                buffer.record_changes(Rc::downgrade(&changed_buffers));
             });
+            changed_buffers.borrow_mut().insert(*buffer_id);
             buffers.insert(
                 *buffer_id,
                 BufferState {
@@ -1347,7 +1426,7 @@ impl MultiBuffer {
             capability: self.capability,
             history: self.history.clone(),
             title: self.title.clone(),
-            buffer_changed_since_sync,
+            changed_buffers,
             multiple_paths_per_buffer: self.multiple_paths_per_buffer,
         }
     }
@@ -1894,9 +1973,7 @@ impl MultiBuffer {
             diff_transforms: _,
             non_text_state_update_count: _,
             edit_count: _,
-            is_dirty,
-            has_deleted_file,
-            has_conflict,
+            file_flag_counts,
             has_inverted_diff,
             singleton: _,
             trailing_excerpt_update_count,
@@ -1911,11 +1988,9 @@ impl MultiBuffer {
         let prev_len = ExcerptDimension(excerpts.summary().text.len);
         *excerpts = Default::default();
         *buffers = Default::default();
+        *file_flag_counts = Default::default();
         *diffs = Default::default();
         *trailing_excerpt_update_count += 1;
-        *is_dirty = false;
-        *has_deleted_file = false;
-        *has_conflict = false;
         *has_inverted_diff = false;
 
         let edits = Self::sync_diff_transforms(
@@ -2546,8 +2621,8 @@ impl MultiBuffer {
 
     #[ztracing::instrument(skip_all)]
     fn sync(&self, cx: &App) {
-        let changed = self.buffer_changed_since_sync.replace(false);
-        if !changed {
+        let changed = std::mem::take(&mut *self.changed_buffers.borrow_mut());
+        if changed.is_empty() {
             return;
         }
         let mut snapshot = self.snapshot.borrow_mut();
@@ -2560,7 +2635,7 @@ impl MultiBuffer {
             .unwrap_or(0);
         let old_snapshot = profile.is_enabled().then(|| snapshot.clone());
         let (edits, walked_items) =
-            Self::sync_from_buffer_changes(&mut snapshot, &self.buffers, &self.diffs, cx);
+            Self::sync_from_buffer_changes(&mut snapshot, &changed, &self.buffers, &self.diffs, cx);
         profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = edits
@@ -2601,8 +2676,8 @@ impl MultiBuffer {
 
     fn sync_mut(&mut self, cx: &App) -> &mut MultiBufferSnapshot {
         let snapshot = self.snapshot.get_mut();
-        let changed = self.buffer_changed_since_sync.replace(false);
-        if !changed {
+        let changed = std::mem::take(&mut *self.changed_buffers.borrow_mut());
+        if changed.is_empty() {
             return snapshot;
         }
         let mut profile = gpui::profiler::EditorTimingGuard::new(
@@ -2614,7 +2689,7 @@ impl MultiBuffer {
             .unwrap_or(0);
         let old_snapshot = profile.is_enabled().then(|| snapshot.clone());
         let (edits, walked_items) =
-            Self::sync_from_buffer_changes(snapshot, &self.buffers, &self.diffs, cx);
+            Self::sync_from_buffer_changes(snapshot, &changed, &self.buffers, &self.diffs, cx);
         profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = edits
@@ -2658,6 +2733,7 @@ impl MultiBuffer {
 
     fn sync_from_buffer_changes(
         snapshot: &mut MultiBufferSnapshot,
+        changed: &collections::HashSet<BufferId>,
         buffers: &BTreeMap<BufferId, BufferState>,
         diffs: &HashMap<BufferId, DiffState>,
         cx: &App,
@@ -2670,9 +2746,7 @@ impl MultiBuffer {
             diff_transforms: _,
             non_text_state_update_count,
             edit_count,
-            is_dirty,
-            has_deleted_file,
-            has_conflict,
+            file_flag_counts,
             has_inverted_diff: _,
             singleton: _,
             trailing_excerpt_update_count: _,
@@ -2681,9 +2755,6 @@ impl MultiBuffer {
             use_extended_diff_range: _,
             show_headers: _,
         } = snapshot;
-        *is_dirty = false;
-        *has_deleted_file = false;
-        *has_conflict = false;
 
         if !diffs.is_empty() {
             let mut diffs_to_add = Vec::new();
@@ -2711,7 +2782,10 @@ impl MultiBuffer {
         let mut non_text_state_updated = false;
         let mut edited = false;
         let mut scanned_items = 0_u64;
-        for buffer_state in buffers.values() {
+        for buffer_id in changed {
+            let Some(buffer_state) = buffers.get(buffer_id) else {
+                continue;
+            };
             scanned_items = scanned_items.saturating_add(1);
             let buffer = buffer_state.buffer.read(cx);
             let last_snapshot = buffer_snapshots
@@ -2743,11 +2817,26 @@ impl MultiBuffer {
 
             edited |= buffer_edited;
             non_text_state_updated |= buffer_non_text_state_updated;
-            *is_dirty |= buffer.is_dirty();
-            *has_deleted_file |= buffer
-                .file()
-                .is_some_and(|file| file.disk_state().is_deleted());
-            *has_conflict |= buffer.has_conflict();
+
+            // Only this buffer's own contribution is recomputed. The others
+            // did not change, so their contributions are already counted.
+            let flags = BufferFileFlags {
+                is_dirty: buffer.is_dirty(),
+                has_conflict: buffer.has_conflict(),
+                has_deleted_file: buffer
+                    .file()
+                    .is_some_and(|file| file.disk_state().is_deleted()),
+            };
+            if flags != last_snapshot.file_flags {
+                let mut updated = last_snapshot.clone();
+                updated.file_flags = flags;
+                insert_buffer_state(
+                    buffer_snapshots,
+                    file_flag_counts,
+                    buffer.remote_id(),
+                    updated,
+                );
+            }
         }
         if edited {
             *edit_count += 1;
@@ -2767,16 +2856,17 @@ impl MultiBuffer {
             let buffer = buffer.read(cx);
             let buffer_id = buffer.remote_id();
 
-            let paths = buffer_snapshots
+            let previous = buffer_snapshots
                 .get(&buffer_id)
-                .expect("each buffer should have a snapshot")
-                .paths
-                .clone();
+                .expect("each buffer should have a snapshot");
+            let paths = previous.paths.clone();
+            let file_flags = previous.file_flags;
             buffer_snapshots.insert(
                 buffer_id,
                 BufferStateSnapshot {
                     paths,
                     buffer_snapshot: buffer.snapshot(),
+                    file_flags,
                 },
             );
 
@@ -6375,15 +6465,15 @@ impl MultiBufferSnapshot {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.is_dirty
+        self.file_flag_counts.dirty > 0
     }
 
     pub fn has_deleted_file(&self) -> bool {
-        self.has_deleted_file
+        self.file_flag_counts.deleted > 0
     }
 
     pub fn has_conflict(&self) -> bool {
-        self.has_conflict
+        self.file_flag_counts.conflicted > 0
     }
 
     pub fn has_diagnostics(&self) -> bool {

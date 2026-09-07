@@ -26,7 +26,7 @@ pub use crate::{
 use anyhow::{Context as _, Result};
 use clock::Lamport;
 pub use clock::ReplicaId;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use encoding_rs::Encoding;
 use fs::MTime;
 use futures::channel::oneshot;
@@ -43,7 +43,7 @@ use smallvec::SmallVec;
 use std::{
     any::Any,
     borrow::Cow,
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp::{self, Ordering, Reverse},
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
@@ -137,7 +137,7 @@ pub struct Buffer {
     /// Memoize calls to has_changes_since(saved_version).
     /// The contents of a cell are (self.version, has_changes) at the time of a last call.
     has_unsaved_edits: Cell<(clock::Global, bool)>,
-    change_bits: Vec<rc::Weak<Cell<bool>>>,
+    change_bits: Vec<rc::Weak<ChangedBuffers>>,
     modeline: Option<Arc<ModelineSettings>>,
     _subscriptions: Vec<gpui::Subscription>,
     tree_sitter_data: Arc<TreeSitterData>,
@@ -145,6 +145,12 @@ pub struct Buffer {
     has_bom: bool,
     reload_with_encoding_txns: HashMap<TransactionId, (&'static Encoding, bool)>,
 }
+
+/// The buffers that have changed since whoever registered it last looked.
+///
+/// A buffer writes its own id here as it changes, so a listener holding
+/// many buffers can visit the ones that changed rather than all of them.
+pub type ChangedBuffers = RefCell<HashSet<BufferId>>;
 
 #[derive(Debug)]
 pub struct TreeSitterData {
@@ -2538,11 +2544,17 @@ impl Buffer {
         self.text.subscribe()
     }
 
-    /// Adds a bit to the list of bits that are set when the buffer's text changes.
+    /// Adds a set that this buffer records itself in when its text changes.
     ///
     /// This allows downstream code to check if the buffer's text has changed without
     /// waiting for an effect cycle, which would be required if using eents.
-    pub fn record_changes(&mut self, bit: rc::Weak<Cell<bool>>) {
+    ///
+    /// It records which buffer changed and not merely that one did, so a
+    /// listener holding many buffers can visit the ones that changed
+    /// instead of asking all of them. A multi buffer with a buffer per
+    /// composed chunk has as many buffers as the document is long, and
+    /// asking all of them is per-edit work in the size of the document.
+    pub fn record_changes(&mut self, bit: rc::Weak<ChangedBuffers>) {
         if let Err(ix) = self
             .change_bits
             .binary_search_by_key(&rc::Weak::as_ptr(&bit), rc::Weak::as_ptr)
@@ -2551,13 +2563,14 @@ impl Buffer {
         }
     }
 
-    /// Set the change bit for all "listeners".
+    /// Record this buffer as changed with all "listeners".
     fn was_changed(&mut self) {
+        let id = self.remote_id();
         self.change_bits.retain(|change_bit| {
             change_bit
                 .upgrade()
-                .inspect(|bit| {
-                    _ = bit.replace(true);
+                .inspect(|changed| {
+                    changed.borrow_mut().insert(id);
                 })
                 .is_some()
         });

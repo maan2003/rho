@@ -13,7 +13,8 @@ use ztracing::instrument;
 use crate::{
     Anchor, BufferRangesUpdate, BufferState, BufferStateSnapshot, DiffChangeKind, Event, Excerpt,
     ExcerptOffset, ExcerptRange, ExcerptSummary, ExpandExcerptDirection, MultiBuffer,
-    MultiBufferOffset, PathKeyIndex, build_excerpt_ranges, remove_diff_state,
+    MultiBufferOffset, PathKeyIndex, build_excerpt_ranges, insert_buffer_state,
+    remove_buffer_state, remove_diff_state,
 };
 
 #[derive(PartialEq, Eq, Ord, PartialOrd, Clone, Hash, Debug)]
@@ -218,13 +219,19 @@ impl MultiBuffer {
                         None => BufferStateSnapshot {
                             paths: Default::default(),
                             buffer_snapshot: buffer_snapshot.clone(),
+                            file_flags: Default::default(),
                         },
                     }
                 });
                 state.add_path(path.clone(), *path_key_index);
             }
             for (buffer_id, state) in updated_buffers {
-                snapshot.buffers.insert(buffer_id, state);
+                insert_buffer_state(
+                    &mut snapshot.buffers,
+                    &mut snapshot.file_flag_counts,
+                    buffer_id,
+                    state,
+                );
             }
 
             let patch = vec![Edit {
@@ -251,12 +258,21 @@ impl MultiBuffer {
                         .paths
                         .retain(|(key, _)| &*key < first_path || &*key > last_path);
                     if !state.paths.is_empty() {
-                        snapshot.buffers.insert(buffer_id, state);
+                        insert_buffer_state(
+                            &mut snapshot.buffers,
+                            &mut snapshot.file_flag_counts,
+                            buffer_id,
+                            state,
+                        );
                         continue;
                     }
                 }
                 self.buffers.remove(&buffer_id);
-                snapshot.buffers.remove(&buffer_id);
+                remove_buffer_state(
+                    &mut snapshot.buffers,
+                    &mut snapshot.file_flag_counts,
+                    buffer_id,
+                );
                 remove_diff_state(&mut snapshot.diffs, buffer_id);
                 self.diffs.remove(&buffer_id);
                 removed_buffer_ids.push(buffer_id);
@@ -273,9 +289,11 @@ impl MultiBuffer {
             self.buffers
                 .entry(buffer_snapshot.remote_id())
                 .or_insert_with(|| {
-                    self.buffer_changed_since_sync.replace(true);
+                    self.changed_buffers
+                        .borrow_mut()
+                        .insert(buffer_snapshot.remote_id());
                     buffer.update(cx, |buffer, _| {
-                        buffer.record_changes(Rc::downgrade(&self.buffer_changed_since_sync));
+                        buffer.record_changes(Rc::downgrade(&self.changed_buffers));
                     });
                     BufferState {
                         _subscriptions: [
@@ -628,10 +646,19 @@ impl MultiBuffer {
                 Some(existing) => {
                     let mut state = existing.clone();
                     if state.remove_path(&path_key) {
-                        snapshot.buffers.remove(&old_buffer_id);
+                        remove_buffer_state(
+                            &mut snapshot.buffers,
+                            &mut snapshot.file_flag_counts,
+                            old_buffer_id,
+                        );
                         true
                     } else {
-                        snapshot.buffers.insert(old_buffer_id, state);
+                        insert_buffer_state(
+                            &mut snapshot.buffers,
+                            &mut snapshot.file_flag_counts,
+                            old_buffer_id,
+                            state,
+                        );
                         false
                     }
                 }
@@ -809,15 +836,21 @@ impl MultiBuffer {
             None => BufferStateSnapshot {
                 paths: Default::default(),
                 buffer_snapshot: buffer_snapshot.clone(),
+                file_flags: Default::default(),
             },
         };
         state.add_path(path_key.clone(), path_key_index);
-        snapshot.buffers.insert(buffer_id, state);
+        insert_buffer_state(
+            &mut snapshot.buffers,
+            &mut snapshot.file_flag_counts,
+            buffer_id,
+            state,
+        );
 
         self.buffers.entry(buffer_id).or_insert_with(|| {
-            self.buffer_changed_since_sync.replace(true);
+            self.changed_buffers.borrow_mut().insert(buffer_id);
             buffer.update(cx, |buffer, _| {
-                buffer.record_changes(Rc::downgrade(&self.buffer_changed_since_sync));
+                buffer.record_changes(Rc::downgrade(&self.changed_buffers));
             });
             BufferState {
                 _subscriptions: [
@@ -896,10 +929,19 @@ impl MultiBuffer {
                 Some(existing) => {
                     let mut state = existing.clone();
                     if state.remove_path(&path) {
-                        snapshot.buffers.remove(&buffer_id);
+                        remove_buffer_state(
+                            &mut snapshot.buffers,
+                            &mut snapshot.file_flag_counts,
+                            buffer_id,
+                        );
                         true
                     } else {
-                        snapshot.buffers.insert(buffer_id, state);
+                        insert_buffer_state(
+                            &mut snapshot.buffers,
+                            &mut snapshot.file_flag_counts,
+                            buffer_id,
+                            state,
+                        );
                         false
                     }
                 }
