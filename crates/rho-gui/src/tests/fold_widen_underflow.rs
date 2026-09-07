@@ -118,6 +118,24 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
         .expect("splice two inlays inside the fold");
     cx.run_until_parked();
 
+    // The clamp keeps the arithmetic safe. It does not make the premise
+    // true, and the map now says so: the two sides were to move together
+    // and could not, which is the thing worth knowing and the thing that
+    // used to arrive as a subtraction overflow with nothing attached.
+    let said = editor
+        .update(cx, |editor, _, cx| {
+            editor
+                .display_map
+                .update(cx, |map, _| map.take_fold_widening_violations())
+        })
+        .expect("read what the widening recorded");
+    assert!(
+        said.iter()
+            .any(|said| said.contains("did not name the same boundary")),
+        "the widening had to clamp one side against the other and must say \
+         so; it said {said:#?}"
+    );
+
     // The map still describes one document: what the fold map says it has,
     // the inlay map beneath it agrees it has.
     editor

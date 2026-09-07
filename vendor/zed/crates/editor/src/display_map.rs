@@ -91,6 +91,8 @@ pub use block_map::{
     StickyHeaderExcerpt,
 };
 pub use crease_map::*;
+#[cfg(feature = "wrap-test-support")]
+pub use fold_map::widening_violation;
 pub use fold_map::{
     CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder,
     FoldPoint,
@@ -405,6 +407,13 @@ impl DisplayMap {
     #[cfg(feature = "wrap-test-support")]
     pub fn wrap_sync_records(&self, cx: &gpui::App) -> Vec<wrap_map::WrapSyncRecord> {
         self.wrap_map.read(cx).sync_records().to_vec()
+    }
+
+    /// Every widened fold edit that stopped describing a range since the
+    /// last time this was asked. See [`FoldMap::take_widening_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_widening_violations(&mut self) -> Vec<String> {
+        self.fold_map.take_widening_violations()
     }
 
     /// See [`wrap_map::WrapMap::take_sync_violations`].

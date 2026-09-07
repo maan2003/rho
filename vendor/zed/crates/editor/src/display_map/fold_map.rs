@@ -545,12 +545,61 @@ impl FoldMapWriter<'_> {
 pub struct FoldMap {
     snapshot: FoldSnapshot,
     next_fold_id: FoldId,
+    /// Every widened edit that stopped describing a range, in the words of
+    /// [`widening_violation`].
+    ///
+    /// The widening loops in `sync` are where an edit is made wrong; the
+    /// seek that walks over it is where the panic happens, and the two are
+    /// far enough apart that the message names the wrong layer. Both faults
+    /// found on the rig this week — an unsigned underflow at a fold
+    /// beginning at offset zero, and an edit left behind a cursor that
+    /// stepped over it — are visible here, at the point the edit is built,
+    /// before anything is asked to seek anywhere.
+    #[cfg(feature = "wrap-test-support")]
+    widening_violations: Vec<String>,
+}
+
+/// Whether a widened edit still describes a range of a document that exists.
+///
+/// Deliberately narrow. It does not know what the right answer is, only
+/// what cannot be one: a range whose start is past its own end, or whose
+/// end is past everything there is. Both are unreachable in a document and
+/// both are one subtraction away in the loops that build them.
+#[cfg(feature = "wrap-test-support")]
+pub fn widening_violation(
+    side: &str,
+    range: std::ops::Range<usize>,
+    extent: usize,
+    stage: &str,
+) -> Option<String> {
+    if range.start > range.end {
+        return Some(format!(
+            "{stage}: the {side} side was widened to {}..{}, which starts after it ends; an unsigned subtraction took more than the side had in front of it",
+            range.start, range.end
+        ));
+    }
+    if range.end > extent {
+        return Some(format!(
+            "{stage}: the {side} side was widened to {}..{}, past the {extent} bytes the tree has",
+            range.start, range.end
+        ));
+    }
+    None
 }
 
 impl FoldMap {
+    /// Every widened edit this map built that did not describe a range,
+    /// and forgets them. Empty is the answer a healthy sync gives.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_widening_violations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.widening_violations)
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn new(inlay_snapshot: InlaySnapshot) -> (Self, FoldSnapshot) {
         let this = Self {
+            #[cfg(feature = "wrap-test-support")]
+            widening_violations: Vec::new(),
             snapshot: FoldSnapshot {
                 folds: SumTree::new(&inlay_snapshot.buffer),
                 transforms: SumTree::from_item(
@@ -896,6 +945,15 @@ impl FoldMap {
             drop(cursor);
 
             let mut fold_edits = Vec::with_capacity(inlay_edits.len());
+            #[cfg(feature = "wrap-test-support")]
+            let mut widening_violations = Vec::new();
+            // Taken from the trees before the cursors shadow them: what a
+            // widened edit is checked against is the whole of each side,
+            // and a cursor only knows where it is standing.
+            #[cfg(feature = "wrap-test-support")]
+            let old_extent = self.snapshot.transforms.summary().output.len.0;
+            #[cfg(feature = "wrap-test-support")]
+            let new_extent = new_transforms.summary().output.len.0;
             {
                 let mut old_transforms = self
                     .snapshot
@@ -949,10 +1007,25 @@ impl FoldMap {
                         // to the sixty-fourth minus a couple of hundred is
                         // handed to a cursor that is then asked to seek
                         // forward to an end far behind it.
-                        let delta = old_delta
-                            .max(new_delta)
-                            .min(edit.old.start.0.0)
-                            .min(edit.new.start.0.0);
+                        let wanted = old_delta.max(new_delta);
+                        let delta = wanted.min(edit.old.start.0.0).min(edit.new.start.0.0);
+                        // Recorded where the clamp bites, and before the
+                        // `delta == 0` break, because a side with nothing
+                        // in front of it clamps to zero and would leave by
+                        // the quiet door. The clamp keeps the arithmetic
+                        // safe; it does not make the premise true, and an
+                        // edit widened by less than the fold it was widened
+                        // to still names a fold the layers above will be
+                        // told about in full. What is recorded is that the
+                        // two sides did not move together, which is the
+                        // thing the comment above assumes never happens.
+                        #[cfg(feature = "wrap-test-support")]
+                        if wanted > delta {
+                            widening_violations.push(format!(
+                                "fold widening: both sides were to move by {wanted}, and the old side at {} and the new side at {} could only move by {delta}; the two sides did not name the same boundary",
+                                edit.old.start.0.0, edit.new.start.0.0
+                            ));
+                        }
                         if delta == 0 {
                             break;
                         }
@@ -989,6 +1062,21 @@ impl FoldMap {
                     let new_end =
                         new_transforms.start().1.0 + (edit.new.end - new_transforms.start().0);
 
+                    #[cfg(feature = "wrap-test-support")]
+                    {
+                        widening_violations.extend(widening_violation(
+                            "old",
+                            old_start.0..old_end.0,
+                            old_extent,
+                            "fold widening",
+                        ));
+                        widening_violations.extend(widening_violation(
+                            "new",
+                            new_start.0..new_end.0,
+                            new_extent,
+                            "fold widening",
+                        ));
+                    }
                     fold_edits.push(FoldEdit {
                         old: FoldOffset(old_start)..FoldOffset(old_end),
                         new: FoldOffset(new_start)..FoldOffset(new_end),
@@ -1001,6 +1089,8 @@ impl FoldMap {
             self.snapshot.transforms = new_transforms;
             self.snapshot.inlay_snapshot = inlay_snapshot;
             self.snapshot.version += 1;
+            #[cfg(feature = "wrap-test-support")]
+            self.widening_violations.extend(widening_violations);
             fold_edits
         };
         if profile.is_enabled() {
