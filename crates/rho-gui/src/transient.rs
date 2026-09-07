@@ -606,12 +606,15 @@ pub(crate) enum MenuId {
     Projects,
     /// The snooze units under the verdicts (`s` then `m`, `h`, `d`, `w`).
     VerdictSnooze,
-    /// Still the bottom strip; here so the root menu can reach them while
-    /// they move over one batch at a time.
     Input,
     Agent,
     New,
     Status,
+    /// `space a s`: how long, in the sizes a keyboard picks.
+    Snooze,
+    /// Still the bottom strip: the charts, which leave with their data when
+    /// `rho-visualizations` takes them.
+    UsageRoot,
 }
 
 /// A command a menu item runs, which is the whole of what the item means.
@@ -652,6 +655,40 @@ pub(crate) enum Command {
     // Projects.
     ProjectAdd,
     ProjectRemove,
+    // Input.
+    EndVoice,
+    PastePrompt,
+    ClearPromptImages,
+    // New: creation, one verb.
+    NewAgent,
+    NewPage,
+    NewNote,
+    // Status.
+    UploadTelemetry,
+    Version,
+    // The agent under the point.
+    AgentDone,
+    AgentHide,
+    AgentCancel,
+    AgentRole,
+    AgentCompact,
+    AgentRewind,
+    AgentRewindMany,
+    AgentContinue,
+    AgentCacheKey,
+    /// `space a s`: a fixed distance ahead, in milliseconds because that is
+    /// what the item says and not a unit the reader has to combine.
+    AgentSnooze(u64),
+    // The phone.
+    PhoneOpenDesk,
+    /// A distance ahead, the sizes a thumb picks.
+    PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
+    /// A named hour of the day: `tonight` is this evening while it is still
+    /// ahead and the next one after that, `tomorrow` is always the next day.
+    PhoneSnoozeAt {
+        hour: u32,
+        tomorrow: bool,
+    },
 }
 
 /// What a verdict item does. Kept apart from [`Command`] because a verdict
@@ -870,101 +907,165 @@ pub(crate) fn hosts_menu() -> Menu {
         .item("u", "auth…", MenuAction::Command(Command::HostAuth))
 }
 
+/// Creation, the one verb: everything new starts here and is filed where
+/// the area picker's first row already points.
+pub(crate) fn new_menu() -> Menu {
+    Menu::new("new")
+        .item("a", "agent…", MenuAction::Command(Command::NewAgent))
+        .item("p", "page…", MenuAction::Command(Command::NewPage))
+        .item("n", "note…", MenuAction::Command(Command::NewNote))
+}
+
+pub(crate) fn input_menu() -> Menu {
+    Menu::new("input")
+        .item(
+            "m",
+            "voice microphone · mute/unmute",
+            MenuAction::Command(Command::Voice),
+        )
+        .item(
+            "e",
+            "voice session · end",
+            MenuAction::Command(Command::EndVoice),
+        )
+        .item(
+            "p",
+            "paste clipboard",
+            MenuAction::Command(Command::PastePrompt),
+        )
+        .item(
+            "c",
+            "clear images",
+            MenuAction::Command(Command::ClearPromptImages),
+        )
+}
+
+pub(crate) fn status_menu() -> Menu {
+    Menu::new("status")
+        .item(
+            "p",
+            "upload GUI performance snapshot",
+            MenuAction::Command(Command::UploadTelemetry),
+        )
+        .item("u", "usage…", MenuAction::Open(MenuId::UsageRoot))
+        .item("v", "version", MenuAction::Command(Command::Version))
+}
+
+/// `space a`: driving the current conversation.
+pub(crate) fn agent_menu() -> Menu {
+    Menu::new("agent")
+        .item("d", "done", MenuAction::Command(Command::AgentDone))
+        .item("shift-d", "hide", MenuAction::Command(Command::AgentHide))
+        .item("s", "snooze…", MenuAction::Open(MenuId::Snooze))
+        .item(
+            "c",
+            "cancel turn",
+            MenuAction::Command(Command::AgentCancel),
+        )
+        .item("r", "role…", MenuAction::Command(Command::AgentRole))
+        .item("k", "compact", MenuAction::Command(Command::AgentCompact))
+        .item(
+            "w",
+            "rewind turn",
+            MenuAction::Command(Command::AgentRewind),
+        )
+        .item(
+            "shift-w",
+            "rewind turns…",
+            MenuAction::Command(Command::AgentRewindMany),
+        )
+        .item(
+            "shift-c",
+            "continue turn",
+            MenuAction::Command(Command::AgentContinue),
+        )
+        .item(
+            "shift-k",
+            "new prompt cache key",
+            MenuAction::Command(Command::AgentCacheKey),
+        )
+}
+
+pub(crate) fn snooze_menu() -> Menu {
+    const MINUTE_MS: u64 = 60 * 1000;
+    Menu::new("snooze")
+        .item(
+            "3",
+            "30 minutes",
+            MenuAction::Command(Command::AgentSnooze(30 * MINUTE_MS)),
+        )
+        .item(
+            "h",
+            "2 hours",
+            MenuAction::Command(Command::AgentSnooze(2 * 60 * MINUTE_MS)),
+        )
+        .item(
+            "d",
+            "1 day",
+            MenuAction::Command(Command::AgentSnooze(24 * 60 * MINUTE_MS)),
+        )
+}
+
+pub(crate) fn phone_root_menu() -> Menu {
+    Menu::new("menu")
+        .item("d", "Map", MenuAction::Command(Command::PhoneOpenDesk))
+        .item(
+            "s",
+            "Slack",
+            MenuAction::Command(Command::SlackConversations),
+        )
+        .item("a", "Agents", MenuAction::Open(MenuId::Agent))
+        .item("i", "Status", MenuAction::Open(MenuId::Status))
+}
+
+/// The phone's answer to "how long": the times a thumb picks, where a
+/// keyboard types a count and a unit. `tonight` and `tomorrow` name an hour
+/// of the day, so they land on the clock and not on a distance from now.
+pub(crate) fn snooze_sheet() -> Menu {
+    use crate::workspace::SnoozeUnit;
+    Menu::new("snooze")
+        .item(
+            "m",
+            "30m",
+            MenuAction::Command(Command::PhoneSnoozeAhead(SnoozeUnit::Minutes, 30)),
+        )
+        .item(
+            "h",
+            "2h",
+            MenuAction::Command(Command::PhoneSnoozeAhead(SnoozeUnit::Hours, 2)),
+        )
+        .item(
+            "t",
+            "tonight (18:00)",
+            MenuAction::Command(Command::PhoneSnoozeAt {
+                hour: 18,
+                tomorrow: false,
+            }),
+        )
+        .item(
+            "shift-t",
+            "tomorrow (09:00)",
+            MenuAction::Command(Command::PhoneSnoozeAt {
+                hour: 9,
+                tomorrow: true,
+            }),
+        )
+        .item(
+            "d",
+            "3d",
+            MenuAction::Command(Command::PhoneSnoozeAhead(SnoozeUnit::Days, 3)),
+        )
+        .item(
+            "w",
+            "next week",
+            MenuAction::Command(Command::PhoneSnoozeAhead(SnoozeUnit::Weeks, 1)),
+        )
+}
+
 pub(crate) fn projects_menu() -> Menu {
     Menu::new("projects")
         .item("a", "add…", MenuAction::Command(Command::ProjectAdd))
         .item("r", "remove…", MenuAction::Command(Command::ProjectRemove))
-}
-
-pub fn phone_root_menu() -> Transient {
-    Transient::new("menu")
-        .item("d", "Map", |workspace, window, cx| {
-            workspace.phone_open_desk(window, cx);
-        })
-        .item("s", "Slack", |workspace, window, cx| {
-            workspace.open_slack(window, cx);
-        })
-        .item("a", "Agents", |workspace, window, cx| {
-            workspace.open_transient(agent_menu(), window, cx);
-        })
-        .item("i", "Status", |workspace, window, cx| {
-            workspace.open_transient(status_menu(), window, cx);
-        })
-}
-
-pub fn phone_desk_menu(raw_mode: bool) -> Transient {
-    Transient::new("Map")
-        .item("f", "Cycle folds", |workspace, window, cx| {
-            workspace.phone_cycle_dashboard_folds(window, cx);
-        })
-        .item(
-            "e",
-            if raw_mode {
-                "Done editing"
-            } else {
-                "Edit notes"
-            },
-            |workspace, window, cx| {
-                workspace.phone_toggle_dashboard_editing(window, cx);
-            },
-        )
-        .item("n", "New…", |workspace, window, cx| {
-            workspace.open_transient(new_menu(), window, cx);
-        })
-}
-
-/// Creation, the one verb: everything new starts here and is filed where
-/// the area picker's first row already points.
-pub fn new_menu() -> Transient {
-    use crate::create::NewKind;
-
-    Transient::new("new")
-        .item("a", "agent…", |workspace, window, cx| {
-            workspace.begin_new(NewKind::Agent, window, cx);
-        })
-        .item("p", "page…", |workspace, window, cx| {
-            workspace.begin_new(NewKind::Page, window, cx);
-        })
-        .item("n", "note…", |workspace, window, cx| {
-            workspace.begin_new(NewKind::Note, window, cx);
-        })
-}
-
-pub(crate) fn status_menu() -> Transient {
-    Transient::new("status")
-        .item(
-            "p",
-            "upload GUI performance snapshot",
-            |workspace, _, cx| {
-                workspace.cmd_upload_gui_telemetry(cx);
-            },
-        )
-        .item("u", "usage…", |workspace, window, cx| {
-            workspace.open_transient(usage_root_menu(), window, cx);
-        })
-        .item("v", "version", |workspace, _, cx| {
-            workspace.cmd_version(cx);
-        })
-}
-
-pub(crate) fn input_menu() -> Transient {
-    Transient::new("input")
-        .item(
-            "m",
-            "voice microphone · mute/unmute",
-            |workspace, window, cx| {
-                workspace.cmd_voice(window, cx);
-            },
-        )
-        .item("e", "voice session · end", |workspace, _, cx| {
-            workspace.cmd_end_voice(cx);
-        })
-        .item("p", "paste clipboard", |workspace, window, cx| {
-            workspace.cmd_paste_prompt(window, cx);
-        })
-        .item("c", "clear images", |workspace, window, cx| {
-            workspace.cmd_clear_prompt_attachments(window, cx);
-        })
 }
 
 pub fn usage_root_menu() -> Transient {
@@ -1792,152 +1893,17 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
         / 1_000_000.0
 }
 
-/// `space a`: driving the current conversation.
-pub(crate) fn agent_menu() -> Transient {
-    Transient::new("agent")
-        .item("d", "done", |workspace, window, cx| {
-            workspace.cmd_agent_done(false, window, cx);
-        })
-        .item("shift-d", "hide", |workspace, window, cx| {
-            workspace.cmd_agent_done(true, window, cx);
-        })
-        .item("s", "snooze…", |workspace, window, cx| {
-            workspace.open_transient(snooze_menu(), window, cx);
-        })
-        .item("c", "cancel turn", |workspace, window, cx| {
-            workspace.cmd_agent_cancel(window, cx);
-        })
-        .item("r", "role…", |workspace, window, cx| {
-            workspace.prompt_change_agent_role(window, cx);
-        })
-        .item("k", "compact", |workspace, window, cx| {
-            workspace.cmd_compact(window, cx);
-        })
-        .item("w", "rewind turn", |workspace, window, cx| {
-            workspace.cmd_rewind(1, window, cx);
-        })
-        .item("shift-w", "rewind turns…", |workspace, window, cx| {
-            workspace.prompt_rewind(window, cx);
-        })
-        .item("shift-c", "continue turn", |workspace, window, cx| {
-            workspace.cmd_continue_turn(window, cx);
-        })
-        .item(
-            "shift-k",
-            "new prompt cache key",
-            |workspace, window, cx| {
-                workspace.cmd_change_prompt_cache_key(window, cx);
-            },
-        )
-}
-
-fn snooze_menu() -> Transient {
-    const MINUTE_MS: u64 = 60 * 1000;
-    Transient::new("snooze")
-        .item("3", "30 minutes", |workspace, window, cx| {
-            workspace.cmd_agent_snooze(30 * MINUTE_MS, window, cx);
-        })
-        .item("h", "2 hours", |workspace, window, cx| {
-            workspace.cmd_agent_snooze(2 * 60 * MINUTE_MS, window, cx);
-        })
-        .item("d", "1 day", |workspace, window, cx| {
-            workspace.cmd_agent_snooze(24 * 60 * MINUTE_MS, window, cx);
-        })
-}
-
-/// The phone's answer to "how long": the times a thumb picks, where a
-/// keyboard types a count and a unit. `tonight` and `tomorrow` name an hour
-/// of the day, so they land on the clock and not on a distance from now.
-pub(crate) fn snooze_sheet() -> Transient {
-    fn later(
-        workspace: &mut Workspace,
-        at: chrono::DateTime<chrono::Local>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        workspace.phone_verdict_with(
-            crate::journal::PhoneVerdict::Defer,
-            move |workspace, window, cx| workspace.deal_snooze_at(at, window, cx),
-            window,
-            cx,
-        );
-    }
-    fn ahead(
-        workspace: &mut Workspace,
-        unit: crate::workspace::SnoozeUnit,
-        count: usize,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        workspace.phone_verdict_with(
-            crate::journal::PhoneVerdict::Defer,
-            move |workspace, window, cx| workspace.deal_snooze(unit, Some(count), window, cx),
-            window,
-            cx,
-        );
-    }
-    /// A named hour of the day. `tonight` is this evening while it is still
-    /// ahead and the next one after that; `tomorrow` is always the next day,
-    /// even when read before nine in the morning.
-    fn at_hour(hour: u32, tomorrow: bool) -> chrono::DateTime<chrono::Local> {
-        use chrono::TimeZone as _;
-        let now = chrono::Local::now();
-        let mut day = now.date_naive();
-        let time = chrono::NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default();
-        if tomorrow || day.and_time(time) <= now.naive_local() {
-            day += chrono::Duration::days(1);
-        }
-        chrono::Local
-            .from_local_datetime(&day.and_time(time))
-            .earliest()
-            .unwrap_or(now)
-    }
-    use crate::workspace::SnoozeUnit;
-    Transient::new("snooze")
-        .item("m", "30m", |workspace, window, cx| {
-            ahead(workspace, SnoozeUnit::Minutes, 30, window, cx);
-        })
-        .item("h", "2h", |workspace, window, cx| {
-            ahead(workspace, SnoozeUnit::Hours, 2, window, cx);
-        })
-        .item("t", "tonight (18:00)", |workspace, window, cx| {
-            later(workspace, at_hour(18, false), window, cx);
-        })
-        .item("shift-t", "tomorrow (09:00)", |workspace, window, cx| {
-            later(workspace, at_hour(9, true), window, cx);
-        })
-        .item("d", "3d", |workspace, window, cx| {
-            ahead(workspace, SnoozeUnit::Days, 3, window, cx);
-        })
-        .item("w", "next week", |workspace, window, cx| {
-            ahead(workspace, SnoozeUnit::Weeks, 1, window, cx);
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn phone_desk_menu_switches_editing_label() {
-        let browse = phone_desk_menu(false).phone_rows();
-        assert_eq!(
-            browse
-                .iter()
-                .map(|(_, description, _)| description.as_str())
-                .collect::<Vec<_>>(),
-            ["Cycle folds", "Edit notes", "New…"]
-        );
-        assert_eq!(phone_desk_menu(true).phone_rows()[1].1, "Done editing");
-    }
-
-    #[test]
     fn the_phone_snooze_sheet_offers_the_decided_chips() {
         assert_eq!(
             snooze_sheet()
-                .phone_rows()
+                .items()
                 .iter()
-                .map(|(_, description, _)| description.as_str())
+                .map(rho_window::transient::Item::description)
                 .collect::<Vec<_>>(),
             [
                 "30m",
@@ -1968,9 +1934,9 @@ mod tests {
         let status = status_menu();
         assert!(
             status
-                .items
+                .items()
                 .iter()
-                .any(|item| { item.key == "u" && item.description == "usage…" })
+                .any(|item| { item.key() == "u" && item.description() == "usage…" })
         );
     }
 

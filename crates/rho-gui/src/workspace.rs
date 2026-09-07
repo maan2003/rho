@@ -245,7 +245,11 @@ struct VerdictUndo {
 struct MenuBuffer {
     menu: crate::transient::Menu,
     editor: gpui::WeakEntity<editor::Editor>,
-    block: editor::display_map::CustomBlockId,
+    /// The block the menu was drawn as, when it is drawn in the buffer at
+    /// all. The phone draws the same menu as a sheet over the surface —
+    /// a thumb needs a target, not a row — so there is no block there and
+    /// nothing in the buffer moves.
+    block: Option<editor::display_map::CustomBlockId>,
     anchor: multi_buffer::Anchor,
     /// A count typed in this menu that belongs to the one it opened: `45 s m`
     /// is forty-five minutes, and the digits were typed before the `s`.
@@ -257,6 +261,20 @@ struct MenuBuffer {
     /// Whether this is the verdict menu (or a menu opened from it), which
     /// is what makes the next `shift` Home rather than another open.
     verdict: bool,
+}
+
+/// The open menu, ready to be drawn as a list of targets rather than as a
+/// block: what the phone needs and all it needs.
+pub(crate) struct MenuSheet {
+    pub(crate) title: String,
+    pub(crate) rows: Vec<MenuRow>,
+    /// Whether anything is under this menu for `back` to return to.
+    pub(crate) has_back: bool,
+}
+
+pub(crate) struct MenuRow {
+    pub(crate) description: String,
+    pub(crate) value: Option<String>,
 }
 
 /// What escape goes back to when a menu is dismissed.
@@ -276,6 +294,23 @@ pub(crate) enum SnoozeUnit {
     Hours,
     Days,
     Weeks,
+}
+
+/// A named hour of the day, for the phone's `tonight` and `tomorrow`.
+/// `tonight` is this evening while it is still ahead and the next one after
+/// that; `tomorrow` is always the next day, even when read before nine.
+fn named_hour(hour: u32, tomorrow: bool) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone as _;
+    let now = chrono::Local::now();
+    let mut day = now.date_naive();
+    let time = chrono::NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default();
+    if tomorrow || day.and_time(time) <= now.naive_local() {
+        day += chrono::Duration::days(1);
+    }
+    chrono::Local
+        .from_local_datetime(&day.and_time(time))
+        .earliest()
+        .unwrap_or(now)
 }
 
 /// Where a snooze lands and how the bar says it. Minutes and hours keep the
@@ -5489,6 +5524,16 @@ impl Workspace {
         self.menu_buffer.as_ref().map(|open| open.menu.title())
     }
 
+    /// Whether the open menu is drawn as a block in the buffer. False on
+    /// the phone, where the same menu is a sheet and the surface behind it
+    /// is left alone.
+    #[cfg(test)]
+    pub(crate) fn menu_has_block_for_test(&self) -> bool {
+        self.menu_buffer
+            .as_ref()
+            .is_some_and(|open| open.block.is_some())
+    }
+
     /// The reconnect loop marks test hosts disconnected (their sockets
     /// don't exist); verbs gated on connectivity need this to run.
     #[cfg(test)]
@@ -6954,10 +6999,11 @@ impl Workspace {
         let verdict = previous.as_ref().map_or(verdict, |open| open.verdict);
         let editor = self.active_editor(cx);
         if let Some(open) = &previous
+            && let Some(block) = open.block
             && let Some(editor) = open.editor.upgrade()
         {
             editor.update(cx, |editor, cx| {
-                editor.remove_blocks(std::iter::once(open.block).collect(), None, cx);
+                editor.remove_blocks(std::iter::once(block).collect(), None, cx);
             });
         }
         let under = match back {
@@ -6969,14 +7015,19 @@ impl Workspace {
             }),
             Back::Under(under) => under,
         };
-        let block = editor
-            .update(cx, |editor, cx| {
-                editor.insert_blocks([menu.block(anchor)], None, cx)
-            })
-            .into_iter()
-            .next();
-        let Some(block) = block else {
-            return false;
+        let block = if self.phone.enabled {
+            None
+        } else {
+            let block = editor
+                .update(cx, |editor, cx| {
+                    editor.insert_blocks([menu.block(anchor)], None, cx)
+                })
+                .into_iter()
+                .next();
+            if block.is_none() {
+                return false;
+            }
+            block
         };
         self.menu_buffer = Some(MenuBuffer {
             menu,
@@ -6996,11 +7047,13 @@ impl Workspace {
         let Some(open) = self.menu_buffer.as_ref() else {
             return;
         };
-        let (Some(editor), anchor) = (open.editor.upgrade(), open.anchor) else {
+        let (Some(editor), anchor, Some(old)) = (open.editor.upgrade(), open.anchor, open.block)
+        else {
+            // The phone's sheet redraws from the menu itself; there is no
+            // block to put back.
             return;
         };
         let properties = open.menu.block(anchor);
-        let old = open.block;
         let block = editor
             .update(cx, |editor, cx| {
                 editor.remove_blocks(std::iter::once(old).collect(), None, cx);
@@ -7008,7 +7061,7 @@ impl Workspace {
             })
             .into_iter()
             .next();
-        if let (Some(open), Some(block)) = (self.menu_buffer.as_mut(), block) {
+        if let Some(open) = self.menu_buffer.as_mut() {
             open.block = block;
         }
     }
@@ -7017,16 +7070,79 @@ impl Workspace {
         let Some(open) = self.menu_buffer.take() else {
             return;
         };
-        if let Some(editor) = open.editor.upgrade() {
+        if let Some(block) = open.block
+            && let Some(editor) = open.editor.upgrade()
+        {
             editor.update(cx, |editor, cx| {
-                editor.remove_blocks(std::iter::once(open.block).collect(), None, cx);
+                editor.remove_blocks(std::iter::once(block).collect(), None, cx);
             });
         }
     }
 
+    /// One step back: to the menu this one is standing on, or out of the
+    /// menus altogether. Escape and the phone sheet's `back` are the same
+    /// motion, so they are the same code.
+    pub(crate) fn menu_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.menu_buffer.as_mut() else {
+            return;
+        };
+        match open.under.pop() {
+            // Out of the submenu, back to the menu it came from, over the
+            // same row and with the rest of the way back kept.
+            Some(parent) => {
+                let count = open.carried_count;
+                let under = std::mem::take(&mut open.under);
+                self.show_menu(parent, count, Back::Under(under), false, cx);
+                cx.notify();
+            }
+            None => self.close_menu(window, cx),
+        }
+    }
+
+    /// The open menu as the phone draws it: its title, a row per item, and
+    /// whether there is anything under it to go back to. The same rows the
+    /// block draws — one menu, read two ways, not two menus.
+    pub(crate) fn menu_sheet(&self) -> Option<MenuSheet> {
+        let open = self.menu_buffer.as_ref()?;
+        Some(MenuSheet {
+            title: open.menu.title().to_owned(),
+            rows: open
+                .menu
+                .items()
+                .iter()
+                .map(|item| MenuRow {
+                    description: item.description().to_owned(),
+                    value: item.value().map(str::to_owned),
+                })
+                .collect(),
+            has_back: !open.under.is_empty(),
+        })
+    }
+
+    /// A tap on the phone's sheet: the same item the same key would have
+    /// reached, run the same way.
+    pub(crate) fn run_menu_at(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.menu_buffer.as_ref() else {
+            return;
+        };
+        let Some(item) = open.menu.items().get(index) else {
+            return;
+        };
+        let action = *item.action();
+        let closes = item.kind() == rho_window::transient::Kind::Suffix;
+        let count = open.carried_count;
+        self.run_menu_action(action, count, closes, window, cx);
+        cx.notify();
+    }
+
     /// Close the menu and give the keyboard back to the surface it opened
     /// over. The point has not moved: the menu was a block beside it.
-    fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu_buffer.is_none() {
             return;
         }
@@ -7061,17 +7177,7 @@ impl Workspace {
                 self.reinsert_menu_block(cx);
                 cx.notify();
             }
-            rho_window::transient::Press::Dismiss => match open.under.pop() {
-                // Out of the submenu, back to the menu it came from, over
-                // the same row and with the rest of the way back kept.
-                Some(parent) => {
-                    let count = open.carried_count;
-                    let under = std::mem::take(&mut open.under);
-                    self.show_menu(parent, count, Back::Under(under), false, cx);
-                    cx.notify();
-                }
-                None => self.close_menu(window, cx),
-            },
+            rho_window::transient::Press::Dismiss => self.menu_dismiss(window, cx),
             rho_window::transient::Press::Unbound => {}
             rho_window::transient::Press::Run {
                 item,
@@ -7132,21 +7238,15 @@ impl Workspace {
             MenuId::Hosts => crate::transient::hosts_menu(),
             MenuId::Projects => crate::transient::projects_menu(),
             MenuId::VerdictSnooze => crate::transient::verdict_snooze_menu(),
-            // Still the bottom strip.
-            MenuId::Input => {
-                self.open_transient(crate::transient::input_menu(), window, cx);
-                return;
-            }
-            MenuId::Agent => {
-                self.open_transient(crate::transient::agent_menu(), window, cx);
-                return;
-            }
-            MenuId::New => {
-                self.open_transient(crate::transient::new_menu(), window, cx);
-                return;
-            }
-            MenuId::Status => {
-                self.open_transient(crate::transient::status_menu(), window, cx);
+            MenuId::Input => crate::transient::input_menu(),
+            MenuId::Agent => crate::transient::agent_menu(),
+            MenuId::New => crate::transient::new_menu(),
+            MenuId::Status => crate::transient::status_menu(),
+            MenuId::Snooze => crate::transient::snooze_menu(),
+            // Still the bottom strip: the charts carry their series, and
+            // they leave with them.
+            MenuId::UsageRoot => {
+                self.open_transient(crate::transient::usage_root_menu(), window, cx);
                 return;
             }
         };
@@ -7217,6 +7317,44 @@ impl Workspace {
             Command::HostAuth => self.open_host_auth_transient(window, cx),
             Command::ProjectAdd => self.prompt_project_add(window, cx),
             Command::ProjectRemove => self.prompt_project_remove(window, cx),
+            Command::EndVoice => self.cmd_end_voice(cx),
+            Command::PastePrompt => self.cmd_paste_prompt(window, cx),
+            Command::ClearPromptImages => self.cmd_clear_prompt_attachments(window, cx),
+            Command::NewAgent => self.begin_new(crate::create::NewKind::Agent, window, cx),
+            Command::NewPage => self.begin_new(crate::create::NewKind::Page, window, cx),
+            Command::NewNote => self.begin_new(crate::create::NewKind::Note, window, cx),
+            Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
+            Command::Version => self.cmd_version(cx),
+            Command::AgentDone => self.cmd_agent_done(false, window, cx),
+            Command::AgentHide => self.cmd_agent_done(true, window, cx),
+            Command::AgentCancel => self.cmd_agent_cancel(window, cx),
+            Command::AgentRole => self.prompt_change_agent_role(window, cx),
+            Command::AgentCompact => self.cmd_compact(window, cx),
+            Command::AgentRewind => self.cmd_rewind(1, window, cx),
+            Command::AgentRewindMany => self.prompt_rewind(window, cx),
+            Command::AgentContinue => self.cmd_continue_turn(window, cx),
+            Command::AgentCacheKey => self.cmd_change_prompt_cache_key(window, cx),
+            Command::AgentSnooze(ms) => self.cmd_agent_snooze(ms, window, cx),
+            Command::PhoneOpenDesk => self.phone_open_desk(window, cx),
+            Command::PhoneSnoozeAhead(unit, count) => {
+                self.phone_verdict_with(
+                    crate::journal::PhoneVerdict::Defer,
+                    move |workspace, window, cx| {
+                        workspace.deal_snooze(unit, Some(count), window, cx)
+                    },
+                    window,
+                    cx,
+                );
+            }
+            Command::PhoneSnoozeAt { hour, tomorrow } => {
+                let at = named_hour(hour, tomorrow);
+                self.phone_verdict_with(
+                    crate::journal::PhoneVerdict::Defer,
+                    move |workspace, window, cx| workspace.deal_snooze_at(at, window, cx),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 

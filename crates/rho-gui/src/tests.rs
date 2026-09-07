@@ -4638,6 +4638,78 @@ fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppCo
         .unwrap();
 }
 
+/// The phone draws the same menu. Not the same picture — a thumb needs a
+/// target, not a row — but the same items, reached by tapping the row a key
+/// would have run, with the same stack behind `back`. And no block: the
+/// sheet is over the surface, so nothing in the buffer moves to make room.
+#[gpui::test]
+fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("draw phone frame");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
+            let sheet = workspace.menu_sheet().expect("a sheet to draw");
+            assert_eq!(sheet.title, "menu");
+            assert_eq!(
+                sheet
+                    .rows
+                    .iter()
+                    .map(|row| row.description.as_str())
+                    .collect::<Vec<_>>(),
+                ["Map", "Slack", "Agents", "Status"]
+            );
+            assert!(
+                !sheet.has_back,
+                "the root of the sheet has nothing under it"
+            );
+            assert!(
+                !workspace.menu_has_block_for_test(),
+                "the phone's menu is a sheet, not a block in the buffer"
+            );
+            assert!(
+                !workspace.has_transient_for_test(),
+                "and not the bottom strip either"
+            );
+        })
+        .unwrap();
+
+    // Tapping "Status" is the same step `i` would have taken.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.run_menu_at(3, window, cx);
+            let sheet = workspace.menu_sheet().expect("the submenu draws");
+            assert_eq!(sheet.title, "status");
+            assert!(sheet.has_back, "and the sheet says there is a way back");
+            assert!(!workspace.menu_has_block_for_test());
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.menu_dismiss(window, cx);
+            assert_eq!(workspace.menu_title_for_test(), Some("menu"));
+            workspace.menu_dismiss(window, cx);
+            assert_eq!(workspace.menu_title_for_test(), None, "and then out");
+        })
+        .unwrap();
+}
+
 /// Escape out of the snooze units goes back to the verdicts, not out of the
 /// menu: back returns, here as everywhere.
 #[gpui::test]

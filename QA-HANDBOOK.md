@@ -39,7 +39,7 @@ rho wayland --session desk screenshot --output /tmp/case.png
 rho wayland --session desk tree                               # the window tree
 ```
 
-Three things the driver does not do, and what to do instead.
+Four things the driver does not do, and what to do instead.
 
 - **Resize.** There is no resize for a running session. Sway's own ipc socket
   is the way: the path is `ipc_socket` in the session's `session.json`, and
@@ -54,6 +54,19 @@ Three things the driver does not do, and what to do instead.
   so the tool that reads a run is never older than the run. It did not, once,
   and a stale copy wrote no summary line into desk sessions 23 to 25 while
   looking like a rig fault.
+- **Tap.** `rho wayland click` and `move` go out as sway `seat seat0 cursor`
+  commands, the ipc answers `success: true`, and no client ever sees them: the
+  headless seat has no pointer. `swaymsg -t get_seats` says `capabilities: 0`
+  with an empty `devices` on an idle session, and `2` with one
+  `wlr_virtual_keyboard_v1` while `wtype` is running — the keyboard is a
+  device the driver creates for the length of a keystroke and the pointer is
+  nothing at all. So a screen reached only by tap cannot be photographed here.
+  That is the phone: its sheet opens from the ☰, the deal card's header or the
+  feed header, keys do arrive at phone width (`ctrl-shift-f` opens the
+  minibuffer) but none of them opens the menu. Prove those paths by test and
+  say in the note that you did; giving the driver a virtual pointer is the
+  rig's own next item. Do not read a silent `click` as a screen that ignored
+  the tap — check the seat first.
 
 Three rules for every run.
 

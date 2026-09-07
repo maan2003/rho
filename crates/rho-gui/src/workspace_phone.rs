@@ -920,7 +920,7 @@ impl Workspace {
                 .text_color(colors.text_muted)
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_transient(crate::transient::phone_root_menu(), window, cx);
+                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
                 }))
                 .child(
                     div()
@@ -985,7 +985,7 @@ impl Workspace {
                         .text_color(colors.text_muted)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_transient(crate::transient::phone_root_menu(), window, cx);
+                            this.open_menu(crate::transient::phone_root_menu(), window, cx);
                         }))
                         // The header names what the reader is looking at,
                         // and with the queue empty that is Home, not the
@@ -1190,7 +1190,7 @@ impl Workspace {
                 // unit answers on a keyboard.
                 item("phone-verdict-defer", "◷", "defer").on_click(cx.listener(
                     |this, _, window, cx| {
-                        this.open_transient(crate::transient::snooze_sheet(), window, cx);
+                        this.open_menu(crate::transient::snooze_sheet(), window, cx);
                     },
                 )),
             )
@@ -1284,7 +1284,7 @@ impl Workspace {
             )
             .child(
                 item("phone-menu", "☰", "menu").on_click(cx.listener(|this, _, window, cx| {
-                    this.open_transient(crate::transient::phone_root_menu(), window, cx);
+                    this.open_menu(crate::transient::phone_root_menu(), window, cx);
                 })),
             )
             .children(primary)
@@ -1326,15 +1326,6 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn phone_cycle_dashboard_folds(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dashboard.cycle_global_folds(cx);
-        self.refresh_dashboard(window, cx);
-    }
-
     pub(crate) fn phone_toggle_dashboard_editing(
         &mut self,
         window: &mut Window,
@@ -1371,6 +1362,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close whichever sheet is showing. Two sources until the charts
+    /// move, one motion.
+    fn close_sheet(&mut self, from_menu: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if from_menu {
+            self.close_menu(window, cx);
+        } else {
+            self.close_transient(window, cx);
+        }
+    }
+
+    /// A tap on a bottom-strip menu's sheet. Only the usage charts reach
+    /// this now, and it goes when they do.
     fn phone_transient_action(
         &mut self,
         index: usize,
@@ -1409,11 +1412,35 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let transient = self.transient.as_ref()?;
+        // The menu under the point is the same menu; the phone draws its
+        // rows as targets a thumb can hit instead of as a block in the
+        // buffer. The bottom strip is the fallback until the usage charts
+        // move, since they are the last menus that are not this data.
+        let (sheet, from_menu) = match self.menu_sheet() {
+            Some(sheet) => (sheet, true),
+            None => {
+                let transient = self.transient.as_ref()?;
+                let sheet = crate::workspace::MenuSheet {
+                    title: transient.title().to_owned(),
+                    rows: transient
+                        .phone_rows()
+                        .into_iter()
+                        .map(|(_key, description, value)| crate::workspace::MenuRow {
+                            description,
+                            value,
+                        })
+                        .collect(),
+                    has_back: !self.transient_stack.is_empty(),
+                };
+                (sheet, false)
+            }
+        };
+        let crate::workspace::MenuSheet {
+            title,
+            rows,
+            has_back: has_parent,
+        } = sheet;
         let colors = cx.theme().colors();
-        let title = transient.title();
-        let rows = transient.phone_rows();
-        let has_parent = !self.transient_stack.is_empty();
 
         let mut header = div()
             .flex()
@@ -1433,8 +1460,10 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .child("back")
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        if let Some(parent) = this.transient_stack.pop() {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if from_menu {
+                            this.menu_dismiss(window, cx);
+                        } else if let Some(parent) = this.transient_stack.pop() {
                             this.transient = Some(parent);
                             cx.notify();
                         }
@@ -1459,16 +1488,14 @@ impl Workspace {
                     .items_center()
                     .justify_end()
                     .child("close")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_transient(window, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_sheet(from_menu, window, cx);
                         cx.stop_propagation();
                     })),
             );
 
-        let rows = rows
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_key, description, value))| {
+        let rows = rows.into_iter().enumerate().map(
+            |(index, crate::workspace::MenuRow { description, value })| {
                 let mut row = div()
                     .id(("phone-sheet-row", index))
                     .cursor_pointer()
@@ -1485,10 +1512,15 @@ impl Workspace {
                     row = row.child(div().text_color(colors.text_muted).child(value));
                 }
                 row.on_click(cx.listener(move |this, _, window, cx| {
-                    this.phone_transient_action(index, window, cx);
+                    if from_menu {
+                        this.run_menu_at(index, window, cx);
+                    } else {
+                        this.phone_transient_action(index, window, cx);
+                    }
                     cx.stop_propagation();
                 }))
-            });
+            },
+        );
 
         let mut background: gpui::Hsla = colors.editor_background.into();
         if background.l < 0.5 {

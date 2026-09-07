@@ -128,9 +128,54 @@ from the third step rather than back to the second is the thing the design
 says never happens. What is kept is what escape retraces, so the whole way
 back is there, not one step of it.
 
-What is not done: thirteen strip menus, the phone's second way in (still
-`phone_rows`/`action_at` on the old strip type), and the charts, which are the
-batch that needs `rho-visualizations` rather than a mechanical move.
+The third batch is the draft's two — `new` and `input` — and with them the
+phone, which is where the primitive's fifth complaint about the old
+transient is answered. The phone does not draw the block: a thumb needs a
+target, not a row, so the sheet draws the menu's items as targets and the
+surface behind it is left alone. What makes it one presentation path rather
+than two is that it is the same `Transient<A>` read through `items()`, and a
+tap runs the item a key would have run — `action_at` and `phone_rows` are
+gone for every menu that has moved. The block became optional on the buffer
+rather than conditional at the call site, which is the honest shape: a menu
+is open either way, and only its drawing differs.
+
+What is not done: the five usage menus, which carry their series and are the
+batch that needs `rho-visualizations` rather than a mechanical move. They are
+the last readers of the bottom strip and of `phone_rows`, and the strip's
+element tree goes when they do. One orphan found on the way and removed: `phone_desk_menu`,
+the Map screen's own sheet on the phone — cycle folds, edit notes, new — was
+opened by nothing, because the phone's ☰ opens the root menu whichever root
+is showing. A menu nothing opens is residue; if the map's own sheet is wanted
+it comes back as a `Transient` over `MenuAction` with one line in the bottom
+bar, not as a strip.
+
+### Owed
+
+Not this crate's yet, and written down here so they are one list rather than
+three landing notes.
+
+- **The right prompt is the vendored editor's, not the window's.** A screen
+  reaches it through `editor`, so today the window does not own every
+  primitive its screens draw with.
+- **A width change rewraps the whole buffer, and so does the wrap map on its
+  own.** That fails the cost rule twice over. Tail-first shrinks what the
+  rewrap sees but does not fix it, it is a vendored-editor primitive, and
+  after the fold trio it is the layer `gg` over a full history still fails
+  on. eng-b8os has it as their next task; it is written here so the list is
+  one list, not to claim it.
+- **A block insert costing a rewrap of what is around it is closed.** It was
+  two frames over the 8 ms budget when a twenty-six row menu opened into a
+  121k-row Home on desk session 30. Re-measured after the fold trio landed,
+  on desk session 41 — ten open-and-dismiss round trips on Home and nothing
+  else — it is 115 frames, draw p99 5.8 ms, none over 8 ms, with
+  `block_map_sync` p99 0.08 ms at one row. The insert costs the block now.
+  It was desktop-only in any case: the phone draws the same menu as a sheet
+  and inserts no block, so nothing in its buffer moves.
+- **The rig cannot tap.** The phone's menu is reached by tap and the headless
+  seat has no pointer device, so the sheet is proven by test and not by
+  picture. That is the rig's gap, not the window's, and it is the rig's next
+  item; it is here because it is what stops a window primitive being proven
+  the way the section below says every one of them will be.
 
 ### How it will be proven
 

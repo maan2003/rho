@@ -779,6 +779,79 @@ wrong at the design, not at the polish.
   Gate green: rho-gui 259 passed and 3 ignored (against main's 258), clippy
   `-D warnings` clean, `cargo fmt --check` clean.
 
+  *Landed, the draft's menus and the phone's one way in (`rho-gui`'s
+  `transient`, `workspace` and `workspace_phone`).* `new`, `input`,
+  `status`, `agent`, `snooze`, `phone_root_menu` and the phone's snooze
+  sheet: twelve of the seventeen have moved, and the five that have not are
+  the usage charts, which carry their series and want
+  `rho-visualizations` rather than a mechanical move.
+  The part worth reading is the phone. The primitive's fifth complaint
+  about the old transient was that the phone had a second way in —
+  `phone_rows` and `action_at`, by index into a private `Vec`. The sheet
+  now draws from the same `Transient<A>` through `items()`, and a tap runs
+  the item a key would have run through the same `run_menu_action`. It is
+  not the same picture — a thumb needs a target, not a row — and that is
+  the point: one menu, one set of actions, two drawings.
+  Which made the block optional rather than conditional at the call site.
+  A menu on the phone is open the same way it is open on the desk; it just
+  has no block, so nothing in the buffer moves to make room for a sheet
+  that is drawn over the surface. `MenuBuffer::block` is an `Option`, and
+  the one place that decides is `show_menu`.
+  Proven on the desk, sessions 40 and 41, rebased onto main `1e04ecff` and
+  rebuilt, so the pictures are of b8os's fold trio with this batch on top.
+  On the desktop: `space` on Home with the point on the `eng-8gpr` row draws
+  the root menu as a block directly under the point, `n` replaces it with
+  `new` — **a** agent…, **p** page…, **n** note… — the rows below pushed
+  down and the bottom strip empty, and two escapes give Home back in a frame
+  byte-identical to the one the menu opened over. Three consecutive
+  open-and-dismiss round trips: two byte-identical, and the third differing
+  by 1,167 pixels which are all the `eng-b8os` name going from muted to
+  normal — that agent's own mirror row moving while they work, not the
+  buffer. A no-input control over the same span is byte-identical, which is
+  how the live row and the buffer were told apart.
+  The phone half could not be photographed, and the reason is the rig, not
+  the change. Every way into the sheet is a tap — the ☰, the deal card's
+  header, the empty feed's header — and the rig's headless seat has no
+  pointer: sway reports `capabilities: 0` with no devices, so
+  `seat seat0 cursor press` succeeds in the ipc and reaches no client, while
+  `wtype`'s virtual keyboard is a device and does. Keys do arrive at phone
+  width (`ctrl-shift-f` opens the minibuffer there), but nothing bound to a
+  key opens the phone's menu: `space` is bound for editors and the deal card
+  focuses none, and the one command that would leave the card for the
+  dashboard is itself an item in the menu being opened. So the phone half is
+  proven by `the_phone_sheet_is_the_same_menu_as_the_block` — 400x800, sheet
+  title `menu`, rows Map/Slack/Agents/Status, no block and no strip, `Status`
+  opening a submenu with a back, two dismissals to close — and not by a
+  picture. Giving `rho wayland` a virtual pointer is the rig's next item and
+  the handbook says so; until then the phone is a test, not a photograph, and
+  this note says which.
+  The block-insert re-measure asked for after the fold trio is session 41 and
+  nothing else: ten open-and-dismiss round trips on Home, `115 frames, draw
+  p99 5.8 ms, 0 over 8 ms; worst gap 290 ms, p99 8 ms; 13100 events, slowest
+  stage block_map_sync p99 0.08 ms at 1 rows`. Against the two frames over
+  8 ms and the rewrap of what was around the block measured before the trio,
+  the block insert now costs the block: one row of block-map work, and no
+  frame over budget on the whole run.
+  Removed, and named here so it can be asked for back. `phone_desk_menu`
+  was the Map screen's own sheet on the phone — **cycle folds**, **edit
+  notes**, **new** — and nothing opened it: the phone's ☰ opens the root
+  menu whichever root is showing, so the Map sheet had never been
+  reachable. A menu nothing opens is residue by the rule every dead item
+  here has been answered with, so it goes rather than being carried over as
+  data. If the map's own sheet is wanted on the phone it comes back as a
+  `Transient` over `MenuAction` like the rest, with one line in the bottom
+  bar, not as a strip. `phone_cycle_dashboard_folds` went with it, having
+  had no other caller; the desktop's fold cycling is untouched.
+  The block-insert cost from the batch above came off `rho-window`'s owed
+  list with the number above: the fold trio changed what Home's block map
+  holds, and a menu open is one row of it now. What is left on that list
+  beside the width-change rewrap is the wrap map's own whole-buffer rewrap,
+  which is eng-b8os's next task, not this crate's.
+  Gate green on the rebase: rho-gui 262 passed and 3 ignored — one test
+  added for the phone sheet and one removed with the menu it was about, so
+  the count is main's, which the fold trio moved from 259 to 262. Clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+
 - **Landed, the refusal block is measured too** (`rho-window` module touched:
   `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
   the other `height: None` in the chrome, filed in the change above and fixed
