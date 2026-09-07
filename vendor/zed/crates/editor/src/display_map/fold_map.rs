@@ -1343,10 +1343,23 @@ fn elided_ranges(
                 .row()
                 .saturating_sub(rows.saturating_sub(1))
                 .max(start_point.row());
-            let tail_start = inlay_snapshot
-                .to_offset(InlayPoint(Point::new(tail_start_row, 0)))
-                .max(fold_range.start)
-                .min(fold_range.end);
+            // The elided head stops at the end of the row above the tail,
+            // not at the tail's first column: the newline between them has
+            // to survive, or the tail's first row is not a row at all — it
+            // is drawn on the end of the placeholder's row, and a policy
+            // that promises `rows` visible rows delivers `rows - 1` of them
+            // plus a fragment.
+            let tail_start = if tail_start_row == 0 {
+                fold_range.start
+            } else {
+                inlay_snapshot
+                    .to_offset(InlayPoint(Point::new(
+                        tail_start_row - 1,
+                        inlay_snapshot.line_len(tail_start_row - 1),
+                    )))
+                    .max(fold_range.start)
+                    .min(fold_range.end)
+            };
 
             if tail_start <= fold_range.start {
                 (None, Some(fold_range))
@@ -2290,7 +2303,10 @@ mod tests {
         )]);
 
         let (snapshot, _) = map.read(inlay_snapshot, vec![]);
-        assert_eq!(snapshot.text(), "⋯four\nfive");
+        // The placeholder keeps its own row: the newline above the tail is
+        // outside the elided head, so "four" starts a row rather than
+        // running on from the fold.
+        assert_eq!(snapshot.text(), "⋯\nfour\nfive");
     }
 
     #[gpui::test]

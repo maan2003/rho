@@ -155,19 +155,30 @@ impl Editor {
             return;
         }
 
-        if self.buffer().read(cx).is_singleton() {
-            let selection = self.selections.newest::<Point>(&display_map);
-
-            let range = if selection.is_empty() {
-                let point = selection.head().to_display_point(&display_map);
-                let start = DisplayPoint::new(point.row(), 0).to_point(&display_map);
-                let end = DisplayPoint::new(point.row(), display_map.line_len(point.row()))
-                    .to_point(&display_map);
-                start..end
-            } else {
-                selection.range()
-            };
-            if display_map.folds_in_range(range).next().is_some() {
+        let selection = self.selections.newest::<Point>(&display_map);
+        let range = if selection.is_empty() {
+            let point = selection.head().to_display_point(&display_map);
+            let start = DisplayPoint::new(point.row(), 0).to_point(&display_map);
+            let end = DisplayPoint::new(point.row(), display_map.line_len(point.row()))
+                .to_point(&display_map);
+            start..end
+        } else {
+            selection.range()
+        };
+        let folded = display_map.folds_in_range(range.clone()).next().is_some();
+        // A multibuffer with a fold or a crease under the point toggles that
+        // fold, the way a singleton buffer always has. Only when there is
+        // neither does the whole-buffer gesture below apply — that gesture is
+        // for a project search, where a multibuffer is a list of files and
+        // there is nothing else a fold could mean.
+        let creased = !folded
+            && (range.start.row..=range.end.row).any(|row| {
+                display_map
+                    .crease_for_buffer_row(MultiBufferRow(row))
+                    .is_some()
+            });
+        if self.buffer().read(cx).is_singleton() || folded || creased {
+            if folded {
                 self.unfold_lines(&Default::default(), window, cx)
             } else {
                 self.fold(&Default::default(), window, cx)
@@ -232,7 +243,7 @@ impl Editor {
             return;
         }
 
-        if self.buffer().read(cx).is_singleton() {
+        {
             let mut to_fold = Vec::new();
             let selections = self.selections.all_adjusted(&display_map);
 
@@ -270,8 +281,20 @@ impl Editor {
                 }
             }
 
-            self.fold_creases(to_fold, true, window, cx);
-        } else {
+            // The creases under the selection are what `zc` folds, in a
+            // multibuffer as much as in a singleton one. A multibuffer with
+            // no crease under the point keeps zed's own gesture below:
+            // fold the whole buffer, which is what a file in a project
+            // search means by a fold.
+            if !to_fold.is_empty() {
+                self.fold_creases(to_fold, true, window, cx);
+                return;
+            }
+            if self.buffer().read(cx).is_singleton() {
+                return;
+            }
+        }
+        {
             let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
             let buffer_ids = self
                 .selections
@@ -514,21 +537,26 @@ impl Editor {
             return;
         }
 
-        if self.buffer().read(cx).is_singleton() {
-            let buffer = display_map.buffer_snapshot();
-            let selections = self.selections.all::<Point>(&display_map);
-            let ranges = selections
-                .iter()
-                .map(|s| {
-                    let range = s.display_range(&display_map).sorted();
-                    let mut start = range.start.to_point(&display_map);
-                    let mut end = range.end.to_point(&display_map);
-                    start.column = 0;
-                    end.column = buffer.line_len(MultiBufferRow(end.row));
-                    start..end
-                })
-                .collect::<Vec<_>>();
-
+        let buffer = display_map.buffer_snapshot();
+        let selections = self.selections.all::<Point>(&display_map);
+        let ranges = selections
+            .iter()
+            .map(|s| {
+                let range = s.display_range(&display_map).sorted();
+                let mut start = range.start.to_point(&display_map);
+                let mut end = range.end.to_point(&display_map);
+                start.column = 0;
+                end.column = buffer.line_len(MultiBufferRow(end.row));
+                start..end
+            })
+            .collect::<Vec<_>>();
+        // A fold under the selection is opened wherever it is. Only a
+        // multibuffer with nothing folded under the point falls through to
+        // unfolding whole buffers.
+        let folded = ranges
+            .iter()
+            .any(|range| display_map.folds_in_range(range.clone()).next().is_some());
+        if self.buffer().read(cx).is_singleton() || folded {
             self.unfold_ranges(&ranges, true, true, cx);
         } else {
             let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
