@@ -7109,6 +7109,33 @@ pub enum ElementId {
     NamedChild(Arc<ElementId>, SharedString),
     /// A byte array ID (used for text-anchors)
     OpaqueId([u8; 20]),
+    /// An element whose paint is expected to change on a declared cadence.
+    LiveOwner(LiveOwner),
+}
+
+/// A typed declaration that an element's paint may change as time advances.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct LiveOwner {
+    /// Stable identity within its containing view.
+    pub name: SharedString,
+    /// Minimum time between expected paint changes.
+    pub cadence: std::time::Duration,
+}
+
+impl LiveOwner {
+    /// Declares a time-varying owner with a stable name and cadence.
+    pub fn every(name: impl Into<SharedString>, cadence: std::time::Duration) -> Self {
+        Self {
+            name: name.into(),
+            cadence,
+        }
+    }
+}
+
+impl From<LiveOwner> for ElementId {
+    fn from(owner: LiveOwner) -> Self {
+        Self::LiveOwner(owner)
+    }
 }
 
 impl ElementId {
@@ -7131,6 +7158,7 @@ impl Display for ElementId {
             ElementId::CodeLocation(location) => write!(f, "{}", location)?,
             ElementId::NamedChild(id, name) => write!(f, "{}-{}", id, name)?,
             ElementId::OpaqueId(opaque_id) => write!(f, "{:x?}", opaque_id)?,
+            ElementId::LiveOwner(owner) => write!(f, "live:{}", owner.name)?,
         }
 
         Ok(())

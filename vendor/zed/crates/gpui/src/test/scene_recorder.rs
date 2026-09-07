@@ -155,6 +155,19 @@ impl<E: Clone + 'static> SceneRecorder<E> {
     }
 }
 
+impl SceneOwner {
+    /// The nearest element declaration allowing this owner to change with time.
+    pub fn live_owner(&self) -> Option<&crate::LiveOwner> {
+        self.elements
+            .iter()
+            .rev()
+            .find_map(|element| match element {
+                ElementId::LiveOwner(owner) => Some(owner),
+                _ => None,
+            })
+    }
+}
+
 fn record<E: Clone>(recording: &mut Recording<E>, scene: &Scene) {
     let primitives: Arc<[RecordedPrimitive]> = scene.recorded_primitives().into();
     let hash = scene.recorded_hash();
@@ -283,6 +296,21 @@ mod tests {
     enum Event {
         Initial,
         Key(char),
+    }
+
+    #[test]
+    fn typed_live_owner_is_read_from_the_element_path() {
+        let cadence = std::time::Duration::from_secs(1);
+        let owner = SceneOwner {
+            view: None,
+            elements: vec![
+                ElementId::from("row"),
+                crate::LiveOwner::every("connection", cadence).into(),
+            ]
+            .into(),
+            vertical_band: 0,
+        };
+        assert_eq!(owner.live_owner().map(|owner| owner.cadence), Some(cadence));
     }
 
     fn quad(top: f32) -> Quad {
