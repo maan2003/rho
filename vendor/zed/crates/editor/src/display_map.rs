@@ -102,6 +102,8 @@ pub use tab_map::TabEdit;
 #[cfg(feature = "wrap-test-support")]
 pub use wrap_map::WrapSyncTrace;
 pub use wrap_map::{WrapPoint, WrapPriority, WrapRow, WrapSnapshot};
+#[cfg(feature = "wrap-test-support")]
+pub use wrap_map::{WrapQueueState, WrapSyncRecord};
 
 use collections::{HashMap, HashSet, IndexSet};
 use gpui::{
@@ -397,6 +399,18 @@ impl DisplayMap {
     ) -> Vec<(Option<Pixels>, Option<Pixels>)> {
         self.wrap_map
             .update(cx, |wrap_map, _| wrap_map.take_wrap_width_changes())
+    }
+
+    /// See [`wrap_map::WrapMap::queue_state`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn wrap_queue_state(&self, cx: &gpui::App) -> wrap_map::WrapQueueState {
+        self.wrap_map.read(cx).queue_state()
+    }
+
+    /// See [`wrap_map::WrapSyncRecord`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn wrap_sync_records(&self, cx: &gpui::App) -> Vec<wrap_map::WrapSyncRecord> {
+        self.wrap_map.read(cx).sync_records().to_vec()
     }
 
     pub fn new(

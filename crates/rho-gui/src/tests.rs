@@ -20,6 +20,7 @@ use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod story;
+mod wrap_invariants;
 use rho_agents::HostId;
 
 use crate::workspace::{AttachTarget, HostSpec, Workspace};

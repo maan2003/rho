@@ -142,6 +142,43 @@ pub struct WrapMap {
     sync_traces: Vec<WrapSyncTrace>,
     #[cfg(feature = "wrap-test-support")]
     wrap_width_changes: Vec<(Option<Pixels>, Option<Pixels>)>,
+    /// One record per `sync` answered. See [`WrapSyncRecord`].
+    #[cfg(feature = "wrap-test-support")]
+    #[cfg(feature = "wrap-test-support")]
+    sync_rows_and_edit_ends: Vec<WrapSyncRecord>,
+}
+
+/// What one `sync` handed its caller: the snapshot's row count and the
+/// shape of the edits beside it.
+///
+/// The block map above resolves the rows those edits name against that
+/// snapshot, so the two have to describe one document — every row the
+/// snapshot gains or loses between two syncs is named by the edits handed
+/// over with it, no edit's old side reaches past the previous snapshot, and
+/// no edit's new side reaches past its own. When that fails, a row range is
+/// asked of a document that does not have it and a column of one row
+/// resolves on another, which reaches the rope four maps down as a point
+/// beyond its row. `WrapSnapshot::check_invariants` asserts the snapshot's
+/// own consistency and says nothing about the edits, and it is `cfg(test)`
+/// inside this crate, which is not a workspace member and cannot run its own
+/// tests here.
+#[cfg(feature = "wrap-test-support")]
+#[derive(Clone, Copy, Debug)]
+pub struct WrapSyncRecord {
+    pub rows: u32,
+    pub rows_named: i64,
+    pub old_end: u32,
+    pub new_end: u32,
+}
+
+/// What the map is in the middle of when a test asks.
+#[cfg(feature = "wrap-test-support")]
+#[derive(Clone, Copy, Debug)]
+pub struct WrapQueueState {
+    pub chunk_in_flight: bool,
+    pub queued_batches: usize,
+    pub interpolated: bool,
+    pub backfilling: bool,
 }
 
 #[cfg(feature = "wrap-test-support")]
@@ -248,6 +285,9 @@ impl WrapMap {
                 sync_traces: Vec::new(),
                 #[cfg(feature = "wrap-test-support")]
                 wrap_width_changes: Vec::new(),
+                #[cfg(feature = "wrap-test-support")]
+                #[cfg(feature = "wrap-test-support")]
+                sync_rows_and_edit_ends: Vec::new(),
             };
             // A map being built has no rows on a screen yet.
             this.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx);
@@ -322,6 +362,33 @@ impl WrapMap {
         }
 
         let output_edits = mem::take(&mut self.edits_since_sync);
+        #[cfg(feature = "wrap-test-support")]
+        {
+            self.sync_rows_and_edit_ends.push(WrapSyncRecord {
+                rows: self.snapshot.max_point().row().0 + 1,
+                rows_named: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| {
+                        i64::from(edit.new.end.0)
+                            - i64::from(edit.new.start.0)
+                            - (i64::from(edit.old.end.0) - i64::from(edit.old.start.0))
+                    })
+                    .sum(),
+                old_end: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| edit.old.end.0)
+                    .max()
+                    .unwrap_or(0),
+                new_end: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| edit.new.end.0)
+                    .max()
+                    .unwrap_or(0),
+            });
+        }
         if profile.is_enabled() {
             let output_start = output_edits
                 .edits()
@@ -369,6 +436,40 @@ impl WrapMap {
     #[cfg(feature = "wrap-test-support")]
     pub fn take_wrap_width_changes(&mut self) -> Vec<(Option<Pixels>, Option<Pixels>)> {
         mem::take(&mut self.wrap_width_changes)
+    }
+
+    /// Every `sync` this map has answered: the snapshot's row count, the
+    /// rows the edits beside it added or removed, and how far those edits
+    /// reach on each side. See [`WrapSyncRecord`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn sync_records(&self) -> &[WrapSyncRecord] {
+        &self.sync_rows_and_edit_ends
+    }
+
+    /// Whether the last `sync` described one document.
+    ///
+    /// `sync` hands its caller a snapshot and, beside it, the edits since
+    /// the caller's last one; the block map above resolves the rows those
+    /// edits name against that snapshot. A row the edits name past the end
+    /// of the snapshot is a row range asked of a document that does not have
+    /// it, which resolves a column of one row on another and reaches the
+    /// rope as a point beyond its row. `check_invariants` asserts the
+    /// snapshot's own consistency, but only under `cfg(test)` inside this
+    /// crate, which is not a workspace member and cannot run its tests here,
+    /// and it says nothing about the edits.
+    /// What the map is in the middle of: a chunk in flight, batches queued
+    /// behind it, a snapshot carried through an edit rather than wrapped
+    /// for it, a width still owed to the rest of the document. A test that
+    /// means to exercise one of those states has to be able to say it
+    /// reached it.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn queue_state(&self) -> WrapQueueState {
+        WrapQueueState {
+            chunk_in_flight: self.background_task.is_some(),
+            queued_batches: self.pending_edits.len(),
+            interpolated: self.snapshot.interpolated,
+            backfilling: self.backfill.is_some(),
+        }
     }
 
     #[ztracing::instrument(skip_all)]
