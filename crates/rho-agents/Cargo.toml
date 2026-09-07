@@ -12,6 +12,10 @@ version.workspace = true
 
 [dependencies]
 bytes.workspace = true
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+] }
 camino.workspace = true
 collections = { path = "../../vendor/zed/crates/collections" }
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }

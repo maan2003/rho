@@ -20,6 +20,7 @@ pub mod create;
 pub mod find;
 pub mod fold;
 pub mod map;
+pub mod messages;
 pub mod render;
 pub mod session;
 pub mod state;

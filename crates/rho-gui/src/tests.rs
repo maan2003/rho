@@ -3574,8 +3574,8 @@ fn notices_append_to_messages_without_changing_the_transcript(cx: &mut TestAppCo
         .expect("post notice");
     assert!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .message_log_texts()
+            .update(cx, |workspace, _, cx| workspace
+                .message_log_texts(cx)
                 .iter()
                 .any(|message| message.ends_with(": boom")))
             .expect("read messages"),
@@ -3720,7 +3720,7 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
                     rho_window::style::StyleClass::SystemImportant,
                     "important".to_owned(),
                 ))
-                .chain((1..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
+                .chain((1..rho_agents::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("ordinary-{index}"),
@@ -3755,15 +3755,15 @@ fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppCon
 fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
-        .update(cx, |workspace, _, _| {
-            for index in 0..=crate::workspace::MESSAGE_LOG_CAP {
-                workspace.append_test_log_entry(format!("message-{index}"));
+        .update(cx, |workspace, _, cx| {
+            for index in 0..=rho_agents::messages::LOG_CAP {
+                workspace.append_test_log_entry(format!("message-{index}"), cx);
             }
-            let messages = workspace.message_log_texts();
-            assert_eq!(messages.len(), crate::workspace::MESSAGE_LOG_CAP);
-            assert_eq!(messages.first(), Some(&"message-1"));
-            let expected_last = format!("message-{}", crate::workspace::MESSAGE_LOG_CAP);
-            assert_eq!(messages.last(), Some(&expected_last.as_str()));
+            let messages = workspace.message_log_texts(cx);
+            assert_eq!(messages.len(), rho_agents::messages::LOG_CAP);
+            assert_eq!(messages.first().map(String::as_str), Some("message-1"));
+            let expected_last = format!("message-{}", rho_agents::messages::LOG_CAP);
+            assert_eq!(messages.last(), Some(&expected_last));
         })
         .expect("fill message log");
 }
@@ -3774,7 +3774,7 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
     let original = workspace
         .update(cx, |workspace, _, cx| {
             workspace.seed_messages_for_test(
-                (0..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
+                (0..rho_agents::messages::LOG_CAP).map(|index| {
                     (
                         rho_window::style::StyleClass::SystemInfo,
                         format!("initial-{index}"),
@@ -3782,12 +3782,12 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
                 }),
                 cx,
             );
-            workspace.messages_buffer_id()
+            workspace.messages_buffer_id(cx)
         })
         .expect("seed capped messages");
     workspace
         .update(cx, |workspace, _, cx| {
-            for index in 0..crate::workspace::MESSAGE_REBASE_EVICTIONS {
+            for index in 0..rho_agents::messages::REBASE_EVICTIONS {
                 workspace.append_test_message(
                     format!("replacement-{index}"),
                     rho_window::style::StyleClass::SystemInfo,
@@ -3798,11 +3798,11 @@ fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppC
         .expect("append enough evictions to rebase");
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_ne!(workspace.messages_buffer_id(), original);
+        .update(cx, |workspace, _, cx| {
+            assert_ne!(workspace.messages_buffer_id(cx), original);
             assert_eq!(
-                workspace.message_log_texts().len(),
-                crate::workspace::MESSAGE_LOG_CAP
+                workspace.message_log_texts(cx).len(),
+                rho_agents::messages::LOG_CAP
             );
         })
         .expect("inspect rebased messages");
@@ -3874,8 +3874,8 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
         })
         .expect("update connection status");
     workspace
-        .update(cx, |workspace, _, _| {
-            let notices = workspace.message_log_texts();
+        .update(cx, |workspace, _, cx| {
+            let notices = workspace.message_log_texts(cx);
             assert!(notices.iter().any(|text| text.contains("reconnecting")));
             assert!(notices.iter().any(|text| text.contains("connected")));
             assert!(notices.iter().any(|text| text.contains("disconnected")));
@@ -4041,8 +4041,8 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
     let text = display_text(&workspace, cx);
     assert!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .message_log_texts()
+            .update(cx, |workspace, _, cx| workspace
+                .message_log_texts(cx)
                 .iter()
                 .any(|message| message.contains("not connected to rho-daemon")))
             .expect("read messages"),
@@ -4062,8 +4062,8 @@ fn upload_gui_telemetry_action_reports_when_no_daemon_is_connected(cx: &mut Test
     cx.dispatch_action(*workspace, crate::UploadGuiTelemetry);
     assert!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .message_log_texts()
+            .update(cx, |workspace, _, cx| workspace
+                .message_log_texts(cx)
                 .iter()
                 .any(
                     |message| message.contains("performance snapshot: no daemon is connected")
@@ -8345,11 +8345,11 @@ fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert_eq!(workspace.current_surface_name_for_test(), "home");
             assert!(
                 workspace
-                    .message_log_texts()
+                    .message_log_texts(cx)
                     .iter()
                     .any(|message| message.contains("nothing needs attention"))
             );
@@ -10212,8 +10212,8 @@ fn enter_in_a_new_agent_draft_creates_the_agent(cx: &mut TestAppContext) {
     // no trace: reaching the draft's own submit is what is under test.
     assert!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .message_log_texts()
+            .update(cx, |workspace, _, cx| workspace
+                .message_log_texts(cx)
                 .iter()
                 .any(|message| message.contains("not connected to rho-daemon")))
             .expect("read messages"),
@@ -10374,8 +10374,8 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
 
     assert!(
         workspace
-            .update(cx, |workspace, _, _| workspace
-                .message_log_texts()
+            .update(cx, |workspace, _, cx| workspace
+                .message_log_texts(cx)
                 .iter()
                 .any(|message| message.contains("not connected to rho-daemon")))
             .expect("read messages"),

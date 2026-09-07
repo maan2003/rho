@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -30,6 +30,7 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agents::agent_view::AgentModel;
 use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
+use rho_agents::messages::MessageLog;
 use rho_agents::session::ActiveAgents;
 use rho_agents::store::FrameSummary;
 use rho_agents::{AgentMap, HostId, TranscriptFrame};
@@ -85,31 +86,6 @@ use crate::{
     TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
     ZulipNextUnread, ZulipOpenRow,
 };
-
-pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
-pub(crate) const MESSAGE_REBASE_EVICTIONS: usize = 512;
-
-#[derive(Clone)]
-struct MessageLogEntry {
-    timestamp: chrono::DateTime<chrono::FixedOffset>,
-    class: StyleClass,
-    text: String,
-}
-
-#[derive(Default)]
-struct MessageLog(VecDeque<MessageLogEntry>);
-
-impl MessageLog {
-    fn push(&mut self, entry: MessageLogEntry) -> bool {
-        self.0.push_back(entry);
-        if self.0.len() > MESSAGE_LOG_CAP {
-            self.0.pop_front();
-            true
-        } else {
-            false
-        }
-    }
-}
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
 
@@ -435,14 +411,10 @@ pub struct Workspace {
     /// and whose rows it wants. The journal cursor is the model's.
     model: futures_mpsc::UnboundedSender<rho_mirror::model::ToModel>,
     draft_model: Entity<DraftModel>,
-    message_log: MessageLog,
-    messages_buffer: Entity<language::Buffer>,
-    messages_editor: Entity<editor::Editor>,
-    messages_styles: Vec<(StyleClass, std::ops::Range<text::Anchor>)>,
-    messages_line_lengths: VecDeque<usize>,
-    messages_applied_classes: HashSet<StyleClass>,
-    message_evictions_since_rebase: usize,
-    message_rebase_scheduled: bool,
+    /// What rho has said, and the surface it says it on. The log owns its
+    /// own buffer, editor and highlights; the host records a line and shows
+    /// the surface.
+    messages: Entity<MessageLog>,
     /// Launch arguments for a configured Desk staffing or quick-spawn. The
     /// transient edits these; the writable dashboard row owns the message.
     /// Where `n a` files the agent the draft page is composing. `None`
@@ -951,22 +923,7 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
-        let messages_buffer = cx.new(|cx| {
-            let mut buffer = language::Buffer::local("", cx);
-            buffer.set_capability(language::Capability::Read, cx);
-            buffer
-        });
-        let messages_editor = cx.new(|cx| {
-            let mut editor = editor::Editor::for_buffer(messages_buffer.clone(), None, window, cx);
-            rho_window::editor_config::configure(&mut editor, window, cx);
-            editor.set_read_only(true);
-            editor.set_autoscroll_pin(
-                multi_buffer::Anchor::Max,
-                editor::scroll::AutoscrollStrategy::Bottom,
-                cx,
-            );
-            editor
-        });
+        let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
             let mut changes: UnboundedReceiver<rho_mirror::model::ModelEvent> = changes;
             while let Some(change) = changes.next().await {
@@ -1129,14 +1086,7 @@ impl Workspace {
             pending_syncs: HashMap::new(),
             model: model_commands,
             draft_model,
-            message_log: MessageLog::default(),
-            messages_buffer,
-            messages_editor,
-            messages_styles: Vec::new(),
-            messages_line_lengths: VecDeque::new(),
-            messages_applied_classes: HashSet::new(),
-            message_evictions_since_rebase: 0,
-            message_rebase_scheduled: false,
+            messages,
             draft_area: None,
             awaiting_draft_agent: None,
             insert_when_shown: false,
@@ -4356,140 +4306,9 @@ impl Workspace {
     }
 
     fn append_message(&mut self, text: String, class: StyleClass, cx: &mut Context<Self>) {
-        let entry = MessageLogEntry {
-            timestamp: chrono::Local::now().fixed_offset(),
-            class,
-            text: text.lines().collect::<Vec<_>>().join(" "),
-        };
-        let line = Self::render_message_entry(&entry);
-        let evicted = self.message_log.push(entry);
-        let removed_len = if evicted {
-            self.messages_line_lengths
-                .pop_front()
-                .expect("capped log has a rendered first line")
-        } else {
-            0
-        };
-        self.messages_line_lengths.push_back(line.len());
-        let range = self.messages_buffer.update(cx, |buffer, cx| {
-            let old_len = buffer.len();
-            let mut edits = Vec::with_capacity(2);
-            if removed_len > 0 {
-                edits.push((0..removed_len, ""));
-            }
-            edits.push((old_len..old_len, line.as_str()));
-            buffer.edit(edits, None, cx);
-            let start = buffer.len() - line.len();
-            buffer.anchor_before(start)..buffer.anchor_before(buffer.len())
-        });
-        if evicted {
-            self.messages_styles.remove(0);
-            self.message_evictions_since_rebase += 1;
-        }
-        self.messages_styles.push((class, range));
-        self.apply_message_styles(cx);
-        if self.message_evictions_since_rebase >= MESSAGE_REBASE_EVICTIONS
-            && !self.message_rebase_scheduled
-        {
-            self.message_rebase_scheduled = true;
-            cx.spawn(async move |this, cx| {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.rebase_messages_buffer(window, cx)
-                });
-            })
-            .detach();
-        }
+        self.messages
+            .update(cx, |messages, cx| messages.append(text, class, cx));
         cx.notify();
-    }
-
-    fn render_message_entry(entry: &MessageLogEntry) -> String {
-        format!("{}  {}\n", entry.timestamp.format("%H:%M"), entry.text)
-    }
-
-    fn apply_message_styles(&mut self, cx: &mut Context<Self>) {
-        let multi_buffer = self.messages_editor.read(cx).buffer().clone();
-        let current_classes = self
-            .messages_styles
-            .iter()
-            .map(|(class, _)| *class)
-            .collect::<HashSet<_>>();
-        let mut by_class = self
-            .messages_applied_classes
-            .union(&current_classes)
-            .copied()
-            .map(|class| (class, Vec::new()))
-            .collect::<Vec<(StyleClass, Vec<std::ops::Range<text::Anchor>>)>>();
-        for (class, range) in &self.messages_styles {
-            by_class
-                .iter_mut()
-                .find(|(existing, _)| existing == class)
-                .expect("current class was seeded")
-                .1
-                .push(range.clone());
-        }
-        rho_window::highlights::apply_class_highlights(
-            &self.messages_editor,
-            &multi_buffer,
-            rho_window::style::Region::System,
-            by_class
-                .iter()
-                .map(|(class, ranges)| (*class, ranges.as_slice())),
-            cx,
-        );
-        self.messages_applied_classes = current_classes;
-    }
-
-    fn rebase_messages_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.message_rebase_scheduled = false;
-        self.message_evictions_since_rebase = 0;
-        let scroll_position = self
-            .messages_editor
-            .update(cx, |editor, cx| editor.scroll_position(cx));
-        let following = self.messages_editor.read(cx).has_active_autoscroll_pin();
-        let rendered = self
-            .message_log
-            .0
-            .iter()
-            .map(Self::render_message_entry)
-            .collect::<String>();
-        let buffer = cx.new(|cx| {
-            let mut buffer = language::Buffer::local(rendered, cx);
-            buffer.set_capability(language::Capability::Read, cx);
-            buffer
-        });
-        let mut offset = 0;
-        self.messages_styles = buffer.update(cx, |buffer, _| {
-            self.message_log
-                .0
-                .iter()
-                .zip(&self.messages_line_lengths)
-                .map(|(entry, len)| {
-                    let start = offset;
-                    offset += *len;
-                    (
-                        entry.class,
-                        buffer.anchor_before(start)..buffer.anchor_before(offset),
-                    )
-                })
-                .collect()
-        });
-        let multi_buffer = self.messages_editor.read(cx).buffer().clone();
-        multi_buffer.update(cx, |multi_buffer, cx| {
-            multi_buffer.set_excerpts_for_path(
-                multi_buffer::PathKey::sorted(0),
-                buffer.clone(),
-                [language::Point::zero()..buffer.read(cx).max_point()],
-                0,
-                cx,
-            );
-        });
-        self.messages_buffer = buffer;
-        self.apply_message_styles(cx);
-        if !following {
-            self.messages_editor.update(cx, |editor, cx| {
-                editor.set_scroll_position(scroll_position, window, cx);
-            });
-        }
     }
 
     /// Replacing a message cancels its predecessor's dismiss timer.
@@ -4514,21 +4333,19 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn message_log_texts(&self) -> Vec<&str> {
-        self.message_log
-            .0
-            .iter()
-            .map(|entry| entry.text.as_str())
+    pub(crate) fn message_log_texts(&self, cx: &App) -> Vec<String> {
+        self.messages
+            .read(cx)
+            .texts()
+            .into_iter()
+            .map(str::to_owned)
             .collect()
     }
 
     #[cfg(test)]
-    pub(crate) fn append_test_log_entry(&mut self, text: String) {
-        let _ = self.message_log.push(MessageLogEntry {
-            timestamp: chrono::Local::now().fixed_offset(),
-            class: StyleClass::SystemInfo,
-            text,
-        });
+    pub(crate) fn append_test_log_entry(&mut self, text: String, cx: &mut Context<Self>) {
+        self.messages
+            .update(cx, |messages, _| messages.append_unrendered(text));
     }
 
     #[cfg(test)]
@@ -4537,37 +4354,8 @@ impl Workspace {
         entries: impl IntoIterator<Item = (StyleClass, String)>,
         cx: &mut Context<Self>,
     ) {
-        self.message_log = MessageLog::default();
-        self.messages_line_lengths.clear();
-        let mut rendered = String::new();
-        let mut spans = Vec::new();
-        for (class, text) in entries {
-            let entry = MessageLogEntry {
-                timestamp: chrono::Local::now().fixed_offset(),
-                class,
-                text,
-            };
-            let line = Self::render_message_entry(&entry);
-            let start = rendered.len();
-            rendered.push_str(&line);
-            spans.push((class, start..rendered.len()));
-            self.messages_line_lengths.push_back(line.len());
-            let _ = self.message_log.push(entry);
-        }
-        self.messages_styles = self.messages_buffer.update(cx, |buffer, cx| {
-            let old_len = buffer.len();
-            buffer.edit([(0..old_len, rendered.as_str())], None, cx);
-            spans
-                .into_iter()
-                .map(|(class, range)| {
-                    (
-                        class,
-                        buffer.anchor_before(range.start)..buffer.anchor_before(range.end),
-                    )
-                })
-                .collect()
-        });
-        self.apply_message_styles(cx);
+        self.messages
+            .update(cx, |messages, cx| messages.seed(entries, cx));
     }
 
     #[cfg(test)]
@@ -4581,8 +4369,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn messages_buffer_id(&self) -> gpui::EntityId {
-        self.messages_buffer.entity_id()
+    pub(crate) fn messages_buffer_id(&self, cx: &App) -> gpui::EntityId {
+        self.messages.read(cx).buffer_id()
     }
 
     #[cfg(test)]
@@ -4636,7 +4424,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn messages_following(&self, cx: &App) -> bool {
-        self.messages_editor.read(cx).has_active_autoscroll_pin()
+        self.messages.read(cx).following(cx)
     }
 
     pub fn select_agent(
@@ -6792,7 +6580,7 @@ impl Workspace {
             SurfaceKey::Home => {
                 SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
             }
-            SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
+            SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
             SurfaceKey::Usage => SurfaceView::Usage(self.usage_view(window, cx)),
             SurfaceKey::DeskNode { host, node_id } => {
                 let (host, node_id) = (*host, node_id.clone());
