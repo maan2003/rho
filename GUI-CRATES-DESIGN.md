@@ -631,6 +631,61 @@ wrong at the design, not at the polish.
   those rows. Nothing here grows with the desk.
   Gate green: rho-gui 245 passed and 3 ignored (248 total, against main's
   246), rho-window 11, clippy `-D warnings` clean, `cargo fmt --check` clean.
+  *Landed, the root menu and the three under it (`rho-gui`'s `transient` and
+  `workspace`).* The second batch of the seventeen, and the one that turned
+  the verdict menu's private plumbing into the window's one way of showing a
+  menu. `root_menu`, `slack_menu`, `hosts_menu` and `projects_menu` are now
+  data over the same primitive: `MenuAction` is `Open(MenuId)`, `Verdict(..)`
+  or `Command(..)`, and `Workspace::run_command` is the single match that
+  knows what a menu item means, beside `run_verdict` which already did.
+  `VerdictBuffer` became `MenuBuffer` and `open_menu` is the way in for any
+  menu; `space` no longer touches the bottom strip at all.
+  Two shapes came out of doing the root menu rather than another leaf, both
+  written up in `RHO-WINDOW-DESIGN`. An item names a menu rather than opening
+  one, which is what lets the seventeen move in batches — the root menu says
+  "hosts", the workspace decides where hosts is drawn, and the four menus
+  still reached by name (`input`, `agent`, `new`, `status`) open in the strip
+  from the same arm until their batch. And back is a stack rather than a
+  parent: the verdicts were one deep so one parent sufficed, but `space a s`
+  is three, and an escape that leaves from the third step instead of
+  returning to the second is exactly what the design says never happens.
+  Also removed, because the primitive does it: `Transient::item_when`,
+  `retain_applicable` and the strip item's `when` field. Applicability is at
+  build time now — `root_menu(&subject)` — which is the same moment as before
+  and one fewer pass. `Workspace::echo_text_for_test` was missing its
+  `#[cfg(test)]`, so `clippy --all-targets -D warnings` on rho-gui failed on
+  main; the attribute is added here since the gate has to be green.
+  Proven on the desk rig, session 30, on `user-2026-09-06`: `space` on Home
+  with the point on a running agent's row opens `rho` as a block under that
+  row, with the rows below it moved down and the bottom strip empty; `h`
+  replaces it with `hosts` over the same row; `escape` comes back to `rho`
+  and `escape` leaves, the point on the row it started on. The screenshot
+  taken after the first `escape` is byte for byte the one taken when the
+  root menu first opened — back returns the buffer as it was, and two
+  identical frames is the strongest way to say so.
+  Two more pictures for the two claims that are not about one menu. `space
+  s` from the same row draws `status` in the bottom strip, which is the
+  mixed state working: a menu that has moved and a menu that has not, one
+  keystroke apart. And `space` on a transcript opens the same `rho` menu
+  under the point in that buffer, this time with `a agent…` and `d changes`
+  in it — the same key, the same menu, applicability answered by the surface
+  rather than by the menu. `l` there ran the message log and the menu closed:
+  one key, ran, closed. Emacs-feel checks: the point survives back, the same
+  key means the same thing in both buffers, nothing needed the mouse, no
+  modal appeared and nothing dimmed.
+  The rig-down line for that session:
+  `187 frames, draw p99 9.1 ms, 2 over 8 ms; worst gap 746 ms, p99 22 ms;
+  17875 events, slowest stage wrap_map_update p99 2.43 ms at 220 rows; 295
+  samples on rho-gui: __syscall_cancel_arch_end 14%,
+  __memcpy_avx512_unaligned_erms 4%, runtime 4%`. The two frames over budget
+  are the block insert and the rewrap it causes when a twenty-six row menu
+  opens into a 121k-row Home; opening a menu is one block insert and one
+  measured element, and a press is one pass over the rows on screen. Nothing
+  here grows with the desk, but a menu on screen is a real edit to the block
+  map and does not belong in a sample being measured for something else.
+  Gate green: rho-gui 259 passed and 3 ignored (against main's 258), clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+
 - **Landed, the refusal block is measured too** (`rho-window` module touched:
   `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
   the other `height: None` in the chrome, filed in the change above and fixed

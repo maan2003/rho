@@ -107,9 +107,30 @@ here before the cut, not after.
 The primitive is in `rho_window::transient`: the data shape kept, the actions
 values of the caller's type, the drawing a measured block under the point, one
 presentation path, applicability at open, and one key then closed. `Kind::Infix`
-is there for the open question above and unused until it is answered. What is
-not done is the wiring: `rho-gui`'s menus still run through its own
-`transient.rs`, and the verdict menu is the first to move.
+is there for the open question above and unused until it is answered.
+
+The wiring is moving a batch at a time. The verdicts went first; the root menu
+and the three menus only it reaches — slack, hosts, projects — are the second,
+which is the batch that turned the verdict menu's private plumbing into the
+window's one way of showing a menu. Two things came out of doing the root menu
+rather than another leaf.
+
+An item that names a menu (`MenuId`) rather than opening one is what lets a
+menu half on the buffer and half on the strip work at all: the root menu says
+"hosts" and the workspace decides where hosts is drawn, which is the only
+reason the seventeen can move in batches instead of one landing. It is also
+the honest shape afterwards — a menu should not know how another menu is
+presented.
+
+And back has to be a stack, not a parent. The verdicts were one deep, so a
+single parent was enough; `space a s` is three, and an escape that goes out
+from the third step rather than back to the second is the thing the design
+says never happens. What is kept is what escape retraces, so the whole way
+back is there, not one step of it.
+
+What is not done: thirteen strip menus, the phone's second way in (still
+`phone_rows`/`action_at` on the old strip type), and the charts, which are the
+batch that needs `rho-visualizations` rather than a mechanical move.
 
 ### How it will be proven
 

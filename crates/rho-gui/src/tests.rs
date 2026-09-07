@@ -1166,7 +1166,8 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(workspace.is_dashboard_mode(window, cx));
-            workspace.open_transient(crate::transient::root_menu(), window, cx);
+            let subject = workspace.subject(window, cx);
+            workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
         })
         .expect("open dashboard transient");
     cx.simulate_keystrokes(*workspace, "p r");
@@ -4472,6 +4473,89 @@ fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppC
                 before,
                 "and the point came back to where it was"
             );
+        })
+        .unwrap();
+}
+
+/// The root menu is a buffer under the point too, and `shift` no longer
+/// reaches Home while it is open: with a menu holding the keyboard, a tap
+/// belongs to the menu. Three steps down and three escapes back, with the
+/// point where it started — the whole way back, not one step of it.
+#[gpui::test]
+fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let point = |workspace: &Workspace, cx: &App| {
+        workspace
+            .active_editor(cx)
+            .read(cx)
+            .selections
+            .newest_anchor()
+            .head()
+    };
+    let before = workspace
+        .update(cx, |workspace, _, cx| point(workspace, cx))
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let subject = workspace.subject(window, cx);
+            workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
+            assert_eq!(workspace.menu_title_for_test(), Some("rho"));
+            assert!(
+                !workspace.has_transient_for_test(),
+                "the strip stays empty: the root menu is in the buffer"
+            );
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the root menu is not the verdicts, so shift is not Home"
+            );
+            assert_eq!(point(workspace, cx), before, "the point did not move");
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "h");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                Some("hosts"),
+                "h replaces the root menu over the same row"
+            );
+            assert_eq!(point(workspace, cx), before, "and still does not move it");
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                Some("rho"),
+                "escape goes back to the menu it came from, not out"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.menu_title_for_test(), None, "and then out");
+            assert_eq!(point(workspace, cx), before, "the point came back");
         })
         .unwrap();
 }

@@ -32,9 +32,6 @@ pub struct TransientItem {
     /// A toggle: running it keeps the menu open (magit's do-stay), so
     /// several toggles chain without reopening.
     stay: bool,
-    /// Menu-time applicability: items whose context is missing (no agent
-    /// selected, say) drop out at open instead of failing when pressed.
-    when: Option<fn(&Subject) -> bool>,
 }
 
 pub struct Transient {
@@ -89,7 +86,6 @@ impl Transient {
         description: impl Into<String>,
         value: Option<String>,
         stay: bool,
-        when: Option<fn(&Subject) -> bool>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.items.push(TransientItem {
@@ -98,7 +94,6 @@ impl Transient {
             value,
             run: Rc::new(run),
             stay,
-            when,
         });
         self
     }
@@ -109,26 +104,7 @@ impl Transient {
         label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
-        self.push(key, label, None, false, None, run)
-    }
-
-    /// A value-setting item. Like upstream Transient infixes, its current
-    /// value is rendered separately from the command description.
-    /// An item present only while `when` holds of the subject at menu open.
-    fn item_when(
-        self,
-        when: fn(&Subject) -> bool,
-        key: &'static str,
-        label: impl Into<String>,
-        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) -> Self {
-        self.push(key, label, None, false, Some(when), run)
-    }
-
-    /// Drops items that have nothing to act on right now.
-    pub fn retain_applicable(&mut self, subject: &Subject) {
-        self.items
-            .retain(|item| item.when.is_none_or(|when| when(subject)));
+        self.push(key, label, None, false, run)
     }
 
     /// The action bound to `keystroke` and whether the menu stays open.
@@ -600,21 +576,91 @@ fn display_key(spec: &str) -> String {
     }
 }
 
-/// One tap of `shift` — the verdicts, on the card in view. Deal mode used
-/// to take `d`, `x`, `s`, `t` and `f` from every dealt surface, so a card
-/// could not be read, searched or yanked like the buffer it is; the keys
-/// live here instead and vim keeps its own everywhere. `shift` again is
-/// Home, which is what the old double tap did.
-/// What a verdict item does, as a value the window hands back rather than a
+/// What a menu item does, as a value the window hands back rather than a
 /// closure over the workspace. `rho_window::transient` never learns what any
-/// of these mean; the match in `Workspace::run_verdict` is the only place
-/// that does.
+/// of these mean; the matches in `Workspace::run_menu_action` are the only
+/// places that do.
+///
+/// Why a value at all, when a closure would be shorter: a closure over the
+/// workspace can only be written by something that already has the
+/// workspace, which is every screen and no source crate. An item that is
+/// data can be put in a menu by the crate that owns the thing it acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuAction {
+    /// Open this menu in place of the one on screen, over the same row.
+    /// Escape goes back to it: a submenu is a step, not a new place.
+    Open(MenuId),
+    /// A verdict on the card under the point.
+    Verdict(VerdictAction),
+    /// Everything else: one command, named.
+    Command(Command),
+}
+
+/// A menu by name, so an item can reach another menu without building it —
+/// the building is `Workspace::menu_by_id`, which is also where a menu that
+/// has not moved off the bottom strip yet is still opened as a strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuId {
+    Slack,
+    Hosts,
+    Projects,
+    /// The snooze units under the verdicts (`s` then `m`, `h`, `d`, `w`).
+    VerdictSnooze,
+    /// Still the bottom strip; here so the root menu can reach them while
+    /// they move over one batch at a time.
+    Input,
+    Agent,
+    New,
+    Status,
+}
+
+/// A command a menu item runs, which is the whole of what the item means.
+/// One variant per item and no arguments beyond what the item itself says,
+/// so the match that runs them reads as the list of what the menus can do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    // The root menu.
+    Voice,
+    Rail,
+    Map,
+    MapRawSource,
+    SwitchBuffer,
+    MessageLog,
+    SurfaceBack,
+    PullCard,
+    CloseAndDeal,
+    OpenFile,
+    FindNode,
+    NotesForThis,
+    Shell,
+    ShellClose,
+    Changes,
+    Terminal,
+    NewTerminal,
+    UndoVerdict,
+    Quit,
+    // Slack.
+    SlackConversations,
+    SlackAttach,
+    SlackMarkReadBefore,
+    SlackRegister,
+    // Hosts.
+    HostsList,
+    HostAttach,
+    HostDetach,
+    HostAuth,
+    // Projects.
+    ProjectAdd,
+    ProjectRemove,
+}
+
+/// What a verdict item does. Kept apart from [`Command`] because a verdict
+/// is the one action that lands on the card under the point rather than on
+/// the workspace, and because the count belongs to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerdictAction {
     Done,
     Mute,
-    /// `s`: the unit menu, in place of this one.
-    OpenSnooze,
     RoomSnooze,
     Todo,
     File,
@@ -625,143 +671,209 @@ pub(crate) enum VerdictAction {
     Snooze(Option<crate::workspace::SnoozeUnit>),
 }
 
-/// The verdict menu and its snooze submenu are the window's transient buffer:
-/// a block under the point, one key, closed. Everything else in this file is
-/// still the bottom strip.
-pub(crate) type VerdictMenu = rho_window::transient::Transient<VerdictAction>;
+/// A menu that is a block under the point rather than the bottom strip:
+/// `rho_window::transient`, with this application's own values in it.
+pub(crate) type Menu = rho_window::transient::Transient<MenuAction>;
 
 /// One tap of `shift` — the verdicts, on the card under the point. Deal mode
 /// used to take `d`, `x`, `s`, `t` and `f` from every dealt surface, so a card
 /// could not be read, searched or yanked like the buffer it is; the keys live
 /// here instead and vim keeps its own everywhere. `shift` again is Home, which
 /// is what the old double tap did.
-pub(crate) fn verdict_menu() -> VerdictMenu {
-    VerdictMenu::new("verdict")
-        .item("d", "done", VerdictAction::Done)
-        .item("x", "mute", VerdictAction::Mute)
-        .item("s", "snooze…", VerdictAction::OpenSnooze)
-        .item("shift-s", "snooze the room…", VerdictAction::RoomSnooze)
-        .item("t", "todo", VerdictAction::Todo)
-        .item("f", "file…", VerdictAction::File)
-        .item("u", "undo the last verdict", VerdictAction::Undo)
-        .item("j", "open the top card", VerdictAction::Pull)
+pub(crate) fn verdict_menu() -> Menu {
+    Menu::new("verdict")
+        .item("d", "done", MenuAction::Verdict(VerdictAction::Done))
+        .item("x", "mute", MenuAction::Verdict(VerdictAction::Mute))
+        .item("s", "snooze…", MenuAction::Open(MenuId::VerdictSnooze))
+        .item(
+            "shift-s",
+            "snooze the room…",
+            MenuAction::Verdict(VerdictAction::RoomSnooze),
+        )
+        .item("t", "todo", MenuAction::Verdict(VerdictAction::Todo))
+        .item("f", "file…", MenuAction::Verdict(VerdictAction::File))
+        .item(
+            "u",
+            "undo the last verdict",
+            MenuAction::Verdict(VerdictAction::Undo),
+        )
+        .item(
+            "j",
+            "open the top card",
+            MenuAction::Verdict(VerdictAction::Pull),
+        )
         .counted()
 }
 
 /// The snooze unit, after a count: `45 m`, `3 h`, `7 d`, `w`, and `s` for
 /// the day the bare key used to mean.
-pub(crate) fn verdict_snooze_menu() -> VerdictMenu {
+pub(crate) fn verdict_snooze_menu() -> Menu {
     use crate::workspace::SnoozeUnit;
-    VerdictMenu::new("snooze")
-        .item("s", "a day", VerdictAction::Snooze(None))
+    Menu::new("snooze")
+        .item(
+            "s",
+            "a day",
+            MenuAction::Verdict(VerdictAction::Snooze(None)),
+        )
         .item(
             "m",
             "minutes",
-            VerdictAction::Snooze(Some(SnoozeUnit::Minutes)),
+            MenuAction::Verdict(VerdictAction::Snooze(Some(SnoozeUnit::Minutes))),
         )
-        .item("h", "hours", VerdictAction::Snooze(Some(SnoozeUnit::Hours)))
-        .item("d", "days", VerdictAction::Snooze(Some(SnoozeUnit::Days)))
-        .item("w", "weeks", VerdictAction::Snooze(Some(SnoozeUnit::Weeks)))
+        .item(
+            "h",
+            "hours",
+            MenuAction::Verdict(VerdictAction::Snooze(Some(SnoozeUnit::Hours))),
+        )
+        .item(
+            "d",
+            "days",
+            MenuAction::Verdict(VerdictAction::Snooze(Some(SnoozeUnit::Days))),
+        )
+        .item(
+            "w",
+            "weeks",
+            MenuAction::Verdict(VerdictAction::Snooze(Some(SnoozeUnit::Weeks))),
+        )
         .counted()
 }
 
 /// `space` — the root menu: every leader chord lives here (or one level
 /// down), so the whole vocabulary is discoverable by pausing.
-pub fn root_menu() -> Transient {
-    let menu = Transient::new("rho")
-        .item("i", "input…", |workspace, window, cx| {
-            workspace.open_transient(input_menu(), window, cx);
-        })
+///
+/// The subject is read once, here, rather than filtered afterwards: an item
+/// with nothing to act on is not in the menu the reader sees.
+pub(crate) fn root_menu(subject: &Subject) -> Menu {
+    Menu::new("rho")
+        .item("i", "input…", MenuAction::Open(MenuId::Input))
         .item(
             "m",
             "voice microphone · mute/unmute",
-            |workspace, window, cx| {
-                workspace.cmd_voice(window, cx);
-            },
+            MenuAction::Command(Command::Voice),
         )
-        .item_when(
-            Subject::has_agent,
+        .when(
+            subject.has_agent(),
             "a",
             "agent…",
-            |workspace, window, cx| {
-                workspace.open_transient(agent_menu(), window, cx);
-            },
+            MenuAction::Open(MenuId::Agent),
         )
-        .item("r", "rail", |workspace, window, cx| {
-            workspace.focus_rail(window, cx);
-        })
+        .item("r", "rail", MenuAction::Command(Command::Rail))
         // Home took the front door; the map keeps a key of its own so the
         // notes store stays one press away from it.
-        .item("o", "map", |workspace, window, cx| {
-            workspace.open_overview(window, cx);
-        })
-        .item("e", "map raw source", |workspace, window, cx| {
-            workspace.cmd_toggle_raw_desk(window, cx);
-        })
-        .item("b", "switch buffer…", |workspace, window, cx| {
-            workspace.open_buffer_picker(window, cx);
-        })
+        .item("o", "map", MenuAction::Command(Command::Map))
+        .item(
+            "e",
+            "map raw source",
+            MenuAction::Command(Command::MapRawSource),
+        )
+        .item(
+            "b",
+            "switch buffer…",
+            MenuAction::Command(Command::SwitchBuffer),
+        )
         // The echo area keeps two seconds; the log keeps everything it
         // said. Reachable by no key at all until now, which made every
         // notice that scrolled past unrecoverable.
-        .item("l", "message log", |workspace, window, cx| {
-            workspace.cmd_messages(window, cx);
-        })
-        .item("k", "surface back", |workspace, window, cx| {
-            workspace.cmd_surface_back(window, cx);
-        })
-        .item("j", "open the top card", |workspace, window, cx| {
-            workspace.pull_card(window, cx);
-        })
-        .item("shift-j", "close · deal", |workspace, window, cx| {
-            workspace.cmd_close_and_deal(window, cx);
-        })
-        .item("f", "open file…", |workspace, window, cx| {
-            workspace.prompt_open_file(window, cx);
-        })
-        .item("shift-f", "find node…", |workspace, window, cx| {
-            workspace.open_find(window, cx);
-        })
-        .item("n", "new…", |workspace, window, cx| {
-            workspace.open_transient(new_menu(), window, cx);
-        })
-        .item("shift-n", "notes for this", |workspace, window, cx| {
-            workspace.open_notes_for_surface(window, cx);
-        })
-        .item("c", "start/attach shell", |workspace, window, cx| {
-            workspace.cmd_shell(window, cx);
-        })
-        .item("shift-c", "close shell", |workspace, window, cx| {
-            workspace.cmd_shell_close(window, cx);
-        })
-        .item_when(
-            Subject::has_agent,
+        .item("l", "message log", MenuAction::Command(Command::MessageLog))
+        .item(
+            "k",
+            "surface back",
+            MenuAction::Command(Command::SurfaceBack),
+        )
+        .item(
+            "j",
+            "open the top card",
+            MenuAction::Command(Command::PullCard),
+        )
+        .item(
+            "shift-j",
+            "close · deal",
+            MenuAction::Command(Command::CloseAndDeal),
+        )
+        .item("f", "open file…", MenuAction::Command(Command::OpenFile))
+        .item(
+            "shift-f",
+            "find node…",
+            MenuAction::Command(Command::FindNode),
+        )
+        .item("n", "new…", MenuAction::Open(MenuId::New))
+        .item(
+            "shift-n",
+            "notes for this",
+            MenuAction::Command(Command::NotesForThis),
+        )
+        .item(
+            "c",
+            "start/attach shell",
+            MenuAction::Command(Command::Shell),
+        )
+        .item(
+            "shift-c",
+            "close shell",
+            MenuAction::Command(Command::ShellClose),
+        )
+        .when(
+            subject.has_agent(),
             "d",
             "changes",
-            |workspace, window, cx| workspace.cmd_diff(window, cx),
+            MenuAction::Command(Command::Changes),
         )
-        .item("t", "terminal", |workspace, window, cx| {
-            workspace.cmd_term(false, window, cx);
-        })
-        .item("shift-t", "new terminal", |workspace, window, cx| {
-            workspace.cmd_term(true, window, cx);
-        })
-        .item("p", "projects…", |workspace, window, cx| {
-            workspace.open_transient(projects_menu(), window, cx);
-        })
-        .item("h", "hosts…", |workspace, window, cx| {
-            workspace.open_transient(hosts_menu(), window, cx);
-        })
-        .item("s", "status…", |workspace, window, cx| {
-            workspace.open_transient(status_menu(), window, cx);
-        })
-        .item("shift-u", "undo verdict", |_, window, cx| {
-            window.dispatch_action(Box::new(crate::UndoVerdict), cx);
-        });
-    let menu = menu.item("shift-s", "slack…", |workspace, window, cx| {
-        workspace.open_transient(slack_menu(), window, cx);
-    });
-    menu.item("q", "quit", |_, _, cx| cx.quit())
+        .item("t", "terminal", MenuAction::Command(Command::Terminal))
+        .item(
+            "shift-t",
+            "new terminal",
+            MenuAction::Command(Command::NewTerminal),
+        )
+        .item("p", "projects…", MenuAction::Open(MenuId::Projects))
+        .item("h", "hosts…", MenuAction::Open(MenuId::Hosts))
+        .item("s", "status…", MenuAction::Open(MenuId::Status))
+        .item(
+            "shift-u",
+            "undo verdict",
+            MenuAction::Command(Command::UndoVerdict),
+        )
+        .item("shift-s", "slack…", MenuAction::Open(MenuId::Slack))
+        .item("q", "quit", MenuAction::Command(Command::Quit))
+}
+
+pub(crate) fn slack_menu() -> Menu {
+    Menu::new("slack")
+        .item(
+            "o",
+            "conversations",
+            MenuAction::Command(Command::SlackConversations),
+        )
+        .item(
+            "a",
+            "attach file…",
+            MenuAction::Command(Command::SlackAttach),
+        )
+        .item(
+            "m",
+            "mark read before…",
+            MenuAction::Command(Command::SlackMarkReadBefore),
+        )
+        .item(
+            "r",
+            "register workspace…",
+            MenuAction::Command(Command::SlackRegister),
+        )
+}
+
+/// `space h`: the attached daemons. Attaching and detaching are rare, so
+/// they live one level down rather than on the root's crowded first row.
+pub(crate) fn hosts_menu() -> Menu {
+    Menu::new("hosts")
+        .item("l", "list", MenuAction::Command(Command::HostsList))
+        .item("a", "attach…", MenuAction::Command(Command::HostAttach))
+        .item("d", "detach…", MenuAction::Command(Command::HostDetach))
+        .item("u", "auth…", MenuAction::Command(Command::HostAuth))
+}
+
+pub(crate) fn projects_menu() -> Menu {
+    Menu::new("projects")
+        .item("a", "add…", MenuAction::Command(Command::ProjectAdd))
+        .item("r", "remove…", MenuAction::Command(Command::ProjectRemove))
 }
 
 pub fn phone_root_menu() -> Transient {
@@ -818,23 +930,7 @@ pub fn new_menu() -> Transient {
         })
 }
 
-fn slack_menu() -> Transient {
-    Transient::new("slack")
-        .item("o", "conversations", |workspace, window, cx| {
-            workspace.open_slack(window, cx);
-        })
-        .item("a", "attach file…", |workspace, window, cx| {
-            workspace.prompt_slack_attach(window, cx);
-        })
-        .item("m", "mark read before…", |workspace, window, cx| {
-            workspace.prompt_slack_mark_read_before(window, cx);
-        })
-        .item("r", "register workspace…", |workspace, window, cx| {
-            workspace.prompt_slack_register(window, cx);
-        })
-}
-
-fn status_menu() -> Transient {
+pub(crate) fn status_menu() -> Transient {
     Transient::new("status")
         .item(
             "p",
@@ -851,7 +947,7 @@ fn status_menu() -> Transient {
         })
 }
 
-fn input_menu() -> Transient {
+pub(crate) fn input_menu() -> Transient {
     Transient::new("input")
         .item(
             "m",
@@ -1696,36 +1792,8 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
         / 1_000_000.0
 }
 
-/// `space h`: the attached daemons. Attaching and detaching are rare, so
-/// they live one level down rather than on the root's crowded first row.
-fn hosts_menu() -> Transient {
-    Transient::new("hosts")
-        .item("l", "list", |workspace, _, cx| {
-            workspace.cmd_hosts(cx);
-        })
-        .item("a", "attach…", |workspace, window, cx| {
-            workspace.prompt_host_attach(window, cx);
-        })
-        .item("d", "detach…", |workspace, window, cx| {
-            workspace.prompt_host_detach(window, cx);
-        })
-        .item("u", "auth…", |workspace, window, cx| {
-            workspace.open_host_auth_transient(window, cx);
-        })
-}
-
-fn projects_menu() -> Transient {
-    Transient::new("projects")
-        .item("a", "add…", |workspace, window, cx| {
-            workspace.prompt_project_add(window, cx);
-        })
-        .item("r", "remove…", |workspace, window, cx| {
-            workspace.prompt_project_remove(window, cx);
-        })
-}
-
 /// `space a`: driving the current conversation.
-fn agent_menu() -> Transient {
+pub(crate) fn agent_menu() -> Transient {
     Transient::new("agent")
         .item("d", "done", |workspace, window, cx| {
             workspace.cmd_agent_done(false, window, cx);
@@ -1884,13 +1952,18 @@ mod tests {
 
     #[test]
     fn leader_keeps_usage_under_status() {
-        let root = root_menu();
+        let root = root_menu(&Subject::default());
         assert!(
-            root.items
+            root.items()
                 .iter()
-                .any(|item| { item.key == "s" && item.description == "status…" })
+                .any(|item| { item.key() == "s" && item.description() == "status…" })
         );
-        assert!(!root.items.iter().any(|item| item.description == "usage…"));
+        assert!(
+            !root
+                .items()
+                .iter()
+                .any(|item| item.description() == "usage…")
+        );
 
         let status = status_menu();
         assert!(
