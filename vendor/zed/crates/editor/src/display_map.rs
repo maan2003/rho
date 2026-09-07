@@ -407,6 +407,13 @@ impl DisplayMap {
         self.wrap_map.read(cx).sync_records().to_vec()
     }
 
+    /// See [`wrap_map::WrapMap::take_sync_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_wrap_sync_violations(&mut self, cx: &mut gpui::App) -> Vec<String> {
+        self.wrap_map
+            .update(cx, |wrap_map, _| wrap_map.take_sync_violations())
+    }
+
     pub fn new(
         buffer: Entity<MultiBuffer>,
         font: Font,

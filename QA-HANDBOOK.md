@@ -546,3 +546,31 @@ fixing: the case is what says the fix worked, and the list of cases is the only
 record of what has been proven. Give it the next number in its section, say why
 it is tricky in one paragraph, give the exact steps, and leave "Closed by"
 empty until a run fills it in.
+
+## Finding the layer a crash comes from
+
+A crash in a stack of maps almost never comes from the layer that panics. The
+transcript's display map is six of them - buffer, inlay, fold, tab, wrap,
+block - and each hands the next a snapshot plus the edits since the last one.
+The panic surfaces wherever some layer first notices that those two do not
+describe the same document, which is usually well above where they stopped
+agreeing.
+
+So do not read the panicking layer. Ask every layer the same accounting
+question and walk it down until one answers no: does this snapshot's row count
+equal the last snapshot's row count plus the net of the edits handed over with
+it. Add the check at each layer in turn, run the failing case, and read which
+layer is the first to disagree. The layers above it are reporting faithfully
+and have nothing wrong with them; the layers below it were never asked.
+
+This is cheap and it is decisive. On the streaming crash the whole run had
+exactly one disagreement, four layers below the panic, and it was the fatal
+one: an edit whose net said one thing and whose snapshot said another. Two
+readings that were plausible from the panic alone - a wrap-map interpolation
+and an unsigned subtraction in `line_len` - were both wrong, and both had been
+written down as findings before the accounting was run.
+
+Two rules that come with it. Take the check off before landing; what stays is
+the invariant that earns its place, not the scaffolding that found it. And a
+control that passes with and without the fix is not a guard: say so and land
+the test that fails without it instead.

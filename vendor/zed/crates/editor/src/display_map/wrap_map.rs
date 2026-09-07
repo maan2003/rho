@@ -49,6 +49,11 @@ pub struct WrapMap {
     sync_traces: Vec<WrapSyncTrace>,
     #[cfg(feature = "wrap-test-support")]
     wrap_width_changes: Vec<(Option<Pixels>, Option<Pixels>)>,
+    /// Every snapshot handed out by a `sync` that did not describe one
+    /// document, in the words of [`WrapSnapshot::rows_within_their_document`].
+    #[cfg(feature = "wrap-test-support")]
+    sync_violations: Vec<String>,
+
     /// One record per `sync` answered. See [`WrapSyncRecord`].
     #[cfg(feature = "wrap-test-support")]
     #[cfg(feature = "wrap-test-support")]
@@ -173,6 +178,8 @@ impl WrapMap {
                 wrap_width: None,
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
+                #[cfg(feature = "wrap-test-support")]
+                sync_violations: Vec::new(),
                 edits_since_sync: Default::default(),
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
@@ -273,6 +280,9 @@ impl WrapMap {
                     .max()
                     .unwrap_or(0),
             });
+            if let Err(violation) = self.snapshot.rows_within_their_document() {
+                self.sync_violations.push(violation);
+            }
         }
         if profile.is_enabled() {
             let output_start = output_edits
@@ -339,6 +349,14 @@ impl WrapMap {
     #[cfg(feature = "wrap-test-support")]
     pub fn sync_records(&self) -> &[WrapSyncRecord] {
         &self.sync_rows_and_edit_ends
+    }
+
+    /// Every snapshot a `sync` handed out that offered a row its own tab
+    /// snapshot does not have. Empty is the contract; anything here is the
+    /// element being told to lay out rows the document cannot supply.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_sync_violations(&mut self) -> Vec<String> {
+        mem::take(&mut self.sync_violations)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -1066,6 +1084,46 @@ impl WrapSnapshot {
     #[ztracing::instrument(skip_all)]
     pub fn max_point(&self) -> WrapPoint {
         WrapPoint(self.transforms.summary().output.lines)
+    }
+
+    /// Every display row this snapshot offers, checked against the tab
+    /// snapshot it is carrying: the row must start at a tab row that document
+    /// has, and at a column that row reaches.
+    ///
+    /// `line_len` resolves a display row's width as
+    /// `tab_line_len - start.1.column()`, on unsigned integers. A wrap
+    /// boundary kept across an edit that shortened its line sits at a column
+    /// the line no longer reaches, and that subtraction wraps to about four
+    /// billion wherever debug assertions are off, which is every build a
+    /// reader runs. The row then claims a width it does not have: the element
+    /// takes its row count from the snapshot and its text from a chunk
+    /// iterator that runs dry early, and indexes the layouts it never got.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn rows_within_their_document(&self) -> Result<(), String> {
+        let max_tab_row = self.tab_snapshot.max_point().row();
+        for row in 0..=self.max_point().row().0 {
+            let tab_point = self.to_tab_point(WrapPoint::new(WrapRow(row), 0));
+            if tab_point.row() > max_tab_row {
+                return Err(format!(
+                    "display row {row} of {} starts at tab row {} of a \
+                     document with {} rows",
+                    self.max_point().row().0 + 1,
+                    tab_point.row(),
+                    max_tab_row + 1,
+                ));
+            }
+            let line_len = self.tab_snapshot.line_len(tab_point.row());
+            if tab_point.column() > line_len {
+                return Err(format!(
+                    "display row {row} of {} starts at column {} of tab row \
+                     {}, which is {line_len} long",
+                    self.max_point().row().0 + 1,
+                    tab_point.column(),
+                    tab_point.row(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[ztracing::instrument(skip_all)]

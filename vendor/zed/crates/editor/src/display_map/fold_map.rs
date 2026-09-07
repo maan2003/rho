@@ -847,33 +847,68 @@ impl FoldMap {
                     new_transforms.cursor::<Dimensions<InlayOffset, FoldOffset>>(());
 
                 for mut edit in inlay_edits {
-                    old_transforms.seek(&edit.old.start, Bias::Left);
-                    if old_transforms.item().is_some_and(|t| t.is_fold()) {
-                        edit.old.start = old_transforms.start().0;
+                    // An edit landing inside a fold is widened to the fold,
+                    // which has to be re-emitted whole. Both sides of the
+                    // edit name the same boundary in the text - the bytes
+                    // before an edit are the same bytes before and after it
+                    // - so widening one side widens the other by the same
+                    // inlay bytes. Widen either side alone and the edit
+                    // stops describing one document: the map above adds up
+                    // the rows it names and gets a total the snapshot
+                    // beside it does not have.
+                    //
+                    // The folds are not the same on both sides - that is
+                    // what the edit is often about - so moving one side
+                    // can land the other in a fold of its own, and this
+                    // repeats until neither side is inside one. It walks
+                    // the folds the edit touches and no others.
+                    loop {
+                        old_transforms.seek(&edit.old.start, Bias::Left);
+                        let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
+                            edit.old.start.0.0 - old_transforms.start().0.0.0
+                        } else {
+                            0
+                        };
+                        new_transforms.seek(&edit.new.start, Bias::Left);
+                        let new_delta = if new_transforms.item().is_some_and(|t| t.is_fold()) {
+                            edit.new.start.0.0 - new_transforms.start().0.0.0
+                        } else {
+                            0
+                        };
+                        let delta = old_delta.max(new_delta);
+                        if delta == 0 {
+                            break;
+                        }
+                        edit.old.start.0.0 -= delta;
+                        edit.new.start.0.0 -= delta;
                     }
                     let old_start =
                         old_transforms.start().1.0 + (edit.old.start - old_transforms.start().0);
-
-                    old_transforms.seek_forward(&edit.old.end, Bias::Right);
-                    if old_transforms.item().is_some_and(|t| t.is_fold()) {
-                        old_transforms.next();
-                        edit.old.end = old_transforms.start().0;
-                    }
-                    let old_end =
-                        old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
-
-                    new_transforms.seek(&edit.new.start, Bias::Left);
-                    if new_transforms.item().is_some_and(|t| t.is_fold()) {
-                        edit.new.start = new_transforms.start().0;
-                    }
                     let new_start =
                         new_transforms.start().1.0 + (edit.new.start - new_transforms.start().0);
 
-                    new_transforms.seek_forward(&edit.new.end, Bias::Right);
-                    if new_transforms.item().is_some_and(|t| t.is_fold()) {
-                        new_transforms.next();
-                        edit.new.end = new_transforms.start().0;
+                    loop {
+                        old_transforms.seek_forward(&edit.old.end, Bias::Right);
+                        let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
+                            old_transforms.end().0.0.0 - edit.old.end.0.0
+                        } else {
+                            0
+                        };
+                        new_transforms.seek_forward(&edit.new.end, Bias::Right);
+                        let new_delta = if new_transforms.item().is_some_and(|t| t.is_fold()) {
+                            new_transforms.end().0.0.0 - edit.new.end.0.0
+                        } else {
+                            0
+                        };
+                        let delta = old_delta.max(new_delta);
+                        if delta == 0 {
+                            break;
+                        }
+                        edit.old.end.0.0 += delta;
+                        edit.new.end.0.0 += delta;
                     }
+                    let old_end =
+                        old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
                     let new_end =
                         new_transforms.start().1.0 + (edit.new.end - new_transforms.start().0);
 

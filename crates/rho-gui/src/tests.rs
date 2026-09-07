@@ -24,6 +24,7 @@ mod inlay_cost;
 mod minibuffer;
 mod scene_fuzz;
 mod story;
+mod wrap_rows;
 use rho_agents::HostId;
 
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
