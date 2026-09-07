@@ -101,7 +101,7 @@ pub use invisibles::{is_invisible, replacement};
 pub use tab_map::TabEdit;
 #[cfg(feature = "wrap-test-support")]
 pub use wrap_map::WrapSyncTrace;
-pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
+pub use wrap_map::{WrapPoint, WrapPriority, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
 use gpui::{
@@ -495,11 +495,13 @@ impl DisplayMap {
             let (snapshot, edits) = self.inlay_map.sync(snapshot, edits.into_inner());
             let (mut writer, snapshot, edits) = self.fold_map.write(snapshot, edits);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-            let (_snapshot, _edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+            let (_snapshot, _edits) =
+                Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
             let (snapshot, edits) = writer.unfold_intersecting([Anchor::Min..Anchor::Max], true);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-            let (snapshot, _edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+            let (snapshot, _edits) =
+                Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
             self.block_map.retain_blocks_raw(&mut |block| {
                 !matches!(block.placement, BlockPlacement::Replace(_))
@@ -808,7 +810,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot.clone(), edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let inline = creases.iter().filter_map(|crease| {
@@ -827,7 +830,8 @@ impl DisplayMap {
         let (snapshot, edits) = fold_map.fold(inline);
 
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         let blocks = creases
             .into_iter()
@@ -882,12 +886,14 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) = fold_map.remove_folds(ranges, type_id);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .write(self_new_wrap_snapshot, self_new_wrap_edits, None);
@@ -910,7 +916,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let inline = creases.into_iter().filter_map(|crease| match crease {
@@ -924,7 +931,8 @@ impl DisplayMap {
         });
         let (snapshot, edits) = fold_map.replace_folds_with_type(type_id, inline);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.write(snapshot, edits, None);
     }
 
@@ -949,7 +957,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, buffer_edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) = self.inlay_map.replace_concealments(ranges);
@@ -958,7 +967,8 @@ impl DisplayMap {
         }
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.write(snapshot, edits, None);
     }
 
@@ -981,13 +991,15 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) =
             fold_map.unfold_intersecting(offset_ranges.iter().cloned(), inclusive);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .write(self_new_wrap_snapshot.clone(), self_new_wrap_edits, None)
@@ -1489,9 +1501,24 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_font_with_size(font, font_size, cx))
     }
 
-    pub fn set_wrap_width(&self, width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
+    /// Sets the width rows wrap at, and which rows are laid out at it first.
+    ///
+    /// See [`WrapPriority`]: a caller with a screen in front of it passes the
+    /// rows on that screen, and a caller with none says so.
+    pub fn set_wrap_width(
+        &self,
+        width: Option<Pixels>,
+        priority: WrapPriority,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.wrap_map
-            .update(cx, |map, cx| map.set_wrap_width(width, cx))
+            .update(cx, |map, cx| map.set_wrap_width(width, priority, cx))
+    }
+
+    /// True while rows outside the reader's are still being laid out at the
+    /// current wrap width.
+    pub fn is_backfilling_wrap(&self, cx: &gpui::App) -> bool {
+        self.wrap_map.read(cx).is_backfilling()
     }
 
     #[instrument(skip_all)]
@@ -1507,13 +1534,15 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) = fold_map.update_fold_widths(widths);
         let widths_changed = !edits.is_empty();
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .read(self_new_wrap_snapshot, self_new_wrap_edits, None);
@@ -1548,7 +1577,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         {
             let companion_ref = self.companion.as_ref().map(|(_, c)| c.read(cx));
@@ -1563,7 +1593,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.splice(to_remove, to_insert);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         let (self_wrap_snapshot, self_wrap_edits) =
             (self_new_wrap_snapshot.clone(), self_new_wrap_edits.clone());
@@ -3281,7 +3312,9 @@ pub mod tests {
                         Some(px(rng.random_range(0.0..=max_wrap_width)))
                     };
                     log::info!("setting wrap width to {:?}", wrap_width);
-                    map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
+                    map.update(cx, |map, cx| {
+                        map.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx)
+                    });
                 }
                 20..=29 => {
                     let mut tab_sizes = vec![1, 2, 3, 4];

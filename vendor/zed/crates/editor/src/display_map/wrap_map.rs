@@ -9,7 +9,7 @@ use super::{
 use futures_lite::future::yield_now;
 use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
 use language::{LanguageAwareStyling, Point};
-use multi_buffer::RowInfo;
+use multi_buffer::{MultiBufferRow, RowInfo};
 use std::{cmp, collections::VecDeque, mem, ops::Range, sync::LazyLock, time::Duration};
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
@@ -29,6 +29,98 @@ pub struct WrapRow(pub u32);
 
 const WRAP_YIELD_ROW_INTERVAL: usize = 100;
 
+/// How many rows a background pass lays out between two chances to run an
+/// edit. An edit that arrives during a width change waits for the chunk in
+/// flight and no longer for the document.
+const WRAP_BACKFILL_ROW_CHUNK: u32 = 500;
+
+/// Which rows a width change lays out before the rest of the document.
+///
+/// A width on its own says nothing about who is waiting for it, so a map that
+/// is only given a width lays the document out from its first row and the
+/// reader waits behind rows they are not looking at. Every caller says which
+/// rows are in front of a reader, or says that none are; the choice is in the
+/// call, so a caller cannot forget to make it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WrapPriority {
+    /// No reader is waiting on this width: lay the document out from its
+    /// first row to its last, as a headless sync, a measuring pass and a test
+    /// do.
+    DocumentOrder,
+    /// The buffer rows in front of a reader. They are laid out at the new
+    /// width before [`WrapMap::set_wrap_width`] returns, so the reader never
+    /// waits for the document; the rest follows in the background, spreading
+    /// out from them. The cost of the blocking part is the caller's: it is
+    /// the range they pass, so a screen and its margin is a screen and its
+    /// margin.
+    ReaderRows(Range<MultiBufferRow>),
+}
+
+/// The rows a width change still owes, and how far the pass has got.
+struct Backfill {
+    /// Tab rows laid out at the current width: one contiguous run that grows
+    /// outward from the rows the reader was looking at when the width
+    /// changed. Rows outside it are still laid out at the width before it.
+    done: Range<u32>,
+    /// One past the last tab row in the document.
+    end: u32,
+}
+
+impl Backfill {
+    /// The next rows to lay out: below the reader first, since that is where
+    /// reading goes, then above.
+    fn next_chunk(&self) -> Option<Range<u32>> {
+        if self.done.end < self.end {
+            Some(self.done.end..cmp::min(self.done.end + WRAP_BACKFILL_ROW_CHUNK, self.end))
+        } else if self.done.start > 0 {
+            Some(self.done.start.saturating_sub(WRAP_BACKFILL_ROW_CHUNK)..self.done.start)
+        } else {
+            None
+        }
+    }
+
+    fn extend(&mut self, rows: Range<u32>) {
+        if rows.start < self.done.start {
+            self.done.start = rows.start;
+        }
+        if rows.end > self.done.end {
+            self.done.end = rows.end;
+        }
+    }
+
+    /// Moves the run to account for edits a flush is about to apply.
+    ///
+    /// A flush lays the rows it rewrites out at the current width, so rows an
+    /// edit touches stay in the run - but rows below an edit shift, and a run
+    /// that keeps a row number an edit moved would leave a row wrapped at the
+    /// old width and never come back to it. Where the arithmetic is not
+    /// certain the run gives rows up: laying a row out twice costs a chunk,
+    /// leaving one out is a line drawn at the wrong width forever.
+    fn shift(&mut self, tab_edits: &[TabEdit], end: u32) {
+        self.end = end;
+        let mut start = i64::from(self.done.start);
+        let mut done_end = i64::from(self.done.end);
+        for edit in tab_edits {
+            let old = edit.old.start.row()..edit.old.end.row() + 1;
+            let delta = i64::from(edit.new.end.row() - edit.new.start.row())
+                - i64::from(edit.old.end.row() - edit.old.start.row());
+            if i64::from(old.end) <= start {
+                start += delta;
+                done_end += delta;
+            } else if i64::from(old.start) >= done_end {
+                continue;
+            } else {
+                done_end = cmp::max(done_end + delta, i64::from(edit.new.end.row() + 1));
+            }
+        }
+        let end = i64::from(end);
+        self.done = start.clamp(0, end) as u32..done_end.clamp(0, end) as u32;
+        if self.done.end < self.done.start {
+            self.done.end = self.done.start;
+        }
+    }
+}
+
 impl_for_row_types! {
     WrapRow => RowDelta
 }
@@ -43,6 +135,7 @@ pub struct WrapMap {
     edits_since_sync: WrapPatch,
     wrap_width: Option<Pixels>,
     background_task: Option<Task<()>>,
+    backfill: Option<Backfill>,
     font_with_size: (Font, Pixels),
     row_scales: RowScaleSnapshot,
     #[cfg(feature = "wrap-test-support")]
@@ -149,13 +242,15 @@ impl WrapMap {
                 edits_since_sync: Default::default(),
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
+                backfill: None,
                 row_scales,
                 #[cfg(feature = "wrap-test-support")]
                 sync_traces: Vec::new(),
                 #[cfg(feature = "wrap-test-support")]
                 wrap_width_changes: Vec::new(),
             };
-            this.set_wrap_width(wrap_width, cx);
+            // A map being built has no rows on a screen yet.
+            this.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx);
             mem::take(&mut this.edits_since_sync);
             this
         });
@@ -163,8 +258,18 @@ impl WrapMap {
         (handle, snapshot)
     }
 
+    /// True while the rows a reader is looking at are not yet laid out at the
+    /// current width. The element defers its first paint on this, so it means
+    /// the reader's rows and not the document's: a pass that has served the
+    /// reader and is filling in the rest is not rewrapping in this sense.
     pub(crate) fn is_rewrapping(&self) -> bool {
-        self.background_task.is_some()
+        self.background_task.is_some() && self.backfill.is_none()
+    }
+
+    /// True while rows outside the reader's are still being laid out at the
+    /// current width.
+    pub(crate) fn is_backfilling(&self) -> bool {
+        self.backfill.is_some()
     }
 
     #[ztracing::instrument(skip_all)]
@@ -279,7 +384,9 @@ impl WrapMap {
             false
         } else {
             self.font_with_size = font_with_size;
-            self.rewrap(cx);
+            // A font change rewrites every glyph's advance, and the callers
+            // that make one are not laying a screen out at the time.
+            self.rewrap(WrapPriority::DocumentOrder, cx);
             true
         }
     }
@@ -296,25 +403,98 @@ impl WrapMap {
     }
 
     #[ztracing::instrument(skip_all)]
-    pub fn set_wrap_width(&mut self, wrap_width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
+    pub fn set_wrap_width(
+        &mut self,
+        wrap_width: Option<Pixels>,
+        priority: WrapPriority,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if wrap_width == self.wrap_width {
+            // The width has not moved but the reader may have. A background
+            // pass spreading out from where they used to be can be seconds
+            // away from where they are now, and those rows are still laid out
+            // at the width before this one.
+            self.reprioritize(priority, cx);
             return false;
         }
 
         #[cfg(feature = "wrap-test-support")]
         self.wrap_width_changes.push((self.wrap_width, wrap_width));
         self.wrap_width = wrap_width;
-        self.rewrap(cx);
+        self.rewrap(priority, cx);
         true
     }
 
-    #[ztracing::instrument(skip_all)]
-    fn rewrap(&mut self, cx: &mut Context<Self>) {
+    /// The tab rows a priority names, clamped to the document, or `None` when
+    /// no reader is waiting.
+    fn priority_tab_rows(&self, priority: &WrapPriority) -> Option<Range<u32>> {
+        let WrapPriority::ReaderRows(rows) = priority else {
+            return None;
+        };
+        let tab_snapshot = &self.snapshot.tab_snapshot;
+        let max_row = tab_snapshot.max_point().row();
+        let start = tab_snapshot.buffer_row_to_tab_row(rows.start).min(max_row);
+        let end = tab_snapshot
+            .buffer_row_to_tab_row(rows.end)
+            .min(max_row)
+            .max(start)
+            + 1;
+        Some(start..end)
+    }
+
+    /// Serves rows that have come in front of a reader since a pass started.
+    fn reprioritize(&mut self, priority: WrapPriority, cx: &mut Context<Self>) {
+        let Some(wrap_width) = self.wrap_width else {
+            return;
+        };
+        if self.backfill.is_none() {
+            return;
+        }
+        let Some(rows) = self.priority_tab_rows(&priority) else {
+            return;
+        };
+        // A copy of the snapshot is only safe to work from where the
+        // snapshot is the tab map's own; edits in flight go first.
+        if !self.pending_edits.is_empty() || self.snapshot.interpolated {
+            return;
+        }
+        let backfill = self.backfill.as_ref().expect("checked above");
+        if backfill.done.start <= rows.start && rows.end <= backfill.done.end {
+            return;
+        }
+
+        // The chunk in flight was chosen for where the reader was. Its rows
+        // are at most one chunk of work and they will be laid out again.
         self.background_task.take();
+        self.wrap_rows_now(rows.clone(), wrap_width, cx);
+        let backfill = self.backfill.as_mut().expect("checked above");
+        if rows.start > backfill.done.end || rows.end < backfill.done.start {
+            // The reader jumped clear of the run. Rows the old run had laid
+            // out keep their layout; the run follows the reader.
+            backfill.done = rows;
+        } else {
+            backfill.extend(rows);
+        }
+        self.drive_backfill(cx);
+        cx.notify();
+    }
+
+    #[ztracing::instrument(skip_all)]
+    fn rewrap(&mut self, priority: WrapPriority, cx: &mut Context<Self>) {
+        self.background_task.take();
+        self.backfill = None;
         self.interpolated_edits.clear();
         self.pending_edits.clear();
 
         if let Some(wrap_width) = self.wrap_width {
+            if let Some(rows) = self.priority_tab_rows(&priority) {
+                let end = self.snapshot.tab_snapshot.max_point().row() + 1;
+                self.wrap_rows_now(rows.clone(), wrap_width, cx);
+                self.backfill = Some(Backfill { done: rows, end });
+                self.drive_backfill(cx);
+                return;
+            }
+
             let mut new_snapshot = self.snapshot.clone();
 
             let text_system = cx.text_system();
@@ -400,6 +580,133 @@ impl WrapMap {
         }
     }
 
+    /// Lays a range of tab rows out at `wrap_width` on the thread that asks
+    /// for it.
+    ///
+    /// The range is the caller's, and so is the cost: a screen and its margin
+    /// is a screen and its margin. This is what makes a reader's rows ready
+    /// before `set_wrap_width` returns, so no row is ever painted at a width
+    /// that is no longer the editor's.
+    fn wrap_rows_now(&mut self, rows: Range<u32>, wrap_width: Pixels, cx: &mut Context<Self>) {
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::WrapMapRewrap);
+        profile.input(1, u64::from(rows.start), u64::from(rows.end - rows.start));
+        let old_rows = u64::from(self.snapshot.max_point().row().0) + 1;
+
+        let mut new_snapshot = self.snapshot.clone();
+        let tab_snapshot = new_snapshot.tab_snapshot.clone();
+        let tab_edits = [tab_edit_for_rows(&tab_snapshot, rows)];
+        let text_system = cx.text_system();
+        let (font, font_size) = self.font_with_size.clone();
+        let mut line_wrapper = text_system.line_wrapper(font, font_size);
+        let row_scales = self.row_scales.clone();
+        let edits = gpui::block_on(new_snapshot.update(
+            tab_snapshot,
+            &tab_edits,
+            wrap_width,
+            &row_scales,
+            &mut line_wrapper,
+        ));
+        self.snapshot = new_snapshot;
+        self.edits_since_sync = self.edits_since_sync.compose(&edits);
+        profile.state(
+            old_rows,
+            u64::from(self.snapshot.max_point().row().0) + 1,
+            self.pending_edits.len(),
+            REWRAP_READER_ROWS,
+        );
+    }
+
+    /// Lays out the next rows a width change owes, when the map is settled
+    /// enough to take them.
+    fn drive_backfill(&mut self, cx: &mut Context<Self>) {
+        let Some(wrap_width) = self.wrap_width else {
+            self.backfill = None;
+            return;
+        };
+        if self.background_task.is_some() {
+            return;
+        }
+        // A chunk works from a copy of the snapshot, so it can only start
+        // where the snapshot is the tab map's own: edits waiting to be
+        // flushed go first and the pass resumes behind them.
+        if !self.pending_edits.is_empty() || self.snapshot.interpolated {
+            return;
+        }
+        let Some(backfill) = self.backfill.as_ref() else {
+            return;
+        };
+        let Some(rows) = backfill.next_chunk() else {
+            self.backfill = None;
+            return;
+        };
+
+        let mut new_snapshot = self.snapshot.clone();
+        let tab_snapshot = new_snapshot.tab_snapshot.clone();
+        let tab_edits = [tab_edit_for_rows(&tab_snapshot, rows.clone())];
+        let text_system = cx.text_system();
+        let (font, font_size) = self.font_with_size.clone();
+        let mut line_wrapper = text_system.line_wrapper(font, font_size);
+        let row_scales = self.row_scales.clone();
+        let old_rows = u64::from(self.snapshot.max_point().row().0) + 1;
+        let chunk = rows.clone();
+        let update = async move {
+            let mut profile = gpui::profiler::EditorTimingGuard::new(
+                gpui::profiler::EditorTimingKind::WrapMapRewrap,
+            );
+            // This span migrates across executor workers, so it goes on a
+            // synthetic asynchronous lane rather than the first poll's thread.
+            profile.thread(0);
+            profile.input(
+                1,
+                u64::from(chunk.start),
+                u64::from(chunk.end - chunk.start),
+            );
+            let edits = new_snapshot
+                .update(
+                    tab_snapshot,
+                    &tab_edits,
+                    wrap_width,
+                    &row_scales,
+                    &mut line_wrapper,
+                )
+                .await;
+            profile.state(
+                old_rows,
+                u64::from(new_snapshot.max_point().row().0) + 1,
+                0,
+                0,
+            );
+            (new_snapshot, edits)
+        };
+
+        // See rewrap: on wasm the text system must stay main-thread only to
+        // avoid Atomics.wait traps on the browser main thread.
+        #[cfg(target_family = "wasm")]
+        let task = cx.foreground_executor().spawn(update);
+        #[cfg(not(target_family = "wasm"))]
+        let task = cx.background_spawn(update);
+
+        self.background_task = Some(cx.spawn(async move |this, cx| {
+            let (snapshot, edits) = task.await;
+            this.update(cx, |this, cx| {
+                this.snapshot = snapshot;
+                this.edits_since_sync = this
+                    .edits_since_sync
+                    .compose(mem::take(&mut this.interpolated_edits).invert())
+                    .compose(&edits);
+                this.background_task = None;
+                if let Some(backfill) = this.backfill.as_mut() {
+                    backfill.extend(rows);
+                }
+                this.flush_edits(cx);
+                this.drive_backfill(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn finish_update_in_background(
         &mut self,
         task: Task<(WrapSnapshot, WrapPatch)>,
@@ -415,6 +722,7 @@ impl WrapMap {
                     .compose(&edits);
                 this.background_task = None;
                 this.flush_edits(cx);
+                this.drive_backfill(cx);
                 cx.notify();
             })
             .ok();
@@ -443,6 +751,11 @@ impl WrapMap {
             && self.background_task.is_none()
         {
             let pending_edits = self.pending_edits.clone();
+            if let Some(backfill) = self.backfill.as_mut() {
+                for (tab_snapshot, _, tab_edits) in &pending_edits {
+                    backfill.shift(tab_edits, tab_snapshot.max_point().row() + 1);
+                }
+            }
             let mut snapshot = self.snapshot.clone();
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
@@ -591,6 +904,26 @@ impl WrapMap {
         if !was_interpolated {
             self.pending_edits.drain(..to_remove_len);
         }
+
+        self.drive_backfill(cx);
+    }
+}
+
+/// The flag a rewrap timing carries when it is laying out the rows a reader
+/// is looking at, rather than filling in the rest of the document.
+const REWRAP_READER_ROWS: u64 = 1;
+
+/// An edit that rewrites a range of tab rows without changing them: what a
+/// partial pass hands the wrap snapshot to have those rows laid out again at
+/// the current width.
+fn tab_edit_for_rows(tab_snapshot: &TabSnapshot, rows: Range<u32>) -> TabEdit {
+    let max_row = tab_snapshot.max_point().row();
+    let start_row = rows.start.min(max_row);
+    let end_row = rows.end.saturating_sub(1).clamp(start_row, max_row);
+    let range = TabPoint::new(start_row, 0)..TabPoint::new(end_row, tab_snapshot.line_len(end_row));
+    TabEdit {
+        old: range.clone(),
+        new: range,
     }
 }
 

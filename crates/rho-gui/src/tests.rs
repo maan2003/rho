@@ -3818,9 +3818,13 @@ fn elided_history_still_soft_wraps_the_rows_it_leaves(cx: &mut TestAppContext) {
     // fold, so it still has to come out of the display as several rows.
     let (fold_rows, display_rows) = cx.update(|cx| {
         editor.update(cx, |editor, cx| {
-            editor
-                .display_map
-                .update(cx, |map, cx| map.set_wrap_width(Some(gpui::px(160.)), cx));
+            editor.display_map.update(cx, |map, cx| {
+                map.set_wrap_width(
+                    Some(gpui::px(160.)),
+                    editor::display_map::WrapPriority::DocumentOrder,
+                    cx,
+                )
+            });
             let snapshot = editor.display_snapshot(cx);
             (
                 snapshot.fold_snapshot().max_point().row(),
@@ -10434,5 +10438,107 @@ fn a_fold_wraps_the_rows_it_flushes_at_their_scale(cx: &mut TestAppContext) {
         scaled < unscaled,
         "the scaled row breaks earlier than the unscaled one: \
          {scaled} characters against {unscaled}"
+    );
+}
+
+/// A width change lays out the rows in front of the reader before it returns,
+/// and the rest of the document behind them.
+///
+/// The wrap map used to lay every row out from the first, so a width arrived
+/// on the rows a reader was looking at only after rows they were not looking
+/// at had been measured - on a long transcript, several frames later, with
+/// the rows on screen still at the width before it in between. The rows in
+/// view are the ones about to be painted, so they go first and they go on the
+/// thread that asked: nothing is ever painted at a width that is no longer
+/// the editor's.
+#[gpui::test]
+fn a_width_change_wraps_the_reader_s_rows_before_the_document(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let line = "alpha bravo charlie delta echo foxtrot golf hotel india juliett";
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text(format!("{line}\n").repeat(2_000), window, cx);
+        editor
+    });
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            window.refresh();
+        })
+        .expect("soft wrap at the editor's width");
+    cx.simulate_window_resize(*editor, gpui::size(gpui::px(300.), gpui::px(400.)));
+    cx.run_until_parked();
+    cx.update_window(*editor, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("wrap the document this editor opened on");
+    cx.run_until_parked();
+
+    // Rows a reader is a long way down a wrapped document to look at.
+    let reader = multi_buffer::MultiBufferRow(1_500)..multi_buffer::MultiBufferRow(1_530);
+    fn display_rows(editor: &Editor, cx: &mut gpui::App, rows: std::ops::Range<u32>) -> u32 {
+        let snapshot = editor.display_snapshot(cx);
+        let row_of = |row| {
+            snapshot
+                .point_to_display_point(language::Point::new(row, 0), text::Bias::Left)
+                .row()
+                .0
+        };
+        row_of(rows.end) - row_of(rows.start)
+    }
+
+    let (opening_before, reader_before) = editor
+        .update(cx, |editor, _, cx| {
+            (
+                display_rows(editor, cx, 0..30),
+                display_rows(editor, cx, 1_500..1_530),
+            )
+        })
+        .expect("measure the document at the width it opened on");
+
+    let (opening_after, reader_after) = editor
+        .update(cx, |editor, _, cx| {
+            editor.display_map.update(cx, |map, cx| {
+                map.set_wrap_width(
+                    Some(gpui::px(120.)),
+                    editor::display_map::WrapPriority::ReaderRows(reader.clone()),
+                    cx,
+                )
+            });
+            // No executor run: this is the state the very next paint sees.
+            (
+                display_rows(editor, cx, 0..30),
+                display_rows(editor, cx, 1_500..1_530),
+            )
+        })
+        .expect("set a narrower width with rows in front of a reader");
+
+    assert!(
+        reader_after > reader_before,
+        "the reader's rows are laid out at the narrower width before the \
+         call returns, so they take more rows than they did: \
+         {reader_before} then {reader_after}"
+    );
+    assert_eq!(
+        opening_after, opening_before,
+        "rows the reader is not looking at wait for the background pass, \
+         and keep the layout they had: {opening_before} then {opening_after}"
+    );
+
+    cx.run_until_parked();
+    let (opening_end, backfilling) = editor
+        .update(cx, |editor, _, cx| {
+            (
+                display_rows(editor, cx, 0..30),
+                editor.display_map.read(cx).is_backfilling_wrap(cx),
+            )
+        })
+        .expect("let the background pass finish");
+    assert!(
+        opening_end > 30,
+        "the pass reaches the rest of the document, which is wrapped: \
+         {opening_end}"
+    );
+    assert!(
+        !backfilling,
+        "and it finishes, so no row is left at a width the editor has left"
     );
 }

@@ -3394,7 +3394,7 @@ mod tests {
     use crate::{
         display_map::{
             Companion, fold_map::FoldMap, fold_map::FoldPlaceholder, inlay_map::InlayMap,
-            tab_map::TabMap, wrap_map::WrapMap,
+            tab_map::TabMap, wrap_map::WrapMap, wrap_map::WrapPriority,
         },
         test::test_font,
     };
@@ -4553,7 +4553,9 @@ mod tests {
                         Some(px(rng.random_range(0.0..=100.0)))
                     };
                     log::info!("Setting wrap width to {:?}", wrap_width);
-                    wrap_map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
+                    wrap_map.update(cx, |map, cx| {
+                        map.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx)
+                    });
                 }
                 20..=39 => {
                     let block_count = rng.random_range(1..=5);

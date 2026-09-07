@@ -887,6 +887,7 @@ pub enum EditorTimingKind {
     BlockMapSync = 6,
     InlayMapSync = 7,
     WrapMapUpdate = 8,
+    WrapMapRewrap = 9,
 }
 
 const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
