@@ -25,18 +25,13 @@ use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_core::ContentPart;
 use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 
-use crate::commands::WorkspaceCompletionProvider;
-use crate::workspace::Workspace;
-
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
 const MODE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 
-// What a draft means — the start modes, the default base and the role
-// names — belongs to `rho-agents`; this screen draws it.
-pub use rho_agents::create::{AUTO_BASE_REVSET, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
+pub use crate::create::{AUTO_BASE_REVSET, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
 
 impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {
@@ -54,10 +49,56 @@ trait StartFieldModeLabel {
     fn label(self) -> &'static str;
 }
 
+/// What the host supplies for a draft editor. The crate builds the editor
+/// and owns the fields; who can complete a workdir, a role or a start is
+/// the host's question, so the host installs its own provider on each
+/// editor as it is built.
+///
+/// A closure rather than a function pointer because the provider needs
+/// whatever the host completes against, and that is state the crate must
+/// not see.
+#[derive(Clone)]
+pub struct Hooks(std::rc::Rc<ConfigureEditor>);
+
+/// What the host does to each draft editor as it is built.
+type ConfigureEditor = dyn Fn(&mut Editor, Fields, &mut Window, &mut Context<Editor>);
+
+impl Hooks {
+    pub fn new(
+        configure: impl Fn(&mut Editor, Fields, &mut Window, &mut Context<Editor>) + 'static,
+    ) -> Self {
+        Self(std::rc::Rc::new(configure))
+    }
+
+    /// Hooks that do nothing, for a host with no completion of its own.
+    pub fn inert() -> Self {
+        Self::new(|_, _, _, _| {})
+    }
+}
+
+/// The three field buffers an editor is built over, named so the host can
+/// tell them apart when it installs completion.
+#[derive(Clone, Copy)]
+pub struct Fields {
+    pub workdir: gpui::EntityId,
+    pub role: gpui::EntityId,
+    pub start: gpui::EntityId,
+}
+
+/// What the draft says about itself. The host decides what an edit means
+/// for the rest of the screen; the draft only says that one happened.
+pub enum Event {
+    /// The reader has typed in the draft, so it is what they are working
+    /// on now.
+    Edited,
+}
+
+impl gpui::EventEmitter<Event> for DraftModel {}
+
 pub struct DraftGutter;
 
 pub struct DraftModel {
-    workspace: WeakEntity<Workspace>,
+    hooks: Hooks,
     multi_buffer: Entity<MultiBuffer>,
     workdir_buffer: Entity<Buffer>,
     role_buffer: Entity<Buffer>,
@@ -80,7 +121,7 @@ pub struct DraftModel {
 }
 
 impl DraftModel {
-    pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    pub fn new(hooks: Hooks, cx: &mut Context<Self>) -> Self {
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
         let role_buffer = cx.new(|cx| Buffer::local(DEFAULT_ROLE, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
@@ -131,7 +172,7 @@ impl DraftModel {
         ];
 
         Self {
-            workspace,
+            hooks,
             multi_buffer,
             workdir_buffer,
             role_buffer,
@@ -153,7 +194,7 @@ impl DraftModel {
     /// Builds an editor over the shared multibuffer — own cursor and
     /// scroll — fully caught up with the model, cursor at the body end.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
-        let workspace = self.workspace.clone();
+        let hooks = self.hooks.clone();
         let multi_buffer = self.multi_buffer.clone();
         let buffers = [
             &self.workdir_buffer,
@@ -181,12 +222,16 @@ impl DraftModel {
             for buffer_id in buffer_ids {
                 editor.disable_header_for_buffer(buffer_id, cx);
             }
-            editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
-                workspace,
-                Some(workdir_id),
-                Some(role_id),
-                Some(start_id),
-            )));
+            (hooks.0)(
+                &mut editor,
+                Fields {
+                    workdir: workdir_id,
+                    role: role_id,
+                    start: start_id,
+                },
+                window,
+                cx,
+            );
             editor
         });
 
@@ -755,10 +800,6 @@ impl DraftModel {
         if self.suppress_draft_activation {
             return;
         }
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.mark_draft_active_from_edit(cx);
-            });
-        }
+        cx.emit(Event::Edited);
     }
 }

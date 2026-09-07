@@ -46,7 +46,7 @@ pub fn start_field_candidates(
     let needle = last_token(text_before_cursor);
     [
         Candidate {
-            value: crate::draft_view::DEFAULT_START.to_owned(),
+            value: rho_agents::create::DEFAULT_START.to_owned(),
             description: "local main → local master → trunk (New/Sandbox)".to_owned(),
         },
         Candidate {
@@ -242,7 +242,7 @@ mod tests {
             description: "fix tests".to_owned(),
         }];
         let candidates = start_field_candidates("", &agents);
-        assert_eq!(candidates[0].value, crate::draft_view::DEFAULT_START);
+        assert_eq!(candidates[0].value, rho_agents::create::DEFAULT_START);
         assert!(candidates.iter().any(|c| c.value == "user"));
         assert!(candidates.iter().any(|c| c.value == "a3f"));
         let candidates = start_field_candidates("tes", &agents);

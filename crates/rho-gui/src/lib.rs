@@ -7,7 +7,6 @@ pub(crate) mod commands;
 pub(crate) mod create;
 pub mod dashboard;
 pub mod desk_view;
-pub mod draft_view;
 pub(crate) mod find;
 pub mod home;
 pub mod minibuffer;

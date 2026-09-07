@@ -30,6 +30,7 @@ use gpui::{
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agents::agent_view::AgentModel;
 use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
+use rho_agents::draft::DraftModel;
 use rho_agents::messages::MessageLog;
 use rho_agents::session::ActiveAgents;
 use rho_agents::store::FrameSummary;
@@ -47,7 +48,6 @@ use theme::ActiveTheme as _;
 
 use crate::chime::Chime;
 use crate::desk_view::DeskCells;
-use crate::draft_view::DraftModel;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
 
@@ -554,6 +554,9 @@ pub struct Workspace {
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
     /// One per agent screen, for as long as the screen lives: what it says
     /// when its transcript is ready.
+    /// The draft says when it has been edited; what that means for the rest
+    /// of the screen is the host's.
+    _draft_subscription: gpui::Subscription,
     agent_model_subscriptions: Vec<gpui::Subscription>,
     /// A transcript search waiting for the history it has to look through
     /// to be composed: the agent, the query, and which way it runs.
@@ -922,7 +925,25 @@ impl Workspace {
         let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
-        let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
+        let draft_model = cx.new(|cx| {
+            DraftModel::new(
+                rho_agents::draft::Hooks::new(move |editor, fields, _, _| {
+                    editor.set_completion_provider(Some(
+                        crate::commands::WorkspaceCompletionProvider::new(
+                            workspace.clone(),
+                            Some(fields.workdir),
+                            Some(fields.role),
+                            Some(fields.start),
+                        ),
+                    ));
+                }),
+                cx,
+            )
+        });
+        let draft_subscription =
+            cx.subscribe(&draft_model, |workspace, _, event, cx| match event {
+                rho_agents::draft::Event::Edited => workspace.mark_draft_active_from_edit(cx),
+            });
         let messages = cx.new(|cx| MessageLog::new(window, cx));
         let event_task = cx.spawn(async move |this, cx| {
             let mut changes: UnboundedReceiver<rho_mirror::model::ModelEvent> = changes;
@@ -1147,6 +1168,7 @@ impl Workspace {
             slack_search_before: None,
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
+            _draft_subscription: draft_subscription,
             agent_model_subscriptions: Vec::new(),
             pending_transcript_search: None,
             last_search: None,
@@ -2177,8 +2199,8 @@ impl Workspace {
                         view.set_body_text("", cx);
                         view.clear_attachments(cx);
                         view.set_workdir_text(&label, cx);
-                        view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
-                        view.set_start_text(crate::draft_view::DEFAULT_START, cx);
+                        view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
+                        view.set_start_text(rho_agents::create::DEFAULT_START, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
                 }
@@ -8199,8 +8221,8 @@ impl Workspace {
         self.draft_model.update(cx, |view, cx| {
             view.set_body_text("", cx);
             view.clear_attachments(cx);
-            view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
-            view.set_start_text(crate::draft_view::DEFAULT_START, cx);
+            view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
+            view.set_start_text(rho_agents::create::DEFAULT_START, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -8328,12 +8350,12 @@ impl Workspace {
             .area_workdir(host, node_id)
             .or_else(|| self.only_workdir())
             .ok_or_else(|| "new agent: no working directory for this area".to_owned())?;
-        let role = parse_agent_role(crate::draft_view::DEFAULT_ROLE)?;
+        let role = parse_agent_role(rho_agents::create::DEFAULT_ROLE)?;
         Ok((
             workdir.host,
             rho_ui_proto::StartMode::NewOn {
                 repo: workdir.path,
-                revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
+                revset: rho_agents::create::AUTO_BASE_REVSET.to_owned(),
             },
             role,
         ))
@@ -8481,7 +8503,7 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn draft_model_for_test(&self) -> Entity<crate::draft_view::DraftModel> {
+    pub(crate) fn draft_model_for_test(&self) -> Entity<DraftModel> {
         self.draft_model.clone()
     }
 
