@@ -494,6 +494,36 @@ else is built on. The transient lands after slice 2.
 
 Each slice lands on its own with the tests of the slices before it green.
 
+## A device is one GUI, and the newest window wins it
+
+A device id names one writer in the CRDT: each device has its own
+namespace and its own version counter, so two live connections writing
+under one device id would mint the same versions for different writes.
+The daemon therefore lets one connection hold a device at a time.
+
+The first shape of that guard refused the *second* connection, and it was
+wrong in exactly the case it mattered. The user's GUI panicked and
+restarted, and the restarted one was told
+`Desk device already has an active writer connection` — the hold belonged
+to a connection nobody was on the other end of, and it is released only
+when its handler loop ends, which over an iroh relay means waiting out
+`rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`: **ten minutes** with no desk.
+
+So the hold goes to the newest: a `DeskSync` for a device that is already
+bound displaces the connection holding it. The one already there is dead
+or stale — it is the same device, which is to say the same GUI — and the
+window in front of the user is the one that should have it. The displaced
+connection is told in words it can show ("The desk moved to a newer window
+on this device"), its read loop is woken so it ends rather than sitting on
+a socket nobody reads, and its session is marked displaced.
+
+The guard itself is not weakened, only pointed the other way: a displaced
+connection may not write. Its `DeskMutationApply` is refused with the same
+sentence and its `DeskTextApply` errors, from the moment it is displaced
+and whether or not its socket has noticed, so there is never a second live
+writer in one device's namespace. A connection ending releases the device
+only if the hold is still its own, so the window that took it keeps it.
+
 ## Symptoms to watch for
 
 - A fact in the store that a source could have answered.
@@ -501,6 +531,7 @@ Each slice lands on its own with the tests of the slices before it green.
 - A title stored rather than derived.
 - A verdict that changes facts without a log entry.
 - A view rule enforced by rewriting storage.
+- A restarted GUI refused its own device.
 
 ## What done means
 

@@ -23,7 +23,7 @@ use rho_ui_proto::{
     McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
     WorkspaceInfo, read_frame, write_frame,
 };
-use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
 pub mod debug;
 mod desk_cells;
@@ -759,11 +759,40 @@ impl GitTransportBroker {
     }
 }
 
+/// One GUI's hold on a desk device.
+///
+/// A device is one GUI, and the CRDT gives each device its own namespace, so
+/// two live writers under one device id would collide on versions. The hold
+/// is therefore exclusive — but exclusive to the *newest* connection: a GUI
+/// that died without closing leaves its hold behind, and the GUI the user
+/// just restarted must not be the one that is refused.
+struct DeskBinding {
+    /// Which connection holds it, so a connection ending only lets go of a
+    /// hold that is still its own.
+    connection: u64,
+    /// The displaced connection's writer, to tell it why it is going.
+    outgoing: mpsc::UnboundedSender<ServerMessage>,
+    /// Set when a newer connection takes the device. A displaced connection
+    /// may not write: its mutations are refused from this moment, whether or
+    /// not its socket has noticed yet.
+    displaced: AtomicBool,
+    /// Wakes the displaced connection's read loop so it ends rather than
+    /// sitting on a socket nobody is reading.
+    closed: Notify,
+}
+
+/// What a connection holds after `DeskSync`.
+struct DeskSession {
+    device: rho_desk::cells::DeviceId,
+    node_namespace: u16,
+    binding: Arc<DeskBinding>,
+}
+
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
     desk_cells: desk_cells::DeskCellStore,
-    desk_devices: Mutex<HashSet<rho_desk::cells::DeviceId>>,
+    desk_devices: Mutex<HashMap<rho_desk::cells::DeviceId, Arc<DeskBinding>>>,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
@@ -820,7 +849,7 @@ impl AgentRegistry {
             pool,
             db,
             desk_cells,
-            desk_devices: Mutex::new(HashSet::new()),
+            desk_devices: Mutex::new(HashMap::new()),
             visualizations,
             inference,
             machine_seed,
@@ -1368,15 +1397,38 @@ where
         let message = match first.take() {
             Some(message) => message,
             None => {
-                match rho_ui_proto::read_frame_optional::<_, ClientMessage>(&mut reader).await {
-                    Ok(Some(message)) => message,
-                    Ok(None) => {
+                // A displaced connection stops here rather than sitting on a
+                // socket nobody is reading: the GUI that held this device has
+                // been told, and the window that took it is the live one.
+                let displaced = desk_session
+                    .as_ref()
+                    .map(|session: &DeskSession| Arc::clone(&session.binding));
+                let frame = rho_ui_proto::read_frame_optional::<_, ClientMessage>(&mut reader);
+                let read = match displaced {
+                    Some(binding) => {
+                        tokio::select! {
+                            biased;
+                            () = binding.closed.notified() => None,
+                            read = frame => Some(read),
+                        }
+                    }
+                    None => Some(frame.await),
+                };
+                match read {
+                    None => {
                         for (repo, _) in &land_leases {
                             agents.clear_land_holder(repo).await;
                         }
                         break Ok(());
                     }
-                    Err(error) => {
+                    Some(Ok(Some(message))) => message,
+                    Some(Ok(None)) => {
+                        for (repo, _) in &land_leases {
+                            agents.clear_land_holder(repo).await;
+                        }
+                        break Ok(());
+                    }
+                    Some(Err(error)) => {
                         for (repo, _) in &land_leases {
                             agents.clear_land_holder(repo).await;
                         }
@@ -1416,8 +1468,16 @@ where
             }
         }
     };
-    if let Some((device, _)) = desk_session {
-        agents.desk_devices.lock().await.remove(&device);
+    // Let go of the device only if the hold is still this connection's: a
+    // newer window may have taken it, and ending must not unbind theirs.
+    if let Some(session) = desk_session {
+        let mut devices = agents.desk_devices.lock().await;
+        if devices
+            .get(&session.device)
+            .is_some_and(|held| Arc::ptr_eq(held, &session.binding))
+        {
+            devices.remove(&session.device);
+        }
     }
     events_task.abort();
     if let Some(log_follow) = log_follow {
@@ -2003,7 +2063,7 @@ async fn handle_message(
     land_holder: Option<LandLeaseHolder>,
     connection_id: u64,
     log_follow: &mut Option<tokio::task::JoinHandle<()>>,
-    desk_session: &mut Option<(rho_desk::cells::DeviceId, u16)>,
+    desk_session: &mut Option<DeskSession>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -2012,7 +2072,10 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::DeskSync { device, known } => {
-            if desk_session.is_some_and(|(bound, _)| bound != device) {
+            if desk_session
+                .as_ref()
+                .is_some_and(|session| session.device != device)
+            {
                 anyhow::bail!("Desk connection is already bound to another device");
             }
             let node_namespace = agents
@@ -2024,10 +2087,45 @@ async fn handle_message(
                 .desk_cells
                 .sync_since(&known)
                 .map_err(anyhow::Error::msg)?;
-            if desk_session.is_none() && !agents.desk_devices.lock().await.insert(device) {
-                anyhow::bail!("Desk device already has an active writer connection");
-            }
-            *desk_session = Some((device, node_namespace));
+            let binding = match desk_session.take() {
+                // This connection already holds the device: syncing again is
+                // a resync, not a second writer.
+                Some(session) => session.binding,
+                None => {
+                    let binding = Arc::new(DeskBinding {
+                        connection: connection_id,
+                        outgoing: outgoing_tx.clone(),
+                        displaced: AtomicBool::new(false),
+                        closed: Notify::new(),
+                    });
+                    // Newest wins. A device is one GUI, so a hold that is
+                    // still standing belongs to a GUI that has died or is
+                    // stale — the user has just restarted theirs, and
+                    // refusing it would leave them with no desk until the
+                    // transport gave up on the old connection, which over
+                    // iroh is the ten minutes of
+                    // `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`.
+                    if let Some(held) = agents
+                        .desk_devices
+                        .lock()
+                        .await
+                        .insert(device, Arc::clone(&binding))
+                        && held.connection != connection_id
+                    {
+                        held.displaced.store(true, Ordering::SeqCst);
+                        let _ = held.outgoing.send(ServerMessage::Error {
+                            message: "The desk moved to a newer window on this device".into(),
+                        });
+                        held.closed.notify_one();
+                    }
+                    binding
+                }
+            };
+            *desk_session = Some(DeskSession {
+                device,
+                node_namespace,
+                binding,
+            });
             let _ = outgoing_tx.send(ServerMessage::DeskSynced {
                 node_namespace,
                 delta,
@@ -2037,13 +2135,24 @@ async fn handle_message(
         }
         ClientMessage::DeskMutationApply { mutation } => {
             let stamp = mutation.stamp;
-            let Some((device, _)) = *desk_session else {
+            let Some(session) = desk_session.as_ref() else {
                 let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
                     stamp,
                     reason: "Desk connection must sync before writing".into(),
                 });
                 return Ok(Refresh::None);
             };
+            // Displaced, so this connection's device id belongs to another
+            // window now: writing under it would put two authors in one
+            // CRDT namespace.
+            if session.binding.displaced.load(Ordering::SeqCst) {
+                let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
+                    stamp,
+                    reason: "The desk moved to a newer window on this device".into(),
+                });
+                return Ok(Refresh::None);
+            }
+            let device = session.device;
             match agents.desk_cells.apply_mutation(device, mutation).await {
                 Ok(()) => {
                     let _ = outgoing_tx.send(ServerMessage::DeskMutationAccepted { stamp });
@@ -2063,9 +2172,14 @@ async fn handle_message(
             operation,
             transaction,
         } => {
-            let Some((_, namespace)) = *desk_session else {
+            let Some(session) = desk_session.as_ref() else {
                 anyhow::bail!("Desk connection must sync before writing text");
             };
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
+            let namespace = session.node_namespace;
             if agents
                 .desk_cells
                 .apply_body(
@@ -3466,11 +3580,11 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
-        MAX_INPUT_IMAGES, PlatformSecrets, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
-        prepare_image_content, quota_burn, quota_summaries, start_runtime_sockets,
-        validate_image_content,
+        AgentRegistry, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
+        GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets,
+        claude_quota_history, configure_octo_git_transport, hourly_global_usage_series,
+        merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
+        quota_summaries, start_runtime_sockets, validate_image_content,
     };
 
     #[tokio::test]
@@ -4041,5 +4155,150 @@ mod tests {
             .to_string()
             .contains("exceeds")
         );
+    }
+
+    /// A device is one GUI, and the newest window wins it.
+    ///
+    /// The user's GUI panicked and restarted; the daemon still held the old
+    /// connection's binding, and the restarted GUI was refused with "Desk
+    /// device already has an active writer connection" until the transport
+    /// gave up on the dead one — over iroh that is the ten minutes of
+    /// `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`. So a second `DeskSync`
+    /// displaces the first. The guard itself stays real: the displaced
+    /// connection may not write afterwards, because two writers under one
+    /// device id would collide in the CRDT's per-device namespace.
+    #[tokio::test]
+    async fn a_newer_window_takes_the_device_and_the_displaced_one_may_not_write() {
+        use rho_desk::cells::{
+            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, State, Uuid, Version,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let agents = test_registry(temp.path()).await;
+        let device = DeviceId([7; 16]);
+
+        let (older_tx, mut older_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (newer_tx, mut newer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut older: Option<DeskSession> = None;
+        let mut newer: Option<DeskSession> = None;
+
+        let sync = |device| ClientMessage::DeskSync {
+            device,
+            known: Version::default(),
+        };
+        desk_message(&agents, &older_tx, 1, &mut older, sync(device))
+            .await
+            .expect("the first window binds the device");
+        desk_message(&agents, &newer_tx, 2, &mut newer, sync(device))
+            .await
+            .expect("and the window the user just restarted binds it too");
+
+        // The older connection is told why it is going, in words it can show.
+        let told = std::iter::from_fn(|| older_rx.try_recv().ok())
+            .filter_map(|message| match message {
+                ServerMessage::Error { message } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            told,
+            ["The desk moved to a newer window on this device"],
+            "the displaced window is told, and not left guessing"
+        );
+
+        let mutation = CellMutation {
+            // The first version this device has ever written: the store
+            // refuses a stamp that runs ahead of what it could have seen.
+            stamp: Stamp { device, version: 1 },
+            writes: vec![CellWrite {
+                id: Id::Note(Uuid([9; 16])),
+                property: Property::State(State::Open),
+            }],
+            verdict: None,
+        };
+        desk_message(
+            &agents,
+            &older_tx,
+            1,
+            &mut older,
+            ClientMessage::DeskMutationApply {
+                mutation: mutation.clone(),
+            },
+        )
+        .await
+        .expect("the refusal is an answer, not a broken connection");
+        let refused = std::iter::from_fn(|| older_rx.try_recv().ok())
+            .filter_map(|message| match message {
+                ServerMessage::DeskMutationRejected { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refused,
+            ["The desk moved to a newer window on this device"],
+            "and it may not write under a device id that is another window's now"
+        );
+
+        // The window that took the device writes.
+        desk_message(
+            &agents,
+            &newer_tx,
+            2,
+            &mut newer,
+            ClientMessage::DeskMutationApply { mutation },
+        )
+        .await
+        .unwrap();
+        let answered = std::iter::from_fn(|| newer_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            answered
+                .iter()
+                .any(|message| matches!(message, ServerMessage::DeskMutationAccepted { .. })),
+            "the live window's write lands: {answered:?}"
+        );
+    }
+
+    /// One desk message through the daemon's own handler, with everything a
+    /// desk message does not use left empty.
+    async fn desk_message(
+        agents: &Arc<AgentRegistry>,
+        outgoing: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+        connection: u64,
+        session: &mut Option<DeskSession>,
+        message: ClientMessage,
+    ) -> anyhow::Result<()> {
+        let mut log_follow = None;
+        super::handle_message(
+            agents,
+            None,
+            outgoing,
+            &mut Vec::new(),
+            None,
+            connection,
+            &mut log_follow,
+            session,
+            message,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn test_registry(root: &std::path::Path) -> Arc<AgentRegistry> {
+        let db = RhoDb::open(root.join("rho.redb"));
+        db.write().await.init_agent_tables();
+        let inference = rho_inference::Inference::new(db.clone()).await.unwrap();
+        Arc::new(
+            AgentRegistry::new(
+                db,
+                inference,
+                Default::default(),
+                camino::Utf8PathBuf::from_path_buf(root.join("state")).unwrap(),
+                rho_workspaces::UserEnvironment::new(Default::default()),
+                PlatformSecrets::default(),
+                root.join("octo.sock"),
+            )
+            .await
+            .unwrap(),
+        )
     }
 }
