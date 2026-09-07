@@ -3080,6 +3080,8 @@ impl Window {
                 prepaint_end: prepaint_end.unwrap_or(draw_start),
                 paint_end: paint_end.unwrap_or(draw_start),
                 draw_end,
+                // Replaced by what elements reported during this frame.
+                work: profiler::FrameWorkScale::default(),
             });
         }
 

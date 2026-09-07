@@ -709,6 +709,11 @@ pub fn trace_enabled() -> bool {
 pub struct FrameTiming {
     /// The window that was drawn.
     pub window_id: WindowId,
+    /// How much there was to draw. A duration on its own cannot be divided
+    /// by anything, so a slow frame can be named but not explained; this is
+    /// what it was slow *per*. Accumulated across every element that
+    /// reported during the frame, and zero when nothing did.
+    pub work: FrameWorkScale,
     /// When the frame first became dirty (its first invalidation). `None` if
     /// frame tracing was not yet enabled when the invalidation occurred.
     pub dirty_at: Option<Instant>,
@@ -722,6 +727,41 @@ pub struct FrameTiming {
     pub paint_end: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+}
+
+/// What one frame had to draw.
+///
+/// Counts, not contents: like every other payload here these are numeric by
+/// design, so profiling never captures text or paths. Elements add their own
+/// numbers with [`record_frame_work`] while the frame is being drawn, and
+/// [`record_frame_timing`] takes the total.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct FrameWorkScale {
+    /// Rows actually on screen.
+    pub visible_rows: u64,
+    /// Rows the document has, on screen or not.
+    pub total_rows: u64,
+    /// Block decorations in the display map.
+    pub blocks: u64,
+    /// Excerpts the multibuffer is composed of.
+    pub excerpts: u64,
+    /// Inlays spliced into the display map.
+    pub inlays: u64,
+    /// Cursors and selections being drawn.
+    pub cursors: u64,
+}
+
+impl FrameWorkScale {
+    /// Adds another element's numbers to these. Saturating, because a
+    /// profiling counter must never be the thing that panics.
+    pub fn add(&mut self, other: Self) {
+        self.visible_rows = self.visible_rows.saturating_add(other.visible_rows);
+        self.total_rows = self.total_rows.saturating_add(other.total_rows);
+        self.blocks = self.blocks.saturating_add(other.blocks);
+        self.excerpts = self.excerpts.saturating_add(other.excerpts);
+        self.inlays = self.inlays.saturating_add(other.inlays);
+        self.cursors = self.cursors.saturating_add(other.cursors);
+    }
 }
 
 /// CPU time spent submitting a rendered scene to the platform renderer.
@@ -779,6 +819,16 @@ static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings 
 });
 static PRESENT_TIMINGS: spin::Mutex<VecDeque<PresentTiming>> = spin::Mutex::new(VecDeque::new());
 
+/// What the frame currently being drawn has reported so far.
+static FRAME_WORK: spin::Mutex<FrameWorkScale> = spin::Mutex::new(FrameWorkScale {
+    visible_rows: 0,
+    total_rows: 0,
+    blocks: 0,
+    excerpts: 0,
+    inlays: 0,
+    cursors: 0,
+});
+
 static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enables or disables frame timing collection at runtime.
@@ -798,6 +848,10 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         let mut presents = PRESENT_TIMINGS.lock();
         presents.clear();
         presents.shrink_to_fit();
+        *FRAME_WORK.lock() = FrameWorkScale::default();
+        let mut work = MAIN_THREAD_WORK.lock();
+        work.work.clear();
+        work.work.shrink_to_fit();
     }
     true
 }
@@ -807,15 +861,41 @@ pub fn frame_trace_enabled() -> bool {
     FRAME_TRACE_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Records the timing of a drawn window frame.
+/// Reports how much this element had to draw in the frame being drawn.
+///
+/// Called during prepaint, once per element that knows its own scale. The
+/// numbers accumulate until the frame is recorded, so several editors in one
+/// window add up to what the window drew.
 ///
 /// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
-pub fn record_frame_timing(timing: FrameTiming) {
+pub fn record_frame_work(scale: FrameWorkScale) {
     if !frame_trace_enabled() {
         return;
     }
     std::hint::cold_path(); // optimize for when profiling is off
 
+    FRAME_WORK.lock().add(scale);
+}
+
+/// Takes what has been reported since the last frame and resets the total.
+pub fn take_frame_work() -> FrameWorkScale {
+    std::mem::take(&mut *FRAME_WORK.lock())
+}
+
+/// Records the timing of a drawn window frame.
+///
+/// The frame's work scale is taken from what elements reported during it, so
+/// callers need not thread it through; whatever is passed in `timing.work` is
+/// replaced.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+pub fn record_frame_timing(mut timing: FrameTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path(); // optimize for when profiling is off
+
+    timing.work = take_frame_work();
     let mut frames = FRAME_TIMINGS.lock();
     if frames.timings.len() >= MAX_FRAME_TIMINGS {
         frames.timings.pop_front();
@@ -873,6 +953,18 @@ pub struct EditorTiming {
     pub new_rows: u64,
     pub pending_batches: u64,
     pub flags: u64,
+    /// Transforms in the map the stage worked on. What a splice is divided
+    /// by: the same stage over ten transforms and ten thousand is the same
+    /// name and a different thing.
+    pub transforms: u64,
+    /// The span the stage affected, in the map's own offsets.
+    pub affected_start: u64,
+    /// The end of that span.
+    pub affected_end: u64,
+    /// How many distinct offsets inside it were touched. A splice costs the
+    /// offsets, not the span, so a wide span over few offsets is cheap and
+    /// the two must be told apart.
+    pub affected_offsets: u64,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -887,6 +979,10 @@ pub enum EditorTimingKind {
     BlockMapSync = 6,
     InlayMapSync = 7,
     WrapMapUpdate = 8,
+    /// The dashboard reconciling its tree into the editor's composition.
+    SyncTree = 9,
+    /// Inlays going into or out of the display map.
+    SpliceInlays = 10,
 }
 
 const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
@@ -964,6 +1060,10 @@ impl EditorTimingGuard {
                     new_rows: 0,
                     pending_batches: 0,
                     flags: 0,
+                    transforms: 0,
+                    affected_start: 0,
+                    affected_end: 0,
+                    affected_offsets: 0,
                 },
                 generation,
             )
@@ -1004,6 +1104,23 @@ impl EditorTimingGuard {
             timing.tid = tid;
         }
     }
+
+    /// What the stage worked on and where. `affected` is a span in the map's
+    /// own offsets and `offsets` is how many distinct points inside it were
+    /// touched, which is the number a splice's cost is actually in.
+    pub fn spliced(
+        &mut self,
+        transforms: u64,
+        affected: std::ops::Range<u64>,
+        affected_offsets: u64,
+    ) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.transforms = transforms;
+            timing.affected_start = affected.start;
+            timing.affected_end = affected.end;
+            timing.affected_offsets = affected_offsets;
+        }
+    }
 }
 
 fn editor_profile_tid() -> u64 {
@@ -1027,6 +1144,91 @@ impl Drop for EditorTimingGuard {
             record_editor_timing(timing, generation);
         }
     }
+}
+
+/// Who was on the main thread when no frame was being drawn.
+///
+/// The frame ring accounts for time inside `Window::draw` and nothing else,
+/// so main-thread work between frames is invisible in it — and that work is
+/// exactly what makes the *next* frame late. A record names its owner rather
+/// than leaving it to be guessed from a stack.
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+#[expect(missing_docs)]
+pub enum MainThreadWorkKind {
+    /// Reconciling a model event into the UI.
+    ModelEvent = 1,
+    /// Rebuilding or patching the desk's map.
+    DeskSync = 2,
+    /// Work a background task handed back to the main thread.
+    TaskCompletion = 3,
+    /// Anything else the caller chose to name.
+    Other = 4,
+}
+
+/// One span of main-thread work outside a frame.
+#[derive(Debug, Copy, Clone)]
+pub struct MainThreadWork {
+    /// What was running.
+    pub owner: MainThreadWorkKind,
+    /// When it started.
+    pub start: Instant,
+    /// When it finished.
+    pub end: Instant,
+    /// How much it did, in whatever the owner counts — events reconciled,
+    /// rows patched. Divides the duration the way a frame's scale does.
+    pub work_units: u64,
+}
+
+// Keep the same bound as the frame ring: this is on in normal operation.
+const MAX_MAIN_THREAD_WORK: usize = (1024 * 1024) / core::mem::size_of::<MainThreadWork>();
+
+struct MainThreadWorkLog {
+    work: VecDeque<MainThreadWork>,
+    total_pushed: u64,
+}
+
+static MAIN_THREAD_WORK: spin::Mutex<MainThreadWorkLog> = spin::Mutex::new(MainThreadWorkLog {
+    work: VecDeque::new(),
+    total_pushed: 0,
+});
+
+/// Records a span of main-thread work that happened outside a frame.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+pub fn record_main_thread_work(work: MainThreadWork) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut log = MAIN_THREAD_WORK.lock();
+    if log.work.len() >= MAX_MAIN_THREAD_WORK {
+        log.work.pop_front();
+    }
+    log.work.push_back(work);
+    log.total_pushed += 1;
+}
+
+/// The buffered outside-frame work, with how many records have ever been
+/// pushed. The second number is the point: the ring drops its oldest, so a
+/// reader that does not know the total cannot tell a quiet period from a
+/// dropped one.
+pub fn snapshot_main_thread_work() -> (Vec<MainThreadWork>, u64) {
+    let log = MAIN_THREAD_WORK.lock();
+    (log.work.iter().copied().collect(), log.total_pushed)
+}
+
+/// How many editor timings have ever been pushed, against however many the
+/// ring still holds. A stage total read without this is a total over an
+/// unknown window.
+pub fn editor_timings_pushed() -> u64 {
+    EDITOR_TIMINGS.lock().total_pushed
+}
+
+/// The same for frames.
+pub fn frame_timings_pushed() -> u64 {
+    FRAME_TIMINGS.lock().total_pushed
 }
 
 #[expect(missing_docs)]
@@ -1125,6 +1327,78 @@ mod timing_ring_tests {
         set_editor_trace_enabled(true);
         drop(EditorTimingGuard::new(EditorTimingKind::BufferEdit));
         assert_eq!(collector.collect_unseen().len(), 1);
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_frame_s_work_is_the_sum_of_what_its_elements_reported() {
+        set_frame_trace_enabled(true);
+        let _ = take_frame_work();
+
+        record_frame_work(FrameWorkScale {
+            visible_rows: 40,
+            total_rows: 1_000,
+            inlays: 3,
+            ..Default::default()
+        });
+        // A second element in the same frame: a window can draw more than
+        // one editor, and what the frame drew is all of them.
+        record_frame_work(FrameWorkScale {
+            visible_rows: 2,
+            total_rows: 5,
+            cursors: 1,
+            ..Default::default()
+        });
+
+        let taken = take_frame_work();
+        assert_eq!(taken.visible_rows, 42);
+        assert_eq!(taken.total_rows, 1_005);
+        assert_eq!(taken.inlays, 3);
+        assert_eq!(taken.cursors, 1);
+        // Taking resets: the next frame starts from nothing, or every frame
+        // would report the whole session's work.
+        assert_eq!(take_frame_work(), FrameWorkScale::default());
+
+        set_frame_trace_enabled(false);
+    }
+
+    #[test]
+    fn work_outside_a_frame_is_recorded_with_its_owner_and_counted() {
+        set_frame_trace_enabled(true);
+        let before = snapshot_main_thread_work().1;
+
+        let start = Instant::now();
+        record_main_thread_work(MainThreadWork {
+            owner: MainThreadWorkKind::ModelEvent,
+            start,
+            end: start,
+            work_units: 7,
+        });
+
+        let (work, total) = snapshot_main_thread_work();
+        assert_eq!(total, before + 1);
+        let last = work.last().expect("the record just pushed");
+        assert_eq!(last.work_units, 7);
+        assert!(matches!(last.owner, MainThreadWorkKind::ModelEvent));
+
+        set_frame_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_stage_can_say_what_it_worked_on() {
+        set_editor_trace_enabled(true);
+        let mut collector = EditorTimingCollector::new();
+        {
+            let mut guard = EditorTimingGuard::new(EditorTimingKind::SpliceInlays);
+            guard.spliced(4_000, 120..980, 16);
+        }
+        let timings = collector.collect_unseen();
+        let timing = timings.last().expect("the stage just recorded");
+        assert_eq!(timing.transforms, 4_000);
+        assert_eq!(timing.affected_start, 120);
+        assert_eq!(timing.affected_end, 980);
+        // The offsets, not the span: a splice costs the points it touches.
+        assert_eq!(timing.affected_offsets, 16);
         set_editor_trace_enabled(false);
     }
 }

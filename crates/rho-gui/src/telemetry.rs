@@ -511,6 +511,8 @@ fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
         WrapMapSync => "wrap_map_sync",
         BlockMapSync => "block_map_sync",
         WrapMapUpdate => "wrap_map_update",
+        SyncTree => "sync_tree",
+        SpliceInlays => "splice_inlays",
     }
 }
 
@@ -532,6 +534,7 @@ mod tests {
             prepaint_end: draw_start + std::time::Duration::from_millis(1),
             paint_end: draw_start + std::time::Duration::from_millis(3),
             draw_end: draw_start + std::time::Duration::from_millis(4),
+            work: gpui::profiler::FrameWorkScale::default(),
         });
         gpui::profiler::record_present_timing(gpui::profiler::PresentTiming {
             window_id: gpui::WindowId::from(99),
