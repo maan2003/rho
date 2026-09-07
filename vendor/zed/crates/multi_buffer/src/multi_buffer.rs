@@ -4238,6 +4238,14 @@ impl MultiBufferSnapshot {
         }
     }
 
+    /// How many excerpts the multibuffer is composed of. O(1): the count is
+    /// already in the excerpt tree's summary. A transcript is one buffer per
+    /// row and thousands of excerpts, so this is the number a frame's cost
+    /// most often divides by.
+    pub fn excerpt_count(&self) -> usize {
+        self.excerpts.summary().count
+    }
+
     pub fn len(&self) -> MultiBufferOffset {
         self.diff_transforms.summary().output.len
     }

@@ -191,6 +191,26 @@ for about eight minutes after each delete on the shared loop device (3.2 GB,
 then 29, 96, 287). A deletion judged by the `df` that follows it will be read
 as having freed almost nothing. Wait, or measure something else.
 
+The other way a binary is not the one you built is the linker. On 2026-09-07
+rho-gui's test binary crossed ~1.149 GB and stopped starting at all: SIGSEGV
+before the first test, `--list` printing nothing. The cause was wild 0.10.0,
+named by store path in the flake's shellHook — and the one-line check, from
+eng-bgkw, is worth more than the story:
+
+```
+readelf -lW BIN | awk '$1=="DYNAMIC"{print $2}'
+readelf -SW BIN | awk '$2==".dynamic"{print $5}'
+```
+
+Those two must be the same number. When they drift the loader reads the
+dynamic array at the program header's offset, finds zeros, stops, and the
+program never reaches `main`. The drift starts after the NOBITS `.tbss`, so
+that is where to look if a future toolchain does it again. Fixed by moving to
+mold; note that a shell started before that change still has the old linker's
+store path in `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, and a
+target-specific RUSTFLAGS variable shadows `.cargo/config.toml` outright.
+`direnv exec . cargo …` picks up the new one without restarting anything.
+
 The same day gave the other half of that: `du` on a rig's state reports the
 snapshot's full size because `rig new` clones with `cp -a --reflink=auto` and
 `du` counts shared extents once per directory it walks. `filefrag -v` shows
@@ -198,6 +218,36 @@ the truth — the rig's file and the snapshot's at identical physical offsets,
 flagged `shared`. A rig costs its divergence from the snapshot, not the
 snapshot. Deleting rigs to free space frees very little; retiring the
 snapshot is what frees the 43 GB, and only once no rig points into it.
+
+### R5. An instrument can be faithful and still blind
+
+The rule already here is to give the harness a question whose answer is known.
+This is the sharper form of it, and it is eng-b8os's, from the fold cut: **an
+instrument can measure correctly and still be incapable of seeing the fault.**
+Their per-row invariant check was right about every row it examined and could
+never have caught a row four billion columns wide, because every column in
+such a row is inside it. The check passed, faithfully, and meant nothing.
+
+So: **the check that "passes" is the one to distrust when you have not first
+shown it can fail.** Before believing a green instrument, make it go red on
+purpose — a deliberately wrong reference, a known-bad input, a fault you have
+planted. The fold fix's zero rope errors was worth reporting only because the
+same grep found 1,440 of them on the session before it. The inlay-map seek was
+proven by a negative control in which a deliberately wrong reference failed
+148 tests, which is what established the suite reached the function at all.
+
+Two ways this has bitten in one week, both producing green:
+
+- **Measuring nothing.** A cost test that fired a model event and asserted the
+  map was not composed passed on the *unfixed* code, because the event was
+  deferred to `on_next_frame` and the test never drew one. Every assertion held
+  trivially over work that never happened. The fix is to assert first that the
+  thing happened at all — a row was drawn again — before asserting what it cost.
+- **Measuring faithfully the wrong thing.** The per-row check above.
+
+The first is caught by a known-answer check. The second is only caught by
+asking what the instrument *cannot* see, which is a question worth writing down
+beside every new check.
 
 ## The cases
 

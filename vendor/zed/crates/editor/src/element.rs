@@ -9994,6 +9994,21 @@ impl Element for EditorElement {
                         editor.last_horizontal_scrollbar_visible = visible_horizontal_scrollbar;
                     });
 
+                    // What this frame had to draw, for the profiler. A
+                    // duration cannot be divided by anything on its own, so
+                    // every element that knows its own scale reports it and
+                    // the frame takes the total. Everything here is already
+                    // computed or O(1); nothing is walked for it, and the
+                    // call returns immediately when tracing is off.
+                    gpui::profiler::record_frame_work(gpui::profiler::FrameWorkScale {
+                        visible_rows: end_row.0.saturating_sub(start_row.0) as u64,
+                        total_rows: position_map.snapshot.max_point().row().0 as u64 + 1,
+                        blocks: blocks.len() as u64,
+                        excerpts: position_map.snapshot.buffer_snapshot().excerpt_count() as u64,
+                        inlays: position_map.snapshot.inlay_count() as u64,
+                        cursors: selections.len() as u64,
+                    });
+
                     EditorLayout {
                         mode,
                         defer_paint_until_rewrapped,

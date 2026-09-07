@@ -100,7 +100,18 @@ struct Snapshot<'a> {
     monotonic_origin_ns: Option<u64>,
     cpu_profile: Option<CpuProfileSnapshot>,
     frames: Vec<FrameRecord>,
+    /// How many frame records have ever been pushed, against however many
+    /// are in `frames`. The difference is what the ring dropped, and
+    /// without it a total over `frames` is a total over an unknown window.
+    frames_pushed: u64,
     editor: Vec<EditorRecord>,
+    /// The same for the editor ring, which is the one that misleads: it
+    /// holds 4,096 records, and on a real report it has covered seconds
+    /// while `frames` covered minutes.
+    editor_pushed: u64,
+    /// Main-thread work that happened outside any frame.
+    main_thread_work: Vec<MainThreadWorkRecord>,
+    main_thread_work_pushed: u64,
     browser: Vec<BrowserRecord>,
     browser_frames: Vec<BrowserFrameRecord>,
     browser_commands: Vec<BrowserCommandRecord>,
@@ -141,6 +152,22 @@ struct FrameRecord {
     invalidations: u64,
     focused_surface: &'static str,
     visible_surfaces: Vec<&'static str>,
+    /// What the frame had to draw, summed over the elements that reported.
+    /// A duration divided by nothing explains nothing.
+    visible_rows: u64,
+    total_rows: u64,
+    blocks: u64,
+    excerpts: u64,
+    inlays: u64,
+    cursors: u64,
+}
+
+#[derive(Serialize)]
+struct MainThreadWorkRecord {
+    owner: &'static str,
+    start_ns: u64,
+    duration_ns: u64,
+    work_units: u64,
 }
 
 #[derive(Serialize)]
@@ -159,6 +186,10 @@ struct EditorRecord {
     new_rows: u64,
     pending_batches: u64,
     flags: u64,
+    transforms: u64,
+    affected_start: u64,
+    affected_end: u64,
+    affected_offsets: u64,
 }
 
 #[derive(Serialize)]
@@ -290,7 +321,9 @@ fn snapshot_with_cpu_profiles(
 ) -> anyhow::Result<Vec<u8>> {
     let started = *STARTED.get_or_init(Instant::now);
     let frames = gpui::profiler::snapshot_frame_timings();
+    let frames_pushed = gpui::profiler::frame_timings_pushed();
     let editor = gpui::profiler::snapshot_editor_timings();
+    let editor_pushed = gpui::profiler::editor_timings_pushed();
     let presents = gpui::profiler::snapshot_present_timings();
     let browser = rho_browser::snapshot_browser_timings();
     let surfaces = SURFACES
@@ -343,6 +376,12 @@ fn snapshot_with_cpu_profiles(
                             .collect()
                     })
                     .unwrap_or_default(),
+                visible_rows: timing.work.visible_rows,
+                total_rows: timing.work.total_rows,
+                blocks: timing.work.blocks,
+                excerpts: timing.work.excerpts,
+                inlays: timing.work.inlays,
+                cursors: timing.work.cursors,
             }
         })
         .collect();
@@ -366,6 +405,10 @@ fn snapshot_with_cpu_profiles(
             output_rows: timing.output_rows,
             old_rows: timing.old_rows,
             new_rows: timing.new_rows,
+            transforms: timing.transforms,
+            affected_start: timing.affected_start,
+            affected_end: timing.affected_end,
+            affected_offsets: timing.affected_offsets,
             pending_batches: timing.pending_batches,
             flags: timing.flags,
         })
@@ -427,9 +470,24 @@ fn snapshot_with_cpu_profiles(
             status: event.status,
         })
         .collect();
+    let (main_thread_work, main_thread_work_pushed) = gpui::profiler::snapshot_main_thread_work();
+    let main_thread_work = main_thread_work
+        .into_iter()
+        .rev()
+        .take(MAX_SNAPSHOT_FRAMES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|work| MainThreadWorkRecord {
+            owner: main_thread_work_owner(work.owner),
+            start_ns: duration_ns(work.start.saturating_duration_since(started)),
+            duration_ns: duration_ns(work.end.saturating_duration_since(work.start)),
+            work_units: work.work_units,
+        })
+        .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
-        version: 10,
+        version: 11,
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -467,7 +525,11 @@ fn snapshot_with_cpu_profiles(
             }
         }),
         frames,
+        frames_pushed,
         editor,
+        editor_pushed,
+        main_thread_work,
+        main_thread_work_pushed,
         browser,
         browser_frames,
         browser_commands,
@@ -498,6 +560,16 @@ fn browser_stage_name(kind: rho_browser::BrowserTimingKind) -> &'static str {
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+fn main_thread_work_owner(kind: gpui::profiler::MainThreadWorkKind) -> &'static str {
+    use gpui::profiler::MainThreadWorkKind::*;
+    match kind {
+        ModelEvent => "model_event",
+        DeskSync => "desk_sync",
+        TaskCompletion => "task_completion",
+        Other => "other",
+    }
 }
 
 fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
@@ -552,7 +624,7 @@ mod tests {
         assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
-        assert_eq!(value["version"], 10);
+        assert_eq!(value["version"], 11);
         assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
         assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
         assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));
@@ -572,6 +644,17 @@ mod tests {
         assert_eq!(frame["present_ns"], 2_000_000);
         assert_eq!(frame["draw_to_present_ns"], 1_000_000);
         assert_eq!(frame["focused_surface"], "transcript");
+        // Schema 11: a frame carries what it had to draw. Recorded here as
+        // zero because this test drives the profiler directly and no
+        // element reported, which is the honest value — the point is that
+        // the fields exist and travel, not that this test invents a scale.
+        assert_eq!(frame["visible_rows"], 0);
+        assert_eq!(frame["total_rows"], 0);
+        assert!(frame["excerpts"].is_number());
+        assert!(frame["inlays"].is_number());
+        assert!(value["frames_pushed"].is_number());
+        assert!(value["editor_pushed"].is_number());
+        assert!(value["main_thread_work"].is_array());
         assert_eq!(
             frame["visible_surfaces"],
             serde_json::json!(["transcript", "browser"])

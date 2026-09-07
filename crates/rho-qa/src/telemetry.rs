@@ -49,6 +49,14 @@ struct Report {
     #[serde(default)]
     editor: Vec<Stage>,
     #[serde(default)]
+    frames_pushed: u64,
+    #[serde(default)]
+    editor_pushed: u64,
+    #[serde(default)]
+    main_thread_work: Vec<Work>,
+    #[serde(default)]
+    main_thread_work_pushed: u64,
+    #[serde(default)]
     cpu_profile: Option<CpuProfile>,
 }
 
@@ -70,6 +78,20 @@ struct Frame {
     invalidations: u64,
     #[serde(default)]
     focused_surface: String,
+    // The frame's scale, added in schema 11. Absent in older reports, which
+    // is the whole reason they could not be explained.
+    #[serde(default)]
+    visible_rows: u64,
+    #[serde(default)]
+    total_rows: u64,
+    #[serde(default)]
+    blocks: u64,
+    #[serde(default)]
+    excerpts: u64,
+    #[serde(default)]
+    inlays: u64,
+    #[serde(default)]
+    cursors: u64,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +105,22 @@ struct Stage {
     input_rows: u64,
     #[serde(default)]
     new_rows: u64,
+    #[serde(default)]
+    transforms: u64,
+    #[serde(default)]
+    affected_offsets: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct Work {
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    start_ns: u64,
+    #[serde(default)]
+    duration_ns: u64,
+    #[serde(default)]
+    work_units: u64,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +177,115 @@ pub fn summarize(path: &Path) -> Result<String> {
             ms(&collect(frames, |frame| frame.paint_ns), 0.50),
             ms(&collect(frames, |frame| frame.paint_ns), 0.99),
         ));
+    }
+
+    // What the slow frames were slow *per*. A duration on its own can only
+    // be reported; divided by the rows it drew it can be explained, and a
+    // frame that costs 27 ms on one invalidation over 200 rows is a
+    // different fault from one that costs 27 ms over 20,000.
+    if report.frames.iter().any(|frame| frame.total_rows > 0) {
+        out.push_str("\nwhat the frames had to draw:\n");
+        for (surface, frames) in &surfaces {
+            let scaled: Vec<&Frame> = frames
+                .iter()
+                .copied()
+                .filter(|frame| frame.total_rows > 0)
+                .collect();
+            if scaled.is_empty() {
+                continue;
+            }
+            let slow: Vec<&Frame> = scaled
+                .iter()
+                .copied()
+                .filter(|frame| frame.draw_ns > BUDGET_NS)
+                .collect();
+            let per_row = |frames: &[&Frame]| -> f64 {
+                let rows: u64 = frames.iter().map(|frame| frame.visible_rows.max(1)).sum();
+                let draw: u64 = frames.iter().map(|frame| frame.draw_ns).sum();
+                if rows == 0 {
+                    0.0
+                } else {
+                    draw as f64 / rows as f64 / 1e3
+                }
+            };
+            out.push_str(&format!(
+                "  {surface:<20} visible rows p50 {:.0} of {:.0} total  blocks {:.0}                   excerpts {:.0}  inlays {:.0}  cursors {:.0}  ·  {:.1} us per visible row\n",
+                ms(&collect(&scaled, |frame| frame.visible_rows), 0.50) * 1e6,
+                ms(&collect(&scaled, |frame| frame.total_rows), 0.50) * 1e6,
+                ms(&collect(&scaled, |frame| frame.blocks), 0.50) * 1e6,
+                ms(&collect(&scaled, |frame| frame.excerpts), 0.50) * 1e6,
+                ms(&collect(&scaled, |frame| frame.inlays), 0.50) * 1e6,
+                ms(&collect(&scaled, |frame| frame.cursors), 0.50) * 1e6,
+                per_row(&scaled),
+            ));
+            if !slow.is_empty() {
+                out.push_str(&format!(
+                    "  {:<20} the {} over budget: visible rows p50 {:.0}, {:.1} us per visible row\n",
+                    "",
+                    slow.len(),
+                    ms(&collect(&slow, |frame| frame.visible_rows), 0.50) * 1e6,
+                    per_row(&slow),
+                ));
+            }
+        }
+    }
+
+    // Main-thread work with no frame around it. The frame ring accounts for
+    // time inside `Window::draw`; this is the work that makes the *next*
+    // frame late, and before schema 11 no report could see it at all.
+    if !report.main_thread_work.is_empty() {
+        out.push_str("\nmain-thread work outside any frame, which no frame number can show:\n");
+        let mut by_owner: HashMap<&str, Vec<&Work>> = HashMap::new();
+        for work in &report.main_thread_work {
+            by_owner.entry(work.owner.as_str()).or_default().push(work);
+        }
+        let mut owners: Vec<(&str, Vec<&Work>)> = by_owner.into_iter().collect();
+        owners.sort_by_key(|(_, work)| {
+            std::cmp::Reverse(work.iter().map(|work| work.duration_ns).sum::<u64>())
+        });
+        for (owner, work) in owners {
+            let durations: Vec<u64> = work.iter().map(|work| work.duration_ns).collect();
+            let units: u64 = work.iter().map(|work| work.work_units).sum();
+            let total: u64 = durations.iter().sum();
+            out.push_str(&format!(
+                "  {owner:<20} {:>5} spans  {:>7.1} ms total  p50 {:.2} p99 {:.2} ms                   {units} units  {:.1} us per unit\n",
+                work.len(),
+                total as f64 / 1e6,
+                ms(&durations, 0.50),
+                ms(&durations, 0.99),
+                if units == 0 {
+                    0.0
+                } else {
+                    total as f64 / units as f64 / 1e3
+                },
+            ));
+        }
+        if report.main_thread_work_pushed > report.main_thread_work.len() as u64 {
+            out.push_str(&format!(
+                "  (the ring dropped {} older spans)\n",
+                report.main_thread_work_pushed - report.main_thread_work.len() as u64,
+            ));
+        }
+    }
+
+    // How much of the session each ring actually covers. This is the
+    // smallest number here and it prevents the worst misreading: the editor
+    // ring holds 4,096 records and has covered seconds on reports whose
+    // frames covered minutes, so a stage total set against a frame total
+    // was a comparison between two different windows of time.
+    if report.editor_pushed > 0 || report.frames_pushed > 0 {
+        out.push_str(&format!(
+            "\nring coverage: frames {} of {} pushed, editor stages {} of {} pushed\n",
+            report.frames.len(),
+            report.frames_pushed,
+            report.editor.len(),
+            report.editor_pushed,
+        ));
+        if report.editor_pushed > report.editor.len() as u64 {
+            out.push_str(
+                "  the editor ring dropped records: its totals are over its own span, \n                 \x20 not the session's, and must not be set against a frame total\n",
+            );
+        }
     }
 
     // A frame's own accounting: whatever `draw` is that prepaint and paint
@@ -613,4 +760,97 @@ fn ms(values: &[u64], quantile: f64) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     sorted[((sorted.len() - 1) as f64 * quantile) as usize] as f64 / 1e6
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize;
+
+    /// A report at schema 11, with a frame that says what it drew, work
+    /// outside every frame, and rings that dropped records.
+    fn report_with_scale() -> String {
+        let frames: Vec<String> = (0..4)
+            .map(|nth| {
+                // One slow frame over 200 rows, three fast ones.
+                let draw = if nth == 0 { 27_000_000 } else { 1_000_000 };
+                format!(
+                    r#"{{"start_ns":{},"draw_ns":{draw},"prepaint_ns":{},"paint_ns":500000,
+                       "invalidations":1,"focused_surface":"transcript","visible_rows":200,
+                       "total_rows":68939,"blocks":12,"excerpts":4096,"inlays":37,"cursors":1}}"#,
+                    nth * 16_000_000,
+                    draw - 600_000,
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"captured_unix_ms":1,"build":{{"profile":"profiling","target":"x86_64"}},
+               "frames":[{}],"frames_pushed":9,
+               "editor":[],"editor_pushed":8192,
+               "main_thread_work":[
+                 {{"owner":"model_event","start_ns":1,"duration_ns":4000000,"work_units":8}},
+                 {{"owner":"desk_sync","start_ns":2,"duration_ns":1000000,"work_units":1}}],
+               "main_thread_work_pushed":3}}"#,
+            frames.join(",")
+        )
+    }
+
+    fn summarize_str(json: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "rho-qa-telemetry-test-{}",
+            std::process::id() as u64 + json.len() as u64
+        ));
+        std::fs::create_dir_all(&dir).expect("make the temp dir");
+        let path = dir.join("report.json");
+        std::fs::write(&path, json).expect("write the report");
+        let out = summarize(&path).expect("read the report");
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn a_frame_that_says_what_it_drew_is_reported_per_row() {
+        let out = summarize_str(&report_with_scale());
+
+        // The scale itself, so a duration has something to be divided by.
+        assert!(out.contains("what the frames had to draw"), "{out}");
+        assert!(out.contains("excerpts 4096"), "{out}");
+        assert!(out.contains("per visible row"), "{out}");
+        // And the over-budget frames called out separately: the whole point
+        // is telling a slow frame over 200 rows from a slow frame over
+        // 20,000, which an average over all frames hides.
+        assert!(out.contains("over budget: visible rows"), "{out}");
+
+        // Work with no frame around it, which no frame number can show.
+        assert!(out.contains("outside any frame"), "{out}");
+        assert!(out.contains("model_event"), "{out}");
+        assert!(out.contains("desk_sync"), "{out}");
+
+        // And how much of the session the rings actually cover.
+        assert!(out.contains("ring coverage"), "{out}");
+        assert!(
+            out.contains("the editor ring dropped records"),
+            "8192 pushed against 0 held is a dropped ring and must say so: {out}"
+        );
+    }
+
+    /// The known-answer half: an older report has none of these fields, and
+    /// must print none of these sections rather than print zeros. A test
+    /// that only checked the new report would pass just as well against
+    /// code that printed the sections unconditionally.
+    #[test]
+    fn a_report_without_the_scale_says_nothing_about_it() {
+        let out = summarize_str(
+            r#"{"captured_unix_ms":1,"build":{"profile":"profiling","target":"x86_64"},
+               "frames":[{"start_ns":0,"draw_ns":9000000,"prepaint_ns":6000000,
+                          "paint_ns":2000000,"invalidations":3,
+                          "focused_surface":"transcript"}]}"#,
+        );
+
+        // It still reads the frames it does have.
+        assert!(out.contains("transcript"), "{out}");
+        // But it invents nothing about what they drew.
+        assert!(!out.contains("what the frames had to draw"), "{out}");
+        assert!(!out.contains("outside any frame"), "{out}");
+        assert!(!out.contains("ring coverage"), "{out}");
+    }
 }

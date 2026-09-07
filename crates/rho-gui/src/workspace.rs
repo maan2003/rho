@@ -640,6 +640,18 @@ pub struct Workspace {
 /// Target-independent application state transitions. Transport adapters feed
 /// these methods; native and browser layout code only decide when to render
 /// the resulting canonical registry/store/model state.
+/// Runs a closure when it is dropped, so a function that returns from
+/// several places still records itself once.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(run) = self.0.take() {
+            run();
+        }
+    }
+}
+
 impl Workspace {
     fn ensure_agent_model(
         &mut self,
@@ -1950,9 +1962,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Main-thread work outside a frame. The frame ring accounts for
+        // time inside `Window::draw` and nothing else, so this batch is
+        // invisible in it — and it is exactly the work that makes the next
+        // frame late. It is recorded with its own count so a slow batch can
+        // be divided by the events it reconciled.
+        let start = std::time::Instant::now();
+        let count = events.len() as u64;
         for crate::model::ModelEvent { host, msg } in events {
             self.handle_model_event(host, msg, window, cx);
         }
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::ModelEvent,
+            start,
+            end: std::time::Instant::now(),
+            work_units: count,
+        });
     }
 
     pub(crate) fn handle_model_event(
@@ -5860,6 +5885,9 @@ impl Workspace {
 
     /// The map for a host, made again from the desk. `moved` names the
     /// agents a `Changed` moved; everything else the sources hold stands.
+    ///
+    /// Times itself on the way out, including the early return, which is
+    /// the path a cheap event takes and so the one worth measuring.
     fn sync_tree_rows(
         &mut self,
         host: HostId,
@@ -5867,6 +5895,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The desk half of the same accounting: this runs from
+        // `on_next_frame`, before the frame, so it lands outside every
+        // frame span. Its work unit is the agents the event named, or zero
+        // for a whole-desk sync, which is the distinction that matters —
+        // the two cost differently and are the same function.
+        let start = std::time::Instant::now();
+        let work_units = moved.map_or(0, |agents| agents.len() as u64);
+        let _record = OnDrop(Some(move || {
+            gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+                owner: gpui::profiler::MainThreadWorkKind::DeskSync,
+                start,
+                end: std::time::Instant::now(),
+                work_units,
+            });
+        }));
         self.refresh_desk_sources(host, moved, cx);
         // The sources decide who is on the desk at all, so the map is
         // built again here and the delta paths patch what it left.

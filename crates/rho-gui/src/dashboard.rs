@@ -2181,6 +2181,8 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        let mut timing =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::SyncTree);
         self.tree_heading_agents.clear();
         self.tree_heading_pages.clear();
         self.referenced_pages.clear();
@@ -2359,6 +2361,11 @@ impl Dashboard {
         {
             self.composed += 1;
         }
+        // What this composition was over. A `sync_tree` that composes eight
+        // rows and one that composes eight thousand are the same stage name
+        // and not the same event, and until now the report could not tell
+        // them apart.
+        timing.input(rows.len(), 0, rows.len() as u64);
         self.tree_draw.clear();
         self.tree_draw_at.clear();
         let mut eol_hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
@@ -2532,6 +2539,7 @@ impl Dashboard {
                 editor.highlight_text(class.key(), ranges, class.style(cx), cx);
             }
         });
+        timing.spliced(self.tree_inlay_ids.len() as u64, 0..rows.len() as u64, 0);
         self.apply_tree_folds(rows.as_slice(), &row_depths, cx);
     }
 

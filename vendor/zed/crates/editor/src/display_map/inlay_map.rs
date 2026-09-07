@@ -48,6 +48,11 @@ pub struct InlaySnapshot {
     pub buffer: MultiBufferSnapshot,
     transforms: SumTree<Transform>,
     pub version: usize,
+    /// How many inlays the map holds. Kept here because the transform tree
+    /// has no O(1) length and a frame that wants to divide its cost by the
+    /// map's size cannot afford to walk it. `splice` is the only thing that
+    /// changes the inlay set, so this is set there and nowhere else.
+    inlay_count: usize,
 }
 
 impl std::ops::Deref for InlaySnapshot {
@@ -604,6 +609,7 @@ impl InlayMap {
             ),
             buffer,
             version,
+            inlay_count: 0,
         };
 
         (
@@ -840,6 +846,8 @@ impl InlayMap {
         to_remove: &[InlayId],
         to_insert: Vec<Inlay>,
     ) -> (InlaySnapshot, Vec<InlayEdit>) {
+        let mut timing =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::SpliceInlays);
         let old_snapshot = self.snapshot.clone();
         let snapshot = &mut self.snapshot;
         let mut edits = BTreeSet::new();
@@ -874,7 +882,22 @@ impl InlayMap {
             edits.insert(offset);
         }
 
+        snapshot.inlay_count = self.inlays.len();
         let affected_offsets = edits.into_iter().collect::<Vec<_>>();
+        // What this splice is to be divided by. `transforms` is the number
+        // of inlays in the map rather than a count of the transform tree's
+        // nodes: the tree has no O(1) length and walking it to count would
+        // cost more than the measurement is worth, while the two are
+        // proportional and it is the inlays the cost is actually in. The
+        // span is the whole affected range and `affected_offsets` the
+        // distinct points inside it, which is the number `splice` pays for
+        // twice over — a wide span over few offsets is cheap.
+        timing.spliced(
+            self.inlays.len() as u64,
+            affected_offsets.first().map_or(0, |offset| offset.0 as u64)
+                ..affected_offsets.last().map_or(0, |offset| offset.0 as u64),
+            affected_offsets.len() as u64,
+        );
         let buffer_edits = affected_offsets
             .iter()
             .copied()
@@ -973,6 +996,11 @@ impl InlayMap {
 }
 
 impl InlaySnapshot {
+    /// How many inlays are in the map. O(1).
+    pub fn inlay_count(&self) -> usize {
+        self.inlay_count
+    }
+
     /// The inlay offsets a buffer offset maps to, including any inlays that
     /// sit exactly on it.
     ///
