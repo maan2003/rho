@@ -1032,12 +1032,9 @@ impl Workspace {
             .collect();
         // A card older than the cutoff whose unit Slack has nothing unread
         // for is backlog just the same, closed at its own newest.
-        for (node, cursor) in cards_before(
-            self.dashboard.open_thread_cards(),
-            &self.slack_thread_facts(cx),
-            host,
-            before,
-        ) {
+        let model = session.read(cx).model();
+        for (node, cursor) in cards_before(self.dashboard.open_thread_cards(), model, host, before)
+        {
             if !nodes.iter().any(|(known, _)| known == &node) {
                 nodes.push((node, cursor));
             }
@@ -1266,6 +1263,9 @@ impl Workspace {
     /// itself would be badging it, and the desk closes the ones it says
     /// nothing for. A mention read on the phone this morning has a reason
     /// of `None` and is not handed to anybody.
+    /// The Slack facts the desk is built from. The crate answers what it is
+    /// asking about and in what words; this is the map from its cards onto
+    /// the desk's own cells, and it decides nothing.
     pub(crate) fn slack_thread_facts(
         &self,
         cx: &gpui::App,
@@ -1275,26 +1275,20 @@ impl Workspace {
         };
         let now = chrono::Local::now();
         let session = session.read(cx);
-        let model = session.model();
-        model
-            .tracked()
+        let workspace = session.model().workspace();
+        session
+            .tracked_cards(now.timestamp_millis())
             .into_iter()
-            .filter_map(|unit| {
-                let card = model.card(&unit, now.timestamp_millis())?;
-                let facts = model.unit(&unit)?;
-                let reason = card.attention;
-                let raised_at = chrono::DateTime::from_timestamp_millis(facts.first_seen_ms)?
+            .filter_map(|card| {
+                let raised_at = chrono::DateTime::from_timestamp_millis(card.first_seen_ms)?
                     .with_timezone(&now.timezone())
                     .fixed_offset();
                 Some((
-                    store_unit(model.workspace(), &unit),
+                    store_unit(workspace, &card.unit),
                     SlackFacts {
-                        // Rendered here, every time the view is built, so a
-                        // name the roster only supplied after the message
-                        // landed shows as `@ada` rather than `<@U123>`.
-                        title: session.unit_summary(&unit),
+                        title: card.title,
                         conversation: card.conversation.clone(),
-                        reason,
+                        reason: card.attention,
                         raised_at,
                         wait_days: card.wait_days,
                         waiting_on: match card.waiting {
@@ -1310,21 +1304,23 @@ impl Workspace {
     }
 }
 
-/// Which open thread cards a cutoff closes: the ones whose newest message
-/// is older than it. A card the mirror has nothing to say about is left
-/// alone, and nothing newer than the cutoff is ever in here.
+/// Which open thread cards this host's cutoff closes. Whether the cutoff
+/// closes a unit at all is Slack's question and `Model::closed_by` answers
+/// it — a unit the mirror has nothing to say about is left alone; which
+/// cards belong to this host is the desk's, and that is all that is decided
+/// here.
 fn cards_before(
     cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
-    facts: &std::collections::HashMap<SlackUnit, SlackFacts>,
+    model: &Model,
     host: Option<rho_agents::HostId>,
     before: f64,
 ) -> Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> {
     cards
         .into_iter()
+        .filter(|(card, _)| Some(card.host) == host)
         .filter_map(|(card, thread)| {
-            let facts = facts.get(&thread)?;
-            (Some(card.host) == host && Ts(facts.latest.clone()).epoch_seconds() < before)
-                .then(|| (card.node_id, rho_desk::cells::SlackTs(facts.latest.clone())))
+            let closed = model.closed_by(&model_unit(&thread), before)?;
+            Some((card.node_id, rho_desk::cells::SlackTs(closed.0)))
         })
         .collect()
 }
@@ -1460,23 +1456,20 @@ mod tests {
         }
     }
 
-    fn facts(latest: &str) -> SlackFacts {
-        SlackFacts {
-            title: "any update?".to_owned(),
-            conversation: "#design".to_owned(),
-            raised_at: chrono::Local::now().fixed_offset(),
-            wait_days: 1.0,
-            waiting_on: None,
-            latest: latest.to_owned(),
-            newest_from_other: None,
-            reason: Some(rho_slack::model::Attention::FollowedThread),
-        }
-    }
-
     /// The cutoff is the whole of what the command touches: a card whose
     /// newest message is newer than it stays open, however old the card is.
+    /// Which units the cutoff reaches is now the crate's answer, so the
+    /// model is seeded with the messages rather than the map being written
+    /// out by hand.
     #[test]
     fn only_cards_older_than_the_cutoff_are_closed() {
+        let mut model = model();
+        model.set_followed(
+            ["100.0", "900.0"].map(|ts| (ChannelId("C1".into()), Ts(ts.to_owned()), None)),
+        );
+        for ts in ["100.0", "900.0"] {
+            model.note_message(&message(ts, Some(ts), "U1", "any update?"), 0);
+        }
         let host = rho_agents::HostId::default();
         let node = |counter: u8| rho_desk::cells::Id::Note(rho_desk::cells::Uuid([counter; 16]));
         let card = |node_id| crate::dashboard::DealCardId { host, node_id };
@@ -1485,15 +1478,9 @@ mod tests {
             (card(node(2)), thread_ref_of("900.0")),
             (card(node(3)), thread_ref_of("50.0")),
         ];
-        let facts = [
-            (thread_ref_of("100.0"), facts("100.0")),
-            (thread_ref_of("900.0"), facts("900.0")),
-        ]
-        .into_iter()
-        .collect();
 
         assert_eq!(
-            cards_before(cards, &facts, Some(host), 500.0),
+            cards_before(cards, &model, Some(host), 500.0),
             vec![(node(1), rho_desk::cells::SlackTs("100.0".to_owned()))],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );

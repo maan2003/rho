@@ -152,6 +152,11 @@ pub enum Change {
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnitCard {
     pub unit: Unit,
+    /// What the unit is about, in the words the mirror has now — a name the
+    /// roster only supplied after the message landed reads as `@ada` rather
+    /// than as `<@U123>`. Empty from [`Model::card`], which does not hold
+    /// the mirror; [`crate::session::Session::cards`] is where it is filled.
+    pub title: String,
     /// `#design` or `@ada`.
     pub conversation: String,
     /// Why this unit is asking now, or `None` when nothing is: a unit rho
@@ -161,6 +166,9 @@ pub struct UnitCard {
     pub attention: Option<Attention>,
     pub waiting: Waiting,
     pub wait_days: f64,
+    /// When rho first saw this unit, in milliseconds. What a card is raised
+    /// at, which is not the same as when its newest message landed.
+    pub first_seen_ms: i64,
     /// The newest message; a change here is what re-raises the card.
     pub newest: Ts,
     /// Where a dealt card lands the reader: the oldest message from someone
@@ -1907,13 +1915,24 @@ impl Model {
         let facts = self.units.get(unit)?;
         Some(UnitCard {
             unit: unit.clone(),
+            title: String::new(),
             conversation: self.label(&unit.channel),
             attention: self.attention(unit),
             waiting: facts.waiting(),
             wait_days: wait_days(facts, now_ms),
+            first_seen_ms: facts.first_seen_ms,
             newest: facts.newest.clone(),
             newest_from_other: facts.newest_from_other.clone(),
         })
+    }
+
+    /// Whether a `mark read before` cutoff closes this unit, and the
+    /// message it closes at: its newest message is older than the cutoff.
+    /// A unit the model has nothing to say about is not closed, which is
+    /// what keeps a cutoff from touching a card the mirror never saw.
+    pub fn closed_by(&self, unit: &Unit, before_epoch_seconds: f64) -> Option<Ts> {
+        let facts = self.units.get(unit)?;
+        (facts.newest.epoch_seconds() < before_epoch_seconds).then(|| facts.newest.clone())
     }
 
     /// Whether Slack itself would be badging this unit right now, and what
@@ -2067,6 +2086,51 @@ mod tests {
             .into_iter()
             .filter(|card| card.waiting == Waiting::OnYou)
             .collect()
+    }
+
+    /// The cutoff rule, which used to live in the GUI beside the desk's
+    /// card ids: whether a `mark read before` reaches a unit is a question
+    /// about the unit's newest message, so the crate answers it.
+    #[test]
+    fn a_cutoff_closes_what_is_older_than_it_and_nothing_it_has_never_seen() {
+        let mut model = model();
+        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"), 0);
+        model.note_message(&message("C1", "900.0", "U1", "<@ME> again"), 0);
+        let channel = Unit::conversation(&ChannelId("C1".into()));
+        let never_seen = Unit::conversation(&ChannelId("C9".into()));
+        assert_eq!(
+            model.closed_by(&channel, 1_000.0),
+            Some(Ts("900.0".into())),
+            "a unit older than the cutoff is closed at its own newest message"
+        );
+        assert_eq!(
+            model.closed_by(&channel, 500.0),
+            None,
+            "and one whose newest message is newer than the cutoff stays open"
+        );
+        assert_eq!(
+            model.closed_by(&never_seen, 1_000.0),
+            None,
+            "a unit the model has nothing to say about is left alone"
+        );
+    }
+
+    /// What the host needs to draw a card and what the model can say without
+    /// the mirror: everything but the title, which needs the words the
+    /// mirror holds and is filled by the session.
+    #[test]
+    fn a_card_carries_when_it_was_first_seen_and_leaves_the_title_to_the_session() {
+        let mut model = model();
+        model.note_message(&message("C1", "100.0", "U1", "hey <@ME>"), 7 * DAY);
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+        let card = model.card(&unit, 7 * DAY).expect("a mention is a card");
+        assert_eq!(card.first_seen_ms, 7 * DAY, "raised when it was first seen");
+        assert_eq!(card.conversation, "#design");
+        assert_eq!(card.attention, Some(Attention::Mentioned));
+        assert!(
+            card.title.is_empty(),
+            "the model does not hold the mirror, so it does not invent the words"
+        );
     }
 
     #[test]

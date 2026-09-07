@@ -20,7 +20,7 @@ use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
 use crate::mirror::{Mirror, Scope};
-use crate::model::{Change, ConversationRow, Model, Unit};
+use crate::model::{Change, ConversationRow, Model, Unit, UnitCard};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
 use crate::types::{ChannelId, Message, Reaction, ThreadKey, Ts, UserId};
 
@@ -1001,6 +1001,29 @@ impl Session {
     /// rather than kept from when the message landed. A name the roster
     /// only supplied on the second connection is why: a summary frozen at
     /// ingest says `<@U123>` on every cold start, and this says `@ada`.
+    /// Every unit rho is tracking, as a card, in the words the mirror has
+    /// now. This is the crate's answer to "what do you know about the units
+    /// you track"; the host maps it onto whatever a card is on its own desk
+    /// and decides nothing about it here.
+    ///
+    /// The superset of [`Model::cards`], which is the units currently
+    /// asking and is what a dealer wants. A unit whose messages have all
+    /// been read is still here, with `attention: None`: it is not a card,
+    /// but Find reaches it and a card already on the desk needs its facts to
+    /// say it has gone quiet. The cost is one pass over the units, never
+    /// over the messages — the facts are already the answer.
+    pub fn tracked_cards(&self, now_ms: i64) -> Vec<UnitCard> {
+        self.model
+            .tracked()
+            .into_iter()
+            .filter_map(|unit| {
+                let mut card = self.model.card(&unit, now_ms)?;
+                card.title = self.unit_summary(&unit);
+                Some(card)
+            })
+            .collect()
+    }
+
     pub fn unit_summary(&self, unit: &Unit) -> String {
         match self.mirror.as_deref() {
             Some(mirror) => unit_summary(&self.model, mirror, unit),
@@ -2411,7 +2434,11 @@ fn oldest_from_other_after(
         .or_else(|| model.unit(unit).map(|facts| facts.newest.clone()))
 }
 
-fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
+/// The words a unit is known by: the first line of its newest message, as
+/// the mirror holds it now. Public because it is what a card's title is,
+/// and a host measuring what a desk rebuild costs has to be able to reach
+/// the half of it that reads the mirror.
+pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
     let scope = unit_scope(model, unit);
     let message = model
         .unit(unit)

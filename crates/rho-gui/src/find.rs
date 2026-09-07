@@ -685,10 +685,12 @@ mod tests {
                 key.clone(),
                 UnitCard {
                     unit: Unit::thread(&key.channel, &key.thread_ts),
+                    title: "release date".to_owned(),
                     conversation: "#design".to_owned(),
                     attention: None,
                     waiting: Waiting::OnYou,
                     wait_days: 0.0,
+                    first_seen_ms: 0,
                     newest: Ts::from("140.000000"),
                     newest_from_other: None,
                 },
