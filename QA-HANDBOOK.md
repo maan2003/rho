@@ -29,9 +29,12 @@ agents drove the same desk twice in one evening, seconds apart in both
 directions, so the refusal is not politeness — an overlapped run's numbers are
 noise and neither party can tell from the screenshots.
 
-Driving the GUI, with the rig's own runtime dir:
+Driving the GUI, with the rig's own runtime dir — or, better in a script,
+with `--state-dir`, which names the session's directory outright and needs no
+environment at all:
 
 ```sh
+rho wayland --session desk --state-dir /home/maan2003/src/rho-rigs/desk/run/rho-wayland key "space"
 export XDG_RUNTIME_DIR=/home/maan2003/src/rho-rigs/desk/run   # where the session lives
 rho wayland --session desk key "ctrl+shift+p"                 # a chord
 rho wayland --session desk input down:shift wait:400 up:shift # a held shift
@@ -476,6 +479,21 @@ it: since `wrap_map_rewrap` exists, a resize's cost has its own line and its
 own row count instead of hiding under a neighbour. So when a stage's p99 is
 large and its rows are zero or implausible, do not report the stage — find
 what ran inside it and give that its own stage first, then measure.
+
+*A run that wrote a profile is not a run that did the thing.* The driver
+finds the session under the rig's own runtime dir, so `rho wayland` from a
+normal shell with neither `--state-dir` nor `XDG_RUNTIME_DIR` set finds no
+session and the keystrokes go nowhere — and the run still comes up, still
+profiles, still prints a session line that reads like a good result. Desk
+session 64 is the worked case (eng-b8os, the rewrap cut): 312 frames, draw p99
+2.4 ms, and no drive behind any of it. What gave it away was the row count,
+not the stage name: 2114 rows touched across a whole run whose point was a
+262,000-row transcript being composed. A run that did the thing has a row
+count you could have predicted before it started, so predict it, and read it
+first. Two habits from the same afternoon: drive with `--state-dir` rather
+than an exported environment a subshell may not carry, and `trap` the `rig
+down`, because session 64's `set -e` left the rig up and the next two runs
+refused as already held.
 
 *What fails it.*
 
