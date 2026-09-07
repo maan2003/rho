@@ -762,6 +762,10 @@ impl InlayMap {
                 self.concealments
                     .sync_from(rebuild_start, &self.snapshot.buffer);
                 let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                let rebuild_start = concealments
+                    .iter()
+                    .find(|range| range.start < rebuild_start && rebuild_start < range.end)
+                    .map_or(rebuild_start, |range| range.start);
                 let prefix_end = transforms.summary().input.len;
                 push_isomorphic(
                     &mut transforms,
@@ -816,7 +820,11 @@ impl InlayMap {
             self.snapshot.check_invariants();
             profile.walked_items(walked_items);
             inlay_edits.sort_unstable_by_key(|edit| (edit.old.start, edit.old.end));
-            (self.snapshot.clone(), Patch::new(inlay_edits).into_inner())
+            let mut patch = Patch::default();
+            for edit in inlay_edits {
+                patch.push_maybe_empty(edit);
+            }
+            (self.snapshot.clone(), patch.into_inner())
         };
 
         if profile.is_enabled() {
@@ -990,16 +998,14 @@ impl InlayMap {
             .collect();
         let buffer_snapshot = snapshot.buffer.clone();
         let (snapshot, _) = self.sync(buffer_snapshot, buffer_edits);
-        let edits = Patch::new(
-            affected_offsets
-                .into_iter()
-                .map(|offset| Edit {
-                    old: old_snapshot.output_span_for_buffer_offset(offset),
-                    new: snapshot.output_span_for_buffer_offset(offset),
-                })
-                .collect(),
-        )
-        .into_inner();
+        let mut edits = Patch::default();
+        for offset in affected_offsets {
+            edits.push_maybe_empty(Edit {
+                old: old_snapshot.output_span_for_buffer_offset(offset),
+                new: snapshot.output_span_for_buffer_offset(offset),
+            });
+        }
+        let edits = edits.into_inner();
         (snapshot, edits)
     }
 
@@ -1840,7 +1846,7 @@ fn append_transforms_from(
         .filter(|inlay| inlay.position.is_valid(buffer))
         .map(|inlay| (inlay.position.to_offset(buffer), inlay))
         .collect::<Vec<_>>();
-    let first_concealment_ix = concealments.partition_point(|range| range.start < start);
+    let first_concealment_ix = concealments.partition_point(|range| range.end <= start);
     let candidate_concealments = &concealments[first_concealment_ix..];
     let mut inlay_ix = 0;
     let mut source_offset = start;
@@ -1859,12 +1865,13 @@ fn append_transforms_from(
             inlay_ix += 1;
         }
 
+        let concealed_start = concealed.start.max(source_offset);
         push_isomorphic(
             transforms,
-            buffer.text_summary_for_range(source_offset..concealed.start),
+            buffer.text_summary_for_range(source_offset..concealed_start),
         );
         transforms.push(
-            Transform::Concealed(buffer.text_summary_for_range(concealed.clone())),
+            Transform::Concealed(buffer.text_summary_for_range(concealed_start..concealed.end)),
             (),
         );
         source_offset = concealed.end;
