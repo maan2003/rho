@@ -876,8 +876,8 @@ wrong at the design, not at the polish.
   `transient`, `workspace` and `workspace_phone`).* `new`, `input`,
   `status`, `agent`, `snooze`, `phone_root_menu` and the phone's snooze
   sheet: twelve of the seventeen have moved, and the five that have not are
-  the usage charts, which carry their series and want
-  `rho-visualizations` rather than a mechanical move.
+  the usage charts, which carry their series and want a screen of their own
+  rather than a mechanical move.
   The part worth reading is the phone. The primitive's fifth complaint
   about the old transient was that the phone had a second way in —
   `phone_rows` and `action_at`, by index into a private `Vec`. The sheet
@@ -996,6 +996,93 @@ wrong at the design, not at the polish.
   resizes and a card pull, and a resize is the whole-buffer rewrap on the
   owed list. The menu's own cost is session 41's, ten round trips and
   nothing else, none over 8 ms.
+
+- **Landed, the usage charts are a screen** (`rho-agents` module added:
+  `usage`; `rho-gui` modules touched: `usage` (new), `transient`,
+  `workspace`, `workspace_phone`, `pane`, `telemetry`, `journal`). The five
+  chart items under `space s u` were the last thing the bottom strip was
+  for, so they became plain `MenuAction`s that open a screen and the strip's
+  element tree went with them: `Transient`, `TransientRun`, `TransientItem`,
+  `quota_usage`, `active_auth_namespaces`, `global_usage`,
+  `agent_cost_usage`, `usage_days`, the workspace's `transient` and
+  `transient_stack`, and the phone's `phone_transient_action`. `transient.rs`
+  is 2115 lines down to 601 and holds menus, which are values and nothing
+  else.
+  The summary lives in `rho-agents`' `usage` and the painting in `rho-gui`'s.
+  The line between them is that the reduction takes a *count* of columns, not
+  a pixel: nothing in it is about gpui, so it sits with the rest of what the
+  client knows about agents and is unit-tested without a window. `usage.rs`
+  in the GUI only paints. The screen is a buffer — the title and the totals
+  are its text and the chart is a block below them, the way a menu is a block
+  below its row — so `:buffer`, `escape`, history and search work because
+  there is nothing new for them to work on. `SurfaceKey::Usage` is one
+  screen: `c` after `r` redraws it rather than opening a second place to be,
+  which is what the new test asserts.
+  The cost rule is met by where the arithmetic happens, not by how fast it
+  is. A summary is built when a series arrives, once per arrival, and reduced
+  there to the chart's width, so a frame walks at most one point per column
+  per line and the percentile buckets are already bucketed. `render()`
+  computes nothing over samples. A window that gets wider than the summary
+  was reduced to rebuilds it — that is a resize, not a frame, and the same
+  goes for a window that gets taller, since the chart's height follows the
+  viewport now.
+  **The before, on the desk snapshot's own rows.** The two defects were that
+  the strip recomputed its summary inside `render` from every sample it held,
+  and that the transient carried the series to do it with. What that walked
+  here, counted against `/home/maan2003/src/rho-rigs/desk/state/rho/rho.redb`
+  with the daemon down: 279 Claude quota samples over seven days (124 opus,
+  155 fable) and 807 over thirty, and 23041 gpt samples in
+  `chatgpt_quota_observations`, which keeps thirty days and nothing older.
+  So a frame of the thirty-day rate limit chart on main recomputed over
+  roughly twenty-four thousand samples, and the seven-day one over some
+  thousands of them; after the change a frame walks at most the chart's
+  width per line, which the unit test pins at 833 points for a week of
+  minute-by-minute polls on an 832-column chart.
+  **The after, and it is not a win per frame.** Both runs are the first open
+  of a fresh session on the same desk snapshot at 2560x1664 scale 2, driven
+  by the same twenty opens of the rate limit chart (`escape`, `space`, `s`,
+  `u`, `r`). Session 58 on main 98ca1835: 206 frames, draw p50 1.93, p95
+  3.65, p99 4.27 ms, prepaint p99 2.77, paint p99 1.68, 0 frames over 8 ms.
+  Session 62 on this change: 296 frames, draw p50 3.08, p95 5.92, p99 6.14
+  ms, prepaint p99 4.02, paint p99 2.39, 0 over 8 ms. The change costs about
+  1.8 ms of p99 draw and it stays inside the budget.
+  The obvious suspect was the picture's size — the strip drew 1280x240 and
+  the screen draws 1280x682 — and it is not the cause. Session 63 is the
+  control for it: the same binaries with the chart pinned to the strip's 240
+  px and the identical drive script, 263 frames, draw p99 6.07 ms, prepaint
+  p99 4.03. Holding the picture's height changes nothing, so what is left is
+  that a screen redraws the viewport where a strip redrew a strip. That is
+  the cost the change takes on, in exchange for the bound above and for the
+  charts being a place you can go rather than a strip that appears. Sessions
+  62 and 63 ran the identical script; session 58's pauses I cannot swear were
+  the same to the millisecond, so the frame *counts* between main and the
+  change are not like for like and the per-frame percentiles are what the
+  comparison rests on.
+  Two things the screenshots caught that no assertion here would have. The
+  block went in as `BlockStyle::Fixed`, which the editor measures at
+  min-content: the chart drew across 60% of the screen with the rest blank,
+  and the test asserting the block exists passed the whole time. It is `Flex`
+  now. And a chart sized for a strip on a screen of its own is a quarter of
+  the glass in use, so the height is the viewport's less the header, floored
+  at the strip's 220. Inserted, drawn, and drawn at the right size are three
+  different claims.
+  The docs that named the wrong crate are fixed in the same commit:
+  RHO-WINDOW-DESIGN.md lines 83 and 143 and this file above said the charts
+  were "drawn by `rho-visualizations`". They are not and were never going to
+  be — that crate is the daemon-side store of immutable SVG blobs an agent
+  recorded, and a live quota chart through it would be O(events) per refresh
+  plus a store round trip for a series the GUI already holds.
+  Gate green: rho-gui 258 passed and 3 ignored (main's 263 less the eight
+  tests that moved to `rho-agents`, plus two pchip tests in the GUI's
+  `usage` and one new test for the screen), rho-agents 68 passed (eight
+  moved and two added for the reduction), rho-window 11 passed, clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+  One housekeeping line, since the restart truncated three of these files to
+  zero bytes mid-change: `workspace.rs`, `usage.rs` and `tests.rs` were
+  restored by reading operation `52a22986d0df`'s working-copy snapshot with
+  `jj --at-op … file show`, nothing was written to the store, and after the
+  gate passed they were re-read against that operation. They differ from it
+  by exactly the six edits deliberately re-applied on top and nothing else.
 
 - **Landed, the refusal block is measured too** (`rho-window` module touched:
   `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was

@@ -277,6 +277,7 @@ pub enum SurfaceIdentity {
         title: String,
     },
     Dashboard,
+    Usage,
 }
 
 /// Who ignored the thread: this rho, or Slack telling rho that another

@@ -139,6 +139,7 @@ pub(crate) enum SurfaceView {
     },
     Home(Entity<crate::home::HomeView>),
     Messages(Entity<editor::Editor>),
+    Usage(Entity<crate::usage::UsageView>),
     DeskNode(Entity<editor::Editor>),
     Transcript {
         model: Entity<AgentModel>,
@@ -169,6 +170,7 @@ impl SurfaceView {
             // way, so it counts as the same kind of screen.
             Self::Home(_) => SurfaceKind::Dashboard,
             Self::Messages(_) => SurfaceKind::Messages,
+            Self::Usage(_) => SurfaceKind::Usage,
             Self::DeskNode(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
@@ -581,16 +583,17 @@ pub struct Workspace {
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     pub(crate) minibuffer: Option<Minibuffer>,
-    /// An open transient menu in the bottom strip; captures the keyboard
-    /// via `transient_focus` while shown.
-    transient: Option<crate::transient::Transient>,
-    /// Parent menus beneath the open one; escape pops one level (magit's
-    /// quit-one) before a final escape closes the strip.
-    transient_stack: Vec<crate::transient::Transient>,
+
+    /// The keyboard while a menu is open, on the desk as a block and on the
+    /// phone as a sheet.
     transient_focus: gpui::FocusHandle,
+    /// The usage screen, once something has asked for it. Held here rather
+    /// than looked up through the surface because a series arriving has to
+    /// reach it whether or not it is the screen in view.
+    usage_view: Option<Entity<crate::usage::UsageView>>,
     /// The menu under the point, when one is open: a transient buffer
-    /// under the point (`rho_window::transient`). The strip menus above it
-    /// have not moved yet.
+    /// under the point (`rho_window::transient`). Every menu is one of
+    /// these now.
     menu_buffer: Option<MenuBuffer>,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
@@ -1143,9 +1146,8 @@ impl Workspace {
             pending_find_target: None,
             scroll_journal_task: None,
             minibuffer: None,
-            transient: None,
-            transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            usage_view: None,
             menu_buffer: None,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
@@ -2070,16 +2072,10 @@ impl Workspace {
                 if let Some(entry) = self.hosts.get_mut(host) {
                     entry.auth = Some(auth);
                 }
-                if self
-                    .transient
-                    .as_ref()
-                    .is_some_and(|transient| transient.title() == "rate limit")
-                {
-                    self.transient = Some(crate::transient::usage_menu(
-                        self.hosts.merged_quota_history(),
-                        self.hosts.active_quota_namespaces(),
-                        self.quota_history_days,
-                    ));
+                if let Some(view) = self.usage_view.clone() {
+                    let history = self.hosts.merged_quota_history();
+                    let active = self.hosts.active_quota_namespaces();
+                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
                 }
                 cx.notify();
             }
@@ -2153,53 +2149,26 @@ impl Workspace {
             }
             ConnEvent::QuotaHistory(series) => {
                 self.hosts.set_quota_history(host, series);
-                if self
-                    .transient
-                    .as_ref()
-                    .is_some_and(|transient| transient.title() == "rate limit")
-                {
-                    self.transient = Some(crate::transient::usage_menu(
-                        self.hosts.merged_quota_history(),
-                        self.hosts.active_quota_namespaces(),
-                        self.quota_history_days,
-                    ));
+                if let Some(view) = self.usage_view.clone() {
+                    let history = self.hosts.merged_quota_history();
+                    let active = self.hosts.active_quota_namespaces();
+                    view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
                 }
                 cx.notify();
             }
             ConnEvent::GlobalUsage(series) => {
                 self.global_usage.insert(host, series);
-                if self
-                    .transient
-                    .as_ref()
-                    .is_some_and(|transient| transient.title() == "model cost")
-                {
-                    self.transient = Some(crate::transient::global_usage_menu(
-                        self.merged_global_usage(),
-                        self.global_usage_days,
-                    ));
-                } else if self
-                    .transient
-                    .as_ref()
-                    .is_some_and(|transient| transient.title() == "model usage share")
-                {
-                    self.transient = Some(crate::transient::usage_share_menu(
-                        self.merged_global_usage(),
-                        self.global_usage_days,
-                    ));
+                if let Some(view) = self.usage_view.clone() {
+                    let usage = self.merged_global_usage();
+                    view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
                 }
                 cx.notify();
             }
             ConnEvent::AgentCostDistribution(series) => {
                 self.agent_cost_usage.insert(host, series);
-                if self
-                    .transient
-                    .as_ref()
-                    .is_some_and(|transient| transient.title() == "agent cost")
-                {
-                    self.transient = Some(crate::transient::agent_cost_menu(
-                        self.merged_agent_cost_usage(),
-                        self.agent_cost_days,
-                    ));
+                if let Some(view) = self.usage_view.clone() {
+                    let usage = self.merged_agent_cost_usage();
+                    view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
                 }
                 cx.notify();
             }
@@ -2297,10 +2266,7 @@ impl Workspace {
                 prompt,
                 response,
             } => {
-                if self.minibuffer.is_some()
-                    || self.transient.is_some()
-                    || self.pending_git_approval.is_some()
-                {
+                if self.minibuffer.is_some() || self.pending_git_approval.is_some() {
                     let _ = response.send(GitApprovalDecision::Deny);
                     let source = self.error_source(host);
                     self.notice_on(
@@ -4711,6 +4677,7 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Home => "home".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
+            SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::DeskNode { .. } => "note".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
@@ -4745,6 +4712,7 @@ impl Workspace {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Home => "home",
             SurfaceKey::Messages => "messages",
+            SurfaceKey::Usage => "usage",
             SurfaceKey::DeskNode { .. } => "note",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
@@ -4820,6 +4788,7 @@ impl Workspace {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
             SurfaceKey::Home => SurfaceIdentity::Home,
             SurfaceKey::Messages => SurfaceIdentity::Messages,
+            SurfaceKey::Usage => SurfaceIdentity::Usage,
             SurfaceKey::DeskNode { host, node_id } => SurfaceIdentity::DeskNode {
                 host: host.0,
                 node_id: node_id.clone().into(),
@@ -4902,6 +4871,10 @@ impl Workspace {
             let pane = self.active_pane();
             let position = match &pane.surface.view {
                 SurfaceView::Home(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                SurfaceView::Usage(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
@@ -5512,11 +5485,6 @@ impl Workspace {
         self.draft_area.clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_transient_for_test(&self) -> bool {
-        self.transient.is_some()
-    }
-
     /// The title of the menu under the point, which is how a test says
     /// which menu came back when escape retraced a step.
     #[cfg(test)]
@@ -5613,6 +5581,24 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn current_surface_name_for_test(&self) -> String {
         self.surface_name(&self.active_pane().surface.key)
+    }
+
+    /// Which chart the usage screen is showing, and how many usage surfaces
+    /// exist: picking a second chart must redraw the one screen rather than
+    /// open another.
+    #[cfg(test)]
+    pub(crate) fn usage_chart_for_test(
+        &self,
+        cx: &App,
+    ) -> Option<(crate::usage::Chart, usize, bool)> {
+        let view = self.usage_view.as_ref()?.read(cx);
+        let screens = self
+            .surfaces
+            .values()
+            .flatten()
+            .filter(|surface| surface.key == SurfaceKey::Usage)
+            .count();
+        Some((view.chart(), screens, view.has_block()))
     }
 
     #[cfg(test)]
@@ -6489,6 +6475,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Home(view) => view.read(cx).editor().clone(),
             SurfaceView::Messages(editor) => editor.clone(),
+            SurfaceView::Usage(view) => view.read(cx).editor().clone(),
             SurfaceView::DeskNode(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
@@ -6545,6 +6532,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Home(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
+            SurfaceView::Usage(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
@@ -6573,6 +6561,7 @@ impl Workspace {
             SurfaceKey::Draft
             | SurfaceKey::Home
             | SurfaceKey::Messages
+            | SurfaceKey::Usage
             | SurfaceKey::DeskNode { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
@@ -6616,6 +6605,7 @@ impl Workspace {
                 SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
+            SurfaceKey::Usage => SurfaceView::Usage(self.usage_view(window, cx)),
             SurfaceKey::DeskNode { host, node_id } => {
                 let (host, node_id) = (*host, node_id.clone());
                 match self.note_view_for(host, node_id, window, cx) {
@@ -6715,6 +6705,7 @@ impl Workspace {
             SurfaceKey::Home
             | SurfaceKey::DeskNode { .. }
             | SurfaceKey::Messages
+            | SurfaceKey::Usage
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
@@ -6809,7 +6800,7 @@ impl Workspace {
     }
 
     /// Opens a completing-read prompt in the bottom strip: the primitive
-    /// transient items drop into for values.
+    /// menu items drop into for values.
     pub(crate) fn open_prompt(
         &mut self,
         prompt: impl Into<gpui::SharedString>,
@@ -6830,27 +6821,9 @@ impl Workspace {
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         self.remove_menu_block(cx);
-        self.drop_transient();
         // The strip is single-occupancy; a stale message reappearing after
         // the prompt closes would be confusing.
         self.echo = None;
-        cx.notify();
-    }
-
-    pub(crate) fn open_transient(
-        &mut self,
-        transient: crate::transient::Transient,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // The strip is single-occupancy and so is the keyboard: a menu in
-        // the strip takes it from the menu under the point.
-        self.remove_menu_block(cx);
-        self.capture_overlay_focus(window, cx);
-        self.transient = Some(transient);
-        self.minibuffer = None;
-        self.echo = None;
-        window.focus(&self.transient_focus, cx);
         cx.notify();
     }
 
@@ -6958,9 +6931,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // One menu and one keyboard: a menu under the point takes it from
-        // whatever the bottom strip was showing.
-        self.drop_transient();
         self.capture_overlay_focus(window, cx);
         if !self.show_menu(menu, None, Back::Out, false, cx) {
             return;
@@ -7221,15 +7191,14 @@ impl Workspace {
         }
     }
 
-    /// A menu named by an item of another menu. The ones that have moved to
-    /// the transient buffer replace the menu over the same row; the ones
-    /// still on the bottom strip open there, which is what makes the move a
-    /// batch at a time rather than one landing.
+    /// A menu named by an item of another menu: it replaces the menu on
+    /// screen over the same row, so a submenu is a step rather than a new
+    /// place, and escape comes back to what named it.
     fn open_menu_by_id(
         &mut self,
         id: crate::transient::MenuId,
         count: Option<u32>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::transient::MenuId;
@@ -7243,12 +7212,7 @@ impl Workspace {
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
             MenuId::Snooze => crate::transient::snooze_menu(),
-            // Still the bottom strip: the charts carry their series, and
-            // they leave with them.
-            MenuId::UsageRoot => {
-                self.open_transient(crate::transient::usage_root_menu(), window, cx);
-                return;
-            }
+            MenuId::UsageRoot => crate::transient::usage_root_menu(),
         };
         self.show_menu(menu, count, Back::Over, false, cx);
         cx.notify();
@@ -7323,6 +7287,7 @@ impl Workspace {
             Command::NewAgent => self.begin_new(crate::create::NewKind::Agent, window, cx),
             Command::NewPage => self.begin_new(crate::create::NewKind::Page, window, cx),
             Command::NewNote => self.begin_new(crate::create::NewKind::Note, window, cx),
+            Command::Usage(chart, days) => self.open_usage_chart(chart, days, window, cx),
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
             Command::Version => self.cmd_version(cx),
             Command::AgentDone => self.cmd_agent_done(false, window, cx),
@@ -7378,7 +7343,6 @@ impl Workspace {
 
     fn has_modal_overlay(&self) -> bool {
         self.minibuffer.is_some()
-            || self.transient.is_some()
             || self.menu_buffer.is_some()
             || self.pending_git_approval.is_some()
     }
@@ -7404,81 +7368,6 @@ impl Workspace {
     fn finish_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.restore_overlay_focus(window, cx);
         self.overlay_return_focus = None;
-    }
-
-    /// Clears the menu without touching focus.
-    fn drop_transient(&mut self) {
-        self.transient = None;
-        self.transient_stack.clear();
-    }
-
-    fn close_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transient.is_some() {
-            self.drop_transient();
-            self.finish_overlay_focus(window, cx);
-            cx.notify();
-        }
-    }
-
-    /// Keyboard dispatch while a transient is open: a bound key runs its
-    /// action (toggles keep the menu up, submenus stack their parent),
-    /// escape pops one level; unbound keys leave the menu open.
-    fn transient_key(
-        &mut self,
-        event: &gpui::KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let keystroke = &event.keystroke;
-        // Bare modifiers arrive as key events too; holding shift for an
-        // uppercase key must not dismiss the menu.
-        if matches!(
-            keystroke.key.as_str(),
-            "shift" | "control" | "alt" | "platform" | "function"
-        ) {
-            return;
-        }
-        let Some(transient) = &self.transient else {
-            return;
-        };
-        if keystroke.key == "escape" {
-            match self.transient_stack.pop() {
-                Some(parent) => {
-                    self.transient = Some(parent);
-                    cx.notify();
-                }
-                None => self.close_transient(window, cx),
-            }
-            cx.stop_propagation();
-            return;
-        }
-        match transient.action_for(keystroke) {
-            Some((run, stay)) if stay => {
-                run(self, window, cx);
-                cx.notify();
-            }
-            Some((run, _)) => {
-                let parent = self.transient.take();
-                // Restore focus to the chord's origin first so the action
-                // sees normal focus (and a dashboard chord stays home);
-                // submenus and prompts re-take the strip themselves.
-                self.restore_overlay_focus(window, cx);
-                run(self, window, cx);
-                if self.transient.is_some() {
-                    // The action opened a submenu: its parent waits under
-                    // it for escape.
-                    self.transient_stack.extend(parent);
-                } else {
-                    self.transient_stack.clear();
-                    if !self.has_modal_overlay() {
-                        self.overlay_return_focus = None;
-                    }
-                }
-                cx.notify();
-            }
-            None => {}
-        }
-        cx.stop_propagation();
     }
 
     /// Prompt for a path to open from the current agent's workspace.
@@ -8390,77 +8279,77 @@ impl Workspace {
         self.agent_workdir(agent_id)
     }
 
-    pub(crate) fn open_usage_transient(
+    /// The usage screen, built once and kept. A series that arrives while
+    /// another screen is in view still lands in it.
+    fn usage_view(
         &mut self,
-        days: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.quota_history_days = days;
-        self.hosts.broadcast(|| ClientMessage::QuotaHistory);
-        let history = self.hosts.merged_quota_history();
-        self.open_transient(
-            crate::transient::usage_menu(history, self.hosts.active_quota_namespaces(), days),
-            window,
-            cx,
-        );
+    ) -> Entity<crate::usage::UsageView> {
+        self.usage_view
+            .get_or_insert_with(|| cx.new(|cx| crate::usage::UsageView::new(window, cx)))
+            .clone()
     }
 
-    pub(crate) fn open_global_usage_transient(
+    /// Show `chart` over `days`: ask the daemon for the range it needs, hand
+    /// the screen what this client already holds so it draws at once, and
+    /// display it. Picking another chart from the menu comes back through
+    /// here and redraws the same surface.
+    pub(crate) fn open_usage_chart(
         &mut self,
-        days: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.global_usage_days = days;
-        self.hosts.broadcast(|| ClientMessage::GlobalUsage {
-            since_ms: now_ms().saturating_sub(days * 24 * 60 * 60 * 1_000),
-        });
-        self.open_transient(
-            crate::transient::global_usage_menu(self.merged_global_usage(), days),
-            window,
-            cx,
-        );
-    }
-
-    pub(crate) fn open_usage_share_transient(
-        &mut self,
-        days: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.global_usage_days = days;
-        let ema_warmup_days = if days <= 7 { 4 } else { 14 };
-        self.hosts.broadcast(|| ClientMessage::GlobalUsage {
-            // Seed the EMA with seven half-lives before the visible range so
-            // its left edge represents actual prior usage rather than a reset.
-            since_ms: now_ms().saturating_sub((days + ema_warmup_days) * 24 * 60 * 60 * 1_000),
-        });
-        self.open_transient(
-            crate::transient::usage_share_menu(self.merged_global_usage(), days),
-            window,
-            cx,
-        );
-    }
-
-    pub(crate) fn open_agent_cost_transient(
-        &mut self,
+        chart: crate::usage::Chart,
         days: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
-        self.agent_cost_days = days;
-        let ema_warmup_days = if days <= 7 { 4 } else { 14 };
-        self.hosts
-            .broadcast(|| ClientMessage::AgentCostDistribution {
-                since_ms: now_ms().saturating_sub((days + ema_warmup_days) * DAY_MS),
-            });
-        self.open_transient(
-            crate::transient::agent_cost_menu(self.merged_agent_cost_usage(), days),
-            window,
-            cx,
-        );
+        use crate::usage::Chart;
+        let view = self.usage_view(window, cx);
+        view.update(cx, |view, cx| view.show(chart, days, cx));
+        match chart {
+            Chart::RateLimit => {
+                self.quota_history_days = days;
+                self.hosts.broadcast(|| ClientMessage::QuotaHistory);
+                let history = self.hosts.merged_quota_history();
+                let active = self.hosts.active_quota_namespaces();
+                view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
+            }
+            Chart::ModelCost => {
+                self.global_usage_days = days;
+                self.hosts.broadcast(|| ClientMessage::GlobalUsage {
+                    since_ms: now_ms().saturating_sub(days * DAY_MS),
+                });
+                let usage = self.merged_global_usage();
+                view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
+            }
+            Chart::UsageShare => {
+                self.global_usage_days = days;
+                // Seed the EMA with seven half-lives before the visible range
+                // so its left edge represents actual prior usage rather than
+                // a reset.
+                let warmup = if days <= 7 { 4 } else { 14 };
+                self.hosts.broadcast(|| ClientMessage::GlobalUsage {
+                    since_ms: now_ms().saturating_sub((days + warmup) * DAY_MS),
+                });
+                let usage = self.merged_global_usage();
+                view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
+            }
+            Chart::AgentCost => {
+                self.agent_cost_days = days;
+                let warmup = if days <= 7 { 4 } else { 14 };
+                self.hosts
+                    .broadcast(|| ClientMessage::AgentCostDistribution {
+                        since_ms: now_ms().saturating_sub((days + warmup) * DAY_MS),
+                    });
+                let usage = self.merged_agent_cost_usage();
+                view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
+            }
+        }
+        let surface = self.make_surface(SurfaceKey::Usage, window, cx);
+        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Command, cx);
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
     }
 
     /// What a new agent under an area starts as: the area's inherited
@@ -9883,6 +9772,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
+            SurfaceView::Usage(view) => div()
+                .id("rho-surface-usage")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::DeskNode(editor) => div()
                 .id("rho-surface-note")
                 .key_context("RhoNote")
@@ -10666,92 +10561,70 @@ impl Render for Workspace {
                     .track_focus(&self.transient_focus)
                     .on_key_down(cx.listener(Self::menu_key))
             }))
-            .children(
-                match (
-                    &self.pending_git_approval,
-                    &self.minibuffer,
-                    &self.transient,
-                    &self.echo,
-                ) {
-                    (Some(pending), _, _, _) => {
-                        let colors = cx.theme().colors();
-                        let focused = self.git_approval_focus.is_focused(window);
-                        let mut deny = div().flex().flex_row().px_1().child("n deny");
-                        if focused {
-                            deny = deny.bg(colors.element_selected);
-                        } else {
-                            deny = deny.text_color(colors.text_muted);
-                        }
-                        Some(
-                            div()
-                                .key_context("RhoGitApproval")
-                                .track_focus(&self.git_approval_focus)
-                                .child(
-                                    bottom_strip(&text_style, cx)
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .gap_1()
-                                                .px_2()
-                                                .child(
-                                                    div()
-                                                        .font_weight(gpui::FontWeight::BOLD)
-                                                        .text_color(colors.text_accent)
-                                                        .child("Git approval"),
-                                                )
-                                                .child("·")
-                                                .child(pending.prompt.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_4()
-                                                .px_2()
-                                                .child(
-                                                    div()
-                                                        .text_color(colors.text_muted)
-                                                        .child("Y allow"),
-                                                )
-                                                .child(deny),
-                                        ),
-                                )
-                                .into_any_element(),
-                        )
-                    }
-                    (None, Some(minibuffer), _, _) => Some(if phone {
-                        minibuffer.render_phone(&text_style, cx)
+            .children(match (&self.pending_git_approval, &self.minibuffer) {
+                (Some(pending), _) => {
+                    let colors = cx.theme().colors();
+                    let focused = self.git_approval_focus.is_focused(window);
+                    let mut deny = div().flex().flex_row().px_1().child("n deny");
+                    if focused {
+                        deny = deny.bg(colors.element_selected);
                     } else {
-                        minibuffer.render(&text_style, cx)
-                    }),
-                    // A menu is drawn as a block in the buffer on the desk and
-                    // as a sheet on the phone, and the sheet is drawn from
-                    // here: nothing else in this method knows the phone has an
-                    // overlay to draw. Without this arm the phone opens a menu
-                    // nobody can see — the buffer has no block on purpose, and
-                    // the strip it used to be is gone.
-                    (None, None, None, _) if phone && self.menu_buffer.is_some() => {
-                        self.render_phone_transient_sheet(&text_style, cx)
+                        deny = deny.text_color(colors.text_muted);
                     }
-                    (None, None, Some(transient), _) => {
-                        if phone {
-                            self.render_phone_transient_sheet(&text_style, cx)
-                        } else {
-                            Some(
-                                div()
-                                    .track_focus(&self.transient_focus)
-                                    .on_key_down(cx.listener(Self::transient_key))
-                                    .child(transient.render(&text_style, cx))
-                                    .into_any_element(),
+                    Some(
+                        div()
+                            .key_context("RhoGitApproval")
+                            .track_focus(&self.git_approval_focus)
+                            .child(
+                                bottom_strip(&text_style, cx)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .gap_1()
+                                            .px_2()
+                                            .child(
+                                                div()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(colors.text_accent)
+                                                    .child("Git approval"),
+                                            )
+                                            .child("·")
+                                            .child(pending.prompt.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_4()
+                                            .px_2()
+                                            .child(
+                                                div()
+                                                    .text_color(colors.text_muted)
+                                                    .child("Y allow"),
+                                            )
+                                            .child(deny),
+                                    ),
                             )
-                        }
-                    }
-                    (None, None, None, Some(_)) => None,
-                    (None, None, None, None) => None,
-                },
-            )
+                            .into_any_element(),
+                    )
+                }
+                (None, Some(minibuffer)) => Some(if phone {
+                    minibuffer.render_phone(&text_style, cx)
+                } else {
+                    minibuffer.render(&text_style, cx)
+                }),
+                // A menu is drawn as a block in the buffer on the desk and
+                // as a sheet on the phone, and the sheet is drawn from
+                // here: nothing else in this method knows the phone has an
+                // overlay to draw. Without this arm the phone opens a menu
+                // nobody can see — the buffer has no block on purpose.
+                (None, None) if phone && self.menu_buffer.is_some() => {
+                    self.render_phone_menu_sheet(&text_style, cx)
+                }
+                (None, None) => None,
+            })
     }
 }
 

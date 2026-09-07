@@ -26,6 +26,7 @@ pub mod slack;
 pub mod telemetry;
 pub(crate) mod terminal_view;
 pub mod transient;
+pub(crate) mod usage;
 pub mod workspace;
 pub(crate) mod zed_remote;
 

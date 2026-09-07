@@ -13,6 +13,11 @@ pub enum SurfaceKey {
     /// and an empty queue land.
     Home,
     Messages,
+    /// What the desk has spent: the four usage charts, one screen. Which
+    /// chart is showing is the screen's own state and not its identity, so
+    /// picking another from the menu redraws this surface rather than
+    /// opening a second one.
+    Usage,
     DeskNode {
         host: HostId,
         node_id: rho_desk::cells::Id,

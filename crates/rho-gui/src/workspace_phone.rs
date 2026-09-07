@@ -532,15 +532,6 @@ impl Workspace {
     }
 
     pub(super) fn phone_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.transient.is_some() {
-            if let Some(parent) = self.transient_stack.pop() {
-                self.transient = Some(parent);
-                cx.notify();
-            } else {
-                self.close_transient(window, cx);
-            }
-            return;
-        }
         if self.minibuffer.is_some() {
             self.minibuffer_cancel(window, cx);
             return;
@@ -668,7 +659,6 @@ impl Workspace {
                     && self.phone.stack.is_empty()
                     && !self.phone_current_deal_has_pending_tree_verdict(cx)
                     && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
-                    && self.transient.is_none()
                     && self.minibuffer.is_none()
                 {
                     let edge = if self.open_card_in_view(cx).is_some() {
@@ -1362,84 +1352,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Close whichever sheet is showing. Two sources until the charts
-    /// move, one motion.
-    fn close_sheet(&mut self, from_menu: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if from_menu {
-            self.close_menu(window, cx);
-        } else {
-            self.close_transient(window, cx);
-        }
-    }
-
-    /// A tap on a bottom-strip menu's sheet. Only the usage charts reach
-    /// this now, and it goes when they do.
-    fn phone_transient_action(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((run, stay)) = self
-            .transient
-            .as_ref()
-            .and_then(|transient| transient.action_at(index))
-        else {
-            return;
-        };
-        if stay {
-            run(self, window, cx);
-            cx.notify();
-            return;
-        }
-
-        let parent = self.transient.take();
-        self.restore_overlay_focus(window, cx);
-        run(self, window, cx);
-        if self.transient.is_some() {
-            self.transient_stack.extend(parent);
-        } else {
-            self.transient_stack.clear();
-            if !self.has_modal_overlay() {
-                self.overlay_return_focus = None;
-            }
-        }
-        cx.notify();
-    }
-
-    pub(super) fn render_phone_transient_sheet(
+    /// The open menu, drawn as a sheet: the same menu the desk draws as a
+    /// block under the point, with its rows as targets a thumb can hit.
+    pub(super) fn render_phone_menu_sheet(
         &self,
         text_style: &gpui::TextStyle,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        // The menu under the point is the same menu; the phone draws its
-        // rows as targets a thumb can hit instead of as a block in the
-        // buffer. The bottom strip is the fallback until the usage charts
-        // move, since they are the last menus that are not this data.
-        let (sheet, from_menu) = match self.menu_sheet() {
-            Some(sheet) => (sheet, true),
-            None => {
-                let transient = self.transient.as_ref()?;
-                let sheet = crate::workspace::MenuSheet {
-                    title: transient.title().to_owned(),
-                    rows: transient
-                        .phone_rows()
-                        .into_iter()
-                        .map(|(_key, description, value)| crate::workspace::MenuRow {
-                            description,
-                            value,
-                        })
-                        .collect(),
-                    has_back: !self.transient_stack.is_empty(),
-                };
-                (sheet, false)
-            }
-        };
         let crate::workspace::MenuSheet {
             title,
             rows,
             has_back: has_parent,
-        } = sheet;
+        } = self.menu_sheet()?;
         let colors = cx.theme().colors();
 
         let mut header = div()
@@ -1461,12 +1385,7 @@ impl Workspace {
                     .items_center()
                     .child("back")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if from_menu {
-                            this.menu_dismiss(window, cx);
-                        } else if let Some(parent) = this.transient_stack.pop() {
-                            this.transient = Some(parent);
-                            cx.notify();
-                        }
+                        this.menu_dismiss(window, cx);
                         cx.stop_propagation();
                     })),
             );
@@ -1489,7 +1408,7 @@ impl Workspace {
                     .justify_end()
                     .child("close")
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.close_sheet(from_menu, window, cx);
+                        this.close_menu(window, cx);
                         cx.stop_propagation();
                     })),
             );
@@ -1512,11 +1431,7 @@ impl Workspace {
                     row = row.child(div().text_color(colors.text_muted).child(value));
                 }
                 row.on_click(cx.listener(move |this, _, window, cx| {
-                    if from_menu {
-                        this.run_menu_at(index, window, cx);
-                    } else {
-                        this.phone_transient_action(index, window, cx);
-                    }
+                    this.run_menu_at(index, window, cx);
                     cx.stop_propagation();
                 }))
             },
@@ -1538,19 +1453,12 @@ impl Workspace {
                 .justify_end()
                 .bg(gpui::black().opacity(0.35))
                 .track_focus(&self.transient_focus)
-                // The keys are the menu's when the sheet is a menu: the same
-                // press does the same thing whether the reader is looking at
-                // a block on the desk or a sheet here, and a tap outside
-                // dismisses whichever of the two is open.
-                .on_key_down(cx.listener(move |this, event, window, cx| {
-                    if from_menu {
-                        this.menu_key(event, window, cx);
-                    } else {
-                        this.transient_key(event, window, cx);
-                    }
-                }))
+                // The same press does the same thing whether the reader is
+                // looking at a block on the desk or a sheet here, and a tap
+                // outside dismisses it either way.
+                .on_key_down(cx.listener(Workspace::menu_key))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.close_sheet(from_menu, window, cx);
+                    this.close_menu(window, cx);
                 }))
                 .child(
                     div()

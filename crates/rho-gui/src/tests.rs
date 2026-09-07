@@ -4489,8 +4489,8 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
 }
 
 /// The verdicts are a buffer under the point, not a strip at the bottom:
-/// nothing goes into the strip when they open, and the point does not move
-/// to make room for them. Both halves matter — a menu that stole the point
+/// they open beside the row the reader is on and the point does not move to
+/// make room for them. Both halves matter — a menu that stole the point
 /// would answer about the wrong card when it closed.
 #[gpui::test]
 fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppContext) {
@@ -4523,10 +4523,6 @@ fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppC
     let after = workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.verdict_transient_open(), "the verdicts are open");
-            assert!(
-                !workspace.has_transient_for_test(),
-                "the strip stays empty: the menu is in the buffer"
-            );
             workspace
                 .active_editor(cx)
                 .read(cx)
@@ -4595,10 +4591,6 @@ fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppCo
             let subject = workspace.subject(window, cx);
             workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
             assert_eq!(workspace.menu_title_for_test(), Some("rho"));
-            assert!(
-                !workspace.has_transient_for_test(),
-                "the strip stays empty: the root menu is in the buffer"
-            );
             assert!(
                 !workspace.verdict_transient_open(),
                 "the root menu is not the verdicts, so shift is not Home"
@@ -4686,10 +4678,6 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
                 !workspace.menu_has_block_for_test(),
                 "the phone's menu is a sheet, not a block in the buffer"
             );
-            assert!(
-                !workspace.has_transient_for_test(),
-                "and not the bottom strip either"
-            );
         })
         .unwrap();
 
@@ -4718,7 +4706,8 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
 /// its title whether or not anything puts them on screen, so a test that asks
 /// the workspace what the sheet says passes while the phone shows nothing at
 /// all — which is exactly what happened: the overlay was drawn only for the
-/// bottom strip, and a migrated menu opened into an empty screen. This taps
+/// bottom strip the menus used to be, and a migrated menu opened into an
+/// empty screen. This taps
 /// where the last row lands, which fails if nothing is drawn there.
 #[gpui::test]
 fn the_phone_sheet_is_drawn_where_a_thumb_can_reach_it(cx: &mut TestAppContext) {
@@ -8234,10 +8223,6 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
 
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.has_transient_for_test(),
-                "the new-agent transient is retired: the draft page carries the fields"
-            );
             assert_eq!(workspace.current_surface_name_for_test(), "draft");
             assert_eq!(
                 workspace.draft_area_for_test(),
@@ -10541,4 +10526,57 @@ fn a_width_change_wraps_the_reader_s_rows_before_the_document(cx: &mut TestAppCo
         !backfilling,
         "and it finishes, so no row is left at a width the editor has left"
     );
+}
+
+/// The usage charts are a screen, not a strip: `space s u` then a letter
+/// opens the usage buffer with the chart in it, and picking another chart
+/// redraws that one screen instead of opening a second place to be.
+#[gpui::test]
+fn the_usage_menu_opens_one_screen_and_another_chart_redraws_it(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::usage_root_menu(), window, cx);
+            assert_eq!(workspace.menu_title_for_test(), Some("usage"));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "c");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_surface_name_for_test(), "usage");
+            assert_eq!(
+                workspace.usage_chart_for_test(cx),
+                Some((crate::usage::Chart::ModelCost, 1, true)),
+                "one screen, with the chart drawn into it as a block"
+            );
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                None,
+                "the menu closed behind the chart it opened"
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::usage_root_menu(), window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift-a");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.usage_chart_for_test(cx),
+                Some((crate::usage::Chart::AgentCost, 1, true)),
+                "the second chart replaced the picture on the same surface"
+            );
+        })
+        .unwrap();
 }

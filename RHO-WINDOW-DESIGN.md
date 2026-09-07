@@ -80,8 +80,11 @@ Concretely, in `rho-window`:
   hands that value back to it when the key is pressed. `rho-window` names no
   source type and holds no `&mut Workspace`.
 - The usage charts leave with their data. They are `rho-agents`' facts about
-  quota and cost drawn by `rho-visualizations`; a menu that shows one asks for
-  a rendered thing rather than carrying the series.
+  quota and cost, summarised there and painted by `rho-gui`'s `usage`; a menu
+  that shows one asks for a rendered thing rather than carrying the series.
+  (This line said `rho-visualizations` until the charts moved. That crate is
+  the daemon's opaque SVG blob store — record and get by sha256, no gpui, no
+  idea what a chart is — so it was the wrong name for painting a live series.)
 - One presentation path, not two. The phone renders the same buffer; there is
   no second by-index API.
 
@@ -139,10 +142,11 @@ gone for every menu that has moved. The block became optional on the buffer
 rather than conditional at the call site, which is the honest shape: a menu
 is open either way, and only its drawing differs.
 
-What is not done: the five usage menus, which carry their series and are the
-batch that needs `rho-visualizations` rather than a mechanical move. They are
-the last readers of the bottom strip and of `phone_rows`, and the strip's
-element tree goes when they do. One orphan found on the way and removed: `phone_desk_menu`,
+What is not done: nothing of the menus. The five usage menus were the last
+readers of the bottom strip and of `phone_rows`; they are now eight items of
+one `Menu` over `Command::Usage`, the charts are a screen of their own
+(`rho-gui`'s `usage`, over summaries from `rho-agents`' `usage`), and the
+strip's element tree went with them. One orphan found on the way and removed: `phone_desk_menu`,
 the Map screen's own sheet on the phone — cycle folds, edit notes, new — was
 opened by nothing, because the phone's ☰ opens the root menu whichever root
 is showing. A menu nothing opens is residue; if the map's own sheet is wanted
