@@ -37,7 +37,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut frames = 0;
     let mut distinct = 0;
     let mut max_changed = 0;
-    let mut max_rows = 0;
+    let mut max_touched_rows = 0;
+    let mut max_walked_items = 0;
+    let mut max_drawn_rows = 0;
     let mut max_draw = 0;
     let mut max_cold = 0;
     let mut max_warm = 0;
@@ -57,19 +59,22 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 .and_then(|event| serde_json::to_string(event).ok())
                 .unwrap_or_else(|| "null".to_owned());
             anyhow::anyhow!(
-                "oracle={} seed={seed}\nstep={} event={event}\ncold_draw_us={} warm_draw_us={} event_draw_us={} editor_rows={}\nshrunk sequence:\n{script}\nsub-scene changes (capped at 32):\n{details}",
+                "oracle={} seed={seed}\nstep={} event={event}\ncold_draw_us={} warm_draw_us={} event_draw_us={} touched_rows={} walked_items={}\nshrunk sequence:\n{script}\nsub-scene changes (capped at 32):\n{details}",
                 failure.oracle,
                 failure.step,
                 failure.cold_draw_micros,
                 failure.warm_draw_micros,
                 failure.draw_micros,
-                failure.editor_rows,
+                failure.touched_rows,
+                failure.walked_items,
             )
         })?;
         frames += report.frames;
         distinct += report.distinct_scenes;
         max_changed = max_changed.max(report.max_changed_primitives);
-        max_rows = max_rows.max(report.max_editor_rows);
+        max_touched_rows = max_touched_rows.max(report.max_touched_rows);
+        max_walked_items = max_walked_items.max(report.max_walked_items);
+        max_drawn_rows = max_drawn_rows.max(report.max_drawn_rows);
         max_draw = max_draw.max(report.max_draw_micros);
         max_cold = max_cold.max(report.cold_draw_micros);
         max_warm = max_warm.max(report.warm_draw_micros);
@@ -87,8 +92,8 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let sequence =
                 serde_json::to_string(&finding.sequence).unwrap_or_else(|_| "[]".to_owned());
             println!(
-                "WALL_CLOCK_FINDING seed={seed} step={} draw_us={} editor_work_rows={} sequence={sequence}",
-                finding.step, finding.draw_micros, finding.editor_work_rows
+                "WALL_CLOCK_FINDING seed={seed} step={} draw_us={} touched_rows={} walked_items={} sequence={sequence}",
+                finding.step, finding.draw_micros, finding.touched_rows, finding.walked_items
             );
             let mut owners = report.step_owners[finding.step].iter().collect::<Vec<_>>();
             owners.sort_by_key(|owner| std::cmp::Reverse(owner.paint_nanos));
@@ -104,15 +109,17 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 );
             }
         }
-        for (step, ((draw, editor_rows), total_rows)) in report
+        for (step, ((((draw, touched_rows), walked_items), drawn_rows), total_rows)) in report
             .step_draw_micros
             .iter()
-            .zip(&report.step_editor_rows)
+            .zip(&report.step_touched_rows)
+            .zip(&report.step_walked_items)
+            .zip(&report.step_drawn_rows)
             .zip(&report.step_total_rows)
             .enumerate()
         {
             println!(
-                "seed={seed} step={step} draw_us={draw} editor_rows={editor_rows} total_rows={total_rows}"
+                "seed={seed} step={step} draw_us={draw} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}"
             );
         }
     }
@@ -122,13 +129,15 @@ pub fn run(args: WalkArgs) -> Result<()> {
         anyhow::ensure!(elapsed.as_secs() < 300, "walk gate exceeded five minutes");
     }
     println!(
-        "seeds={} events={} frames={} distinct={} changed_max={} editor_rows_max={} cold_draw_max_us={} warm_draw_max_us={} draw_max_us={} wall_ms={}",
+        "seeds={} events={} frames={} distinct={} changed_max={} touched_rows_max={} walked_items_max={} drawn_rows_max={} cold_draw_max_us={} warm_draw_max_us={} draw_max_us={} wall_ms={}",
         seeds.len(),
         seeds.len() * steps,
         frames,
         distinct,
         max_changed,
-        max_rows,
+        max_touched_rows,
+        max_walked_items,
+        max_drawn_rows,
         max_cold,
         max_warm,
         max_draw,

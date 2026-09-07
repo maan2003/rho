@@ -69,12 +69,16 @@ pub struct WalkReport {
     pub frames: usize,
     pub distinct_scenes: usize,
     pub max_changed_primitives: usize,
-    pub max_editor_rows: u64,
+    pub max_touched_rows: u64,
+    pub max_walked_items: u64,
+    pub max_drawn_rows: u64,
     pub max_draw_micros: u64,
     pub cold_draw_micros: u64,
     pub warm_draw_micros: u64,
     pub step_draw_micros: Vec<u64>,
-    pub step_editor_rows: Vec<u64>,
+    pub step_touched_rows: Vec<u64>,
+    pub step_walked_items: Vec<u64>,
+    pub step_drawn_rows: Vec<u64>,
     pub step_total_rows: Vec<u64>,
     pub scene_hashes: Vec<u64>,
     pub wall_clock_findings: Vec<WallClockFinding>,
@@ -89,7 +93,8 @@ pub struct WallClockFinding {
     pub step: usize,
     pub event: WalkEvent,
     pub draw_micros: u64,
-    pub editor_work_rows: u64,
+    pub touched_rows: u64,
+    pub walked_items: u64,
     pub sequence: Vec<WalkEvent>,
 }
 
@@ -111,7 +116,8 @@ pub struct WalkFailure {
     pub event: Option<WalkEvent>,
     pub events: Vec<WalkEvent>,
     pub draw_micros: u64,
-    pub editor_rows: u64,
+    pub touched_rows: u64,
+    pub walked_items: u64,
     pub cold_draw_micros: u64,
     pub warm_draw_micros: u64,
     pub scene_details: Vec<String>,
@@ -129,6 +135,18 @@ impl std::fmt::Display for WalkFailure {
 }
 
 impl std::error::Error for WalkFailure {}
+
+type WalkRejection = (
+    &'static str,
+    usize,
+    Option<WalkEvent>,
+    u64,
+    u64,
+    u64,
+    u64,
+    u64,
+    Vec<String>,
+);
 
 /// Runs one generated sequence and deletion-shrinks an oracle failure.
 pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
@@ -176,7 +194,8 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                 step,
                 event,
                 draw_micros,
-                editor_rows,
+                touched_rows,
+                walked_items,
                 cold_draw_micros,
                 warm_draw_micros,
                 scene_details,
@@ -187,7 +206,8 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                 event,
                 events: shrunk,
                 draw_micros,
-                editor_rows,
+                touched_rows,
+                walked_items,
                 cold_draw_micros,
                 warm_draw_micros,
                 scene_details,
@@ -284,22 +304,11 @@ fn generated_result_bytes(random: u64) -> u16 {
     }
 }
 
-/// What a rejected walk hands back: which oracle rejected it, where and on
-/// which event, the four counts the shrinker reports, and the lines it
-/// rejected on. Named because the shrinker passes it from function to
-/// function, not because the shape changed.
-type Rejection = (
-    &'static str,
-    usize,
-    Option<WalkEvent>,
-    u64,
-    u64,
-    u64,
-    u64,
-    Vec<String>,
-);
-
-fn run_events(seed: u64, mode: WalkMode, events: &[WalkEvent]) -> Result<WalkReport, Rejection> {
+fn run_events(
+    seed: u64,
+    mode: WalkMode,
+    events: &[WalkEvent],
+) -> Result<WalkReport, WalkRejection> {
     run_events_with_detached_host(seed, mode, events, false)
 }
 
@@ -308,10 +317,11 @@ fn run_events_with_detached_host(
     mode: WalkMode,
     events: &[WalkEvent],
     detached_host: bool,
-) -> Result<WalkReport, Rejection> {
+) -> Result<WalkReport, WalkRejection> {
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();
+    let mut frame_timings = gpui::profiler::FrameTimingCollector::new();
     let mut cx = TestAppContext::build_with_text_system(
         TestDispatcher::new(seed),
         None,
@@ -328,6 +338,7 @@ fn run_events_with_detached_host(
                 "create isolated walk state",
                 0,
                 None,
+                0,
                 0,
                 0,
                 0,
@@ -351,31 +362,34 @@ fn run_events_with_detached_host(
             workspace.select_agent(Some(agent), window, cx);
             workspace.seed_transcript_for_test(agent, state.clone(), window, cx);
         })
-        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, Vec::new()))?;
+        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, 0, Vec::new()))?;
     cx.run_until_parked();
     let editor = active_editor(&workspace, &mut cx)
-        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, Vec::new()))?;
+        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, 0, Vec::new()))?;
     let cold_started = Instant::now();
     cx.draw_window(*workspace);
-    gpui::profiler::take_frame_work();
+    frame_timings.collect_unseen();
     let cold_draw_micros = cold_started.elapsed().as_micros() as u64;
     let warm_started = Instant::now();
     cx.draw_window(*workspace);
-    gpui::profiler::take_frame_work();
+    frame_timings.collect_unseen();
     let warm_draw_micros = warm_started.elapsed().as_micros() as u64;
     let recorder = cx.record_scenes::<WalkEvent>(*workspace);
     cx.draw_window(*workspace);
-    gpui::profiler::take_frame_work();
+    frame_timings.collect_unseen();
     timings.collect_unseen();
 
     let mut max_changed_primitives = 0;
-    let mut max_editor_rows = 0;
+    let mut max_touched_rows = 0;
+    let mut max_walked_items = 0;
+    let mut max_drawn_rows = 0;
     let mut max_draw_micros = 0;
     let mut step_draw_micros = Vec::with_capacity(events.len());
-    let mut step_editor_rows = Vec::with_capacity(events.len());
+    let mut step_touched_rows = Vec::with_capacity(events.len());
+    let mut step_walked_items = Vec::with_capacity(events.len());
+    let mut step_drawn_rows = Vec::with_capacity(events.len());
     let mut step_total_rows = Vec::with_capacity(events.len());
     let mut work_exceeded = None;
-    let mut work_baselines: [Option<(u64, u64)>; 6] = [None; 6];
     let mut wall_clock_findings = Vec::new();
     let mut virtual_time = Duration::ZERO;
     let mut live_last_changed = HashMap::new();
@@ -398,6 +412,7 @@ fn run_events_with_detached_host(
                 Some(event.clone()),
                 0,
                 0,
+                0,
                 cold_draw_micros,
                 warm_draw_micros,
                 Vec::new(),
@@ -406,17 +421,30 @@ fn run_events_with_detached_host(
         cx.run_until_parked();
         let draw_started = Instant::now();
         cx.draw_window(*workspace);
-        let work = gpui::profiler::take_frame_work();
+        let work = frame_timings
+            .collect_unseen()
+            .last()
+            .map(|timing| timing.work)
+            .unwrap_or_default();
         let draw_micros = draw_started.elapsed().as_micros() as u64;
         max_draw_micros = max_draw_micros.max(draw_micros);
         step_draw_micros.push(draw_micros);
         let event_timings = timings.collect_unseen();
-        let rows = event_timings
+        let touched_rows = event_timings
             .iter()
-            .map(|timing| timing.old_rows.max(timing.new_rows))
+            .map(|timing| timing.touched_rows)
+            .max()
+            .unwrap_or(0);
+        let walked_items = event_timings
+            .iter()
+            .map(|timing| timing.walked_items)
             .sum::<u64>();
-        max_editor_rows = max_editor_rows.max(rows);
-        step_editor_rows.push(rows);
+        max_touched_rows = max_touched_rows.max(touched_rows);
+        max_walked_items = max_walked_items.max(walked_items);
+        step_touched_rows.push(touched_rows);
+        step_walked_items.push(walked_items);
+        max_drawn_rows = max_drawn_rows.max(work.visible_rows);
+        step_drawn_rows.push(work.visible_rows);
         let total_rows = work.total_rows.max(
             event_timings
                 .iter()
@@ -430,27 +458,16 @@ fn run_events_with_detached_host(
                 step,
                 event: event.clone(),
                 draw_micros,
-                editor_work_rows: rows,
+                touched_rows,
+                walked_items,
                 sequence: events[..=step].to_vec(),
             });
         }
         if mode == WalkMode::Profiling {
-            let (class, scale) = row_work_scale(event, total_rows);
-            match work_baselines[class] {
-                Some((baseline_scale, baseline_rows)) => {
-                    let expected = baseline_rows
-                        .saturating_mul(scale)
-                        .div_ceil(baseline_scale)
-                        .saturating_mul(2)
-                        .saturating_add(64);
-                    if rows > expected && work_exceeded.is_none() {
-                        work_exceeded = Some((step, event.clone(), draw_micros, rows));
-                    }
-                    if scale < baseline_scale {
-                        work_baselines[class] = Some((scale, rows));
-                    }
-                }
-                None => work_baselines[class] = Some((scale, rows)),
+            let expected = editor_work_limit(&event_timings);
+            if walked_items > expected && work_exceeded.is_none() {
+                work_exceeded =
+                    Some((step, event.clone(), draw_micros, touched_rows, walked_items));
             }
         }
 
@@ -462,6 +479,7 @@ fn run_events_with_detached_host(
                 step,
                 Some(event.clone()),
                 draw_micros,
+                0,
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
@@ -478,6 +496,7 @@ fn run_events_with_detached_host(
                 step,
                 Some(event.clone()),
                 draw_micros,
+                0,
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
@@ -499,6 +518,7 @@ fn run_events_with_detached_host(
                 Some(event.clone()),
                 draw_micros,
                 0,
+                0,
                 cold_draw_micros,
                 warm_draw_micros,
                 describe_changes(&recorder, frame),
@@ -513,6 +533,7 @@ fn run_events_with_detached_host(
                 Some(event.clone()),
                 draw_micros,
                 0,
+                0,
                 cold_draw_micros,
                 warm_draw_micros,
                 describe_changes(&recorder, frame),
@@ -520,13 +541,14 @@ fn run_events_with_detached_host(
         }
     }
 
-    if let Some((step, event, draw_micros, rows)) = work_exceeded {
+    if let Some((step, event, draw_micros, touched_rows, walked_items)) = work_exceeded {
         return Err((
-            "editor work exceeded changed rows plus log total",
+            "editor cursor work exceeded touched rows plus log total",
             step,
             Some(event),
             draw_micros,
-            rows,
+            touched_rows,
+            walked_items,
             cold_draw_micros,
             warm_draw_micros,
             Vec::new(),
@@ -541,12 +563,16 @@ fn run_events_with_detached_host(
         frames: frames.len().saturating_sub(1),
         distinct_scenes: scenes.len(),
         max_changed_primitives,
-        max_editor_rows,
+        max_touched_rows,
+        max_walked_items,
+        max_drawn_rows,
         max_draw_micros,
         cold_draw_micros,
         warm_draw_micros,
         step_draw_micros,
-        step_editor_rows,
+        step_touched_rows,
+        step_walked_items,
+        step_drawn_rows,
         step_total_rows,
         scene_hashes: frames
             .iter()
@@ -637,25 +663,20 @@ fn changes_follow_declared_cadence(
     true
 }
 
-fn row_work_scale(event: &WalkEvent, total_rows: u64) -> (usize, u64) {
-    let changed_rows = match event {
-        WalkEvent::ComposerKey { .. } => 1,
-        WalkEvent::AgentChunk { bytes } | WalkEvent::ToolBody { bytes } => {
-            u64::from(*bytes).div_ceil(64).max(1)
-        }
-        WalkEvent::Resize { .. } => total_rows,
-        WalkEvent::AdvanceTime { .. } | WalkEvent::Idle => 0,
-    };
-    let log_total = u64::from(u64::BITS - total_rows.max(1).leading_zeros());
-    let class = match event {
-        WalkEvent::ComposerKey { .. } => 0,
-        WalkEvent::Resize { .. } => 1,
-        WalkEvent::AgentChunk { .. } => 2,
-        WalkEvent::ToolBody { .. } => 3,
-        WalkEvent::AdvanceTime { .. } => 4,
-        WalkEvent::Idle => 5,
-    };
-    (class, changed_rows + log_total + 2)
+fn editor_work_limit(timings: &[gpui::profiler::EditorTiming]) -> u64 {
+    timings
+        .iter()
+        .map(|timing| {
+            let total_rows = timing.old_rows.max(timing.new_rows).max(1);
+            let log_total = u64::from(u64::BITS - total_rows.leading_zeros());
+            timing
+                .touched_rows
+                .saturating_add(log_total)
+                .saturating_add(2)
+                .saturating_mul(2)
+        })
+        .sum::<u64>()
+        .saturating_add(64)
 }
 
 fn apply(
@@ -809,7 +830,8 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             event: generate(config.seed, config.steps).last().cloned(),
             events: generate(config.seed, config.steps),
             draw_micros: first.max_draw_micros,
-            editor_rows: first.max_editor_rows,
+            touched_rows: first.max_touched_rows,
+            walked_items: first.max_walked_items,
             cold_draw_micros: first.cold_draw_micros,
             warm_draw_micros: first.warm_draw_micros,
             scene_details: Vec::new(),
@@ -822,7 +844,8 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             event: generate(config.seed, config.steps).last().cloned(),
             events: generate(config.seed, config.steps),
             draw_micros: first.max_draw_micros,
-            editor_rows: first.max_editor_rows,
+            touched_rows: first.max_touched_rows,
+            walked_items: first.max_walked_items,
             cold_draw_micros: first.cold_draw_micros,
             warm_draw_micros: first.warm_draw_micros,
             scene_details: Vec::new(),
