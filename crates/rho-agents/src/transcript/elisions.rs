@@ -32,11 +32,11 @@ use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, tur
 use crate::state::UiBlock;
 
 /// What one fold looks like, independent of its editor identity.
-#[derive(Clone, PartialEq)]
-struct ElisionSpec {
-    range: Range<Anchor>,
-    tool_count: usize,
-    tail_rows: u32,
+#[derive(Clone, Debug, PartialEq)]
+pub struct ElisionSpec {
+    pub range: Range<Anchor>,
+    pub tool_count: usize,
+    pub tail_rows: u32,
 }
 
 /// One editor's live folds, reconciled against the model's specs: what the
@@ -48,6 +48,16 @@ pub struct ElisionState {
     active: Vec<(ElisionSpec, editor::display_map::CreaseId)>,
 }
 
+impl ElisionState {
+    /// The specs this editor is carrying folds for, in document order.
+    /// Public because that list is the thing a guard has to read: whether
+    /// it names the turns that actually became folds is the whole of the
+    /// pairing below.
+    pub fn active_specs(&self) -> impl Iterator<Item = &ElisionSpec> {
+        self.active.iter().map(|(spec, _)| spec)
+    }
+}
+
 #[derive(Default)]
 pub struct ElisionSync {
     plans: Vec<ElisionPlan>,
@@ -55,6 +65,13 @@ pub struct ElisionSync {
 }
 
 impl ElisionSync {
+    /// Sets the specs directly, bypassing the plans they normally come
+    /// from. Public for guards, which need a spec whose anchors will not
+    /// resolve and cannot get one from a plan.
+    pub fn set_specs(&mut self, specs: Vec<ElisionSpec>) {
+        self.specs = specs;
+    }
+
     /// Recomputes plans and their anchor-resolved specs from the changed
     /// turn onward. `plan_range` resolves a plan to its buffer anchor range.
     pub fn refresh(
@@ -163,12 +180,20 @@ impl ElisionSync {
             .filter_map(|(spec, _)| excerpt_range(&snapshot, &spec.range))
             .collect::<Vec<_>>();
         let uncrease = stale.iter().map(|(_, id)| *id).collect::<Vec<_>>();
-        let fold = fresh
+        // Only the specs whose anchors resolve in this snapshot become
+        // folds, and a spec in the middle of the run can fail to resolve —
+        // a transcript that is still composing its history has excerpts
+        // that are not in the buffer yet, which is the normal state of a
+        // long one. So each surviving spec is carried next to its crease
+        // rather than recovered by position afterwards: the ids come back
+        // for these specs and no others.
+        let (resolved, fold): (Vec<&ElisionSpec>, Vec<_>) = fresh
             .iter()
             .filter_map(|spec| {
                 let range = excerpt_range(&snapshot, &spec.range)?;
                 let label = elision_label(spec.tool_count);
-                Some(
+                Some((
+                    spec,
                     Crease::simple(
                         range,
                         editor::FoldPlaceholder {
@@ -183,9 +208,9 @@ impl ElisionSync {
                     .with_elision_policy(ElisionPolicy::Tail {
                         rows: spec.tail_rows,
                     }),
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .unzip();
 
         let fresh_ids = editor.update(cx, |editor, cx| {
             if !uncrease.is_empty() {
@@ -208,13 +233,13 @@ impl ElisionSync {
             ids
         });
 
-        // The specs that resolved to a range are the ones that became folds,
-        // in order, so the ids line up with them; a spec whose anchors no
-        // longer resolve is carried with no crease of its own and is
-        // reconciled again the next time its turn changes.
+        // The ids come back for the resolved specs, in their order, so they
+        // pair with those. A spec that did not resolve is not recorded at
+        // all: it has no crease to be reconciled against, and leaving it out
+        // is what makes the next reconcile see it as fresh and try it again.
         let mut fresh_ids = fresh_ids.into_iter();
         let mut active = state.active[..common].to_vec();
-        active.extend(fresh.iter().filter_map(|spec| {
+        active.extend(resolved.into_iter().filter_map(|spec| {
             let id = fresh_ids.next()?;
             Some((spec.clone(), id))
         }));

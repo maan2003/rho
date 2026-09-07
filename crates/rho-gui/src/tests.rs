@@ -12,6 +12,7 @@ use gpui::{
 use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
+use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 use rho_core::UnixMs;
 use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::AgentId;
@@ -125,6 +126,100 @@ fn image_inlays_are_fixed_cell_decorations(cx: &mut TestAppContext) {
             assert_eq!(editor.display_snapshot(cx).line_len(DisplayRow(0)), 2);
         })
         .expect("remove image inlay");
+}
+
+/// A spec whose anchors do not resolve is not a fold, so it must not take
+/// a fold's crease id. The ids come back for the resolved specs only, and
+/// pairing them against every spec by position hands each spec after an
+/// unresolved one its neighbour's crease and drops the last one — after
+/// which the editor's record of which crease belongs to which turn is wrong
+/// and the next reconcile unfolds turns that should have stayed folded. A
+/// transcript still composing its history hands this path unresolved specs
+/// as a matter of course, so it is not a corner.
+#[gpui::test]
+fn an_elision_that_cannot_resolve_takes_no_crease(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let text = (0..9)
+        .map(|row| format!("line {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let buffer = cx.update(|cx| cx.new(|cx| language::Buffer::local(text, cx)));
+    // Never an excerpt of the multibuffer, so its anchors resolve to
+    // nothing — the same answer an excerpt that has not been composed yet
+    // gives.
+    let elsewhere = cx.update(|cx| cx.new(|cx| language::Buffer::local("a\nb\nc", cx)));
+    let multi_buffer = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut multi_buffer =
+                multi_buffer::MultiBuffer::without_headers(language::Capability::ReadWrite);
+            multi_buffer.set_excerpts_for_path(
+                multi_buffer::PathKey::sorted(0),
+                buffer.clone(),
+                [language::Point::zero()..buffer.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multi_buffer
+        })
+    });
+    let window = cx.add_window(|window, cx| {
+        Editor::new(
+            editor::EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: true,
+                show_active_line_background: false,
+                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+            },
+            multi_buffer.clone(),
+            None,
+            window,
+            cx,
+        )
+    });
+    let editor = window.root(cx).expect("editor");
+
+    let spec = |anchors: (text::Anchor, text::Anchor), tool_count: usize| ElisionSpec {
+        range: anchors.0..anchors.1,
+        tool_count,
+        tail_rows: 0,
+    };
+    let (first, unresolvable, last) = cx.update(|cx| {
+        let buffer = buffer.read(cx);
+        let elsewhere = elsewhere.read(cx);
+        (
+            spec((buffer.anchor_before(7), buffer.anchor_after(21)), 2),
+            spec((elsewhere.anchor_before(0), elsewhere.anchor_after(3)), 3),
+            spec((buffer.anchor_before(35), buffer.anchor_after(49)), 4),
+        )
+    });
+
+    let host = cx.update(|cx| cx.new(|_| ()));
+    let mut sync = ElisionSync::default();
+    let mut state = ElisionState::default();
+    sync.set_specs(vec![first.clone(), unresolvable.clone(), last.clone()]);
+    cx.update(|cx| {
+        host.update(cx, |_, cx| {
+            sync.apply(&mut state, &multi_buffer, &editor, cx)
+        })
+    });
+    assert_eq!(
+        state.active_specs().cloned().collect::<Vec<_>>(),
+        vec![first.clone(), last.clone()],
+        "the two folds that happened are the two the editor is carrying"
+    );
+
+    // The first turn changes, so its fold is the only stale one; the fold
+    // that never moved keeps the crease it was given.
+    sync.set_specs(vec![unresolvable, last.clone()]);
+    cx.update(|cx| {
+        host.update(cx, |_, cx| {
+            sync.apply(&mut state, &multi_buffer, &editor, cx)
+        })
+    });
+    assert_eq!(
+        state.active_specs().cloned().collect::<Vec<_>>(),
+        vec![last],
+        "only the stale fold left"
+    );
 }
 
 /// A fold placeholder stands in for buffer text, so it draws in the
