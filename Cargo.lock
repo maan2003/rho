@@ -14176,7 +14176,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
- "dirs",
  "editor",
  "emojis",
  "futures 0.3.33",

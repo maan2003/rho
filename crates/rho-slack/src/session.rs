@@ -10,14 +10,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{AppContext as _, Context, EventEmitter, Task};
 use tokio::sync::Notify;
 
 use crate::api::Client;
-use crate::config::Credentials;
+use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
 use crate::mirror::{Mirror, Scope};
@@ -296,6 +295,9 @@ pub struct Session {
     /// What rho already knows, on disk. Surfaces render from here before the
     /// network answers, and a refresh asks only for what it does not hold.
     mirror: Option<Arc<Mirror>>,
+    /// Where this rho's Slack files live. Handed in by the caller and
+    /// never resolved here; see `config::Paths`.
+    paths: Paths,
     /// The conversation last opened, which is the one on screen. Only this
     /// one re-syncs its tail: every conversation ever opened stays in
     /// `loaded`, and re-syncing all of them would spend a request a minute
@@ -311,9 +313,13 @@ pub struct Session {
 impl EventEmitter<SessionEvent> for Session {}
 
 impl Session {
-    pub fn new(credentials: Credentials, cx: &mut Context<Self>) -> Self {
+    /// The session for a registered workspace, keeping its files where
+    /// `paths` says. Nothing in this crate knows where the user's state
+    /// directory is, so nothing in it can open the user's files by
+    /// accident: see `config::Paths`.
+    pub fn new(credentials: Credentials, paths: Paths, cx: &mut Context<Self>) -> Self {
         match Client::new(credentials.clone()) {
-            Ok(client) => Self::with_client(Arc::new(client), cx),
+            Ok(client) => Self::with_client(Arc::new(client), paths, cx),
             Err(error) => Self {
                 client: None,
                 model: Model::new(credentials.workspace),
@@ -323,7 +329,8 @@ impl Session {
                 catch_up: Arc::new(Notify::new()),
                 pending_sends: 0,
                 cached_files: HashMap::new(),
-                mirror: open_mirror(),
+                mirror: open_mirror(&paths.mirror),
+                paths,
                 focused: None,
                 connected_once: false,
                 _tasks: Vec::new(),
@@ -331,7 +338,7 @@ impl Session {
         }
     }
 
-    pub fn with_client(client: Arc<Client>, cx: &mut Context<Self>) -> Self {
+    pub fn with_client(client: Arc<Client>, paths: Paths, cx: &mut Context<Self>) -> Self {
         let mut session = Self {
             model: Model::new(client.workspace().clone()),
             client: Some(client.clone()),
@@ -341,7 +348,8 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             cached_files: HashMap::new(),
-            mirror: open_mirror(),
+            mirror: open_mirror(&paths.mirror),
+            paths,
             focused: None,
             connected_once: false,
             _tasks: Vec::new(),
@@ -929,6 +937,31 @@ impl Session {
         self.model.conversation_count() > 0
     }
 
+    /// Narrows the list to the conversations a typed query reaches. The
+    /// model answers it from its word index and logs which rows left and
+    /// which arrived.
+    pub fn narrow(&mut self, query: &str) {
+        self.model.narrow(query);
+    }
+
+    /// The conversations a query reaches, in the list's own order, for a
+    /// caller showing matches without narrowing: the minibuffer offering
+    /// names as the reader types.
+    pub fn reached_by(&self, query: &str, most: usize) -> Vec<crate::model::ConversationRow> {
+        self.model.reached_by(query, most)
+    }
+
+    /// What the reader has typed to narrow the list.
+    pub fn query(&self) -> String {
+        self.model.query()
+    }
+
+    /// Whether a query stands, so a drawer with nothing to draw can say
+    /// that nothing matches rather than talk about the socket.
+    pub fn is_narrowed(&self) -> bool {
+        self.model.is_narrowed()
+    }
+
     /// What the conversation list has done since the drawer last asked.
     /// `None` when the drawer has to write the listing again.
     pub fn take_row_edits(&mut self) -> Option<Vec<crate::model::RowEdit>> {
@@ -1429,7 +1462,7 @@ impl Session {
         file: &crate::types::FileSummary,
         cx: &mut Context<Self>,
     ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
-        let path = match file_cache_path(file) {
+        let path = match file_cache_path(&self.paths.files, file) {
             Ok(path) => path,
             Err(error) => return gpui::Task::ready(Err(error)),
         };
@@ -1473,7 +1506,7 @@ impl Session {
         }
         // Claimed before the fetch starts, so a second redraw does not queue
         // the same download again.
-        let Ok(path) = file_cache_path(file) else {
+        let Ok(path) = file_cache_path(&self.paths.files, file) else {
             return;
         };
         self.cached_files.insert(file.id.clone(), path.clone());
@@ -1558,8 +1591,9 @@ impl Session {
             return;
         }
         let file = file.clone();
+        let files = self.paths.files.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
-            let path = file_cache_path(&file)?;
+            let path = file_cache_path(&files, &file)?;
             if !path.exists() {
                 let bytes = client.download(&file.url).await?;
                 if let Some(parent) = path.parent() {
@@ -2275,9 +2309,14 @@ fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
 /// The mirror lives beside rho's other state. A machine without a state
 /// directory simply runs without one: the client still works, it just has
 /// nothing to show before the first response.
-fn open_mirror() -> Option<Arc<Mirror>> {
-    let path = dirs::state_dir()?.join("rho").join("slack.redb");
-    match Mirror::open(&path) {
+/// Opens the mirror the caller named, or goes without one.
+///
+/// Which file that is comes from `config::Paths` and never from the OS:
+/// a library that resolves the user's state directory hands every test
+/// and every rig the user's live Slack data, which is what this used to
+/// do.
+fn open_mirror(path: &std::path::Path) -> Option<Arc<Mirror>> {
+    match Mirror::open(path) {
         Ok(mirror) => Some(Arc::new(mirror)),
         Err(error) => {
             tracing::warn!(error = %error, "slack mirror unavailable");
@@ -2286,17 +2325,17 @@ fn open_mirror() -> Option<Arc<Mirror>> {
     }
 }
 
-fn file_cache_path(file: &crate::types::FileSummary) -> anyhow::Result<std::path::PathBuf> {
-    let base = dirs::state_dir().context("state directory not available")?;
+fn file_cache_path(
+    files: &std::path::Path,
+    file: &crate::types::FileSummary,
+) -> anyhow::Result<std::path::PathBuf> {
     let name = file
         .title
         .rsplit(['/', '\\'])
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("file");
-    Ok(base
-        .join("rho/slack-files")
-        .join(format!("{}-{name}", file.id)))
+    Ok(files.join(format!("{}-{name}", file.id)))
 }
 
 fn now_ms() -> i64 {

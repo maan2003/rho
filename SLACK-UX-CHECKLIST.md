@@ -794,6 +794,27 @@ done right after the transcript primitive (2.4) and before 2.10:
       asking and leaves the unit standing, so Find still reaches it and a
       row the reader half filed is not pulled out from under them.
 
+- [x] 2.27 The list is a buffer built once and edited per event. Every
+      row exists from the first draw and the model's order *is* the order
+      on screen — a `BTreeMap` keyed by muted, unread, mentions, latest and
+      name — so an event takes one row out and puts it back beside a named
+      neighbour rather than sorting the list or drawing it again. The point
+      follows its conversation, so rows arriving above the reader never
+      move the reader. 4.74 ms once at 20 000 rows, then 910 ns a badge and
+      1.44 µs a move.
+- [x] 2.28 Narrowing the list by name. `s` asks in the minibuffer and the
+      list narrows to the conversations the typed words reach, by word
+      prefix: `des` reaches `#design`, `ops` reaches `dev-ops` and
+      `ops-alerts`, `sig` reaches neither — Emacs completion's style for
+      names, and a range scan rather than a walk. A second word intersects.
+      The minibuffer offers the names it reaches while the reader types.
+      The narrowing is the model's: a keystroke edits out the rows that
+      left and edits in the rows that arrived, and nothing else, at
+      442 µs for 1 885 matches out of 20 000 against 753 µs to walk them.
+      Deleting a letter widens by the same diff run backwards. `/`, `n`,
+      `G` and yank still see the whole list, because narrowing is the
+      model's and not the buffer's.
+
 ## Phase 3: composing
 
 - [x] 3.1 Composer boundary. Now a bare line under the last message. Rho:

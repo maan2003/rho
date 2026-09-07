@@ -4,6 +4,7 @@
 //! The Slack client itself lives in `rho-slack`; this module is only the
 //! seam where it meets the workspace, the inbox, and the journal.
 
+use anyhow::Context as _;
 use gpui::AppContext as _;
 use rho_desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
@@ -129,8 +130,24 @@ impl Workspace {
         }
     }
 
+    /// Where this rho keeps Slack's files, under the client state
+    /// directory `main` resolved. rho-slack has no default of its own, so
+    /// a rho that has not said where its state lives — a test — has no
+    /// Slack session rather than the user's.
+    pub(crate) fn slack_paths(&self) -> anyhow::Result<rho_slack::config::Paths> {
+        let state_dir =
+            crate::mirror::state_dir().context("the client state directory is not set")?;
+        let mut paths = rho_slack::config::Paths::under(state_dir);
+        // The override exists so an isolated run (QA, a second profile)
+        // cannot touch the real workspaces.
+        if let Some(path) = std::env::var_os("RHO_SLACK_CREDENTIALS").filter(|it| !it.is_empty()) {
+            paths.credentials = path.into();
+        }
+        Ok(paths)
+    }
+
     pub(crate) fn slack_credentials(&self) -> anyhow::Result<CredentialStore> {
-        CredentialStore::open_default()
+        CredentialStore::open(self.slack_paths()?.credentials)
     }
 
     pub(crate) fn slack_workspaces(&self) -> Vec<WorkspaceName> {
@@ -174,7 +191,8 @@ impl Workspace {
         let store = self.slack_credentials().ok()?;
         let name = store.workspaces().next()?;
         let credentials = store.get(&name)?.clone();
-        let session = cx.new(|cx| Session::new(credentials, cx));
+        let paths = self.slack_paths().ok()?;
+        let session = cx.new(|cx| Session::new(credentials, paths, cx));
         // Window-scoped: a thread ignored in another client closes its card
         // here, and closing a card writes to the tree.
         self._slack_subscription =
@@ -941,6 +959,11 @@ impl Workspace {
         );
     }
 
+    /// How many matching names the minibuffer offers while the reader
+    /// types. A screenful and a little: the list itself narrows to every
+    /// match, and this is only the reminder of what is being reached for.
+    const SLACK_MATCHES_OFFERED: usize = 64;
+
     pub(crate) fn prompt_slack_search(
         &mut self,
         window: &mut gpui::Window,
@@ -951,7 +974,23 @@ impl Workspace {
         }
         self.open_prompt(
             "slack:",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
+            // The matches as the reader types, answered off the crate's
+            // word index: a range scan per typed word and the matches, so
+            // a keystroke here costs what it reaches and not the
+            // workspace. The minibuffer asks this on every edit.
+            std::rc::Rc::new(|workspace: &Workspace, typed: &str, cx: &gpui::App| {
+                let SurfaceView::SlackList(view) = &workspace.active_surface().view else {
+                    return Vec::new();
+                };
+                view.read(cx)
+                    .reached_by(typed, Self::SLACK_MATCHES_OFFERED, cx)
+                    .into_iter()
+                    .map(|row| crate::minibuffer::Candidate {
+                        value: row.label,
+                        description: String::new(),
+                    })
+                    .collect()
+            }),
             std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
                 if let SurfaceView::SlackList(view) = &workspace.active_surface().view {
                     let input = input.to_owned();

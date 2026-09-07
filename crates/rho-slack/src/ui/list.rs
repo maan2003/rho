@@ -39,8 +39,6 @@ pub struct ListView {
     muted: usize,
     /// Lines above the listing: the health notice, when there is one.
     banner: usize,
-    /// A substring the listing is narrowed to, as typed by the user.
-    filter: String,
     _observe: gpui::Subscription,
 }
 
@@ -105,7 +103,6 @@ impl ListView {
             unmuted: 0,
             muted: 0,
             banner: 0,
-            filter: String::new(),
             _observe: observe,
         };
         view.refresh(window, cx);
@@ -116,14 +113,27 @@ impl ListView {
         &self.editor
     }
 
-    pub fn filter(&self) -> &str {
-        &self.filter
+    /// The names a query reaches, for a caller that wants to show matches
+    /// without narrowing to them: the minibuffer offering completions
+    /// while the reader types. Answered off the same word index, so it
+    /// costs the range scan and the matches returned, not the workspace.
+    pub fn reached_by(&self, query: &str, most: usize, cx: &gpui::App) -> Vec<ConversationRow> {
+        self.session.read(cx).reached_by(query, most)
     }
 
-    /// Narrows the listing. Searching is filing here: the user types the
-    /// name they have in mind and the rest of Slack goes away.
+    pub fn filter(&self, cx: &Context<Self>) -> String {
+        self.session.read(cx).query()
+    }
+
+    /// Narrows the listing. Searching is filing here: the reader types a
+    /// word of the name they have in mind and the rest of Slack goes away.
+    ///
+    /// The narrowing is the model's, not the view's: the model holds the
+    /// index the query is answered from and says which rows left and which
+    /// arrived, so a keystroke edits those lines and no others.
     pub fn set_filter(&mut self, filter: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.filter = filter;
+        self.session
+            .update(cx, |session, _| session.narrow(&filter));
         self.refresh(window, cx);
     }
 
@@ -133,6 +143,17 @@ impl ListView {
     #[cfg(any(test, feature = "fake"))]
     pub fn row_of_for_test(&self, channel: &ChannelId) -> Option<usize> {
         self.line_of_id(channel)
+    }
+
+    /// The conversation names the buffer currently holds, in the order
+    /// they are drawn. What a narrowing is asserted against from outside.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn drawn_conversations_for_test(&self, _cx: &Context<Self>) -> Vec<String> {
+        self.drawn
+            .iter()
+            .filter(|line| line.id.is_some())
+            .map(|line| line.text.split("  ").next().unwrap_or_default().to_owned())
+            .collect()
     }
 
     #[cfg(any(test, feature = "fake"))]
@@ -193,7 +214,8 @@ impl ListView {
     /// already holds the listing and the model can say what moved, the
     /// lines that moved are edited and nothing else is touched: a message
     /// arriving is one line out and one line in, whatever the workspace
-    /// holds. Everything else — the first draw, a narrowing, a status line
+    /// holds, and so is a letter typed into the narrowing. Everything else
+    /// — the first draw, entering or leaving a narrowing, a status line
     /// instead of a listing, or a model that had to give up its log —
     /// writes the whole buffer, because in those cases the buffer and the
     /// listing no longer have a line in common to build from.
@@ -205,24 +227,18 @@ impl ListView {
             .health_reason()
             .map(|reason| vec![Span::styled(reason.to_owned(), Class::Error)]);
         let listing = self.session.read(cx).has_rows();
-        let edits = match listing && self.filter.is_empty() {
+        let edits = match listing {
             true => self
                 .session
                 .update(cx, |session, _| session.take_row_edits()),
-            // A narrowed listing is not the model's list, so the model's
-            // log cannot be applied to it. Whatever is in the log is
-            // already in the rows the rebuild reads, so it is dropped
-            // rather than saved for later.
             false => {
                 self.session
                     .update(cx, |session, _| session.forget_row_edits());
                 None
             }
         };
-        let incremental = listing
-            && self.filter.is_empty()
-            && !self.drawn.is_empty()
-            && banner.is_some() == (self.banner == 1);
+        let incremental =
+            listing && !self.drawn.is_empty() && banner.is_some() == (self.banner == 1);
         match (incremental, edits) {
             (true, Some(edits)) => self.apply_edits(edits, cx),
             _ => self.rebuild(banner, cx),
@@ -246,8 +262,16 @@ impl ListView {
         // offline workspace stays readable. The status line is for when
         // there is genuinely nothing to show yet.
         let known = session.rows();
+        let narrowed = session.is_narrowed();
         let (lines, rows) = match session.status() {
-            _ if !known.is_empty() => render_rows(&known, &self.filter),
+            _ if !known.is_empty() => render_rows(&known),
+            // A query that reaches nothing says so, rather than falling
+            // through to a status line about the socket, which is not what
+            // the reader just did.
+            _ if narrowed => (
+                vec![vec![Span::styled("nothing matches", Class::Muted)]],
+                vec![None],
+            ),
             Status::Failed(reason) => (
                 vec![vec![
                     Span::styled("slack unavailable: ", Class::Error),
@@ -259,10 +283,13 @@ impl ListView {
                 vec![vec![Span::styled("connecting to slack…", Class::Muted)]],
                 vec![None],
             ),
-            Status::Connected => render_rows(&known, &self.filter),
+            Status::Connected => (
+                vec![vec![Span::styled("no conversations", Class::Muted)]],
+                vec![None],
+            ),
         };
         let muted = known.iter().filter(|row| row.muted).count();
-        let listed = !known.is_empty() && self.filter.is_empty();
+        let listed = !known.is_empty();
 
         self.drawn = Vec::with_capacity(lines.len() + 1);
         self.banner = usize::from(banner.is_some());
@@ -322,7 +349,7 @@ impl ListView {
     /// same line, which the rope handles as a rewrite of one line.
     fn apply_edits(&mut self, edits: Vec<crate::model::RowEdit>, cx: &mut Context<Self>) {
         for edit in edits {
-            let leaving = match edit.was_listed {
+            let leaving = match edit.was_shown {
                 true => self.line_of_id(&edit.channel),
                 false => None,
             };
@@ -465,19 +492,11 @@ impl ListView {
 /// One line per conversation: the name, what is waiting in it, and when it
 /// last spoke. No ids and no last-message preview — the list is for choosing
 /// where to go, and a preview is the conversation's job.
-fn render_rows(rows: &[ConversationRow], filter: &str) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
-    let needle = filter.trim().to_lowercase();
-    let matching = rows
-        .iter()
-        .filter(|row| needle.is_empty() || row.label.to_lowercase().contains(&needle))
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        let message = match needle.is_empty() {
-            true => "no conversations",
-            false => "nothing matches",
-        };
-        return (vec![vec![Span::styled(message, Class::Muted)]], vec![None]);
-    }
+/// The rows the model handed over, laid out. Narrowing happened before
+/// this: the model answers a query from its own index, so nothing here
+/// looks at every conversation to decide what to draw.
+fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
+    let matching = rows.iter().collect::<Vec<_>>();
     let mut lines = Vec::with_capacity(matching.len());
     let mut targets = Vec::with_capacity(matching.len());
     let mut muted_section = false;
@@ -624,7 +643,7 @@ mod tests {
             }
 
             fn apply(&mut self, edit: &RowEdit) {
-                let leaving = match edit.was_listed {
+                let leaving = match edit.was_shown {
                     true => self.line_of_id(&edit.channel),
                     false => None,
                 };
@@ -668,7 +687,7 @@ mod tests {
         model.set_muted([ChannelId("C5".into())]);
 
         let known = model.conversation_rows();
-        let (_, targets) = render_rows(&known, "");
+        let (_, targets) = render_rows(&known);
         let mut lines = Lines {
             drawn: targets,
             unmuted: known.iter().filter(|row| !row.muted).count(),
@@ -681,7 +700,7 @@ mod tests {
             for edit in &edits {
                 lines.apply(edit);
             }
-            let (_, expected) = render_rows(&model.conversation_rows(), "");
+            let (_, expected) = render_rows(&model.conversation_rows());
             assert_eq!(lines.drawn, expected, "{at}");
         };
 
@@ -716,7 +735,7 @@ mod tests {
             "#design  @2 · 5 new  {}",
             crate::ui::clock_time(1_755_780_420)
         );
-        let (lines, _) = render_rows(&[design], "");
+        let (lines, _) = render_rows(&[design]);
         assert_eq!(text(&lines[0]), expected);
     }
 
@@ -724,7 +743,7 @@ mod tests {
     fn a_channel_unread_from_before_the_last_start_says_so_in_words() {
         // Slack counts messages for DMs only, so a channel that was already
         // unread at connect has no number to show and must not invent one.
-        let (lines, _) = render_rows(&[row("#design", true, 0)], "");
+        let (lines, _) = render_rows(&[row("#design", true, 0)]);
         assert_eq!(text(&lines[0]), "#design  unread");
     }
 
@@ -732,23 +751,21 @@ mod tests {
     fn muted_conversations_sit_at_the_bottom_under_one_break() {
         let mut muted = row("#noise", true, 0);
         muted.muted = true;
-        let (lines, targets) = render_rows(&[row("#design", true, 2), muted], "");
+        let (lines, targets) = render_rows(&[row("#design", true, 2), muted]);
         assert_eq!(text(&lines[0]), "#design  @2");
         assert_eq!(text(&lines[1]), "─────", "muted conversations start here");
         assert_eq!(targets[1], None, "the break opens nothing");
         assert_eq!(text(&lines[2]), "#noise  unread");
     }
 
+    /// Narrowing is the model's now, so the rows the view is handed are
+    /// already the matches. What is asserted here is that the view draws
+    /// what it is given and says so when it is given nothing.
     #[test]
-    fn a_filter_narrows_to_what_was_typed() {
-        let rows = [row("#design", false, 0), row("@ada", false, 0)];
-        let (lines, targets) = render_rows(&rows, "ad");
+    fn an_empty_narrowing_says_nothing_matches_rather_than_drawing_a_list() {
+        let (lines, targets) = render_rows(&[row("@ada", false, 0)]);
         assert_eq!(lines.len(), 1);
         assert_eq!(text(&lines[0]), "@ada");
         assert_eq!(targets[0], Some(ChannelId("@ada".into())));
-
-        let (lines, targets) = render_rows(&rows, "zzz");
-        assert_eq!(text(&lines[0]), "nothing matches");
-        assert_eq!(targets, vec![None]);
     }
 }

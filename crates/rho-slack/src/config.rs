@@ -23,6 +23,39 @@ impl std::fmt::Display for WorkspaceName {
     }
 }
 
+/// Where a rho keeps Slack's own files: the mirror, the file cache and
+/// the credential store.
+///
+/// Handed in by the binary that opens a session. This crate never asks
+/// the OS where the user's state lives, and that is the point: a default
+/// would be the user's live mirror — the file the running daemon holds
+/// open — and anything that is not the user's own rho would fall into it
+/// by writing nothing at all. A test did exactly that, silently, for a
+/// whole change. With no default there is nothing to fall into.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paths {
+    /// The message mirror, one redb file. redb allows a single opener, so
+    /// two rhos pointed at one path is a panic rather than a muddle.
+    pub mirror: PathBuf,
+    /// Where a downloaded file is kept. A Slack file id is immutable, so
+    /// nothing here expires.
+    pub files: PathBuf,
+    /// The registered workspaces and their tokens.
+    pub credentials: PathBuf,
+}
+
+impl Paths {
+    /// The layout under a client's state directory. Which directory that
+    /// is stays the caller's to resolve.
+    pub fn under(state_dir: &Path) -> Self {
+        Self {
+            mirror: state_dir.join("slack.redb"),
+            files: state_dir.join("slack-files"),
+            credentials: state_dir.join("slack-credentials.json"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     pub workspace: WorkspaceName,
@@ -75,23 +108,6 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
-    /// The client state directory, or wherever `RHO_SLACK_CREDENTIALS` points.
-    /// The override exists so an isolated run (QA, a second profile) cannot
-    /// touch the real workspaces.
-    pub fn default_path() -> anyhow::Result<PathBuf> {
-        if let Some(path) =
-            std::env::var_os("RHO_SLACK_CREDENTIALS").filter(|path| !path.is_empty())
-        {
-            return Ok(PathBuf::from(path));
-        }
-        let base = dirs::state_dir().context("state directory not available")?;
-        Ok(base.join("rho/slack-credentials.json"))
-    }
-
-    pub fn open_default() -> anyhow::Result<Self> {
-        Self::open(Self::default_path()?)
-    }
-
     /// Reads the store, treating "not there yet" as an empty store: the first
     /// registration creates the file.
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {

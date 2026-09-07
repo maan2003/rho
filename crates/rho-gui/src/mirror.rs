@@ -465,6 +465,13 @@ pub fn set_state_dir(state_dir: PathBuf) {
     let _ = STATE_DIR.set(state_dir);
 }
 
+/// The client state directory `main` named, if it named one. Nothing but
+/// `main` resolves it: a test never sets it, so a test can reach none of
+/// the user's files through anything that asks here.
+pub fn state_dir() -> Option<&'static Path> {
+    STATE_DIR.get().map(PathBuf::as_path)
+}
+
 /// Opens the mirror named by `set_state_dir`, if one was. Called from the
 /// model thread as its first act.
 pub fn open_stated() {

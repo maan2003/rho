@@ -660,4 +660,6 @@ pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+mod slack_tests;
+#[cfg(test)]
 mod tests;

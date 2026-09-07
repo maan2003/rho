@@ -790,6 +790,99 @@ wrong at the design, not at the polish.
   `src/tests.rs` and so dead to the plain lib build. Both reproduced on a
   clean checkout of main with nothing of this change in the tree, and
   both are fixed on 0bb4ffc9.
+  **Change 4, search.** The promise is word-prefix, not substring: `des`
+  reaches `#design`, `ops` reaches `dev-ops` and `ops-alerts`, `sig`
+  reaches neither. That is Emacs completion's style for names and, unlike
+  substring, it is a range scan. The index is a `BTreeSet<(word, id)>`
+  over every word start in every name — split on dash, underscore, space,
+  dot, comma, slash, `#`, `@`, `:` and on a lower→upper hump — kept up to
+  date per event in O(words of the one name that changed). A typed word is
+  answered by scanning from it to the first word that does not begin with
+  it, so one word costs the depth of the tree plus what it reaches. A
+  second typed word intersects, and the intersection walks the *rarest*
+  posting list first and asks the other words of each name it meets, so
+  two words cost the rarer word's matches and not the sum.
+  Narrowing edits the list; it does not draw it again. The match set is
+  kept as a sorted `Vec<(RowKey, ChannelId)>` in the list's own order, and
+  a keystroke diffs the old against the new in one two-pointer merge:
+  leavings first, then arrivals in descending order, so each arriving
+  row's neighbour is already on screen when it is named. Entering a
+  narrowing and leaving it are the two resyncs; every keystroke between
+  them is a diff. Traffic in a conversation the query does not reach logs
+  nothing at all.
+  Names are interned as `Arc<str>` in the sort key. This is not tidiness:
+  the per-keystroke cost is dominated by building keys for the matches,
+  and cloning two `String`s per match was 640 µs against 442 µs for two
+  pointer bumps at 1 885 matches.
+  The minibuffer offers the names a query reaches while the reader types
+  — `reached_by` off the same index, capped at 64, in the list's order.
+  Said plainly: **the narrowing runs on submit, not per keystroke**, and
+  that is the minibuffer's limit rather than this change's shape. Its
+  `CandidateSource` is handed only `&Workspace`, so a prompt can offer
+  completions per keystroke and cannot do anything per keystroke. The
+  index and the row edits are already the per-keystroke shape — the
+  numbers below are per keystroke, and the list narrows by editing the
+  rows that changed — so when eng-8gpr's on-change hook lands, wiring the
+  same `narrow` call to it is the whole of the next change.
+  Numbers, `cargo run --release --example list_cost`, this machine, over
+  a 256-word vocabulary so a query reaches a fraction of the workspace and
+  not all of it — the first benchmark named every channel `channel-N`,
+  every query reached all 20 000, and it measured nothing:
+
+  | one keystroke | 5 000 | 20 000 |
+  | --- | --- | --- |
+  | walked, every row every key (the before) | 179 µs | 753 µs |
+  | one letter | 54 µs (695 reached) | 282 µs (2 525 reached) |
+  | three letters | 93 µs (567 reached) | 442 µs (1 885 reached) |
+  | two words | 32 µs | 50 µs (1 reached) |
+  | the widen, a letter deleted | 91 µs | 443 µs (1 885 reached) |
+
+  Each row is the average of the query going on and coming off again —
+  `""`→`d`→`""`, `de`→`des`→`de` — so a keystroke and its undo are both
+  in every number and none of them is a lucky direction.
+  Read the shape: the walk grows with the workspace, and the index grows
+  with the matches. Four times the workspace is 3.3 times the matches and
+  4.7 times the time; a two-word query that reaches one conversation costs
+  50 µs at 20 000 against the walk's 753 µs, and the widen costs what the
+  narrowing it undoes costs, because it is the same diff run the other
+  way. The `matches` term is honest and unavoidable: a query reaching a
+  tenth of the workspace has to move a tenth of the workspace's rows.
+  One thing this change had to fix before it could be trusted: the two
+  `rho-gui` Slack tests were reading the **user's own mirror**. The fake
+  server starts empty and neither test seeded it, so the listing they
+  asserted against came from `~/.local/state/rho/slack.redb`, which
+  `Session::with_client` opens by default — the user's live Slack data,
+  and the file the running daemon holds. With a second such test in the
+  process it stopped being merely wrong and started failing outright:
+  redb allows one opener, so the second test panicked `DatabaseAlreadyOpen`.
+  The fix goes further than the tests, on eng-en1p's ruling: **a library
+  does not resolve the user's state directory.** `dirs::state_dir()` is
+  gone from `rho-slack` — from `open_mirror`, from `file_cache_path` and
+  from `CredentialStore::default_path`. In its place `config::Paths`
+  carries the three files (mirror, file cache, credentials), `Paths::under`
+  lays them out under a state directory the *caller* names, and
+  `Session::new` and `Session::with_client` both take it. `rho-gui`'s
+  `slack_paths` resolves it once from the directory `main` already
+  computes, keeping the `RHO_SLACK_CREDENTIALS` override the rig uses. A
+  test never sets that directory, so a test now has no Slack files at all
+  rather than the user's — there is no default left to fall into.
+  The tests pass a `tempfile::tempdir`, and the workspace they read is
+  seeded on the fake, server-side, where the mocking belongs: `#design`,
+  `#random`, `#dev-ops`, `#ops-alerts`, `@ada` and a group DM. They also
+  went from 20 s of socket waiting to 0.36 s, because what they wait for
+  now actually arrives — the old ones waited on a socket for rows that
+  were never coming, and passed on the mirror's.
+  This change's `rho-gui` tests are in their own file,
+  `crates/rho-gui/src/slack_tests.rs`, declared from `lib.rs` and not
+  appended to the end of `tests.rs`. Every agent was appending at that
+  same last line and every rebase collided there; five of 2b's conflicts
+  were nothing but append-vs-append. A test belongs to the surface it is
+  about.
+  Gate on 40e6bb00: the workspace suite green, `cargo fmt --check` clean.
+  Clippy stops on `tests.rs:10854`,
+  `clippy::type_complexity` on a `Rc<RefCell<Option<(usize, usize, u32,
+  Option<usize>)>>>` — main's line, present on a clean checkout with
+  nothing of this change in the tree, reported and not worked around.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is
