@@ -116,6 +116,11 @@ pub struct WalkReport {
 
 /// A profiling-only observation. It is reported by the gate but is not a
 /// deterministic landing failure until the known slow cases are repaired.
+///
+/// Its `draw_micros` is measured with the scene recorder attached, so it
+/// carries what recording a primitive costs and is not the reader's frame.
+/// Read it against the other steps of the same run, not against a bound;
+/// the bound is asked of the recorder-free cold and warm draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WallClockFinding {
     pub step: usize,

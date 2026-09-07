@@ -36,6 +36,9 @@ const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
 /// chunk to page in - `gg` touches 49 rows at 400 where it touched 6 at 40.
 const LARGE_TRANSCRIPT_TURNS: usize = 400;
 
+/// What one frame may cost the reader.
+const FRAME_BOUND_US: u64 = 4_000;
+
 #[derive(Args)]
 pub struct WalkArgs {
     /// Run the fixed landing corpus and check byte-identical replay.
@@ -210,5 +213,18 @@ pub fn run(args: WalkArgs) -> Result<()> {
         max_draw,
         elapsed.as_millis(),
     );
+
+    // The frame bound is asked of the two draws a run takes before its
+    // recorder attaches, because those are the only frames here without
+    // the recording in them. A per-step draw carries the fingerprinting,
+    // the two record clones, the owner clone and the clock read that
+    // recording costs, which measured four fifths of the frame; a bound
+    // on that number would be a bound on the harness.
+    if args.gate {
+        anyhow::ensure!(
+            max_cold <= FRAME_BOUND_US && max_warm <= FRAME_BOUND_US,
+            "a frame is over the {FRAME_BOUND_US} us bound: cold_draw_max_us={max_cold} warm_draw_max_us={max_warm}"
+        );
+    }
     Ok(())
 }
