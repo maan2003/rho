@@ -1092,7 +1092,6 @@ impl FoldMap {
                     .cursor::<Dimensions<InlayOffset, FoldOffset>>(());
                 let mut new_transforms =
                     new_transforms.cursor::<Dimensions<InlayOffset, FoldOffset>>(());
-
                 for mut edit in inlay_edits {
                     // An edit landing inside a fold is widened to the fold,
                     // which has to be re-emitted whole. Both sides of the
@@ -1340,6 +1339,20 @@ impl FoldMap {
                 }
 
                 fold_edits = consolidate_fold_edits(fold_edits);
+
+                // The new start of each edit is its old start shifted by the edits
+                // before it. Compute that only after consolidation: widening can make
+                // otherwise disjoint input edits overlap in fold output, where applying
+                // either raw edit's full delta to the other would double-count it.
+                let mut output_delta = 0isize;
+                for edit in &mut fold_edits {
+                    edit.new.start = FoldOffset(MultiBufferOffset(
+                        (edit.old.start.0.0 as isize + output_delta)
+                            .try_into()
+                            .expect("consolidated fold edits cannot move a start before zero"),
+                    ));
+                    output_delta += edit.new_len() as isize - edit.old_len() as isize;
+                }
 
                 // Asked after consolidation, because consolidation is
                 // part of what is handed over and a fault introduced

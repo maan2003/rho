@@ -1,18 +1,12 @@
 //! The transcript's own streaming path, asked whether the fold map's edits
 //! account for its own output.
 //!
-//! These three shapes are not new. They are the shapes of three tests that
-//! were already in this suite when the fault was found - a settled message
-//! whose markdown is concealed and more text arriving after it, markup
-//! streaming in three bytes at a time until its delimiters close, and a
-//! turn streaming at the end of a long settled history. All three passed
-//! throughout, because each asserts something else about the path:
-//! concealment is preserved, markup conceals, history is not revisited.
-//! None of them asked whether the fold map told the layers above the truth
-//! about how much its output had changed, and all three were carrying a
-//! sync that did not.
+//! These cover a settled message whose markdown is concealed before more
+//! text arrives, markup streaming until its delimiters close, and a turn
+//! streaming at the end of a long settled history. Each used to produce an
+//! output edit whose new start was derived independently from the new tree.
 //!
-//! What the accounting record says, on main, today:
+//! The bad edits' accounting records were:
 //!
 //! ```text
 //! plain assistant, streaming after concealment       37 + 16 -> 54
@@ -20,33 +14,9 @@
 //! edited turn at the end of settled history        2277 + 30 -> 2309
 //! ```
 //!
-//! Over by one byte, one byte and two bytes: a boundary miscounted rather
-//! than a region lost. In each case the output is *larger* than the edits
-//! admit, so the layers above are told the document grew less than it did,
-//! and go looking for rows at offsets the snapshot does not have.
-//!
-//! These assertions are written as full characterisation and are **meant to
-//! fail on the day the fault is fixed** rather than guarded. Emptiness is
-//! the assertion when a rule is fixed; characterisation is the assertion
-//! while a known fault remains and the day it changes should be loud. The
-//! distinction is eng-8gpr's, arrived at by being caught by each shape in
-//! turn.
-//!
-//! One correction belongs here rather than only in a note, because this
-//! file exists because of it. These three were reported as carrying the
-//! fault, then retracted on a sweep that said they did not fire, then found
-//! to fire after all when the tests were written and run. The sweep counted
-//! its marker with a line-anchored pattern; under `--nocapture` the harness
-//! prints `test tests::name ... ` without a newline and the test's own
-//! output continues that line, so every marker printed during a test landed
-//! mid-line and was not counted. The same log read without the anchor had
-//! all of them. Twenty seconds of running these three directly would have
-//! settled what an hour of experiment did not.
-//!
-//! The three tests they are drawn from stay where they are and keep
-//! asserting what they assert. Duplicating the shape here rather than
-//! adding a fourth assertion to each of them keeps the accounting question
-//! in one file, where the next person looking for it will find it.
+//! They were short by one, one and two bytes. These regressions assert that
+//! the accounting record remains empty while the original concealment and
+//! history-locality assertions stay in their owning tests.
 
 use gpui::{Entity, TestAppContext};
 
@@ -102,17 +72,9 @@ fn streaming_after_a_concealed_message_accounts_for_the_fold_maps_output(cx: &mu
     cx.run_until_parked();
 
     let books = accounting(&workspace, &editor, cx);
-    assert_eq!(
-        books.len(),
-        1,
-        "one sync on this document does not account for its own output; it \
-         said {books:#?}"
-    );
     assert!(
-        books[0].contains("net 16, which is 53; the new output is 54"),
-        "streaming after a settled concealed message: the output is larger than the edits admit, and by \
-         how much is the thing worth knowing; it said {:?}",
-        books[0]
+        books.is_empty(),
+        "streaming after a concealed message must account for its output: {books:#?}"
     );
 }
 
@@ -160,17 +122,9 @@ fn markup_concealing_as_it_streams_accounts_for_the_fold_maps_output(cx: &mut Te
     );
 
     let books = accounting(&workspace, &editor, cx);
-    assert_eq!(
-        books.len(),
-        1,
-        "one sync on this document does not account for its own output; it \
-         said {books:#?}"
-    );
     assert!(
-        books[0].contains("net 3, which is 40; the new output is 41"),
-        "markup concealing as it streams: the output is larger than the edits admit, and by \
-         how much is the thing worth knowing; it said {:?}",
-        books[0]
+        books.is_empty(),
+        "markup concealing as it streams must account for its output: {books:#?}"
     );
 }
 
@@ -219,16 +173,8 @@ fn streaming_at_the_end_of_a_settled_history_accounts_for_the_fold_maps_output(
     cx.run_until_parked();
 
     let books = accounting(&workspace, &editor, cx);
-    assert_eq!(
-        books.len(),
-        1,
-        "one sync on this document does not account for its own output; it \
-         said {books:#?}"
-    );
     assert!(
-        books[0].contains("net 30, which is 2307; the new output is 2309"),
-        "a turn streaming after a settled history: the output is larger than the edits admit, and by \
-         how much is the thing worth knowing; it said {:?}",
-        books[0]
+        books.is_empty(),
+        "streaming after settled history must account for its output: {books:#?}"
     );
 }
