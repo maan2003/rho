@@ -22,11 +22,13 @@ flate2 = "1"
 redb.workspace = true
 reqwest.workspace = true
 rho-core.workspace = true
+rho-fake-model.workspace = true
 rho-ui-proto.workspace = true
 rustls.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }
 serde = { workspace = true }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tempfile.workspace = true
 

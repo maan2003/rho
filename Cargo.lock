@@ -14134,11 +14134,13 @@ dependencies = [
  "redb",
  "reqwest 0.12.28",
  "rho-core",
+ "rho-fake-model",
  "rho-slack",
  "rho-ui-proto",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

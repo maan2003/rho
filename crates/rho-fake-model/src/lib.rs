@@ -17,6 +17,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
+use clap::ValueEnum;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,6 +31,43 @@ use tokio::sync::watch;
 pub enum TimingMode {
     Immediate,
     Timed,
+}
+
+/// A deterministic, protocol-level behavior selected for a fake-model run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum Scenario {
+    /// Corpus-shaped normal traffic with the configured low-rate faults.
+    #[default]
+    Baseline,
+    /// Return a rate limit, then an overload, then allow retries to succeed.
+    RateLimit,
+    /// End the first stream during a text delta, then allow retries to succeed.
+    StreamCut,
+    /// Emit approximately one word-sized text chunk every 300 ms when timed.
+    SlowTrickle,
+    /// Cycle through a documented synthetic 100-result heavy-tail population.
+    HugeToolOutput,
+    /// Emit forty valid tool calls in one response.
+    FortyToolCalls,
+    /// Emit encrypted reasoning followed by a compaction item.
+    ReasoningCompaction,
+    /// Ask a question without invoking a tool, then end the turn.
+    ClarifyingQuestion,
+}
+
+impl Scenario {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::RateLimit => "rate-limit",
+            Self::StreamCut => "stream-cut",
+            Self::SlowTrickle => "slow-trickle",
+            Self::HugeToolOutput => "huge-tool-output",
+            Self::FortyToolCalls => "forty-tool-calls",
+            Self::ReasoningCompaction => "reasoning-compaction",
+            Self::ClarifyingQuestion => "clarifying-question",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +138,7 @@ impl Default for PersonaDistribution {
 pub struct FakeModelConfig {
     pub seed: u64,
     pub bind: SocketAddr,
+    pub scenario: Scenario,
     pub timing: StreamTiming,
     pub distribution: PersonaDistribution,
 }
@@ -109,6 +148,7 @@ impl FakeModelConfig {
         Self {
             seed,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            scenario: Scenario::Baseline,
             timing: StreamTiming::default(),
             distribution: PersonaDistribution::default(),
         }
@@ -316,7 +356,7 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
         let request_number = begin_request(&state.metrics, &state.next_request);
         let events = openai_turn(&state, request_number, &envelope.request);
         for (index, event) in events.into_iter().enumerate() {
-            delay(&state.config.timing, index).await;
+            delay(&state.config, index, &event).await;
             let bytes = event.to_string();
             state
                 .metrics
@@ -333,10 +373,9 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
             if socket.send(Message::Text(bytes.into())).await.is_err() {
                 break;
             }
-            if matches!(
-                outcome(&state.config, request_number),
-                TerminalOutcome::Disconnect
-            ) && index >= 2
+            if outcome(&state.config, request_number) == TerminalOutcome::Disconnect
+                && ((state.config.scenario == Scenario::StreamCut && is_text_delta(&event))
+                    || (state.config.scenario != Scenario::StreamCut && index >= 2))
             {
                 let _ = socket.close().await;
                 end_request(&state.metrics, false);
@@ -355,19 +394,36 @@ async fn openai_http(
     Json(request): Json<OpenAiRequest>,
 ) -> Response {
     let request_number = begin_request(&state.metrics, &state.next_request);
+    let terminal = outcome(&state.config, request_number);
+    if terminal != TerminalOutcome::Complete && terminal != TerminalOutcome::Disconnect {
+        end_request(&state.metrics, false);
+        return openai_error_response(terminal, request_number);
+    }
     let events = openai_turn(&state, request_number, &request);
-    let timing = state.config.timing.clone();
+    let config = state.config.clone();
     let metrics = state.metrics.clone();
     let observed_state = state.clone();
-    let terminal = outcome(&state.config, request_number);
     let stream = async_stream::stream! {
         for (index, event) in events.into_iter().enumerate() {
-            delay(&timing, index).await;
-            let bytes = format!("data: {event}\n\n");
+            delay(&config, index, &event).await;
+            let cut = terminal == TerminalOutcome::Disconnect
+                && config.scenario == Scenario::StreamCut
+                && is_text_delta(&event);
+            let mut bytes = format!("data: {event}\n\n");
+            if cut {
+                bytes.truncate(bytes.len() * 3 / 4);
+            }
             metrics.bytes_streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             observe(&observed_state, request_number, openai_conversation(&request), ProviderProtocol::OpenAiResponses, &event, bytes.len());
-            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
-            if terminal == TerminalOutcome::Disconnect && index >= 2 { break; }
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(bytes));
+            if cut {
+                yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "seeded stream cut"));
+                end_request(&metrics, false);
+                return;
+            }
+            if terminal == TerminalOutcome::Disconnect && index >= 2 {
+                break;
+            }
         }
         end_request(&metrics, terminal == TerminalOutcome::Complete);
     };
@@ -396,7 +452,7 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
         };
         return vec![
             json!({"type":"response.created","response":{"id":response_id}}),
-            json!({"type":"response.failed","response":{"id":response_id,"error":{"message":message,"code":code}}}),
+            json!({"type":"response.failed","response":{"id":response_id,"error":{"type":error_type(terminal),"message":message,"code":code}}}),
         ];
     }
 
@@ -411,35 +467,93 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
         .input
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"));
-    if asks_compaction {
-        events.push(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"compaction","id":format!("cmp_{request_number}")}}));
-        events.push(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":format!("cmp_{request_number}"),"encrypted_content":format!("fake-compaction-{}-{request_number}",state.config.seed)}}));
-    } else if !request.tools.is_empty()
-        && (!has_tool_result || !mix(state.config.seed ^ request_number).is_multiple_of(20))
+    let tools = request_tools(request);
+    if state.config.scenario == Scenario::ReasoningCompaction {
+        append_reasoning(&mut events, request_number, 0);
+        append_compaction(&mut events, state, request_number, 1);
+    } else if asks_compaction {
+        append_compaction(&mut events, state, request_number, 0);
+    } else if matches!(
+        state.config.scenario,
+        Scenario::ClarifyingQuestion | Scenario::SlowTrickle | Scenario::StreamCut
+    ) {
+        append_text(&mut events, state, request_number, request, 0);
+    } else if !tools.is_empty()
+        && (!has_tool_result
+            || (matches!(
+                state.config.scenario,
+                Scenario::Baseline | Scenario::RateLimit
+            ) && !mix(state.config.seed ^ request_number).is_multiple_of(20)))
     {
         append_reasoning(&mut events, request_number, 0);
-        let tool = &request.tools
-            [(mix(state.config.seed ^ request_number) as usize) % request.tools.len()];
-        // One call at nearly every boundary approximates the observed
-        // results-per-Sent near one. That number came from one user's history
-        // and chiefly says batching was rare; batching is an explicit stress
-        // control rather than something this synthetic distribution invents.
-        for offset in 0..state.config.distribution.parallel_tool_calls.max(1) {
+        let tool = if matches!(
+            state.config.scenario,
+            Scenario::HugeToolOutput | Scenario::FortyToolCalls
+        ) {
+            tools
+                .iter()
+                .find(|tool| tool.name == "exec")
+                .unwrap_or(&tools[0])
+        } else {
+            &tools[(mix(state.config.seed ^ request_number) as usize) % tools.len()]
+        };
+        let call_count = match state.config.scenario {
+            Scenario::HugeToolOutput => 100,
+            Scenario::FortyToolCalls => 40,
+            _ => state.config.distribution.parallel_tool_calls.max(1),
+        };
+        for offset in 0..call_count {
             append_tool_call(&mut events, state, request_number, offset + 1, tool);
         }
     } else {
         append_reasoning(&mut events, request_number, 0);
-        let text = persona_text(state.config.seed, request_number, request);
-        let item_id = format!("msg_fake_{request_number}");
-        events.push(json!({"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":item_id,"phase":"final_answer"}}));
-        for chunk in chunks(&text, &state.config, request_number) {
-            events
-                .push(json!({"type":"response.output_text.delta","output_index":1,"delta":chunk}));
-        }
-        events.push(json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":item_id,"phase":"final_answer"}}));
+        append_text(&mut events, state, request_number, request, 1);
     }
     events.push(json!({"type":"response.completed","response":{"id":response_id,"usage":{"input_tokens":request.input.len() * 31 + 17,"input_tokens_details":{"cached_tokens":if request.previous_response_id.is_some(){19}else{0}},"output_tokens":events.len() * 7 + 3}}}));
     events
+}
+
+fn request_tools(request: &OpenAiRequest) -> Vec<ProviderTool> {
+    if !request.tools.is_empty() {
+        return request.tools.clone();
+    }
+    request
+        .input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|tool| serde_json::from_value(tool.clone()).ok())
+        .collect()
+}
+
+fn append_compaction(
+    events: &mut Vec<Value>,
+    state: &AppState,
+    request_number: u64,
+    output_index: usize,
+) {
+    let id = format!("cmp_{request_number}");
+    events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"compaction","id":id}}));
+    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"compaction","id":id,"encrypted_content":format!("fake-compaction-{}-{request_number}",state.config.seed)}}));
+}
+
+fn append_text(
+    events: &mut Vec<Value>,
+    state: &AppState,
+    request_number: u64,
+    request: &OpenAiRequest,
+    output_index: usize,
+) {
+    let text = scenario_text(state, request_number, request);
+    let item_id = format!("msg_fake_{request_number}");
+    events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"message","id":item_id,"phase":"final_answer"}}));
+    for chunk in chunks(&text, &state.config, request_number) {
+        events.push(
+            json!({"type":"response.output_text.delta","output_index":output_index,"delta":chunk}),
+        );
+    }
+    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"message","id":item_id,"phase":"final_answer"}}));
 }
 
 fn append_tool_call(
@@ -469,7 +583,13 @@ fn append_tool_call(
     let arguments = tool_arguments(
         tool,
         state.config.distribution.large_tool_body_bytes,
-        request_number ^ output_index as u64,
+        if state.config.scenario == Scenario::HugeToolOutput {
+            output_index as u64 - 1
+        } else {
+            request_number ^ output_index as u64
+        },
+        state.config.scenario,
+        state.config.seed,
     );
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
     for chunk in chunks(&arguments, &state.config, request_number) {
@@ -485,26 +605,53 @@ fn append_reasoning(events: &mut Vec<Value>, request_number: u64, output_index: 
     events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":"reasoning","id":id,"encrypted_content":format!("fake-reasoning-{request_number}"),"summary":[{"type":"summary_text","text":"Inspecting the current state and choosing the next bounded action."}]}}));
 }
 
-fn tool_arguments(tool: &ProviderTool, size: usize, request_number: u64) -> String {
+fn tool_arguments(
+    tool: &ProviderTool,
+    size: usize,
+    request_number: u64,
+    scenario: Scenario,
+    seed: u64,
+) -> String {
     if tool.kind == "custom" || tool.name == "exec" {
-        let body = "x".repeat(size.saturating_sub(180));
-        let result_bytes = synthetic_result_bytes(request_number);
-        format!(
-            "const payload_{request_number} = {body:?};\nconst result = await tools.exec_command({{cmd:\"python3 -c \\\"print('x' * {result_bytes})\\\"\", max_output_tokens:60000}});\ntext(result.output);"
-        )
+        let body = "x".repeat(if scenario == Scenario::FortyToolCalls {
+            0
+        } else {
+            size.saturating_sub(180)
+        });
+        let result_bytes = synthetic_result_bytes(scenario, seed, request_number);
+        format!("const payload_{request_number} = {body:?};\ntext('x'.repeat({result_bytes}));")
     } else {
         json!({"cmd":format!("python3 - <<'PY'\nprint('x' * {size})\nPY"),"max_output_tokens":10000}).to_string()
     }
 }
 
-// This is deliberately a synthetic heavy tail, not an empirical fit. The
-// source corpus established only a ~227-byte median and mean/median near 18,
-// plus p90/max landmarks; it did not provide a histogram or joint tool shape.
-fn synthetic_result_bytes(request_number: u64) -> usize {
-    match mix(request_number) % 10_000 {
-        0..=8_749 => 227,
-        8_750..=9_849 => 13_097,
-        _ => 170_448,
+// This is deliberately a synthetic approximation, not an empirical fit. Its
+// 100-value population is 89×227, 1×13,097, 9×22,328, and 1×170,448 bytes:
+// exactly p50 227, mean 4,047, p90 13,097, and max 170,448.
+fn synthetic_result_bytes(scenario: Scenario, seed: u64, request_number: u64) -> usize {
+    if scenario == Scenario::HugeToolOutput {
+        match seed.wrapping_add(request_number) % 100 {
+            0..=88 => 227,
+            89 => 13_097,
+            90..=98 => 22_328,
+            _ => 170_448,
+        }
+    } else {
+        match mix(request_number) % 10_000 {
+            0..=8_749 => 227,
+            8_750..=9_849 => 13_097,
+            _ => 170_448,
+        }
+    }
+}
+
+fn scenario_text(state: &AppState, request_number: u64, request: &OpenAiRequest) -> String {
+    match state.config.scenario {
+        Scenario::ClarifyingQuestion => {
+            "Could you clarify which behavior you want me to implement?".to_owned()
+        }
+        Scenario::SlowTrickle => (0..200).map(|index| format!("token-{index} ")).collect(),
+        _ => persona_text(state.config.seed, request_number, request),
     }
 }
 
@@ -526,6 +673,12 @@ fn persona_text(seed: u64, request_number: u64, request: &OpenAiRequest) -> Stri
 }
 
 fn chunks(text: &str, config: &FakeModelConfig, request_number: u64) -> Vec<String> {
+    if config.scenario == Scenario::SlowTrickle {
+        return text
+            .split_inclusive(char::is_whitespace)
+            .map(str::to_owned)
+            .collect();
+    }
     let min = config.distribution.min_chunk_bytes.max(1);
     let max = config.distribution.max_chunk_bytes.max(min);
     let mut at = 0;
@@ -544,6 +697,24 @@ fn chunks(text: &str, config: &FakeModelConfig, request_number: u64) -> Vec<Stri
 }
 
 fn outcome(config: &FakeModelConfig, request_number: u64) -> TerminalOutcome {
+    match config.scenario {
+        Scenario::RateLimit => {
+            return match request_number {
+                0 => TerminalOutcome::RateLimit,
+                1 => TerminalOutcome::Overloaded,
+                _ => TerminalOutcome::Complete,
+            };
+        }
+        Scenario::StreamCut => {
+            return if request_number == 0 {
+                TerminalOutcome::Disconnect
+            } else {
+                TerminalOutcome::Complete
+            };
+        }
+        Scenario::Baseline => {}
+        _ => return TerminalOutcome::Complete,
+    }
     if let Some(value) = config.distribution.forced_outcome {
         return value;
     }
@@ -569,10 +740,17 @@ fn mix(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-async fn delay(timing: &StreamTiming, event_index: usize) {
-    if timing.mode == TimingMode::Immediate {
+async fn delay(config: &FakeModelConfig, event_index: usize, event: &Value) {
+    if config.timing.mode == TimingMode::Immediate {
         return;
     }
+    if config.scenario == Scenario::SlowTrickle {
+        if is_text_delta(event) {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        return;
+    }
+    let timing = &config.timing;
     let duration = if event_index == 0 {
         timing.first_token
     } else if timing.stall_every != 0 && event_index.is_multiple_of(timing.stall_every as usize) {
@@ -583,6 +761,62 @@ async fn delay(timing: &StreamTiming, event_index: usize) {
         timing.between_chunks
     };
     tokio::time::sleep(duration).await;
+}
+
+fn is_text_delta(event: &Value) -> bool {
+    event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+        || event
+            .get("delta")
+            .and_then(|delta| delta.get("type"))
+            .and_then(Value::as_str)
+            == Some("text_delta")
+}
+
+fn error_type(outcome: TerminalOutcome) -> &'static str {
+    match outcome {
+        TerminalOutcome::RateLimit => "rate_limit_error",
+        TerminalOutcome::UsageLimit => "usage_limit_error",
+        TerminalOutcome::Overloaded => "overloaded_error",
+        _ => unreachable!("only HTTP error outcomes have error types"),
+    }
+}
+
+fn openai_error_response(outcome: TerminalOutcome, request_number: u64) -> Response {
+    let (status, message, code) = match outcome {
+        TerminalOutcome::RateLimit => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit reached for requests",
+            "rate_limit_exceeded",
+        ),
+        TerminalOutcome::UsageLimit => (
+            StatusCode::PAYMENT_REQUIRED,
+            "Usage limit reached for this organization",
+            "usage_limit_reached",
+        ),
+        TerminalOutcome::Overloaded => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The server is overloaded",
+            "server_is_overloaded",
+        ),
+        _ => unreachable!("complete streams do not produce HTTP errors"),
+    };
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": error_type(outcome),
+                "param": null,
+                "code": code,
+            },
+            "request_id": format!("req_fake_{request_number}"),
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
+    response
 }
 
 fn begin_request(metrics: &Metrics, ordinal: &AtomicU64) -> u64 {
@@ -665,30 +899,48 @@ async fn anthropic_messages(
                 "Usage limit reached.",
             ),
             TerminalOutcome::Overloaded => (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::from_u16(529).expect("valid Anthropic overload status"),
                 "overloaded_error",
                 "Overloaded",
             ),
             _ => unreachable!(),
         };
-        return (status, Json(json!({"type":"error","error":{"type":kind,"message":message},"request_id":format!("req_fake_{number}")}))).into_response();
+        let mut response = (status, Json(json!({"type":"error","error":{"type":kind,"message":message},"request_id":format!("req_fake_{number}")}))).into_response();
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+        return response;
     }
     if !request.stream {
         end_request(&state.metrics, true);
-        return Json(json!({"id":format!("msg_fake_{number}"),"type":"message","role":"assistant","model":request.model,"content":[{"type":"text","text":persona_text(state.config.seed,number,&OpenAiRequest::default())}],"stop_reason":"end_turn","usage":{"input_tokens":17,"output_tokens":31}})).into_response();
+        let text = scenario_text(&state, number, &OpenAiRequest::default());
+        return Json(json!({"id":format!("msg_fake_{number}"),"type":"message","role":"assistant","model":request.model,"content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":{"input_tokens":17,"output_tokens":31}})).into_response();
     }
     let events = anthropic_turn(&state, number, &request);
-    let timing = state.config.timing.clone();
+    let config = state.config.clone();
     let metrics = state.metrics.clone();
     let observed_state = state.clone();
     let stream = async_stream::stream! {
         for (index, (name, event)) in events.into_iter().enumerate() {
-            delay(&timing,index).await;
-            let bytes = format!("event: {name}\ndata: {event}\n\n");
+            delay(&config,index,&event).await;
+            let cut = terminal == TerminalOutcome::Disconnect
+                && config.scenario == Scenario::StreamCut
+                && is_text_delta(&event);
+            let mut bytes = format!("event: {name}\ndata: {event}\n\n");
+            if cut {
+                bytes.truncate(bytes.len() * 3 / 4);
+            }
             metrics.bytes_streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             observe(&observed_state, number, anthropic_conversation(&request), ProviderProtocol::AnthropicMessages, &event, bytes.len());
-            yield Ok::<Bytes,std::convert::Infallible>(Bytes::from(bytes));
-            if terminal == TerminalOutcome::Disconnect && index >= 2 { break; }
+            yield Ok::<Bytes,std::io::Error>(Bytes::from(bytes));
+            if cut {
+                yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "seeded stream cut"));
+                end_request(&metrics, false);
+                return;
+            }
+            if terminal == TerminalOutcome::Disconnect && index >= 2 {
+                break;
+            }
         }
         end_request(&metrics, terminal == TerminalOutcome::Complete);
     };
@@ -735,27 +987,42 @@ fn anthropic_turn(
         .messages
         .iter()
         .any(|message| message.to_string().contains("tool_result"));
-    if !has_tool_result && !request.tools.is_empty() {
+    if !request.tools.is_empty()
+        && !matches!(
+            state.config.scenario,
+            Scenario::ClarifyingQuestion | Scenario::SlowTrickle | Scenario::StreamCut
+        )
+        && ((state.config.scenario == Scenario::HugeToolOutput && number < 100) || !has_tool_result)
+    {
         let tool = &request.tools[(mix(state.config.seed ^ number) as usize) % request.tools.len()];
-        events.push(("content_block_start",json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":format!("toolu_fake_{number}"),"name":tool.name,"input":{}}})));
-        let arguments = tool_arguments(
-            &ProviderTool {
-                kind: "function".into(),
-                name: tool.name.clone(),
-            },
-            state.config.distribution.large_tool_body_bytes,
-            number,
-        );
-        for chunk in chunks(&arguments, &state.config, number) {
-            events.push(("content_block_delta",json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":chunk}})));
+        let call_count = if state.config.scenario == Scenario::FortyToolCalls {
+            40
+        } else {
+            1
+        };
+        for index in 0..call_count {
+            events.push(("content_block_start",json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":format!("toolu_fake_{number}_{index}"),"name":tool.name,"input":{}}})));
+            let arguments = tool_arguments(
+                &ProviderTool {
+                    kind: "function".into(),
+                    name: tool.name.clone(),
+                },
+                state.config.distribution.large_tool_body_bytes,
+                number ^ index as u64,
+                state.config.scenario,
+                state.config.seed,
+            );
+            for chunk in chunks(&arguments, &state.config, number) {
+                events.push(("content_block_delta",json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":chunk}})));
+            }
+            events.push((
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            ));
         }
-        events.push((
-            "content_block_stop",
-            json!({"type":"content_block_stop","index":0}),
-        ));
         events.push(("message_delta",json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":71}})));
     } else {
-        let text = persona_text(state.config.seed, number, &OpenAiRequest::default());
+        let text = scenario_text(state, number, &OpenAiRequest::default());
         events.push(("content_block_start",json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}})));
         events.push(("content_block_delta",json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Inspecting the current state."}})));
         events.push(("content_block_delta",json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":format!("fake-signature-{number}")}})));

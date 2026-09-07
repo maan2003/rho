@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use rho_fake_model::{FakeModel, FakeModelConfig, TimingMode};
+use rho_fake_model::{FakeModel, FakeModelConfig, Scenario, TimingMode};
 
 #[derive(Parser)]
 #[command(
@@ -11,6 +11,8 @@ use rho_fake_model::{FakeModel, FakeModelConfig, TimingMode};
 struct Args {
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    #[arg(long, value_enum, default_value_t)]
+    scenario: Scenario,
     #[arg(long, default_value = "127.0.0.1:0")]
     bind: SocketAddr,
     #[arg(long)]
@@ -25,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config = FakeModelConfig::seeded(args.seed);
     config.bind = args.bind;
-    if args.wall_clock_timing {
+    config.scenario = args.scenario;
+    if args.wall_clock_timing || args.scenario == Scenario::SlowTrickle {
         config.timing.mode = TimingMode::Timed;
     }
     if args.no_faults {

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,11 +12,13 @@ use anyhow::{Context as _, Result, bail, ensure};
 use camino::Utf8PathBuf;
 use clap::Args as ClapArgs;
 use rho_core::{AgentId, AgentRole, ContentPart, MessageDelivery};
+use rho_fake_model::Scenario;
 use rho_ui_proto::client::Client;
 use rho_ui_proto::mirror::{AgentPos, DetailBody, MirrorEvent, Seq, TurnEdge};
 use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 
 const AGENTS: usize = 20;
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -30,6 +32,9 @@ pub struct Args {
     /// Deterministic fake-model seed.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Provider behavior to exercise.
+    #[arg(long, value_enum, default_value_t)]
+    scenario: Scenario,
     /// Directory containing rho-daemon and rho-fake-model. Defaults to the
     /// directory containing this rho-qa executable.
     #[arg(long)]
@@ -50,6 +55,12 @@ struct FakeMetrics {
 }
 
 struct Children(Vec<Child>);
+
+#[derive(Clone, Copy)]
+enum ExpectedDetail {
+    Response,
+    Results,
+}
 
 impl Drop for Children {
     fn drop(&mut self) {
@@ -102,11 +113,20 @@ async fn run_async(args: Args) -> Result<()> {
     let daemon_bin = bin_dir.join("rho-daemon");
     ensure!(fake_bin.is_file(), "missing {}", fake_bin.display());
     ensure!(daemon_bin.is_file(), "missing {}", daemon_bin.display());
+    let tree_commit = tree_commit()?;
+    let proof_hash = sha256_file(&std::env::current_exe()?)?;
+    let fake_hash = sha256_file(&fake_bin)?;
 
     let mut fake = isolated_command(&fake_bin, root.path());
-    fake.args(["--seed", &args.seed.to_string(), "--no-faults"])
-        .stdout(Stdio::piped())
-        .stderr(File::create(root.path().join("fake-model.stderr.log"))?);
+    fake.args([
+        "--seed",
+        &args.seed.to_string(),
+        "--scenario",
+        args.scenario.as_str(),
+        "--no-faults",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(File::create(root.path().join("fake-model.stderr.log"))?);
     let mut fake = fake
         .spawn()
         .with_context(|| format!("start {}", fake_bin.display()))?;
@@ -148,12 +168,25 @@ async fn run_async(args: Args) -> Result<()> {
         initial_head == Seq(0),
         "fresh isolated daemon journal was not empty"
     );
+    println!(
+        "PROOF_READY tree_commit={} proof_sha256={} fake_sha256={} scenario={} seed={}",
+        tree_commit,
+        proof_hash,
+        fake_hash,
+        args.scenario.as_str(),
+        args.seed
+    );
     client
         .send(&ClientMessage::Follow { since: Seq(0) })
         .await?;
 
     let repo = Utf8PathBuf::try_from(workspace).context("workspace path is not UTF-8")?;
-    for index in 0..AGENTS {
+    let agent_count = if args.scenario == Scenario::Baseline {
+        AGENTS
+    } else {
+        1
+    };
+    for index in 0..agent_count {
         client
             .send(&ClientMessage::NewAgent {
                 role: AgentRole::default(),
@@ -169,18 +202,42 @@ async fn run_async(args: Args) -> Result<()> {
     let mut expected_pos: HashMap<AgentId, AgentPos> = HashMap::new();
     let mut sent_at = HashMap::new();
     let mut open_turns = HashSet::new();
-    let mut pending_details = HashSet::new();
+    let mut pending_details = HashMap::new();
     let mut latencies = Vec::new();
     let mut replies = 0u64;
+    let mut failed = 0u64;
+    let mut retrying = 0u64;
+    let mut calls = 0usize;
+    let mut compacted = 0u64;
+    let mut clarifying = 0u64;
+    let mut result_sizes = Vec::new();
     let mut cycles: HashMap<AgentId, u64> = HashMap::new();
     let mut last_seq = Seq(0);
-    let quiesce_deadline = deadline + QUIESCE_TIMEOUT;
+    let quiesce_deadline = deadline
+        + if matches!(
+            args.scenario,
+            Scenario::HugeToolOutput | Scenario::FortyToolCalls
+        ) {
+            Duration::from_secs(600)
+        } else {
+            QUIESCE_TIMEOUT
+        };
 
     loop {
-        if Instant::now() >= deadline
-            && agents.len() == AGENTS
-            && open_turns.is_empty()
-            && pending_details.is_empty()
+        let all_idle =
+            agents.len() == agent_count && open_turns.is_empty() && pending_details.is_empty();
+        if (args.scenario != Scenario::Baseline
+            && all_idle
+            && scenario_complete(
+                args.scenario,
+                failed,
+                calls,
+                compacted,
+                clarifying,
+                result_sizes.len(),
+                &latencies,
+            ))
+            || (Instant::now() >= deadline && all_idle)
         {
             break;
         }
@@ -188,15 +245,23 @@ async fn run_async(args: Args) -> Result<()> {
             Instant::now() < quiesce_deadline,
             "agents did not quiesce after the drive window"
         );
-        let message = tokio::time::timeout(Duration::from_secs(10), client.recv())
+        let event_timeout = if matches!(
+            args.scenario,
+            Scenario::HugeToolOutput | Scenario::FortyToolCalls | Scenario::SlowTrickle
+        ) {
+            QUIESCE_TIMEOUT
+        } else {
+            Duration::from_secs(10)
+        };
+        let message = tokio::time::timeout(event_timeout, client.recv())
             .await
             .context("daemon journal stalled")??;
         match message {
             ServerMessage::AgentCreated { agent_id } => {
                 agents.insert(agent_id);
                 ensure!(
-                    agents.len() <= AGENTS,
-                    "daemon created more than {AGENTS} agents"
+                    agents.len() <= agent_count,
+                    "daemon created more than {agent_count} agents"
                 );
             }
             ServerMessage::Log { entries } => {
@@ -225,16 +290,36 @@ async fn run_async(args: Args) -> Result<()> {
                             );
                             agents.insert(entry.agent_id);
                         }
-                        MirrorEvent::Sent { at, .. } => {
+                        MirrorEvent::Sent { results, at, .. } => {
                             sent_at.insert(entry.agent_id, at);
+                            if !results.is_empty() {
+                                pending_details
+                                    .insert((entry.agent_id, entry.pos), ExpectedDetail::Results);
+                                client
+                                    .send(&ClientMessage::Detail {
+                                        agent_id: entry.agent_id,
+                                        pos: entry.pos,
+                                    })
+                                    .await?;
+                            }
                         }
-                        MirrorEvent::Replied { at, .. } => {
+                        MirrorEvent::Replied {
+                            text,
+                            calls: reply_calls,
+                            compacted: did_compact,
+                            at,
+                            ..
+                        } => {
                             let sent = sent_at
                                 .remove(&entry.agent_id)
                                 .context("Replied without preceding Sent")?;
                             latencies.push(at.saturating_duration_since(sent));
                             replies += 1;
-                            pending_details.insert((entry.agent_id, entry.pos));
+                            calls += reply_calls.len();
+                            compacted += u64::from(did_compact);
+                            clarifying += u64::from(text.trim_end().ends_with('?'));
+                            pending_details
+                                .insert((entry.agent_id, entry.pos), ExpectedDetail::Response);
                             client
                                 .send(&ClientMessage::Detail {
                                     agent_id: entry.agent_id,
@@ -244,6 +329,13 @@ async fn run_async(args: Args) -> Result<()> {
                                     more: Vec::new(),
                                 })
                                 .await?;
+                        }
+                        MirrorEvent::Failed {
+                            retrying: is_retrying,
+                            ..
+                        } => {
+                            failed += 1;
+                            retrying += u64::from(is_retrying);
                         }
                         MirrorEvent::Turn {
                             edge: TurnEdge::Started,
@@ -256,7 +348,7 @@ async fn run_async(args: Args) -> Result<()> {
                             ..
                         } => {
                             open_turns.remove(&entry.agent_id);
-                            if Instant::now() < deadline {
+                            if args.scenario == Scenario::Baseline && Instant::now() < deadline {
                                 let cycle = cycles.entry(entry.agent_id).or_default();
                                 *cycle += 1;
                                 client
@@ -277,22 +369,24 @@ async fn run_async(args: Args) -> Result<()> {
                 pos,
                 body,
             } => {
-                ensure!(
-                    pending_details.remove(&(agent_id, pos)),
-                    "unexpected Detail response"
-                );
-                ensure!(
-                    matches!(body, DetailBody::Response(_)),
-                    "Replied detail was not a response"
-                );
+                let expected = pending_details
+                    .remove(&(agent_id, pos))
+                    .context("unexpected Detail response")?;
+                match (expected, body) {
+                    (ExpectedDetail::Response, DetailBody::Response(_)) => {}
+                    (ExpectedDetail::Results, DetailBody::Results(results)) => {
+                        result_sizes.extend(results.into_iter().map(|result| result.output.len()));
+                    }
+                    _ => bail!("daemon Detail body did not match its journal event"),
+                }
             }
             ServerMessage::Error { message } => bail!("daemon refused proof action: {message}"),
             _ => {}
         }
     }
     ensure!(
-        agents.len() == AGENTS,
-        "created {} agents, expected {AGENTS}",
+        agents.len() == agent_count,
+        "created {} agents, expected {agent_count}",
         agents.len()
     );
     ensure!(!latencies.is_empty(), "no model replies completed");
@@ -338,11 +432,39 @@ async fn run_async(args: Args) -> Result<()> {
     .json()
     .await?;
     latencies.sort_unstable();
+    let scenario_error = verify_scenario(
+        args.scenario,
+        &ScenarioResults {
+            failed,
+            retrying,
+            calls,
+            compacted,
+            clarifying,
+            result_sizes: &result_sizes,
+            latencies: &latencies,
+        },
+    )
+    .err();
+    let mut sorted_result_sizes = result_sizes.clone();
+    sorted_result_sizes.sort_unstable();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "agents={AGENTS} duration_s={} replies={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} daemon_vmrss_kib={} journal_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} daemon_vmrss_kib={} journal_head={}",
+        args.scenario.as_str(),
+        agent_count,
         args.seconds,
         replies,
+        failed,
+        retrying,
+        calls,
+        compacted,
+        clarifying,
+        result_sizes.len(),
+        result_sizes.iter().sum::<usize>(),
+        usize_percentile(&sorted_result_sizes, 50),
+        result_sizes.iter().sum::<usize>() / result_sizes.len().max(1),
+        usize_percentile(&sorted_result_sizes, 90),
+        sorted_result_sizes.last().copied().unwrap_or(0),
         metrics.completed_turns as f64 / elapsed,
         metrics.completed_turns,
         metrics.bytes_streamed,
@@ -352,6 +474,92 @@ async fn run_async(args: Args) -> Result<()> {
         vmrss_kib(daemon_pid)?,
         final_head.0
     );
+    if let Some(error) = scenario_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn scenario_complete(
+    scenario: Scenario,
+    failed: u64,
+    calls: usize,
+    compacted: u64,
+    clarifying: u64,
+    results: usize,
+    latencies: &[u64],
+) -> bool {
+    match scenario {
+        Scenario::Baseline => false,
+        Scenario::RateLimit => failed >= 2 && !latencies.is_empty(),
+        Scenario::StreamCut => failed >= 1 && !latencies.is_empty(),
+        Scenario::SlowTrickle => !latencies.is_empty(),
+        Scenario::HugeToolOutput => results >= 100,
+        Scenario::FortyToolCalls => calls >= 40 && results >= 40,
+        Scenario::ReasoningCompaction => compacted >= 1,
+        Scenario::ClarifyingQuestion => clarifying >= 1,
+    }
+}
+
+struct ScenarioResults<'a> {
+    failed: u64,
+    retrying: u64,
+    calls: usize,
+    compacted: u64,
+    clarifying: u64,
+    result_sizes: &'a [usize],
+    latencies: &'a [u64],
+}
+
+fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<()> {
+    match scenario {
+        Scenario::Baseline => {}
+        Scenario::RateLimit => {
+            ensure!(
+                results.failed >= 2,
+                "daemon did not journal both provider failures"
+            );
+            ensure!(
+                results.retrying >= 1,
+                "daemon did not mark a provider failure retrying"
+            );
+        }
+        Scenario::StreamCut => {
+            ensure!(results.failed >= 1, "daemon did not journal the cut stream");
+            ensure!(results.retrying >= 1, "daemon did not retry the cut stream");
+        }
+        Scenario::SlowTrickle => {
+            ensure!(
+                percentile(results.latencies, 50) >= 59_000,
+                "daemon ended the one-minute trickle early"
+            );
+        }
+        Scenario::HugeToolOutput => {
+            ensure!(
+                results.result_sizes.len() == 100,
+                "expected 100 tool results"
+            );
+        }
+        Scenario::FortyToolCalls => {
+            ensure!(results.calls == 40, "daemon did not retain forty calls")
+        }
+        Scenario::ReasoningCompaction => {
+            ensure!(
+                results.compacted >= 1,
+                "daemon did not retain the compaction item"
+            );
+        }
+        Scenario::ClarifyingQuestion => {
+            ensure!(
+                results.clarifying == 1,
+                "client did not see the clarifying question"
+            );
+            ensure!(
+                results.calls == 0,
+                "clarifying persona unexpectedly called a tool"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -388,17 +596,19 @@ fn write_synthetic_auth(state: &Path) -> Result<()> {
     let dir = state.join("rho/auth.d");
     fs::create_dir_all(&dir)?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    let path = dir.join("default.json");
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&json!({
-            "access_token": "rho-qa-synthetic-token",
-            "expires_at_ms": u64::MAX,
-            "account_id": "rho-qa-synthetic-account",
-            "client_secret": vec![0u8; 32],
-        }))?,
-    )?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    for name in ["default", "backup"] {
+        let path = dir.join(format!("{name}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "access_token": format!("rho-qa-synthetic-{name}-token"),
+                "expires_at_ms": u64::MAX,
+                "account_id": format!("rho-qa-synthetic-{name}-account"),
+                "client_secret": vec![0u8; 32],
+            }))?,
+        )?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -459,6 +669,13 @@ fn percentile(sorted: &[u64], percent: usize) -> u64 {
     sorted[(sorted.len() * percent).div_ceil(100).saturating_sub(1)]
 }
 
+fn usize_percentile(sorted: &[usize], percent: usize) -> usize {
+    sorted
+        .get((sorted.len() * percent).div_ceil(100).saturating_sub(1))
+        .copied()
+        .unwrap_or(0)
+}
+
 fn vmrss_kib(pid: u32) -> Result<u64> {
     let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
     let line = status
@@ -470,6 +687,32 @@ fn vmrss_kib(pid: u32) -> Result<u64> {
         .context("malformed VmRSS")?
         .parse()
         .context("parse VmRSS")
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn tree_commit() -> Result<String> {
+    let output = Command::new("jj")
+        .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+        .output()
+        .context("read proof tree commit")?;
+    ensure!(
+        output.status.success(),
+        "jj could not read proof tree commit"
+    );
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 #[cfg(test)]
