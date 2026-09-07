@@ -21,6 +21,7 @@ use story::ready_with;
 
 mod dashboard_cost;
 mod fold_tail_rows;
+mod fold_widen_bias;
 mod fold_widen_underflow;
 mod fold_widening_check;
 mod history;

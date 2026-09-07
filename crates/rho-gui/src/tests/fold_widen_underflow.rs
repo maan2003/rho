@@ -34,6 +34,11 @@
 //!
 //! Reported by eng-b8os from the desk rig; the fault is theirs to fix and
 //! this is only the case that names it.
+//!
+//! That rule is gone now: each side is widened to the boundary its own
+//! fold starts at, named once in buffer coordinates. The document stays
+//! because it is the shape that produced the fault, and what it asks for
+//! is now the opposite - a widening with nothing to report.
 
 use gpui::{TestAppContext, px, size};
 
@@ -118,10 +123,20 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
         .expect("splice two inlays inside the fold");
     cx.run_until_parked();
 
-    // The clamp keeps the arithmetic safe. It does not make the premise
-    // true, and the map now says so: the two sides were to move together
-    // and could not, which is the thing worth knowing and the thing that
-    // used to arrive as a subtraction overflow with nothing attached.
+    // Nothing to say. This assertion used to characterise a record of
+    // three lines: two clamps and the inverted edit the clamps left
+    // behind. It was the right assertion for a rule that no longer
+    // exists. Each side of an edit is now widened to the boundary its own
+    // fold starts at, named once in buffer coordinates and said back on
+    // each side in that side's own, so the sides never have to give each
+    // other bytes they do not have and never end up naming different
+    // boundaries. On this document that leaves the widening with nothing
+    // to report, which is the whole of what the rule change guarantees.
+    //
+    // Written as emptiness rather than as three matched lines on purpose:
+    // an assertion that names the lines it expects is satisfied by a
+    // fault standing next to the one it is checking, which is exactly how
+    // the inverted edit went unnoticed here the first time.
     let said = editor
         .update(cx, |editor, _, cx| {
             editor
@@ -129,43 +144,9 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
                 .update(cx, |map, _| map.take_fold_widening_violations())
         })
         .expect("read what the widening recorded");
-    // Every line of it, not one line of it. An earlier version of this
-    // assertion asked only that a clamp had been reported, and passed over
-    // the inverted edit sitting in the same record — an assertion satisfied
-    // by the fault standing next to the one it was checking. eng-b8os found
-    // that by asserting the record empty instead; this is the same reading
-    // written down so it cannot be passed over again.
-    assert_eq!(
-        said.len(),
-        3,
-        "the record is characterised here in full, so a change to it is \
-         visible rather than absorbed; it said {said:#?}"
-    );
     assert!(
-        said[0].contains("move by 219")
-            && said[0].contains("old side at 5")
-            && said[0].contains("could only move by 5"),
-        "the inlay inside the fold moves the new side and not the fold's \
-         start, so the two sides are asked to move by 219 and the old side \
-         has 5; it said {:?}",
-        said[0]
-    );
-    assert!(
-        said[1].contains("move by 214") && said[1].contains("could only move by 0"),
-        "and the round after it clamps to nothing, which is where the loop \
-         breaks with the new side still inside its fold; it said {:?}",
-        said[1]
-    );
-    // The fault that remains, named rather than tolerated. The clamp stops
-    // the unsigned wrap and leaves an edit whose start is past its own end,
-    // which is a better failure and still a failure. This line goes when
-    // the widening rule is fixed rather than guarded, and this test is
-    // meant to fail on that day.
-    assert!(
-        said[2].contains("widened to 214..3") && said[2].contains("starts after it ends"),
-        "the clamp converts the underflow into an inverted edit, and the \
-         record has to say so for as long as that is true; it said {:?}",
-        said[2]
+        said.is_empty(),
+        "the widening had nothing to report on this document; it said {said:#?}"
     );
 
     // The map still describes one document: what the fold map says it has,

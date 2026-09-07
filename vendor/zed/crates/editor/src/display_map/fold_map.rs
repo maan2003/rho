@@ -729,6 +729,11 @@ impl FoldMap {
         } else {
             let mut inlay_edits_iter = inlay_edits.iter().cloned().peekable();
 
+            // The snapshot the old tree is written against. Lengths on the
+            // two sides are only comparable through the buffer, so both
+            // snapshots have to be in hand to convert either way.
+            let old_inlay_snapshot = self.snapshot.inlay_snapshot.clone();
+
             let mut new_transforms = SumTree::<Transform>::default();
             let mut cursor = self.snapshot.transforms.cursor::<InlayOffset>(());
             cursor.seek(&InlayOffset(MultiBufferOffset(0)), Bias::Right);
@@ -755,27 +760,12 @@ impl FoldMap {
                 cursor.next();
 
                 let mut delta = edit.new_len() as isize - edit.old_len() as isize;
-                loop {
-                    edit.old.end = *cursor.start();
-
-                    if let Some(next_edit) = inlay_edits_iter.peek() {
-                        if next_edit.old.start > edit.old.end {
-                            break;
-                        }
-
-                        let next_edit = inlay_edits_iter.next().unwrap();
-                        delta += next_edit.new_len() as isize - next_edit.old_len() as isize;
-
-                        if next_edit.old.end >= edit.old.end {
-                            edit.old.end = next_edit.old.end;
-                            cursor.seek(&edit.old.end, Bias::Right);
-                            cursor.next();
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
+                delta += absorb_edits_behind_the_cursor(
+                    &mut edit,
+                    &mut cursor,
+                    &mut inlay_edits_iter,
+                    true,
+                );
                 edit.new.end = InlayOffset(MultiBufferOffset(
                     ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
                 ));
@@ -917,30 +907,107 @@ impl FoldMap {
                     if sum.input.len <= edit.new.end.0 {
                         break;
                     }
-                    let overshoot = sum.input.len.0 - edit.new.end.0.0;
-                    let covered = InlayOffset(MultiBufferOffset(cursor.start().0.0 + overshoot));
+                    // How much further the new tree reached than the
+                    // edit's end, and where in the old tree that is. Both
+                    // steps go through the buffer: `sum.input.len` and
+                    // `edit.new.end` are new-side inlay offsets and the
+                    // cursor stands in the old tree, and an inlay is bytes
+                    // one side has and the other does not, so adding a
+                    // new-side length to an old-side offset is only right
+                    // when no inlay lies between them. Buffer bytes past
+                    // the edit are the same bytes on both sides, so the
+                    // distance is measured there and laid off from the
+                    // cursor's own buffer position.
+                    let reached = inlay_snapshot.to_buffer_offset(InlayOffset(sum.input.len));
+                    let edit_end = inlay_snapshot.to_buffer_offset(edit.new.end);
+                    let overshoot = reached.0 - edit_end.0;
+                    let covered_buffer = MultiBufferOffset(
+                        old_inlay_snapshot.to_buffer_offset(*cursor.start()).0 + overshoot,
+                    );
+                    let covered = widen_end_over_inlays(&old_inlay_snapshot, covered_buffer);
                     cursor.seek_forward(&covered, Bias::Right);
-                    if *cursor.start() == covered {
-                        // The old tree has a boundary where the new one now
-                        // ends - the usual case, since a fold ends at the same
-                        // anchor on both sides - and the suffix starts there.
-                        edit.old.end = covered;
-                        edit.new.end = InlayOffset(sum.input.len);
+                    if cursor.item().is_some_and(|item| !item.is_fold())
+                        && *cursor.start() != covered
+                    {
+                        // The new tree ends part way through a plain run of
+                        // text. A fold has no meaningful half, but text
+                        // does: emit the part of this transform the new
+                        // tree has not described yet, from the new
+                        // snapshot, and step past it. The edit is not
+                        // touched. Widening it to the end of this transform
+                        // instead - which is what this did before - makes
+                        // an edit that reaches the end of the document
+                        // whenever the run does, and an edit that size is
+                        // O(rows composed so far) on every batch that gets
+                        // here, which is the cost rule broken rather than
+                        // exceeded.
+                        let remainder =
+                            old_inlay_snapshot.to_buffer_offset(cursor.end()).0 - covered_buffer.0;
+                        let remainder_end = widen_end_over_inlays(
+                            &inlay_snapshot,
+                            MultiBufferOffset(reached.0 + remainder),
+                        );
+                        if remainder_end.0 > sum.input.len {
+                            let text_summary = inlay_snapshot
+                                .text_summary_for_range(InlayOffset(sum.input.len)..remainder_end);
+                            push_isomorphic(&mut new_transforms, text_summary);
+                        }
+                        // The edit has to name everything the new tree
+                        // re-described, or the maps above are never told
+                        // that part of their document changed - but that is
+                        // `covered`, the extent of what was re-described,
+                        // and not the end of the transform it landed in.
+                        if covered > edit.old.end {
+                            edit.old.end = covered;
+                        }
+                        cursor.next();
+                        delta += absorb_edits_behind_the_cursor(
+                            &mut edit,
+                            &mut cursor,
+                            &mut inlay_edits_iter,
+                            false,
+                        );
+                        edit.new.end = InlayOffset(MultiBufferOffset(
+                            ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
+                        ));
                         break;
                     }
-                    // The new tree ends inside an old transform. It cannot be
-                    // appended whole and it cannot be split - a fold transform
-                    // has no meaningful half - so step over it and go round
-                    // again with the edit widened to its end. Whatever of it
-                    // the new tree does not already describe is emitted from
-                    // the new snapshot, by the folds above if a fold still
-                    // covers it and as text below if none does. The cursor
-                    // only ever moves forward, so this ends.
-                    let stepped_over = cursor.end();
+                    if *cursor.start() == covered {
+                        // The old tree has a boundary where the new one now
+                        // ends - the usual case, since a fold ends at the
+                        // same anchor on both sides - and the suffix starts
+                        // there.
+                        let absorbed = absorb_edits_behind_the_cursor(
+                            &mut edit,
+                            &mut cursor,
+                            &mut inlay_edits_iter,
+                            true,
+                        );
+                        delta += absorbed;
+                        edit.new.end = InlayOffset(MultiBufferOffset(
+                            ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
+                        ));
+                        break;
+                    }
+                    // The new tree ends inside an old transform. It cannot
+                    // be appended whole and it cannot be split - a fold
+                    // transform has no meaningful half - so step over it and
+                    // go round again with the edit widened to its end.
+                    // Whatever of it the new tree does not already describe
+                    // is emitted from the new snapshot, by the folds above
+                    // if a fold still covers it and as text below if none
+                    // does. The cursor only ever moves forward, so this
+                    // ends.
                     cursor.next();
-                    edit.old.end = stepped_over;
+                    let absorbed = absorb_edits_behind_the_cursor(
+                        &mut edit,
+                        &mut cursor,
+                        &mut inlay_edits_iter,
+                        true,
+                    );
+                    delta += absorbed;
                     edit.new.end = InlayOffset(MultiBufferOffset(
-                        sum.input.len.0 + (stepped_over.0.0 - covered.0.0),
+                        ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
                     ));
                 }
 
@@ -997,65 +1064,109 @@ impl FoldMap {
                     // can land the other in a fold of its own, and this
                     // repeats until neither side is inside one. It walks
                     // the folds the edit touches and no others.
+                    // How far the new side's start sits from the old
+                    // side's, in the coordinate they share, before any
+                    // widening. This is not zero in general: within a
+                    // batch, an edit's new side carries the shift of every
+                    // edit before it. What the widening must not do is
+                    // change it.
+                    #[cfg(feature = "wrap-test-support")]
+                    let unwidened_start = (edit.old.start, edit.new.start);
+                    #[cfg(feature = "wrap-test-support")]
+                    let start_skew = inlay_snapshot.to_buffer_offset(edit.new.start).0 as isize
+                        - old_inlay_snapshot.to_buffer_offset(edit.old.start).0 as isize;
                     loop {
                         old_transforms.seek(&edit.old.start, Bias::Left);
-                        let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
-                            edit.old.start.0.0 - old_transforms.start().0.0.0
-                        } else {
-                            0
-                        };
+                        let old_fold_start = old_transforms
+                            .item()
+                            .is_some_and(|t| t.is_fold())
+                            .then(|| old_inlay_snapshot.to_buffer_offset(old_transforms.start().0));
                         new_transforms.seek(&edit.new.start, Bias::Left);
-                        let new_delta = if new_transforms.item().is_some_and(|t| t.is_fold()) {
-                            edit.new.start.0.0 - new_transforms.start().0.0.0
-                        } else {
-                            0
+                        let new_fold_start = new_transforms
+                            .item()
+                            .is_some_and(|t| t.is_fold())
+                            .then(|| inlay_snapshot.to_buffer_offset(new_transforms.start().0));
+                        // The boundary the edit is being moved back to,
+                        // named once, in the coordinate both sides share.
+                        // Whichever side is inside a fold names the fold's
+                        // start; if both are, the earlier of the two wins,
+                        // because the later side is inside that fold too
+                        // once it gets there.
+                        let target = match (old_fold_start, new_fold_start) {
+                            (Some(old), Some(new)) => old.min(new),
+                            (Some(side), None) | (None, Some(side)) => side,
+                            (None, None) => break,
                         };
-                        // The step is the room both sides have, not what
-                        // the deeper one wants. The premise above - that
-                        // the two sides name the same boundary and so move
-                        // by the same inlay bytes - holds while whatever
-                        // shifted them sat in front of the fold, and fails
-                        // when something shifted one of them from inside
-                        // it: an inlay anchored within a fold moves the new
-                        // side out by its own length and leaves the fold's
-                        // start where it was. The new side is then deeper
-                        // into its fold than the old side is from the top
-                        // of the document, and the larger delta is more
-                        // than the old side has to give. Unclamped that
-                        // subtraction wraps, and an edit whose start is two
-                        // to the sixty-fourth minus a couple of hundred is
-                        // handed to a cursor that is then asked to seek
-                        // forward to an end far behind it.
-                        let wanted = old_delta.max(new_delta);
-                        let delta = wanted.min(edit.old.start.0.0).min(edit.new.start.0.0);
-                        // Recorded where the clamp bites, and before the
-                        // `delta == 0` break, because a side with nothing
-                        // in front of it clamps to zero and would leave by
-                        // the quiet door. The clamp keeps the arithmetic
-                        // safe; it does not make the premise true, and an
-                        // edit widened by less than the fold it was widened
-                        // to still names a fold the layers above will be
-                        // told about in full. What is recorded is that the
-                        // two sides did not move together, which is the
-                        // thing the comment above assumes never happens.
-                        #[cfg(feature = "wrap-test-support")]
-                        if wanted > delta {
-                            widening_violations.push(format!(
-                                "fold widening: both sides were to move by {wanted}, and the old side at {} and the new side at {} could only move by {delta}; the two sides did not name the same boundary",
-                                edit.old.start.0.0, edit.new.start.0.0
-                            ));
-                        }
-                        if delta == 0 {
+                        // Said back on each side in its own coordinates.
+                        // The two sides can differ here, and only here:
+                        // by the inlay bytes standing in front of the
+                        // boundary on that side. Stepping back over an
+                        // adjacent inlay brings it inside the widened
+                        // edit, which is where it belongs.
+                        let old_start = widen_start_over_inlays(&old_inlay_snapshot, target);
+                        let new_start = widen_start_over_inlays(&inlay_snapshot, target);
+                        if old_start >= edit.old.start && new_start >= edit.new.start {
                             break;
                         }
-                        edit.old.start.0.0 -= delta;
-                        edit.new.start.0.0 -= delta;
+                        edit.old.start = edit.old.start.min(old_start);
+                        edit.new.start = edit.new.start.min(new_start);
+                    }
+                    // Both sides moved back to one boundary, so the gap
+                    // between them is the one they started with. That is
+                    // the invariant the layers above depend on: they add
+                    // up the rows the edit names and expect the total the
+                    // snapshot beside them has. Sides that moved by
+                    // different amounts describe two different documents,
+                    // and that is the fault this records.
+                    #[cfg(feature = "wrap-test-support")]
+                    {
+                        let skew = inlay_snapshot.to_buffer_offset(edit.new.start).0 as isize
+                            - old_inlay_snapshot.to_buffer_offset(edit.old.start).0 as isize;
+                        if skew != start_skew {
+                            widening_violations.push(format!(
+                                "fold widening: the two sides of the start stood {start_skew} apart in the buffer and stand {skew} apart after widening; they did not move back to the same boundary"
+                            ));
+                        }
+                        // An inlay standing on a widened start belongs
+                        // inside the widened edit, whatever its own bias:
+                        // the direction of travel decides, and a start
+                        // travels backwards. A byte just before the start
+                        // that maps to the same buffer offset as the start
+                        // is inlay text left outside.
+                        for (side, start, unwidened, snapshot) in [
+                            (
+                                "old",
+                                edit.old.start,
+                                unwidened_start.0,
+                                &old_inlay_snapshot,
+                            ),
+                            ("new", edit.new.start, unwidened_start.1, &inlay_snapshot),
+                        ] {
+                            // Only a side the widening moved. An inlay
+                            // beside a start that never moved is where the
+                            // inlay map put the edit, and the edit already
+                            // covers it; this is about a boundary chosen
+                            // here.
+                            if start < unwidened && start.0.0 > 0 {
+                                let before = InlayOffset(MultiBufferOffset(start.0.0 - 1));
+                                if snapshot.to_buffer_offset(before)
+                                    == snapshot.to_buffer_offset(start)
+                                {
+                                    widening_violations.push(format!(
+                                        "fold widening: an inlay stands on the widened {side} start at {} and was left outside the edit",
+                                        start.0.0
+                                    ));
+                                }
+                            }
+                        }
                     }
                     let old_start =
                         old_transforms.start().1.0 + (edit.old.start - old_transforms.start().0);
                     let new_start =
                         new_transforms.start().1.0 + (edit.new.start - new_transforms.start().0);
 
+                    #[cfg(feature = "wrap-test-support")]
+                    let unwidened_end = (edit.old.end, edit.new.end);
                     loop {
                         old_transforms.seek_forward(&edit.old.end, Bias::Right);
                         let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
@@ -1075,6 +1186,24 @@ impl FoldMap {
                         }
                         edit.old.end.0.0 += delta;
                         edit.new.end.0.0 += delta;
+                    }
+                    // The mirror at the end: an end travels forwards, so
+                    // a byte just after it mapping to the same buffer
+                    // offset is inlay text left outside.
+                    #[cfg(feature = "wrap-test-support")]
+                    for (side, end, unwidened, snapshot) in [
+                        ("old", edit.old.end, unwidened_end.0, &old_inlay_snapshot),
+                        ("new", edit.new.end, unwidened_end.1, &inlay_snapshot),
+                    ] {
+                        if end > unwidened && end < snapshot.len() {
+                            let after = InlayOffset(MultiBufferOffset(end.0.0 + 1));
+                            if snapshot.to_buffer_offset(after) == snapshot.to_buffer_offset(end) {
+                                widening_violations.push(format!(
+                                    "fold widening: an inlay stands on the widened {side} end at {} and was left outside the edit",
+                                    end.0.0
+                                ));
+                            }
+                        }
                     }
                     let old_end =
                         old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
@@ -1547,6 +1676,111 @@ fn push_isomorphic(transforms: &mut SumTree<Transform>, summary: MBTextSummary) 
             (),
         )
     }
+}
+
+/// The inlay offset of a buffer boundary, on the side of any inlay sitting
+/// there that a *start* being widened backwards wants: in front of it, so
+/// the inlay falls inside the widened edit.
+///
+/// `InlaySnapshot::to_inlay_offset` cannot answer this on its own. It
+/// resolves the ambiguity at an inlay by the inlay's own bias - stepping
+/// over left-biased ones and stopping in front of right-biased ones - so
+/// which side you get is a property of the inlay rather than of what you
+/// are doing with it. A widening has a direction of travel and the choice
+/// belongs to that. An inlay left straddling the edge of an edit is a side
+/// naming bytes the other side does not, which is the fault this whole
+/// function was rewritten to make impossible.
+fn widen_start_over_inlays(snapshot: &InlaySnapshot, buffer: MultiBufferOffset) -> InlayOffset {
+    let offset = snapshot.to_inlay_offset(buffer);
+    let mut start = offset;
+    while start > InlayOffset(MultiBufferOffset(0)) {
+        let before = InlayOffset(MultiBufferOffset(start.0.0 - 1));
+        if snapshot.to_buffer_offset(before) != buffer {
+            break;
+        }
+        start = before;
+    }
+    start
+}
+
+/// The same boundary on the side an *end* being widened forwards wants:
+/// past any inlay sitting there, so the inlay falls inside the widened
+/// edit rather than beyond its end.
+fn widen_end_over_inlays(snapshot: &InlaySnapshot, buffer: MultiBufferOffset) -> InlayOffset {
+    let offset = snapshot.to_inlay_offset(buffer);
+    let mut end = offset;
+    let limit = snapshot.len();
+    while end < limit {
+        let after = InlayOffset(MultiBufferOffset(end.0.0 + 1));
+        if snapshot.to_buffer_offset(after) != buffer {
+            break;
+        }
+        end = after;
+    }
+    end
+}
+
+/// Grow an edit's end to the boundary its cursor now stands on, and take in
+/// the later edits that boundary has moved past.
+///
+/// The rule this keeps, and the one both faults in this function broke: the
+/// cursor never passes an offset a later edit still names, and the two sides
+/// of an edit always name the same bytes. An edit's end moves forward for two
+/// reasons - the old tree's boundary lies past it, or the folds emitted for
+/// it reach past it - and in both cases the edits behind the new end can no
+/// longer be sliced to, because the cursor is already past them. They are
+/// taken into this edit instead, with their lengths, so that the one edit
+/// that survives describes everything the cursor walked over.
+///
+/// It moves the old end only, and returns the length the edits it took in
+/// added or removed. The new end is the caller's, because the two callers
+/// know it from different places: the one that widens to a boundary in the
+/// old tree derives it from the running delta, and the one that widens
+/// because the emitted folds reached past the edit derives it from how far
+/// the new tree already reaches. What they must both do is move the new end
+/// by what this returns.
+fn absorb_edits_behind_the_cursor<I>(
+    edit: &mut InlayEdit,
+    cursor: &mut sum_tree::Cursor<'_, '_, Transform, InlayOffset>,
+    edits: &mut iter::Peekable<I>,
+    widen_to_cursor: bool,
+) -> isize
+where
+    I: Iterator<Item = InlayEdit>,
+{
+    let mut absorbed = 0;
+    loop {
+        // Where the cursor has reached is what decides which edits can no
+        // longer be sliced to. How far this edit is widened is a separate
+        // question: when a fold was taken whole the edit has to name all of
+        // it, and when a run of text was split the edit only has to name
+        // what the edits behind the cursor named, which is the difference
+        // between O(edit) and O(document).
+        let reach = *cursor.start();
+        if widen_to_cursor {
+            edit.old.end = reach;
+        }
+
+        let Some(next_edit) = edits.peek() else {
+            break;
+        };
+        if next_edit.old.start > reach {
+            break;
+        }
+
+        let next_edit = edits.next().expect("peeked");
+        absorbed += next_edit.new_len() as isize - next_edit.old_len() as isize;
+
+        if next_edit.old.end > edit.old.end {
+            edit.old.end = next_edit.old.end;
+        }
+        if next_edit.old.end >= reach {
+            cursor.seek_forward(&edit.old.end, Bias::Right);
+            cursor.next();
+        }
+    }
+
+    absorbed
 }
 
 fn elided_ranges(
