@@ -401,6 +401,64 @@ nothing to say, or the user starts checking the other app again.
 Typed events: connected, disconnected, item ingested, replied, each with
 the thread identity. No strings where an enum will do.
 
+## The fake is a server, not a test double
+
+`rho-fake-slack` is its own crate, a library and a binary. The fake lived
+inside `rho-slack` for as long as it was a test double: a client library
+carrying the server it is tested against, which means the server is only ever
+as good as one test needs at a time, only one client can be pointed at it, and
+nothing outside the crate pays its cost so nobody sees it. Out on its own the
+goal changes: a workspace a client cannot tell from Slack, that several
+clients connect to at once, that keeps living while they are connected.
+`rho-slack` depends on it only for tests, so nothing about the fake can reach
+the client.
+
+**The surface is every method rho calls, in Slack's shapes.** Real cursor
+pagination (`response_metadata.next_cursor`, `has_more`, `latest`/`oldest`/
+`inclusive` meaning what they mean at Slack), and real error codes rather than
+a 500: `invalid_auth`, `channel_not_found`, `not_in_channel`,
+`message_not_found`, `already_reacted`, `no_reaction`, and `ratelimited` as a
+429 with `Retry-After`, because a client that only reads the body never backs
+off. The socket surface is held to the same standard — `hello`, `message` with
+the subtypes rho reads, the reaction and mark events, `reconnect_url`, a
+disconnect with a reason — and the failure paths stay first-class, since a
+real server drops sockets and refuses calls and rho has to survive it.
+
+**One typed store, and the counts derived from it.** Conversations, users,
+messages, threads, reactions, and read cursors per person and per thread, as
+types rather than JSON blobs; the wire shapes are made from them at the edge.
+Unread counts are derived from the cursors and never stored beside them, so
+the server cannot contradict itself — `client.counts` saying four while the
+history shows three is a thing rho would then have to cope with, and Slack
+does not do it. The cost rule holds here as in the client: a request costs the
+rows it touches plus a lookup to place them, never a pass over the workspace.
+
+**One seed is one world.** The generated workspace comes from eng-8gpr's
+generator as a library call, so this crate owns no fixture data, and the
+default is the scale that matters: 300 conversations and 450,000 messages,
+long-tailed. The seed fixes the world *and* the traffic that arrives after it,
+so a run replays.
+
+**Time runs in it.** Other people post, reply in threads, react, edit and mark
+read on a schedule taken off the same seed, at a configurable rate, so a
+connected client sees a workspace that is alive rather than a fixture that is
+frozen. It can be advanced explicitly as well as run in real time — a test
+says "an hour passes" instead of sleeping through it — and it stops cleanly on
+drop.
+
+**Several clients, and the server checking them.** Each connected client is a
+named user and the server knows what it told whom, which is what makes
+consistency checkable from the one place that holds the whole truth: a message
+visible to a conversation's members reached every connected member, read
+cursors and unread counts agree between clients and with the store, and no
+client was told something the store does not say. Violations come back as
+typed observations, not log lines.
+
+**Two transports, one vocabulary.** In-process from a test — start it, get an
+API base and a socket URL, point one `rho-slack` session or several or a whole
+GUI at it — and as a binary for the rig, where the control endpoint takes the
+same typed actions the in-process handle takes.
+
 ## What stays the same for the human
 
 - The dealer, verdict keys, deal history, filing.

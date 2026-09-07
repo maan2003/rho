@@ -13916,6 +13916,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-fake-slack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest 0.12.28",
+ "rho-slack",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rho-gui"
 version = "0.1.0"
 dependencies = [

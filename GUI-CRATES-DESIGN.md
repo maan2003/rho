@@ -2285,6 +2285,59 @@ swamped it, and no frame in the report records how many rows it drew.
 +check comes first, which is b8os's rule from the fold cut applied to a cost
 +test: give the harness a question whose answer you already know.
 +
+- **`rho-fake-slack`, first landing: the store, the seed and the read side**
+  (new crate). The fake was a type inside `rho-slack` — the client library
+  carrying the server it is tested against. This is the first of three
+  landings that make it a server: the typed store, the world one number
+  builds, every read-side method rho calls, and one client's first full sync
+  measured against it. The socket and the living schedule come next, then
+  several clients at once with the server checking that what they see agrees.
+  The design is in SLACK-DESIGN.md, "The fake is a server, not a test double".
+  *Typed, and derived.* Conversations, users, messages, threads, reactions and
+  read cursors are types, and the wire shapes are made from them at the edge,
+  so Slack's oddities — three booleans for one kind, `ts` as a string with six
+  decimals, `dm_count` rather than `unread_count`, a `next_cursor` that is
+  empty rather than absent — live in one file. Unread counts are derived from
+  the cursors rather than stored beside them: a server that keeps both can say
+  four while its own history shows three, and a client written against that is
+  being taught something Slack does not do.
+  *The cost rule, on the server.* A conversation is one sorted vector, so a
+  window of history is two binary searches and a slice. The counts a client
+  asks for on every poll are an index subtraction against a prefix sum of
+  mentions built as each conversation arrives — never a walk of the messages
+  behind the cursor. The activity feed is the tail of a mention index, so it
+  is a slice rather than a search of the workspace.
+  *The numbers, at the default 300 conversations and 450,000 messages*
+  (`cargo run --release --example full_sync`):
+
+  | | |
+  | --- | --- |
+  | seed the world | 194 ms |
+  | resident, world in hand | 179 MiB |
+  | a client's first full sync | 136–148 ms, 306 requests, 15,000 messages |
+  | of which the list | 5–6 ms for 300 conversations |
+  | history, one client | 1,894 requests/s |
+  | history, eight clients | 23,235 requests/s |
+
+  The full sync is a real `rho-slack` client from cold, not a script pretending
+  to be one: the list, the badge counts, the mutes, the custom emoji, the
+  followed threads, and then the first page of every conversation, which is
+  what fills the rows. 136 ms is the number a reader feels between starting rho
+  and seeing their list, against a workspace the size of the user's own.
+  *The message count is a budget.* 450,000 means 450,000 messages in the world,
+  replies included — a thread of four comes out of its conversation's share
+  rather than on top of it — because a seed whose count means "top-level only"
+  quietly builds a bigger world than it says.
+  *Where the generator goes.* The world is behind one call, so eng-8gpr's
+  generator replaces it as a library call without anything else in the crate
+  moving; until it hands back typed conversations and messages rather than
+  seeding a `Fake` directly, this crate builds its own from the same kind of
+  seed (splitmix64, deterministic from the number alone). Stated because it is
+  a difference from the design: today one seed means one world *here*, and the
+  point of a single generator is that it means one world everywhere.
+  Gate green: rho-fake-slack 7 tests and 1 doc test, clippy `-D warnings`
+  clean, `cargo fmt --check` clean, workspace suite green.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists
