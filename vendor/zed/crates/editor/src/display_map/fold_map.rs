@@ -557,6 +557,27 @@ pub struct FoldMap {
     /// before anything is asked to seek anywhere.
     #[cfg(feature = "wrap-test-support")]
     widening_violations: Vec<String>,
+    /// Every sync whose emitted edits did not account for the change in
+    /// this map's own output extent.
+    ///
+    /// The layer-by-layer accounting question, asked of the fold map at
+    /// its own output: does this snapshot's extent equal the last one's
+    /// plus the net of the edits handed over with it. A sync that says
+    /// the document grew by six bytes over an output that did not grow is
+    /// telling the layers above about a document that does not exist, and
+    /// they find out later and further away - as `display point out of
+    /// range` in `FoldPoint::to_offset`, reached from `BlockMap::sync`,
+    /// or as rows a snapshot claims and the chunks do not yield.
+    #[cfg(feature = "wrap-test-support")]
+    accounting_violations: Vec<String>,
+    /// How many times the two ends of an edit met at one buffer offset at
+    /// the end of one and the same fold - the shape that is allowed.
+    ///
+    /// Kept so that an empty violation record means something. Without it,
+    /// a document whose ends converge legitimately and one whose ends never
+    /// converge at all are the same silence.
+    #[cfg(feature = "wrap-test-support")]
+    end_convergences: usize,
 }
 
 /// Whether a widened edit still describes a range of a document that exists.
@@ -595,11 +616,31 @@ impl FoldMap {
         std::mem::take(&mut self.widening_violations)
     }
 
+    /// Every sync whose edits did not account for its own output extent,
+    /// and forgets them. Empty is the answer a healthy sync gives.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_accounting_violations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.accounting_violations)
+    }
+
+    /// How many edits had both ends widened to the end of one and the same
+    /// fold, and forgets the count. A test asserting the violation record
+    /// is empty asserts this is not zero beside it, or it has not shown
+    /// that the shape is legitimate - only that it did not occur.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_end_convergences(&mut self) -> usize {
+        std::mem::take(&mut self.end_convergences)
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn new(inlay_snapshot: InlaySnapshot) -> (Self, FoldSnapshot) {
         let this = Self {
             #[cfg(feature = "wrap-test-support")]
             widening_violations: Vec::new(),
+            #[cfg(feature = "wrap-test-support")]
+            accounting_violations: Vec::new(),
+            #[cfg(feature = "wrap-test-support")]
+            end_convergences: 0,
             snapshot: FoldSnapshot {
                 folds: SumTree::new(&inlay_snapshot.buffer),
                 transforms: SumTree::from_item(
@@ -1033,6 +1074,10 @@ impl FoldMap {
             let mut fold_edits = Vec::with_capacity(inlay_edits.len());
             #[cfg(feature = "wrap-test-support")]
             let mut widening_violations = Vec::new();
+            #[cfg(feature = "wrap-test-support")]
+            let mut accounting_violations = Vec::new();
+            #[cfg(feature = "wrap-test-support")]
+            let mut end_convergences = 0usize;
             // Taken from the trees before the cursors shadow them: what a
             // widened edit is checked against is the whole of each side,
             // and a cursor only knows where it is standing.
@@ -1167,15 +1212,38 @@ impl FoldMap {
 
                     #[cfg(feature = "wrap-test-support")]
                     let unwidened_end = (edit.old.end, edit.new.end);
+                    // The last fold each end was widened out of, as a
+                    // range of the buffer, which is the only coordinate in
+                    // which the two sides' folds can be compared.
+                    #[cfg(feature = "wrap-test-support")]
+                    let mut widened_out_of: (
+                        Option<std::ops::Range<MultiBufferOffset>>,
+                        Option<std::ops::Range<MultiBufferOffset>>,
+                    ) = (None, None);
                     loop {
                         old_transforms.seek_forward(&edit.old.end, Bias::Right);
                         let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
+                            #[cfg(feature = "wrap-test-support")]
+                            {
+                                widened_out_of.0 = Some(
+                                    old_inlay_snapshot.to_buffer_offset(old_transforms.start().0)
+                                        ..old_inlay_snapshot
+                                            .to_buffer_offset(old_transforms.end().0),
+                                );
+                            }
                             old_transforms.end().0.0.0 - edit.old.end.0.0
                         } else {
                             0
                         };
                         new_transforms.seek_forward(&edit.new.end, Bias::Right);
                         let new_delta = if new_transforms.item().is_some_and(|t| t.is_fold()) {
+                            #[cfg(feature = "wrap-test-support")]
+                            {
+                                widened_out_of.1 = Some(
+                                    inlay_snapshot.to_buffer_offset(new_transforms.start().0)
+                                        ..inlay_snapshot.to_buffer_offset(new_transforms.end().0),
+                                );
+                            }
                             new_transforms.end().0.0.0 - edit.new.end.0.0
                         } else {
                             0
@@ -1186,6 +1254,46 @@ impl FoldMap {
                         }
                         edit.old.end.0.0 += delta;
                         edit.new.end.0.0 += delta;
+                    }
+                    // Whether the two ends met, and whether they had a
+                    // right to.
+                    //
+                    // Two ends inside one fold converge on one buffer
+                    // offset legitimately: the fold is re-emitted whole, so
+                    // both ends are moved to its end and that end is the
+                    // same text on both sides. Two ends that converge for
+                    // any other reason - two different folds whose ends
+                    // happen to land on one offset, or a common step
+                    // carrying one end further than its own fold needed -
+                    // are the end's version of the inverted range the
+                    // common step used to hide at the start.
+                    //
+                    // The legitimate case is counted and not only the
+                    // faulty one recorded. Silence on its own cannot tell
+                    // a document whose ends met legitimately from one whose
+                    // ends never met at all, and without the count "it
+                    // never fired" would be partly a statement about the
+                    // documents rather than about the rule. eng-8gpr's
+                    // point, from having been caught by their own record.
+                    #[cfg(feature = "wrap-test-support")]
+                    if edit.old.end > unwidened_end.0 || edit.new.end > unwidened_end.1 {
+                        let old_buffer = old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                        let new_buffer = inlay_snapshot.to_buffer_offset(edit.new.end);
+                        if old_buffer == new_buffer {
+                            match (&widened_out_of.0, &widened_out_of.1) {
+                                (Some(old), Some(new)) if old == new => {
+                                    end_convergences += 1;
+                                }
+                                (old, new) => {
+                                    accounting_violations.push(format!(
+                                        "fold end convergence: the two ends met at buffer offset {}, and the old side was widened out of {:?} while the new side was widened out of {:?}; ends only have a right to meet at the end of one fold",
+                                        old_buffer.0,
+                                        old.as_ref().map(|r| r.start.0..r.end.0),
+                                        new.as_ref().map(|r| r.start.0..r.end.0),
+                                    ));
+                                }
+                            }
+                        }
                     }
                     // The mirror at the end: an end travels forwards, so
                     // a byte just after it mapping to the same buffer
@@ -1232,6 +1340,27 @@ impl FoldMap {
                 }
 
                 fold_edits = consolidate_fold_edits(fold_edits);
+
+                // Asked after consolidation, because consolidation is
+                // part of what is handed over and a fault introduced
+                // there would be invisible before it.
+                #[cfg(feature = "wrap-test-support")]
+                {
+                    let net: isize = fold_edits
+                        .iter()
+                        .map(|edit| {
+                            (edit.new.end.0 - edit.new.start.0) as isize
+                                - (edit.old.end.0 - edit.old.start.0) as isize
+                        })
+                        .sum();
+                    let accounted = old_extent as isize + net;
+                    if accounted != new_extent as isize {
+                        accounting_violations.push(format!(
+                            "fold output accounting: the old output was {old_extent} bytes and the {} edit(s) handed over net {net}, which is {accounted}; the new output is {new_extent}",
+                            fold_edits.len()
+                        ));
+                    }
+                }
                 walked_items = walked_items
                     .saturating_add(old_transforms.walked_items())
                     .saturating_add(new_transforms.walked_items());
@@ -1242,6 +1371,12 @@ impl FoldMap {
             self.snapshot.version += 1;
             #[cfg(feature = "wrap-test-support")]
             self.widening_violations.extend(widening_violations);
+            #[cfg(feature = "wrap-test-support")]
+            self.accounting_violations.extend(accounting_violations);
+            #[cfg(feature = "wrap-test-support")]
+            {
+                self.end_convergences += end_convergences;
+            }
             fold_edits
         };
         profile.walked_items(walked_items);

@@ -149,6 +149,53 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
         "the widening had nothing to report on this document; it said {said:#?}"
     );
 
+    // What the accounting record says here, in full and on purpose. This
+    // is the fault that remains: the fold map tells the layers above the
+    // document lost eight bytes, and its own output extent did not change.
+    // Eight is the length of the `y` inlay spliced above, which is what
+    // ties it to the end of an edit still being widened by one step common
+    // to both sides. This assertion is meant to fail on the day that rule
+    // is fixed rather than guarded.
+    let books = editor
+        .update(cx, |editor, _, cx| {
+            editor
+                .display_map
+                .update(cx, |map, _| map.take_fold_accounting_violations())
+        })
+        .expect("read what the accounting recorded");
+    assert_eq!(
+        books.len(),
+        1,
+        "one sync on this document does not account for its own output; it said {books:#?}"
+    );
+    assert!(
+        books[0].contains("net -8"),
+        "the edits say the output lost eight bytes, the length of the inlay, \
+         and the output did not shrink; it said {:?}",
+        books[0]
+    );
+
+    // And what it does not say. The two ends of an edit meeting at one
+    // buffer offset is legitimate when it is the end of one and the same
+    // fold on both sides, and that is what happens here - once, at the end
+    // of the fold. Counted rather than left to silence: without the count,
+    // a document whose ends meet legitimately and one whose ends never meet
+    // at all read the same, and an empty violation record would be a
+    // statement about this document rather than about the rule.
+    let met = editor
+        .update(cx, |editor, _, cx| {
+            editor
+                .display_map
+                .update(cx, |map, _| map.take_fold_end_convergences())
+        })
+        .expect("read how often the ends met legitimately");
+    assert!(
+        met > 0,
+        "the ends of an edit meet at the end of the fold on this document, \
+         so an empty convergence-fault record means the shape was allowed \
+         rather than absent; they met {met} times"
+    );
+
     // The map still describes one document: what the fold map says it has,
     // the inlay map beneath it agrees it has.
     editor

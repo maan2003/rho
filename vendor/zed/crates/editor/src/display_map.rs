@@ -416,6 +416,22 @@ impl DisplayMap {
         self.fold_map.take_widening_violations()
     }
 
+    /// Every fold sync whose edits did not account for the change in the
+    /// fold map's own output extent since the last time this was asked.
+    /// See [`FoldMap::take_accounting_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_accounting_violations(&mut self) -> Vec<String> {
+        self.fold_map.take_accounting_violations()
+    }
+
+    /// How many fold edits had both ends widened to the end of one and the
+    /// same fold since the last time this was asked. See
+    /// [`FoldMap::take_end_convergences`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_end_convergences(&mut self) -> usize {
+        self.fold_map.take_end_convergences()
+    }
+
     /// See [`wrap_map::WrapMap::take_sync_violations`].
     #[cfg(feature = "wrap-test-support")]
     pub fn take_wrap_sync_violations(&mut self, cx: &mut gpui::App) -> Vec<String> {
