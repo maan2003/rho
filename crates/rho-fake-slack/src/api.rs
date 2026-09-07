@@ -3,16 +3,17 @@
 //! control endpoint take.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
+use crate::socket::Wire;
 use crate::store::Store;
-use crate::types::{ChannelId, Ts, UserId};
-use crate::wire;
+use crate::types::{ChannelId, Message, Ts, UserId};
+use crate::{socket, wire};
 
 /// Every method this server answers. A typed name rather than a string, so a
 /// caller cannot ask for a method that does not exist and a refusal cannot be
@@ -30,6 +31,15 @@ pub enum Method {
     EmojiList,
     SubscriptionsThreadGetView,
     ActivityFeed,
+    RtmConnect,
+    ChatPostMessage,
+    ChatUpdate,
+    ReactionsAdd,
+    ReactionsRemove,
+    ConversationsMark,
+    SubscriptionsThreadAdd,
+    SubscriptionsThreadRemove,
+    SubscriptionsThreadMark,
 }
 
 impl Method {
@@ -46,8 +56,35 @@ impl Method {
             "emoji.list" => Self::EmojiList,
             "subscriptions.thread.getView" => Self::SubscriptionsThreadGetView,
             "activity.feed" => Self::ActivityFeed,
+            "rtm.connect" => Self::RtmConnect,
+            "chat.postMessage" => Self::ChatPostMessage,
+            "chat.update" => Self::ChatUpdate,
+            "reactions.add" => Self::ReactionsAdd,
+            "reactions.remove" => Self::ReactionsRemove,
+            "conversations.mark" => Self::ConversationsMark,
+            "subscriptions.thread.add" => Self::SubscriptionsThreadAdd,
+            "subscriptions.thread.remove" => Self::SubscriptionsThreadRemove,
+            "subscriptions.thread.mark" => Self::SubscriptionsThreadMark,
             _ => return None,
         })
+    }
+}
+
+impl Method {
+    /// Whether the method changes the workspace. Writes take the store
+    /// exclusively and end in a frame; reads do neither.
+    pub fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::ChatPostMessage
+                | Self::ChatUpdate
+                | Self::ReactionsAdd
+                | Self::ReactionsRemove
+                | Self::ConversationsMark
+                | Self::SubscriptionsThreadAdd
+                | Self::SubscriptionsThreadRemove
+                | Self::SubscriptionsThreadMark
+        )
     }
 }
 
@@ -60,6 +97,8 @@ pub enum Refusal {
     UserNotFound,
     MessageNotFound,
     NotInChannel,
+    AlreadyReacted,
+    NoReaction,
     UnknownMethod,
     RateLimited { retry_after_seconds: u32 },
 }
@@ -72,6 +111,8 @@ impl Refusal {
             Self::UserNotFound => "user_not_found",
             Self::MessageNotFound => "message_not_found",
             Self::NotInChannel => "not_in_channel",
+            Self::AlreadyReacted => "already_reacted",
+            Self::NoReaction => "no_reaction",
             Self::UnknownMethod => "unknown_method",
             Self::RateLimited { .. } => "ratelimited",
         }
@@ -152,8 +193,14 @@ impl Control {
 
 #[derive(Clone)]
 pub struct Server {
-    pub store: Arc<Store>,
+    /// Behind a lock because the world is alive: the schedule and the
+    /// clients both write to it. Reads take it shared and never hold it
+    /// across an await, so a history page and a scheduled message do not
+    /// wait on each other for longer than the page takes to build.
+    pub store: Arc<RwLock<Store>>,
     pub control: Arc<Mutex<Control>>,
+    /// Where a write becomes a frame every connected client sees.
+    pub live: Wire,
 }
 
 /// How many rows a paginated call returns when the caller does not say.
@@ -168,7 +215,17 @@ pub async fn call(
     // The body is read rather than extracted, because Slack accepts a call
     // with no body at all and a `Form` extractor answers that with a 415 the
     // client has never seen.
-    let form = parse_form(&body);
+    let json = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    // Slack takes some calls as a form and some as JSON, and the client
+    // sends each the way Slack wants it. Both arrive here as the same flat
+    // map of fields, so no method has to know which it was.
+    let form = match json {
+        true => parse_json(&body),
+        false => parse_form(&body),
+    };
     let Some(method) = Method::parse(name.trim_end_matches(".json")) else {
         return Refusal::UnknownMethod.response();
     };
@@ -187,14 +244,161 @@ pub async fn call(
         }
         *control.served.entry(method).or_default() += 1;
     }
-    match answer(&server.store, method, &form) {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("127.0.0.1")
+        .to_owned();
+    // Reads take the store shared; writes take it exclusively and put a
+    // frame on the wire, which is how one client's action reaches the
+    // others.
+    let answered = match method.writes() {
+        true => apply(&server, method, &form),
+        false => answer(&server.store.read().expect("store"), method, &form, &host),
+    };
+    match answered {
         Ok(body) => axum::Json(body).into_response(),
         Err(refusal) => refusal.response(),
     }
 }
 
-fn answer(store: &Store, method: Method, form: &HashMap<String, String>) -> Result<Value, Refusal> {
+/// The write side. Every one of these ends in a frame, because that is how
+/// Slack tells the client — including the client that made the call — that
+/// it happened.
+fn apply(
+    server: &Server,
+    method: Method,
+    form: &HashMap<String, String>,
+) -> Result<Value, Refusal> {
+    let mut store = server.store.write().expect("store");
     match method {
+        Method::ChatPostMessage => {
+            let channel = ChannelId(field(form, "channel")?);
+            let thread_ts = form.get("thread_ts").and_then(|ts| Ts::parse(ts));
+            let text = form.get("text").cloned().unwrap_or_default();
+            let ts = store.tick();
+            let self_id = store.self_id.clone();
+            let message = Message {
+                ts,
+                thread_ts,
+                user: self_id,
+                text,
+                edited: false,
+                reply_count: 0,
+                latest_reply: None,
+                reactions: Vec::new(),
+                deleted: false,
+                mentions_self: false,
+            };
+            if !store.post(&channel, message.clone()) {
+                return Err(Refusal::ChannelNotFound);
+            }
+            server.live.publish(socket::message(&channel, &message));
+            Ok(json!({"ok": true, "channel": channel.0, "ts": ts.to_string()}))
+        }
+        Method::ChatUpdate => {
+            let channel = ChannelId(field(form, "channel")?);
+            let ts = Ts::parse(&field(form, "ts")?).ok_or(Refusal::MessageNotFound)?;
+            let text = form.get("text").cloned().unwrap_or_default();
+            let names_self = text.contains(&format!("<@{}>", store.self_id.0));
+            if !store.edit(&channel, ts, text, names_self) {
+                return Err(Refusal::MessageNotFound);
+            }
+            let at = store.tick();
+            let (_, edited) = store
+                .message(&channel, ts)
+                .ok_or(Refusal::MessageNotFound)?;
+            server.live.publish(socket::edited(&channel, at, edited));
+            Ok(json!({"ok": true, "channel": channel.0, "ts": ts.to_string()}))
+        }
+        Method::ReactionsAdd | Method::ReactionsRemove => {
+            let added = method == Method::ReactionsAdd;
+            let channel = ChannelId(field(form, "channel")?);
+            let ts = Ts::parse(&field(form, "timestamp")?).ok_or(Refusal::MessageNotFound)?;
+            let name = field(form, "name")?;
+            let user = store.self_id.clone();
+            if store.message(&channel, ts).is_none() {
+                return Err(Refusal::MessageNotFound);
+            }
+            // Slack says so when nothing changed, and the client is written
+            // to read those two as "already in the state you asked for".
+            if !store.react(&channel, ts, &user, &name, added) {
+                return Err(match added {
+                    true => Refusal::AlreadyReacted,
+                    false => Refusal::NoReaction,
+                });
+            }
+            server
+                .live
+                .publish(socket::reaction(added, &channel, ts, &user, &name));
+            Ok(json!({"ok": true}))
+        }
+        Method::ConversationsMark => {
+            let channel = ChannelId(field(form, "channel")?);
+            let ts = Ts::parse(&field(form, "ts")?).ok_or(Refusal::MessageNotFound)?;
+            let kind = store
+                .conversation(&channel)
+                .ok_or(Refusal::ChannelNotFound)?
+                .kind;
+            let user = store.self_id.clone();
+            store.set_read(&channel, user, ts);
+            server.live.publish(socket::marked(kind, &channel, ts));
+            Ok(json!({"ok": true}))
+        }
+        Method::SubscriptionsThreadAdd | Method::SubscriptionsThreadRemove => {
+            let channel = ChannelId(field(form, "channel")?);
+            let parent = Ts::parse(&field(form, "thread_ts")?).ok_or(Refusal::MessageNotFound)?;
+            if store.message(&channel, parent).is_none() {
+                return Err(Refusal::MessageNotFound);
+            }
+            let name = match method {
+                Method::SubscriptionsThreadAdd => {
+                    store.follow_thread(channel.clone(), parent);
+                    "thread_subscribed"
+                }
+                _ => {
+                    store.unfollow_thread(&channel, parent);
+                    "thread_unsubscribed"
+                }
+            };
+            server
+                .live
+                .publish(socket::thread(name, &channel, parent, None));
+            Ok(json!({"ok": true}))
+        }
+        Method::SubscriptionsThreadMark => {
+            let channel = ChannelId(field(form, "channel")?);
+            let parent = Ts::parse(&field(form, "thread_ts")?).ok_or(Refusal::MessageNotFound)?;
+            let ts = Ts::parse(&field(form, "ts")?).ok_or(Refusal::MessageNotFound)?;
+            let user = store.self_id.clone();
+            store.set_thread_read(&channel, parent, user, ts);
+            server
+                .live
+                .publish(socket::thread("thread_marked", &channel, parent, Some(ts)));
+            Ok(json!({"ok": true}))
+        }
+        _ => Err(Refusal::UnknownMethod),
+    }
+}
+
+fn answer(
+    store: &Store,
+    method: Method,
+    form: &HashMap<String, String>,
+    host: &str,
+) -> Result<Value, Refusal> {
+    match method {
+        Method::RtmConnect => {
+            let name = store
+                .user(&store.self_id)
+                .map(|user| user.handle.clone())
+                .unwrap_or_default();
+            Ok(socket::rtm(
+                &format!("ws://{host}/socket"),
+                &store.self_id,
+                &name,
+            ))
+        }
         Method::UsersConversations => {
             let (from, limit) = window(form);
             let all: Vec<Value> = store
@@ -358,7 +562,35 @@ fn answer(store: &Store, method: Method, form: &HashMap<String, String>) -> Resu
                 .collect();
             Ok(json!({"ok": true, "emoji": emoji}))
         }
+        // Every writing method went to `apply` before this was called.
+        Method::ChatPostMessage
+        | Method::ChatUpdate
+        | Method::ReactionsAdd
+        | Method::ReactionsRemove
+        | Method::ConversationsMark
+        | Method::SubscriptionsThreadAdd
+        | Method::SubscriptionsThreadRemove
+        | Method::SubscriptionsThreadMark => Err(Refusal::UnknownMethod),
     }
+}
+
+/// A JSON body flattened to the same field map a form gives, so that
+/// `chat.postMessage` and `conversations.mark` are the same shape of handler
+/// even though Slack takes them differently.
+fn parse_json(body: &str) -> HashMap<String, String> {
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) else {
+        return HashMap::new();
+    };
+    fields
+        .into_iter()
+        .map(|(name, value)| {
+            let value = match value {
+                Value::String(text) => text,
+                other => other.to_string(),
+            };
+            (name, value)
+        })
+        .collect()
 }
 
 /// `a=1&b=two%20words`, the way a client sends it.

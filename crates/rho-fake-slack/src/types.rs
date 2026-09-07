@@ -93,6 +93,10 @@ pub struct Message {
     pub reply_count: u32,
     pub latest_reply: Option<Ts>,
     pub reactions: Vec<Reaction>,
+    /// Deleted messages stay in place as tombstones. Removing one would move
+    /// every row after it, and the positions of those rows are what make the
+    /// counts cheap.
+    pub deleted: bool,
     /// Whether the text names the signed-in user. Kept beside the message
     /// because the unread counts are derived from it on every `client.counts`
     /// and re-scanning the text there would be a pass over the history.

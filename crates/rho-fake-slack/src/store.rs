@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::types::{ChannelId, Conversation, Kind, Message, Ts, User, UserId};
+use crate::types::{ChannelId, Conversation, Kind, Message, Reaction, Ts, User, UserId};
 
 /// One conversation and everything under it.
 struct Held {
@@ -22,9 +22,12 @@ struct Held {
     /// Top-level messages, ascending by `ts`. Replies live in `threads`, as
     /// they do at Slack: `conversations.history` does not return them.
     messages: Vec<Message>,
-    /// `mentions[i]` is how many of `messages[..i]` name the signed-in user,
-    /// so the mention count after a cursor is one subtraction.
-    mentions: Vec<u32>,
+    /// How many of `messages[..i]` name the signed-in user. A Fenwick tree
+    /// rather than a plain prefix sum, because the world is alive: a message
+    /// arriving is one append and an edit that gains or loses a mention is
+    /// one update, both in log time, where a prefix sum would rewrite the
+    /// tail of the conversation on every edit.
+    mentions: Mentions,
     threads: BTreeMap<Ts, Vec<Message>>,
     /// Where each person has read to in the conversation.
     read: BTreeMap<UserId, Ts>,
@@ -37,6 +40,10 @@ struct Held {
 /// The workspace. Everything a request can ask about is here, and nothing
 /// about a connection is.
 pub struct Store {
+    /// The next timestamp anything new gets. One clock for the server, so a
+    /// message the schedule wrote and a message a client sent cannot land on
+    /// the same second or out of order in a conversation both touched.
+    clock: Ts,
     /// Who the client signs in as.
     pub self_id: UserId,
     users: BTreeMap<UserId, User>,
@@ -73,6 +80,7 @@ pub struct Unread {
 impl Store {
     pub fn new(self_id: UserId) -> Self {
         Self {
+            clock: Ts::new(0, 0),
             self_id,
             users: BTreeMap::new(),
             user_order: Vec::new(),
@@ -99,12 +107,9 @@ impl Store {
     /// one pass here rather than being rebuilt on every count later.
     pub fn add_conversation(&mut self, conversation: Conversation, messages: Vec<Message>) {
         let id = conversation.id.clone();
-        let mut mentions = Vec::with_capacity(messages.len() + 1);
-        let mut running = 0;
-        mentions.push(0);
+        let mut mentions = Mentions::default();
         for (at, message) in messages.iter().enumerate() {
-            running += u32::from(message.mentions_self);
-            mentions.push(running);
+            mentions.push(u32::from(message.mentions_self));
             if message.mentions_self {
                 self.mention_index.push((message.ts, id.clone(), at));
             }
@@ -151,10 +156,58 @@ impl Store {
     /// time once they are all in.
     pub fn settle(&mut self) {
         self.mention_index.sort_by_key(|(ts, _, _)| *ts);
+        // Where time starts: just after the newest thing in the world. The
+        // one pass over conversations the live side makes, made once here
+        // rather than per happening.
+        let newest = self
+            .held
+            .values()
+            .filter_map(|held| held.messages.last().map(|message| message.ts))
+            .max()
+            .unwrap_or(Ts::new(0, 0));
+        self.clock = Ts::new(newest.seconds + 1, 0);
+    }
+
+    /// The next timestamp, strictly after every one handed out before it.
+    /// Everything that writes takes its `ts` from here — the schedule and
+    /// the clients both — so a conversation's history is append-only no
+    /// matter who is writing to it.
+    pub fn tick(&mut self) -> Ts {
+        self.clock = Ts::new(self.clock.seconds + 1, self.clock.micros);
+        self.clock
     }
 
     pub fn follow_thread(&mut self, channel: ChannelId, parent: Ts) {
         self.followed.push((channel, parent));
+    }
+
+    /// Stops following a thread, and says whether it was followed at all.
+    pub fn unfollow_thread(&mut self, channel: &ChannelId, parent: Ts) -> bool {
+        let before = self.followed.len();
+        self.followed
+            .retain(|(id, ts)| id != channel || *ts != parent);
+        self.followed.len() != before
+    }
+
+    /// One message by its timestamp, and where it sits. A binary search, not
+    /// a scan: this is on the path of every reaction and every edit.
+    pub fn message(&self, channel: &ChannelId, ts: Ts) -> Option<(usize, &Message)> {
+        let held = self.held.get(channel)?;
+        let at = held
+            .messages
+            .binary_search_by(|message| message.ts.cmp(&ts))
+            .ok()?;
+        Some((at, &held.messages[at]))
+    }
+
+    /// A reply by its timestamp, inside the thread it belongs to.
+    pub fn reply(&self, channel: &ChannelId, parent: Ts, ts: Ts) -> Option<&Message> {
+        let held = self.held.get(channel)?;
+        held.threads
+            .get(&parent)?
+            .iter()
+            .rev()
+            .find(|reply| reply.ts == ts)
     }
 
     pub fn followed(&self) -> &[(ChannelId, Ts)] {
@@ -266,7 +319,7 @@ impl Store {
         let total = held.messages.len();
         Unread {
             messages: (total - at) as u32,
-            mentions: held.mentions[total] - held.mentions[at],
+            mentions: held.mentions.after(at),
         }
     }
 
@@ -282,6 +335,126 @@ impl Store {
             .copied()
     }
 
+    /// Puts a message at the end of a conversation. Appending is what time
+    /// does to a conversation, so it is the cheap case on purpose: a push, a
+    /// log-time mention update, and nothing else moves.
+    pub fn post(&mut self, channel: &ChannelId, message: Message) -> bool {
+        let Some(held) = self.held.get_mut(channel) else {
+            return false;
+        };
+        match message.thread_ts {
+            // A reply belongs to its thread, and bumps the parent's counters
+            // the way Slack does rather than appearing in the history.
+            Some(parent) => {
+                let replies = held.threads.entry(parent).or_default();
+                replies.push(message.clone());
+                let Ok(at) = held.messages.binary_search_by(|held| held.ts.cmp(&parent)) else {
+                    return false;
+                };
+                held.messages[at].reply_count += 1;
+                held.messages[at].latest_reply = Some(message.ts);
+            }
+            None => {
+                if message.mentions_self {
+                    self.mention_index
+                        .push((message.ts, channel.clone(), held.messages.len()));
+                }
+                held.mentions.push(u32::from(message.mentions_self));
+                held.messages.push(message);
+            }
+        }
+        true
+    }
+
+    /// Rewrites a message's text. The mention count follows the new text, so
+    /// an edit that takes the reader's name out of a message takes it out of
+    /// their badge as well.
+    pub fn edit(&mut self, channel: &ChannelId, ts: Ts, text: String, mentions_self: bool) -> bool {
+        let Some(held) = self.held.get_mut(channel) else {
+            return false;
+        };
+        let Ok(at) = held.messages.binary_search_by(|held| held.ts.cmp(&ts)) else {
+            return false;
+        };
+        let was = held.messages[at].mentions_self;
+        held.messages[at].text = text;
+        held.messages[at].edited = true;
+        held.messages[at].mentions_self = mentions_self;
+        if was != mentions_self {
+            held.mentions.set(at, u32::from(mentions_self));
+            match mentions_self {
+                true => self.mention_index.push((ts, channel.clone(), at)),
+                false => self
+                    .mention_index
+                    .retain(|(_, id, row)| *row != at || id != channel),
+            }
+        }
+        true
+    }
+
+    /// A deletion is a tombstone rather than a removal: every row after it
+    /// would otherwise move, and the indexes that make the counts cheap are
+    /// positions in that list.
+    pub fn delete(&mut self, channel: &ChannelId, ts: Ts) -> bool {
+        let Some(held) = self.held.get_mut(channel) else {
+            return false;
+        };
+        let Ok(at) = held.messages.binary_search_by(|held| held.ts.cmp(&ts)) else {
+            return false;
+        };
+        held.messages[at].deleted = true;
+        held.messages[at].text = String::new();
+        if held.messages[at].mentions_self {
+            held.messages[at].mentions_self = false;
+            held.mentions.set(at, 0);
+        }
+        true
+    }
+
+    /// Puts an emoji on a message or takes it off, and says whether anything
+    /// changed — pressing a reaction twice is not two reactions.
+    pub fn react(
+        &mut self,
+        channel: &ChannelId,
+        ts: Ts,
+        user: &UserId,
+        name: &str,
+        added: bool,
+    ) -> bool {
+        let Some(held) = self.held.get_mut(channel) else {
+            return false;
+        };
+        let Ok(at) = held.messages.binary_search_by(|held| held.ts.cmp(&ts)) else {
+            return false;
+        };
+        let reactions = &mut held.messages[at].reactions;
+        let found = reactions.iter().position(|reaction| reaction.name == name);
+        match (added, found) {
+            (true, Some(at)) => {
+                if reactions[at].users.contains(user) {
+                    return false;
+                }
+                reactions[at].users.push(user.clone());
+            }
+            (true, None) => reactions.push(Reaction {
+                name: name.to_owned(),
+                users: Vec::from([user.clone()]),
+            }),
+            (false, Some(at)) => {
+                let before = reactions[at].users.len();
+                reactions[at].users.retain(|had| had != user);
+                if reactions[at].users.len() == before {
+                    return false;
+                }
+                if reactions[at].users.is_empty() {
+                    reactions.remove(at);
+                }
+            }
+            (false, None) => return false,
+        }
+        true
+    }
+
     /// The newest message in a conversation, which is what the list sorts on
     /// and what `client.counts` reports as `latest`.
     pub fn latest(&self, channel: &ChannelId) -> Option<Ts> {
@@ -294,5 +467,57 @@ impl Store {
         self.held
             .get(channel)
             .is_some_and(|held| matches!(held.conversation.kind, Kind::Dm | Kind::Group))
+    }
+}
+
+/// A Fenwick tree over "does this message name the signed-in user": append
+/// and update in log time, and the count after a cursor in log time. The
+/// alternative, a plain prefix sum, is one line shorter and rewrites the tail
+/// of a conversation whenever an edit changes a mention.
+#[derive(Default)]
+struct Mentions {
+    /// 1-based, each cell holding the sum of a power-of-two run below it.
+    tree: Vec<u32>,
+}
+
+impl Mentions {
+    fn push(&mut self, value: u32) {
+        let at = self.tree.len() + 1;
+        let mut sum = value;
+        let mut step = 1;
+        while step < (at & at.wrapping_neg()) {
+            sum += self.tree[at - step - 1];
+            step <<= 1;
+        }
+        self.tree.push(sum);
+    }
+
+    /// The sum of the first `count` messages.
+    fn upto(&self, count: usize) -> u32 {
+        let mut at = count.min(self.tree.len());
+        let mut sum = 0;
+        while at > 0 {
+            sum += self.tree[at - 1];
+            at -= at & at.wrapping_neg();
+        }
+        sum
+    }
+
+    /// How many mentions are after the first `count` messages.
+    fn after(&self, count: usize) -> u32 {
+        self.upto(self.tree.len()) - self.upto(count)
+    }
+
+    /// Sets one message's value, which is what an edit does.
+    fn set(&mut self, at: usize, value: u32) {
+        let was = self.upto(at + 1) - self.upto(at);
+        if was == value {
+            return;
+        }
+        let mut cursor = at + 1;
+        while cursor <= self.tree.len() {
+            self.tree[cursor - 1] = self.tree[cursor - 1] + value - was;
+            cursor += cursor & cursor.wrapping_neg();
+        }
     }
 }

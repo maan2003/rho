@@ -184,6 +184,7 @@ fn history(
             latest_reply: None,
             reactions: reactions(random, members),
             mentions_self,
+            deleted: false,
         };
         made += 1;
         let room = share - made;
@@ -199,6 +200,7 @@ fn history(
                     reply_count: 0,
                     latest_reply: None,
                     reactions: Vec::new(),
+                    deleted: false,
                     mentions_self: false,
                 })
                 .collect();
@@ -276,14 +278,14 @@ fn capitalised(word: &str) -> String {
 
 /// SplitMix64: three lines, no dependency, and the same numbers on every
 /// machine — which is the whole requirement a replayable world has of it.
-struct Random(u64);
+pub struct Random(u64);
 
 impl Random {
-    fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self(seed.wrapping_add(0x9E3779B97F4A7C15))
     }
 
-    fn next(&mut self) -> u64 {
+    pub fn draw(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -291,10 +293,10 @@ impl Random {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, bound: u64) -> u64 {
+    pub fn below(&mut self, bound: u64) -> u64 {
         match bound {
             0 => 0,
-            bound => self.next() % bound,
+            bound => self.draw() % bound,
         }
     }
 }

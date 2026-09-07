@@ -311,15 +311,15 @@ fn run_events(
     let editor = active_editor(&workspace, &mut cx)
         .map_err(|_| ("workspace closed", 0, 0, 0, 0, Vec::new()))?;
     let cold_started = Instant::now();
-    cx.draw_window((*workspace).into());
+    cx.draw_window(*workspace);
     gpui::profiler::take_frame_work();
     let cold_draw_micros = cold_started.elapsed().as_micros() as u64;
     let warm_started = Instant::now();
-    cx.draw_window((*workspace).into());
+    cx.draw_window(*workspace);
     gpui::profiler::take_frame_work();
     let warm_draw_micros = warm_started.elapsed().as_micros() as u64;
-    let recorder = cx.record_scenes::<WalkEvent>((*workspace).into());
-    cx.draw_window((*workspace).into());
+    let recorder = cx.record_scenes::<WalkEvent>(*workspace);
+    cx.draw_window(*workspace);
     gpui::profiler::take_frame_work();
     timings.collect_unseen();
 
@@ -353,7 +353,7 @@ fn run_events(
         })?;
         cx.run_until_parked();
         let draw_started = Instant::now();
-        cx.draw_window((*workspace).into());
+        cx.draw_window(*workspace);
         let work = gpui::profiler::take_frame_work();
         let draw_micros = draw_started.elapsed().as_micros() as u64;
         max_draw_micros = max_draw_micros.max(draw_micros);
@@ -616,7 +616,7 @@ fn active_editor(
     workspace: &WindowHandle<Workspace>,
     cx: &mut TestAppContext,
 ) -> anyhow::Result<Entity<Editor>> {
-    Ok(workspace.update(cx, |workspace, _, cx| workspace.active_editor(cx))?)
+    workspace.update(cx, |workspace, _, cx| workspace.active_editor(cx))
 }
 
 fn prompt_row(

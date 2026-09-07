@@ -2372,6 +2372,62 @@ the second fold fix and the dashboard patch. The commit message stays as
 history and this is the record. The frame on a folded turn opened by unfolding
 is still owed and is in neither.
 
+- **`rho-fake-slack`, second landing: the socket and the living schedule**
+  The workspace no longer sits still while a client is connected. Other
+  people post, reply in threads, react, edit what they said and read what was
+  said to them, and every one of those becomes a frame on the socket that
+  every connected client sees.
+  *The vocabulary is the client's, not an invention.* The frames are exactly
+  what `rho-slack`'s `events::parse` reads: `hello`, `pong` naming the ping it
+  answers, `reconnect_url`, `message` and its `message_changed` /
+  `message_deleted` subtypes, `reaction_added` / `reaction_removed` with the
+  message named inside `item`, `channel_marked` / `im_marked` /
+  `group_marked` by kind of conversation, and the three thread frames through
+  their `subscription` object. A test asserts that no frame the server sends
+  parses as `Ignored`, so a shape rho would drop on the floor is a failing
+  test rather than a quiet hole.
+  *The write side came with it.* `chat.postMessage`, `chat.update`,
+  `reactions.add` / `.remove`, `conversations.mark` and the three
+  `subscriptions.thread.*` calls, with `already_reacted` and `no_reaction`
+  said the way Slack says them — the client reads those two as "already in
+  the state you asked for", which is only true if the server actually says
+  them. A write takes the store exclusively and ends in a frame, which is how
+  one client's action reaches the others; reads take it shared. Slack takes
+  some of these as a form and some as JSON, so both arrive at one flat field
+  map and no handler knows which it was.
+  *One sequence, two ways to run it.* `advance(n)` applies the next n
+  happenings immediately — no sleeping, no timer, no flake — and hands back
+  what they were as typed `Happening`s, so a test asserts against what the
+  server did rather than against what it guessed. `live(per_second)` runs the
+  same sequence on a clock for the rig. Same seed, same hour: a test asserts
+  two servers' `advance(200)` are equal. Time stops on drop along with the
+  listener and the sockets.
+  *One clock.* The store hands out every new timestamp, so a message the
+  schedule wrote and a message a client sent cannot land out of order in a
+  conversation both touched, and a history stays append-only.
+  *The cost.* Per happening: one draw, a binary search to find the message it
+  lands on, and an append or an in-place write — no pass over the
+  conversation and none over the workspace. Measured: **1.518 µs** in a world
+  of 8 conversations / 16,798 messages and **1.815 µs** in one of 300 /
+  464,720 — the same number, which is the claim. Per frame: rendered once and
+  handed to every socket as a pointer, so eight sockets cost **7.3 µs** a
+  happening rather than eight serialisations. A deletion is a tombstone and
+  an edit's mention flag is a Fenwick update, both in log time, because
+  removing a row or rewriting a prefix sum would move every row after it and
+  those positions are what make the unread counts cheap.
+  *The numbers a reader feels.* Eight `rho-slack` clients on the socket at
+  the default 450,000 messages: a happening reaches all eight in **1.25 ms**
+  median, **1.49 ms** at the 99th (both dominated by the measuring loop's own
+  50 µs poll). Sustained: asked for 2,000 happenings/s, got 2,013, 44,811
+  frames delivered, all eight still connected; asked for 200,000/s, got
+  210,666, 4.67 M frames delivered, all eight still connected. Resident 193
+  MiB with the world in hand, 373 MiB after three seconds at that rate. A
+  client that genuinely stops reading is cut with an error frame after 8,192
+  frames of backlog rather than being queued for forever, which is what makes
+  it reconnect and resync instead of carrying a hole.
+  Gate green: rho-fake-slack 14 tests and 1 doc test, clippy `-D warnings`
+  clean, `cargo fmt --check` clean, workspace suite green.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists
