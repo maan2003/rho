@@ -168,6 +168,10 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 );
             }
         }
+        println!(
+            "run={run} unrecorded cold_draw_us={} warm_draw_us={}",
+            report.cold_draw_micros, report.warm_draw_micros
+        );
         for (step, ((((draw, touched_rows), walked_items), drawn_rows), total_rows)) in report
             .step_draw_micros
             .iter()
@@ -177,8 +181,12 @@ pub fn run(args: WalkArgs) -> Result<()> {
             .zip(&report.step_total_rows)
             .enumerate()
         {
+            let owners = &report.step_owners[step];
+            let paint_us = owners.iter().map(|owner| owner.paint_nanos).sum::<u64>() / 1_000;
+            let primitives = owners.iter().map(|owner| owner.primitives).sum::<usize>();
             println!(
-                "run={run} step={step} draw_us={draw} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}"
+                "run={run} step={step} draw_us={draw} paint_us={paint_us} owners={} primitives={primitives} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}",
+                owners.len()
             );
         }
     }
