@@ -123,6 +123,12 @@ pub struct Model {
     stored: Option<crate::mirror::Loaded>,
 }
 
+impl Default for Model {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Model {
     pub fn new() -> Self {
         Self {
