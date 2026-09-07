@@ -1060,7 +1060,7 @@ fn surrounding_filename(
 mod tests {
     use super::*;
     use crate::{
-        DisplayPoint,
+        DisplayPoint, InlayId,
         display_map::ToDisplayPoint,
         editor_tests::init_test,
         inlays::inlay_hints::tests::{cached_hint_labels, visible_hint_labels},

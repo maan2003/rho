@@ -12923,9 +12923,9 @@ mod tests {
                 a: 0.5,
             };
             let player_color = PlayerColor {
-                cursor: selection_color,
-                background: selection_color,
-                selection: selection_color,
+                cursor: selection_color.into(),
+                background: selection_color.into(),
+                selection: selection_color.into(),
             };
 
             let spanning_selection = SelectionLayout {
@@ -12972,9 +12972,9 @@ mod tests {
                 a: 0.5,
             };
             let player_color = PlayerColor {
-                cursor: selection_color,
-                background: selection_color,
-                selection: selection_color,
+                cursor: selection_color.into(),
+                background: selection_color.into(),
+                selection: selection_color.into(),
             };
 
             let selection = SelectionLayout {
