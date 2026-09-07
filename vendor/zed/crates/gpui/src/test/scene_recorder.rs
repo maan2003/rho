@@ -297,7 +297,10 @@ fn record<E: Clone>(recording: &mut Recording<E>, scene: &Scene) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContentMask, Quad, point, size};
+    use crate::{
+        ContentMask, Context, InteractiveElement, IntoElement, ParentElement, Quad, Render, Styled,
+        TestAppContext, Window, div, point, px, size,
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Event {
@@ -318,6 +321,85 @@ mod tests {
             vertical_band: 0,
         };
         assert_eq!(owner.live_owner().map(|owner| owner.cadence), Some(cadence));
+    }
+
+    struct ElementIdentityView {
+        show_connection: bool,
+    }
+
+    impl Render for ElementIdentityView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(3_500.))
+                .h(px(10.))
+                .children(self.show_connection.then(|| {
+                    div()
+                        .id("connection")
+                        .absolute()
+                        .left_0()
+                        .size(px(10.))
+                        .bg(crate::rgb(0xff0000))
+                }))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(3_400.))
+                        .size(px(10.))
+                        .bg(crate::rgb(0x0000ff)),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn element_identity_keeps_keyed_primitives_separate_from_unkeyed_primitives(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| ElementIdentityView {
+            show_connection: true,
+        });
+        let recorder = cx.record_scenes::<()>(*window);
+        cx.draw_window(*window);
+
+        window
+            .update(cx, |view, _, cx| {
+                view.show_connection = false;
+                cx.notify();
+            })
+            .expect("test window remains open");
+        cx.draw_window(*window);
+
+        let frames = recorder.frames();
+        let connection = ElementId::from("connection");
+        let connection_subscene = frames[0]
+            .subscenes
+            .iter()
+            .find(|subscene| {
+                recorder
+                    .owner(subscene.id)
+                    .is_some_and(|owner| owner.elements.last() == Some(&connection))
+            })
+            .expect("connection primitives are owned by their element id")
+            .id;
+        let connection_changes = frames[1]
+            .changes
+            .iter()
+            .filter(|change| change.subscene == connection_subscene)
+            .collect::<Vec<_>>();
+        assert!(!connection_changes.is_empty());
+        assert!(
+            connection_changes
+                .iter()
+                .all(|change| change.after.is_none())
+        );
+        assert_eq!(frames[1].changes.len(), connection_changes.len());
+        let changed_bounds = frames[1]
+            .change_bounds
+            .expect("removing the connection records damage");
+        assert!(
+            changed_bounds.size.width < ScaledPixels(100.),
+            "element identity must not produce the old 3,400px pairing: {changed_bounds:?}"
+        );
     }
 
     fn quad(top: f32) -> Quad {
