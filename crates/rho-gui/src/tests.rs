@@ -21,6 +21,7 @@ use story::ready_with;
 
 mod history;
 mod minibuffer;
+mod scene_fuzz;
 mod story;
 use rho_agents::HostId;
 
