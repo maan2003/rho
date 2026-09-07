@@ -2,7 +2,35 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use rho_gui::walk::{WalkConfig, WalkHarness, WalkMode};
+use rho_gui::walk::{WalkConfig, WalkEvent, WalkHarness, WalkMode};
+
+/// The wrap map's two whole-document drives, on a transcript already worth
+/// scrolling: a width change and a jump to the top, with keystrokes beside
+/// them so the cost of one edit on a long document is on the same line as
+/// the cost of a rewrap. A keystroke never follows the jump: an insert
+/// scrolls the cursor back into view, and the repaint that follows is the
+/// scroll's, not the keystroke's.
+const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
+    WalkEvent::ComposerKey { character: 'a' },
+    WalkEvent::Resize {
+        width: 700,
+        height: 600,
+    },
+    WalkEvent::ComposerKey { character: 'b' },
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::Resize {
+        width: 1100,
+        height: 900,
+    },
+    WalkEvent::Idle,
+];
+
+/// Settled turns seeded before the drive runs. Forty turns is past the
+/// point where the whole document fits a screen, which is what makes a
+/// whole-document rewrap distinguishable from a visible-rows one.
+const LARGE_TRANSCRIPT_TURNS: usize = 40;
 
 #[derive(Args)]
 pub struct WalkArgs {
@@ -43,12 +71,29 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut max_draw = 0;
     let mut max_cold = 0;
     let mut max_warm = 0;
-    for seed in seeds {
-        let config = WalkConfig {
+    let mut runs = seeds
+        .iter()
+        .map(|seed| WalkConfig {
             seed: *seed,
             steps,
             mode,
-        };
+            prefill_turns: 0,
+            script: None,
+        })
+        .collect::<Vec<_>>();
+    if args.gate {
+        runs.push(WalkConfig {
+            seed: 0,
+            steps: LARGE_TRANSCRIPT_DRIVE.len(),
+            mode,
+            prefill_turns: LARGE_TRANSCRIPT_TURNS,
+            script: Some(LARGE_TRANSCRIPT_DRIVE),
+        });
+    }
+    let total_events = runs.iter().map(|config| config.steps).sum::<usize>();
+    for config in &runs {
+        let config = *config;
+        let seed = &config.seed;
         let report = WalkHarness::new(config).run().map_err(|failure| {
             let script =
                 serde_json::to_string_pretty(&failure.events).unwrap_or_else(|_| "[]".to_owned());
@@ -130,8 +175,8 @@ pub fn run(args: WalkArgs) -> Result<()> {
     }
     println!(
         "seeds={} events={} frames={} distinct={} changed_max={} touched_rows_max={} walked_items_max={} drawn_rows_max={} cold_draw_max_us={} warm_draw_max_us={} draw_max_us={} wall_ms={}",
-        seeds.len(),
-        seeds.len() * steps,
+        runs.len(),
+        total_events,
         frames,
         distinct,
         max_changed,

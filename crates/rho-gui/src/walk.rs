@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use editor::Editor;
-use gpui::{App, Entity, TestAppContext, TestDispatcher, WindowHandle, px, size};
+use gpui::{App, Entity, TestAppContext, TestDispatcher, WindowHandle, point, px, size};
 use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
@@ -20,11 +20,24 @@ use crate::workspace::{AttachTarget, HostSpec, Workspace};
 /// One action understood by the generator, recorder, drive script and shrinker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalkEvent {
-    ComposerKey { character: char },
-    Resize { width: u16, height: u16 },
-    AgentChunk { bytes: u16 },
-    ToolBody { bytes: u16 },
-    AdvanceTime { milliseconds: u16 },
+    ComposerKey {
+        character: char,
+    },
+    Resize {
+        width: u16,
+        height: u16,
+    },
+    AgentChunk {
+        bytes: u16,
+    },
+    ToolBody {
+        bytes: u16,
+    },
+    AdvanceTime {
+        milliseconds: u16,
+    },
+    /// What `gg` does: put the reader at the top of the transcript.
+    ScrollToTop,
     Idle,
 }
 
@@ -41,6 +54,21 @@ pub struct WalkConfig {
     pub seed: u64,
     pub steps: usize,
     pub mode: WalkMode,
+    /// Settled turns to seed the transcript with before anything is driven.
+    ///
+    /// Generated walks leave this at zero and grow their document from the
+    /// events themselves, which never takes it past about fifty tab rows -
+    /// the tool bodies that would take it further are concealed before the
+    /// tab map sees them. A drive that means to reach the whole-buffer
+    /// rewrap, or to ask what one keystroke costs on a document worth
+    /// scrolling, has to start with the document already there.
+    pub prefill_turns: usize,
+    /// A fixed drive, run in place of a generated sequence.
+    ///
+    /// A generator cannot be asked for a particular shape of run. The two
+    /// events that make the wrap map do whole-document work - a width
+    /// change and a jump to the top - have to be named in order.
+    pub script: Option<&'static [WalkEvent]>,
 }
 
 /// Owns one deterministic random-walk request and its replay oracle.
@@ -150,8 +178,8 @@ type WalkRejection = (
 
 /// Runs one generated sequence and deletion-shrinks an oracle failure.
 pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
-    let events = generate(config.seed, config.steps);
-    match run_events(config.seed, config.mode, &events) {
+    let events = events_for(config);
+    match run_events(config, &events) {
         Ok(report) => Ok(report),
         Err(rejection) => {
             let oracle = rejection.0;
@@ -161,7 +189,7 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             while index < shrunk.len() {
                 let mut candidate = shrunk.clone();
                 candidate.remove(index);
-                match run_events(config.seed, config.mode, &candidate) {
+                match run_events(config, &candidate) {
                     Err(rejection) if rejection.0 == oracle => {
                         shrunk = candidate;
                         final_rejection = rejection;
@@ -175,7 +203,7 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                     for replacement in smaller_values(&shrunk[index]) {
                         let mut candidate = shrunk.clone();
                         candidate[index] = replacement;
-                        if let Err(rejection) = run_events(config.seed, config.mode, &candidate)
+                        if let Err(rejection) = run_events(config, &candidate)
                             && rejection.0 == oracle
                         {
                             shrunk = candidate;
@@ -261,6 +289,14 @@ fn smaller_values(event: &WalkEvent) -> Vec<WalkEvent> {
     }
 }
 
+/// The drive a config asks for: its own script, or its generated sequence.
+fn events_for(config: WalkConfig) -> Vec<WalkEvent> {
+    match config.script {
+        Some(script) => script.to_vec(),
+        None => generate(config.seed, config.steps),
+    }
+}
+
 fn generate(seed: u64, steps: usize) -> Vec<WalkEvent> {
     let mut random = seed;
     (0..steps)
@@ -304,20 +340,21 @@ fn generated_result_bytes(random: u64) -> u16 {
     }
 }
 
-fn run_events(
-    seed: u64,
-    mode: WalkMode,
-    events: &[WalkEvent],
-) -> Result<WalkReport, WalkRejection> {
-    run_events_with_detached_host(seed, mode, events, false)
+fn run_events(config: WalkConfig, events: &[WalkEvent]) -> Result<WalkReport, WalkRejection> {
+    run_events_with_detached_host(config, events, false)
 }
 
 fn run_events_with_detached_host(
-    seed: u64,
-    mode: WalkMode,
+    config: WalkConfig,
     events: &[WalkEvent],
     detached_host: bool,
 ) -> Result<WalkReport, WalkRejection> {
+    let WalkConfig {
+        seed,
+        mode,
+        prefill_turns,
+        ..
+    } = config;
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();
@@ -356,7 +393,7 @@ fn run_events_with_detached_host(
         .collect();
     let workspace = cx.add_window(|window, cx| Workspace::new(specs, window, cx));
     let agent = AgentId::from_counter(1, &AgentIdDomain(0)).expect("generated agent id");
-    let mut state = initial_state();
+    let mut state = initial_state(prefill_turns);
     workspace
         .update(&mut cx, |workspace, window, cx| {
             workspace.select_agent(Some(agent), window, cx);
@@ -707,8 +744,13 @@ fn apply(
             seed(agent, state, workspace, cx)?;
         }
         WalkEvent::ToolBody { bytes } => {
-            let UiBlock::Tool(tool) = Arc::make_mut(&mut state.blocks[1]) else {
-                anyhow::bail!("generated tool block moved")
+            let tool_block = state
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(***block, UiBlock::Tool(_)))
+                .context("generated tool block")?;
+            let UiBlock::Tool(tool) = Arc::make_mut(tool_block) else {
+                unreachable!("found by discriminant")
             };
             tool.output = Some(generated_text(usize::from(*bytes)));
             seed(agent, state, workspace, cx)?;
@@ -717,6 +759,11 @@ fn apply(
             cx.dispatcher
                 .advance_clock(std::time::Duration::from_millis(u64::from(*milliseconds)));
         }
+        WalkEvent::ScrollToTop => workspace.update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(point(0., 0.), window, cx);
+            });
+        })?,
         WalkEvent::Idle => {}
     }
     Ok(())
@@ -773,7 +820,14 @@ fn prompt_row(
         .flatten()
 }
 
-fn initial_state() -> UiAgentState {
+/// The transcript a walk starts from: one settled turn with a tool, and
+/// `prefill_turns` settled turns in front of it.
+///
+/// The prefilled turns are assistant text with newlines in it rather than
+/// tool output, because tool output is concealed and concealed rows are
+/// gone before the tab map counts them. Rows that survive to the tab map
+/// are the only ones a rewrap has to do.
+fn initial_state(prefill_turns: usize) -> UiAgentState {
     let tool = UiTool {
         id: "generated-tool".to_owned(),
         name: "shell_command".to_owned(),
@@ -787,17 +841,30 @@ fn initial_state() -> UiAgentState {
         result_at: None,
         metadata: None,
     };
+    let mut blocks = Vec::with_capacity(prefill_turns * 2 + 3);
+    for turn in 0..prefill_turns {
+        blocks.push(Arc::new(UiBlock::UserMessage {
+            text: format!("settled question {turn} about a wrapping boundary"),
+        }));
+        blocks.push(Arc::new(UiBlock::AssistantMessage {
+            text: format!(
+                "settled answer {turn}: compiled 12 targets in 0.42s\nand a second line of ordinary prose that wraps\nand a third that does not\n"
+            ),
+            phase: Some(UiMessagePhase::FinalAnswer),
+        }));
+    }
+    blocks.extend([
+        Arc::new(UiBlock::UserMessage {
+            text: "generated request near a wrapping boundary ".repeat(8),
+        }),
+        Arc::new(UiBlock::Tool(tool)),
+        Arc::new(UiBlock::AssistantMessage {
+            text: "generated streaming tail ".repeat(8),
+            phase: Some(UiMessagePhase::FinalAnswer),
+        }),
+    ]);
     UiAgentState {
-        blocks: vec![
-            Arc::new(UiBlock::UserMessage {
-                text: "generated request near a wrapping boundary ".repeat(8),
-            }),
-            Arc::new(UiBlock::Tool(tool)),
-            Arc::new(UiBlock::AssistantMessage {
-                text: "generated streaming tail ".repeat(8),
-                phase: Some(UiMessagePhase::FinalAnswer),
-            }),
-        ],
+        blocks,
         status: UiAgentStatus::Streaming,
         context_used: None,
         usage: Default::default(),
@@ -823,12 +890,13 @@ fn init(cx: &mut TestAppContext) {
 pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
     let first = run(config)?;
     let second = run(config)?;
+    let steps = events_for(config).len();
     if first.scene_hashes != second.scene_hashes {
         return Err(WalkFailure {
             oracle: "same seed produced different scenes",
-            step: config.steps.saturating_sub(1),
-            event: generate(config.seed, config.steps).last().cloned(),
-            events: generate(config.seed, config.steps),
+            step: steps.saturating_sub(1),
+            event: events_for(config).last().cloned(),
+            events: events_for(config),
             draw_micros: first.max_draw_micros,
             touched_rows: first.max_touched_rows,
             walked_items: first.max_walked_items,
@@ -837,12 +905,12 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             scene_details: Vec::new(),
         });
     }
-    if first.frames != config.steps {
+    if first.frames != steps {
         return Err(WalkFailure {
             oracle: "frame count",
-            step: config.steps.saturating_sub(1),
-            event: generate(config.seed, config.steps).last().cloned(),
-            events: generate(config.seed, config.steps),
+            step: steps.saturating_sub(1),
+            event: events_for(config).last().cloned(),
+            events: events_for(config),
             draw_micros: first.max_draw_micros,
             touched_rows: first.max_touched_rows,
             walked_items: first.max_walked_items,
@@ -864,6 +932,8 @@ mod tests {
             seed: 0,
             steps: 8,
             mode: WalkMode::Debug,
+            prefill_turns: 0,
+            script: None,
         })
         .expect("generated scene sequence");
         assert_eq!(report.frames, 8);
@@ -873,8 +943,13 @@ mod tests {
     #[test]
     fn detached_host_retry_is_the_declared_live_status_owner() {
         run_events_with_detached_host(
-            1,
-            WalkMode::Debug,
+            WalkConfig {
+                seed: 1,
+                steps: 6,
+                mode: WalkMode::Debug,
+                prefill_turns: 0,
+                script: None,
+            },
             &[
                 WalkEvent::Resize {
                     width: 480,
