@@ -19,6 +19,7 @@ use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
+mod fold_tail_rows;
 mod history;
 mod inlay_cost;
 mod minibuffer;

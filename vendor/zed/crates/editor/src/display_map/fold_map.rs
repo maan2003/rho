@@ -596,7 +596,12 @@ impl FoldMap {
 
     #[ztracing::instrument(skip_all)]
     fn check_invariants(&self) {
-        if cfg!(test) {
+        // `cfg!(test)` alone never fires from rho: this crate is vendored and
+        // is not a workspace member, so its own tests do not run here and the
+        // invariant that would have caught a fold tree out of step with its
+        // inlay snapshot was dead code for us. The feature lets rho's tests
+        // run it.
+        if cfg!(test) || cfg!(feature = "wrap-test-support") {
             assert_eq!(
                 self.snapshot.transforms.summary().input.len,
                 self.snapshot.inlay_snapshot.len().0,
@@ -740,85 +745,138 @@ impl FoldMap {
                 })
                 .peekable();
 
-                while folds
-                    .peek()
-                    .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
-                {
-                    let (fold, mut fold_range) = folds.next().unwrap();
-                    let sum = new_transforms.summary();
+                // Round again when the folds emitted below reach past the
+                // end of the edit; see the overshoot at the end of the loop.
+                loop {
+                    while folds
+                        .peek()
+                        .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
+                    {
+                        let (fold, mut fold_range) = folds.next().unwrap();
+                        let sum = new_transforms.summary();
 
-                    assert!(fold_range.start.0 >= sum.input.len);
+                        assert!(fold_range.start.0 >= sum.input.len);
 
-                    while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
-                        next_fold_range.start < fold_range.end
-                            || (next_fold_range.start == fold_range.end
-                                && fold.elision_policy == ElisionPolicy::Hidden
-                                && next_fold.elision_policy == ElisionPolicy::Hidden
-                                && fold.placeholder.merge_adjacent
-                                && next_fold.placeholder.merge_adjacent)
-                    }) {
-                        let (_, next_fold_range) = folds.next().unwrap();
-                        if next_fold_range.end > fold_range.end {
-                            fold_range.end = next_fold_range.end;
+                        while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
+                            next_fold_range.start < fold_range.end
+                                || (next_fold_range.start == fold_range.end
+                                    && fold.elision_policy == ElisionPolicy::Hidden
+                                    && next_fold.elision_policy == ElisionPolicy::Hidden
+                                    && fold.placeholder.merge_adjacent
+                                    && next_fold.placeholder.merge_adjacent)
+                        }) {
+                            let (_, next_fold_range) = folds.next().unwrap();
+                            if next_fold_range.end > fold_range.end {
+                                fold_range.end = next_fold_range.end;
+                            }
+                        }
+
+                        if fold_range.start.0 > sum.input.len {
+                            let text_summary = inlay_snapshot.text_summary_for_range(
+                                InlayOffset(sum.input.len)..fold_range.start,
+                            );
+                            push_isomorphic(&mut new_transforms, text_summary);
+                        }
+
+                        let (placeholder_range, visible_tail_range) =
+                            elided_ranges(&inlay_snapshot, fold_range, fold.elision_policy);
+
+                        if let Some(fold_range) = placeholder_range {
+                            const ELLIPSIS: &str = "⋯";
+
+                            let placeholder_text: SharedString = fold
+                                .placeholder
+                                .collapsed_text
+                                .clone()
+                                .unwrap_or_else(|| ELLIPSIS.into());
+                            let chars_bitmap = placeholder_text
+                                .char_indices()
+                                .fold(0u128, |bitmap, (idx, _)| {
+                                    bitmap | 1u128.unbounded_shl(idx as u32)
+                                });
+
+                            let fold_id = fold.id;
+                            new_transforms.push(
+                                Transform {
+                                    summary: TransformSummary {
+                                        output: MBTextSummary::from(placeholder_text.as_ref()),
+                                        input: inlay_snapshot.text_summary_for_range(
+                                            fold_range.start..fold_range.end,
+                                        ),
+                                    },
+                                    placeholder: Some(TransformPlaceholder {
+                                        text: placeholder_text,
+                                        chars: chars_bitmap,
+                                        renderer: ChunkRenderer {
+                                            id: ChunkRendererId::Fold(fold.id),
+                                            render: Arc::new(move |cx| {
+                                                (fold.placeholder.render)(
+                                                    fold_id,
+                                                    fold.range.0.clone(),
+                                                    cx.context,
+                                                )
+                                            }),
+                                            constrain_width: fold.placeholder.constrain_width,
+                                            measured_width: self.snapshot.fold_width(&fold_id),
+                                        },
+                                    }),
+                                },
+                                (),
+                            );
+                        }
+
+                        if let Some(tail_range) = visible_tail_range {
+                            let text_summary = inlay_snapshot.text_summary_for_range(tail_range);
+                            push_isomorphic(&mut new_transforms, text_summary);
                         }
                     }
 
-                    if fold_range.start.0 > sum.input.len {
-                        let text_summary = inlay_snapshot
-                            .text_summary_for_range(InlayOffset(sum.input.len)..fold_range.start);
-                        push_isomorphic(&mut new_transforms, text_summary);
+                    // A fold that starts inside the edit can end well after it,
+                    // and it is emitted whole, so the tree can now describe
+                    // input the cursor has not walked past. Past the edit both
+                    // sides are the same text at a constant shift, so that
+                    // input sits the same distance ahead of the cursor in the
+                    // old tree. Leave the cursor where it is and the suffix
+                    // appended below repeats those bytes: the tree then claims
+                    // a longer document than the inlay snapshot under it, and
+                    // rows resolve to offsets that are not theirs.
+                    //
+                    // Zed does not meet this because a hidden fold covers the
+                    // same anchored range before and after, so stepping past
+                    // the old fold transform steps past the right amount.
+                    // `ElisionPolicy::Tail` is ours and splits one fold into a
+                    // placeholder over the head and a visible tail, by rows, so
+                    // the extent of what is emitted moves as the text under it
+                    // does and stops matching the old transform.
+                    let sum = new_transforms.summary();
+                    if sum.input.len <= edit.new.end.0 {
+                        break;
                     }
-
-                    let (placeholder_range, visible_tail_range) =
-                        elided_ranges(&inlay_snapshot, fold_range, fold.elision_policy);
-
-                    if let Some(fold_range) = placeholder_range {
-                        const ELLIPSIS: &str = "⋯";
-
-                        let placeholder_text: SharedString = fold
-                            .placeholder
-                            .collapsed_text
-                            .clone()
-                            .unwrap_or_else(|| ELLIPSIS.into());
-                        let chars_bitmap = placeholder_text
-                            .char_indices()
-                            .fold(0u128, |bitmap, (idx, _)| {
-                                bitmap | 1u128.unbounded_shl(idx as u32)
-                            });
-
-                        let fold_id = fold.id;
-                        new_transforms.push(
-                            Transform {
-                                summary: TransformSummary {
-                                    output: MBTextSummary::from(placeholder_text.as_ref()),
-                                    input: inlay_snapshot
-                                        .text_summary_for_range(fold_range.start..fold_range.end),
-                                },
-                                placeholder: Some(TransformPlaceholder {
-                                    text: placeholder_text,
-                                    chars: chars_bitmap,
-                                    renderer: ChunkRenderer {
-                                        id: ChunkRendererId::Fold(fold.id),
-                                        render: Arc::new(move |cx| {
-                                            (fold.placeholder.render)(
-                                                fold_id,
-                                                fold.range.0.clone(),
-                                                cx.context,
-                                            )
-                                        }),
-                                        constrain_width: fold.placeholder.constrain_width,
-                                        measured_width: self.snapshot.fold_width(&fold_id),
-                                    },
-                                }),
-                            },
-                            (),
-                        );
+                    let overshoot = sum.input.len.0 - edit.new.end.0.0;
+                    let covered = InlayOffset(MultiBufferOffset(cursor.start().0.0 + overshoot));
+                    cursor.seek_forward(&covered, Bias::Right);
+                    if *cursor.start() == covered {
+                        // The old tree has a boundary where the new one now
+                        // ends - the usual case, since a fold ends at the same
+                        // anchor on both sides - and the suffix starts there.
+                        edit.old.end = covered;
+                        edit.new.end = InlayOffset(sum.input.len);
+                        break;
                     }
-
-                    if let Some(tail_range) = visible_tail_range {
-                        let text_summary = inlay_snapshot.text_summary_for_range(tail_range);
-                        push_isomorphic(&mut new_transforms, text_summary);
-                    }
+                    // The new tree ends inside an old transform. It cannot be
+                    // appended whole and it cannot be split - a fold transform
+                    // has no meaningful half - so step over it and go round
+                    // again with the edit widened to its end. Whatever of it
+                    // the new tree does not already describe is emitted from
+                    // the new snapshot, by the folds above if a fold still
+                    // covers it and as text below if none does. The cursor
+                    // only ever moves forward, so this ends.
+                    let stepped_over = cursor.end();
+                    cursor.next();
+                    edit.old.end = stepped_over;
+                    edit.new.end = InlayOffset(MultiBufferOffset(
+                        sum.input.len.0 + (stepped_over.0.0 - covered.0.0),
+                    ));
                 }
 
                 let sum = new_transforms.summary();
