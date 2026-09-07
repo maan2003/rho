@@ -933,7 +933,26 @@ impl FoldMap {
                         } else {
                             0
                         };
-                        let delta = old_delta.max(new_delta);
+                        // The step is the room both sides have, not what
+                        // the deeper one wants. The premise above - that
+                        // the two sides name the same boundary and so move
+                        // by the same inlay bytes - holds while whatever
+                        // shifted them sat in front of the fold, and fails
+                        // when something shifted one of them from inside
+                        // it: an inlay anchored within a fold moves the new
+                        // side out by its own length and leaves the fold's
+                        // start where it was. The new side is then deeper
+                        // into its fold than the old side is from the top
+                        // of the document, and the larger delta is more
+                        // than the old side has to give. Unclamped that
+                        // subtraction wraps, and an edit whose start is two
+                        // to the sixty-fourth minus a couple of hundred is
+                        // handed to a cursor that is then asked to seek
+                        // forward to an end far behind it.
+                        let delta = old_delta
+                            .max(new_delta)
+                            .min(edit.old.start.0.0)
+                            .min(edit.new.start.0.0);
                         if delta == 0 {
                             break;
                         }
