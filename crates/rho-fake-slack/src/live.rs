@@ -15,6 +15,11 @@
 //! conversations is when the schedule is built, to find where the clock
 //! starts.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use crate::api::Action;
 use crate::socket::Wire;
 use crate::store::Store;
 use crate::types::{ChannelId, Kind, Message, Ts, UserId};
@@ -292,3 +297,106 @@ const SAID: [&str; 12] = [
     "reading it back this looks right",
     "one more pass and it lands",
 ];
+
+/// Time, as something both the in-process handle and the control endpoint
+/// can drive. One schedule behind one lock, so `advance` from a test and a
+/// rate started over HTTP draw from the same sequence rather than from two.
+#[derive(Clone)]
+pub struct Living {
+    schedule: Arc<Mutex<Schedule>>,
+    store: Arc<RwLock<Store>>,
+    wire: Wire,
+    happenings: Arc<AtomicU64>,
+    ticker: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+/// How often the clock wakes up. Happenings are applied in batches on a
+/// fixed tick rather than one timer each, so a high rate costs the same
+/// number of wakeups as a low one.
+const TICK: Duration = Duration::from_millis(20);
+
+impl Living {
+    pub fn new(schedule: Schedule, store: Arc<RwLock<Store>>, wire: Wire) -> Self {
+        Self {
+            schedule: Arc::new(Mutex::new(schedule)),
+            store,
+            wire,
+            happenings: Arc::new(AtomicU64::new(0)),
+            ticker: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Runs the next `happenings` right now and hands back what they were.
+    pub fn advance(&self, happenings: usize) -> Vec<Happening> {
+        let mut schedule = self.schedule.lock().expect("schedule");
+        let mut store = self.store.write().expect("store");
+        self.happenings
+            .fetch_add(happenings as u64, Ordering::Relaxed);
+        (0..happenings)
+            .map(|_| schedule.step(&mut store, &self.wire))
+            .collect()
+    }
+
+    /// Starts the clock, or changes its rate; zero stops it.
+    pub fn rate(&self, per_second: f64) {
+        let mut ticker = self.ticker.lock().expect("ticker");
+        if let Some(running) = ticker.take() {
+            running.abort();
+        }
+        if per_second <= 0.0 {
+            return;
+        }
+        let schedule = self.schedule.clone();
+        let store = self.store.clone();
+        let wire = self.wire.clone();
+        let counted = self.happenings.clone();
+        let per_tick = per_second * TICK.as_secs_f64();
+        *ticker = Some(tokio::spawn(async move {
+            let mut owed = 0.0f64;
+            let mut tick = tokio::time::interval(TICK);
+            loop {
+                tick.tick().await;
+                owed += per_tick;
+                let due = owed.floor();
+                owed -= due;
+                let mut schedule = schedule.lock().expect("schedule");
+                let mut store = store.write().expect("store");
+                for _ in 0..due as usize {
+                    schedule.step(&mut store, &wire);
+                }
+                counted.fetch_add(due as u64, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    /// How many happenings have been applied, however they were driven.
+    pub fn happenings(&self) -> u64 {
+        self.happenings.load(Ordering::Relaxed)
+    }
+
+    /// Does one typed action. The same enum the in-process handle takes and
+    /// the control endpoint decodes; the refusals half of it belongs to
+    /// `Control`, so it is passed through untouched here.
+    pub fn take(&self, action: Action) -> Vec<Happening> {
+        match action {
+            Action::Advance { happenings } => self.advance(happenings),
+            Action::Live { per_second } => {
+                self.rate(per_second);
+                Vec::new()
+            }
+            Action::Still => {
+                self.rate(0.0);
+                Vec::new()
+            }
+            Action::Refuse { .. } => Vec::new(),
+        }
+    }
+
+    /// Stops the clock. Called when the server goes, so nothing is left
+    /// writing to a workspace nobody holds.
+    pub fn stop(&self) {
+        if let Some(ticker) = self.ticker.lock().expect("ticker").take() {
+            ticker.abort();
+        }
+    }
+}

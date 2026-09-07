@@ -584,3 +584,226 @@ async fn a_thread_reply_moves_the_thread_and_not_the_channel() {
         "the parent's counters moved with it"
     );
 }
+
+/// Several clients on one workspace, each connected the way rho connects,
+/// each reading its socket in its own task.
+async fn crowd(slack: &FakeSlack, clients: usize) -> Vec<tokio::task::JoinHandle<()>> {
+    use futures_util::StreamExt as _;
+    let mut readers = Vec::new();
+    for _ in 0..clients {
+        let client = connected(slack);
+        let mut socket = socket(slack, &client).await;
+        readers.push(tokio::spawn(async move {
+            while let Some(Ok(_)) = socket.next().await {}
+        }));
+    }
+    while slack.connected() < clients {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    readers
+}
+
+#[tokio::test]
+async fn what_one_client_is_told_all_of_them_are_told() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let readers = crowd(&slack, 4).await;
+    slack.advance(300);
+    assert!(
+        slack.settled(std::time::Duration::from_secs(5)).await,
+        "every client caught up"
+    );
+    let observations = slack.observations();
+    assert!(
+        observations.agree(),
+        "the server saw the clients disagree: {:?}",
+        observations.disagreements
+    );
+    assert_eq!(observations.clients.len(), 4);
+    let delivered: Vec<u64> = observations
+        .clients
+        .iter()
+        .map(|client| client.delivered)
+        .collect();
+    assert!(
+        delivered.windows(2).all(|pair| pair[0] == pair[1]),
+        "the same number of frames reached each of them: {delivered:?}"
+    );
+    assert_eq!(
+        delivered[0], observations.published,
+        "and that number is everything published"
+    );
+    for reader in readers {
+        reader.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_arrives_late_is_not_held_to_what_it_missed() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let early = crowd(&slack, 1).await;
+    slack.advance(100);
+    assert!(slack.settled(std::time::Duration::from_secs(5)).await);
+    let late = crowd(&slack, 1).await;
+    slack.advance(100);
+    assert!(slack.settled(std::time::Duration::from_secs(5)).await);
+    let observations = slack.observations();
+    assert!(
+        observations.agree(),
+        "a client that joined late agrees about everything since it joined: {:?}",
+        observations.disagreements
+    );
+    let delivered: Vec<u64> = observations
+        .clients
+        .iter()
+        .map(|client| client.delivered)
+        .collect();
+    assert!(
+        delivered[0] > delivered[1],
+        "and heard more, because it was there longer: {delivered:?}"
+    );
+    for reader in early.into_iter().chain(late) {
+        reader.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_read_cursor_reaches_every_client() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let readers = crowd(&slack, 3).await;
+    let client = connected(&slack);
+    let channel = {
+        let store = slack.store();
+        store.conversations().next().expect("a channel").id.clone()
+    };
+    let latest = slack.store().latest(&channel).expect("a message");
+    client
+        .mark_read(
+            &rho_slack::types::ChannelId(channel.0.clone()),
+            &rho_slack::types::Ts(latest.to_string()),
+        )
+        .await
+        .expect("mark");
+    assert!(slack.settled(std::time::Duration::from_secs(5)).await);
+    let observations = slack.observations();
+    assert!(
+        observations.agree(),
+        "a cursor that moved moved for everyone: {:?}",
+        observations.disagreements
+    );
+    assert_eq!(
+        slack
+            .store()
+            .read_cursor(&channel, &UserId(SELF_ID.to_owned())),
+        Some(latest),
+        "and the server holds what it told them"
+    );
+    for reader in readers {
+        reader.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_is_named() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let client = connected(&slack);
+    // Connected and never read from: the socket's buffers fill, the
+    // connection stops draining, and the server eventually cuts it.
+    let _silent = socket(&slack, &client).await;
+    while slack.connected() < 1 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    for _ in 0..60 {
+        slack.advance(2_000);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let observations = slack.observations();
+        if let Some(missed) = observations
+            .disagreements
+            .iter()
+            .find(|disagreement| matches!(disagreement, crate::Disagreement::Missed { .. }))
+        {
+            let crate::Disagreement::Missed { frames, .. } = missed else {
+                unreachable!()
+            };
+            assert!(*frames > 0, "the server says how much it missed");
+            return;
+        }
+    }
+    panic!(
+        "a client that never reads was never named: {:?}",
+        slack.observations()
+    );
+}
+
+#[tokio::test]
+async fn the_control_surface_takes_the_same_action_the_handle_takes() {
+    let slack = FakeSlack::start(small()).await.expect("server");
+    let readers = crowd(&slack, 2).await;
+    let control = format!("{}/control", slack.api_base().trim_end_matches("/api"));
+    let http = client();
+    let answer: serde_json::Value = http
+        .post(&control)
+        .json(&crate::Action::Advance { happenings: 120 })
+        .send()
+        .await
+        .expect("call")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(answer["happenings"], 120, "it says what it made happen");
+    assert_eq!(
+        slack.happenings(),
+        120,
+        "and it is the same schedule the handle drives"
+    );
+    assert!(slack.settled(std::time::Duration::from_secs(5)).await);
+    let observations: serde_json::Value = http
+        .get(&control)
+        .send()
+        .await
+        .expect("call")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        observations["clients"].as_array().expect("clients").len(),
+        2,
+        "the rig sees both clients"
+    );
+    assert!(
+        observations["disagreements"]
+            .as_array()
+            .expect("disagreements")
+            .is_empty(),
+        "agreeing, over HTTP as in process: {observations}"
+    );
+    // A refusal is the other half of the same enum, and lands the same way.
+    http.post(&control)
+        .json(&crate::Action::Refuse {
+            method: Method::EmojiList,
+            refusal: Refusal::RateLimited {
+                retry_after_seconds: 3,
+            },
+            times: 1,
+        })
+        .send()
+        .await
+        .expect("call");
+    let refused = http
+        .post(format!("{}/emoji.list", slack.api_base()))
+        .bearer_auth("xoxc-fake")
+        .send()
+        .await
+        .expect("call");
+    assert_eq!(refused.status(), 429, "the refusal was taken");
+    assert_eq!(
+        refused
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("3"),
+        "with the header a client backs off on"
+    );
+    for reader in readers {
+        reader.abort();
+    }
+}

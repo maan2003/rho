@@ -18,27 +18,49 @@ use crate::{socket, wire};
 /// Every method this server answers. A typed name rather than a string, so a
 /// caller cannot ask for a method that does not exist and a refusal cannot be
 /// aimed at one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Method {
+    #[serde(rename = "users.conversations")]
     UsersConversations,
+    #[serde(rename = "users.info")]
     UsersInfo,
+    #[serde(rename = "users.list")]
     UsersList,
+    #[serde(rename = "users.prefs.get")]
     UsersPrefsGet,
+    #[serde(rename = "conversations.history")]
     ConversationsHistory,
+    #[serde(rename = "conversations.replies")]
     ConversationsReplies,
+    #[serde(rename = "conversations.info")]
     ConversationsInfo,
+    #[serde(rename = "client.counts")]
     ClientCounts,
+    #[serde(rename = "emoji.list")]
     EmojiList,
+    #[serde(rename = "subscriptions.thread.getView")]
     SubscriptionsThreadGetView,
+    #[serde(rename = "activity.feed")]
     ActivityFeed,
+    #[serde(rename = "rtm.connect")]
     RtmConnect,
+    #[serde(rename = "chat.postMessage")]
     ChatPostMessage,
+    #[serde(rename = "chat.update")]
     ChatUpdate,
+    #[serde(rename = "reactions.add")]
     ReactionsAdd,
+    #[serde(rename = "reactions.remove")]
     ReactionsRemove,
+    #[serde(rename = "conversations.mark")]
     ConversationsMark,
+    #[serde(rename = "subscriptions.thread.add")]
     SubscriptionsThreadAdd,
+    #[serde(rename = "subscriptions.thread.remove")]
     SubscriptionsThreadRemove,
+    #[serde(rename = "subscriptions.thread.mark")]
     SubscriptionsThreadMark,
 }
 
@@ -90,7 +112,8 @@ impl Method {
 
 /// Why a call was refused, in Slack's own vocabulary. The client is written
 /// against these strings, so they are the thing to be literal about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Refusal {
     InvalidAuth,
     ChannelNotFound,
@@ -100,7 +123,10 @@ pub enum Refusal {
     AlreadyReacted,
     NoReaction,
     UnknownMethod,
-    RateLimited { retry_after_seconds: u32 },
+    #[serde(rename = "ratelimited")]
+    RateLimited {
+        retry_after_seconds: u32,
+    },
 }
 
 impl Refusal {
@@ -140,7 +166,8 @@ impl Refusal {
 /// transports: the in-process handle takes it directly and the binary's
 /// control endpoint decodes it, so there is no second vocabulary to keep in
 /// step.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     /// Refuse the next `times` calls of a method.
     Refuse {
@@ -148,6 +175,12 @@ pub enum Action {
         refusal: Refusal,
         times: usize,
     },
+    /// Run the next `happenings` of the schedule right now.
+    Advance { happenings: usize },
+    /// Run the schedule on a clock, at this many happenings a second.
+    Live { per_second: f64 },
+    /// Stop the clock without stopping the server.
+    Still,
 }
 
 /// What the server is doing to callers on purpose, and what it has served.
@@ -161,14 +194,13 @@ pub struct Control {
 
 impl Control {
     pub fn take(&mut self, action: Action) {
-        match action {
-            Action::Refuse {
-                method,
-                refusal,
-                times,
-            } => {
-                self.refusals.insert(method, (refusal, times));
-            }
+        if let Action::Refuse {
+            method,
+            refusal,
+            times,
+        } = action
+        {
+            self.refusals.insert(method, (refusal, times));
         }
     }
 
@@ -201,6 +233,9 @@ pub struct Server {
     pub control: Arc<Mutex<Control>>,
     /// Where a write becomes a frame every connected client sees.
     pub live: Wire,
+    /// Time, so the control endpoint can drive the same schedule the
+    /// in-process handle drives.
+    pub living: crate::live::Living,
 }
 
 /// How many rows a paginated call returns when the caller does not say.
@@ -260,6 +295,29 @@ pub async fn call(
         Ok(body) => axum::Json(body).into_response(),
         Err(refusal) => refusal.response(),
     }
+}
+
+/// The control surface, for the binary form. One typed action in, over the
+/// same enum the in-process handle takes; whatever it made happen back out.
+/// There is no second vocabulary to keep in step, and nothing here is
+/// reachable from the Slack API path a client uses.
+pub async fn control(
+    State(server): State<Server>,
+    axum::Json(action): axum::Json<Action>,
+) -> Response {
+    server.control.lock().expect("control").take(action);
+    let happened = server.living.take(action);
+    axum::Json(json!({"ok": true, "happenings": happened.len()})).into_response()
+}
+
+/// What the server saw every client be told, and everywhere they do not
+/// agree. The rig reads this rather than trying to compare clients from
+/// outside, because the server is the only place that knows what it sent.
+pub async fn watched(State(server): State<Server>) -> Response {
+    let observations = server
+        .live
+        .observations(&server.store.read().expect("store"));
+    axum::Json(observations).into_response()
 }
 
 /// The write side. Every one of these ends in a frame, because that is how

@@ -9,12 +9,12 @@
 use std::fmt;
 
 /// A user id, as Slack mints them.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct UserId(pub String);
 
 /// A conversation id: a channel, a group or a DM, told apart by `Kind` and
 /// not by the letter the id starts with.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct ChannelId(pub String);
 
 /// A Slack timestamp: whole seconds and the microseconds that order two
@@ -40,6 +40,14 @@ impl Ts {
             seconds: seconds.parse().ok()?,
             micros: micros.parse().ok()?,
         })
+    }
+}
+
+/// On the wire a timestamp is Slack's string, never a pair of numbers: the
+/// control surface says the same thing the Slack API says.
+impl serde::Serialize for Ts {
+    fn serialize<S: serde::Serializer>(&self, out: S) -> Result<S::Ok, S::Error> {
+        out.serialize_str(&self.to_string())
     }
 }
 

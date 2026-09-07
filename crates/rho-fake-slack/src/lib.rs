@@ -23,7 +23,6 @@
 //! # }
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -32,6 +31,7 @@ use axum::routing::{any, post};
 
 pub mod api;
 pub mod live;
+pub mod observe;
 pub mod socket;
 pub mod store;
 pub mod types;
@@ -39,7 +39,8 @@ pub mod wire;
 pub mod world;
 
 pub use api::{Action, Method, Refusal};
-pub use live::{Happening, Schedule};
+pub use live::{Happening, Living, Schedule};
+pub use observe::{ClientView, Disagreement, Observations};
 pub use socket::Wire;
 pub use store::Store;
 pub use world::{SELF_ID, Seed};
@@ -51,14 +52,12 @@ pub struct FakeSlack {
     store: Arc<RwLock<Store>>,
     control: Arc<Mutex<api::Control>>,
     live: Wire,
-    /// The seeded schedule, shared between an explicit `advance` and the
-    /// task a rate starts, so both draw from one sequence.
-    schedule: Arc<Mutex<Schedule>>,
+    /// Time, shared with the control endpoint so that a rate started over
+    /// HTTP and an `advance` from a test draw from one sequence.
+    living: Living,
     api_base: String,
-    /// How many happenings have been applied, however they were driven.
-    happenings: Arc<AtomicU64>,
+    socket_base: String,
     task: tokio::task::JoinHandle<()>,
-    ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl FakeSlack {
@@ -79,22 +78,35 @@ impl FakeSlack {
     /// Starts on a workspace built elsewhere — the seam eng-8gpr's generator
     /// arrives through, so this crate carries no fixture of its own.
     pub async fn serve(store: Store) -> anyhow::Result<Self> {
-        let schedule = Arc::new(Mutex::new(Schedule::new(&store, store_seed(&store))));
+        Self::serve_on("127.0.0.1:0", store).await
+    }
+
+    /// The same, on an address the caller picks — what the binary form needs
+    /// so the rig can point rho at a port it knows.
+    pub async fn serve_on(address: &str, store: Store) -> anyhow::Result<Self> {
+        let schedule = Schedule::new(&store, store_seed(&store));
         let store = Arc::new(RwLock::new(store));
         let control = Arc::new(Mutex::new(api::Control::default()));
         let live = Wire::default();
+        let living = Living::new(schedule, store.clone(), live.clone());
         let server = api::Server {
             store: store.clone(),
             control: control.clone(),
             live: live.clone(),
+            living: living.clone(),
         };
         let router = Router::new()
             .route("/api/{method}", post(api::call))
             // The upgrade is a GET, so it cannot share the API's route.
             .route("/socket", any(socket::connect))
+            // The control surface, for the binary form: the same typed
+            // action the in-process handle takes, and the same observations.
+            .route("/control", post(api::control).get(api::watched))
             .with_state(server);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let api_base = format!("http://{}/api", listener.local_addr()?);
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let address = listener.local_addr()?;
+        let api_base = format!("http://{address}/api");
+        let socket_base = format!("ws://{address}/socket");
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
@@ -102,17 +114,22 @@ impl FakeSlack {
             store,
             control,
             live,
-            schedule,
+            living,
             api_base,
-            happenings: Arc::new(AtomicU64::new(0)),
+            socket_base,
             task,
-            ticker: Mutex::new(None),
         })
     }
 
     /// Where the web API is, in the form a client is configured with.
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// Where the socket is. `rtm.connect` says the same thing; this is for
+    /// the binary's own banner and for a rig that wants to say it aloud.
+    pub fn socket_base(&self) -> &str {
+        &self.socket_base
     }
 
     /// The workspace, for a test that wants to assert against the truth
@@ -128,63 +145,25 @@ impl FakeSlack {
     /// same thing every run, which is what makes a test against a living
     /// workspace repeatable.
     pub fn advance(&self, happenings: usize) -> Vec<Happening> {
-        let mut schedule = self.schedule.lock().expect("schedule");
-        let mut store = self.store.write().expect("store");
-        self.happenings
-            .fetch_add(happenings as u64, Ordering::Relaxed);
-        (0..happenings)
-            .map(|_| schedule.step(&mut store, &self.live))
-            .collect()
+        self.living.advance(happenings)
     }
 
     /// How many happenings have been applied since the server started, by
     /// `advance` and by the rate alike.
     pub fn happenings(&self) -> u64 {
-        self.happenings.load(Ordering::Relaxed)
+        self.living.happenings()
     }
 
     /// Starts time at a rate, or changes it. The same sequence `advance`
     /// would produce, spread over a clock instead of a loop: a rate is when
     /// they happen, not what happens.
-    ///
-    /// Happenings are applied in small batches on a fixed tick rather than
-    /// one timer per happening, so a high rate costs the same number of
-    /// wakeups as a low one.
     pub fn live(&self, per_second: f64) {
-        const TICK: Duration = Duration::from_millis(20);
-        let mut ticker = self.ticker.lock().expect("ticker");
-        if let Some(running) = ticker.take() {
-            running.abort();
-        }
-        if per_second <= 0.0 {
-            return;
-        }
-        let schedule = self.schedule.clone();
-        let store = self.store.clone();
-        let wire = self.live.clone();
-        let counted = self.happenings.clone();
-        let per_tick = per_second * TICK.as_secs_f64();
-        *ticker = Some(tokio::spawn(async move {
-            let mut owed = 0.0f64;
-            let mut tick = tokio::time::interval(TICK);
-            loop {
-                tick.tick().await;
-                owed += per_tick;
-                let due = owed.floor();
-                owed -= due;
-                let mut schedule = schedule.lock().expect("schedule");
-                let mut store = store.write().expect("store");
-                for _ in 0..due as usize {
-                    schedule.step(&mut store, &wire);
-                }
-                counted.fetch_add(due as u64, Ordering::Relaxed);
-            }
-        }));
+        self.living.rate(per_second);
     }
 
     /// Stops time without stopping the server.
     pub fn still(&self) {
-        self.live(0.0);
+        self.living.rate(0.0);
     }
 
     /// How many clients are on the socket.
@@ -192,10 +171,33 @@ impl FakeSlack {
         self.live.connected()
     }
 
+    /// What the server saw every client be told, and everywhere they do not
+    /// agree. A snapshot: a client that simply has not been handed the last
+    /// frame yet reads as `Behind`, which is what `settled` waits out.
+    pub fn observations(&self) -> Observations {
+        self.live.observations(&self.store.read().expect("store"))
+    }
+
+    /// Waits until every connected client has been handed everything
+    /// published, or the wait runs out. Returns whether they caught up, so a
+    /// test can say so rather than assume it.
+    pub async fn settled(&self, within: Duration) -> bool {
+        let until = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < until {
+            if self.live.caught_up() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        self.live.caught_up()
+    }
+
     /// Does something to the server: the same typed action the binary's
-    /// control endpoint takes.
-    pub fn take(&self, action: Action) {
+    /// control endpoint takes, over the same enum. Hands back what happened
+    /// when the action was one that makes things happen.
+    pub fn take(&self, action: Action) -> Vec<Happening> {
         self.control.lock().expect("control").take(action);
+        self.living.take(action)
     }
 
     /// How many requests have been answered, in total and per method — the
@@ -215,9 +217,7 @@ impl Drop for FakeSlack {
         // is holding open, and time itself. A test that forgets is not
         // leaving a workspace running behind it.
         self.task.abort();
-        if let Some(ticker) = self.ticker.lock().expect("ticker").take() {
-            ticker.abort();
-        }
+        self.living.stop();
     }
 }
 

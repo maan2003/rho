@@ -284,23 +284,22 @@ fn generated_result_bytes(random: u64) -> u16 {
     }
 }
 
-fn run_events(
-    seed: u64,
-    mode: WalkMode,
-    events: &[WalkEvent],
-) -> Result<
-    WalkReport,
-    (
-        &'static str,
-        usize,
-        Option<WalkEvent>,
-        u64,
-        u64,
-        u64,
-        u64,
-        Vec<String>,
-    ),
-> {
+/// What a rejected walk hands back: which oracle rejected it, where and on
+/// which event, the four counts the shrinker reports, and the lines it
+/// rejected on. Named because the shrinker passes it from function to
+/// function, not because the shape changed.
+type Rejection = (
+    &'static str,
+    usize,
+    Option<WalkEvent>,
+    u64,
+    u64,
+    u64,
+    u64,
+    Vec<String>,
+);
+
+fn run_events(seed: u64, mode: WalkMode, events: &[WalkEvent]) -> Result<WalkReport, Rejection> {
     run_events_with_detached_host(seed, mode, events, false)
 }
 
@@ -309,19 +308,7 @@ fn run_events_with_detached_host(
     mode: WalkMode,
     events: &[WalkEvent],
     detached_host: bool,
-) -> Result<
-    WalkReport,
-    (
-        &'static str,
-        usize,
-        Option<WalkEvent>,
-        u64,
-        u64,
-        u64,
-        u64,
-        Vec<String>,
-    ),
-> {
+) -> Result<WalkReport, Rejection> {
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();

@@ -21,7 +21,18 @@ fn the_widening_check_says_both_things() {
     // underflow at a fold beginning at offset zero: 5 minus 219, which in
     // release is about eighteen quintillion and here is simply a start past
     // its own end.
-    let inverted = widening_violation("old", 900..100, 4_000, "fold widening");
+    // Built rather than written as `900..100`, because an inverted range
+    // literal is a mistake everywhere except here, where it is the input
+    // under test.
+    let inverted = widening_violation(
+        "old",
+        std::ops::Range {
+            start: 900,
+            end: 100,
+        },
+        4_000,
+        "fold widening",
+    );
     assert!(
         inverted.is_some_and(|said| said.contains("starts after it ends")),
         "a range whose start is past its end has to be reported"

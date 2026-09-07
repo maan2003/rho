@@ -94,6 +94,10 @@ struct Frame {
     cursors: u64,
 }
 
+/// A stage, as much of one as the summaries read. The daemon also emits
+/// `transforms` and `affected_offsets`, which nothing here reports yet;
+/// serde drops what the struct does not name, so they come back by being
+/// added when there is a summary that wants them.
 #[derive(Deserialize)]
 struct Stage {
     stage: String,
@@ -105,18 +109,14 @@ struct Stage {
     input_rows: u64,
     #[serde(default)]
     new_rows: u64,
-    #[serde(default)]
-    transforms: u64,
-    #[serde(default)]
-    affected_offsets: u64,
 }
 
+/// One piece of work. The daemon also emits `start_ns`, which no summary
+/// reads: the work lines are ranked by duration, not placed on a timeline.
 #[derive(Deserialize, Default)]
 struct Work {
     #[serde(default)]
     owner: String,
-    #[serde(default)]
-    start_ns: u64,
     #[serde(default)]
     duration_ns: u64,
     #[serde(default)]

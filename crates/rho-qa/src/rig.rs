@@ -1278,7 +1278,7 @@ impl Identity {
         format!(
             "  {:<12} {} {}  {}",
             self.name,
-            &self.hash,
+            self.hash,
             self.modified
                 .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|since| format!("mtime {}", since.as_secs()))
