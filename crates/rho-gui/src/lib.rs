@@ -1,6 +1,6 @@
 //! The Rho GPUI client views and native application integration.
 
-pub(crate) mod capture_carryover;
+mod capture_carryover;
 pub(crate) mod chime;
 pub(crate) mod commands;
 pub(crate) mod create;
@@ -9,7 +9,6 @@ pub mod desk_view;
 pub mod draft_view;
 pub(crate) mod find;
 pub mod home;
-pub(crate) mod image_view;
 pub mod minibuffer;
 pub mod note_view;
 pub mod pane;
@@ -17,8 +16,8 @@ pub mod rho_assets;
 #[cfg(test)]
 mod sampler;
 pub mod slack;
-#[doc(hidden)]
 pub mod telemetry;
+#[doc(hidden)]
 pub mod transient;
 pub(crate) mod usage;
 #[cfg(feature = "walk-support")]

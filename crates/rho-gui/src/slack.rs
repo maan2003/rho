@@ -502,7 +502,7 @@ impl Workspace {
         let surface = match self.find_surface(|surface| surface.key == key).cloned() {
             Some(surface) => surface,
             None => {
-                let view = cx.new(|cx| crate::image_view::ImageView::new(path, cx));
+                let view = cx.new(|cx| rho_window::image_view::ImageView::new(path, cx));
                 crate::workspace::Workspace::wrap_surface(key, SurfaceView::Image(view))
             }
         };

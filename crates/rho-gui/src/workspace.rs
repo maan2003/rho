@@ -167,7 +167,7 @@ pub(crate) enum SurfaceView {
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
     SlackList(Entity<rho_slack::ui::ListView>),
     SlackConversation(Entity<rho_slack::ui::ConversationView>),
-    Image(Entity<crate::image_view::ImageView>),
+    Image(Entity<rho_window::image_view::ImageView>),
 }
 
 impl SurfaceView {
