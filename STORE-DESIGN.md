@@ -50,19 +50,23 @@ for. There is no separate object column; the payload is the object.
 Two shapes of property, decided per variant:
 
 - One per subject, last-writer-wins: the store key is the subject and
-  the variant; a newer stamp replaces the payload. `Parent(Option<Id>)`,
-  `Name(String)` (a label's name; on any other id the user's override of
+  the variant; a newer stamp replaces the payload. `Parent(Option<Id>)`
+  (valid only from a label to another label or to none; any other write is
+  a typed refusal), `About(Id)` (valid only on a note), `Name(String)` (a
+  label's name; on any other id the user's override of
   the derived title, so renaming an agent, a Slack unit, or a page is a
   store write that syncs, not a request to the daemon), `State(State)`,
   `DeferUntil(Timestamp)`,
   `Deadline(Timestamp)`, `PaceDays(u32)`, `SlackHandledThrough(Ts)` and
   `AgentHandledThrough(AgentEventPos)` (the verdict cursors, one per
   source, at that source's own position), `Deleted(bool)`,
-  `CreatedAt(Timestamp)`.
+  `CreatedAt(Timestamp)`. `CreatedAt` is never zero; when creation time is
+  unknown there is no cell.
 - Many per subject, one boolean LWW cell per payload: the store key is the
   subject, the variant, and the payload; the cell says present or absent.
-  `Labeled(Id::Label)` (the tag rule as today: opposing writes at the
-  same version choose add). Any future property the user can have several
+  `Labeled(Id::Label)` on things (the tag rule as today: opposing writes
+  at the same version choose add). Labels use `Parent`, not `Labeled`. Any
+  future property the user can have several
   of is this shape.
 - `Body` (note) is the text CRDT, keyed by subject.
 - The verdict log: `(Id, stamp) → VerdictEvent`, grow-only, merged by
@@ -73,8 +77,10 @@ the unit (a Slack thread, an agent, a page), but a property can name the
 exact thing inside it, and the variant is as specific as the fact:
 `FromSlack { unit: SlackUnit, message: Ts }` on an agent records the very
 message that led to spawning it, though no id exists for a message;
-`FromPage { page: PageId, url: Url }` records the page and the exact
-address that led to it. One variant per source, never a generic `From`
+`FromPage { page: PageId, url: Url }`, also on an agent, records the page and
+the exact address that led to it. `About(Id)` on a note records that the note was
+written about a thing such as an agent or Slack unit. One variant per source,
+never a generic `From`
 with an id that could be anything; a property may carry several ids where
 one fact genuinely joins several things. The same rule bounds it: a
 payload is typed, never a string that means something. The enum is the
@@ -111,7 +117,7 @@ in the GUI, where the sources already live:
   workspace), `newest`, `newest_from_other`, `newest_author`: the Slack
   mirror.
 - `opened_from` (page → page): the browser. A `ctrl-click` that opens a
-  tab records where it came from, so the tab lands under its origin.
+  tab records where it came from. This is provenance, not placement.
 - `title`, everywhere: a note's first line, a label's name, the agent's
   label, the page's title, the Slack unit's subject; a stored `Name`
   overrides any of the derived ones.
@@ -129,52 +135,46 @@ Nothing in storage says where a thing is shown, whether it is dealt, or
 what it is called. Each view is a rule set, and changing a rule moves
 nothing in storage.
 
-- Place, for the map and for paths: the user's `parent` if set; else the
-  derived edge into its source context (`spawned_by`, then `on_host`;
-  `in_channel`, then `in_workspace`; `opened_from`); else the root. A
-  parent chain that never reaches the root (a cycle, a deleted ancestor)
-  is shown at the root, as today.
-- Labels are a second axis: a thing also appears under every label it
-  carries. The map is therefore a DAG drawn as a tree; a thing in two
-  places appears twice, and that is the truth, not a bug.
+- Place, for the map and for paths: labels alone. Labels nest through
+  `Parent`; a thing appears under every label named by its `Labeled` cells
+  and otherwise at the root. A label chain that cycles or reaches a deleted
+  label is shown at the root.
 - Matters, for what the map and Find show at all: an id with any user
-  fact, or open by source facts, or a place-ancestor of one that is. So
+  fact, or open by source facts, or a label-ancestor of one that is. So
   not every Slack channel, not every finished agent, not every tab.
 - Home (`HOME-DESIGN.md`): dealable if open by source facts (an agent
   waiting, a Slack unit with `newest_from_other > handled_through`) or by
   user facts (`defer_until` reached, with `pace_days`), filtered by
   `state`; curves per id kind as today.
-- Notes for this: notes whose `parent` is this id, any id.
-- Find: every id that matters, matched fuzzily against its place path and
-  its labels, as today.
+- Notes for this: notes whose `About` names this id.
+- Find: every id that matters, matched fuzzily against its title and its label
+  paths, as today. `spawned_by` remains derived from the registry;
+  it is never stored or used as placement.
 
 **Why:** the user's words, 4 Sep: "the raw storage stays flexible and then
 you convert it to visual with a set of rules". Every "where does this
 live" question becomes a rule that can change without a migration.
 
-### Labels are the filing; parent is for things
+### Labels are the filing; parent is only for labels
 
-The user's call, 4 Sep, after slice 3 landed. A thing is filed by
-labels: `f` on anything opens the picker, a label path (`rho/agent`)
-adds that label to the thing (a thing can carry several; naming the
-same path again takes it off), and the label's own `parent` chain
-makes `rho/agent` count as `rho` too, transitively. There is no
-separate label key. `parent` on a thing is set only when the thing
-hangs under another thing: a note under a Slack thread (notes for
-this), an agent under the thread or page it was spawned from, or `f`
-picking a thing instead of a label; one value, replaced. Find ranks a
-thing over its label paths and its parent path alike. The map shows
-the label tree with things under their labels, things under their
-parent thing, and the rest at the root. Workdir inheritance walks the
-parent chain as before; a label may carry a `Project { host, path }`
-property, the workdir itself, so an agent made "in" `rho` inherits it
-the way a heading used to own one. There is no separate project
-concept and no project id: a project is a label with a `Project`
-property (the user, 4 Sep). The `Labeled` property, the
-picker, and the map's label axis from slice 3 stay as built; what
-changes is that `f` writes `Labeled` for a label and `Parent` only for
-a thing, and the unbound label key is deleted rather than left waiting.
+The user's revised call, 7 Sep: "why should they have parents, we should just
+use labels for things right" and "convert archived things to done". Labels
+carry all structure. A thing (note, agent, page, Slack unit, pull request, or
+file) has no parent; it carries only `Labeled` cells and otherwise sits at the
+root. Labels nest through `Parent`.
+The daemon refuses a `Parent` cell whose subject or non-none target is not a
+label, as a typed error rather than silently dropping it.
 
+`f` opens the label picker. A label path (`rho/agent`) adds that label to the
+thing (a thing can carry several; naming the same path again takes it off),
+and the label's own `Parent` chain makes `rho/agent` count as `rho`
+transitively. Find ranks filing over label paths alone. Relations do not
+pretend to be structure: `FromSlack`, `FromPage`, and a note's `About(Id)` say
+what happened, while agent `spawned_by` comes from the registry. The map shows
+the label tree with things under their labels and unlabelled things at the
+root. Workdir inheritance walks the label chain; a label may carry a `Project
+{ host, path }` property, so a project is a label with a workdir rather than a
+separate id. `f` writes only `Labeled`; it never writes `Parent` on a thing.
 Built and landed as d8625568 (GUI plus the `Project` property in
 rho-desk, so the daemon's profile moved there too): one picker on `f`,
 label rows first ("label · enter takes it off" when the thing already
@@ -182,7 +182,7 @@ carries it), then things; `DashboardLabel` and `prompt_label_card`
 gone; Find ranks over label paths (`rho/agent › title`); a Slack room
 is findable because Slack says it exists, and its desk labels are
 joined on by the room's unit; `area_workdir` inherits `Project` up the
-parent chain.
+label-parent chain.
 
 ### Labels are ids, not strings
 
@@ -204,7 +204,8 @@ open again the moment the source has an event that wants the user past
 the cursor (a reply from them, an agent turn ending on a question or a
 tag), with a fresh wait; the user's own message to either never reopens
 anything. No wall clock from one system is ever compared with another's.
-`State(Done)` is for what nothing external can reopen: notes and labels.
+`State(Done)` means archived for every kind of thing. There is no archive
+label and no `:archived:` stamp line in a note body.
 `x` mute (the verdict formerly called discard; renamed 4 Sep because
 what it does is stop the thing from raising its hand): the cursor,
 plus `state := muted` so the thing stays out of Home even when it
@@ -213,7 +214,7 @@ source's own silence where it has one (a thread unfollowed, a
 conversation marked read). `s` snooze:
 `defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file: a
 label path adds `Labeled(label)`, created if new, or takes it off if
-already there; a thing picked with Find sets `parent := that thing`. `u` undo: the log entry
+already there. `u` undo: the log entry
 names the facts it changed and their old values; undo writes them back.
 Every verdict is a log entry first.
 
@@ -341,15 +342,61 @@ The user's calls, 4 Sep, on the simplification pass:
 
 ## Browser tabs
 
-A tab is `Page(PageId)`; it is never created in the store. Its place is
-its `opened_from` origin until the user files it, so a burst of
-`ctrl-click`s from a search page reads as a group under that page on the
-map, and filing the page under a project carries the group with it in the
-view (the children's place still derives from the page). Capture
+A tab is `Page(PageId)`; it is never created in the store. The browser's
+derived `opened_from` fact records its source page, but that relation is not
+placement. Only labels file the page; an unlabelled page remains at the root.
+Capture
 (`CREATE-DESIGN.md`) is unchanged: a draft page carries the fields the
 user typed, and the page exists when the browser opens it.
 
 ## Migration
+
+### Second conversion: recover the outline as labels
+
+No copy of the Org text survived the 3 Sep cutover, so this conversion reads
+the outline back from the current Desk store: a heading is now a note, an Org
+agent tag is now an agent parented under that note, an archive mark is now a
+`:archived:` stamp-note child, a bookmark heading owns page children, and
+`:project:` is represented by a file child plus a label's `Project`. These
+stored facts and bodies are the only source.
+
+The one-shot daemon-start conversion, behind a durable marker, interprets that
+shape in this order:
+
+1. Drop each `:archived: <date>` stamp note and set its containing note Done.
+2. Drop each `Archive`/`archive` folder, set every descendant Done, and delete
+   the `archive` label and all of its memberships.
+3. Outside an archive folder, a note with at least two non-stamp children is a
+   heading: mint or reuse an equal-name label, stripping a trailing colon,
+   and parent that label to the nearest enclosing heading-label. Drop the
+   heading note itself unless it has a real body; preserve a real heading
+   body as a note labeled with that label. Inside an
+   archive folder a heading flattens instead: its children take the nearest
+   outside label and remain Done.
+4. Drop a heading-label's old `File { host, path }` project-marker child. Its
+   `Project` already belongs on the label; if absent there and available from
+   the file child, copy it to the label first.
+5. An item note whose only children are one or more agents, and whose body is
+   empty or equals its title, is an agent entry. Drop the note; give every
+   child agent the note's labels, its Done state, and `Name(title)` when that
+   differs from the agent's current name.
+6. Keep every other note, label it with the nearest heading-label, and add
+   `About(agent)` when a body note sat below an agent item.
+7. Drop bookmark headings and their page children; the browser is the source.
+8. Drop every remaining non-label `Parent`, including spawn chains and links
+   from agents or pages to notes. Preserve `AgentHandledThrough` and `State`,
+   but drop every agent `DeferUntil`: "lets just remove snooze for them, I
+   will resnooze them if needed".
+9. Drop every zero `CreatedAt` and every body whose note does not exist.
+
+The code is deleted after the user has run it. Proof uses DeskSync to save a
+read-only version-zero snapshot outside the repository, renders that snapshot
+with the parked reader's `--org` output before and after applying the
+conversion as a pure function, and then deletes the snapshot. Before daemon
+code is written, the snapshot's counts and any unexpected shapes are reported
+for review. This process never copies or directly opens `rho.redb`.
+
+### First conversion from the native tree (historical)
 
 One shot at daemon start, and then the code goes (the standing rule):
 
@@ -459,6 +506,10 @@ else is built on. The transient lands after slice 2.
    under the thing it labels keeps the root row, or nothing would reach
    it). Screens: `br-12-burst.png`, `br-26-map-filed.png`.
 
+   This records the behavior that landed on 4 Sep. The revised 7 Sep rule
+   above supersedes its placement semantics: `opened_from` is now provenance
+   only, and labels alone place pages.
+
 5. **The client keeps the store.** Decided 5 Sep, after slice B of
    `AGENT-LOG-DESIGN.md` showed that a cold GUI has agents but nothing
    to hang them on: the store's cells, verdicts, version and note bodies
@@ -536,6 +587,7 @@ only if the hold is still its own, so the window that took it keeps it.
 ## What done means
 
 One store of the user's facts, typed ids that are the sources' own,
-verdicts and the Slack cursor visible on every device, a note under
-anything, a tab under the page it came from, and every "where is this
-shown" answer a rule in one place.
+verdicts and the Slack cursor visible on every device, typed relations such as
+a note about anything or a page opened from another page, labels as the only
+placement structure, and every "where is this shown" answer a rule in one
+place.
