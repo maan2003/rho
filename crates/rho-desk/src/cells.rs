@@ -157,11 +157,11 @@ pub struct Project {
 /// than in a string somewhere else.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Property {
-    /// Where the user filed it. Any id may be a parent: an agent under a
-    /// Slack thread, a note under a page, a label under a label. `None` is
-    /// the root, written rather than deleted, so un-filing is a fact like
-    /// any other.
+    /// Label nesting. The store accepts this on any subject, but rho writes
+    /// and reads it for placement only when the subject is a label.
     Parent(Option<Id>),
+    /// What a note is about. This is provenance, never placement.
+    About(Id),
     /// A set: the label is part of the key, so two devices tagging at once
     /// do not fight over one cell.
     Labeled {
@@ -200,6 +200,7 @@ pub enum Property {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
 pub enum PropertyKey {
     Parent,
+    About,
     Labeled(Id),
     Name,
     Project,
@@ -234,6 +235,7 @@ impl Property {
     pub fn key(&self) -> PropertyKey {
         match self {
             Property::Parent(_) => PropertyKey::Parent,
+            Property::About(_) => PropertyKey::About,
             Property::Labeled { label, .. } => PropertyKey::Labeled(label.clone()),
             Property::Name(_) => PropertyKey::Name,
             Property::Project(_) => PropertyKey::Project,
@@ -307,7 +309,7 @@ impl PropertyKey {
             }
             PropertyKey::AgentHandledThrough => Some(Property::AgentHandledThrough(StoryPos(0))),
             PropertyKey::SlackSnoozedAt => Some(Property::SlackSnoozedAt(SlackTs(String::new()))),
-            PropertyKey::Name | PropertyKey::CreatedAt => None,
+            PropertyKey::Name | PropertyKey::About | PropertyKey::CreatedAt => None,
         }
     }
 }
@@ -689,10 +691,10 @@ pub struct Snapshot {
 /// rules over these facts joined with the sources, and live in the GUI.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
-    /// The user's filing, and whether they ever did any: `None` filed is
-    /// the root, and never filed leaves the place to the source.
+    /// The raw parent cell. Rho's placement rule consults it only for labels.
     pub parent: Option<Id>,
     pub filed: bool,
+    pub about: Option<Id>,
     pub labels: BTreeSet<Id>,
     pub name: Option<String>,
     /// The workdir this thing stands for, which only a label carries.
@@ -715,6 +717,7 @@ impl Facts {
     /// it, and the map does not show it for its own sake.
     pub fn any(&self) -> bool {
         self.filed
+            || self.about.is_some()
             || !self.labels.is_empty()
             || self.name.is_some()
             || self.project.is_some()
@@ -961,6 +964,7 @@ impl Store {
                     facts.parent = parent.clone();
                     facts.filed = true;
                 }
+                Property::About(about) => facts.about = Some(about.clone()),
                 Property::Labeled {
                     label,
                     present: true,
@@ -1089,6 +1093,7 @@ mod tests {
     fn variants() -> Vec<(Property, Property)> {
         vec![
             (Property::Parent(None), Property::Parent(Some(note(9)))),
+            (Property::About(note(8)), Property::About(note(9))),
             (
                 Property::Labeled {
                     label: label(1),

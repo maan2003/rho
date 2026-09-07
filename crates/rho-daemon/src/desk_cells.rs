@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use redb::TableDefinition;
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
 use rho_desk::cells::{
     BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
@@ -19,6 +20,8 @@ const BODIES: TableDefinition<Sen<Id>, Sen<BodySnapshot>> =
 const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
 const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
+const OUTLINE_CONVERTED: TableDefinition<(), bool> =
+    TableDefinition::new("rho_desk_outline_labels_v1");
 
 /// The same two tables, read without trusting every row to decode. A newer
 /// build on another device can write a property or a verdict this one has
@@ -70,6 +73,49 @@ impl DeskCellStore {
     pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
         initialize(&mut write)?;
+        if write.open_table(OUTLINE_CONVERTED).get(&()).is_none() {
+            let read = db.read();
+            let agent_titles = if read.has_table("agent_log") {
+                read.list_agents()
+                    .into_iter()
+                    .map(|(id, head)| (id, head.title().map(str::to_owned)))
+                    .collect()
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            drop(read);
+            let mut meta = load_meta_from_write(&mut write)?;
+            let snapshot = read_snapshot_from_write(&mut write)?;
+            let bodies = write
+                .open_table(BODIES_READ)
+                .iter()
+                .map(|(_, body)| body.value().ok_or("Desk body was written by a newer build"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let zero_created = snapshot
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell.property, Property::CreatedAt(at) if at.unix_ms == 0))
+                .map(|cell| CellAddress {
+                    id: cell.id.clone(),
+                    key: PropertyKey::CreatedAt,
+                })
+                .collect::<Vec<_>>();
+            let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+            let (snapshot, bodies, report) =
+                crate::desk_outline_migration::convert(&mut store, bodies, &agent_titles)?;
+            persist_snapshot(&mut write, &snapshot, bodies)?;
+            // CreatedAt has no empty value. The conversion's only correct
+            // representation for a zero timestamp is no cell at all.
+            let mut cells = write.open_table(CELLS);
+            for address in zero_created {
+                cells.remove(SenValue::borrowed(&address));
+            }
+            drop(cells);
+            meta.frontier = snapshot.version;
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            write.open_table(OUTLINE_CONVERTED).insert(&(), &true);
+            tracing::info!("{}", report.line());
+        }
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -498,7 +544,7 @@ fn validate_mutation_bounds(mutation: &CellMutation) -> Result<(), String> {
     for write in &mutation.writes {
         subject_bounds(&write.id)?;
         match &write.property {
-            Property::Parent(Some(parent)) => subject_bounds(parent)?,
+            Property::Parent(Some(parent)) | Property::About(parent) => subject_bounds(parent)?,
             Property::Labeled { label, .. } => subject_bounds(label)?,
             Property::Name(name) if name.len() > 64 * 1024 => {
                 return Err("Desk name exceeds 65536 bytes".into());
@@ -671,6 +717,7 @@ pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     write.open_table(CELLS);
     write.open_table(VERDICTS);
     write.open_table(BODIES);
+    write.open_table(OUTLINE_CONVERTED);
     write.open_table(META).insert(&(), SenValue::owned(meta));
     Ok(())
 }
@@ -816,6 +863,18 @@ fn persist_snapshot(
     }
     drop(verdicts);
     let mut table = write.open_table(BODIES);
+    let keep = bodies
+        .iter()
+        .map(|body| body.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let remove = table
+        .iter()
+        .map(|(id, _)| id.value().into_owned())
+        .filter(|id| !keep.contains(id))
+        .collect::<Vec<_>>();
+    for id in remove {
+        table.remove(SenValue::borrowed(&id));
+    }
     for body in bodies {
         table.insert(SenValue::owned(body.id.clone()), SenValue::owned(body));
     }
@@ -918,6 +977,75 @@ mod tests {
             .max()
             .unwrap_or(0)
             + 1
+    }
+
+    #[tokio::test]
+    async fn outline_conversion_and_marker_commit_once_with_body_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("rho.redb"));
+        let kept = Id::Note(Uuid::random());
+        let orphan = Id::Note(Uuid::random());
+        {
+            let mut write = db.write().await;
+            initialize(&mut write).unwrap();
+            let mut meta = load_meta_from_write(&mut write).unwrap();
+            let mut cells = Store::new(meta.daemon_device);
+            cells.write(kept.clone(), Property::Parent(None)).unwrap();
+            cells
+                .write(
+                    kept.clone(),
+                    Property::CreatedAt(Timestamp {
+                        unix_ms: 0,
+                        precision: TimestampPrecision::Millisecond,
+                    }),
+                )
+                .unwrap();
+            let make_body = |id: Id, replica: u16, value: &str| {
+                let mut buffer = text::Buffer::new(
+                    text::ReplicaId::new(replica),
+                    text::BufferId::new(replica as u64).unwrap(),
+                    "",
+                );
+                let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, value)]));
+                BodySnapshot {
+                    id,
+                    operations: vec![operation],
+                    transactions: Vec::new(),
+                }
+            };
+            persist_snapshot(
+                &mut write,
+                &cells.snapshot(),
+                vec![
+                    make_body(kept.clone(), 1, "kept"),
+                    make_body(orphan, 2, "orphan"),
+                ],
+            )
+            .unwrap();
+            meta.frontier = cells.version().clone();
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            write.commit();
+        }
+
+        let first = DeskCellStore::new(db.clone()).await.unwrap();
+        let first_snapshot = first.sync_since(&Version::new()).unwrap();
+        let first_bodies = first.bodies();
+        assert_eq!(first_bodies.len(), 1);
+        assert_eq!(first_bodies[0].id, kept);
+        let converted = Store::from_snapshot(DeviceId([0; 16]), first_snapshot.clone()).unwrap();
+        assert_eq!(converted.facts(&kept).created_at, None);
+        assert_eq!(converted.facts(&kept).parent, None);
+        assert_eq!(
+            db.read()
+                .open_table(OUTLINE_CONVERTED)
+                .get(&())
+                .map(|v| v.value()),
+            Some(true)
+        );
+
+        let second = DeskCellStore::new(db).await.unwrap();
+        assert_eq!(second.sync_since(&Version::new()).unwrap(), first_snapshot);
+        assert_eq!(second.bodies(), first_bodies);
     }
 
     /// Writes one note at the root the way a client does. A note is

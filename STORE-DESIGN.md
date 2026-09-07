@@ -51,8 +51,8 @@ Two shapes of property, decided per variant:
 
 - One per subject, last-writer-wins: the store key is the subject and
   the variant; a newer stamp replaces the payload. `Parent(Option<Id>)`
-  (valid only from a label to another label or to none; any other write is
-  a typed refusal), `About(Id)` (valid only on a note), `Name(String)` (a
+  (the GUI writes and placement reads it only from a label to another label
+  or to none), `About(Id)` (used on a note), `Name(String)` (a
   label's name; on any other id the user's override of
   the derived title, so renaming an agent, a Slack unit, or a page is a
   store write that syncs, not a request to the daemon), `State(State)`,
@@ -162,8 +162,10 @@ use labels for things right" and "convert archived things to done". Labels
 carry all structure. A thing (note, agent, page, Slack unit, pull request, or
 file) has no parent; it carries only `Labeled` cells and otherwise sits at the
 root. Labels nest through `Parent`.
-The daemon refuses a `Parent` cell whose subject or non-none target is not a
-label, as a typed error rather than silently dropping it.
+The store accepts `Parent` on any subject like every other cell, but rho never
+writes one on a non-label and the placement rule never reads one. The user's
+7 Sep correction: "no parent refusal must not happen at daemon. ok about is
+reasonable."
 
 `f` opens the label picker. A label path (`rho/agent`) adds that label to the
 thing (a thing can carry several; naming the same path again takes it off),
@@ -372,16 +374,20 @@ shape in this order:
    heading note itself unless it has a real body; preserve a real heading
    body as a note labeled with that label. Inside an
    archive folder a heading flattens instead: its children take the nearest
-   outside label and remain Done.
-4. Drop a heading-label's old `File { host, path }` project-marker child. Its
-   `Project` already belongs on the label; if absent there and available from
-   the file child, copy it to the label first.
+   outside label and remain Done. Equal names always reuse one label, whose
+   parent comes from the outermost equal-name heading; children below another
+   occurrence carry that label plus their enclosing heading's label.
+4. Drop every old `File { host, path }` project marker, wherever it sits. If
+   the equal-name label lacks `Project`, copy the host and path there first.
 5. An item note whose only children are one or more agents, and whose body is
    empty or equals its title, is an agent entry. Drop the note; give every
    child agent the note's labels, its Done state, and `Name(title)` when that
-   differs from the agent's current name.
+   differs from the registry's human name at conversion time, or when the
+   registry has no name. This specific rule wins over the broad heading rule
+   when every non-stamp child is an agent.
 6. Keep every other note, label it with the nearest heading-label, and add
-   `About(agent)` when a body note sat below an agent item.
+   `About(agent)` for either legacy note-to-agent shape. Afterward drop any note
+   with neither body text nor a title: `About` on nothing is nothing.
 7. Drop bookmark headings and their page children; the browser is the source.
 8. Drop every remaining non-label `Parent`, including spawn chains and links
    from agents or pages to notes. Preserve `AgentHandledThrough` and `State`,
