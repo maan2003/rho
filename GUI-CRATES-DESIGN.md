@@ -852,6 +852,25 @@ wrong at the design, not at the polish.
   the count is main's, which the fold trio moved from 259 to 262. Clippy
   `-D warnings` clean, `cargo fmt --check` clean.
 
+  *Landed, the sheet the change above opened and never drew (`rho-gui`'s
+  `workspace` and `workspace_phone`).* The overlay at the bottom of
+  `render` matched on the bottom strip's `transient` alone, so once the
+  phone's menus stopped being strips the phone opened a menu into an empty
+  screen: `menu_buffer` was set, the sheet had a title and rows, and nothing
+  put them on the glass. The test that shipped with the change asked the
+  workspace what the sheet said and got the right answer, which is the
+  whole lesson — *open* and *drawn* are different claims, and a test that
+  reads state proves only the first. What found it is the rig's new
+  pointer: the first real tap on the phone's header did nothing, and the
+  cursor turning into a hand over that same header is what said the tap was
+  landing and the screen was empty on purpose.
+  The fix is one arm — a menu on the phone draws the same sheet — and two
+  corrections that came with it: the backdrop's keys go to `menu_key` when
+  the sheet is a menu, and a tap outside closes the menu rather than a
+  strip that is not there. The new test taps the bottom of a 400x800 window
+  where the last row lands and asserts the row ran; it fails without the
+  arm, which is the only kind of test that could have caught this one.
+
 - **Landed, the refusal block is measured too** (`rho-window` module touched:
   `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
   the other `height: None` in the chrome, filed in the change above and fixed

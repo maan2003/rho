@@ -1538,9 +1538,19 @@ impl Workspace {
                 .justify_end()
                 .bg(gpui::black().opacity(0.35))
                 .track_focus(&self.transient_focus)
-                .on_key_down(cx.listener(Self::transient_key))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.close_transient(window, cx);
+                // The keys are the menu's when the sheet is a menu: the same
+                // press does the same thing whether the reader is looking at
+                // a block on the desk or a sheet here, and a tap outside
+                // dismisses whichever of the two is open.
+                .on_key_down(cx.listener(move |this, event, window, cx| {
+                    if from_menu {
+                        this.menu_key(event, window, cx);
+                    } else {
+                        this.transient_key(event, window, cx);
+                    }
+                }))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_sheet(from_menu, window, cx);
                 }))
                 .child(
                     div()

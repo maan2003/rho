@@ -10726,6 +10726,15 @@ impl Render for Workspace {
                     } else {
                         minibuffer.render(&text_style, cx)
                     }),
+                    // A menu is drawn as a block in the buffer on the desk and
+                    // as a sheet on the phone, and the sheet is drawn from
+                    // here: nothing else in this method knows the phone has an
+                    // overlay to draw. Without this arm the phone opens a menu
+                    // nobody can see — the buffer has no block on purpose, and
+                    // the strip it used to be is gone.
+                    (None, None, None, _) if phone && self.menu_buffer.is_some() => {
+                        self.render_phone_transient_sheet(&text_style, cx)
+                    }
                     (None, None, Some(transient), _) => {
                         if phone {
                             self.render_phone_transient_sheet(&text_style, cx)

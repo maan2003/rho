@@ -4710,6 +4710,54 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// The sheet has to be *drawn*, not merely open. The menu keeps its rows and
+/// its title whether or not anything puts them on screen, so a test that asks
+/// the workspace what the sheet says passes while the phone shows nothing at
+/// all — which is exactly what happened: the overlay was drawn only for the
+/// bottom strip, and a migrated menu opened into an empty screen. This taps
+/// where the last row lands, which fails if nothing is drawn there.
+#[gpui::test]
+fn the_phone_sheet_is_drawn_where_a_thumb_can_reach_it(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_menu(crate::transient::phone_root_menu(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The sheet sits on the bottom edge and its last row is "Status", so the
+    // bottom of the screen is that row — the target a thumb actually has.
+    let mut visual = gpui::VisualTestContext::from_window(*workspace, cx);
+    visual.simulate_click(
+        gpui::point(gpui::px(200.), gpui::px(790.)),
+        gpui::Modifiers::none(),
+    );
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.menu_title_for_test(),
+                Some("status"),
+                "a tap on the drawn sheet ran the row it landed on"
+            );
+        })
+        .unwrap();
+}
+
 /// Escape out of the snooze units goes back to the verdicts, not out of the
 /// menu: back returns, here as everywhere.
 #[gpui::test]
