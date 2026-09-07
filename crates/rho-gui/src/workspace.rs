@@ -936,7 +936,13 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let rho_mirror::model::ModelChannels { incoming, changes } = rho_mirror::model::spawn();
+        // A test drives the model inline from its story, so it gets channels
+        // with nothing behind them; the crate's own cfg is the right one.
+        #[cfg(not(test))]
+        let channels = rho_mirror::model::spawn();
+        #[cfg(test)]
+        let channels = rho_mirror::model::detached();
+        let rho_mirror::model::ModelChannels { incoming, changes } = channels;
         let model_commands = incoming.clone();
         let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();

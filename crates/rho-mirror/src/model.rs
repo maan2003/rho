@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-#[cfg(not(test))]
 use futures::StreamExt as _;
 use futures::channel::mpsc as futures_mpsc;
 use rho_agents::{HostId, Verdict};
@@ -206,7 +205,10 @@ impl Model {
     /// One frame from a daemon. Rows are folded and written; everything
     /// else is handed on.
     pub fn ingest(&mut self, host: HostId, event: ConnEvent) -> Vec<ModelEvent> {
-        #[cfg(test)]
+        // A batch is its events, one at a time. Only a test feeds one
+        // (the connection hands frames over singly), and a test asserts
+        // per event, so the batch is opened here rather than at every
+        // caller.
         if let ConnEvent::Many(events) = event {
             return events
                 .into_iter()
@@ -386,20 +388,26 @@ pub struct ModelChannels {
 pub fn spawn() -> ModelChannels {
     let (incoming, incoming_rx) = futures_mpsc::unbounded();
     let (changes_tx, changes) = futures_mpsc::unbounded();
-    // A test drives the model inline, on its own thread, so that it can
-    // assert in the frame it fed; a second thread would only wake the test
-    // scheduler from the wrong place.
-    #[cfg(not(test))]
     std::thread::Builder::new()
         .name("rho-model".to_owned())
         .spawn(move || futures::executor::block_on(run(incoming_rx, changes_tx)))
         .expect("spawn the model thread");
-    #[cfg(test)]
-    drop((incoming_rx, changes_tx));
     ModelChannels { incoming, changes }
 }
 
-#[cfg(not(test))]
+/// Channels with no model behind them, for a test that drives the model
+/// inline on its own thread so that it can assert in the frame it fed. A
+/// second thread would only wake the test scheduler from the wrong place,
+/// which is exactly what it did while this choice was a `cfg(test)` here:
+/// that cfg is the crate's own test build, not the caller's, so every
+/// rho-gui test spawned a live model the moment the model left rho-gui.
+/// The caller decides, under its own `cfg(test)`.
+pub fn detached() -> ModelChannels {
+    let (incoming, _incoming_rx) = futures_mpsc::unbounded();
+    let (_changes_tx, changes) = futures_mpsc::unbounded();
+    ModelChannels { incoming, changes }
+}
+
 async fn run(
     mut incoming: futures_mpsc::UnboundedReceiver<ToModel>,
     changes: futures_mpsc::UnboundedSender<ModelEvent>,
