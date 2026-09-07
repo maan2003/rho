@@ -13,6 +13,8 @@ use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+mod pointer;
+
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTPUT_WIDTH: u32 = 2560;
@@ -110,11 +112,14 @@ enum MouseButton {
 }
 
 impl MouseButton {
-    fn sway_name(self) -> &'static str {
+    /// The `linux/input-event-codes.h` code the virtual pointer protocol
+    /// wants. Sway's own names (`button1`) belong to its ipc, which is not
+    /// how a click reaches a client here.
+    fn code(self) -> u32 {
         match self {
-            Self::Left => "button1",
-            Self::Right => "button3",
-            Self::Middle => "button2",
+            Self::Left => pointer::BTN_LEFT,
+            Self::Right => pointer::BTN_RIGHT,
+            Self::Middle => pointer::BTN_MIDDLE,
         }
     }
 }
@@ -194,19 +199,14 @@ pub(crate) fn run(args: WaylandArgs) -> Result<()> {
         DriverCommand::Screenshot { output } => screenshot(&root, &output),
         DriverCommand::Move { x, y } => {
             let session = load_live_session(&root)?;
-            move_pointer(&session, x, y)
+            let mut pointer = virtual_pointer(&session, x, y)?;
+            pointer.move_to(x as u32, y as u32)
         }
         DriverCommand::Click { x, y, button } => {
             let session = load_live_session(&root)?;
-            move_pointer(&session, x, y)?;
-            sway_command(
-                &session,
-                &format!("seat seat0 cursor press {}", button.sway_name()),
-            )?;
-            sway_command(
-                &session,
-                &format!("seat seat0 cursor release {}", button.sway_name()),
-            )
+            let mut pointer = virtual_pointer(&session, x, y)?;
+            pointer.move_to(x as u32, y as u32)?;
+            pointer.click(button.code())
         }
         DriverCommand::Type { text } => {
             let session = load_live_session(&root)?;
@@ -489,9 +489,16 @@ fn screenshot(root: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn move_pointer(session: &Session, x: i32, y: i32) -> Result<()> {
-    let logical_width = session.width / session.scale;
-    let logical_height = session.height / session.scale;
+/// A virtual pointer on the session's seat, with the coordinates checked
+/// against the output first so a typo is an error rather than a click on the
+/// nearest edge.
+///
+/// The device lives as long as the returned value, which is one command: a
+/// headless seat has no pointer of its own, and leaving one attached between
+/// commands would mean every run of the driver changed what the seat's
+/// capabilities said.
+fn virtual_pointer(session: &Session, x: i32, y: i32) -> Result<pointer::Pointer> {
+    let (logical_width, logical_height) = logical_output_size(session)?;
     if x < 0 || y < 0 || x >= logical_width as i32 || y >= logical_height as i32 {
         bail!(
             "coordinates ({x}, {y}) are outside {}x{} output",
@@ -499,15 +506,55 @@ fn move_pointer(session: &Session, x: i32, y: i32) -> Result<()> {
             logical_height
         );
     }
-    sway_command(session, &format!("seat seat0 cursor set {x} {y}"))
+    let socket = session.runtime_dir.join(&session.wayland_display);
+    pointer::Pointer::open(&socket, (logical_width, logical_height))
+}
+
+/// The output's size *now*, not the size the session started at. A resize
+/// goes through sway's own ipc — the driver has no resize — so `session.json`
+/// is the size at startup and a click placed against it lands somewhere else
+/// entirely on a session that has been resized, which is exactly the session
+/// the phone is driven on. Falls back to the recorded size when sway cannot
+/// be asked, so a click still works on a session whose ipc is gone.
+fn logical_output_size(session: &Session) -> Result<(u32, u32)> {
+    let recorded = (
+        session.width / session.scale,
+        session.height / session.scale,
+    );
+    let Ok(outputs) = swaymsg(session, ["-t", "get_outputs", "-r"]) else {
+        return Ok(recorded);
+    };
+    Ok(logical_size_from_outputs(
+        &outputs,
+        &session.output,
+        recorded,
+    ))
+}
+
+/// The `rect` sway reports for the named output, which is already logical —
+/// sway divides by the scale for the layout — falling back to the recorded
+/// size for anything it cannot read. A fallback rather than an error: a
+/// click on a session that has never been resized is right either way, and
+/// the driver refusing to click because it could not parse an unrelated
+/// field would be worse than clicking where the session started.
+fn logical_size_from_outputs(outputs: &str, name: &str, recorded: (u32, u32)) -> (u32, u32) {
+    let Ok(outputs) = serde_json::from_str::<Vec<serde_json::Value>>(outputs) else {
+        return recorded;
+    };
+    let Some(rect) = outputs
+        .iter()
+        .find(|output| output["name"].as_str() == Some(name))
+        .map(|output| &output["rect"])
+    else {
+        return recorded;
+    };
+    let width = rect["width"].as_u64().unwrap_or(recorded.0 as u64) as u32;
+    let height = rect["height"].as_u64().unwrap_or(recorded.1 as u64) as u32;
+    (width, height)
 }
 
 const fn default_output_scale() -> u32 {
     1
-}
-
-fn sway_command(session: &Session, command: &str) -> Result<()> {
-    swaymsg(session, [command]).map(|_| ())
 }
 
 fn swaymsg<const N: usize>(session: &Session, args: [&str; N]) -> Result<String> {
@@ -847,6 +894,35 @@ fn load_live_session(root: &Path) -> Result<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click is placed against the output as it is now. The session file
+    /// says what it was at startup, and a resize goes through sway's ipc
+    /// without touching it, so trusting the file puts every tap on a resized
+    /// session in the wrong place — the phone is only ever driven resized.
+    #[test]
+    fn a_resized_output_is_measured_from_sway_and_not_from_the_session_file() {
+        let outputs = r#"[{"name":"HEADLESS-1","rect":{"x":0,"y":0,"width":400,"height":800}}]"#;
+        assert_eq!(
+            logical_size_from_outputs(outputs, "HEADLESS-1", (1280, 832)),
+            (400, 800)
+        );
+    }
+
+    /// And it falls back rather than failing: an output sway does not know
+    /// about, or a reply it cannot parse, leaves the recorded size in place.
+    #[test]
+    fn an_unreadable_output_list_leaves_the_recorded_size() {
+        let recorded = (1280, 832);
+        let outputs = r#"[{"name":"HEADLESS-2","rect":{"width":400,"height":800}}]"#;
+        assert_eq!(
+            logical_size_from_outputs(outputs, "HEADLESS-1", recorded),
+            recorded
+        );
+        assert_eq!(
+            logical_size_from_outputs("not json", "HEADLESS-1", recorded),
+            recorded
+        );
+    }
 
     #[test]
     fn session_names_are_path_components() {

@@ -871,6 +871,39 @@ wrong at the design, not at the polish.
   where the last row lands and asserts the row ran; it fails without the
   arm, which is the only kind of test that could have caught this one.
 
+  *Landed, the rig can tap (`rho-cli`'s `wayland` driver, `QA-HANDBOOK`'s
+  driving notes).* `click` and `move` were sway ipc `seat cursor` commands,
+  which move a cursor belonging to a pointer device the headless seat does
+  not have: the ipc answered `success: true` and no client ever saw a thing.
+  The driver now creates a `zwlr_virtual_pointer_v1` on the session's own
+  seat for the length of the tap, which is the shape `wtype` already had for
+  keys — `swaymsg -t get_seats` shows `capabilities: 0` with no devices at
+  rest and `1` with a `wlr_virtual_pointer_v1` while a tap is in flight, and
+  the seat is bare again afterwards, so no run changes what the next run
+  finds. Coordinates are logical pixels read off a screenshot and checked
+  against the output's size *now*, from `get_outputs`, not the size in
+  `session.json`: a resize goes through sway's ipc without touching that
+  file, and every session the phone is driven on has been resized. That is
+  its own unit test.
+  Proven on desk session 45, first open of the session, at 800x1600 with
+  scale 2 — a phone. A tap on the note card's header at (200, 16) drew the
+  sheet: **menu** with **close**, and Map / Slack / Agents / Status, the
+  same menu the desk draws as a block under the point. A tap on Status at
+  (100, 772) ran that row and the sheet became **status** with a **back** —
+  upload GUI performance snapshot, usage…, version. A tap on back gave a
+  frame byte-identical to the sheet before it, and a tap on the backdrop
+  closed it into a frame byte-identical to the one before the first tap:
+  the surface underneath never moved, which is what the sheet drawing with
+  no block is for. A no-input control over the same span is byte-identical,
+  so those are the buffer and not the desk. Keys are unharmed: back at
+  2560x1664, `space` still opens the root menu as a block.
+  The session line is `179 frames, draw p99 24.6 ms, 15 over 8 ms; worst gap
+  307 ms, p99 135 ms; 15620 events, slowest stage multi_buffer_sync p99
+  104.32 ms at 0 rows`, and it is not a menu number: that session is two
+  resizes and a card pull, and a resize is the whole-buffer rewrap on the
+  owed list. The menu's own cost is session 41's, ten round trips and
+  nothing else, none over 8 ms.
+
 - **Landed, the refusal block is measured too** (`rho-window` module touched:
   `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
   the other `height: None` in the chrome, filed in the change above and fixed

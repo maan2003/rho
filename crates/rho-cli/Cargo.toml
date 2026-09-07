@@ -31,6 +31,13 @@ tokio.workspace = true
 tracing.workspace = true
 zip.workspace = true
 
+# The driver's pointer: a headless seat has no pointer device, so `click`
+# creates one over `zwlr_virtual_pointer_v1` the way `wtype` creates a virtual
+# keyboard for a keystroke. Linux only, because the session it drives is.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
 [[bin]]
 name = "rho"
 path = "src/main.rs"
