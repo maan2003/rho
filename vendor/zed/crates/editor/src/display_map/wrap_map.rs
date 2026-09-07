@@ -414,8 +414,11 @@ impl WrapMap {
             // pass spreading out from where they used to be can be seconds
             // away from where they are now, and those rows are still laid out
             // at the width before this one.
-            self.reprioritize(priority, cx);
-            return false;
+            // A reprioritize lays the reader's rows out where they are: the
+            // width did not change but the geometry did, and a caller that
+            // reads `false` as "nothing moved" keeps a snapshot that no
+            // longer describes the map.
+            return self.reprioritize(priority, cx);
         }
 
         #[cfg(feature = "wrap-test-support")]
@@ -443,24 +446,27 @@ impl WrapMap {
     }
 
     /// Serves rows that have come in front of a reader since a pass started.
-    fn reprioritize(&mut self, priority: WrapPriority, cx: &mut Context<Self>) {
+    ///
+    /// Reports whether it laid any row out, which is whether the snapshot
+    /// its caller is holding still describes the map.
+    fn reprioritize(&mut self, priority: WrapPriority, cx: &mut Context<Self>) -> bool {
         let Some(wrap_width) = self.wrap_width else {
-            return;
+            return false;
         };
         if self.backfill.is_none() {
-            return;
+            return false;
         }
         let Some(rows) = self.priority_tab_rows(&priority) else {
-            return;
+            return false;
         };
         // A copy of the snapshot is only safe to work from where the
         // snapshot is the tab map's own; edits in flight go first.
         if !self.pending_edits.is_empty() || self.snapshot.interpolated {
-            return;
+            return false;
         }
         let backfill = self.backfill.as_ref().expect("checked above");
         if backfill.done.start <= rows.start && rows.end <= backfill.done.end {
-            return;
+            return false;
         }
 
         // The chunk in flight was chosen for where the reader was. Its rows
@@ -477,6 +483,7 @@ impl WrapMap {
         }
         self.drive_backfill(cx);
         cx.notify();
+        true
     }
 
     #[ztracing::instrument(skip_all)]

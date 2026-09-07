@@ -10789,3 +10789,79 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
         "the top of the history is in the buffer"
     );
 }
+
+/// A width change that lays rows out says so, even when the width is the
+/// same one.
+///
+/// `set_wrap_width` returns whether the caller's snapshot is stale, and the
+/// editor's element uses it exactly that way: `true` and it takes a fresh
+/// snapshot, `false` and it keeps the one it measured with. Serving a
+/// reader's rows on an unchanged width lays rows out — the geometry moves
+/// under the caller — and returning `false` there left the element drawing
+/// one snapshot's rows against another's line layouts, which paints as an
+/// out-of-bounds row in the cursor layout rather than as anything a reader
+/// could describe.
+#[gpui::test]
+fn serving_a_reader_s_rows_at_an_unchanged_width_reports_the_rows_moved(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let line = "alpha bravo charlie delta echo foxtrot golf hotel india juliett";
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text(format!("{line}\n").repeat(2_000), window, cx);
+        editor
+    });
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            window.refresh();
+        })
+        .expect("soft wrap at the editor's width");
+    cx.simulate_window_resize(*editor, gpui::size(gpui::px(300.), gpui::px(400.)));
+    cx.run_until_parked();
+    cx.update_window(*editor, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("wrap the document this editor opened on");
+    cx.run_until_parked();
+
+    // A width change with a reader at the top: the rest of the document is
+    // still owed, which is the state a reader scrolls in.
+    let top = multi_buffer::MultiBufferRow(0)..multi_buffer::MultiBufferRow(30);
+    editor
+        .update(cx, |editor, _, cx| {
+            editor.display_map.update(cx, |map, cx| {
+                map.set_wrap_width(
+                    Some(gpui::px(120.)),
+                    editor::display_map::WrapPriority::ReaderRows(top),
+                    cx,
+                )
+            })
+        })
+        .expect("a narrower width, laid out for a reader at the top");
+
+    // The reader moves, at the same width. Nothing about the width changed;
+    // the rows in front of them are laid out all the same.
+    let moved = multi_buffer::MultiBufferRow(1_500)..multi_buffer::MultiBufferRow(1_530);
+    let (moved_rows, said_so) = editor
+        .update(cx, |editor, _, cx| {
+            let before = editor.display_snapshot(cx).max_point().row().0;
+            let said_so = editor.display_map.update(cx, |map, cx| {
+                map.set_wrap_width(
+                    Some(gpui::px(120.)),
+                    editor::display_map::WrapPriority::ReaderRows(moved),
+                    cx,
+                )
+            });
+            let after = editor.display_snapshot(cx).max_point().row().0;
+            (after != before, said_so)
+        })
+        .expect("serve the rows the reader moved to");
+
+    assert!(
+        moved_rows,
+        "serving the reader's new rows laid them out, so the document's \
+         geometry moved"
+    );
+    assert!(
+        said_so,
+        "and the call said so, so the caller knows to take a fresh snapshot"
+    );
+}
