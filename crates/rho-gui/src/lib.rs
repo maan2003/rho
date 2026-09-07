@@ -24,7 +24,6 @@ pub(crate) mod shell_view;
 pub mod slack;
 #[doc(hidden)]
 pub mod telemetry;
-pub(crate) mod terminal_view;
 pub mod transient;
 pub(crate) mod usage;
 #[cfg(feature = "walk-support")]
@@ -33,6 +32,11 @@ pub mod workspace;
 pub(crate) mod zed_remote;
 
 use gpui::{App, KeyBinding, actions};
+use rho_terminal::{
+    TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalScrollBottom,
+    TerminalScrollHalfPageDown, TerminalScrollHalfPageUp, TerminalScrollLineDown,
+    TerminalScrollLineUp, TerminalScrollTop,
+};
 
 actions!(
     rho_gui,
@@ -102,15 +106,6 @@ actions!(
         MinibufferComplete,
         GitApprovalAllow,
         GitApprovalDeny,
-        TerminalPaste,
-        TerminalNormalMode,
-        TerminalRawMode,
-        TerminalScrollLineUp,
-        TerminalScrollLineDown,
-        TerminalScrollHalfPageUp,
-        TerminalScrollHalfPageDown,
-        TerminalScrollTop,
-        TerminalScrollBottom,
         ShellInterrupt,
         ShellEof,
         ShellPagerMore,

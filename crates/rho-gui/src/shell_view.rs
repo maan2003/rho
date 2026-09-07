@@ -808,10 +808,8 @@ fn append_output_styles(
 fn resolve_output_style(style: ShellTextStyle, cx: &gpui::App) -> HighlightStyle {
     let colors = cx.theme().colors();
     let color = |color| match color {
-        ShellColor::Indexed(index) => crate::terminal_view::terminal_indexed_color(index, colors),
-        ShellColor::Rgb { red, green, blue } => {
-            crate::terminal_view::terminal_rgb_color(red, green, blue)
-        }
+        ShellColor::Indexed(index) => rho_terminal::terminal_indexed_color(index, colors),
+        ShellColor::Rgb { red, green, blue } => rho_terminal::terminal_rgb_color(red, green, blue),
     };
     let mut foreground = style
         .foreground

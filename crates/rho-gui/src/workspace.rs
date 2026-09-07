@@ -160,7 +160,7 @@ pub(crate) enum SurfaceView {
         editor: Entity<editor::Editor>,
     },
     Diff(Entity<crate::diff_view::DiffView>),
-    Terminal(Entity<crate::terminal_view::TerminalView>),
+    Terminal(Entity<rho_terminal::TerminalView>),
     Browser(Entity<rho_browser::PageView>),
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
@@ -5443,9 +5443,8 @@ impl Workspace {
                             agent_id,
                             terminal_id: channel.terminal_id,
                         };
-                        let model =
-                            cx.new(|cx| crate::terminal_view::TerminalModel::new(channel, cx));
-                        let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
+                        let model = cx.new(|cx| rho_terminal::TerminalModel::new(channel, cx));
+                        let view = cx.new(|cx| rho_terminal::TerminalView::new(model, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Terminal(view));
                         this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);

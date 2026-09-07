@@ -13981,6 +13981,7 @@ dependencies = [
  "rho-rpc",
  "rho-rtc",
  "rho-slack",
+ "rho-terminal",
  "rho-transcript",
  "rho-ui-proto",
  "rho-window",
@@ -14249,6 +14250,19 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "ui",
+]
+
+[[package]]
+name = "rho-terminal"
+version = "0.1.0"
+dependencies = [
+ "futures 0.3.33",
+ "gpui",
+ "rho-hosts",
+ "rho-ui-proto",
+ "settings",
+ "theme",
+ "theme_settings",
 ]
 
 [[package]]

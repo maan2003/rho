@@ -39,6 +39,21 @@ use settings::Settings as _;
 use theme::ActiveTheme as _;
 use theme_settings::ThemeSettings;
 
+gpui::actions!(
+    rho_terminal,
+    [
+        TerminalPaste,
+        TerminalNormalMode,
+        TerminalRawMode,
+        TerminalScrollLineUp,
+        TerminalScrollLineDown,
+        TerminalScrollHalfPageUp,
+        TerminalScrollHalfPageDown,
+        TerminalScrollTop,
+        TerminalScrollBottom,
+    ]
+);
+
 /// Client-side scrollback retention; the daemon replays up to its own cap.
 const SCROLLBACK_LIMIT: usize = 8192;
 
@@ -512,7 +527,7 @@ impl Palette<'_> {
     }
 }
 
-pub(crate) fn terminal_indexed_color(index: u8, colors: &theme::ThemeColors) -> Hsla {
+pub fn terminal_indexed_color(index: u8, colors: &theme::ThemeColors) -> Hsla {
     let named: gpui::Color = match index {
         0 => colors.terminal_ansi_black,
         1 => colors.terminal_ansi_red,
@@ -608,7 +623,7 @@ fn grayscale_color(
     }
 }
 
-pub(crate) fn terminal_rgb_color(r: u8, g: u8, b: u8) -> Hsla {
+pub fn terminal_rgb_color(r: u8, g: u8, b: u8) -> Hsla {
     gpui::Rgba {
         r: f32::from(r) / 255.0,
         g: f32::from(g) / 255.0,

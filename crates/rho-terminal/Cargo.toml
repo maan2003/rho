@@ -1,0 +1,20 @@
+# A daemon-owned terminal shown as a surface: the wire display state, the
+# input stream, the viewport with its raw and normal modes, and the actions
+# and colours that belong to it. Owned by no workspace; the window shows it.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-terminal"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+futures.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+rho-hosts = { workspace = true }
+rho-ui-proto.workspace = true
+settings = { path = "../../vendor/zed/crates/settings" }
+theme = { path = "../../vendor/zed/crates/theme" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
