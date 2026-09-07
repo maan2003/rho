@@ -11,8 +11,6 @@ pub(crate) mod find;
 pub mod home;
 pub(crate) mod image_view;
 pub mod minibuffer;
-pub mod mirror;
-pub(crate) mod model;
 pub mod note_view;
 pub mod pane;
 pub mod rho_assets;

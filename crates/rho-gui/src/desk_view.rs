@@ -2083,7 +2083,7 @@ pub fn desk_device() -> DeviceId {
         // `main`, so a test — which never sets it — gets a fresh id per GUI,
         // which is what several GUIs in one process need anyway. That used to
         // be a `#[cfg(test)]` branch saying the same thing twice.
-        let path = crate::mirror::state_dir().map(|base| base.join("desk-device"));
+        let path = rho_mirror::mirror::state_dir().map(|base| base.join("desk-device"));
         if let Some(path) = &path
             && let Ok(bytes) = std::fs::read(path)
             && let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice())
@@ -2115,7 +2115,7 @@ mod tests {
     #[test]
     fn the_desk_device_id_never_reaches_the_user_s_state_directory() {
         assert!(
-            crate::mirror::state_dir().is_none(),
+            rho_mirror::mirror::state_dir().is_none(),
             "only `main` names the state directory, and this is not `main`"
         );
         let first = desk_device();

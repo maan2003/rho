@@ -22,7 +22,7 @@ use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 use rho_ui_proto::{AgentId, ClientMessage};
 
 /// What the main thread hears from the model.
-pub(crate) enum ModelMsg {
+pub enum ModelMsg {
     /// Every agent this client holds for a host, from the disk copy or
     /// after the copy started over. What the main thread had for the host
     /// is gone; this is what there is instead.
@@ -47,13 +47,13 @@ pub(crate) enum ModelMsg {
     Event(ConnEvent),
 }
 
-pub(crate) struct ModelEvent {
+pub struct ModelEvent {
     pub host: HostId,
     pub msg: ModelMsg,
 }
 
 /// What the main thread asks of the model.
-pub(crate) enum ModelCommand {
+pub enum ModelCommand {
     /// A daemon the workspace attached, named before it is dialled: the
     /// name is how the disk copy knows it across restarts.
     AttachHost {
@@ -76,7 +76,7 @@ pub(crate) enum ModelCommand {
 // Under test the model is driven inline and the thread's loop is not
 // built, so nothing reads what the shell puts on this queue.
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) enum ToModel {
+pub enum ToModel {
     Event(HostEvent),
     Command(ModelCommand),
 }
@@ -115,7 +115,7 @@ impl HostModel {
 }
 
 /// The fold of every agent, the cursors, and who is followed.
-pub(crate) struct Model {
+pub struct Model {
     hosts: HashMap<HostId, HostModel>,
     agents: BTreeMap<AgentId, rho_agents::MirroredAgent>,
     followed: BTreeSet<AgentId>,
@@ -125,7 +125,7 @@ pub(crate) struct Model {
 }
 
 impl Model {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             hosts: HashMap::new(),
             agents: BTreeMap::new(),
@@ -134,7 +134,7 @@ impl Model {
         }
     }
 
-    pub(crate) fn command(&mut self, command: ModelCommand) -> Vec<ModelEvent> {
+    pub fn command(&mut self, command: ModelCommand) -> Vec<ModelEvent> {
         match command {
             ModelCommand::AttachHost { host, name } => self.attach(host, name),
             ModelCommand::HostCommands { host, commands } => {
@@ -167,7 +167,7 @@ impl Model {
 
     /// A host the workspace attached, with what the last session left of
     /// it: the cursor `Follow` will send, and the agents already folded.
-    pub(crate) fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
+    pub fn attach(&mut self, host: HostId, name: String) -> Vec<ModelEvent> {
         let mut slot = HostModel::new(name.clone());
         let stored = self.stored.get_or_insert_with(crate::mirror::load);
         if let Some(cursor) = stored.hosts.iter().find(|cursor| cursor.name == name) {
@@ -205,7 +205,7 @@ impl Model {
 
     /// One frame from a daemon. Rows are folded and written; everything
     /// else is handed on.
-    pub(crate) fn ingest(&mut self, host: HostId, event: ConnEvent) -> Vec<ModelEvent> {
+    pub fn ingest(&mut self, host: HostId, event: ConnEvent) -> Vec<ModelEvent> {
         #[cfg(test)]
         if let ConnEvent::Many(events) = event {
             return events
@@ -376,14 +376,14 @@ impl Model {
 
 /// The channels the workspace holds: frames in from every connection,
 /// commands in from the main thread, changes out to it.
-pub(crate) struct ModelChannels {
+pub struct ModelChannels {
     pub incoming: futures_mpsc::UnboundedSender<ToModel>,
     pub changes: futures_mpsc::UnboundedReceiver<ModelEvent>,
 }
 
 /// Starts the model on its own thread. A std thread, not a background
 /// task: it must not take its turn behind the frames it feeds.
-pub(crate) fn spawn() -> ModelChannels {
+pub fn spawn() -> ModelChannels {
     let (incoming, incoming_rx) = futures_mpsc::unbounded();
     let (changes_tx, changes) = futures_mpsc::unbounded();
     // A test drives the model inline, on its own thread, so that it can

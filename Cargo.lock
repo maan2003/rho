@@ -14002,6 +14002,7 @@ dependencies = [
  "rho-hosts",
  "rho-iroh-auth",
  "rho-journal",
+ "rho-mirror",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
@@ -14136,6 +14137,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rho-mirror"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures 0.3.33",
+ "prefix-id",
+ "redb",
+ "rho-agents",
+ "rho-core",
+ "rho-db",
+ "rho-hosts",
+ "rho-ui-proto",
+ "senax-encoder",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

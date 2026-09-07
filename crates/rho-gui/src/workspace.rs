@@ -221,12 +221,12 @@ pub use rho_hosts::{AttachTarget, HostPath, HostSpec};
 /// Where a host's events go from here: onto the model thread's queue, which
 /// is the one place that decides what a frame means. `rho-hosts` knows only
 /// that somebody is listening.
-struct ModelSink(futures::channel::mpsc::UnboundedSender<crate::model::ToModel>);
+struct ModelSink(futures::channel::mpsc::UnboundedSender<rho_mirror::model::ToModel>);
 
 impl rho_hosts::HostSink for ModelSink {
     fn send(&self, event: rho_hosts::HostEvent) -> Result<(), rho_hosts::SinkClosed> {
         self.0
-            .unbounded_send(crate::model::ToModel::Event(event))
+            .unbounded_send(rho_mirror::model::ToModel::Event(event))
             .map_err(|_| rho_hosts::SinkClosed)
     }
 
@@ -433,7 +433,7 @@ pub struct Workspace {
     pending_syncs: HashMap<AgentId, FrameSummary>,
     /// What the main thread asks of the model thread: which hosts exist,
     /// and whose rows it wants. The journal cursor is the model's.
-    model: futures_mpsc::UnboundedSender<crate::model::ToModel>,
+    model: futures_mpsc::UnboundedSender<rho_mirror::model::ToModel>,
     draft_model: Entity<DraftModel>,
     message_log: MessageLog,
     messages_buffer: Entity<language::Buffer>,
@@ -775,9 +775,11 @@ impl Workspace {
     }
 
     fn note_followed(&self) {
-        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
-            crate::model::ModelCommand::Follow(self.followed()),
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_mirror::model::ToModel::Command(
+                rho_mirror::model::ModelCommand::Follow(self.followed()),
+            ));
     }
 
     fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
@@ -793,8 +795,8 @@ impl Workspace {
         }
         // The disk copy may trail the rows just heard by a queued write;
         // waiting for it is what makes the fold whole.
-        crate::mirror::flush();
-        let events = crate::mirror::read_events(agent_id);
+        rho_mirror::mirror::flush();
+        let events = rho_mirror::mirror::read_events(agent_id);
         if !self.transcripts.seed(agent_id, &events) {
             return false;
         }
@@ -934,7 +936,7 @@ impl Subject {
 
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let crate::model::ModelChannels { incoming, changes } = crate::model::spawn();
+        let rho_mirror::model::ModelChannels { incoming, changes } = rho_mirror::model::spawn();
         let model_commands = incoming.clone();
         let hosts = Hosts::new(std::sync::Arc::new(ModelSink(incoming)));
         let workspace = cx.entity().downgrade();
@@ -957,7 +959,7 @@ impl Workspace {
             editor
         });
         let event_task = cx.spawn(async move |this, cx| {
-            let mut changes: UnboundedReceiver<crate::model::ModelEvent> = changes;
+            let mut changes: UnboundedReceiver<rho_mirror::model::ModelEvent> = changes;
             while let Some(change) = changes.next().await {
                 let mut batch = vec![change];
                 while let Ok(change) = changes.try_recv() {
@@ -1250,15 +1252,19 @@ impl Workspace {
         let (host, commands) = self.hosts.attach(spec.name.clone(), spec.target, cx);
         // The model is told the host exists, and how to speak to it, before
         // any frame from it can arrive.
-        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
-            crate::model::ModelCommand::AttachHost {
-                host,
-                name: spec.name.clone(),
-            },
-        ));
-        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
-            crate::model::ModelCommand::HostCommands { host, commands },
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_mirror::model::ToModel::Command(
+                rho_mirror::model::ModelCommand::AttachHost {
+                    host,
+                    name: spec.name.clone(),
+                },
+            ));
+        let _ = self
+            .model
+            .unbounded_send(rho_mirror::model::ToModel::Command(
+                rho_mirror::model::ModelCommand::HostCommands { host, commands },
+            ));
         self.registry.attach_host(host, spec.name);
         host
     }
@@ -1286,9 +1292,11 @@ impl Workspace {
             self.stop_voice();
         }
         self.hosts.detach(host);
-        let _ = self.model.unbounded_send(crate::model::ToModel::Command(
-            crate::model::ModelCommand::DetachHost(host),
-        ));
+        let _ = self
+            .model
+            .unbounded_send(rho_mirror::model::ToModel::Command(
+                rho_mirror::model::ModelCommand::DetachHost(host),
+            ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
         self.global_usage.remove(&host);
@@ -1959,7 +1967,7 @@ impl Workspace {
 
     pub(crate) fn handle_model_events(
         &mut self,
-        events: Vec<crate::model::ModelEvent>,
+        events: Vec<rho_mirror::model::ModelEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1970,7 +1978,7 @@ impl Workspace {
         // be divided by the events it reconciled.
         let start = std::time::Instant::now();
         let count = events.len() as u64;
-        for crate::model::ModelEvent { host, msg } in events {
+        for rho_mirror::model::ModelEvent { host, msg } in events {
             self.handle_model_event(host, msg, window, cx);
         }
         gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
@@ -1984,19 +1992,19 @@ impl Workspace {
     pub(crate) fn handle_model_event(
         &mut self,
         host: HostId,
-        msg: crate::model::ModelMsg,
+        msg: rho_mirror::model::ModelMsg,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match msg {
-            crate::model::ModelMsg::Loaded { agents, verdicts } => {
+            rho_mirror::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
                 self.refresh_dashboard(window, cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
-            crate::model::ModelMsg::Changed { agents } => {
+            rho_mirror::model::ModelMsg::Changed { agents } => {
                 let changed = self.registry.told(agents);
                 if changed.is_empty() {
                     return;
@@ -2013,10 +2021,10 @@ impl Workspace {
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(&changed), cx);
                 self.schedule_desk_sync(host, Some(changed), window, cx);
             }
-            crate::model::ModelMsg::Rows { agent_id, rows } => {
+            rho_mirror::model::ModelMsg::Rows { agent_id, rows } => {
                 self.refold_open_transcript(agent_id, &rows, window, cx);
             }
-            crate::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
+            rho_mirror::model::ModelMsg::Event(event) => self.handle_event(host, event, window, cx),
         }
     }
 
@@ -6073,7 +6081,7 @@ impl Workspace {
         // and the mirror keeps them so a restart ranks the same way.
         for (agent_id, verdict) in self.desk_cells.agent_verdicts(host) {
             if self.registry.set_agent_verdict(agent_id, verdict) {
-                crate::mirror::write_verdict(agent_id, verdict);
+                rho_mirror::mirror::write_verdict(agent_id, verdict);
             }
         }
     }

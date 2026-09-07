@@ -236,8 +236,8 @@ pub fn story(agent_id: AgentId, events: Vec<UiStoryEvent>) -> ConnEvent {
 thread_local! {
     /// The model this test drives. One per test thread, so a test's own
     /// fold and cursor are its own.
-    static MODEL: RefCell<(crate::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
-        RefCell::new((crate::model::Model::new(), std::collections::HashSet::new()));
+    static MODEL: RefCell<(rho_mirror::model::Model, std::collections::HashSet<rho_agents::HostId>)> =
+        RefCell::new((rho_mirror::model::Model::new(), std::collections::HashSet::new()));
 }
 
 /// One frame, through the model and then into the workspace: the same
@@ -256,7 +256,7 @@ pub fn feed(
         if attached.insert(host) {
             model.attach(host, format!("host-{}", attached.len()));
         }
-        model.command(crate::model::ModelCommand::Follow(followed));
+        model.command(rho_mirror::model::ModelCommand::Follow(followed));
         model.ingest(host, event)
     });
     workspace.handle_model_events(events, window, cx);

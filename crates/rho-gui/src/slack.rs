@@ -136,7 +136,7 @@ impl Workspace {
     /// Slack session rather than the user's.
     pub(crate) fn slack_paths(&self) -> anyhow::Result<rho_slack::config::Paths> {
         let state_dir =
-            crate::mirror::state_dir().context("the client state directory is not set")?;
+            rho_mirror::mirror::state_dir().context("the client state directory is not set")?;
         let mut paths = rho_slack::config::Paths::under(state_dir);
         // The override exists so an isolated run (QA, a second profile)
         // cannot touch the real workspaces.

@@ -266,7 +266,7 @@ fn run() -> Result<()> {
     // The mirror is a cache: a session that cannot open it starts empty and
     // asks the daemon for everything, which is the old behaviour. Only the
     // path is settled here; the model thread opens it.
-    rho_gui::mirror::set_state_dir(client_state_dir.clone());
+    rho_mirror::mirror::set_state_dir(client_state_dir.clone());
     rho_gui::telemetry::enable();
     if profiler.is_none()
         && let Err(error) = rho_gui::telemetry::enable_passive_cpu_profile()
@@ -321,7 +321,7 @@ fn run() -> Result<()> {
                 // Closing rather than flushing: a mirror left open is a
                 // file redb finds unclean, and the next start rebuilds its
                 // allocator from every page to be sure of it.
-                rho_gui::mirror::close();
+                rho_mirror::mirror::close();
                 std::future::ready(())
             })
             .detach();
