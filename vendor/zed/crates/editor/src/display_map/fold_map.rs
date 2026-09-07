@@ -2801,18 +2801,13 @@ mod tests {
             (Point::new(2, 4)..Point::new(4, 1), FoldPlaceholder::test()),
         ]);
         assert_eq!(snapshot2.text(), "aa⋯cc⋯eeeee");
+        // Rho merges nearby fold edits so transcript markup batches make one downstream pass.
         assert_eq!(
             edits,
-            &[
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(16)),
-                    new: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(5)),
-                },
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(18))..FoldOffset(MultiBufferOffset(29)),
-                    new: FoldOffset(MultiBufferOffset(7))..FoldOffset(MultiBufferOffset(10)),
-                },
-            ]
+            &[FoldEdit {
+                old: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(29)),
+                new: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(10)),
+            }]
         );
 
         let buffer_snapshot = buffer.update(cx, |buffer, cx| {
@@ -2833,16 +2828,10 @@ mod tests {
         assert_eq!(snapshot3.text(), "123a⋯c123c⋯eeeee");
         assert_eq!(
             edits,
-            &[
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(1)),
-                    new: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(3)),
-                },
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(6))..FoldOffset(MultiBufferOffset(6)),
-                    new: FoldOffset(MultiBufferOffset(8))..FoldOffset(MultiBufferOffset(11)),
-                },
-            ]
+            &[FoldEdit {
+                old: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(6)),
+                new: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(11)),
+            }]
         );
 
         let buffer_snapshot = buffer.update(cx, |buffer, cx| {
@@ -2877,13 +2866,14 @@ mod tests {
         );
         let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
         let buffer_snapshot = buffer.read(cx).snapshot(cx);
-        assert_eq!(buffer_snapshot.text(), "parent\nchild\n");
+        // Composition separates excerpts by a row so their buffer boundaries stay distinct.
+        assert_eq!(buffer_snapshot.text(), "parent\n\nchild\n");
         let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
         let mut map = FoldMap::new(inlay_snapshot.clone()).0;
 
         let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
         let (snapshot, _) = writer.fold(vec![(
-            Point::new(0, 6)..Point::new(2, 0),
+            Point::new(0, 6)..Point::new(3, 0),
             FoldPlaceholder::test(),
         )]);
         assert_eq!(snapshot.text(), "parent⋯");
