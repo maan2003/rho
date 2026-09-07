@@ -60,21 +60,14 @@ impl PrefixIdDomain for AgentIdDomain {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum AgentRole {
-    Engineer {
-        intelligence: EngineerIntelligence,
-    },
-    Advisor {
-        intelligence: AdvisorIntelligence,
-    },
-    WorkflowEngineer {
-        intelligence: EngineerIntelligence,
-        workflow: AgentWorkflow,
-    },
+    Engineer { intelligence: EngineerIntelligence },
+    Advisor { intelligence: AdvisorIntelligence },
 }
 
 /// The role as rows wrote it before the PM and Iris roles were retired.
 /// Variant ids come from the variant names, so this decodes what
 /// `AgentRole` used to; a retired role folds into the nearest live one.
+#[allow(dead_code)]
 #[derive(Decode)]
 enum StoredAgentRole {
     Engineer {
@@ -86,10 +79,10 @@ enum StoredAgentRole {
     },
     WorkflowEngineer {
         intelligence: EngineerIntelligence,
-        workflow: AgentWorkflow,
+        workflow: StoredAgentWorkflow,
     },
     WorkflowPM {
-        workflow: AgentWorkflow,
+        workflow: StoredAgentWorkflow,
     },
     Iris,
 }
@@ -99,24 +92,21 @@ impl senax_encoder::Decoder for AgentRole {
         Ok(match StoredAgentRole::decode(reader)? {
             StoredAgentRole::Engineer { intelligence } => Self::Engineer { intelligence },
             StoredAgentRole::Advisor { intelligence } => Self::Advisor { intelligence },
-            StoredAgentRole::WorkflowEngineer {
-                intelligence,
-                workflow,
-            } => Self::WorkflowEngineer {
-                intelligence,
-                workflow,
-            },
+            // Workflow engineers are retired. Old rows retain their intelligence
+            // while folding into the only creatable engineer role.
+            StoredAgentRole::WorkflowEngineer { intelligence, .. } => {
+                Self::Engineer { intelligence }
+            }
             StoredAgentRole::PM | StoredAgentRole::Iris => Self::default(),
-            StoredAgentRole::WorkflowPM { workflow } => Self::WorkflowEngineer {
+            StoredAgentRole::WorkflowPM { .. } => Self::Engineer {
                 intelligence: EngineerIntelligence::Medium,
-                workflow,
             },
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentWorkflow {
+enum StoredAgentWorkflow {
     #[default]
     Default,
     PrFriendly,
@@ -151,20 +141,13 @@ impl Default for AgentRole {
 }
 
 impl AgentRole {
-    pub fn workflow(self) -> AgentWorkflow {
-        match self {
-            Self::WorkflowEngineer { workflow, .. } => workflow,
-            Self::Engineer { .. } | Self::Advisor { .. } => AgentWorkflow::Default,
-        }
-    }
-
     pub fn is_engineer(self) -> bool {
-        matches!(self, Self::Engineer { .. } | Self::WorkflowEngineer { .. })
+        matches!(self, Self::Engineer { .. })
     }
 
     pub fn handle_prefix(self) -> &'static str {
         match self {
-            Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
+            Self::Engineer { .. } => "eng",
             Self::Advisor { .. } => "adv",
         }
     }
@@ -716,6 +699,38 @@ mod tests {
         assert_eq!(decoded.output.as_str(), "done");
         assert!(decoded.images.is_empty());
         assert_eq!(decoded.status, ToolOutputStatus::Success);
+    }
+
+    #[test]
+    fn legacy_workflow_engineer_decodes_as_engineer() {
+        #[derive(Encode)]
+        enum LegacyWorkflow {
+            PrFriendly,
+        }
+        #[derive(Encode)]
+        enum LegacyAgentRole {
+            WorkflowEngineer {
+                intelligence: EngineerIntelligence,
+                workflow: LegacyWorkflow,
+            },
+        }
+
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(
+            &LegacyAgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::High,
+                workflow: LegacyWorkflow::PrFriendly,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded = <AgentRole as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(
+            decoded,
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            }
+        );
     }
 
     #[test]

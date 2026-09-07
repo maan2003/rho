@@ -478,7 +478,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 rho_agent::db::AdvisorIntelligence::Cheap => "cheap",
             }
         ),
-        AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
+        AgentRole::Engineer { intelligence } => {
             let intelligence = match intelligence {
                 EngineerIntelligence::Mini => "mini",
                 EngineerIntelligence::Low => "low",

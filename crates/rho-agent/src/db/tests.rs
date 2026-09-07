@@ -6,6 +6,40 @@ use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 use super::*;
 
 #[test]
+fn astra_bindings_round_trip() {
+    for binding in [
+        SessionBinding::ResponsesAstra(InferenceProfile::default()),
+        SessionBinding::AdvisorAstra(InferenceProfile::default()),
+    ] {
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&binding, &mut encoded).unwrap();
+        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded, binding);
+    }
+}
+
+#[test]
+fn legacy_high_engineer_binding_stays_on_sol() {
+    let binding = SessionBinding::ResponsesSol(InferenceProfile {
+        effort: ReasoningEffort::Xhigh,
+        fast_mode: false,
+        code_mode: true,
+    });
+    let mut encoded = bytes::BytesMut::new();
+    senax_encoder::encode_to(&binding, &mut encoded).unwrap();
+    let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+
+    assert_eq!(decoded, binding);
+    assert_eq!(decoded.deep_model(), Some(InferenceModel::Gpt56Sol));
+    assert_eq!(
+        decoded.agent_role(),
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        }
+    );
+}
+
+#[test]
 fn quota_observation_decodes_before_auth_namespaces() {
     #[derive(senax_encoder::Encode)]
     struct LegacyQuotaObservationRecord {
@@ -288,21 +322,9 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
-        AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Medium,
-            workflow: AgentWorkflow::PrFriendly,
-        }
-        .session_profile()
-        .unwrap(),
-        SessionBinding::ResponsesSol(InferenceProfile {
-            effort: ReasoningEffort::High,
-            ..
-        })
-    ));
-    assert!(matches!(
         profile(EngineerIntelligence::High),
-        SessionBinding::ResponsesSol(InferenceProfile {
-            effort: ReasoningEffort::Xhigh,
+        SessionBinding::ResponsesAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
             ..
         })
     ));
@@ -338,16 +360,18 @@ fn agent_role_resolves_opinionated_bindings() {
         profile(EngineerIntelligence::Gemini).deep_model(),
         Some(InferenceModel::Gemini37FlashLow)
     );
-    assert_eq!(
+    assert!(matches!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::ClaudeAdvisor {
-            effort: ClaudeEffort::High
-        }
-    );
+        SessionBinding::AdvisorAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+            code_mode: true,
+        })
+    ));
     assert!(matches!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
@@ -355,7 +379,7 @@ fn agent_role_resolves_opinionated_bindings() {
         .session_profile()
         .unwrap(),
         SessionBinding::AdvisorSol(InferenceProfile {
-            effort: ReasoningEffort::Xhigh,
+            effort: ReasoningEffort::High,
             fast_mode: false,
             ..
         })

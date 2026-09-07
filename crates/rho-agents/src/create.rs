@@ -251,64 +251,32 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
             ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Mini,
-            ..
         } => "eng-low",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Low,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Low,
             ..
         } => "eng-cheap",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
             ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Cheap,
-            ..
         } => "eng",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Medium,
             ..
         } => "eng-high",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
             ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::High,
-            ..
         } => "eng-ultra",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Ultra,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Ultra,
             ..
         } => "eng-alt",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
             ..
-        }
-        | AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Alt,
-            ..
         } => "eng-gemini",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Gemini,
-            ..
-        }
-        | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Gemini,
             ..
         } => "pm",

@@ -1047,8 +1047,7 @@ impl Agent {
     async fn change_role(&mut self, requested: AgentRole) -> anyhow::Result<()> {
         self.ensure_settled("a role change")?;
         let requested = match requested {
-            AgentRole::Engineer { intelligence }
-            | AgentRole::WorkflowEngineer { intelligence, .. } => intelligence,
+            AgentRole::Engineer { intelligence } => intelligence,
             _ => anyhow::bail!("role changes currently support only engineer roles"),
         };
         let switchable = |intelligence| {
@@ -1071,13 +1070,6 @@ impl Agent {
                     intelligence: requested,
                 }
             }
-            AgentRole::WorkflowEngineer {
-                intelligence,
-                workflow,
-            } if switchable(intelligence) => AgentRole::WorkflowEngineer {
-                intelligence: requested,
-                workflow,
-            },
             _ => anyhow::bail!(
                 "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
             ),
@@ -1804,6 +1796,7 @@ impl Agent {
 
 fn usage_model(model: InferenceModel) -> AgentUsageModel {
     match model {
+        InferenceModel::Gpt6Astra => AgentUsageModel::ASTRA,
         InferenceModel::Gpt56Terra => AgentUsageModel::TERRA,
         InferenceModel::Gpt56Luna => AgentUsageModel::LUNA,
         InferenceModel::Gemini37FlashLow => AgentUsageModel::GEMINI,

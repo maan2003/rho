@@ -1607,6 +1607,7 @@ fn hourly_global_usage_series(
         AgentUsageModel::TERRA,
         AgentUsageModel::LUNA,
         AgentUsageModel::GEMINI,
+        AgentUsageModel::ASTRA,
     ]
     .into_iter()
     .map(|model| AgentUsageSeries {
@@ -1633,6 +1634,7 @@ fn hourly_agent_cost_series(
             if !matches!(
                 bucket.model,
                 AgentUsageModel::GPT
+                    | AgentUsageModel::ASTRA
                     | AgentUsageModel::TERRA
                     | AgentUsageModel::LUNA
                     | AgentUsageModel::UNKNOWN
@@ -3572,7 +3574,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(series.len(), 6);
+        assert_eq!(series.len(), 7);
         assert_eq!(series[0].model, "fable");
         assert_eq!(series[0].buckets.len(), 1);
         assert_eq!(series[0].buckets[0].bucket_start_ms, 0);
@@ -3582,6 +3584,8 @@ mod tests {
         assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
         assert_eq!(series[5].model, "gemini");
         assert!(series[5].buckets.is_empty());
+        assert_eq!(series[6].model, "astra");
+        assert!(series[6].buckets.is_empty());
     }
 
     #[test]

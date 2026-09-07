@@ -97,7 +97,7 @@ pub fn is_agent_tool(name: &str) -> bool {
 
 pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
     match role {
-        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => vec![
+        AgentRole::Engineer { .. } => vec![
             spawn_engineer_spec(),
             message_agent_spec(),
             interrupt_engineer_spec(),
@@ -329,11 +329,9 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let args: AdvisorArgs = serde_json::from_str(&call.arguments)?;
     anyhow::ensure!(!args.message.trim().is_empty(), "message must not be empty");
     let pool = tools.pool()?;
-    let workdirs = pool
-        .db()
-        .read()
-        .get_agent(tools.self_id)
-        .config
+    let parent = pool.db().read().get_agent(tools.self_id).config;
+    let advisor_intelligence = default_advisor_intelligence(parent.role);
+    let workdirs = parent
         .workdirs
         .into_iter()
         .map(|info| SpawnWorkdir {
@@ -348,7 +346,7 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
             args.message,
             workdirs,
             AgentRole::Advisor {
-                intelligence: crate::db::AdvisorIntelligence::Medium,
+                intelligence: advisor_intelligence,
             },
         )
         .await?;
@@ -356,6 +354,15 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         "Advisor adv-{} is considering the question. Its answer will arrive as mail.",
         pool.agent_id_prefix(advisor)
     ))
+}
+
+fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligence {
+    match role {
+        AgentRole::Engineer {
+            intelligence: crate::db::EngineerIntelligence::High,
+        } => crate::db::AdvisorIntelligence::High,
+        _ => crate::db::AdvisorIntelligence::Medium,
+    }
 }
 
 #[derive(Deserialize)]
@@ -552,5 +559,19 @@ mod tests {
     fn parses_spawn_role() {
         assert_eq!(parse_spawn_role("eng").unwrap(), AgentRole::default());
         assert!(parse_spawn_role("terra").is_err());
+    }
+
+    #[test]
+    fn high_engineers_get_high_advisors() {
+        assert_eq!(
+            default_advisor_intelligence(AgentRole::Engineer {
+                intelligence: crate::db::EngineerIntelligence::High,
+            }),
+            crate::db::AdvisorIntelligence::High
+        );
+        assert_eq!(
+            default_advisor_intelligence(AgentRole::default()),
+            crate::db::AdvisorIntelligence::Medium
+        );
     }
 }

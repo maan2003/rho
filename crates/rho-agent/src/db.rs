@@ -142,6 +142,7 @@ impl AgentUsageModel {
     pub const TERRA: Self = Self(4);
     pub const LUNA: Self = Self(5);
     pub const GEMINI: Self = Self(6);
+    pub const ASTRA: Self = Self(7);
 
     pub fn name(self) -> &'static str {
         match self {
@@ -151,6 +152,7 @@ impl AgentUsageModel {
             Self::TERRA => "terra",
             Self::LUNA => "luna",
             Self::GEMINI => "gemini",
+            Self::ASTRA => "astra",
             _ => "unknown",
         }
     }
@@ -215,6 +217,7 @@ fn usage_model(config: &AgentConfig) -> AgentUsageModel {
 pub(crate) fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentUsageModel {
     match runtime {
         AgentRuntime::Rho { .. } => match binding.deep_model() {
+            Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
             Some(InferenceModel::Gemini37FlashLow) => AgentUsageModel::GEMINI,
@@ -257,9 +260,7 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
         }
 }
 
-pub use rho_core::{
-    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, AgentWorkflow, EngineerIntelligence,
-};
+pub use rho_core::{AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence};
 
 /// A position in one agent's log: dense from zero, never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
@@ -473,6 +474,10 @@ pub enum SessionBinding {
     /// Reduced function-tool Gemini agent. Appended for persisted
     /// compatibility.
     AntigravityFlashLow(InferenceProfile),
+    /// GPT-6 Astra-backed engineer.
+    ResponsesAstra(InferenceProfile),
+    /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
+    AdvisorAstra(InferenceProfile),
 }
 
 /// `SessionBinding` as rows wrote it while the PM role existed. The
@@ -492,6 +497,8 @@ enum StoredSessionBinding {
     AdvisorSol(InferenceProfile),
     AdvisorTerra(InferenceProfile),
     AntigravityFlashLow(InferenceProfile),
+    ResponsesAstra(InferenceProfile),
+    AdvisorAstra(InferenceProfile),
 }
 
 impl senax_encoder::Decoder for SessionBinding {
@@ -512,6 +519,8 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::AdvisorSol(config) => Self::AdvisorSol(config),
             Stored::AdvisorTerra(config) => Self::AdvisorTerra(config),
             Stored::AntigravityFlashLow(config) => Self::AntigravityFlashLow(config),
+            Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
+            Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
         })
     }
 }
@@ -530,10 +539,6 @@ impl AgentRoleSessionProfile for AgentRole {
         Ok(match self {
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Mini,
-                ..
             } => SessionBinding::ResponsesLuna(InferenceProfile {
                 fast_mode: true,
                 code_mode: false,
@@ -541,60 +546,28 @@ impl AgentRoleSessionProfile for AgentRole {
             }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Low,
-                ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::High)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Medium,
-                workflow: AgentWorkflow::PrFriendly,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Medium,
-                workflow: AgentWorkflow::Default,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::High,
-                ..
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh)),
+            } => SessionBinding::ResponsesAstra(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Ultra,
-                ..
             } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Alt,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Alt,
-                ..
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
             },
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Gemini,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Gemini,
-                ..
             } => SessionBinding::AntigravityFlashLow(InferenceProfile {
                 effort: ReasoningEffort::Medium,
                 fast_mode: false,
@@ -602,15 +575,13 @@ impl AgentRoleSessionProfile for AgentRole {
             }),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
-            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
+            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::High)),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Cheap,
             } => SessionBinding::AdvisorTerra(deep(ReasoningEffort::Xhigh)),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
-            } => SessionBinding::ClaudeAdvisor {
-                effort: ClaudeEffort::High,
-            },
+            } => SessionBinding::AdvisorAstra(deep(ReasoningEffort::Medium)),
         })
     }
 }
@@ -624,7 +595,15 @@ pub enum ClaudeEffort {
 
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
-        if matches!(self, Self::ClaudeAdvisor { .. }) {
+        if matches!(self, Self::ResponsesAstra(_)) {
+            return AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            };
+        } else if matches!(self, Self::ClaudeAdvisor { .. }) {
+            return AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::High,
+            };
+        } else if matches!(self, Self::AdvisorAstra(_)) {
             return AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
             };
@@ -658,6 +637,9 @@ impl SessionBinding {
             Self::ResponsesTerra(config) if config.effort == ReasoningEffort::High => {
                 EngineerIntelligence::Cheap
             }
+            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => {
+                unreachable!("Astra role binding returned above")
+            }
             Self::ResponsesGpt55(config)
             | Self::ResponsesSol(config)
             | Self::ResponsesTerra(config)
@@ -680,6 +662,8 @@ impl SessionBinding {
             | Self::ResponsesSol(config)
             | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
+            | Self::ResponsesAstra(config)
+            | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
             Self::AntigravityFlashLow(config) => Some(config),
@@ -693,6 +677,7 @@ impl SessionBinding {
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
             Self::ResponsesTerra(_) | Self::AdvisorTerra(_) => Some(InferenceModel::Gpt56Terra),
+            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
             Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
@@ -706,6 +691,8 @@ impl SessionBinding {
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
+            | Self::ResponsesAstra(_)
+            | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
             Self::AntigravityFlashLow(_) => None,
@@ -722,6 +709,8 @@ impl SessionBinding {
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
+            | Self::ResponsesAstra(_)
+            | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
             Self::AntigravityFlashLow(_) => None,
@@ -899,9 +888,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
                 .config
                 .role
             {
-                AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => {
-                    AgentSpawnedBy::Engineer
-                }
+                AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
                 AgentRole::Advisor { .. } => panic!("Advisors cannot spawn agents"),
             }
         });

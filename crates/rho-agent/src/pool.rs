@@ -445,8 +445,10 @@ impl AgentPool {
             | SessionBinding::ResponsesSol(_)
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
+            | SessionBinding::ResponsesAstra(_)
             | SessionBinding::AdvisorSol(_)
             | SessionBinding::AdvisorTerra(_)
+            | SessionBinding::AdvisorAstra(_)
             | SessionBinding::AntigravityFlashLow(_) => {
                 let (agent_id, agent) = AgentHandle::create(
                     self.db.clone(),
@@ -816,34 +818,22 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Alt,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Alt,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
         },
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
         },
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             },
             AgentRole::Advisor { .. },
         ) => AgentRole::Advisor {
@@ -852,12 +842,8 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Mini,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
         },
@@ -1035,22 +1021,7 @@ impl RunningAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{AgentWorkflow, EngineerIntelligence};
-
-    #[test]
-    fn github_workflow_does_not_flow_to_children() {
-        let engineer = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        };
-        let pr_engineer = AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Medium,
-            workflow: AgentWorkflow::PrFriendly,
-        };
-        assert_eq!(
-            child_role(pr_engineer, engineer).workflow(),
-            AgentWorkflow::Default
-        );
-    }
+    use crate::db::EngineerIntelligence;
 
     #[test]
     fn mini_engineers_spawn_mini_engineers() {
@@ -1085,16 +1056,6 @@ mod tests {
             child_role(
                 AgentRole::Engineer {
                     intelligence: EngineerIntelligence::Alt,
-                },
-                AgentRole::default(),
-            ),
-            cheap
-        );
-        assert_eq!(
-            child_role(
-                AgentRole::WorkflowEngineer {
-                    intelligence: EngineerIntelligence::Alt,
-                    workflow: AgentWorkflow::PrFriendly,
                 },
                 AgentRole::default(),
             ),

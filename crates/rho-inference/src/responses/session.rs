@@ -251,6 +251,7 @@ pub(crate) enum ResponsesModel {
     Gpt56Sol,
     Gpt56Luna,
     Gpt56Terra,
+    Gpt6Astra,
     #[cfg(test)]
     Test(String),
 }
@@ -268,6 +269,7 @@ impl From<InferenceModel> for ResponsesModel {
             InferenceModel::Gpt56Sol => Self::Gpt56Sol,
             InferenceModel::Gpt56Luna => Self::Gpt56Luna,
             InferenceModel::Gpt56Terra => Self::Gpt56Terra,
+            InferenceModel::Gpt6Astra => Self::Gpt6Astra,
             InferenceModel::Gemini37FlashLow => {
                 unreachable!("Antigravity models do not use ResponsesConfig")
             }
@@ -282,18 +284,19 @@ impl ResponsesModel {
             Self::Gpt56Sol => "gpt-5.6-sol",
             Self::Gpt56Luna => "gpt-5.6-luna",
             Self::Gpt56Terra => "gpt-5.6-terra",
+            Self::Gpt6Astra => "gpt-6-astra",
             #[cfg(test)]
             Self::Test(model) => model,
         }
     }
 
-    /// gpt-5.6 models use the Responses Lite wire shape: tools and base
+    /// Responses Lite models use a distinct wire shape: tools and base
     /// instructions ride the input timeline as developer items instead of
     /// top-level request fields, and the request is flagged via
     /// `client_metadata`.
     pub(crate) fn use_responses_lite(&self) -> bool {
         match self {
-            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => true,
+            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra | Self::Gpt6Astra => true,
             Self::Gpt55 => false,
             #[cfg(test)]
             Self::Test(_) => false,
@@ -306,7 +309,7 @@ impl ResponsesModel {
                 context_window: 372_000,
                 auto_compact_token_limit: 280_000,
             },
-            Self::Gpt55 => ResponsesModelInfo {
+            Self::Gpt55 | Self::Gpt6Astra => ResponsesModelInfo {
                 context_window: 272_000,
                 auto_compact_token_limit: 232_560,
             },
@@ -548,6 +551,13 @@ impl SessionTask {
                         if self.config.prompt_cache_key != config.prompt_cache_key {
                             self.connection = None;
                             self.selected_auth = None;
+                        } else if self.config.responses_config != config.responses_config
+                            && let Some(connection) = self.connection.as_mut()
+                        {
+                            // A live role change keeps the warm socket and prompt-cache
+                            // key, but its next Lite request must carry the new model's
+                            // developer prefix instead of chaining through the old one.
+                            connection.cached_response_id = None;
                         }
                         self.config = config;
                         self.epoch = epoch;

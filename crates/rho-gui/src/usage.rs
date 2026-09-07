@@ -431,6 +431,7 @@ fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
     let bands = [
         color_of(SeriesColor::Fable, cx),
         color_of(SeriesColor::Gpt, cx),
+        color_of(SeriesColor::Astra, cx),
         color_of(SeriesColor::Opus, cx),
         color_of(SeriesColor::Terra, cx),
     ];
@@ -477,16 +478,18 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
     let bands = [
         color_of(SeriesColor::Fable, cx),
         color_of(SeriesColor::Gpt, cx),
+        color_of(SeriesColor::Astra, cx),
         color_of(SeriesColor::Opus, cx),
         color_of(SeriesColor::Terra, cx),
         color_of(SeriesColor::Luna, cx),
     ];
     let legend = [
         (SeriesColor::Fable, "fable", summary.latest[0]),
-        (SeriesColor::Opus, "opus", summary.latest[2]),
+        (SeriesColor::Opus, "opus", summary.latest[3]),
         (SeriesColor::Gpt, "gpt", summary.latest[1]),
-        (SeriesColor::Luna, "luna", summary.latest[4]),
-        (SeriesColor::Terra, "terra", summary.latest[3]),
+        (SeriesColor::Astra, "astra", summary.latest[2]),
+        (SeriesColor::Luna, "luna", summary.latest[5]),
+        (SeriesColor::Terra, "terra", summary.latest[4]),
     ]
     .into_iter()
     .map(|(color, model, share)| rho_agents::usage::Legend {
@@ -659,6 +662,7 @@ fn color_of(color: SeriesColor, cx: &App) -> Hsla {
         // terminal palette's, because the model has a colour of its own.
         SeriesColor::Fable => rgb(0xd97757).into(),
         SeriesColor::Gpt => colors.terminal_ansi_cyan.into(),
+        SeriesColor::Astra => colors.terminal_ansi_green.into(),
         SeriesColor::Opus => colors.terminal_ansi_magenta.into(),
         SeriesColor::Terra => colors.terminal_ansi_yellow.into(),
         SeriesColor::Luna => colors.terminal_ansi_blue.into(),

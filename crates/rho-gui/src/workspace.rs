@@ -2994,21 +2994,9 @@ impl Workspace {
                     | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
                     | EngineerIntelligence::High,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence:
-                    EngineerIntelligence::Low
-                    | EngineerIntelligence::Cheap
-                    | EngineerIntelligence::Medium
-                    | EngineerIntelligence::High,
-                ..
             } => &["eng-low", "eng-cheap", "eng", "eng-high"],
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
-                ..
             } => &["eng-ultra", "eng-alt"],
             _ => {
                 self.notice_on(
@@ -9847,18 +9835,16 @@ fn agent_role_label(config: AgentRole) -> String {
             AdvisorIntelligence::High => "advisor-high",
             AdvisorIntelligence::Cheap => "advisor-cheap",
         },
-        AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
-            match intelligence {
-                EngineerIntelligence::Mini => "eng-mini",
-                EngineerIntelligence::Low => "eng-low",
-                EngineerIntelligence::Cheap => "eng-cheap",
-                EngineerIntelligence::Medium => "eng",
-                EngineerIntelligence::High => "eng-high",
-                EngineerIntelligence::Ultra => "eng-ultra",
-                EngineerIntelligence::Alt => "eng-alt",
-                EngineerIntelligence::Gemini => "eng-gemini",
-            }
-        }
+        AgentRole::Engineer { intelligence } => match intelligence {
+            EngineerIntelligence::Mini => "eng-mini",
+            EngineerIntelligence::Low => "eng-low",
+            EngineerIntelligence::Cheap => "eng-cheap",
+            EngineerIntelligence::Medium => "eng",
+            EngineerIntelligence::High => "eng-high",
+            EngineerIntelligence::Ultra => "eng-ultra",
+            EngineerIntelligence::Alt => "eng-alt",
+            EngineerIntelligence::Gemini => "eng-gemini",
+        },
     }
     .to_owned()
 }

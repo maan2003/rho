@@ -1011,8 +1011,7 @@ impl ClaudeLoop {
         );
 
         let requested = match requested {
-            AgentRole::Engineer { intelligence }
-            | AgentRole::WorkflowEngineer { intelligence, .. } => intelligence,
+            AgentRole::Engineer { intelligence } => intelligence,
             _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
         };
         anyhow::ensure!(
@@ -1028,13 +1027,6 @@ impl ClaudeLoop {
                 intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
             } => AgentRole::Engineer {
                 intelligence: requested,
-            },
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
-                workflow,
-            } => AgentRole::WorkflowEngineer {
-                intelligence: requested,
-                workflow,
             },
             _ => anyhow::bail!("role changes currently support only eng-ultra and eng-alt"),
         };

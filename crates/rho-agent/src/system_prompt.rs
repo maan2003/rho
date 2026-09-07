@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::db::{AgentRole, AgentSpawnedBy, AgentWorkflow};
+use crate::db::{AgentRole, AgentSpawnedBy};
 use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
@@ -91,18 +91,8 @@ request.
         )
     });
     let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
-    let workflow_prompt = match role.workflow() {
-        AgentWorkflow::Default => "",
-        AgentWorkflow::PrFriendly => GITHUB_WORKFLOW_PROMPT,
-    };
     let role_prompt = match role {
-        AgentRole::WorkflowEngineer {
-            workflow: AgentWorkflow::PrFriendly,
-            ..
-        } => PR_FRIENDLY_ENGINEER_PROMPT,
-        AgentRole::Engineer { .. }
-        | AgentRole::WorkflowEngineer { .. }
-        | AgentRole::Advisor { .. } => "",
+        AgentRole::Engineer { .. } | AgentRole::Advisor { .. } => "",
     };
     let base_prompt = if matches!(role, AgentRole::Advisor { .. }) {
         ADVISOR_BASE_PROMPT
@@ -111,7 +101,7 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     let workspace = render_workspace_prompt(&workdirs);
-    format!("{base_prompt}{agents_md}{skills}{code_mode}{TOOL_RESULTS_PROMPT}{team_context}{role_prompt}{workflow_prompt}{workspace}{environment}")
+    format!("{base_prompt}{agents_md}{skills}{code_mode}{TOOL_RESULTS_PROMPT}{team_context}{role_prompt}{workspace}{environment}")
         .into()
 }
 
@@ -135,16 +125,8 @@ pub fn claude_prompt(
         };
         format!("## Rho Team Context\n\n{identity}\n\n")
     });
-    let workflow = match role.workflow() {
-        AgentWorkflow::Default => "",
-        AgentWorkflow::PrFriendly => GITHUB_WORKFLOW_PROMPT,
-    };
     let role_prompt = match role {
-        AgentRole::WorkflowEngineer {
-            workflow: AgentWorkflow::PrFriendly,
-            ..
-        } => PR_FRIENDLY_ENGINEER_PROMPT,
-        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => "",
+        AgentRole::Engineer { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
     let workspace = view
@@ -160,7 +142,7 @@ pub fn claude_prompt(
                 .collect::<Vec<_>>();
             render_workspace_prompt(&workdirs)
         });
-    format!("{team}{role_prompt}{workflow}{workspace}").into()
+    format!("{team}{role_prompt}{workspace}").into()
 }
 
 /// One workdir as the prompt renders it: the agent-visible path and the kind
@@ -344,34 +326,6 @@ const ADVISOR_PROMPT: &str = "## Advisor
 You are an independent technical second opinion. Analyze the question deeply, \
 surface risks and tradeoffs, and recommend a path. You are advisory only: do \
 not implement changes.
-
-";
-
-const PR_FRIENDLY_ENGINEER_PROMPT: &str = "## Design Alignment
-
-Before starting implementation, align with the user: briefly surface the \
-consequential high-level design choices or ambiguities and ask a small, focused \
-set of clarifying questions at a time, normally one to three. Ask additional \
-rounds when the answers reveal or leave important high-level decisions \
-unresolved. Ask through your coordinating parent when it mediates user \
-communication. Do not ask about low-level implementation details, invent \
-choices where the design is already constrained, or bombard the user with \
-questions.
-
-## Advisor Review
-
-After implementing and locally verifying the changes, use `ask_advisor` for an \
-independent review. Wait for the review and address its actionable findings \
-before opening the pull request.
-
-";
-
-const GITHUB_WORKFLOW_PROMPT: &str = "## GitHub Workflow
-
-Use the `github-workflow` skill to deliver code changes through a new or \
-existing pull request unless the user explicitly opts out. Follow that skill \
-through completion. Coordinating PMs should promptly relay meaningful workflow \
-updates from Engineers through the active user-facing surface.
 
 ";
 
@@ -794,50 +748,6 @@ mod tests {
         assert!(!ADVISOR_BASE_PROMPT.contains("Only your last message"));
         assert!(!ADVISOR_BASE_PROMPT.contains("`finder`"));
         assert!(!ADVISOR_BASE_PROMPT.contains("`librarian`"));
-        assert!(PR_FRIENDLY_ENGINEER_PROMPT.starts_with("## Design Alignment"));
-        assert!(
-            PR_FRIENDLY_ENGINEER_PROMPT
-                .contains("Before starting implementation, align with the user")
-        );
-        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("normally one to three"));
-        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("Ask additional rounds"));
-        assert!(
-            PR_FRIENDLY_ENGINEER_PROMPT
-                .contains("Do not ask about low-level implementation details")
-        );
-        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("## Advisor Review"));
-        assert!(
-            PR_FRIENDLY_ENGINEER_PROMPT.contains("use `ask_advisor` for an independent review")
-        );
-        assert!(PR_FRIENDLY_ENGINEER_PROMPT.contains("before opening the pull request"));
-        assert!(GITHUB_WORKFLOW_PROMPT.contains("`github-workflow` skill"));
-        assert!(GITHUB_WORKFLOW_PROMPT.contains("Follow that skill through"));
-        assert!(GITHUB_WORKFLOW_PROMPT.contains("Coordinating PMs"));
-    }
-
-    #[test]
-    fn design_alignment_is_only_for_pr_friendly_engineers() {
-        use crate::db::EngineerIntelligence;
-
-        let engineer = claude_prompt(
-            None,
-            None,
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Medium,
-                workflow: AgentWorkflow::PrFriendly,
-            },
-        );
-        let default_engineer = claude_prompt(
-            None,
-            None,
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::Medium,
-            },
-        );
-
-        assert!(engineer.contains("## Design Alignment"));
-        assert!(engineer.contains("## GitHub Workflow"));
-        assert!(!default_engineer.contains("## Design Alignment"));
     }
 
     #[test]

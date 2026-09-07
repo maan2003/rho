@@ -30,6 +30,7 @@ pub type ChartPoint = (f32, f32);
 pub enum SeriesColor {
     Fable,
     Gpt,
+    Astra,
     Opus,
     Terra,
     Luna,
@@ -72,10 +73,10 @@ pub struct CostSummary {
     pub legend: Vec<Legend>,
     pub requests: u64,
     pub approximate: bool,
-    /// Cumulative stacked spend at each column, in dollars: fable, then
-    /// gpt with luna, then opus, then terra. Dollars rather than a ratio
+    /// Cumulative stacked spend at each column, in dollars: fable, gpt with
+    /// luna, astra, opus, then terra. Dollars rather than a ratio
     /// because the axis labels are dollars too.
-    pub columns: Vec<(f32, [f64; 4])>,
+    pub columns: Vec<(f32, [f64; 5])>,
     /// What the top of the chart is worth.
     pub max: f64,
     pub midnights: Vec<f32>,
@@ -88,11 +89,11 @@ pub struct ShareSummary {
     pub days: u64,
     pub requests: u64,
     pub approximate: bool,
-    /// The latest share of each model, in the order fable, gpt, opus,
-    /// terra, luna — which is the order the legend and the bands use.
-    pub latest: [f64; 5],
+    /// The latest share of each model, in the order fable, gpt, astra,
+    /// opus, terra, luna — which is the order the bands use.
+    pub latest: [f64; 6],
     /// Cumulative stacked band heights at each column, 0..=1 of the chart.
-    pub columns: Vec<(f32, [f32; 5])>,
+    pub columns: Vec<(f32, [f32; 6])>,
     pub midnights: Vec<f32>,
 }
 
@@ -258,7 +259,7 @@ pub fn cost_summary(
         (at.saturating_sub(start) as f64 / window_ms.max(1) as f64).clamp(0.0, 1.0) as f32
     };
 
-    let mut costs = HashMap::<u64, [f64; 4]>::new();
+    let mut costs = HashMap::<u64, [f64; 5]>::new();
     for model in series {
         let Some(index) = cost_band_index(&model.model) else {
             continue;
@@ -277,8 +278,8 @@ pub fn cost_summary(
         .sum::<f64>()
         .max(f64::EPSILON);
 
-    let mut totals = [0.0; 4];
-    let mut columns_out = vec![(x_of(start), [0.0; 4])];
+    let mut totals = [0.0; 5];
+    let mut columns_out = vec![(x_of(start), [0.0; 5])];
     let mut bucket_start = start.div_ceil(HOUR_MS) * HOUR_MS;
     while bucket_start <= now {
         if let Some(cost) = costs.get(&bucket_start) {
@@ -302,8 +303,9 @@ pub fn cost_summary(
         (SeriesColor::Fable, "fable"),
         (SeriesColor::Opus, "opus"),
         (SeriesColor::Gpt, "gpt"),
-        // `luna` is in gpt's colour because it is in gpt's band: one
-        // provider, one bill.
+        (SeriesColor::Astra, "astra"),
+        // Luna uses gpt's colour because it is in gpt's band: one provider,
+        // one bill.
         (SeriesColor::Gpt, "luna"),
         (SeriesColor::Terra, "terra"),
     ]
@@ -313,7 +315,7 @@ pub fn cost_summary(
         label: format!("{model} ${:.2}", model_cost(series, model, start)),
     })
     .collect();
-    let total = ["fable", "opus", "gpt", "luna", "terra"]
+    let total = ["fable", "opus", "gpt", "astra", "luna", "terra"]
         .into_iter()
         .map(|model| model_cost(series, model, start))
         .sum();
@@ -330,14 +332,15 @@ pub fn cost_summary(
     }
 }
 
-/// Which band of the cost chart a model is drawn in. `luna` shares gpt's:
-/// they are one provider's bill.
+/// Which band of the cost chart a model is drawn in. Luna shares gpt's: they
+/// are one provider's bill. Astra remains separately visible.
 fn cost_band_index(model: &str) -> Option<usize> {
     match model {
         "fable" => Some(0),
         "gpt" | "luna" => Some(1),
-        "opus" => Some(2),
-        "terra" => Some(3),
+        "astra" => Some(2),
+        "opus" => Some(3),
+        "terra" => Some(4),
         _ => None,
     }
 }
@@ -521,7 +524,10 @@ fn agent_cost_percentile_points(
 
     for (host_index, series_set) in hosts.iter().enumerate() {
         for series in series_set {
-            if !matches!(series.model.as_str(), "gpt" | "terra" | "luna" | "unknown") {
+            if !matches!(
+                series.model.as_str(),
+                "gpt" | "astra" | "terra" | "luna" | "unknown"
+            ) {
                 continue;
             }
             for bucket in &series.buckets {
@@ -638,13 +644,13 @@ fn usage_share_points(
     series: &[rho_ui_proto::AgentUsageSeries],
     now: u64,
     days: u64,
-) -> Vec<(u64, [f64; 5], f64)> {
+) -> Vec<(u64, [f64; 6], f64)> {
     let start = now.saturating_sub(days * DAY_MS);
     let start_bucket = start / HOUR_MS * HOUR_MS;
     let end_bucket = now / HOUR_MS * HOUR_MS;
     let half_life_hours = if days <= 7 { 12.0 } else { 48.0 };
     let decay = 0.5_f64.powf(1.0 / half_life_hours);
-    let mut usage = HashMap::<u64, [f64; 5]>::new();
+    let mut usage = HashMap::<u64, [f64; 6]>::new();
     let mut first_bucket = start_bucket;
 
     for model in series {
@@ -658,7 +664,7 @@ fn usage_share_points(
         }
     }
 
-    let mut smoothed = [0.0; 5];
+    let mut smoothed = [0.0; 6];
     let mut bucket_start = first_bucket;
     while bucket_start < start_bucket {
         for value in &mut smoothed {
@@ -686,7 +692,7 @@ fn usage_share_points(
         let shares = if total > 0.0 {
             smoothed.map(|value| value / total)
         } else {
-            [0.0; 5]
+            [0.0; 6]
         };
         let at = bucket_start.saturating_add(HOUR_MS).min(now);
         if let Some((last_at, last_share, last_total)) = points.last_mut()
@@ -702,7 +708,7 @@ fn usage_share_points(
     points
 }
 
-fn usage_share_scale(points: &[(u64, [f64; 5], f64)]) -> f64 {
+fn usage_share_scale(points: &[(u64, [f64; 6], f64)]) -> f64 {
     let mut totals = points
         .iter()
         .map(|(_, _, total)| *total)
@@ -719,9 +725,10 @@ fn usage_model_index(model: &str) -> Option<usize> {
     match model {
         "fable" => Some(0),
         "gpt" => Some(1),
-        "opus" => Some(2),
-        "terra" => Some(3),
-        "luna" => Some(4),
+        "astra" => Some(2),
+        "opus" => Some(3),
+        "terra" => Some(4),
+        "luna" => Some(5),
         _ => None,
     }
 }
@@ -747,6 +754,7 @@ pub fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> 
     let (input, cache_read, cache_write_5m, cache_write_1h, output) = match model {
         "fable" => (10.0, 1.0, 12.5, 20.0, 50.0),
         "opus" => (5.0, 0.5, 6.25, 10.0, 25.0),
+        "astra" => (10.0, 1.0, 12.5, 12.5, 50.0),
         "terra" => (2.5, 0.25, 3.125, 3.125, 15.0),
         "luna" => (1.0, 0.1, 1.25, 1.25, 6.0),
         _ => (5.0, 0.5, 6.25, 6.25, 30.0),
@@ -779,8 +787,47 @@ mod tests {
         assert_eq!(bucket_cost_usd(&usage, "fable"), 81.0);
         assert_eq!(bucket_cost_usd(&usage, "opus"), 40.5);
         assert_eq!(bucket_cost_usd(&usage, "gpt"), 41.75);
+        assert_eq!(bucket_cost_usd(&usage, "astra"), 73.5);
         assert_eq!(bucket_cost_usd(&usage, "terra"), 20.875);
         assert_eq!(bucket_cost_usd(&usage, "luna"), 8.35);
+    }
+
+    #[test]
+    fn astra_usage_has_its_own_chart_band() {
+        let bucket = rho_ui_proto::AgentUsageBucket {
+            bucket_start_ms: 10 * HOUR_MS,
+            input_tokens: 1_000_000,
+            requests: 1,
+            ..Default::default()
+        };
+        let now = 40 * HOUR_MS + HOUR_MS / 2;
+        let usage = vec![rho_ui_proto::AgentUsageSeries {
+            model: "astra".to_owned(),
+            buckets: vec![bucket.clone()],
+        }];
+
+        let cost = cost_summary(&usage, 7, now, 100);
+        assert_eq!(cost.total, 10.0);
+        assert_eq!(cost.columns.last().unwrap().1[1], 0.0);
+        assert_eq!(cost.columns.last().unwrap().1[2], 10.0);
+        assert!(
+            usage_share_points(&usage, now, 7)
+                .iter()
+                .any(|(_, shares, _)| shares[2] > 0.0)
+        );
+
+        let agent_id =
+            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let points = agent_cost_percentile_points(
+            &[vec![rho_ui_proto::AgentCostSeries {
+                agent_id,
+                model: "astra".to_owned(),
+                buckets: vec![bucket],
+            }]],
+            now,
+            7,
+        );
+        assert!(points.last().unwrap().1[0] > 0.0);
     }
 
     #[test]
@@ -904,7 +951,7 @@ mod tests {
     #[test]
     fn usage_share_height_uses_the_periods_p95_activity() {
         let points = (1..=20)
-            .map(|total| (total, [0.0; 5], total as f64))
+            .map(|total| (total, [0.0; 6], total as f64))
             .collect::<Vec<_>>();
         assert_eq!(usage_share_scale(&points), 19.0);
     }

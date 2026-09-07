@@ -684,7 +684,7 @@ fn serializes_custom_tool_calls_and_results() {
 }
 
 #[test]
-fn responses_lite_moves_tools_and_instructions_into_input() {
+fn astra_responses_lite_moves_tools_and_instructions_into_input() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
         Inference::for_test(auth),
@@ -693,7 +693,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
             fast_mode: false,
             code_mode: false,
         },
-        InferenceModel::Gpt56Sol,
+        InferenceModel::Gpt6Astra,
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     session.config.responses_config.text_verbosity = TextVerbosity::Low;
@@ -712,7 +712,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
     let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
 
-    assert_eq!(json["model"], "gpt-5.6-sol");
+    assert_eq!(json["model"], "gpt-6-astra");
     assert_eq!(json["instructions"], "");
     assert!(json.get("tools").is_none());
     assert!(json.get("tool_choice").is_none());
