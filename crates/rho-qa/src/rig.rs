@@ -359,9 +359,41 @@ fn down(name: &str) -> Result<()> {
     let root = rig_root(name)?;
     let bin = binaries(Binaries::Profiling, false).or_else(|_| binaries(Binaries::Nix, false))?;
     stop_gui(&root, &bin, name);
+    file_application_log(&root, name);
     stop_daemon(&root);
     println!("rig {name} down; its state is as the run left it");
     summarize_session(&root)
+}
+
+/// File the stopped session's application log next to the profile it belongs
+/// to, under the same name.
+///
+/// `rho wayland stop` moves the log beside the session directory before
+/// removing it; this puts it where a later reader will look, which is the
+/// rig's `logs/`, named after the profile so a run's numbers and a run's
+/// errors share a stem. Without it a panic is only ever visible to whoever
+/// was watching when it happened: the summary line says how a run drew, and
+/// nothing says what it said.
+fn file_application_log(root: &Path, name: &str) {
+    let kept = root
+        .join("run")
+        .join("rho-wayland")
+        .join(format!("{name}-application.log"));
+    if !kept.exists() {
+        return;
+    }
+    let stem = load(root)
+        .ok()
+        .and_then(|rig| {
+            let session = rig.sessions.last()?;
+            let profile = session.profile.as_ref()?;
+            Some(profile.file_stem()?.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| name.to_owned());
+    let to = root.join("logs").join(format!("{stem}.log"));
+    if fs::rename(&kept, &to).is_err() {
+        let _ = fs::copy(&kept, &to).and_then(|_| fs::remove_file(&kept));
+    }
 }
 
 /// The line the run earned. The GUI writes its frame log, its editor log and

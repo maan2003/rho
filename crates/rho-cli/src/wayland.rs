@@ -800,12 +800,41 @@ fn stop(root: &Path) -> Result<()> {
     if process_is_running(session.compositor) {
         terminate_process_group(session.compositor.pid, libc::SIGKILL);
     }
+    // The logs are the only thing in here worth more than the session, and
+    // they are worth most at exactly this moment: whatever the application
+    // said on its way out is already in them. Move them beside the
+    // directory before it goes, or a panic is gone with the run that had it.
+    let kept = keep_logs(root, &session.name);
     fs::remove_dir_all(root).context("remove session directory")?;
     println!(
         "{}",
-        serde_json::json!({ "session": session.name, "stopped": true })
+        serde_json::json!({ "session": session.name, "stopped": true, "logs": kept })
     );
     Ok(())
+}
+
+/// Move a stopped session's logs out of the directory that is about to be
+/// removed, to `<state dir>/<session>-<log>`. Returns what was kept, in the
+/// order they were named, so a caller that files them can find them.
+///
+/// Best effort by design: a session with no log to keep, or a directory that
+/// will not take the rename, must not turn stopping into an error.
+fn keep_logs(root: &Path, session: &str) -> Vec<PathBuf> {
+    let Some(beside) = root.parent() else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    for name in ["application.log", "sway.log"] {
+        let from = root.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = beside.join(format!("{session}-{name}"));
+        if fs::rename(&from, &to).is_ok() {
+            kept.push(to);
+        }
+    }
+    kept
 }
 
 fn set_new_session(command: &mut Command) {
@@ -932,6 +961,49 @@ mod tests {
             logical_size_from_outputs("not json", "HEADLESS-1", recorded),
             recorded
         );
+    }
+
+    /// Stopping a session removes its directory, and the logs are inside it.
+    /// They have to come out first: whatever the application said on its way
+    /// out — a panic, an error line — is in there, and it is the only copy.
+    #[test]
+    fn stopping_keeps_the_logs_and_leaves_nothing_else_behind() {
+        let beside =
+            std::env::temp_dir().join(format!("rho-wayland-keep-logs-{}", std::process::id()));
+        let root = beside.join("desk");
+        fs::create_dir_all(&root).expect("session directory");
+        fs::write(root.join("application.log"), "panicked at ...").expect("an application log");
+        fs::write(root.join("sway.log"), "sway said").expect("a compositor log");
+        fs::write(root.join("session.json"), "{}").expect("a session file");
+
+        let kept = keep_logs(&root, "desk");
+
+        assert_eq!(
+            kept,
+            vec![
+                beside.join("desk-application.log"),
+                beside.join("desk-sway.log")
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(beside.join("desk-application.log")).expect("kept"),
+            "panicked at ..."
+        );
+        assert!(!root.join("application.log").exists(), "moved, not copied");
+        // Only the logs: the session file goes with the directory.
+        assert!(root.join("session.json").exists());
+        fs::remove_dir_all(&beside).ok();
+    }
+
+    /// A session with nothing to keep still stops.
+    #[test]
+    fn keeping_logs_that_are_not_there_is_not_an_error() {
+        let beside =
+            std::env::temp_dir().join(format!("rho-wayland-no-logs-{}", std::process::id()));
+        let root = beside.join("desk");
+        fs::create_dir_all(&root).expect("session directory");
+        assert!(keep_logs(&root, "desk").is_empty());
+        fs::remove_dir_all(&beside).ok();
     }
 
     #[test]
