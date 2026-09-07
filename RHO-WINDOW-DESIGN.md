@@ -157,6 +157,40 @@ is showing. A menu nothing opens is residue; if the map's own sheet is wanted
 it comes back as a `Transient` over `MenuAction` with one line in the bottom
 bar, not as a strip.
 
+### The grid, put back
+
+The move onto the primitive dropped Magit's layout: `render` drew one item
+per row, which for the root menu's twenty-eight items is the screen from
+top to bottom. The user asked for the grid back exactly, and it is back —
+the element tree from before the move, ported unchanged into
+`rho_window::transient::render`: columns of four, filled top to bottom and
+then left to right, wrapping across the width with `gap_x_6`; the key in a
+right-aligned `w_8` accent cell so the keys line up down a column; a value
+in muted brackets around bold green; a bold title above, carrying the
+count suffix the primitive added. The strip still pins it to the bottom,
+which is the caller's business and unchanged.
+
+The layout is answerable without a window — `Transient::columns` is the
+chunking, and the two tests assert twenty-eight items as seven columns of
+four and five as a column and a stub — so the shape is proven off-screen.
+The painting is proven too, because the failure this reverses was a
+layout that chunked correctly and still drew as one column — a thing only
+a frame can say. Isolated rig `desk`, session 98, root menu open at
+1280x832 logical: **six columns of four**, five of them across the strip
+and the sixth wrapped onto a second line under the first, every item
+present and none clipped. Twenty-four items rather than the root menu's
+full twenty-eight, because `changes`, `attach` and the other conditional
+items are not applicable in that state — applicability at open, working as
+it should. The shot is `/tmp/rho-slack-ux/screens/root-menu.png`.
+
+One thing the frame shows and the test cannot: the wrap has `gap_x_6`
+between columns and no gap between wrapped lines, so the sixth column sits
+directly under the first. That is what the layout did before the move as
+well, and it is left as it was rather than changed under cover of a
+restoration.
+
+Cost: unchanged, O(items) per frame, and an item is a row on the screen.
+
 ### Owed
 
 Not this crate's yet, and written down here so they are one list rather than

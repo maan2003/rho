@@ -29,6 +29,11 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, Keystroke, TextStyle, div};
 use theme::ActiveTheme as _;
 
+/// How tall a column of the grid is. Magit's number, and the reason the
+/// grid exists: four rows read as one block, and a menu wraps sideways
+/// instead of growing down the screen.
+const COLUMN_ROWS: usize = 4;
+
 /// What an item does to the menu when it runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -182,6 +187,13 @@ impl<A> Transient<A> {
         &self.items
     }
 
+    /// The rows as the menu lays them out: columns of at most
+    /// [`COLUMN_ROWS`], filled top to bottom and then left to right. The
+    /// layout is answerable without a window, which is how it is tested.
+    pub fn columns(&self) -> impl Iterator<Item = &[Item<A>]> {
+        self.items.chunks(COLUMN_ROWS)
+    }
+
     /// The count standing for the next item, when there is one.
     pub fn count(&self) -> Option<u32> {
         self.count
@@ -254,20 +266,44 @@ fn render(
     let muted = colors.text_muted;
     let value_color = colors.terminal_ansi_green;
 
-    // One item per row, which is what a buffer is: the reader scans down the
-    // keys the way they scan down anything else on the screen.
-    let mut rendered = Vec::new();
-    for (key, description, value) in rows {
-        let mut row = div()
+    // Magit's grid, not a list: columns of four, filled top to bottom and
+    // then left to right, wrapping across the width. A menu of
+    // twenty-eight items down one column is the whole screen; the same
+    // twenty-eight in sevens is one glance.
+    let columns = rows.chunks(COLUMN_ROWS).map(|chunk| {
+        div()
             .flex()
-            .gap_1()
-            .child(div().text_color(accent).child(key.clone()))
-            .child(div().child(description.clone()));
-        if let Some(value) = value {
-            row = row.child(div().text_color(value_color).child(value.clone()));
-        }
-        rendered.push(row);
-    }
+            .flex_col()
+            .children(chunk.iter().map(|(key, description, value)| {
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    // The keys line up down the column, so the eye runs
+                    // down them rather than down ragged descriptions.
+                    .child(
+                        div()
+                            .w_8()
+                            .text_align(gpui::TextAlign::Right)
+                            .pr_2()
+                            .text_color(accent)
+                            .child(key.clone()),
+                    )
+                    .child(div().child(description.clone()));
+                if let Some(value) = value {
+                    row = row
+                        .child(div().pl_1().text_color(muted).child("("))
+                        .child(
+                            div()
+                                .text_color(value_color)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(value.clone()),
+                        )
+                        .child(div().text_color(muted).child(")"));
+                }
+                row
+            }))
+    });
 
     let heading = match count {
         Some(count) => format!("{title} {count}"),
@@ -279,12 +315,25 @@ fn render(
         .flex()
         .flex_col()
         .w_full()
-        .px_2()
         .font_family(text_style.font_family.clone())
         .text_size(text_style.font_size)
         .line_height(text_style.line_height)
-        .child(div().text_color(muted).child(heading))
-        .children(rendered)
+        .child(
+            div()
+                .px_2()
+                .flex()
+                .gap_2()
+                .child(div().font_weight(gpui::FontWeight::BOLD).child(heading)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_x_6()
+                .px_2()
+                .children(columns),
+        )
 }
 
 /// `escape` and `ctrl-g` mean the same thing everywhere, so they mean it here
@@ -351,6 +400,40 @@ mod tests {
             .item("x", "mute", Verdict::Mute)
             .item("s", "snooze…", Verdict::Snooze)
             .item("shift-s", "snooze the room…", Verdict::Room)
+    }
+
+    /// The root menu is twenty-eight items. Down one column that is the
+    /// whole screen; in Magit's grid it is seven columns of four, which is
+    /// what the user asked for back.
+    #[test]
+    fn a_long_menu_lays_out_as_columns_of_four() {
+        let mut menu = Transient::new("root");
+        for index in 0..28 {
+            menu = menu.item(format!("{index}"), format!("item {index}"), Verdict::Done);
+        }
+        let columns = menu.columns().collect::<Vec<_>>();
+        assert_eq!(columns.len(), 7, "twenty-eight items in sevens");
+        assert!(
+            columns.iter().all(|column| column.len() == 4),
+            "every column is four tall"
+        );
+        // Top to bottom, then left to right: the second column starts at
+        // the fifth item, not at the second.
+        assert_eq!(columns[1][0].description(), "item 4");
+    }
+
+    /// A short menu wraps at four all the same, so a five-item menu is a
+    /// full column and a stub rather than one long list.
+    #[test]
+    fn a_short_menu_is_a_column_and_a_stub() {
+        let mut menu = Transient::new("verdict");
+        for index in 0..5 {
+            menu = menu.item(format!("{index}"), format!("item {index}"), Verdict::Done);
+        }
+        let columns = menu.columns().collect::<Vec<_>>();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].len(), 4);
+        assert_eq!(columns[1].len(), 1);
     }
 
     #[test]

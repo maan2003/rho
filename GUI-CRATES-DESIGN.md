@@ -964,6 +964,10 @@ wrong at the design, not at the polish.
   in the chrome, filed here rather than fixed in this change.) And the Magit
   column layout was drawing as one column however it was chunked, so the
   chunking went: one item per row, which is what a buffer is anyway.
+  (That last decision was wrong and is reversed: one item per row makes the
+  root menu's twenty-eight items the whole screen. The grid is back in
+  `rho_window::transient::render`, ported from the element tree that worked
+  before the move; see "The grid, put back" in `RHO-WINDOW-DESIGN.md`.)
   Also removed: moving counts into the menu left `Workspace::transient_count`,
   `take_transient_count` and `Transient::counted`/`takes_count` with no reader,
   since the verdict menus were the only counted ones. The path is deleted
