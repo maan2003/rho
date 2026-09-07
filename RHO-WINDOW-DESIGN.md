@@ -175,11 +175,13 @@ three landing notes.
   `block_map_sync` p99 0.08 ms at one row. The insert costs the block now.
   It was desktop-only in any case: the phone draws the same menu as a sheet
   and inserts no block, so nothing in its buffer moves.
-- **The rig cannot tap.** The phone's menu is reached by tap and the headless
-  seat has no pointer device, so the sheet is proven by test and not by
-  picture. That is the rig's gap, not the window's, and it is the rig's next
-  item; it is here because it is what stops a window primitive being proven
-  the way the section below says every one of them will be.
+- **The rig can tap, and this is closed.** It was here because the phone's
+  menu is reached by tap and a headless seat has no pointer device, so the
+  sheet was proven by test and not by picture. The driver creates a
+  `zwlr_virtual_pointer_v1` for the length of a tap now, and the sheet is
+  proven by picture on desk session 45: the header tap draws it, the Status
+  tap runs the row, and closing is byte-identical to the frame before the
+  first tap.
 
 ### How it will be proven
 
@@ -188,3 +190,126 @@ the point survives back, the same key means the same thing in every buffer,
 nothing needs the mouse, no modal appears. Plus the cost rule, per event
 O(touched) + O(log n) and per frame O(drawn), measured on the snapshot and
 written into the landing note.
+
+## Surfaces and history
+
+### The spec
+
+The user's rule, unchanged: a surface is a buffer with the point in it,
+history is a stack, and back returns the point to where it was. Everything
+below is an attempt to say what that means precisely enough to cut against,
+and what it costs.
+
+### What a surface is, and what its identity is
+
+A surface is a place the reader can be. Today it is `Surface { key, view }`
+in `rho-gui`: a `SurfaceKey` that says which place it is, and a live view
+entity that holds the buffer, the point, the scroll and the folds. The two
+are deliberately separate — the key is stable and cheap to compare, the view
+is the expensive live thing — and the split is what lets a context keep a
+buffer list (`surfaces: HashMap<ContextId, Vec<Surface>>`) while its one
+viewport (`Pane<Surface>`) shows one of them.
+
+Identity is what makes a place a different place, and nothing else. It is the
+agent id, the file path, the Slack source, the browser page id — never a
+label, because two threads in one channel have the same label and are two
+surfaces. What a surface happens to be *showing* is not identity: the usage
+screen is one `SurfaceKey::Usage` and the chart on it is its own state, so
+picking another chart redraws that screen instead of opening a second place
+to be. That precedent is the rule, and the design keeps it: if two things
+differ only in what is drawn, they are one surface with state; if a reader
+can mean one and not the other, they are two keys.
+
+The key type stays in `rho-gui`, because every variant of it names a source
+crate's idea. What moves to `rho-window` is the machine that holds surfaces
+and their order, generic over the key the way `Pane<S>` already is. The
+window names no source type; that is the crate's whole rule.
+
+### What history is today, and what is wrong with it
+
+There are two histories, which is the first defect.
+
+`Pane<S>` keeps a per-context `Vec<S>` and `back()` pops it. `show()` first
+does `history.retain(|c| *c != previous)`, so a push walks the whole stack.
+
+`Workspace` keeps a second one — `surface_history: Vec<WarmSurface>` with a
+`history_cursor` — and this is the one the keys actually reach:
+`SurfaceBack` runs `step_surface_back`, which moves the cursor rather than
+popping. `append_history` scans it with `position`, `remove`s the match, and
+pushes. Closing a surface scans it again; forgetting an agent scans both.
+
+So a push is O(entries) twice over, in two places that must agree about what
+happened, and the journal records both. Nothing walks either at draw time,
+which is the one half of the rule that already holds.
+
+### What the history stack must cost
+
+Per event: **O(1)** to push, **O(1)** amortised to go back, **O(1)** when the
+thing behind a surface dies. Per frame: **nothing** — the viewport draws the
+active surface's view and never reads the stack.
+
+The shape that gets there. Entries are appended and never removed from the
+middle: a push is a `Vec::push`. Dedupe is by a `HashMap<Key, usize>` holding
+the index of each key's latest entry, so pushing the same surface twice
+leaves a stale entry behind rather than paying a scan and a memmove to
+delete it. Going back pops and skips any entry whose index is not the one the
+map holds for its key — each stale entry is skipped at most once, which is
+what makes the amortised bound. A surface whose thing has gone is dropped by
+removing its key from the map, one operation at the moment of death rather
+than a scan of everything; its entries are then skipped like any other stale
+one. When stale entries outnumber live ones the stack compacts, which is O(n)
+against n pushes that paid for it.
+
+That leaves one behaviour question I want answered before any cutting rather
+than after: today's `surface_history` is global and its entries carry a
+`ContextId`, so back can walk out of the context the reader is in.
+`Pane`'s stack is per context and cannot. I would make history per context —
+it matches the buffer list it orders, and a back that changes context is a
+back that moves two things at once — but it is a behaviour change and it is
+the user's call, not mine.
+
+### What back restores, and what it does not
+
+The point, and with it the scroll and the folds. It restores them by
+*keeping* the view rather than by replaying anything: the view entity for a
+surface stays alive in the context's surface list, so its editor still holds
+its own selections, scroll position and display map when the viewport comes
+back to it. This is why note bodies already survive leaving and returning.
+Restoring by replay — remembering a line and a column and seeking to them —
+is the design this rejects, because it is a second copy of the truth that is
+wrong whenever the buffer changed underneath.
+
+It does not restore a menu. A menu is open over a surface, not part of one,
+and leaving closes it; coming back finds the surface as it was with nothing
+over it. The alternative — history entries that carry a transient — would
+make the stack hold live UI state, and the reason to say so here is that the
+question is settled rather than open.
+
+### When the thing behind a surface goes away
+
+An agent is deleted, a conversation is gone, a file is removed under the
+reader. The surface's identity is now a place that does not exist, and it
+leaves history at the moment the thing does, by key, in O(1). What it must
+not do is leave a hole the cursor can fall into: back moves to the nearest
+surviving entry, and if none survives, to Home, which is where a cold start
+lands and the one surface that is always there. Today that invariant is kept
+by four separate places agreeing about how to move a cursor after a removal —
+close, discard, forget an agent, forget a daemon — and each of them is
+written out longhand. I have not found a case where they disagree and I am
+not claiming one; the point is that the invariant is not stated anywhere, so
+nothing checks it. Under the shape above there is no cursor to fix: entries
+go stale and are skipped, and a dead surface is unreachable because its key
+is no longer in the map.
+
+### How it will be proven
+
+On the rig, on the user's snapshot, first open named. Open A, note the frame;
+open B; back; the frame must be byte-identical to the one taken on A —
+identical is the whole claim, because a point that moved by one row and a
+scroll that moved by one pixel both show up and neither shows up in an
+assertion that back returned to A. A no-input control of the same span runs
+beside it, because the desk moves while agents work and two frames of Home
+are not equal by default. Then the same pair with the surface scrolled and a
+fold closed, and the same pair after the thing behind the second surface is
+deleted while it is in the stack. Plus the cost rule from the handbook, with
+the per-event numbers on the snapshot and nothing walked at draw time.
