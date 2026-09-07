@@ -34,6 +34,10 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
+/// The per-frame draw budget. The user set it to 4 ms, down from 8: the bar
+/// is zero frames over it, on every surface.
+const BUDGET_NS: u64 = 4_000_000;
+
 #[derive(Deserialize)]
 struct Report {
     #[serde(default)]
@@ -115,13 +119,18 @@ pub fn summarize(path: &Path) -> Result<String> {
     surfaces.sort_by_key(|(_, frames)| std::cmp::Reverse(frames.len()));
     for (surface, frames) in &surfaces {
         let draw: Vec<u64> = frames.iter().map(|frame| frame.draw_ns).collect();
-        let over = draw.iter().filter(|held| **held > 8_000_000).count();
+        let over = draw.iter().filter(|held| **held > BUDGET_NS).count();
+        // The budget was 8 ms until the user set it to 4. The old count is
+        // printed beside the new one for one release, so a report read
+        // today can still be compared with one read last week.
+        let over_old = draw.iter().filter(|held| **held > 8_000_000).count();
         out.push_str(&format!(
-            "  {surface:<20} {:>5} frames  {:>5} over 8 ms ({:.0}%)  draw p50 {:.1} p99 {:.1} max {:.1} ms  \
+            "  {surface:<20} {:>5} frames  {:>5} over 4 ms ({:.0}%)  [{:>5} over 8 ms]  draw p50 {:.1} p99 {:.1} max {:.1} ms  \
              prepaint p50 {:.1} p99 {:.1}  paint p50 {:.1} p99 {:.1}\n",
             frames.len(),
             over,
             100.0 * over as f64 / frames.len() as f64,
+            over_old,
             ms(&draw, 0.50),
             ms(&draw, 0.99),
             draw.iter().copied().max().unwrap_or(0) as f64 / 1e6,
@@ -153,11 +162,11 @@ pub fn summarize(path: &Path) -> Result<String> {
         ));
         let slow: Vec<&&Frame> = frames
             .iter()
-            .filter(|frame| frame.draw_ns > 8_000_000)
+            .filter(|frame| frame.draw_ns > BUDGET_NS)
             .collect();
         let fast: Vec<&&Frame> = frames
             .iter()
-            .filter(|frame| frame.draw_ns <= 8_000_000)
+            .filter(|frame| frame.draw_ns <= BUDGET_NS)
             .collect();
         if !slow.is_empty() && !fast.is_empty() {
             let mean = |set: &[&&Frame]| {
@@ -199,7 +208,7 @@ fn continuity(frames: &[&Frame]) -> String {
     for frame in frames {
         let bucket = ((frame.start_ns - lo) as u128 * 10 / (hi - lo) as u128).min(9) as usize;
         buckets[bucket].0 += 1;
-        if frame.draw_ns > 8_000_000 {
+        if frame.draw_ns > BUDGET_NS {
             buckets[bucket].1 += 1;
         }
     }
@@ -228,7 +237,7 @@ fn continuity(frames: &[&Frame]) -> String {
     let mut runs = Vec::new();
     let mut run = 0usize;
     for frame in frames {
-        if frame.draw_ns > 8_000_000 {
+        if frame.draw_ns > BUDGET_NS {
             run += 1;
         } else if run > 0 {
             runs.push(run);

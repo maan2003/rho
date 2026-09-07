@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 /// What the frame log says a frame cost. A frame that misses at 60 Hz is one
 /// the user sees; `dirty_to_draw` is the wait between something changing and
 /// the pixels moving, which is the one they feel.
-const DRAW_BUDGET_MS: f64 = 8.0;
+///
+/// The user set this to 4 ms, down from 8: the bar is zero frames over it,
+/// on every surface, in the profiling profile.
+const DRAW_BUDGET_MS: f64 = 4.0;
 
 /// The summary of one session's profile, printed on `rig down` and kept in
 /// the rig's session entry so a landing note can quote it verbatim.
@@ -388,7 +391,7 @@ mod tests {
         };
         assert_eq!(
             bare.render(),
-            "81 frames, draw p99 3.6 ms, 0 over 8 ms; worst gap 11 ms, p99 11 ms"
+            "81 frames, draw p99 3.6 ms, 0 over 4 ms; worst gap 11 ms, p99 11 ms"
         );
 
         let full = Summary {
@@ -408,7 +411,7 @@ mod tests {
         };
         assert_eq!(
             full.render(),
-            "81 frames, draw p99 3.6 ms, 0 over 8 ms; worst gap 11 ms, p99 11 ms; \
+            "81 frames, draw p99 3.6 ms, 0 over 4 ms; worst gap 11 ms, p99 11 ms; \
              11471 events, slowest stage buffer_edit p99 0.04 ms at 2 rows; \
              90 samples on rho-gui: memcpy 13%"
         );

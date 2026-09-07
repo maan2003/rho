@@ -428,7 +428,7 @@ on, and `rig down` leaves three files in the rig's `profiles/`:
   thing when you need the flame graph.
 
 `rig down` reads all three and prints the line the run earned: frames drawn,
-`draw_ms` p99, how many frames went over the 8 ms budget, the worst
+`draw_ms` p99, how many frames went over the 4 ms budget, the worst
 dirty-to-draw gap and its p99, the editor stage with the worst p99 and the rows
 it had in hand, and where the GUI thread's samples landed. The same line goes
 into the rig's session entry in `rig.json`, so a landing note quotes the run
@@ -528,7 +528,10 @@ produce.
 
 *What fails it.*
 
-- `draw_ms` p99 above 8 ms, or max above 16 ms: a frame that misses at 60 Hz.
+- Any frame above 4 ms, on any surface: the budget is 4 ms and the bar is
+  zero over it. (It was 8 ms until the user set it to 4; reports printed by
+  `rho-qa telemetry` carry the old count beside the new one for one release
+  so an old report still compares.)
 - `dirty_to_draw_ms` p99 above 50 ms: a visible lag between act and paint.
 - A stage whose `duration_ms` grows with the snapshot while its `input_rows`
   does not: that is O(all) wearing O(touched)'s clothes, and it is the failure
