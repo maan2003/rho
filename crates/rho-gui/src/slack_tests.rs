@@ -7,7 +7,7 @@
 
 use gpui::{AppContext as _, TestAppContext};
 
-use super::tests::init_test_app;
+use super::tests::{bind_test_keymaps, init_test_app, test_workspace};
 
 /// The workspace both tests read, seeded on the server.
 ///
@@ -388,5 +388,124 @@ async fn reacting_puts_the_emoji_on_the_server_and_pressing_again_takes_it_off(
         fake.reactions("C1", "100.0"),
         vec![("tada".to_owned(), vec!["UD".to_owned()])],
         "taking the reader's off leaves the other standing"
+    );
+}
+
+/// `s` on the list narrows as the reader types, and escape puts back what
+/// they were looking at.
+///
+/// The whole path the reader walks: the prompt opens, each keystroke
+/// reaches the change handler and the list behind it narrows on that
+/// keystroke rather than on submit, and escape restores the narrowing that
+/// stood when the prompt opened. Through a workspace and a real session
+/// against the fake, because the thing being asserted is what is on screen
+/// after a key.
+#[gpui::test]
+async fn typing_narrows_the_list_per_keystroke_and_escape_puts_it_back(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+
+    // The workspace first: `test_workspace` initialises the app, and doing
+    // that after the fake had started would replace the runtime the
+    // session's loops live in.
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack(window, cx);
+        })
+        .unwrap();
+
+    // The rows come over a real socket, so wait on the listing itself.
+    let mut whole = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        // The rows a reader sees are the rows drawn, so draw a frame.
+        cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+            .expect("draw a frame");
+        cx.run_until_parked();
+        whole = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if whole.len() > 1 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        whole.len() > 1,
+        "the fake's conversations reached the list: {whole:?}"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prompt_slack_search(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap(),
+        whole,
+        "opening the prompt is not an edit, so nothing has narrowed yet"
+    );
+
+    // One keystroke at a time, and the list is narrower after each: this is
+    // the per-keystroke claim, and submitting is not what does it.
+    cx.simulate_keystrokes(*workspace, "o");
+    cx.run_until_parked();
+    let after_one = workspace
+        .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+        .unwrap();
+    assert!(
+        !after_one.is_empty() && after_one.len() < whole.len(),
+        "one keystroke narrowed {whole:?} to {after_one:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "p s");
+    cx.run_until_parked();
+    let after_three = workspace
+        .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+        .unwrap();
+    assert!(
+        after_three.len() <= after_one.len(),
+        "and each further keystroke narrows again: {after_one:?} then {after_three:?}"
+    );
+    assert!(
+        after_three
+            .iter()
+            .all(|label| label.to_lowercase().contains("ops")),
+        "every row left answers what was typed: {after_three:?}"
+    );
+
+    // Escape is the reader changing their mind: the list goes back to what
+    // it was showing before the prompt opened.
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap(),
+        whole,
+        "escape puts back what the reader was looking at"
     );
 }

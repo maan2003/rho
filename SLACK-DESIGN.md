@@ -411,9 +411,13 @@ the thread identity. No strings where an enum will do.
 
 - Automatic token and cookie extraction from the embedded browser.
 - Dialogs and modals rendered as forms in the editor.
-- Reactions, emoji, file upload, message editing and deletion, presence,
-  workspace-wide search.
+- Presence and typing indicators.
+- Workspace-wide search. Narrowing the conversation list by name is built;
+  searching what people said is not.
 - Scopes and per-heading keyword filters.
+
+Reactions, emoji, file upload, message editing and deletion have all been
+built and are no longer deferred.
 
 ## Symptoms to watch for
 

@@ -812,6 +812,8 @@ done right after the transcript primitive (2.4) and before 2.10:
       The narrowing is the model's: a keystroke edits out the rows that
       left and edits in the rows that arrived, and nothing else, at
       442 µs for 1 885 matches out of 20 000 against 753 µs to walk them.
+      It now runs **per keystroke**, on the minibuffer's change hook, and
+      escape puts back the narrowing that stood when the prompt opened.
       Deleting a letter widens by the same diff run backwards. `/`, `n`,
       `G` and yank still see the whole list, because narrowing is the
       model's and not the buffer's.

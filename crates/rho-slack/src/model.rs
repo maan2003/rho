@@ -1014,7 +1014,18 @@ impl Model {
             .into_iter()
             .filter_map(|channel| self.placed.get(&channel).cloned())
             .collect::<Vec<_>>();
-        found.sort();
+        // Only the first `most` are shown, so only they are put in order:
+        // the rest are partitioned away in one pass rather than sorted.
+        // A letter reaching a tenth of a large workspace was paying to
+        // order thousands of names to show sixty-four of them.
+        match found.len() > most {
+            true => {
+                found.select_nth_unstable(most);
+                found.truncate(most);
+                found.sort_unstable();
+            }
+            false => found.sort_unstable(),
+        }
         found
             .into_iter()
             .take(most)

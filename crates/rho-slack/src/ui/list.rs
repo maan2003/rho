@@ -148,7 +148,7 @@ impl ListView {
     /// The conversation names the buffer currently holds, in the order
     /// they are drawn. What a narrowing is asserted against from outside.
     #[cfg(any(test, feature = "fake"))]
-    pub fn drawn_conversations_for_test(&self, _cx: &Context<Self>) -> Vec<String> {
+    pub fn drawn_conversations_for_test(&self, _cx: &gpui::App) -> Vec<String> {
         self.drawn
             .iter()
             .filter(|line| line.id.is_some())

@@ -854,6 +854,50 @@ wrong at the design, not at the polish.
   tests, clippy `-D warnings` clean, `cargo fmt --check` clean. The crate
   is at a ceiling and the next test to land anywhere in `rho-gui` will hit
   it again.
+
+  **Change 4b, the narrowing runs per keystroke.** Change 4 landed with
+  the narrowing on submit, because the minibuffer's `CandidateSource` is
+  handed only `&Workspace` and so can suggest but not act. eng-8gpr's
+  `ChangeHandler` fixes that, and this is the wiring: `open_prompt_watching`
+  with a handler that narrows the list on every edit. The index and the
+  row edits were already the per-keystroke shape, so the change is the
+  hook, one narrowing path shared by keystroke, submit and escape, and the
+  state escape needs.
+  Escape is the prompt's, per eng-en1p's ruling: `prompt_slack_search`
+  saves the narrowing that stood when it opened and `minibuffer_cancel`
+  puts it back through the same `set_filter`, so cancelling costs what
+  narrowing cost and not a redraw. The primitive only says *when*.
+  Numbers, `cargo run --release --example list_cost`, this machine, p99
+  over 1 744 keystrokes — every prefix of every word in the vocabulary,
+  typed a letter at a time, each keystroke measured twice: the candidates
+  the minibuffer asks for and the narrowing behind it.
+
+  | per keystroke, p99 | 300 | 5 000 | 20 000 |
+  | --- | --- | --- | --- |
+  | the candidate lookup, 64 offered | 24 µs | 620 µs | 3.6 ms |
+  | the narrowing itself | 18 µs | 615 µs | 3.0 ms |
+  | rows edited | 168 | 3 067 | 2 397 |
+
+  Read the shape: the p99 keystroke is a *one-letter* query, which reaches
+  a tenth of the workspace, so the row count and the time are the matches
+  and not the list — a two-word query reaching one conversation is 50 µs
+  at 20 000. Entering a narrowing from the whole list and leaving it again
+  are resyncs by design (two lists with no common shape to diff); of the
+  1 744 keystrokes, 304 were those and 1 440 were diffs.
+  The user's workspace is hundreds of conversations, which is the 300
+  column: 24 µs to offer the names and 18 µs to narrow. The 20 000 column
+  is the stress figure and is where the honest limit shows — at that size
+  a letter reaching 2 400 rows has to move 2 400 rows.
+  One thing this change makes cheaper on the way past: `reached_by` sorted
+  every match to show the first 64. It now partitions with
+  `select_nth_unstable` and sorts only what it shows.
+  Test: `typing_narrows_the_list_per_keystroke_and_escape_puts_it_back` in
+  `slack_tests.rs`, through a workspace and a real session against the
+  fake — the prompt opens and nothing has narrowed yet (opening is not an
+  edit), one keystroke narrows, two more narrow again, and escape puts the
+  whole list back. The one test-only seam is
+  `install_slack_session_for_test`, which hands the workspace a session
+  built against the fake; everything after it is the code the reader runs.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is

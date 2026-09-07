@@ -209,6 +209,56 @@ fn main() {
     model.narrow("");
     model.forget_row_edits();
 
+    // What a keystroke costs as the reader types, p99 rather than an
+    // average, because a search that is quick on average and slow on the
+    // one word the reader wanted is a slow search. Every prefix of every
+    // word in the vocabulary is typed a letter at a time, and each
+    // keystroke is measured twice: the candidates the minibuffer asks for,
+    // and the narrowing of the list behind it.
+    model.narrow("");
+    model.forget_row_edits();
+    let mut lookups = Vec::new();
+    let mut narrowings = Vec::new();
+    let mut edited = Vec::new();
+    let mut resyncs = 0usize;
+    for at in 0..VOCABULARY {
+        let target = word(at);
+        for len in 1..=target.len() {
+            let typed = &target[..len];
+            let started = Instant::now();
+            std::hint::black_box(model.reached_by(typed, OFFERED));
+            lookups.push(started.elapsed());
+            let started = Instant::now();
+            model.narrow(typed);
+            narrowings.push(started.elapsed());
+            match model.take_row_edits() {
+                // Entering a narrowing from the whole list has no common
+                // shape to diff, so the drawer is told to draw once. That
+                // is one keystroke in each direction and never a per-letter
+                // cost, so it is counted rather than timed as an edit.
+                None => resyncs += 1,
+                Some(edits) => edited.push(edits.len()),
+            }
+        }
+        model.narrow("");
+        model.forget_row_edits();
+    }
+    println!(
+        "per keystroke, p99 lookup {:?}   ({OFFERED} offered, {} keystrokes)",
+        p99(&mut lookups),
+        narrowings.len()
+    );
+    println!("per keystroke, p99 narrow {:?}", p99(&mut narrowings));
+    edited.sort_unstable();
+    let rows_p99 = edited
+        .get(edited.len().saturating_sub(1).min(edited.len() * 99 / 100))
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "per keystroke, p99 rows   {rows_p99} edited   ({} diffed, {resyncs} resyncs)",
+        edited.len()
+    );
+
     // One message. The row it lands in moves and no other row is touched.
     // Kept under the log's cap so the model is logging throughout, which
     // is what it does with a drawer on screen.
@@ -225,6 +275,17 @@ fn main() {
         "one message arriving      {:?}",
         event_at.elapsed() / events as u32
     );
+}
+
+/// What the minibuffer offers while the reader types, the same cap the
+/// GUI uses.
+const OFFERED: usize = 64;
+
+/// The slowest of a hundred, which is what a reader notices.
+fn p99(times: &mut [std::time::Duration]) -> std::time::Duration {
+    times.sort_unstable();
+    let at = (times.len() * 99 / 100).min(times.len().saturating_sub(1));
+    times.get(at).copied().unwrap_or_default()
 }
 
 /// How many distinct words the generated names are built from.

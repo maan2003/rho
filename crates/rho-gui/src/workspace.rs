@@ -570,6 +570,11 @@ pub struct Workspace {
     /// because that is what a message is; the line it sits on can move
     /// under a menu the same as under anything else.
     pub(crate) slack_reacting: Option<rho_slack::types::Ts>,
+    /// The narrowing the Slack list stood at when its search prompt opened,
+    /// held so escape puts back what the reader was looking at. The prompt
+    /// owns what "back" means here, not the minibuffer: only this prompt
+    /// knows that its narrowing is a state of the list behind it.
+    pub(crate) slack_search_before: Option<String>,
     pub(crate) _slack_subscription: Option<gpui::Subscription>,
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
@@ -1146,6 +1151,7 @@ impl Workspace {
             slack_degraded: None,
             slack_labels: HashMap::new(),
             slack_reacting: None,
+            slack_search_before: None,
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
             agent_model_subscriptions: Vec::new(),
@@ -6836,6 +6842,8 @@ impl Workspace {
             input: input.clone(),
         });
         self.finish_overlay_focus(window, cx);
+        // Submitting keeps the narrowing, so there is nothing to put back.
+        self.slack_search_before = None;
         on_submit(self, input, window, cx);
         cx.notify();
     }
@@ -6859,6 +6867,7 @@ impl Workspace {
                 input: minibuffer.input(cx),
             });
             self.finish_overlay_focus(window, cx);
+            self.restore_slack_search(window, cx);
             cx.notify();
         }
     }
@@ -7014,6 +7023,7 @@ impl Workspace {
         self.capture_overlay_focus(window, cx);
         self.show_menu(crate::transient::verdict_menu(), None, Back::Out, true);
         self.minibuffer = None;
+        self.slack_search_before = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
         cx.notify();
@@ -7032,6 +7042,7 @@ impl Workspace {
         self.capture_overlay_focus(window, cx);
         self.show_menu(menu, None, Back::Out, false);
         self.minibuffer = None;
+        self.slack_search_before = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
         cx.notify();

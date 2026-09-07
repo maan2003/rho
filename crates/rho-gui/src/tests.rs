@@ -856,7 +856,7 @@ fn touch_editing_strips_vim_from_live_editors(cx: &mut TestAppContext) {
     assert_eq!(text(cx), "xyz", "touch editors must accept text directly");
 }
 
-fn bind_test_keymaps(cx: &mut App) {
+pub(super) fn bind_test_keymaps(cx: &mut App) {
     let default_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)
             .expect("load default keymap");
@@ -1263,7 +1263,7 @@ fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
     cx.run_until_parked();
 }
 
-fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
+pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     story::reset();
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));

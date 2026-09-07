@@ -205,6 +205,37 @@ impl Workspace {
         Some(session)
     }
 
+    /// The conversation names the Slack list is drawing, for a test that
+    /// asserts what the reader is looking at rather than what the model
+    /// holds.
+    #[cfg(test)]
+    pub(crate) fn slack_rows_for_test(&self, cx: &gpui::App) -> Vec<String> {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
+            return Vec::new();
+        };
+        view.read(cx).drawn_conversations_for_test(cx)
+    }
+
+    /// A session built elsewhere, for a test that wants Slack surfaces over
+    /// a fake server rather than over the user's workspace. The one seam:
+    /// everything after it — opening the list, narrowing it, escaping —
+    /// runs the code the reader runs.
+    #[cfg(test)]
+    pub(crate) fn install_slack_session_for_test(
+        &mut self,
+        session: gpui::Entity<Session>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self._slack_subscription =
+            Some(
+                cx.subscribe_in(&session, window, |workspace, session, event, window, cx| {
+                    workspace.on_slack_event(session.clone(), event, window, cx);
+                }),
+            );
+        self.slack = Some(session);
+    }
+
     /// The host services the Slack surfaces borrow, the same two the Zulip
     /// client borrows, so chat reads like every other buffer in the frame.
     pub(crate) fn slack_hooks() -> rho_slack::ui::Hooks {
@@ -1052,10 +1083,14 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        if !matches!(self.active_surface().view, SurfaceView::SlackList(_)) {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
             return;
-        }
-        self.open_prompt(
+        };
+        // What the list stood at before the reader started typing. Escape
+        // puts this back: the prompt owns what "back" means, because only
+        // it knows the narrowing is a state of the list behind it.
+        self.slack_search_before = Some(view.clone().update(cx, |view, cx| view.filter(cx)));
+        self.open_prompt_watching(
             "slack:",
             // The matches as the reader types, answered off the crate's
             // word index: a range scan per typed word and the matches, so
@@ -1074,16 +1109,51 @@ impl Workspace {
                     })
                     .collect()
             }),
+            // The narrowing itself, once per keystroke. The list is not
+            // drawn again: the model says which rows left and which
+            // arrived, and only those lines are rewritten.
+            Some(std::rc::Rc::new(
+                |workspace: &mut Workspace, typed: &str, window: &mut gpui::Window, cx| {
+                    workspace.slack_narrow(typed, window, cx);
+                },
+            )),
             std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
-                if let SurfaceView::SlackList(view) = &workspace.active_surface().view {
-                    let input = input.to_owned();
-                    view.clone()
-                        .update(cx, |view, cx| view.set_filter(input, window, cx));
-                }
+                workspace.slack_narrow(&input, window, cx);
             }),
             window,
             cx,
         );
+    }
+
+    /// Narrows the Slack list to a query. The one place the narrowing
+    /// happens, so a keystroke, a submit and escape putting the old query
+    /// back are the same code and cannot drift apart.
+    fn slack_narrow(
+        &mut self,
+        query: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
+            return;
+        };
+        let query = query.to_owned();
+        view.clone()
+            .update(cx, |view, cx| view.set_filter(query, window, cx));
+    }
+
+    /// Escape out of the search prompt: the list goes back to the narrowing
+    /// it stood at when the prompt opened, by the same diff that narrowed
+    /// it, so putting it back costs what the narrowing cost.
+    pub(crate) fn restore_slack_search(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(before) = self.slack_search_before.take() else {
+            return;
+        };
+        self.slack_narrow(&before, window, cx);
     }
 
     fn on_slack_event(
