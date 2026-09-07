@@ -1331,6 +1331,36 @@ work on it.
 
 ### Landed
 
+- **The pictures for the transient at the bottom and the usage charts**
+  (rig session 93, main `d671995e`, frames in
+  `rho-rigs/sweep/frames/s93-*.png`). Owed with the two commits before this
+  one; the desk was held for the panic repro when they landed.
+  *The round trip.* On Home, with the point on a running agent's row: a
+  no-input control two frames 3 s apart is byte-identical, and `space` then
+  `escape` is byte-identical before to after, three times over. Two deep —
+  `space h`, `escape`, `escape` — is byte-identical too, against its own
+  control taken the same way. So the menu leaves nothing behind, and the
+  desk was still enough for that to mean something.
+  *What the open changes.* Against the frame before it, opening the `hosts`
+  menu differs in exactly two bands: rows 1446–1663, which is the menu, and
+  rows 350–391, which is the point's cursor block ceasing to be drawn while
+  the transient holds the keyboard. Every Home row is unmoved to the pixel.
+  That is the ruling's invariant in a measurement: the buffer above is
+  untouched. The row highlight stays, so the reader can still see where they
+  are; the cursor itself does not, which is what focus moving means here and
+  was as true of the block as it is of the bottom.
+  *The picture.* `s93-menu-hosts.png` is the one the ruling asked for: five
+  rows of `hosts` against the bottom edge, the Home buffer above exactly
+  where it was, the point's row visible mid-buffer with a screenful of empty
+  space between the two. `s93-open-1.png` is the root menu, 25 rows, which
+  reaches further up but still sits on the bottom edge. Neither is clipped:
+  the last row's ink ends 15 px above the window's bottom.
+  *The charts.* All four — rate limit, model cost, usage share, agent cost —
+  read by eye and by count. Not one pixel in any of the four is darker than
+  the background: axis labels, end labels, legend and the p50/p90/p99 labels
+  are all light on dark and all in the buffer's face. The header is buffer
+  text and always was.
+
 - **The usage screen's words get a colour and a font.** Two user reports:
   text drawing black on the dark background, and fonts wrong in several
   places. One cause under both. The charts are a block under the header, and

@@ -350,7 +350,18 @@ block, moved down by the block's height, and no `BlockProperties` in
 `rho-window` asks for `height: None`. *Fails if* the block is painted over the
 row below, or the rows below shift by fewer rows than the block drew.
 
-*Closed by:* the verdict transient (main 8601e048) and `style::refusal_block`.
+*No longer covers the transient.* On the user's ruling the menu left the
+buffer: it is drawn at the bottom edge of the window, over the surface, so
+there is no block and nothing below it to cover. What replaces the check for
+the transient is the opposite one — the surface draws the same number of rows
+with the menu open as without, which is what
+`the_root_menu_opens_at_the_bottom_and_escape_retraces_it` asserts. The case
+still covers every other thing drawn into a buffer: the draft's refusal and
+attachment chip, the usage chart, a Slack image, a transcript gap, a
+visualization.
+
+*Closed by:* `style::refusal_block`. (It was closed by the verdict transient,
+main 8601e048, until the transient stopped being a block.)
 
 ## Does it feel like Emacs
 
