@@ -318,6 +318,20 @@ screenshot the frame. Where a picture has to settle it, build the same drive
 twice, once with the block's height forced to `None`, and compare the two PNGs
 byte for byte.
 
+*And a control, because the desk moves on its own.* Byte for byte is a proof
+only when the buffer is the only thing that could have changed, and on a desk
+with agents running it is not: a mirror row un-dims while you are pressing
+keys, and that is a real difference in the picture that has nothing to do with
+what you did. Take a no-input control — two frames the same span apart with no
+keys between them — and read the round trip against it. If the control is
+byte-identical, a difference in the round trip is yours; if the control moves,
+the difference is only yours where the control did not move. Proving the root
+menu's back on session 40 went that way: two of three open-and-dismiss round
+trips byte-identical, the third differing by 1,167 pixels which were all one
+agent's name in the running list going from muted to normal, and the control
+byte-identical across the same span. Without the control that third frame is
+either a defect or nothing, and there is no way to tell.
+
 *Passes if* the row that was under the point before is still readable below the
 block, moved down by the block's height, and no `BlockProperties` in
 `rho-window` asks for `height: None`. *Fails if* the block is painted over the
@@ -420,6 +434,23 @@ are hidden. Two habits to copy from it: measure the layer that does the work
 rather than the one that shows it, and copy the mirror before reading it,
 because opening a rig's live mirror takes a write transaction on it
 (eng-b8os, the transcript cut).
+
+*Say which open a number came from.* A first open and a second open of the
+same screen are different measurements: the first pays for what has never been
+laid out and the second reads what is already there, and the gap between them
+is large enough to swallow whatever you were trying to show. A number that
+does not say which one it is cannot be compared with anything, including
+itself a day later. So: name the order in the note — "first open, then `gg`,
+on the same drive" — and drive both sides of a comparison the same way.
+
+The same sentence covers what a session *is*. `rig.json` lists sessions and
+they all look alike, but a session can be a control rather than a measurement —
+main's binaries, or a build with the thing under test deliberately switched
+off — and read as a measurement it says the opposite of what it means. Two
+sessions minutes apart were once taken for a before-and-after when one of them
+was a control on a different build (eng-b8os, desk sessions 29 and 33). Say in
+the note, and in the message when you hand numbers to someone else, which
+sessions were controls and what they are controls for.
 
 *What fails it.*
 
