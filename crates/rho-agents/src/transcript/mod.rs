@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
+pub use elisions::HistoryFold;
 use elisions::{ElisionState, ElisionSync};
 use futures::FutureExt as _;
 use futures::future::LocalBoxFuture;

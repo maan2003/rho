@@ -1,20 +1,27 @@
-//! Applies elision plans to editors as display elisions.
+//! Applies elision plans to editors as folds.
 //!
 //! Plans and their anchor-resolved specs are model state, cached per turn:
-//! a refresh recomputes only from the changed turn onward. Which display
-//! elisions an editor actually carries is per-attachment [`ElisionState`],
-//! diffed positionally against the model's specs — elision ids live in the
-//! editor's id space, and fold open/closed state stays per-editor (vim's
-//! per-window folds, not emacs' buffer-level invisibility).
+//! a refresh recomputes only from the changed turn onward. Which folds an
+//! editor actually carries is per-attachment [`ElisionState`], diffed
+//! against the model's specs — fold open/closed state stays per-editor
+//! (vim's per-window folds, not emacs' buffer-level invisibility).
+//!
+//! Folds rather than display elisions, which is the whole point of this
+//! module's second life: a display elision is a block-map construct and the
+//! block map sits *above* the wrap map, so an elided turn was a turn that
+//! had already been wrapped and then hidden. A fold is below the wrap, so
+//! an elided turn leaves the wrap's input — and the block map's — entirely.
+//! The tail an elision keeps visible is the fold map's own
+//! [`ElisionPolicy::Tail`].
 
 use std::ops::Range;
 use std::sync::Arc;
 
-use editor::display_map::{BlockContext, BlockStyle};
-use editor::{DisplayElisionId, DisplayElisionProperties, Editor};
+use editor::Editor;
+use editor::display_map::{CaretRest, Crease, ElisionPolicy};
 use gpui::prelude::*;
-use gpui::{Context, Entity};
-use multi_buffer::{MultiBuffer, MultiBufferSnapshot};
+use gpui::{AnyElement, App, Context, Entity};
+use multi_buffer::MultiBuffer;
 use rho_window::highlights::excerpt_range;
 use text::Anchor;
 use ui::{Icon, IconName, IconSize, div};
@@ -30,15 +37,13 @@ struct ElisionSpec {
     tail_rows: u32,
 }
 
-struct ActiveElision {
-    id: DisplayElisionId,
-    spec: ElisionSpec,
-}
-
-/// One editor's live display elisions, reconciled against the model's specs.
+/// One editor's live folds, reconciled against the model's specs: what the
+/// editor was last told to fold, and the crease id each fold left behind. A
+/// crease is what lets a reader close an elision again after opening it —
+/// the fold is gone once it is open, and the crease is what `z c` finds.
 #[derive(Default)]
 pub struct ElisionState {
-    active: Vec<ActiveElision>,
+    active: Vec<(ElisionSpec, editor::display_map::CreaseId)>,
 }
 
 #[derive(Default)]
@@ -120,7 +125,11 @@ impl ElisionSync {
         ));
     }
 
-    /// Reconciles one editor's display elisions with the model's specs.
+    /// Reconciles one editor's folds with the model's specs. The two lists
+    /// are in document order and a change touches a run in the middle of
+    /// them — composing history adds a prefix, a new turn adds a suffix, an
+    /// edit rewrites one turn — so the common prefix and suffix are skipped
+    /// and only the run between them reaches the editor.
     pub fn apply<V: 'static>(
         &self,
         state: &mut ElisionState,
@@ -128,121 +137,112 @@ impl ElisionSync {
         editor: &Entity<Editor>,
         cx: &mut Context<V>,
     ) {
-        let specs = self.specs.clone();
-        let snapshot = multi_buffer.read(cx).snapshot(cx);
-        let mut removed_ids = state.active[specs.len().min(state.active.len())..]
+        let common = state
+            .active
             .iter()
-            .map(|elision| elision.id)
-            .collect::<rustc_hash::FxHashSet<_>>();
-        let mut updates = Vec::new();
-        let mut inserted_specs = Vec::new();
-        let mut inserted_properties = Vec::new();
-        let mut next_active = Vec::new();
-
-        for (index, spec) in specs.into_iter().enumerate() {
-            let existing = state.active.get(index);
-            if let Some(existing) = existing
-                && existing.spec == spec
-            {
-                next_active.push(ActiveElision {
-                    id: existing.id,
-                    spec,
-                });
-                continue;
-            }
-            let Some(properties) = elision_properties(&snapshot, &spec) else {
-                if let Some(existing) = existing {
-                    removed_ids.insert(existing.id);
-                }
-                continue;
-            };
-            match existing {
-                Some(existing) => {
-                    updates.push((existing.id, properties));
-                    next_active.push(ActiveElision {
-                        id: existing.id,
-                        spec,
-                    });
-                }
-                None => {
-                    inserted_properties.push(properties);
-                    inserted_specs.push(spec);
-                }
-            }
-        }
-
-        if removed_ids.is_empty() && updates.is_empty() && inserted_properties.is_empty() {
-            state.active = next_active;
+            .zip(&self.specs)
+            .take_while(|((active, _), spec)| active == *spec)
+            .count();
+        let tail = state.active[common..]
+            .iter()
+            .rev()
+            .zip(self.specs[common..].iter().rev())
+            .take_while(|((active, _), spec)| active == *spec)
+            .count();
+        let stale = &state.active[common..state.active.len() - tail];
+        let fresh = &self.specs[common..self.specs.len() - tail];
+        if stale.is_empty() && fresh.is_empty() {
             return;
         }
 
-        let inserted_ids = editor.update(cx, |editor, cx| {
-            if !removed_ids.is_empty() {
-                editor.remove_display_elisions(removed_ids, None, cx);
+        let snapshot = multi_buffer.read(cx).snapshot(cx);
+        let unfold = stale
+            .iter()
+            .filter_map(|(spec, _)| excerpt_range(&snapshot, &spec.range))
+            .collect::<Vec<_>>();
+        let uncrease = stale.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+        let fold = fresh
+            .iter()
+            .filter_map(|spec| {
+                let range = excerpt_range(&snapshot, &spec.range)?;
+                let label = elision_label(spec.tool_count);
+                Some(
+                    Crease::simple(
+                        range,
+                        editor::FoldPlaceholder {
+                            render: Arc::new(move |_, _, cx| render_elision(&label, cx)),
+                            constrain_width: false,
+                            merge_adjacent: false,
+                            type_tag: Some(std::any::TypeId::of::<HistoryFold>()),
+                            collapsed_text: None,
+                            caret_rest: CaretRest::Boundary,
+                        },
+                    )
+                    .with_elision_policy(ElisionPolicy::Tail {
+                        rows: spec.tail_rows,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let fresh_ids = editor.update(cx, |editor, cx| {
+            if !uncrease.is_empty() {
+                editor.remove_creases(uncrease, cx);
             }
-            if !updates.is_empty() {
-                editor.update_display_elisions(updates, None, cx);
-            }
-            editor.insert_display_elisions(inserted_properties, None, cx)
+            let ids = editor.insert_creases(fold.clone(), cx);
+            editor.display_map.update(cx, |display_map, cx| {
+                if !unfold.is_empty() {
+                    display_map.remove_folds_with_type(
+                        unfold,
+                        std::any::TypeId::of::<HistoryFold>(),
+                        cx,
+                    );
+                }
+                if !fold.is_empty() {
+                    display_map.fold(fold, cx);
+                }
+            });
+            cx.notify();
+            ids
         });
-        next_active.extend(
-            inserted_ids
-                .into_iter()
-                .zip(inserted_specs)
-                .map(|(id, spec)| ActiveElision { id, spec }),
-        );
-        state.active = next_active;
+
+        // The specs that resolved to a range are the ones that became folds,
+        // in order, so the ids line up with them; a spec whose anchors no
+        // longer resolve is carried with no crease of its own and is
+        // reconciled again the next time its turn changes.
+        let mut fresh_ids = fresh_ids.into_iter();
+        let mut active = state.active[..common].to_vec();
+        active.extend(fresh.iter().filter_map(|spec| {
+            let id = fresh_ids.next()?;
+            Some((spec.clone(), id))
+        }));
+        active.extend_from_slice(&state.active[state.active.len() - tail..]);
+        state.active = active;
     }
 }
 
-fn elision_properties(
-    snapshot: &MultiBufferSnapshot,
-    spec: &ElisionSpec,
-) -> Option<DisplayElisionProperties<multi_buffer::Anchor>> {
-    let range = excerpt_range(snapshot, &spec.range)?;
-    let label = elision_label(spec.tool_count);
-    Some(DisplayElisionProperties {
-        range,
-        tail_rows: spec.tail_rows,
-        height: Some(1),
-        style: BlockStyle::Flex,
-        render: Arc::new(move |cx| render_elision_block(&label, cx).into_any_element()),
-        priority: 0,
-        type_tag: None,
-    })
-}
+/// The tag that tells this module's folds from every other fold in the
+/// buffer — the concealment folds a markdown line carries, above all, which
+/// live inside the ranges these cover and must survive them. Public because
+/// a reader of the editor (a test, a screen that counts what is elided)
+/// needs the same tag to find them.
+pub enum HistoryFold {}
 
-fn render_elision_block(label: &str, cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
-    let text_style = cx.editor_style.text.clone();
-    let cursor_color = cx.editor_style.local_player.cursor;
-    let text_color = if cx.selected {
-        text_style.color
-    } else {
-        rho_window::style::hint_color(cx.app)
-    };
+/// The row a folded turn leaves behind: the same chevron and count the
+/// reader saw when this was a block, drawn now as the fold's placeholder.
+fn render_elision(label: &str, cx: &mut App) -> AnyElement {
+    let text_color = rho_window::style::hint_color(cx);
     div()
-        .block_mouse_except_scroll()
-        .pl(cx.anchor_x)
-        .h(cx.line_height)
         .flex()
         .items_center()
-        .font_family(text_style.font_family.clone())
-        .text_size(text_style.font_size)
-        .line_height(text_style.line_height)
+        .gap_1()
+        .pr_1()
         .text_color(text_color)
         .child(
-            div()
-                .h(cx.line_height)
-                .flex()
-                .items_center()
-                .gap_1()
-                .pr_1()
-                .when(cx.selected, |this| this.bg(cursor_color.opacity(0.22)))
-                .child(
-                    Icon::new(IconName::ChevronRight)
-                        .size(IconSize::XSmall)
-                        .color(text_color.into()),
-                )
-                .child(label.to_owned()),
+            Icon::new(IconName::ChevronRight)
+                .size(IconSize::XSmall)
+                .color(text_color.into()),
         )
+        .child(label.to_owned())
+        .into_any_element()
 }

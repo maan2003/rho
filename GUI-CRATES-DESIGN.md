@@ -425,6 +425,99 @@ wrong at the design, not at the polish.
   render to anything" predicate agrees with rendering it for every block
   there is.
 
+  *Landed, the elisions are folds below the wrap map (10).* The tail-first
+  cut left one number failing its bars: after `gg` the whole transcript is
+  composed, and `block_map_sync` took a p95 of 50,045 input rows at p99
+  18.3 ms. The elisions were display elisions, which are a block-map
+  construct, and the block map sits above the wrap — so an elided turn was
+  a turn already wrapped and then hidden. They are folds now: a fold is
+  below the wrap, so an elided turn leaves the wrap's input and the block
+  map's entirely. The visible tail of a turn is the fold map's own
+  `ElisionPolicy::Tail`, the chip is the fold's placeholder — the same
+  chevron and count the reader saw before — and each fold is tagged
+  `HistoryFold`, so the thousands of concealment folds that live inside an
+  elided range survive it. Folds are reconciled by diffing the model's
+  specs against what an editor carries, skipping the common prefix and
+  suffix, so composing history folds only the run that is new.
+
+  A fold is gone once it is opened, so rho registers a crease beside every
+  fold: `z o` opens an elided turn and `z c` closes it again, which is what
+  a reader expects and what a display elision could not do at all.
+
+  Two changes to vendor/zed's editor were needed, each its own commit
+  before this one, under the user's ruling that we build editor primitives
+  when we must:
+
+  - **A fold in a multibuffer is a fold.** `z c`, `z o` and `toggle_fold`
+    acted on the folds under the selection only in a singleton buffer; in
+    a multibuffer they took the whole-buffer gesture instead, which is
+    zed's project search, where a multibuffer is a list of files and
+    folding one means folding that file. A transcript is a multibuffer
+    with one excerpt, so no fold key reached an elision. The keys now act
+    on the folds and creases under the point wherever they find them and
+    keep the whole-buffer gesture when there is none — a strict widening;
+    singleton behaviour is unchanged.
+  - **Every path to the wrap map carries the row scales.** Found on the
+    rig, not in a test: on the first open of a GUI process, `gg` composed
+    history whose user messages then drew wider than the window and stayed
+    that way. Measured off the pixels rather than guessed at — the row
+    broke at 131 characters where it should have broken at 117, a ratio of
+    1.12, which is `USER_MESSAGE_SCALE` exactly. A scaled row is wrapped at
+    `wrap_width / scale` by the sync that writes it, and the wrap map takes
+    the scales from the display map on each sync — but only
+    `sync_through_wrap` handed them over. `DisplayMap::fold` is another
+    path, and it consumes the buffer subscription itself, so when the
+    transcript composes history and then folds it, the fold's own sync
+    wraps the rows composition just wrote, at scales that do not yet name
+    them. Nothing rewrites a row once wrapped, so they stayed too wide
+    until a resize rewrapped the map. Sixteen call sites now go through one
+    helper. This is why the fold change is three commits and not one: main
+    is what the user builds at every commit, and the widening and the
+    scales each regress nothing alone.
+
+  The `Tail` policy had a bug of its own and it is fixed in the fold map
+  rather than worked around here: a tail-eliding fold ended at the tail's
+  first column, which swallowed the newline above it and glued the chip to
+  the first line of the tail (`⋯echo`). The elided head now ends at the end
+  of the row above the tail.
+
+  What the QA of it taught, and it belongs here because it nearly cost an
+  evening: a control that differs from the run in more than the variable is
+  not a control. The first control run opened a different agent first, so
+  the transcript under test was that process's *second* open — and the
+  second open is the case that works. Two runs described the same way, "open
+  the transcript and press `gg`", were two different runs.
+
+  Numbers, desk rig, `user-2026-09-06`, profiling binaries, first open of a
+  fresh GUI process then `gg`, the same drive on both builds:
+
+  - *`gg` on the 262k agent* (sessions 33 and 36): `block_map_sync` input
+    rows p95 55,144, max 128,710, 58.3M rows over the run at p99 21.97 ms
+    before; p95 337, max 1,468, 265k rows at p99 2.61 ms after. That is the
+    claim the cut was for: the rows are not there to be laid out. Draw p99
+    21.1 ms with 100 frames over 8 ms before, 14.4 ms with 75 over after;
+    `wrap_map_update` p99 29.2 ms at 2,564 rows before, 18.8 ms at 999
+    after.
+  - *Twenty opens and closes of the same agent* (session 37): 941 frames,
+    draw p99 5.6 ms, none over 8 ms; `wrap_map_update` p99 2.65 ms at 223
+    rows. Against the tail-first baseline of draw p99 4.7 ms and wrap p99
+    7.9 ms at 432 rows, the draw p99 is 0.9 ms higher and the wrap does
+    less. The 0.9 ms is reported rather than rounded away.
+
+  Said plainly: `gg` still fails the frame bars — 75 frames over 8 ms is
+  not a pass — and the layer to blame has moved. It is no longer the block
+  map; it is the wrap map's own background rewrap, p99 18.8 ms a batch at
+  999 rows, which is the whole-buffer rewrap primitive already owed to
+  `rho-window`'s list. The reader asked for everything, and everything is
+  what it costs.
+
+  Held by tests: eliding history leaves fewer rows to the wrap than the
+  buffer has, the rows a fold leaves still soft wrap, `z o` opens an elided
+  turn and `z c` closes it again, the folds an editor carries survive a
+  rebuild that does not touch their turns, and a fold that flushes a
+  pending edit wraps the rows it flushes at their scale — 18 characters
+  against 30 with the fix, 30 against 30 without it.
+
 - **`rho-slack`, a real Slack client.** The session, socket and mirror
   that exist, plus what a client is: the channel and DM list with unreads,
   a thread view that reads well, compose and reply, reactions, mark read

@@ -1557,18 +1557,34 @@ fn syntax_highlights_for_text(
         .expect("read buffer syntax highlights")
 }
 
+/// The folds this transcript elided history with, by id, so a test can ask
+/// both whether history is elided and whether the same folds survived a
+/// rebuild. They are folds rather than blocks because the fold map is below
+/// the wrap map: elided history leaves the wrap's input entirely.
+fn history_folds(
+    editor: &Entity<editor::Editor>,
+    cx: &mut TestAppContext,
+) -> rustc_hash::FxHashSet<editor::display_map::FoldId> {
+    cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            snapshot
+                .folds_in_range(
+                    multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                )
+                .filter(|fold| {
+                    fold.placeholder.type_tag
+                        == Some(std::any::TypeId::of::<rho_agents::transcript::HistoryFold>())
+                })
+                .map(|fold| fold.id)
+                .collect()
+        })
+    })
+}
+
 fn has_display_elision(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
     let editor = active_editor(workspace, cx);
-    workspace
-        .update(cx, |_, window, cx| {
-            editor.update(cx, |editor, cx| {
-                let snapshot = editor.snapshot(window, cx);
-                snapshot
-                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
-                    .any(|(_, block)| matches!(block, Block::DisplayElision(_)))
-            })
-        })
-        .expect("inspect blocks")
+    !history_folds(&editor, cx).is_empty()
 }
 
 fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> bool {
@@ -2694,22 +2710,7 @@ fn document_preview_reconciles_decorations_when_appending_a_user_turn(cx: &mut T
             model.update(cx, |model, cx| model.preview_editor(window, cx))
         })
         .expect("open document preview");
-    let folded_elisions = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |_, _, cx| {
-                preview.update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    snapshot
-                        .folded_display_elisions_intersecting_range(
-                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
-                            true,
-                        )
-                        .into_iter()
-                        .collect::<rustc_hash::FxHashSet<_>>()
-                })
-            })
-            .expect("inspect document preview elisions")
-    };
+    let folded_elisions = |cx: &mut TestAppContext| history_folds(&preview, cx);
     let initial_elisions = folded_elisions(cx);
     assert_eq!(initial_elisions.len(), 1);
 
@@ -2747,22 +2748,7 @@ fn document_preview_preserves_decorations_across_invisible_tail_status_change(
             model.update(cx, |model, cx| model.preview_editor(window, cx))
         })
         .expect("open document preview");
-    let folded_elisions = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |_, _, cx| {
-                preview.update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    snapshot
-                        .folded_display_elisions_intersecting_range(
-                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
-                            true,
-                        )
-                        .into_iter()
-                        .collect::<rustc_hash::FxHashSet<_>>()
-                })
-            })
-            .expect("inspect document preview elisions")
-    };
+    let folded_elisions = |cx: &mut TestAppContext| history_folds(&preview, cx);
     let initial_elisions = folded_elisions(cx);
     assert_eq!(initial_elisions.len(), 1);
 
@@ -3762,6 +3748,98 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
             assert!(notices.iter().any(|text| text.contains("disconnected")));
         })
         .expect("inspect connection notices");
+}
+
+/// The point of eliding history with folds rather than blocks: a fold is
+/// below the wrap map, so the rows it covers never reach the wrap at all.
+/// The block map, which is above the wrap, could only hide rows that had
+/// already been wrapped.
+#[gpui::test]
+fn elided_history_leaves_the_wrap_maps_input(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(
+            vec![user("do work")],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::Commentary),
+            )],
+        ),
+    );
+    let editor = active_editor(&workspace, cx);
+    assert!(
+        !history_folds(&editor, cx).is_empty(),
+        "the working text is elided"
+    );
+
+    let (buffer_rows, wrap_input_rows) = cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            (
+                snapshot.buffer_snapshot().max_point().row,
+                snapshot.fold_snapshot().max_point().row(),
+            )
+        })
+    });
+    assert!(
+        wrap_input_rows < buffer_rows,
+        "the elided rows are gone before the wrap sees them: \
+         {wrap_input_rows} of {buffer_rows} rows reach it"
+    );
+}
+
+#[gpui::test]
+fn elided_history_still_soft_wraps_the_rows_it_leaves(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let long_line = "wrap me ".repeat(200);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        state(
+            vec![user(&long_line)],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::Commentary),
+            )],
+        ),
+    );
+    let editor = active_editor(&workspace, cx);
+    assert!(
+        !history_folds(&editor, cx).is_empty(),
+        "the working text is elided"
+    );
+
+    // A fold takes rows out of the wrap's input; it must not take the wrap
+    // away from the rows that are left. The long user line is not inside a
+    // fold, so it still has to come out of the display as several rows.
+    let (fold_rows, display_rows) = cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            editor
+                .display_map
+                .update(cx, |map, cx| map.set_wrap_width(Some(gpui::px(160.)), cx));
+            let snapshot = editor.display_snapshot(cx);
+            (
+                snapshot.fold_snapshot().max_point().row(),
+                snapshot.max_point().row().0,
+            )
+        })
+    });
+    cx.run_until_parked();
+    let display_rows_after_parking = cx.update(|cx| {
+        editor.update(cx, |editor, cx| {
+            editor.display_snapshot(cx).max_point().row().0
+        })
+    });
+    assert!(
+        display_rows_after_parking > fold_rows,
+        "the rows a fold leaves still wrap: {display_rows} rows before the \
+         rewrap and {display_rows_after_parking} after, over {fold_rows} \
+         rows of wrap input"
+    );
 }
 
 #[gpui::test]
