@@ -12,6 +12,7 @@
 
 pub mod editor_config;
 pub mod highlights;
+pub mod history;
 pub mod languages;
 pub mod markdown;
 pub mod selection;

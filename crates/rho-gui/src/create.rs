@@ -61,7 +61,7 @@ impl Workspace {
     ) -> Option<(HostId, rho_desk::cells::Id)> {
         // Home is a window onto the same nodes, so its cursor names an
         // area exactly as the desk's does.
-        if self.active_pane().surface.key == crate::pane::SurfaceKey::Home
+        if self.active_surface().key == crate::pane::SurfaceKey::Home
             && let Some(view) = self.home_view()
         {
             match view.update(cx, |view, cx| view.cursor_target(cx)) {

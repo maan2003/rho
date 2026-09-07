@@ -6547,50 +6547,58 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// Opening a surface that is already behind the reader is an ordinary open:
+/// where they were goes on the stack, and the older entry for the place they
+/// went to is passed over rather than walked back through twice.
 #[gpui::test]
-fn ordinary_open_of_recorded_surface_moves_the_history_cursor_without_reordering(
-    cx: &mut TestAppContext,
-) {
+fn opening_a_surface_already_in_history_leaves_it_reachable_once(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
-            workspace.open_history_index_for_test(0, cx);
+            workspace.open_named_surface_for_test("three", cx);
             assert_eq!(workspace.current_surface_name_for_test(), "three");
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (vec!["three".into(), "two".into(), "one".into()], 0),
-                "opening a recorded surface moves the cursor and leaves the order alone"
+                vec!["one".to_owned(), "two".to_owned()],
+                "back returns to where the reader was, and three is not behind them twice"
             );
         })
         .unwrap();
 }
 
+/// Dealing or opening from the overview the surface already on the glass is
+/// not a place to come back to: it pushes nothing, however often it happens.
 #[gpui::test]
-fn deal_and_overview_append_at_the_end_and_dedupe_existing_entries(cx: &mut TestAppContext) {
+fn dealing_the_surface_already_shown_pushes_nothing(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
             workspace.step_surface_back_for_test(window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "two");
             workspace.show_current_history_for_test(crate::journal::SurfaceShowMethod::Deal, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (vec!["three".into(), "one".into(), "two".into()], 2)
+                vec!["three".to_owned()]
             );
 
             workspace
                 .show_current_history_for_test(crate::journal::SurfaceShowMethod::Overview, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (vec!["three".into(), "one".into(), "two".into()], 2)
+                vec!["three".to_owned()],
+                "showing what is already shown never grows the stack"
             );
         })
         .unwrap();
 }
 
+/// `q` on a standalone draft closes it and goes back one, like `q` on
+/// anything else: the composer is not a special case with its own exit.
+/// Home is the floor under it, not the answer to closing it.
 #[gpui::test]
-fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
+fn q_closes_a_standalone_draft_and_goes_back(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = overview_workspace(cx);
     workspace
@@ -6605,7 +6613,13 @@ fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(*workspace, "q");
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            assert_eq!(workspace.current_surface_name_for_test(), "previous");
+            assert!(
+                !workspace
+                    .surface_history_for_test()
+                    .contains(&"draft".to_owned()),
+                "the closed draft is still somewhere back can land"
+            );
         })
         .unwrap();
 
@@ -6630,15 +6644,10 @@ fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            // Opening the composer from the overview records Draft in
-            // history, matching the state that exposed the human QA failure.
+            // Opening the composer from the overview puts the reader on
+            // Draft, matching the state that exposed the human QA failure.
             workspace.select_agent(None, window, cx);
-            assert!(
-                workspace
-                    .surface_history_for_test()
-                    .0
-                    .contains(&"draft".to_owned())
-            );
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
         })
         .unwrap();
     cx.run_until_parked();
@@ -6666,7 +6675,6 @@ fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
             assert!(
                 !workspace
                     .surface_history_for_test()
-                    .0
                     .contains(&"draft".to_owned()),
                 "discarded draft remained in surface history"
             );
@@ -6708,8 +6716,11 @@ fn discarding_a_heading_draft_preserves_non_draft_history_cursor(cx: &mut TestAp
         .unwrap();
 }
 
+/// Closing after stepping back lands on the next one back. There is no
+/// forward: a stack the reader has walked past is a stack that is shorter,
+/// which is what "history is a stack" costs and buys.
 #[gpui::test]
-fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppContext) {
+fn q_after_stepping_back_lands_on_the_next_surface_back(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
@@ -6724,12 +6735,9 @@ fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppCo
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "three");
-            // The entry the reader had stepped past is still in the list:
-            // only the one they closed is gone.
-            assert_eq!(
-                workspace.surface_history_for_test(),
-                (vec!["three".into(), "one".into()], 0)
-            );
+            // Nothing is behind three: one was left behind by the step back
+            // and two was closed.
+            assert!(workspace.surface_history_for_test().is_empty());
         })
         .unwrap();
 }
@@ -6750,9 +6758,10 @@ fn typing_does_not_reorder_history(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "two");
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (vec!["three".into(), "two".into(), "one".into()], 1)
+                vec!["three".to_owned()]
             );
         })
         .unwrap();
@@ -7390,6 +7399,75 @@ fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppCo
         .unwrap();
 }
 
+/// The thing behind a surface can go while the surface sits in history: a
+/// daemon is detached and its agents go with it. Back must not land on a
+/// transcript of an agent that no longer exists.
+///
+/// Two things keep that, and this test asks only for the result. The close
+/// paths call the machine's `forget`, which is where the invariant is
+/// tested (`rho_window::history`); and an agent's context is that agent's,
+/// so when the agent goes the whole arrangement goes with it and there is
+/// no stack left to walk. Belt and braces, deliberately: `forget` is one
+/// call on every death path so no path has to know which of the two saved
+/// it.
+#[gpui::test]
+fn back_never_lands_on_a_transcript_whose_daemon_is_gone(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let agent_id = agent(91);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "nixos");
+    desk.agent_row(topic, agent_id);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        story_pos: story::UiStoryPos(1),
+                        spawn_name: Some("doomed agent".into()),
+                        ..ui_head(agent_id)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+            workspace.open_agent(agent_id, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Transcript(agent_id)
+            );
+            // Somewhere else, so the transcript is behind the reader rather
+            // than under them.
+            workspace.open_home(window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            workspace.cmd_host_detach("local", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.step_surface_back_for_test(window, cx);
+            assert_ne!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::Transcript(agent_id),
+                "back showed a transcript whose daemon had been detached"
+            );
+        })
+        .unwrap();
+}
+
 /// "Notes for this" from a surface that is not a note: the note is created
 /// under the thing on screen, and pressing the key again returns to it
 /// rather than making a second one.
@@ -7883,16 +7961,15 @@ fn space_j_pulls_a_card_even_with_a_surface_ahead_in_history(cx: &mut TestAppCon
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            // Two surfaces recorded and one step back, so there is something
-            // ahead of the reader for a forward step to land on.
+            // Two surfaces recorded, so there is a surface behind the
+            // reader that a history step would land on.
             workspace.configure_surface_history_for_test(&["one", "two"], window, cx);
-            workspace.step_surface_back_for_test(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
-    let ahead = workspace
+    let behind = workspace
         .update(cx, |workspace, _, _| {
-            workspace.surface_history_for_test().0[0].clone()
+            workspace.surface_history_for_test()[0].clone()
         })
         .unwrap();
 
@@ -7903,8 +7980,8 @@ fn space_j_pulls_a_card_even_with_a_surface_ahead_in_history(cx: &mut TestAppCon
         .update(cx, |workspace, _, cx| {
             assert_ne!(
                 workspace.current_surface_name_for_test(),
-                ahead,
-                "space j gives the most important thing, never the surface ahead"
+                behind,
+                "space j gives the most important thing, never what history holds"
             );
             assert!(
                 workspace.current_deal_card_for_test(cx).is_some(),
@@ -8281,7 +8358,6 @@ fn a_cold_start_leaves_no_draft_in_the_timeline(cx: &mut TestAppContext) {
             assert!(
                 !workspace
                     .surface_history_for_test()
-                    .0
                     .contains(&"draft".to_owned())
             );
         })

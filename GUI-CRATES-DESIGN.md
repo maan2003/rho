@@ -997,6 +997,58 @@ wrong at the design, not at the polish.
   owed list. The menu's own cost is session 41's, ten round trips and
   nothing else, none over 8 ms.
 
+- **Landed, surfaces and history are one machine** (`rho-window` module
+  added: `history`; `rho-gui` `pane` cut down to `SurfaceKey`, `workspace`,
+  `workspace_phone`, and `create` and `slack` where they read the viewport;
+  `RHO-WINDOW-DESIGN.md` the section this cuts against).
+  There were two histories and that was the defect: `Pane<S>`'s per-context
+  `Vec<S>`, whose `show` ran `retain` over the whole stack, and the
+  workspace's global `surface_history: Vec<WarmSurface>` with a
+  `history_cursor`, which is the one the keys actually reached. A push was
+  O(entries) twice over in two places that had to agree, and closing a
+  surface or forgetting an agent scanned both. Both are gone. What replaces
+  them is `rho_window::history::History<K, S>` — generic over the key the way
+  `Pane<S>` was, naming no source type — held once per context in
+  `contexts: HashMap<ContextId, SurfaceHistory>`. Per context is eng-en1p's
+  ruling under the Emacs rule and is named in the design section so the user
+  can reverse it by name.
+  The shape, and its cost. Entries are appended and never removed from the
+  middle; a `HashMap<Key, usize>` holds each key's newest index, so showing a
+  surface that is already in the stack leaves the older entry stale instead
+  of paying a scan and a memmove, and back skips any entry the map no longer
+  points at. Each stale entry is skipped at most once in the life of the
+  stack, which is the amortised bound. The numbers the tests pin, at the
+  size the note quotes: at 1,000 entries a push touches one entry and
+  rebuilds nothing, a back touches one, a forget touches none at all — only
+  the map — and 1,000 distinct pushes rebuild zero times. The rebuild is the
+  only O(n) event; the worst case for staleness, two surfaces alternating
+  over 2,000 pushes, rebuilds 142 times, once per fourteen pushes, and
+  leaves twelve entries for three reachable surfaces. Nothing walks the
+  stack at draw time: the viewport draws `current()`.
+  Death is one call. The four paths — close, discard a draft, forget an
+  agent's transcript, forget a detached daemon's agents — hand a key to
+  `forget`, and the invariant that back never shows a dead entry is two
+  tests on the machine rather than four places agreeing about a cursor. The
+  workspace test for the daemon case asks only for the result and says so:
+  it is kept twice over, once by `forget` and once because an agent's
+  context dies with the agent, and no path has to know which saved it.
+  **Two behaviour changes, both deliberate, both flagged for the user.** `q`
+  on a standalone draft now goes back one surface instead of to Home — it is
+  a close like any other close, and Home was the old global cursor's answer.
+  And there is no forward step: a stack walked past is shorter, which is
+  what "history is a stack" means and what the old cursor did not do.
+  Eviction is not a death: `release_agent` leaves the entry alone and
+  `warm_surface` rebuilds the transcript if back reaches it, which is what
+  the old code did in the path that was live.
+  Gate green: rho-window 24 passed (the machine's own tests, from 11),
+  rho-gui 259 passed and 3 ignored, rho-agents 68 passed, clippy
+  `-D warnings` clean on both crates, `cargo fmt --check` clean.
+  **Owed, and not in this note:** the rig proof — A, B, back byte-identical
+  to A against a no-input control, again scrolled with a fold closed, again
+  after the thing behind B is deleted while it is in the stack, first open
+  named. The desk is with b8os for Cut A; the numbers follow in their own
+  note when the seat frees.
+
 - **Landed, the usage charts are a screen** (`rho-agents` module added:
   `usage`; `rho-gui` modules touched: `usage` (new), `transient`,
   `workspace`, `workspace_phone`, `pane`, `telemetry`, `journal`). The five

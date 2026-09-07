@@ -223,7 +223,7 @@ impl Workspace {
             .read(cx)
             .oldest_from_other_after(&unit_of, cursor.as_ref());
         self.open_slack_source(unit_source(unit), window, cx);
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         if let Some(land) = land {
@@ -309,7 +309,7 @@ impl Workspace {
         let Some(session) = self.slack_session(window, cx) else {
             return;
         };
-        let here = match &self.active_pane().surface.view {
+        let here = match &self.active_surface().view {
             SurfaceView::SlackConversation(view) => Some(view.read(cx).source().channel().clone()),
             _ => None,
         };
@@ -328,7 +328,7 @@ impl Workspace {
     ) {
         // A file line is a file: the reader who put the cursor there asked
         // for the attachment, not for the thread it hangs under.
-        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
             let view = view.clone();
             let file = view.update(cx, |view, cx| view.cursor_file(cx));
             if let Some(file) = file {
@@ -342,7 +342,7 @@ impl Workspace {
         }
         // A link's label shows no address, so the line carries the URL: the
         // reader on it asked for the page, not for the thread around it.
-        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
             let view = view.clone();
             let link = view.update(cx, |view, cx| view.cursor_link(cx));
             if let Some(link) = link {
@@ -350,7 +350,7 @@ impl Workspace {
                 return;
             }
         }
-        let source = match &self.active_pane().surface.view {
+        let source = match &self.active_surface().view {
             SurfaceView::SlackList(view) => {
                 view.clone().update(cx, |view, cx| view.cursor_source(cx))
             }
@@ -378,7 +378,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let SurfaceView::SlackList(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
             return;
         };
         let source = view.clone().update(cx, |view, cx| view.cursor_source(cx));
@@ -468,7 +468,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
             view.clone()
                 .update(cx, |view, cx| view.select_compose(window, cx));
             // `i` is vim's own insert key, and this binding took it.
@@ -480,7 +480,7 @@ impl Workspace {
     /// the reader was further up. `None` when there is nothing to say,
     /// which is every surface that is not a Slack conversation.
     pub(crate) fn slack_unseen(&self, cx: &gpui::App) -> Option<usize> {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return None;
         };
         Some(view.read(cx).unseen()).filter(|unseen| *unseen > 0)
@@ -489,7 +489,7 @@ impl Workspace {
     /// `enter` in the composer: send, or post the rewrite if an edit is
     /// open.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;
         };
         let view = view.clone();
@@ -528,7 +528,7 @@ impl Workspace {
         bytes: Vec<u8>,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         let size = bytes.len() as u64;
@@ -548,7 +548,7 @@ impl Workspace {
         path: &std::path::Path,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         match view
@@ -575,7 +575,7 @@ impl Workspace {
 
     /// Drops the waiting picture without sending it.
     pub(crate) fn slack_clear_attachment(&mut self, cx: &mut gpui::Context<Self>) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         let cleared = view
@@ -629,7 +629,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         let view = view.clone();
@@ -657,7 +657,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         let view = view.clone();
@@ -670,7 +670,7 @@ impl Workspace {
     /// `escape` with an edit open: the message stands and the composer is
     /// given back what it held. With no edit open this is vim's escape.
     pub(crate) fn slack_cancel_edit(&mut self, cx: &mut gpui::Context<Self>) -> bool {
-        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return false;
         };
         view.clone().update(cx, |view, cx| view.cancel_edit(cx))
@@ -946,14 +946,14 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        if !matches!(self.active_pane().surface.view, SurfaceView::SlackList(_)) {
+        if !matches!(self.active_surface().view, SurfaceView::SlackList(_)) {
             return;
         }
         self.open_prompt(
             "slack:",
             std::rc::Rc::new(|_, _, _| Vec::new()),
             std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
-                if let SurfaceView::SlackList(view) = &workspace.active_pane().surface.view {
+                if let SurfaceView::SlackList(view) = &workspace.active_surface().view {
                     let input = input.to_owned();
                     view.clone()
                         .update(cx, |view, cx| view.set_filter(input, window, cx));

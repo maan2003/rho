@@ -291,7 +291,7 @@ impl Workspace {
             self.phone.root = PhoneRoot::Feed;
             if self.open_card_in_view(cx).is_some() {
                 self.phone
-                    .show_feed(self.active_context, self.active_pane().surface.key.clone());
+                    .show_feed(self.active_context, self.active_surface().key.clone());
             } else {
                 self.phone.feed_surface = None;
                 cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
@@ -446,7 +446,7 @@ impl Workspace {
             .feed_surface
             .as_ref()
             .is_some_and(|(context, key)| {
-                *context == self.active_context && self.active_pane().surface.key == *key
+                *context == self.active_context && self.active_surface().key == *key
             })
     }
 
@@ -525,7 +525,7 @@ impl Workspace {
         };
         self.active_context = context;
         if let Some(pane) = self.contexts.get_mut(&context) {
-            pane.show(surface);
+            pane.show(surface.key.clone(), surface);
         }
         self.sync_selection_to_focus(cx);
         window.focus(&self.phone.dashboard_focus, cx);
@@ -581,7 +581,7 @@ impl Workspace {
             .cloned()
         {
             if let Some(pane) = self.contexts.get_mut(&context) {
-                pane.show(surface);
+                pane.show(surface.key.clone(), surface);
             }
             self.sync_selection_to_focus(cx);
             self.focus_active_surface(window, cx);
@@ -590,7 +590,7 @@ impl Workspace {
     }
 
     fn phone_deal_scroll_edge(&mut self, cx: &mut Context<Self>) -> PhoneScrollEdge {
-        let editor = match &self.active_pane().surface.view {
+        let editor = match &self.active_surface().view {
             super::SurfaceView::DeskNode(editor)
             | super::SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
             _ => None,
@@ -921,7 +921,7 @@ impl Workspace {
                         .child(breadcrumb),
                 )
                 .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
-            let body = self.render_surface(&self.active_pane().surface.clone());
+            let body = self.render_surface(&self.active_surface().clone());
             let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.dashboard_focus)
