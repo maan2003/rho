@@ -10,14 +10,21 @@
 //! in the rig's state the way the user's own state accumulates. `rig new` is
 //! for starting a new line of QA, not for cleaning up after a run.
 
+use std::collections::HashSet;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
+use rho_core::{AgentRole, ContentPart};
+use rho_ui_proto::client::Client;
+use rho_ui_proto::mirror::MirrorEvent;
+use rho_ui_proto::{ClientMessage, JoinTarget, ServerMessage, StartMode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::paths;
 use crate::profile::{self, Summary};
@@ -40,6 +47,8 @@ pub enum RigCommand {
     Down(NameArgs),
     /// Say what the rig is and what of it is running.
     Status(NameArgs),
+    /// Send one native agent turn through a running rig and its fake model.
+    Probe(NameArgs),
     /// List the rigs.
     List,
 }
@@ -163,6 +172,7 @@ pub fn run(command: RigCommand) -> Result<()> {
         RigCommand::Up(args) => up(args),
         RigCommand::Down(args) => down(&args.name),
         RigCommand::Status(args) => status(&args.name),
+        RigCommand::Probe(args) => probe(&args.name),
         RigCommand::List => list(),
     }
 }
@@ -272,11 +282,21 @@ fn up(args: UpArgs) -> Result<()> {
     let socket = runtime.join("rho").join("rho.sock");
     let _ = fs::remove_file(&socket);
 
+    fs::create_dir_all(root.join("config").join("claude"))?;
+    let model = start_fake_model(&root, &bin)?;
+    write_model_credentials(&root)?;
+    println!(
+        "model   fake on {} (pid {})",
+        model.openai_base_url, model.pid
+    );
+
     // The rig daemon is its own node: no `--iroh`, no identity of the user's.
     let log = fs::File::create(root.join("logs").join("daemon.log"))?;
     let daemon = command(bin.daemon(), &root)
         .arg("--socket-path")
         .arg(&socket)
+        .args(["--openai-base-url", &model.openai_base_url])
+        .args(["--anthropic-base-url", &model.anthropic_base_url])
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
@@ -342,6 +362,15 @@ fn up(args: UpArgs) -> Result<()> {
         summary: None,
     });
     save(&root, &rig)?;
+    let tree_commit = crate::snapshot::tree_commit().unwrap_or_else(|| "unknown".to_owned());
+    println!(
+        "RIG_READY tree_commit={tree_commit} rho_qa_sha256={} fake_sha256={} daemon_sha256={} rig={} session={}",
+        sha256_file(&std::env::current_exe()?)?,
+        sha256_file(&bin.fake_model())?,
+        sha256_file(&bin.daemon())?,
+        args.name,
+        rig.sessions.len(),
+    );
     println!(
         "\nrig {} up on {} binaries — session {} of this desk",
         args.name,
@@ -357,7 +386,17 @@ fn up(args: UpArgs) -> Result<()> {
 
 fn down(name: &str) -> Result<()> {
     let root = rig_root(name)?;
-    let bin = binaries(Binaries::Profiling, false).or_else(|_| binaries(Binaries::Nix, false))?;
+    let which = match load(&root)?
+        .sessions
+        .last()
+        .map(|session| session.binaries.as_str())
+    {
+        Some("release") => Binaries::Release,
+        Some("nix") => Binaries::Nix,
+        Some("debug") => Binaries::Debug,
+        _ => Binaries::Profiling,
+    };
+    let bin = binaries(which, false)?;
     stop_gui(&root, &bin, name);
     file_application_log(&root, name);
     stop_daemon(&root);
@@ -512,11 +551,67 @@ struct FakeSlack {
     workspace: String,
 }
 
+#[derive(Deserialize)]
+struct FakeModel {
+    ready: bool,
+    openai_base_url: String,
+    anthropic_base_url: String,
+    pid: u32,
+}
+
+#[derive(Deserialize)]
+struct FakeModelMetrics {
+    completed_turns: u64,
+}
+
+fn start_fake_model(root: &Path, bin: &Build) -> Result<FakeModel> {
+    let path = root.join("logs").join("fake-model.log");
+    let log = fs::File::create(&path)?;
+    let child = command(bin.fake_model(), root)
+        .args(["--seed", "0", "--no-faults"])
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .with_context(|| format!("start {}", bin.fake_model().display()))?;
+    let pid = child.id();
+    fs::write(root.join("run").join("fake-model.pid"), pid.to_string())?;
+
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        if let Some(line) = text.lines().next()
+            && let Ok(model) = serde_json::from_str::<FakeModel>(line)
+            && model.ready
+        {
+            if model.pid != pid {
+                bail!("fake model reported pid {}, expected {pid}", model.pid);
+            }
+            return Ok(model);
+        }
+        if !alive(pid) {
+            bail!(
+                "the fake model exited at startup; the last lines of {}:\n{}",
+                path.display(),
+                tail(&path, 8)
+            );
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "the fake model never became ready; the last lines of {}:\n{}",
+                path.display(),
+                tail(&path, 8)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn start_fake_slack(root: &Path, bin: &Build) -> Result<FakeSlack> {
     let path = root.join("logs").join("fake-slack.log");
     let log = fs::File::create(&path)?;
     let mirror = root.join("state").join("rho").join("slack.redb");
-    let mut process = if mirror.exists() {
+    let fixture = !mirror.exists();
+    let mut process = if !fixture {
         let mut loader = command(std::env::current_exe()?, root);
         loader
             .arg("fake-slack")
@@ -544,7 +639,7 @@ fn start_fake_slack(root: &Path, bin: &Build) -> Result<FakeSlack> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         let text = fs::read_to_string(&path).unwrap_or_default();
-        if let Some(fake) = fake_slack_from_log(&text) {
+        if let Some(fake) = fake_slack_from_log(&text, fixture.then_some("acme")) {
             return Ok(fake);
         }
         if Instant::now() > deadline {
@@ -564,7 +659,7 @@ fn start_fake_slack(root: &Path, bin: &Build) -> Result<FakeSlack> {
 /// What the fake said about itself, or `None` while it is still saying it.
 /// Both lines are required: an API base without a workspace is a server, not
 /// a session.
-fn fake_slack_from_log(text: &str) -> Option<FakeSlack> {
+fn fake_slack_from_log(text: &str, fixture_workspace: Option<&str>) -> Option<FakeSlack> {
     let field = |name: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(name))
@@ -572,7 +667,13 @@ fn fake_slack_from_log(text: &str) -> Option<FakeSlack> {
     };
     Some(FakeSlack {
         api_base: field("RHO_SLACK_API_BASE=")?,
-        workspace: field("workspace=")?,
+        workspace: field("workspace=").or_else(|| {
+            if text.lines().any(|line| line == "ready") {
+                fixture_workspace.map(str::to_owned)
+            } else {
+                None
+            }
+        })?,
     })
 }
 
@@ -675,7 +776,7 @@ fn stop_gui(root: &Path, bin: &Build, session: &str) {
 /// and it dies after its socket is already on disk, so everything downstream
 /// looks up and the GUI simply says "reconnecting" for ever.
 fn stop_daemon(root: &Path) {
-    for name in ["daemon.pid", "fake-slack.pid"] {
+    for name in ["daemon.pid", "fake-model.pid", "fake-slack.pid"] {
         let path = root.join("run").join(name);
         if let Some(pid) = read_pid(&path) {
             terminate(pid);
@@ -695,6 +796,107 @@ fn stop_daemon(root: &Path) {
     }
 }
 
+fn probe(name: &str) -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(probe_async(name))
+}
+
+async fn probe_async(name: &str) -> Result<()> {
+    let root = rig_root(name)?;
+    let socket = root.join("run/rho/rho.sock");
+    let workspace = root.join("workspace");
+    if !workspace.join(".jj").exists() {
+        fs::create_dir_all(&workspace)?;
+        let status = Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .arg(&workspace)
+            .status()
+            .context("initialize the rig probe workspace")?;
+        if !status.success() {
+            bail!("could not initialize the rig probe workspace");
+        }
+    }
+
+    let mut client = Client::connect(&socket)
+        .await
+        .with_context(|| format!("connect to the running rig at {}", socket.display()))?;
+    client.send(&ClientMessage::Subscribe).await?;
+    let head = loop {
+        match client.recv().await? {
+            ServerMessage::Ready { journal_head, .. } => break journal_head,
+            ServerMessage::Error { message } => bail!("daemon readiness error: {message}"),
+            _ => {}
+        }
+    };
+    client.send(&ClientMessage::Follow { since: head }).await?;
+    client
+        .send(&ClientMessage::NewAgent {
+            role: AgentRole::default(),
+            start: StartMode::Join(JoinTarget::User {
+                repo: workspace.try_into().context("rig workspace is not UTF-8")?,
+            }),
+            content: Some(vec![ContentPart::Text {
+                text: "Complete one deterministic rig probe turn.".to_owned(),
+            }]),
+        })
+        .await?;
+    // Follow has no acknowledgement. Let the deliberately fast fake finish,
+    // then replay from the pre-creation head so setup cannot race the turn.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    client.send(&ClientMessage::Follow { since: head }).await?;
+
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let mut replies = 0_u64;
+    let mut seen = HashSet::new();
+    loop {
+        let message = tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .context("rig probe timed out")??;
+        match message {
+            ServerMessage::Log { entries } => {
+                for entry in entries {
+                    if !seen.insert(entry.seq) {
+                        continue;
+                    }
+                    let completed_reply = matches!(
+                        &entry.event,
+                        MirrorEvent::Replied { calls, .. } if calls.is_empty()
+                    );
+                    if matches!(&entry.event, MirrorEvent::Replied { .. }) {
+                        replies += 1;
+                    }
+                    if completed_reply {
+                        let model: FakeModel = serde_json::from_str(
+                            fs::read_to_string(root.join("logs/fake-model.log"))?
+                                .lines()
+                                .next()
+                                .context("fake model readiness line is missing")?,
+                        )?;
+                        let metrics: FakeModelMetrics =
+                            reqwest::get(format!("{}/metrics", model.anthropic_base_url))
+                                .await?
+                                .json()
+                                .await?;
+                        if replies == 0 || metrics.completed_turns == 0 {
+                            bail!("rig turn ended without a fake-model reply");
+                        }
+                        println!(
+                            "RIG_PROOF agent={:?} replies={replies} fake_completed_turns={} journal_head={}",
+                            entry.agent_id, metrics.completed_turns, entry.seq.0
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            ServerMessage::Error { message } => bail!("rig probe failed: {message}"),
+            _ => {}
+        }
+    }
+}
+
 /// The rig's environment: its own XDG dirs and nothing of the user's. The
 /// state dir is the copied state, which is what makes the daemon run on the
 /// snapshot rather than on the user's store.
@@ -705,6 +907,7 @@ fn command(program: PathBuf, root: &Path) -> Command {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_DATA_HOME", root.join("state"))
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("CLAUDE_CONFIG_DIR", root.join("config").join("claude"))
         .env("HOME", root);
     command
 }
@@ -734,6 +937,10 @@ impl Build {
 
     fn fake_slack(&self) -> PathBuf {
         self.find("examples/fake_slack")
+    }
+
+    fn fake_model(&self) -> PathBuf {
+        self.find("rho-fake-model")
     }
 
     fn fake_browser(&self) -> PathBuf {
@@ -774,7 +981,7 @@ fn binaries(which: Binaries, gui: bool) -> Result<Build> {
         label: label.to_owned(),
         fallback,
     };
-    let mut wanted = vec![bin.daemon(), bin.fake_slack()];
+    let mut wanted = vec![bin.daemon(), bin.fake_model(), bin.fake_slack()];
     if gui {
         // Only a run that starts the GUI needs the GUI, the driver and the
         // browser the client launches.
@@ -829,6 +1036,38 @@ fn write_credentials(root: &Path, workspace: &str) -> Result<()> {
         .with_context(|| format!("write {}", path.display()))?;
     fs::set_permissions(&path, permissions(0o600))?;
     Ok(())
+}
+
+fn write_model_credentials(root: &Path) -> Result<()> {
+    let dir = root.join("state").join("rho").join("auth.d");
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, permissions(0o700))?;
+    let path = dir.join("default.json");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "access_token": "rho-qa-synthetic-default-token",
+            "expires_at_ms": u64::MAX,
+            "account_id": "rho-qa-synthetic-default-account",
+            "client_secret": vec![0u8; 32],
+        }))?,
+    )?;
+    fs::set_permissions(&path, permissions(0o600))?;
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn rig_root(name: &str) -> Result<PathBuf> {
@@ -915,21 +1154,31 @@ fn permissions(mode: u32) -> fs::Permissions {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
     use super::*;
 
     #[test]
     fn a_fake_that_is_listening_but_holds_no_workspace_is_not_a_session() {
         let listening = "RHO_SLACK_API_BASE=http://127.0.0.1:1/api\nws=ws://127.0.0.1:2\n";
         assert!(
-            fake_slack_from_log(listening).is_none(),
+            fake_slack_from_log(listening, None).is_none(),
             "a fake with no workspace must not be taken for a Slack session"
         );
 
         let serving =
             format!("{listening}control=http://127.0.0.1:1/control\nworkspace=acme\nready\n");
-        let fake = fake_slack_from_log(&serving).expect("a workspace and an api base");
+        let fake = fake_slack_from_log(&serving, None).expect("a workspace and an api base");
         assert_eq!(fake.workspace, "acme");
         assert_eq!(fake.api_base, "http://127.0.0.1:1/api");
+
+        let fixture = format!("{listening}ready\n");
+        assert_eq!(
+            fake_slack_from_log(&fixture, Some("acme"))
+                .expect("the built-in fixture has a known workspace")
+                .workspace,
+            "acme"
+        );
     }
 
     /// The session a rig writes for the client has to name the workspace the
@@ -942,6 +1191,22 @@ mod tests {
         let written = fs::read_to_string(dir.join("credentials.json")).expect("read back");
         assert!(written.contains("\"acme\""), "{written}");
         assert!(!written.contains("\"rig\""), "{written}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_credentials_live_only_under_the_rig_state() {
+        let dir =
+            std::env::temp_dir().join(format!("rho-qa-model-credentials-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        write_model_credentials(&dir).expect("write credentials");
+        let path = dir.join("state/rho/auth.d/default.json");
+        let written = fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("rho-qa-synthetic-default-token"));
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
