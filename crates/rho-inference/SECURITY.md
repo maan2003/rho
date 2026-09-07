@@ -35,6 +35,8 @@ GenerateContent requests for the explicit Gemini agent mode.
   namespace names, percentages, and reset times—never OAuth tokens or provider
   account identifiers. Account identifiers remain memory-only for alias
   deduplication. Session creation and account selection never request quota.
+- Explicit non-production Responses endpoints suppress the ChatGPT usage
+  poller, so an isolated QA daemon cannot make a live provider side request.
 - The current automatic account selection is persisted privately and read at
   request setup by sessions, web search, and realtime. Safe public state
   deliberately omits it. Authentication failures fail their request without

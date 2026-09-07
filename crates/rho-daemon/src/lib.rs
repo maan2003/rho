@@ -313,6 +313,12 @@ pub struct DaemonArgs {
     /// Write a Dial9 CPU trace on shutdown (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
+    /// Override the OpenAI Responses base URL (isolated QA providers).
+    #[arg(long, value_name = "URL")]
+    pub openai_base_url: Option<String>,
+    /// Set ANTHROPIC_BASE_URL for Claude Code subprocesses.
+    #[arg(long, value_name = "URL")]
+    pub anthropic_base_url: Option<String>,
 }
 
 pub struct DaemonProfiler(Option<rho_profiling::CpuProfiler>);
@@ -361,6 +367,18 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
+    if let Some(endpoint) = &args.anthropic_base_url {
+        let parsed = url::Url::parse(endpoint).context("parse Anthropic base URL")?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "Anthropic base URL must use http or https"
+        );
+        anyhow::ensure!(
+            parsed.host().is_some(),
+            "Anthropic base URL must have a host"
+        );
+        set_environment_value(&mut user_environment, "ANTHROPIC_BASE_URL", endpoint);
+    }
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db_path = default_db_path()?;
@@ -382,7 +400,16 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         "rho daemon: rebuilt {} Claude logs from their session files, closed {} queues without one (one-off)",
         rebuilt.rebuilt, rebuilt.closed
     );
-    let inference = Inference::new(db.clone()).await?;
+    let inference = match args.openai_base_url {
+        Some(endpoint) => {
+            Inference::new_with_config(
+                db.clone(),
+                rho_inference::InferenceConfig::with_responses_base_url(endpoint)?,
+            )
+            .await?
+        }
+        None => Inference::new(db.clone()).await?,
+    };
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path

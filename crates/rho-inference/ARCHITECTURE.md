@@ -13,6 +13,9 @@ The public surface is intentionally small:
 - `Inference::new(RhoDb)` opens the complete daemon-wide ChatGPT runtime:
   persisted disabled accounts and current selection, quota polling/history,
   automatic routing, and session creation.
+- `Inference::new_with_config` is the isolated-QA assembly path. It accepts
+  an explicit Responses base URL and does not start the ChatGPT-only quota
+  poller for non-default endpoints.
 - `InferenceSession` configures prompt-cache/thread behavior and owns one warm
   WebSocket. The session task snapshots the account manager's existing
   selection when it accepts each new request and reconnects when it differs

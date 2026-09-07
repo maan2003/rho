@@ -14,7 +14,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   daemon-wide `Inference` handle owns the complete ChatGPT runtime: persisted
   enabled-account settings and current selection, quota polling/history,
   automatic account routing, and session creation. `Inference::new` opens that
-  state from `RhoDb`. The private account manager makes selection decisions only
+  state from `RhoDb`. `Inference::new_with_config` can instead point
+  Responses sessions at an isolated provider; production defaults are
+  unchanged and the ChatGPT-only quota poller is suppressed. The private account manager makes selection decisions only
   when settings, quota, or rate-limit facts change; each new request snapshots
   the existing choice. Ordinary retries retain that choice and only explicit
   rate-limit failover replaces it. The

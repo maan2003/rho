@@ -7,6 +7,7 @@ use senax_encoder::{Decode, Encode};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+#[cfg(test)]
 use super::DEFAULT_CHATGPT_BASE_URL;
 use super::wire::{ProviderError, ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
@@ -374,7 +375,7 @@ impl InferenceSession {
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Deep(config),
             responses_config: ResponsesConfig::deep(config, model.into()),
@@ -384,7 +385,7 @@ impl InferenceSession {
 
     pub(crate) fn new_title(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Title,
             responses_config: ResponsesConfig::title(),
@@ -394,7 +395,7 @@ impl InferenceSession {
 
     pub(crate) fn new_status(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Status,
             responses_config: ResponsesConfig::status(),

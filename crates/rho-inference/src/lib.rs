@@ -12,7 +12,7 @@ pub use accounts::{
     InferenceQuotaPoint, InferenceQuotaSeries, InferenceQuotaSummary, InferenceState,
 };
 pub use auth_cli::{AuthArgs, run_auth_cli};
-pub use inference::Inference;
+pub use inference::{Inference, InferenceConfig};
 pub use responses::{InferenceAuth, OpenAiResponsesProviderData, PromptCacheKey, ResolvedOAuth};
 pub use session::InferenceSession;
 

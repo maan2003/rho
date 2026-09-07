@@ -19,6 +19,7 @@ pub struct Inference(Arc<Inner>);
 #[derive(Debug)]
 struct Inner {
     accounts: Option<Arc<AccountManager>>,
+    responses_base_url: Arc<str>,
     #[cfg(test)]
     fixed_auth: Option<InferenceAuth>,
 }
@@ -33,11 +34,23 @@ impl Inference {
     /// Opens the daemon-owned inference runtime and starts its fallback quota
     /// poller.
     pub async fn new(db: RhoDb) -> anyhow::Result<Self> {
+        Self::new_with_config(db, InferenceConfig::default()).await
+    }
+
+    /// Opens inference with explicit provider transport configuration. This is
+    /// used by isolated QA rigs; the production default remains ChatGPT.
+    pub async fn new_with_config(db: RhoDb, config: InferenceConfig) -> anyhow::Result<Self> {
         Self::migrate(&db).await?;
         let accounts = Arc::new(AccountManager::open(db).await);
-        accounts.spawn_poller();
+        // The quota endpoint is a first-party ChatGPT-only API. An explicit
+        // Responses endpoint (for example the full-stack QA server) must not
+        // leak a side request to the production provider.
+        if &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL {
+            accounts.spawn_poller();
+        }
         let inference = Self(Arc::new(Inner {
             accounts: Some(accounts),
+            responses_base_url: config.responses_base_url,
             #[cfg(test)]
             fixed_auth: None,
         }));
@@ -48,8 +61,13 @@ impl Inference {
     pub(crate) fn for_test(auth: InferenceAuth) -> Self {
         Self(Arc::new(Inner {
             accounts: None,
+            responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
             fixed_auth: Some(auth),
         }))
+    }
+
+    pub(crate) fn responses_base_url(&self) -> &str {
+        &self.0.responses_base_url
     }
 
     pub fn deep_session(
@@ -126,5 +144,36 @@ impl Inference {
 
     fn accounts(&self) -> &AccountManager {
         self.0.accounts.as_ref().expect("inference account manager")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InferenceConfig {
+    responses_base_url: Arc<str>,
+}
+
+impl InferenceConfig {
+    pub fn with_responses_base_url(base_url: impl Into<Arc<str>>) -> anyhow::Result<Self> {
+        let base_url = base_url.into();
+        let parsed = url::Url::parse(&base_url)?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "inference base URL must use http or https"
+        );
+        anyhow::ensure!(
+            parsed.host().is_some(),
+            "inference base URL must have a host"
+        );
+        Ok(Self {
+            responses_base_url: base_url,
+        })
+    }
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
+        }
     }
 }

@@ -32,6 +32,8 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         socket_path: Some(socket_path.clone()),
         iroh: false,
         cpu_profile: None,
+        openai_base_url: None,
+        anthropic_base_url: None,
         extra_before_path: None,
         extra_after_path: None,
     }));
