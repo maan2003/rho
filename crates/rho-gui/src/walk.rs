@@ -1,7 +1,8 @@
 //! Deterministic, in-process GUI random walks over GPUI's real workspace scene.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use editor::Editor;
@@ -105,6 +106,8 @@ pub struct OwnerFrameSummary {
 #[derive(Clone, Debug)]
 pub struct WalkFailure {
     pub oracle: &'static str,
+    pub step: usize,
+    pub event: Option<WalkEvent>,
     pub events: Vec<WalkEvent>,
     pub draw_micros: u64,
     pub editor_rows: u64,
@@ -167,10 +170,20 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                     }
                 }
             }
-            let (_, draw_micros, editor_rows, cold_draw_micros, warm_draw_micros, scene_details) =
-                final_rejection;
+            let (
+                _,
+                step,
+                event,
+                draw_micros,
+                editor_rows,
+                cold_draw_micros,
+                warm_draw_micros,
+                scene_details,
+            ) = final_rejection;
             Err(WalkFailure {
                 oracle,
+                step,
+                event,
                 events: shrunk,
                 draw_micros,
                 editor_rows,
@@ -274,7 +287,40 @@ fn run_events(
     seed: u64,
     mode: WalkMode,
     events: &[WalkEvent],
-) -> Result<WalkReport, (&'static str, u64, u64, u64, u64, Vec<String>)> {
+) -> Result<
+    WalkReport,
+    (
+        &'static str,
+        usize,
+        Option<WalkEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        Vec<String>,
+    ),
+> {
+    run_events_with_detached_host(seed, mode, events, false)
+}
+
+fn run_events_with_detached_host(
+    seed: u64,
+    mode: WalkMode,
+    events: &[WalkEvent],
+    detached_host: bool,
+) -> Result<
+    WalkReport,
+    (
+        &'static str,
+        usize,
+        Option<WalkEvent>,
+        u64,
+        u64,
+        u64,
+        u64,
+        Vec<String>,
+    ),
+> {
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();
@@ -286,19 +332,30 @@ fn run_events(
         )),
     );
     init(&mut cx);
-    let isolated =
-        tempfile::tempdir().map_err(|_| ("create isolated walk state", 0, 0, 0, 0, Vec::new()))?;
-    let target = AttachTarget::Unix(isolated.path().join("daemon.sock"));
-    let workspace = cx.add_window(|window, cx| {
-        Workspace::new(
-            vec![HostSpec {
-                name: "generated".to_owned(),
-                target,
-            }],
-            window,
-            cx,
-        )
-    });
+    let isolated = detached_host
+        .then(tempfile::tempdir)
+        .transpose()
+        .map_err(|_| {
+            (
+                "create isolated walk state",
+                0,
+                None,
+                0,
+                0,
+                0,
+                0,
+                Vec::new(),
+            )
+        })?;
+    let specs = isolated
+        .as_ref()
+        .map(|isolated| HostSpec {
+            name: "generated".to_owned(),
+            target: AttachTarget::Unix(isolated.path().join("daemon.sock")),
+        })
+        .into_iter()
+        .collect();
+    let workspace = cx.add_window(|window, cx| Workspace::new(specs, window, cx));
     let agent = AgentId::from_counter(1, &AgentIdDomain(0)).expect("generated agent id");
     let mut state = initial_state();
     workspace
@@ -306,10 +363,10 @@ fn run_events(
             workspace.select_agent(Some(agent), window, cx);
             workspace.seed_transcript_for_test(agent, state.clone(), window, cx);
         })
-        .map_err(|_| ("workspace closed", 0, 0, 0, 0, Vec::new()))?;
+        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, Vec::new()))?;
     cx.run_until_parked();
     let editor = active_editor(&workspace, &mut cx)
-        .map_err(|_| ("workspace closed", 0, 0, 0, 0, Vec::new()))?;
+        .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, Vec::new()))?;
     let cold_started = Instant::now();
     cx.draw_window(*workspace);
     gpui::profiler::take_frame_work();
@@ -332,9 +389,14 @@ fn run_events(
     let mut work_exceeded = None;
     let mut work_baselines: [Option<(u64, u64)>; 6] = [None; 6];
     let mut wall_clock_findings = Vec::new();
+    let mut virtual_time = Duration::ZERO;
+    let mut live_last_changed = HashMap::new();
     let baseline_owners = summarize_owners(&recorder, &recorder.frames()[0]);
     let mut step_owners = Vec::with_capacity(events.len());
     for (step, event) in events.iter().enumerate() {
+        if let WalkEvent::AdvanceTime { milliseconds } = event {
+            virtual_time += Duration::from_millis(u64::from(*milliseconds));
+        }
         let frame_start = recorder.frames().len();
         let allowed_y = match event {
             WalkEvent::ComposerKey { .. } => prompt_row(&workspace, &editor, &mut cx),
@@ -344,6 +406,8 @@ fn run_events(
         apply(event, agent, &mut state, &workspace, &editor, &mut cx).map_err(|_| {
             (
                 "event application",
+                step,
+                Some(event.clone()),
                 0,
                 0,
                 cold_draw_micros,
@@ -392,7 +456,7 @@ fn run_events(
                         .saturating_mul(2)
                         .saturating_add(64);
                     if rows > expected && work_exceeded.is_none() {
-                        work_exceeded = Some((draw_micros, rows));
+                        work_exceeded = Some((step, event.clone(), draw_micros, rows));
                     }
                     if scale < baseline_scale {
                         work_baselines[class] = Some((scale, rows));
@@ -407,6 +471,8 @@ fn run_events(
         if produced.len() != 1 {
             return Err((
                 "one event did not produce exactly one frame",
+                step,
+                Some(event.clone()),
                 draw_micros,
                 0,
                 cold_draw_micros,
@@ -417,12 +483,12 @@ fn run_events(
         let frame = &produced[0];
         step_owners.push(summarize_owners(&recorder, frame));
         max_changed_primitives = max_changed_primitives.max(frame.changes.len());
-        if matches!(event, WalkEvent::Idle | WalkEvent::AdvanceTime { .. })
-            && !frame.changes.is_empty()
-        {
+        if matches!(event, WalkEvent::Idle) && !frame.changes.is_empty() {
             let scene_details = describe_changes(&recorder, frame);
             return Err((
                 "idle sub-scene changed",
+                step,
+                Some(event.clone()),
                 draw_micros,
                 0,
                 cold_draw_micros,
@@ -430,11 +496,33 @@ fn run_events(
                 scene_details,
             ));
         }
+        if matches!(event, WalkEvent::AdvanceTime { .. })
+            && !frame.changes.is_empty()
+            && !changes_follow_declared_cadence(
+                &recorder,
+                frame,
+                virtual_time,
+                &mut live_last_changed,
+            )
+        {
+            return Err((
+                "time changed outside a declared live cadence",
+                step,
+                Some(event.clone()),
+                draw_micros,
+                0,
+                cold_draw_micros,
+                warm_draw_micros,
+                describe_changes(&recorder, frame),
+            ));
+        }
         if let (Some((top, bottom)), Some(changed)) = (allowed_y, frame.change_bounds)
             && (changed.origin.y.0 < top - 1. || changed.bottom().0 > bottom + 1.)
         {
             return Err((
                 "composer damage escaped its row",
+                step,
+                Some(event.clone()),
                 draw_micros,
                 0,
                 cold_draw_micros,
@@ -444,9 +532,11 @@ fn run_events(
         }
     }
 
-    if let Some((draw_micros, rows)) = work_exceeded {
+    if let Some((step, event, draw_micros, rows)) = work_exceeded {
         return Err((
             "editor work exceeded changed rows plus log total",
+            step,
+            Some(event),
             draw_micros,
             rows,
             cold_draw_micros,
@@ -510,25 +600,52 @@ fn describe_changes(
     recorder: &gpui::SceneRecorder<WalkEvent>,
     frame: &gpui::SceneFrame<WalkEvent>,
 ) -> Vec<String> {
-    frame
+    let mut details = vec![format!("primitive_changes_total={}", frame.changes.len())];
+    details.extend(frame.changes.iter().take(32).map(|change| {
+        format!(
+            "owner={:?} primitive={} before={:?} after={:?}",
+            recorder.owner(change.subscene),
+            change.index,
+            change
+                .before
+                .as_ref()
+                .map(|primitive| (primitive.fingerprint, primitive.bounds)),
+            change
+                .after
+                .as_ref()
+                .map(|primitive| (primitive.fingerprint, primitive.bounds)),
+        )
+    }));
+    details
+}
+
+/// Time may only change owners that declare their own cadence in the scene.
+fn changes_follow_declared_cadence(
+    recorder: &gpui::SceneRecorder<WalkEvent>,
+    frame: &gpui::SceneFrame<WalkEvent>,
+    now: Duration,
+    last_changed: &mut HashMap<gpui::SceneOwner, Duration>,
+) -> bool {
+    let Some(owners) = frame
         .changes
         .iter()
-        .map(|change| {
-            format!(
-                "owner={:?} primitive={} before={:?} after={:?}",
-                recorder.owner(change.subscene),
-                change.index,
-                change
-                    .before
-                    .as_ref()
-                    .map(|primitive| (primitive.fingerprint, primitive.bounds)),
-                change
-                    .after
-                    .as_ref()
-                    .map(|primitive| (primitive.fingerprint, primitive.bounds)),
-            )
-        })
-        .collect()
+        .map(|change| recorder.owner(change.subscene))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if owners.iter().any(|owner| {
+        let Some(live) = owner.live_owner() else {
+            return true;
+        };
+        now.saturating_sub(last_changed.get(owner).copied().unwrap_or_default()) < live.cadence
+    }) {
+        return false;
+    }
+    for owner in owners {
+        last_changed.insert(owner, now);
+    }
+    true
 }
 
 fn row_work_scale(event: &WalkEvent, total_rows: u64) -> (usize, u64) {
@@ -699,6 +816,8 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
     if first.scene_hashes != second.scene_hashes {
         return Err(WalkFailure {
             oracle: "same seed produced different scenes",
+            step: config.steps.saturating_sub(1),
+            event: generate(config.seed, config.steps).last().cloned(),
             events: generate(config.seed, config.steps),
             draw_micros: first.max_draw_micros,
             editor_rows: first.max_editor_rows,
@@ -710,6 +829,8 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
     if first.frames != config.steps {
         return Err(WalkFailure {
             oracle: "frame count",
+            step: config.steps.saturating_sub(1),
+            event: generate(config.seed, config.steps).last().cloned(),
             events: generate(config.seed, config.steps),
             draw_micros: first.max_draw_micros,
             editor_rows: first.max_editor_rows,
@@ -735,5 +856,29 @@ mod tests {
         .expect("generated scene sequence");
         assert_eq!(report.frames, 8);
         assert_eq!(report.scene_hashes.len(), 8);
+    }
+
+    #[test]
+    fn detached_host_retry_is_the_declared_live_status_owner() {
+        run_events_with_detached_host(
+            1,
+            WalkMode::Debug,
+            &[
+                WalkEvent::Resize {
+                    width: 480,
+                    height: 600,
+                },
+                WalkEvent::Resize {
+                    width: 708,
+                    height: 600,
+                },
+                WalkEvent::AdvanceTime { milliseconds: 812 },
+                WalkEvent::AdvanceTime { milliseconds: 671 },
+                WalkEvent::AdvanceTime { milliseconds: 397 },
+                WalkEvent::AdvanceTime { milliseconds: 126 },
+            ],
+            true,
+        )
+        .expect("only the connection label's declared cadence changes");
     }
 }

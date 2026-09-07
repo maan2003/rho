@@ -15,7 +15,7 @@ pub struct WalkArgs {
     /// Generated events in a single exploratory run.
     #[arg(long, default_value_t = 64)]
     steps: usize,
-    /// Enforce the secondary 4 ms wall-clock draw limit.
+    /// Report draws above the secondary 4 ms wall-clock threshold.
     #[arg(long)]
     profiling: bool,
 }
@@ -51,9 +51,15 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let script =
                 serde_json::to_string_pretty(&failure.events).unwrap_or_else(|_| "[]".to_owned());
             let details = failure.scene_details.join("\n");
+            let event = failure
+                .event
+                .as_ref()
+                .and_then(|event| serde_json::to_string(event).ok())
+                .unwrap_or_else(|| "null".to_owned());
             anyhow::anyhow!(
-                "seed={seed} walk oracle `{}` failed: cold_draw_us={} warm_draw_us={} event_draw_us={} editor_rows={}\nshrunk sequence:\n{script}\nsub-scene changes:\n{details}",
+                "oracle={} seed={seed}\nstep={} event={event}\ncold_draw_us={} warm_draw_us={} event_draw_us={} editor_rows={}\nshrunk sequence:\n{script}\nsub-scene changes (capped at 32):\n{details}",
                 failure.oracle,
+                failure.step,
                 failure.cold_draw_micros,
                 failure.warm_draw_micros,
                 failure.draw_micros,

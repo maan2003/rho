@@ -9607,10 +9607,15 @@ impl Workspace {
                     ))
                 }),
             ))
-            .children(
-                self.abnormal_connection_text()
-                    .map(|connection| div().text_color(status.error).child(connection)),
-            )
+            .children(self.abnormal_connection_text().map(|connection| {
+                div()
+                    .id(gpui::LiveOwner::every(
+                        "rho-host-connection-status",
+                        Duration::from_secs(1),
+                    ))
+                    .text_color(status.error)
+                    .child(connection)
+            }))
             .children(self.lamp_on.then(|| {
                 div()
                     .flex_none()
