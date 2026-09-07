@@ -599,11 +599,7 @@ impl SessionBinding {
             return AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
             };
-        } else if matches!(self, Self::ClaudeAdvisor { .. }) {
-            return AgentRole::Advisor {
-                intelligence: AdvisorIntelligence::High,
-            };
-        } else if matches!(self, Self::AdvisorAstra(_)) {
+        } else if matches!(self, Self::ClaudeAdvisor { .. } | Self::AdvisorAstra(_)) {
             return AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
             };
