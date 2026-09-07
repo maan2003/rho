@@ -1,9 +1,10 @@
 //! rho-gui: a native GUI attached to a running rho daemon.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::fs;
+use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,13 +83,33 @@ fn apply_text_rendering_mode(cx: &mut App) {
 
 struct GuiProfiler {
     cpu: rho_profiling::CpuProfiler,
-    frames: gpui::profiler::FrameTimingCollector,
-    editor: Arc<Mutex<gpui::profiler::EditorTimingCollector>>,
+    checkpoint: Arc<ProfileCheckpoint>,
+    draw_tid: u64,
+}
+
+struct ProfileCheckpoint {
+    state: Mutex<ProfileState>,
+    writer: Mutex<()>,
+    finalized: AtomicBool,
+    final_written: AtomicBool,
     frame_path: PathBuf,
     editor_path: PathBuf,
-    draw_tid: u64,
-    collected_frames: Arc<Mutex<Vec<gpui::profiler::FrameTiming>>>,
-    collected_editor: Arc<Mutex<Vec<gpui::profiler::EditorTiming>>>,
+}
+
+struct ProfileState {
+    frames: gpui::profiler::FrameTimingCollector,
+    editor: gpui::profiler::EditorTimingCollector,
+    collected_frames: Vec<gpui::profiler::FrameTiming>,
+    collected_editor: Vec<gpui::profiler::EditorTiming>,
+}
+
+struct ProfileSnapshot {
+    frames: Vec<gpui::profiler::FrameTiming>,
+    editor: Vec<gpui::profiler::EditorTiming>,
+}
+
+thread_local! {
+    static WRITING_PROFILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(serde::Serialize)]
@@ -209,17 +230,27 @@ fn run() -> Result<()> {
             let frame_path = rho_profiling::sidecar_path(cpu.path(), ".frames.json");
             let editor_path = rho_profiling::sidecar_path(cpu.path(), ".editor.json");
             Ok::<_, anyhow::Error>(GuiProfiler {
+                checkpoint: Arc::new(ProfileCheckpoint {
+                    state: Mutex::new(ProfileState {
+                        frames: gpui::profiler::FrameTimingCollector::new(),
+                        editor: gpui::profiler::EditorTimingCollector::new(),
+                        collected_frames: Vec::new(),
+                        collected_editor: Vec::new(),
+                    }),
+                    writer: Mutex::new(()),
+                    finalized: AtomicBool::new(false),
+                    final_written: AtomicBool::new(false),
+                    frame_path,
+                    editor_path,
+                }),
                 cpu,
-                frames: gpui::profiler::FrameTimingCollector::new(),
-                editor: Arc::new(Mutex::new(gpui::profiler::EditorTimingCollector::new())),
-                frame_path,
-                editor_path,
                 draw_tid: 0,
-                collected_frames: Arc::default(),
-                collected_editor: Arc::default(),
             })
         })
         .transpose()?;
+    if let Some(profiler) = &profiler {
+        install_profile_panic_hook(Arc::clone(&profiler.checkpoint));
+    }
     let specs = host_specs(&args)?;
     let local_socket = specs.iter().find_map(|spec| match &spec.target {
         AttachTarget::Unix(socket) => Some(socket),
@@ -261,27 +292,21 @@ fn run() -> Result<()> {
                 // Window drawing and this application callback share GPUI's
                 // foreground thread.
                 profiler.draw_tid = rho_profiling::current_tid();
-                let collected_frames = profiler.collected_frames.clone();
-                let collected_editor = profiler.collected_editor.clone();
-                let editor = profiler.editor.clone();
+                let checkpoint = Arc::clone(&profiler.checkpoint);
                 let executor = cx.background_executor().clone();
                 cx.background_spawn(async move {
-                    let mut collector = gpui::profiler::FrameTimingCollector::new();
+                    let mut ticks = 0u8;
                     loop {
                         executor.timer(Duration::from_secs(5)).await;
-                        collected_frames
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .extend(collector.collect_unseen());
-                        collected_editor
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .extend(
-                                editor
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .collect_unseen(),
-                            );
+                        checkpoint.collect();
+                        ticks += 1;
+                        // Collect often enough that GPUI's bounded timing
+                        // rings cannot wrap, but keep the full JSON rewrite
+                        // out of the workload's hot path.
+                        if ticks == 6 {
+                            ticks = 0;
+                            checkpoint.spawn_periodic_write();
+                        }
                     }
                 })
                 .detach();
@@ -353,49 +378,129 @@ fn quit_on_termination_signal(cx: &mut App) {
     .detach();
 }
 
-fn finish_profiling(mut profiler: GuiProfiler) {
-    let mut frames = std::mem::take(
-        &mut *profiler
-            .collected_frames
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()),
-    );
-    frames.extend(profiler.frames.collect_unseen());
-    frames.sort_unstable_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
-    frames.dedup_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
-    let mut collected_editor = profiler
-        .collected_editor
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut editor_collector = profiler
-        .editor
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut editor = std::mem::take(&mut *collected_editor);
-    editor.extend(editor_collector.collect_unseen());
-    drop(editor_collector);
-    drop(collected_editor);
-    editor.sort_unstable_by_key(|event| (event.start, event.kind as u8));
+fn finish_profiling(profiler: GuiProfiler) {
+    let snapshot = profiler.checkpoint.final_snapshot();
     match profiler.cpu.finish_with_gui_spans(
-        frame_timeline_spans(&frames, profiler.draw_tid),
-        editor_timeline_spans(&editor),
+        frame_timeline_spans(&snapshot.frames, profiler.draw_tid),
+        editor_timeline_spans(&snapshot.editor),
     ) {
         Ok(path) => eprintln!("rho-gui: wrote CPU profile to {}", path.display()),
         Err(error) => eprintln!("rho-gui: failed to write CPU profile: {error:#}"),
     }
-    match export_frame_profile(&profiler.frame_path, frames) {
-        Ok(()) => eprintln!(
-            "rho-gui: wrote frame profile to {}",
-            profiler.frame_path.display()
-        ),
-        Err(error) => eprintln!("rho-gui: failed to write frame profile: {error:#}"),
+    match profiler.checkpoint.install(&snapshot, true) {
+        Ok(()) => {
+            profiler
+                .checkpoint
+                .final_written
+                .store(true, Ordering::Release);
+            eprintln!(
+                "rho-gui: wrote frame profile to {}",
+                profiler.checkpoint.frame_path.display()
+            );
+            eprintln!(
+                "rho-gui: wrote editor profile to {}",
+                profiler.checkpoint.editor_path.display()
+            );
+        }
+        Err(error) => eprintln!("rho-gui: failed to write GUI profile: {error:#}"),
     }
-    match export_editor_profile(&profiler.editor_path, editor) {
-        Ok(()) => eprintln!(
-            "rho-gui: wrote editor profile to {}",
-            profiler.editor_path.display()
-        ),
-        Err(error) => eprintln!("rho-gui: failed to write editor profile: {error:#}"),
+}
+
+impl ProfileCheckpoint {
+    fn collect(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let frames = state.frames.collect_unseen();
+        state.collected_frames.extend(frames);
+        let editor = state.editor.collect_unseen();
+        state.collected_editor.extend(editor);
+    }
+
+    fn snapshot(&self) -> ProfileSnapshot {
+        self.collect();
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut frames = state.collected_frames.clone();
+        let mut editor = state.collected_editor.clone();
+        drop(state);
+        frames.sort_unstable_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
+        frames.dedup_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
+        editor.sort_unstable_by_key(|event| (event.start, event.kind as u8));
+        ProfileSnapshot { frames, editor }
+    }
+
+    fn final_snapshot(&self) -> ProfileSnapshot {
+        self.finalized.store(true, Ordering::Release);
+        self.snapshot()
+    }
+
+    fn spawn_periodic_write(self: &Arc<Self>) {
+        if self.finalized.load(Ordering::Acquire) {
+            return;
+        }
+        let checkpoint = Arc::clone(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("rho-profile-checkpoint".to_owned())
+            .spawn(move || {
+                let Ok(_writer) = checkpoint.writer.try_lock() else {
+                    return;
+                };
+                if checkpoint.finalized.load(Ordering::Acquire) {
+                    return;
+                }
+                // If this thread itself panics while cloning or writing,
+                // the hook must use the last complete atomic checkpoint
+                // rather than trying to take the lock recursively.
+                WRITING_PROFILE.set(true);
+                let snapshot = checkpoint.snapshot();
+                if let Err(error) = checkpoint.install_locked(&snapshot, false) {
+                    eprintln!("rho-gui: failed to checkpoint GUI profile: {error:#}");
+                }
+            })
+        {
+            eprintln!("rho-gui: failed to start GUI profile checkpoint writer: {error}");
+        }
+    }
+
+    fn install(&self, snapshot: &ProfileSnapshot, final_write: bool) -> Result<()> {
+        let Ok(_writer) = self.writer.try_lock() else {
+            if final_write {
+                let _writer = self
+                    .writer
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                return self.install_locked(snapshot, true);
+            }
+            return Ok(());
+        };
+        self.install_locked(snapshot, final_write)
+    }
+
+    fn install_locked(&self, snapshot: &ProfileSnapshot, final_write: bool) -> Result<()> {
+        if !final_write && self.finalized.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        WRITING_PROFILE.set(true);
+        let result = export_frame_profile(&self.frame_path, snapshot.frames.clone())
+            .and_then(|()| export_editor_profile(&self.editor_path, snapshot.editor.clone()));
+        WRITING_PROFILE.set(false);
+        result
+    }
+}
+
+fn install_profile_panic_hook(checkpoint: Arc<ProfileCheckpoint>) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        flush_profile_after_panic(&checkpoint);
+        previous(info);
+    }));
+}
+
+fn flush_profile_after_panic(checkpoint: &ProfileCheckpoint) {
+    if checkpoint.final_written.load(Ordering::Acquire) || WRITING_PROFILE.get() {
+        return;
+    }
+    let snapshot = checkpoint.final_snapshot();
+    if let Err(error) = checkpoint.install(&snapshot, true) {
+        eprintln!("rho-gui: failed to flush GUI profile after panic: {error:#}");
     }
 }
 
@@ -513,10 +618,7 @@ fn export_editor_profile(path: &Path, timings: Vec<gpui::profiler::EditorTiming>
         stages,
         events,
     };
-    let file = File::create(path)
-        .with_context(|| format!("failed to create editor profile {}", path.display()))?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &profile)
-        .with_context(|| format!("failed to write editor profile {}", path.display()))
+    write_json_atomic(path, &profile)
 }
 
 fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) -> Result<()> {
@@ -548,10 +650,26 @@ fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) 
         ),
         invalidations: distribution(frames.iter().map(|frame| frame.invalidations), 1.0),
     };
-    let file = File::create(path)
-        .with_context(|| format!("failed to create frame profile {}", path.display()))?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &FrameProfile { summary, frames })
-        .with_context(|| format!("failed to write frame profile {}", path.display()))
+    write_json_atomic(path, &FrameProfile { summary, frames })
+}
+
+fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)
+        .with_context(|| format!("failed to create profile checkpoint {}", path.display()))?;
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, value)
+            .with_context(|| format!("failed to write profile checkpoint {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush profile checkpoint {}", path.display()))?;
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to install profile checkpoint {}", path.display()))?;
+    Ok(())
 }
 
 fn duration_ns(duration: std::time::Duration) -> u64 {
@@ -644,5 +762,68 @@ fn load_or_create_settings(path: &Path) -> Result<String> {
         Err(error) => {
             Err(error).with_context(|| format!("failed to read settings from {}", path.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_checkpoint_tests {
+    use super::*;
+
+    fn checkpoint(directory: &Path) -> ProfileCheckpoint {
+        let frame_path = directory.join("run.frames.json");
+        let editor_path = directory.join("run.editor.json");
+        ProfileCheckpoint {
+            state: Mutex::new(ProfileState {
+                frames: gpui::profiler::FrameTimingCollector::new(),
+                editor: gpui::profiler::EditorTimingCollector::new(),
+                collected_frames: Vec::new(),
+                collected_editor: Vec::new(),
+            }),
+            writer: Mutex::new(()),
+            finalized: AtomicBool::new(false),
+            final_written: AtomicBool::new(false),
+            frame_path: frame_path.clone(),
+            editor_path: editor_path.clone(),
+        }
+    }
+
+    #[test]
+    fn panic_flush_leaves_complete_readable_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let frame_path = directory.path().join("run.frames.json");
+        let editor_path = directory.path().join("run.editor.json");
+        fs::write(&frame_path, "incomplete").unwrap();
+        fs::write(&editor_path, "incomplete").unwrap();
+        let checkpoint = checkpoint(directory.path());
+
+        flush_profile_after_panic(&checkpoint);
+
+        let frames: serde_json::Value = serde_json::from_slice(&fs::read(&frame_path).unwrap())
+            .expect("the panic-side frame checkpoint is complete JSON");
+        let editor: serde_json::Value = serde_json::from_slice(&fs::read(&editor_path).unwrap())
+            .expect("the panic-side editor checkpoint is complete JSON");
+        assert!(frames["frames"].is_array());
+        assert!(editor["events"].is_array());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn panic_flush_waits_for_an_in_flight_periodic_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = Arc::new(checkpoint(directory.path()));
+        let (locked, wait) = std::sync::mpsc::channel();
+        let holder = Arc::clone(&checkpoint);
+        let thread = std::thread::spawn(move || {
+            let _writer = holder.writer.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        wait.recv().unwrap();
+
+        flush_profile_after_panic(&checkpoint);
+        thread.join().unwrap();
+
+        assert!(checkpoint.frame_path.exists());
+        assert!(checkpoint.editor_path.exists());
     }
 }
