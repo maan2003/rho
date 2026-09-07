@@ -3867,11 +3867,11 @@ async fn test_preview_edits(cx: &mut TestAppContext) {
     });
 
     let insertion_style = HighlightStyle {
-        background_color: Some(cx.read(|cx| cx.theme().status().created_background)),
+        background_color: Some(cx.read(|cx| cx.theme().status().created_background.into())),
         ..Default::default()
     };
     let deletion_style = HighlightStyle {
-        background_color: Some(cx.read(|cx| cx.theme().status().deleted_background)),
+        background_color: Some(cx.read(|cx| cx.theme().status().deleted_background.into())),
         ..Default::default()
     };
 
