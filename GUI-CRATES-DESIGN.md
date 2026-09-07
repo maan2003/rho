@@ -1472,6 +1472,41 @@ work on it.
 
 ### Landed
 
+- **The prompt can act per keystroke: `ChangeHandler`** (`rho-gui`
+  `minibuffer`, `workspace`). eng-bgkw found the gap while landing Slack
+  search and reported it rather than working around it: `CandidateSource` is
+  `Fn(&Workspace, &str, &App) -> Vec<Candidate>` and runs on every edit, so a
+  prompt could offer completions per keystroke and could not *do* anything per
+  keystroke. Slack's `s` wants the list itself to narrow as the reader types —
+  which is the whole of an Emacs-style narrowing read — and could only narrow
+  on submit.
+  *What it widens.* One new type beside `SubmitHandler` and shaped like it:
+  `ChangeHandler = Rc<dyn Fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>)>`,
+  optional per prompt, called once after each edit with the input as it then
+  stands. The two callbacks stay two questions rather than merging into one
+  that does both: completion answers *what could this become* and may only
+  read, the change handler answers *what should the reader be looking at now*
+  and may act. The handler runs after that edit's candidates are recomputed
+  and the minibuffer is back in the workspace, so it sees what the reader
+  sees, including its own prompt, which it may read, replace or close.
+  *What it costs a prompt that does not want it.* One `None` check per
+  keystroke. `open_prompt` keeps its signature and all twenty-six of its
+  callers are untouched; `open_prompt_watching` is the one that takes a
+  handler. The editor subscription moves from `subscribe` to `subscribe_in`,
+  because acting needs a window; that is the only change to a shared path, and
+  `refresh_minibuffer` — which has exactly one caller, that subscription —
+  takes a window with it.
+  *Not included, on purpose.* Saving and restoring what stood before escape.
+  Only the prompt knows what "back" means for the thing it narrows, so the
+  prompt saves it on open; the primitive's job is to say *when*, once per
+  keystroke, exactly.
+  Two tests in `crates/rho-gui/src/tests/minibuffer.rs`: that a keystroke
+  reaches the handler once and with the input as it then stands — opening is
+  not an edit and a redraw is not an edit, both asserted — and that a prompt
+  without a handler is untouched, still completing on open and after each edit
+  and still receiving the typed input on submit.
+  Gate green: rho-gui 272 passed (2 new), 3 ignored, `cargo fmt --check` clean.
+
 - **The two state-directory defaults, moved to the path `main` resolves**
   (`rho-gui` `desk_view`, `rho-workspaces`, `rho-agent` `pool`, `rho-daemon`).
   The rule, from a breach eng-bgkw found on main: a library never resolves the

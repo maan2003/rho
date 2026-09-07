@@ -129,11 +129,22 @@ pub type CandidateSource = Rc<dyn Fn(&Workspace, &str, &App) -> Vec<Candidate>>;
 /// Receives the typed input (tab-completions applied) after the
 /// minibuffer has closed.
 pub type SubmitHandler = Rc<dyn Fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)>;
+/// Receives the input as it now stands, after each edit, while the
+/// minibuffer is still open.
+///
+/// [`CandidateSource`] answers "what could this become" and may only read;
+/// this answers "what should the reader be looking at now" and may act. It is
+/// what makes a prompt narrow the thing behind it as the reader types, which
+/// is the whole of an Emacs-style narrowing read and is not something
+/// completion can do. Optional per prompt: a prompt that sets none pays a
+/// `None` check per keystroke and nothing else.
+pub type ChangeHandler = Rc<dyn Fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>)>;
 
 pub struct Minibuffer {
     prompt: SharedString,
     editor: Entity<Editor>,
     complete: CandidateSource,
+    on_change: Option<ChangeHandler>,
     on_submit: SubmitHandler,
     candidates: Vec<Candidate>,
     selected: usize,
@@ -158,6 +169,7 @@ impl Minibuffer {
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
         complete: CandidateSource,
+        on_change: Option<ChangeHandler>,
         on_submit: SubmitHandler,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -175,16 +187,23 @@ impl Minibuffer {
             });
             editor
         });
-        let edits = cx.subscribe(&editor, |this: &mut Workspace, _, event, cx| {
-            if matches!(event, editor::EditorEvent::BufferEdited) {
-                this.refresh_minibuffer(cx);
-            }
-        });
+        // `subscribe_in` rather than `subscribe`: the change handler may act
+        // on the workspace, and acting needs a window. One edit, one call.
+        let edits = cx.subscribe_in(
+            &editor,
+            window,
+            |this: &mut Workspace, _, event, window, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    this.refresh_minibuffer(window, cx);
+                }
+            },
+        );
         window.focus(&editor.focus_handle(cx), cx);
         Self {
             prompt: prompt.into(),
             editor,
             complete,
+            on_change,
             on_submit,
             candidates: Vec::new(),
             selected: 0,
@@ -197,6 +216,13 @@ impl Minibuffer {
 
     pub fn input(&self, cx: &App) -> String {
         self.editor.read(cx).text(cx)
+    }
+
+    /// The prompt's change handler, if it set one. Cloned rather than
+    /// borrowed because running it needs the workspace mutably, and the
+    /// minibuffer lives in the workspace.
+    pub fn on_change(&self) -> Option<ChangeHandler> {
+        self.on_change.clone()
     }
 
     /// Recomputes candidates against `workspace`; called by the workspace

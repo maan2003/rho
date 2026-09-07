@@ -6783,12 +6783,25 @@ impl Workspace {
     }
 
     /// Recomputes candidates after an edit; subscribed by [`Minibuffer`].
-    pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
+    /// Recomputes the prompt's candidates after an edit, then tells the
+    /// prompt what the input now is. Called once per edit and never per
+    /// frame.
+    ///
+    /// The candidates are recomputed first and the minibuffer put back before
+    /// the handler runs, so the handler sees the workspace as the reader does
+    /// — including the prompt it belongs to, which it may read, replace or
+    /// close.
+    pub(crate) fn refresh_minibuffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
         minibuffer.refresh(self, cx);
+        let on_change = minibuffer.on_change();
+        let input = minibuffer.input(cx);
         self.minibuffer = Some(minibuffer);
+        if let Some(on_change) = on_change {
+            on_change(self, &input, window, cx);
+        }
         cx.notify();
     }
 
@@ -6873,6 +6886,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_prompt_watching(prompt, complete, None, on_submit, window, cx);
+    }
+
+    /// [`Self::open_prompt`] with a handler that runs after each edit, for a
+    /// prompt that narrows what is behind it as the reader types rather than
+    /// only on submit.
+    pub(crate) fn open_prompt_watching(
+        &mut self,
+        prompt: impl Into<gpui::SharedString>,
+        complete: crate::minibuffer::CandidateSource,
+        on_change: Option<crate::minibuffer::ChangeHandler>,
+        on_submit: crate::minibuffer::SubmitHandler,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prompt = prompt.into();
         crate::journal::record(crate::journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
@@ -6881,7 +6909,15 @@ impl Workspace {
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
-        let mut minibuffer = Minibuffer::open(prompt, &text_style, complete, on_submit, window, cx);
+        let mut minibuffer = Minibuffer::open(
+            prompt,
+            &text_style,
+            complete,
+            on_change,
+            on_submit,
+            window,
+            cx,
+        );
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
         self.clear_menu();

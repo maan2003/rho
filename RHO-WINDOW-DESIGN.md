@@ -236,6 +236,51 @@ nothing needs the mouse, no modal appears. Plus the cost rule, per event
 O(touched) + O(log n) and per frame O(drawn), measured on the snapshot and
 written into the landing note.
 
+## The prompt, and what it can do per keystroke
+
+The minibuffer is a completing read: a prompt, an input line, and candidate
+rows beneath it. It has always had two callbacks, and until now only one of
+them could act.
+
+`CandidateSource` is `Fn(&Workspace, &str, &App) -> Vec<Candidate>`. It runs
+on open and after every edit, and it answers one question — *what could this
+input become* — with a list. It takes the workspace by shared reference on
+purpose: recomputing what a reader might mean must not change what they are
+looking at, and a completion that could act would be a keystroke with a side
+effect the reader did not ask for.
+
+`SubmitHandler` is `Fn(&mut Workspace, String, &mut Window, &mut Context<..>)`.
+It may act, and it runs once, after the prompt has closed.
+
+Between them was a gap, found by eng-bgkw while landing Slack search and
+reported rather than worked around: a prompt could offer completions per
+keystroke and could not *do* anything per keystroke. An Emacs-style narrowing
+read is the list itself narrowing as the reader types — that is the whole of
+it — and on submit is not that. The list behind the prompt could only narrow
+after the prompt was gone.
+
+`ChangeHandler` closes it, and is deliberately shaped like `SubmitHandler`
+rather than like `CandidateSource`:
+`Fn(&mut Workspace, &str, &mut Window, &mut Context<..>)`. It answers the
+other question — *what should the reader be looking at now* — and it may act.
+It runs once per edit, after the candidates for that edit have been recomputed
+and the prompt put back, so the handler sees the workspace as the reader does,
+including the prompt it belongs to, which it may read, replace or close. It
+never runs per frame: a redraw is not an edit.
+
+It is optional per prompt, and a prompt that sets none pays one `None` check
+per keystroke and nothing else. `open_prompt` keeps its signature and its
+twenty-six callers keep theirs; `open_prompt_watching` is the one that takes a
+handler. That is the shape of the widening: nothing that did not ask for the
+new power is changed by it, and the two questions stay two questions — read to
+suggest, act to narrow — rather than being merged into one callback that does
+both and is hard to reason about at either.
+
+What it does not do: it does not save or restore what stood before. A prompt
+that narrows something and wants escape to put it back saves that itself, on
+open, because only the prompt knows what "back" means for the thing it is
+narrowing. The primitive's job is to say *when*, once per keystroke, exactly.
+
 ## Surfaces and history
 
 ### The spec

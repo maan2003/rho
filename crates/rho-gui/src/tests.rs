@@ -20,6 +20,7 @@ use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod history;
+mod minibuffer;
 mod story;
 use rho_agents::HostId;
 
