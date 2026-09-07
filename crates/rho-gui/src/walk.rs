@@ -106,6 +106,11 @@ pub struct WalkReport {
     pub step_draw_micros: Vec<u64>,
     pub step_touched_rows: Vec<u64>,
     pub step_walked_items: Vec<u64>,
+    /// What each step's walk was spent on, by stage, largest first, for the
+    /// stages that walked anything. A step's `walked_items` is the sum of
+    /// every stage's, so a step that walks a document says nothing about
+    /// which layer walked it until this is read.
+    pub step_stage_walks: Vec<Vec<(&'static str, u64)>>,
     pub step_drawn_rows: Vec<u64>,
     pub step_total_rows: Vec<u64>,
     pub scene_hashes: Vec<u64>,
@@ -429,6 +434,7 @@ fn run_events_with_detached_host(
     let mut step_draw_micros = Vec::with_capacity(events.len());
     let mut step_touched_rows = Vec::with_capacity(events.len());
     let mut step_walked_items = Vec::with_capacity(events.len());
+    let mut step_stage_walks = Vec::with_capacity(events.len());
     let mut step_drawn_rows = Vec::with_capacity(events.len());
     let mut step_total_rows = Vec::with_capacity(events.len());
     let mut work_exceeded = None;
@@ -485,6 +491,7 @@ fn run_events_with_detached_host(
         max_walked_items = max_walked_items.max(walked_items);
         step_touched_rows.push(touched_rows);
         step_walked_items.push(walked_items);
+        step_stage_walks.push(stage_walks(&event_timings));
         max_drawn_rows = max_drawn_rows.max(work.visible_rows);
         step_drawn_rows.push(work.visible_rows);
         let total_rows = work.total_rows.max(
@@ -614,6 +621,7 @@ fn run_events_with_detached_host(
         step_draw_micros,
         step_touched_rows,
         step_walked_items,
+        step_stage_walks,
         step_drawn_rows,
         step_total_rows,
         scene_hashes: frames
@@ -625,6 +633,39 @@ fn run_events_with_detached_host(
         baseline_owners,
         step_owners,
     })
+}
+
+/// One step's walk, split by the stage that did it.
+fn stage_walks(timings: &[gpui::profiler::EditorTiming]) -> Vec<(&'static str, u64)> {
+    let mut by_stage: Vec<(&'static str, u64)> = Vec::new();
+    for timing in timings {
+        if timing.walked_items == 0 {
+            continue;
+        }
+        let name = stage_name(timing.kind);
+        match by_stage.iter_mut().find(|(stage, _)| *stage == name) {
+            Some((_, walked)) => *walked += timing.walked_items,
+            None => by_stage.push((name, timing.walked_items)),
+        }
+    }
+    by_stage.sort_by_key(|(_, walked)| std::cmp::Reverse(*walked));
+    by_stage
+}
+
+fn stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
+    use gpui::profiler::EditorTimingKind::*;
+    match kind {
+        BufferEdit => "buffer",
+        MultiBufferSync => "multibuffer",
+        FoldMapSync => "fold",
+        TabMapSync => "tab",
+        WrapMapSync => "wrap",
+        BlockMapSync => "block",
+        InlayMapSync => "inlay",
+        WrapMapUpdate => "wrap_update",
+        SyncTree => "tree",
+        SpliceInlays => "splice_inlays",
+    }
 }
 
 fn summarize_owners(

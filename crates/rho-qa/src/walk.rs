@@ -36,6 +36,18 @@ const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
 /// chunk to page in - `gg` touches 49 rows at 400 where it touched 6 at 40.
 const LARGE_TRANSCRIPT_TURNS: usize = 400;
 
+/// One step's walk written as `stage:count`, or `-` where it walked nothing.
+fn stage_walks(walks: &[(&'static str, u64)]) -> String {
+    if walks.is_empty() {
+        return "-".to_owned();
+    }
+    walks
+        .iter()
+        .map(|(stage, walked)| format!("{stage}:{walked}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// What one frame may cost the reader.
 const FRAME_BOUND_US: u64 = 4_000;
 
@@ -188,8 +200,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let paint_us = owners.iter().map(|owner| owner.paint_nanos).sum::<u64>() / 1_000;
             let primitives = owners.iter().map(|owner| owner.primitives).sum::<usize>();
             println!(
-                "run={run} step={step} draw_us={draw} paint_us={paint_us} owners={} primitives={primitives} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}",
-                owners.len()
+                "run={run} step={step} draw_us={draw} paint_us={paint_us} owners={} primitives={primitives} touched_rows={touched_rows} walked_items={walked_items} walk={} drawn_rows={drawn_rows} total_rows={total_rows}",
+                owners.len(),
+                stage_walks(&report.step_stage_walks[step]),
             );
         }
     }
