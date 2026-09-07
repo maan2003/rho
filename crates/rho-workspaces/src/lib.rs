@@ -207,6 +207,15 @@ pub struct Repo {
     is_jj: bool,
     /// PATH entries applied to commands prepared for this repo's workspaces.
     path_overrides: PathOverrides,
+    /// Where sandboxes are made, named by the binary that opened this repo.
+    ///
+    /// A library does not resolve the user's state directory. This one used
+    /// to call `dirs::state_dir()` from `sandbox_base`, which meant any test
+    /// that made a sandbox wrote under the user's home. `None` is not a
+    /// default to fall back on: making a sandbox without one is an error that
+    /// names the rule, so the mistake is caught where it is made rather than
+    /// in the user's files.
+    state_dir: Option<Utf8PathBuf>,
     user_environment: Option<UserEnvironment>,
     /// Serializes jj invocations. jj's op log makes concurrent commands safe
     /// on its own; this is simplicity insurance while the vendored
@@ -236,6 +245,7 @@ impl Repo {
             root: resolve_repo_root(path)?,
             is_jj: true,
             path_overrides,
+            state_dir: None,
             user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
@@ -273,6 +283,7 @@ impl Repo {
             root,
             is_jj: false,
             path_overrides,
+            state_dir: None,
             user_environment: None,
             jj_lock: Mutex::new(()),
             workspaces: Mutex::new(HashMap::new()),
@@ -288,6 +299,13 @@ impl Repo {
         let mut repo = Self::open_plain_with_path_overrides(path, path_overrides)?;
         repo.user_environment = Some(user_environment);
         Ok(repo)
+    }
+
+    /// Names the state directory sandboxes are made under. Called by the
+    /// binary that resolved it; a repo without one cannot make a sandbox.
+    pub fn with_state_dir(mut self, state_dir: Utf8PathBuf) -> Self {
+        self.state_dir = Some(state_dir);
+        self
     }
 
     /// Whether this workdir is a jj repo (as opposed to a plain live
@@ -365,7 +383,7 @@ impl Repo {
             repo: self.root.clone(),
             id,
         };
-        let base = sandbox_base(&self.root, id)?;
+        let base = sandbox_base(self.state_dir.as_deref(), &self.root, id)?;
         anyhow::ensure!(!base.exists(), "sandbox already exists: {base}");
         let checkout = managed.root;
         let result = async {
@@ -424,7 +442,7 @@ impl Repo {
             return Ok(workspace);
         }
         let (managed, lease) = self.open_managed(id).await?;
-        let base = sandbox_base(&self.root, id)?;
+        let base = sandbox_base(self.state_dir.as_deref(), &self.root, id)?;
         let checkout = managed.root;
         anyhow::ensure!(
             base.join("git/HEAD").is_file(),
@@ -765,7 +783,9 @@ impl Workspace {
 
     fn sandbox_base(&self) -> Option<Utf8PathBuf> {
         match self.info() {
-            WorkspaceInfo::Sandbox { id, .. } => sandbox_base(self.repo(), *id).ok(),
+            WorkspaceInfo::Sandbox { id, .. } => {
+                sandbox_base(self.repo.state_dir.as_deref(), self.repo(), *id).ok()
+            }
             WorkspaceInfo::UserCheckout { .. } | WorkspaceInfo::Workspace { .. } => None,
         }
     }
@@ -1486,9 +1506,14 @@ fn gitdir_path(pointer: &str) -> Option<Utf8PathBuf> {
         .map(Utf8PathBuf::from)
 }
 
-fn sandbox_base(repo: &Utf8Path, id: WorkspaceId) -> anyhow::Result<Utf8PathBuf> {
-    let state = dirs::state_dir().context("state directory not available")?;
-    let state = Utf8PathBuf::try_from(state).context("state directory is not valid UTF-8")?;
+fn sandbox_base(
+    state: Option<&Utf8Path>,
+    repo: &Utf8Path,
+    id: WorkspaceId,
+) -> anyhow::Result<Utf8PathBuf> {
+    let state = state.context(
+        "no state directory: the binary that opened this repo must name one with          Repo::with_state_dir, because a library does not resolve the user's",
+    )?;
     let digest = Sha256::digest(repo.as_str().as_bytes());
     Ok(state.join("rho/sandboxes").join(format!(
         "{}-{}",
@@ -1744,8 +1769,17 @@ mod tests {
         std::fs::write(repo.join(".gitignore"), "ignored-secret\n").unwrap();
         std::fs::write(repo.join("ignored-secret"), "secret").unwrap();
 
-        let repo = Arc::new(Repo::open(&repo).unwrap());
+        // The state directory is named here rather than resolved inside the
+        // library: before this the sandbox was made under the user's own
+        // state directory, which is a test writing into the user's files.
+        let state = Utf8PathBuf::try_from(temp.path().join("state")).unwrap();
+        let repo = Arc::new(Repo::open(&repo).unwrap().with_state_dir(state.clone()));
         let workspace = repo.create_sandbox("@").await.unwrap();
+        assert!(
+            workspace.sandbox_base().unwrap().starts_with(&state),
+            "the sandbox is made under the state directory the caller named, \
+             not under one the library found"
+        );
         assert_eq!(
             std::fs::read_to_string(workspace.checkout().join("tracked")).unwrap(),
             "working copy"

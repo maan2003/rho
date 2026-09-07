@@ -363,7 +363,18 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
-    let db = RhoDb::open(default_db_path()?);
+    let db_path = default_db_path()?;
+    // The state directory is resolved here, in the binary, and handed down.
+    // Nothing below this line asks `dirs` for it: a library that resolves the
+    // user's state directory reads the user's own files from a test.
+    let state_dir = camino::Utf8PathBuf::try_from(
+        db_path
+            .parent()
+            .context("the database path has no directory")?
+            .to_owned(),
+    )
+    .context("the state directory is not valid UTF-8")?;
+    let db = RhoDb::open(db_path);
     // One-off (7 Sep), before any agent loop can append: every Claude
     // log the file copier wrote is rebuilt from its session file.
     let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db).await;
@@ -398,6 +409,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             db,
             inference,
             path_overrides,
+            state_dir,
             user_environment,
             platform_secrets,
             runtime.paths.octo_socket(),
@@ -784,6 +796,7 @@ impl AgentRegistry {
         db: RhoDb,
         inference: Inference,
         path_overrides: PathOverrides,
+        state_dir: camino::Utf8PathBuf,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
@@ -792,6 +805,7 @@ impl AgentRegistry {
             db.clone(),
             inference.clone(),
             path_overrides,
+            state_dir,
             user_environment.clone(),
         )
         .await;

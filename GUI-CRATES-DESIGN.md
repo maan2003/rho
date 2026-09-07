@@ -1408,6 +1408,40 @@ work on it.
 
 ### Landed
 
+- **The two state-directory defaults, moved to the path `main` resolves**
+  (`rho-gui` `desk_view`, `rho-workspaces`, `rho-agent` `pool`, `rho-daemon`).
+  The rule, from a breach eng-bgkw found on main: a library never resolves the
+  user's state directory; only a binary's `main` does, and everything below
+  takes the path as configuration. A rho-gui Slack test had been opening the
+  user's own `~/.local/state/rho/slack.redb` because `rho-slack`'s `Session`
+  resolved that path by default and the test named none.
+  *`desk_view::desk_device`* asked `dirs::state_dir()` and had a
+  `#[cfg(test)]` branch beside it generating a fresh id so tests would not
+  collide. It now reads `mirror::state_dir()`, which only `main` ever sets —
+  so a test, which never sets it, has no file to persist to and gets a fresh
+  id per GUI. The guard was the rule written twice; deleting it is the whole
+  simplification. Two tests: that the id never reaches the user's state
+  directory, and that with a directory named it is written under that one.
+  *`rho-workspaces::sandbox_base`* did the same, and one of its own tests —
+  `creates_provenance_free_git_sandbox` — was making a sandbox under the
+  user's state directory as a result. `Repo` now holds
+  `state_dir: Option<Utf8PathBuf>`, named by `Repo::with_state_dir`, and
+  `sandbox_base` errors when it is absent with a message that names the rule
+  rather than falling back to a default. The daemon resolves it once beside
+  the database it already resolves and hands it down through `AgentRegistry`
+  and `AgentPool` to every `Repo` it opens. The test names a tempdir and now
+  asserts the sandbox is made under the directory the caller gave; it failed
+  before the fix, which is what makes it a test of the rule and not of the
+  path.
+  *Not a default that errors quietly:* a repo with no state directory cannot
+  make a sandbox at all, and says so. A `None` that silently fell back would
+  put the mistake back in the user's files, which is the thing being fixed.
+  Gate green: rho-gui 273 (2 new), rho-workspaces 11, rho-window 28,
+  rho-agent 100, `cargo fmt --check` clean.
+  Also in this commit, a correction to the history note above rather than a
+  landing of its own: eng-b8os has since found the rig crash's origin and it
+  is not what that note said.
+
 - **History under the golden rule, which is TikTok** (`rho-window`
   `history`, `rho-gui` `workspace`, rig sessions 99 and 100 on main
   `5c10ee56`). The user's rule, in their words: up (`f21`, `SurfaceBack`)
@@ -1515,8 +1549,20 @@ work on it.
   extends beyond row` into a row about 33 characters wide. Every frame after
   it is solid black, which is why a drive must read `application.log` and not
   only its frames. Logs kept at `rho-rigs/desk/logs/gui-20260907T101459.log`
-  and `/tmp/app-crash-session99.log`; eng-b8os has the mechanism (a display
-  snapshot painted against text an edit has since shortened) and it is theirs.
+  and `/tmp/app-crash-session99.log`. The origin is eng-b8os's and it is
+  theirs to fix: the block map's `block_map.rs:1406` assertion,
+  `new_transforms.summary().input_rows == wrap_snapshot.max_point().row() + 1`,
+  fails 60 against 62 — the transforms are built from wrap edits whose input
+  rows come up two short of the snapshot handed over beside them, and by the
+  time that reaches the element it is the 39 rows against 6 layouts above.
+  The assertion is compiled out of a profiling build, which is why the rig
+  sees the panic and not the assert. The `rope::chunk` errors and the
+  unsigned subtraction in `WrapSnapshot::line_len` are downstream of that
+  disagreement, not its cause; an earlier version of this note had them as
+  the mechanism and was wrong. It reproduces on `98ca1835`, so the
+  reader-rows commits reverted by `733a06c6` did not introduce it, and
+  streaming alone reproduces it with no width change at all. The drive above
+  is the acceptance test for the fix, at two failures in three runs.
   *Journeys.* J1 and J2 measured; see `USER-JOURNEYS.md`.
   Gate green: rho-gui 271 tests (5 new, in `crates/rho-gui/src/tests/history.rs`
   rather than appended to `tests.rs`), rho-window 28 (26 in `history`),

@@ -36,6 +36,9 @@ pub struct AgentPool {
     db: RhoDb,
     inference: Inference,
     path_overrides: PathOverrides,
+    /// Where sandboxes are made, named by the daemon rather than resolved
+    /// here: a library does not reach for the user's state directory.
+    state_dir: camino::Utf8PathBuf,
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// Loaded agents, least recently used first. Touched by every load.
@@ -120,6 +123,7 @@ impl AgentPool {
         db: RhoDb,
         inference: Inference,
         path_overrides: PathOverrides,
+        state_dir: camino::Utf8PathBuf,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare(&db).await;
@@ -132,6 +136,7 @@ impl AgentPool {
             db,
             inference: inference.clone(),
             path_overrides,
+            state_dir,
             user_environment,
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -701,12 +706,14 @@ impl AgentPool {
                 self.path_overrides.clone(),
                 self.user_environment.clone(),
             )?
+            .with_state_dir(self.state_dir.clone())
         } else {
             Repo::open_plain_with_environment(
                 root.as_std_path(),
                 self.path_overrides.clone(),
                 self.user_environment.clone(),
             )?
+            .with_state_dir(self.state_dir.clone())
         };
         let mut repos = self.repos.lock().await;
         Ok(match repos.entry(repo.root().to_owned()) {
