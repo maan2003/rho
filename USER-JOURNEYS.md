@@ -29,7 +29,15 @@ Jn  goal
 
     from:    anywhere, at the newest history entry
     end:     the next surface that asks for attention, point on the thing to answer
-    today:   pending measurement
+    today:   f20, 1 keystroke per item (rig session 99, on main 5c10ee56 plus the
+             history change). Three cards dealt with three presses: notes 174, 38,
+             138, each `surface_shown ... method deal` in the journal, each appended
+             so the list read len 4 with Home under them. Down at the newest is the
+             only way in: nothing else was pressed. Up from the dealt surface is
+             where the reader was, byte-identical (session 97). Meets target.
+             The deal that opens agent qws41uh6dpog's transcript killed the GUI on
+             two runs of three — an editor layout panic, not this journey's and not
+             this change's; see the landing note.
     target:  f20, 1 keystroke per item; the answer itself is the only other input
     rule:    down at the newest entry deals; the dealt surface is appended, so up
              from it is where the reader was; when nothing asks, down says so in the
@@ -39,7 +47,21 @@ Jn  goal
 
     from:    any surface reached through J1 or J3..J9
     end:     the same surface, byte-identical, point where it was
-    today:   pending measurement
+    today:   f21 x n then f20 x n, 2n keystrokes, every stop byte-identical
+             (rig session 99). Open A, B, C by dealing; `f21`, `f21`, `f20`, `f20`
+             gives B, A, B, C and **all four frames are byte-identical** to the
+             originals, against a no-input control that is byte-identical to itself.
+             The journal reads back, back, forward, forward at positions 2, 1, 2, 3
+             of 4. Across a context change (session 100): agent transcript
+             8gpri7fqusxg, Slack list, Slack conversation G1, then `f21`, `f21` —
+             the list then the transcript, both byte-identical, back walking out of
+             Slack and into the agent. A new open with the cursor mid-list
+             **appends and does not truncate**, which is what the old workspace
+             history at 81318e26 did. Meets target.
+             The cost before this change was one list per context, so a deal into a
+             new agent left back with nothing behind it; and a step to a dealt note
+             moved the title bar and not the point, so the reader was told they had
+             moved and shown the rows they were already reading.
     target:  f21 x n then f20 x n, 2n keystrokes, every pair byte-identical
     rule:    one list across contexts; back walks into the context the reader came
              from; a new open with the cursor mid-list behaves as the old workspace
@@ -79,7 +101,14 @@ Jn  goal
 
     from:    any surface
     end:     the same surface, byte-identical
-    today:   pending measurement
+    today:   space s u r then f21, 5 keystrokes (rig session 101, from Home).
+             The frame after `f21` is **byte-identical** to the frame before
+             `space`, against a no-input control that is byte-identical to itself.
+             Three charts deep — `space s u r`, `space s u c`, `space s u a`, 12
+             keystrokes — `f21` is still one keystroke and still byte-identical, and
+             the journal reads one `history_stepped back position 0 len 2` for each
+             return: the usage screen is one surface however many charts were drawn
+             on it. Meets target.
     target:  space s u r (a chart), f21: 5 keystrokes
     rule:    the usage screen is one surface; another chart redraws it, so back
              is one step regardless of how many charts were looked at

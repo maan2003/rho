@@ -245,6 +245,14 @@ history is a stack, and back returns the point to where it was. Everything
 below is an attempt to say what that means precisely enough to cut against,
 and what it costs.
 
+**The golden rule is TikTok.** In the user's words: up (`f21`, `SurfaceBack`)
+moves back through history; down (`f20`, `DealOpen`) moves forward through
+history if there is anything forward, and only when the reader is at the
+newest entry does down deal, opening the next thing that asks for attention
+and appending it. That is the whole spec of the two keys, and it is what the
+workspace did before the machine existed. There is no third key: dealing and
+history are the only next and previous.
+
 ### What a surface is, and what its identity is
 
 A surface is a place the reader can be. Today it is `Surface { key, view }`
@@ -270,57 +278,70 @@ crate's idea. What moves to `rho-window` is the machine that holds surfaces
 and their order, generic over the key the way `Pane<S>` already is. The
 window names no source type; that is the crate's whole rule.
 
-### What history is today, and what is wrong with it
+### What the old history did, and what a new open does
 
-There are two histories, which is the first defect.
+The user says this worked before the machine and must work again exactly as
+it did, so the old code is the specification. At `81318e26` the workspace
+held `surface_history: Vec<WarmSurface>` and a `history_cursor`. `SurfaceBack`
+ran `step_surface_back`, which moved the cursor back rather than popping;
+`step_surface_forward` moved it forward, and `cmd_surface_forward_or_deal`
+dealt when there was nothing forward. Those two were deleted by `0707dff59a6`
+on 4 September, which is when down stopped meaning forward.
 
-`Pane<S>` keeps a per-context `Vec<S>` and `back()` pops it. `show()` first
-does `history.retain(|c| *c != previous)`, so a push walks the whole stack.
+The named question, answered: `append_history` deduped by key, pushed at the
+end, and set the cursor to the end. **It did not truncate forward.** A new
+open with the cursor in the middle appended and left what was ahead of the
+reader behind them, still reachable by going back. The machine restores that,
+and it is a restoration rather than an invention.
 
-`Workspace` keeps a second one — `surface_history: Vec<WarmSurface>` with a
-`history_cursor` — and this is the one the keys actually reach:
-`SurfaceBack` runs `step_surface_back`, which moves the cursor rather than
-popping. `append_history` scans it with `position`, `remove`s the match, and
-pushes. Closing a surface scans it again; forgetting an agent scans both.
-
-So a push is O(entries) twice over, in two places that must agree about what
-happened, and the journal records both. Nothing walks either at draw time,
-which is the one half of the rule that already holds.
+The cost was the defect, not the behaviour. There were two histories that had
+to agree — `Pane<S>` kept a per-context `Vec<S>` whose `show()` did
+`history.retain(...)`, and the workspace kept its own — and `append_history`
+scanned with `position` and `remove`d the match, so a push was O(entries)
+twice over. Closing a surface scanned again; forgetting an agent scanned both.
+Nothing walked either at draw time, which is the one half of the rule that
+already held.
 
 ### What the history stack must cost
 
-Per event: **O(1)** to push, **O(1)** amortised to go back, **O(1)** when the
+Per event: **O(1)** to open, **O(1)** up, **O(1)** down, **O(1)** when the
 thing behind a surface dies. Per frame: **nothing** — the viewport draws the
-active surface's view and never reads the stack.
+active surface's view and never reads the list. And a rule the cost shape is
+not allowed to break: **no forward step is ever lost by the machine on its
+own.**
 
-The shape that gets there. Entries are appended and never removed from the
-middle: a push is a `Vec::push`. Dedupe is by a `HashMap<Key, usize>` holding
-the index of each key's latest entry, so pushing the same surface twice
-leaves a stale entry behind rather than paying a scan and a memmove to
-delete it. Going back pops and skips any entry whose index is not the one the
-map holds for its key — each stale entry is skipped at most once, which is
-what makes the amortised bound. A surface whose thing has gone is dropped by
-removing its key from the map, one operation at the moment of death rather
-than a scan of everything; its entries are then skipped like any other stale
-one. When stale entries outnumber live ones the stack compacts, which is O(n)
-against n pushes that paid for it.
+The shape that gets there is a list with a cursor, held as a slab: entries
+are `{ key, surface, prev, next, order }` in a `Vec<Option<Entry>>` with a
+free list, so a slot that is forgotten is used again rather than growing the
+list. `live: HashMap<Key, usize>` holds each live key's slot, which is what
+makes an open dedupe without a scan: opening a surface already in the list
+unlinks it from where it was and relinks it at the newest end, O(1) on both
+sides. Up and down follow `prev` and `next`, one hop. Forgetting by key is a
+map lookup and an unlink; if the reader is standing on the forgotten entry it
+is marked rather than removed, and dropped when they step off — a stale entry
+is skipped once and never twice.
 
-Ruled by eng-en1p under the Emacs rule: **history is per context** — a
-context is a task's window arrangement, which is Emacs's frame, and buffer
-history is per window within a frame, never across frames; a back that
-changes context moves two things at once, which breaks one key one meaning,
-and entering another surface's context and returning is that switch's own
-memory rather than a history entry. Named here so the user can reverse it by
-name.
+**Withdrawn: history is not per context.** eng-en1p's earlier ruling that
+history is per context, under the Emacs rule that buffer history is per
+window within a frame, is withdrawn by the user. History is one list across
+contexts again, as the old one was, so back walks into the context you came
+from. The user's words are the spec: back is TikTok's up, and what is behind
+you is behind you whatever it belongs to. The old code did this and the user
+wants it back; the per-context version made a deal into a new agent context
+start a fresh list, so back had nothing behind it and did nothing, which is
+what "history is broken" looked like from the desk.
 
-The measured numbers, from `rho_window::history`'s tests. At 1,000 entries a
-push touches one entry and rebuilds nothing; a back touches one entry, plus
-each stale or forgotten entry stepped over exactly once in the life of the
-stack; a forget touches no entries at all, only the map. The rebuild is the
-only O(n) event and it is rare: 1,000 distinct surfaces push with **zero**
-rebuilds, and the worst case for staleness — two surfaces alternating, 2,000
-pushes — rebuilds **142** times, once per fourteen pushes, leaving a stack of
-twelve entries for three reachable surfaces.
+Down at the newest entry is where dealing plugs in. The machine does not know
+what a card is: it reports `at_newest()`, and the workspace deals and appends
+the surface it opened. That is the only place the two meet.
+
+The measured numbers, from `rho_window::history`'s tests. One entry per live
+key: 1,001 opens of 1,001 distinct surfaces make a list of 1,001 entries, and
+2,000 opens alternating between two surfaces make a list of **three** — no
+compaction pass, because there is nothing stale to compact. A forget returns
+its slot to the free list and the next open takes it. Up then down is where
+the reader started, and an open with the cursor in the middle leaves the
+count ahead at zero and the count behind grown by what was ahead.
 
 ### What back restores, and what it does not
 
@@ -332,6 +353,21 @@ back to it. This is why note bodies already survive leaving and returning.
 Restoring by replay — remembering a line and a column and seeking to them —
 is the design this rejects, because it is a second copy of the truth that is
 wrong whenever the buffer changed underneath.
+
+There is one surface kind where keeping the view is not enough, and it is the
+commonest one on the desk. A dealt note is not its own view: `open_card`
+wraps a `SurfaceKey::DeskNode` around **the dashboard's own editor** and moves
+the dashboard's point to the node, so the whole of what distinguishes one note
+surface from another is where that one shared point is standing. Keeping the
+view keeps nothing, because every note surface keeps the same view. Stepping
+to such a surface out of history therefore has to put the point back the way
+the deal put it there. This is not a replay of a remembered line and column —
+it is the same `move_to_tree_node_when_ready(host, node_id)` call the open
+makes, addressed by node rather than by position, so it is right after the
+tree changed underneath. Without it back and forward changed the title bar
+and left the reader on the rows they were already reading: on the rig the
+frames at each stop differed only in the title row, 1,749 pixels of
+4,259,840, with the buffer beneath pixel-identical.
 
 It follows that what the stack stores is a handle, never the only copy of a
 view. Going back drops the machine's entry for the surface being left, so if

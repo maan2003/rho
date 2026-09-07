@@ -52,7 +52,17 @@ use crate::pane::SurfaceKey;
 
 /// One context's viewport and the stack behind it, over Rho's own surface
 /// identity. The machine is `rho-window`'s and names nothing above it.
-type SurfaceHistory = rho_window::history::History<SurfaceKey, Surface>;
+/// A surface in history, with the context it was opened in. History is one
+/// list across every context — the user's ruling — so an entry has to carry
+/// the context back with it, or walking back would land the reader on the
+/// right buffer in the wrong arrangement.
+#[derive(Clone)]
+pub(crate) struct WarmSurface {
+    pub(crate) context: ContextId,
+    pub(crate) surface: Surface,
+}
+
+type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
@@ -470,7 +480,10 @@ pub struct Workspace {
     /// of where the reader was in it. One machine, per context, because a
     /// back that changes context moves two things at once (eng-en1p's
     /// ruling under the Emacs rule; `RHO-WINDOW-DESIGN.md`).
-    contexts: HashMap<ContextId, SurfaceHistory>,
+    /// The one history: every surface the reader has been on, in the order
+    /// they were opened, with a cursor on where they are. `None` only
+    /// before the first surface is shown.
+    history: Option<SurfaceHistory>,
     /// Per-context surface list, the emacs buffer list: every surface
     /// opened in a context lives here for the context's lifetime,
     /// regardless of what its viewport currently displays. Covering one never
@@ -1083,7 +1096,7 @@ impl Workspace {
             agent_cost_days: 7,
             duration_timer: None,
             chime: Chime,
-            contexts: HashMap::new(),
+            history: None,
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             overview_open: false,
@@ -1251,11 +1264,8 @@ impl Workspace {
             self.pending_diff_loads.remove(&agent_id);
         }
         self.note_followed();
-        self.contexts
-            .retain(|context, _| !contexts.contains(context));
-        self.surfaces
-            .retain(|context, _| !contexts.contains(context));
-        if !self.contexts.contains_key(&self.active_context) {
+        self.forget_contexts(|context| !contexts.contains(context));
+        if !self.surfaces.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
             let draft = self.make_surface(SurfaceKey::Draft, window, cx);
             self.display_surface(draft, cx);
@@ -1304,35 +1314,73 @@ impl Workspace {
     }
 
     pub(crate) fn active_pane(&self) -> &SurfaceHistory {
-        self.contexts
-            .get(&self.active_context)
-            .expect("active context has a pane")
+        self.history.as_ref().expect("the reader is on a surface")
     }
 
     pub(crate) fn active_pane_mut(&mut self) -> &mut SurfaceHistory {
-        self.contexts
-            .get_mut(&self.active_context)
-            .expect("active context has a pane")
+        self.history.as_mut().expect("the reader is on a surface")
     }
 
-    /// Where the reader is in this context.
+    /// Where the reader is.
     pub(crate) fn active_surface(&self) -> &Surface {
-        self.active_pane().current()
+        &self.active_pane().current().surface
     }
 
-    /// Back one surface, or nowhere if this context has no history left.
+    /// Back one surface, or nowhere if the reader is at the oldest entry.
     ///
     /// The surface handed back is the one that was left, still holding its
     /// own point, scroll and folds — except a transcript whose agent has
     /// since been let go, which is rebuilt here because its view is gone
-    /// and nothing else would notice.
+    /// and nothing else would notice. History is one list across contexts,
+    /// so this walks into the context the reader came from, and takes them
+    /// with it.
     fn show_previous_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(surface) = self.active_pane_mut().back().cloned() else {
+        let Some(warm) = self.active_pane_mut().back().cloned() else {
             return false;
         };
-        let surface = self.warm_surface(surface, window, cx);
-        *self.active_pane_mut().current_mut() = surface.clone();
+        self.enter_warm_surface(warm, window, cx);
+        true
+    }
+
+    /// Forward one surface. `false` means the reader is at the newest entry,
+    /// which is where down deals instead — the golden rule.
+    fn show_next_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(warm) = self.active_pane_mut().forward().cloned() else {
+            return false;
+        };
+        self.enter_warm_surface(warm, window, cx);
+        true
+    }
+
+    fn enter_warm_surface(
+        &mut self,
+        warm: WarmSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_context = warm.context;
+        let surface = self.warm_surface(warm.surface, window, cx);
+        *self.active_pane_mut().current_mut() = WarmSurface {
+            context: warm.context,
+            surface: surface.clone(),
+        };
         self.overview_open = false;
+        // A dealt note's surface is the dashboard's own editor with the point
+        // moved to the node; nothing else about it is on screen. Stepping to
+        // it out of history has to put the point back the way `open_card`
+        // put it there, or the reader is told the surface changed and shown
+        // the rows they were already reading.
+        if let SurfaceKey::DeskNode { host, node_id } = &surface.key
+            && let SurfaceView::DeskNode(editor) = &surface.view
+            && editor.entity_id() == self.dashboard.editor().entity_id()
+        {
+            self.dashboard
+                .move_to_tree_node_when_ready(*host, node_id.clone());
+            // The pending cursor is consumed by the next composition, and a
+            // step through history is not otherwise one; `open_card` gets its
+            // composition from the deal that follows it.
+            self.refresh_dashboard(window, cx);
+        }
         self.ensure_surface_subscription(&surface.key, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
@@ -1341,7 +1389,6 @@ impl Workspace {
             method: crate::journal::SurfaceShowMethod::Mru,
         });
         cx.notify();
-        true
     }
 
     /// A surface out of history is only as live as what it holds. A
@@ -1404,7 +1451,7 @@ impl Workspace {
     /// the thing behind it is gone. Every context forgets it, because a
     /// dead surface is dead everywhere.
     fn forget_surface(&mut self, key: &SurfaceKey) {
-        for history in self.contexts.values_mut() {
+        if let Some(history) = self.history.as_mut() {
             history.forget(key);
         }
         crate::journal::record(crate::journal::Event::HistoryRemoved {
@@ -1650,14 +1697,38 @@ impl Workspace {
         if self.overview_open {
             return;
         }
-        let before = self.active_pane().reachable();
         if !self.show_previous_surface(window, cx) {
             return;
         }
         crate::journal::record(crate::journal::Event::HistoryStepped {
             direction: crate::journal::HistoryDirection::Back,
-            position: self.active_pane().reachable(),
-            len: before,
+            position: self.active_pane().behind(),
+            len: self.active_pane().len(),
+        });
+        cx.notify();
+    }
+
+    /// Down, the golden rule's half that moves: forward through history if
+    /// the reader has stepped back, and only at the newest entry does it
+    /// deal. Restored from the workspace that had it before `0707dff59a6`
+    /// made every down a pull.
+    pub(crate) fn cmd_surface_forward_or_deal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overview_open || self.active_pane().at_newest() {
+            self.pull_card(window, cx);
+            return;
+        }
+        if !self.show_next_surface(window, cx) {
+            self.pull_card(window, cx);
+            return;
+        }
+        crate::journal::record(crate::journal::Event::HistoryStepped {
+            direction: crate::journal::HistoryDirection::Forward,
+            position: self.active_pane().behind(),
+            len: self.active_pane().len(),
         });
         cx.notify();
     }
@@ -1815,11 +1886,29 @@ impl Workspace {
             ContextId::Agent(agent_id) => live.contains(agent_id),
             ContextId::Zulip | ContextId::Slack => true,
         };
-        self.contexts.retain(|context, _| keep(context));
-        self.surfaces.retain(|context, _| keep(context));
+        self.forget_contexts(keep);
         self.phone.retain_contexts(keep);
-        if !self.contexts.contains_key(&self.active_context) {
+        if !self.surfaces.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
+        }
+    }
+
+    /// A context is going: every surface it held leaves history with it.
+    /// One list means one place to say so, and a surface whose context is
+    /// gone is a place that no longer exists whatever its key says.
+    fn forget_contexts(&mut self, keep: impl Fn(&ContextId) -> bool) {
+        let mut gone = Vec::new();
+        self.surfaces.retain(|context, surfaces| {
+            if keep(context) {
+                return true;
+            }
+            gone.extend(surfaces.iter().map(|surface| surface.key.clone()));
+            false
+        });
+        if let Some(history) = self.history.as_mut() {
+            for key in gone {
+                history.forget(&key);
+            }
         }
     }
 
@@ -3905,14 +3994,14 @@ impl Workspace {
     /// unless they are on screen.
     fn activate_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let joined = self.active.touch(agent_id);
-        let shown = self
-            .contexts
-            .values()
-            .filter_map(|pane| match pane.current().key {
-                SurfaceKey::Transcript(agent_id) => Some(agent_id),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+        let shown = match self
+            .history
+            .as_ref()
+            .map(|history| &history.current().surface.key)
+        {
+            Some(SurfaceKey::Transcript(agent_id)) => HashSet::from([*agent_id]),
+            _ => HashSet::new(),
+        };
         let evicted = self.active.evict(|agent_id| shown.contains(&agent_id));
         for agent_id in &evicted {
             self.release_agent(*agent_id, cx);
@@ -3957,10 +4046,9 @@ impl Workspace {
         // it that is still in someone's history is rebuilt on the way back
         // (`warm_surface`). What leaves history is what has gone, not what
         // has been let go of.
-        let shown = self
-            .contexts
-            .values()
-            .any(|pane| pane.current().key == SurfaceKey::Transcript(agent_id));
+        let shown = self.history.as_ref().is_some_and(|history| {
+            history.current().surface.key == SurfaceKey::Transcript(agent_id)
+        });
         if shown {
             return;
         }
@@ -4817,7 +4905,7 @@ impl Workspace {
             )
         } else {
             let pane = self.active_pane();
-            let position = match &pane.current().view {
+            let position = match &pane.current().surface.view {
                 SurfaceView::Home(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
@@ -4861,7 +4949,7 @@ impl Workspace {
                 }
                 SurfaceView::Image(_) => 0,
             };
-            (Self::journal_surface(&pane.current().key), position)
+            (Self::journal_surface(&pane.current().surface.key), position)
         };
         self.scroll_journal_task = Some(cx.spawn(async move |_, cx| {
             cx.background_executor()
@@ -4922,7 +5010,6 @@ impl Workspace {
         method: crate::journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
-        use std::collections::hash_map::Entry;
         self.ensure_surface_subscription(&surface.key, cx);
         let list = self.surfaces.entry(self.active_context).or_default();
         match list.iter_mut().find(|s| **s == surface) {
@@ -4942,15 +5029,18 @@ impl Workspace {
         // The one push. Where the reader was goes on the stack and where
         // they are now is the current surface; how they got here is a
         // journal fact and not a different kind of history.
-        let shown = match self.contexts.entry(self.active_context) {
-            Entry::Vacant(entry) => {
-                entry.insert(SurfaceHistory::new(surface.key.clone(), surface.clone()));
+        let warm = WarmSurface {
+            context: self.active_context,
+            surface: surface.clone(),
+        };
+        let shown = match self.history.as_mut() {
+            None => {
+                self.history = Some(SurfaceHistory::new(surface.key.clone(), warm));
                 surface
             }
-            Entry::Occupied(entry) => {
-                let history = entry.into_mut();
-                history.show(surface.key.clone(), surface);
-                history.current().clone()
+            Some(history) => {
+                history.show(surface.key.clone(), warm);
+                history.current().surface.clone()
             }
         };
         self.overview_open = false;
@@ -4977,6 +5067,20 @@ impl Workspace {
             surface: Self::journal_surface(&shown.key),
             method,
         });
+    }
+
+    /// Put a surface at the head of history in a named context, without any
+    /// of the focus and subscription work `display_surface` does: the phone
+    /// walks its own stack and has already done the rest.
+    pub(crate) fn show_history_surface(&mut self, context: ContextId, surface: Surface) {
+        let warm = WarmSurface {
+            context,
+            surface: surface.clone(),
+        };
+        match self.history.as_mut() {
+            None => self.history = Some(SurfaceHistory::new(surface.key, warm)),
+            Some(history) => history.show(surface.key, warm),
+        }
     }
 
     fn ensure_surface_subscription(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
@@ -5477,13 +5581,14 @@ impl Workspace {
         // onto, so a test says the whole stack rather than its tail.
         for (position, name) in names.iter().rev().enumerate() {
             let surface = self.test_named_surface(name, cx);
+            let warm = WarmSurface {
+                context: self.active_context,
+                surface: surface.clone(),
+            };
             if position == 0 {
-                self.contexts.insert(
-                    self.active_context,
-                    SurfaceHistory::new(surface.key.clone(), surface),
-                );
+                self.history = Some(SurfaceHistory::new(surface.key, warm));
             } else {
-                self.active_pane_mut().show(surface.key.clone(), surface);
+                self.active_pane_mut().show(surface.key, warm);
             }
         }
         if !names.is_empty() {
@@ -5564,7 +5669,17 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn surface_history_for_test(&self) -> Vec<String> {
         self.active_pane()
-            .keys()
+            .keys_back()
+            .map(|key| self.surface_name(key))
+            .collect()
+    }
+
+    /// What down would step forward through, nearest first. Empty means the
+    /// reader is at the newest entry and down deals.
+    #[cfg(test)]
+    pub(crate) fn surface_history_ahead_for_test(&self) -> Vec<String> {
+        self.active_pane()
+            .keys_forward()
             .map(|key| self.surface_name(key))
             .collect()
     }
@@ -9873,7 +9988,7 @@ impl Render for Workspace {
                 this.step_surface_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
-                this.pull_card(window, cx);
+                this.cmd_surface_forward_or_deal(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealCloseAndNext, window, cx| {
                 this.close_current_surface(window, cx);

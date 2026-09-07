@@ -1408,6 +1408,120 @@ work on it.
 
 ### Landed
 
+- **History under the golden rule, which is TikTok** (`rho-window`
+  `history`, `rho-gui` `workspace`, rig sessions 99 and 100 on main
+  `5c10ee56`). The user's rule, in their words: up (`f21`, `SurfaceBack`)
+  moves back through history; down (`f20`, `DealOpen`) moves forward through
+  history if there is anything forward, and only when the reader is at the
+  newest entry does down deal, opening the next thing that asks for attention
+  and appending it. Dealing and history are the only next and previous.
+  *Two faults, and they are not the same fault.* The first: history was one
+  list per context, so dealing into a new agent's context started a fresh
+  list and back had nothing behind it. That was eng-en1p's ruling under the
+  Emacs rule and the user has withdrawn it — history is one list across
+  contexts again, as the old one was, so back walks into the context you came
+  from. The second, which the first was hiding: a dealt note's surface is not
+  its own view. `open_card` wraps a `SurfaceKey::DeskNode` around **the
+  dashboard's own editor** and moves the dashboard's point to the node, so
+  the whole of what distinguishes one note surface from another is where that
+  one shared point stands; `enter_warm_surface` restored the key, the title,
+  the focus and the journal record and never moved the point. Back and
+  forward changed the title bar and left the reader on the rows they were
+  already reading. On the rig the frames at each stop differed in the title
+  row alone — 1,749 pixels of 4,259,840, rows 17..45 — with the buffer
+  beneath pixel-identical. On a desk where most cards are notes that is what
+  "history is broken" looks like. Fixed by making a step do what the open
+  does: `move_to_tree_node_when_ready(host, node_id)`, addressed by node
+  rather than by position, so it is right after the tree changed underneath.
+  *What a new open does with the cursor in the middle, named.* The old
+  `append_history` at `81318e26` deduped by key, pushed at the end and set
+  the cursor to the end. It **appended and did not truncate**: what was ahead
+  of the reader stayed behind them, still reachable. The machine restores
+  that. `step_surface_forward` and `cmd_surface_forward_or_deal` existed and
+  were deleted by `0707dff59a6` on 4 September, which is when down stopped
+  meaning forward; this is a restoration, not an invention.
+  *The machine.* A list with a cursor held as a slab — entries
+  `{key, surface, prev, next, order}` in a `Vec<Option<Entry>>` with a free
+  list, `live: HashMap<Key, usize>` for the dedupe. O(1) open, O(1) up, O(1)
+  down, O(1) forget by key, nothing per frame, and no forward step lost by
+  the machine on its own. 1,001 distinct opens make 1,001 entries; 2,000
+  opens alternating between two surfaces make **three**. Down at the newest
+  entry is the only place the two halves meet: the machine reports
+  `at_newest()` and the workspace deals.
+  *The proof, session 99, first opens named, against a no-input control.*
+  Three cards dealt with `f20` — note 174 (A), note 38 (B), note 138 (C).
+  Control on C, two frames 1.5 s apart: **byte-identical**. Then `f21`,
+  `f21`, `f20`, `f20`: **up1 == B, up2 == A, dn1 == B, dn2 == C, every one
+  byte-identical**, and the journal reads back/back/forward/forward at
+  positions 2, 1, 2, 3 of 4. `f20` once more at C deals — journal `dealer`
+  verdict on 138 then `surface_shown transcript qws41uh6dpog method deal` —
+  and in session 97, the same drive on the same code, `f21` from there is C
+  **byte-identical**.
+  *The same across a context change, session 100.* Home, `enter` into agent
+  `8gpri7fqusxg`'s transcript, control byte-identical; `space shift-s o` to
+  the Slack list, `gg`, `enter` into Slack conversation `G1`; `f21` is the
+  Slack list **byte-identical**, `f21` again is the agent's transcript
+  **byte-identical**. The journal names each one and reads back to position 2
+  then 1 of 4. Back walked out of Slack and into the agent, which is the
+  withdrawn ruling's opposite and the user's rule.
+  *Which key reaches which action.* `lib.rs` binds `f21` only under
+  `"RhoGui"`, while `f20`, `f16`, `ctrl-k` and `ctrl-j` are bound under both
+  `"RhoGui"` and `"RhoGui > Editor"`. **The difference does not matter in
+  practice**, and the reason is worth writing down: bare `"RhoGui"` matches
+  only where `RhoGui` is innermost, which is the root node, so a key bound
+  there is reached by bubbling; `"RhoGui > Editor"` matches wherever an
+  `Editor` is innermost under `RhoGui`, which is every editor-hosting
+  surface, and gpui prefers the deeper match. The Editor-depth bindings exist
+  for `ctrl-k` and `ctrl-j` *because the bundled keymaps bind them there* —
+  `default-linux.json:405-406` and `vim.json:1290-1291` bind them to
+  `AgentPrevious` and `AgentNext` under `"RhoGui > Editor"` — and the
+  override must be at the same depth to win. `f20` and `f16` have no bundled
+  binding at any depth, so their Editor-depth bindings are redundant, and
+  `f21`'s absence there costs nothing: nothing between an editor and the root
+  binds or consumes it. When `AgentNext` and `AgentPrevious` are deleted the
+  Editor-depth overrides for the two chords can go with them.
+
+  | context | f21 | f20 | f16 | ctrl-k | ctrl-j |
+  | --- | --- | --- | --- | --- | --- |
+  | `RhoGui` alone | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoGui > Editor` | SurfaceBack (at the root) | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoDashboard`, `RhoNote` (the map, a dealt note) | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | `RhoTranscript` (an agent) | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoHome` | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoSlackList` | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | Slack conversation (no context of its own; an `Editor`) | SurfaceBack ✓ | DealOpen | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | messages | SurfaceBack ✓ | DealOpen | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | `RhoUsage` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoDraft` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoMinibuffer` | SurfaceBack (bubbles past it) | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoTerminalNormal` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoTerminal` (raw) | **nothing** | **nothing** | **nothing** | **nothing** | **nothing** |
+
+  ✓ marks a row driven on the rig and read back from the action journal
+  (sessions 95, 97, 99, 100); the rest are read from the bindings and gpui's
+  dispatch rule. The raw-terminal row is read from `terminal_view.rs:159`
+  and `:732`: in raw mode every `f<number>` and every `ctrl-<ascii>` matches
+  `probably_produces_bytes`, so the keystroke goes to the pty and
+  `cx.stop_propagation()` is called. All five keys are swallowed alike, which
+  is the terminal doing its job — a raw terminal that stole `f21` for the
+  window could not run a program that wants it. That row is the one in the
+  table not yet driven and is worth a case.
+  *A crash seen on the rig, not this change's and not fixed here.* Twice out
+  of three runs, the deal at the end of the drive killed the GUI:
+  `editor::element: bug: line_ix 38 is out of bounds - row_infos.len(): 39,
+  line_layouts.len(): 6, crease_trailers.len(): 39`, then a panic at
+  `vendor/zed/crates/editor/src/element.rs:1118` indexing `line_layouts` for
+  the cursor row, preceded by a burst of `rope::chunk: point Point(0:49)
+  extends beyond row` into a row about 33 characters wide. Every frame after
+  it is solid black, which is why a drive must read `application.log` and not
+  only its frames. Logs kept at `rho-rigs/desk/logs/gui-20260907T101459.log`
+  and `/tmp/app-crash-session99.log`; eng-b8os has the mechanism (a display
+  snapshot painted against text an edit has since shortened) and it is theirs.
+  *Journeys.* J1 and J2 measured; see `USER-JOURNEYS.md`.
+  Gate green: rho-gui 271 tests (5 new, in `crates/rho-gui/src/tests/history.rs`
+  rather than appended to `tests.rs`), rho-window 28 (26 in `history`),
+  `cargo fmt --check` clean.
+
 - **The pictures for the transient at the bottom and the usage charts**
   (rig session 93, main `d671995e`, frames in
   `rho-rigs/sweep/frames/s93-*.png`). Owed with the two commits before this

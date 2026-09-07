@@ -19,6 +19,7 @@ use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
+mod history;
 mod story;
 use rho_agents::HostId;
 

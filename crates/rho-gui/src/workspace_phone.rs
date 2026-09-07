@@ -524,9 +524,7 @@ impl Workspace {
             return;
         };
         self.active_context = context;
-        if let Some(pane) = self.contexts.get_mut(&context) {
-            pane.show(surface.key.clone(), surface);
-        }
+        self.show_history_surface(context, surface);
         self.sync_selection_to_focus(cx);
         window.focus(&self.phone.dashboard_focus, cx);
     }
@@ -553,11 +551,10 @@ impl Workspace {
             let Some((context, key)) = self.phone.stack.last().cloned() else {
                 break None;
             };
-            let valid = self.contexts.contains_key(&context)
-                && self
-                    .surfaces
-                    .get(&context)
-                    .is_some_and(|surfaces| surfaces.iter().any(|surface| surface.key == key));
+            let valid = self
+                .surfaces
+                .get(&context)
+                .is_some_and(|surfaces| surfaces.iter().any(|surface| surface.key == key));
             if valid {
                 break Some((context, key));
             }
@@ -580,9 +577,7 @@ impl Workspace {
             .and_then(|surfaces| surfaces.iter().find(|surface| surface.key == key))
             .cloned()
         {
-            if let Some(pane) = self.contexts.get_mut(&context) {
-                pane.show(surface.key.clone(), surface);
-            }
+            self.show_history_surface(context, surface);
             self.sync_selection_to_focus(cx);
             self.focus_active_surface(window, cx);
         }
