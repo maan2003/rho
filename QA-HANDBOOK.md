@@ -300,6 +300,120 @@ steps; it does not compare them. Two runs of "the 09:12 recipe" with different
 step counts are two different drives whatever they are called, and the count
 beside the name is what makes that visible.
 
+**And it does not tell you a rig is idle.** A rig with no drive named writes
+no drive log at all, so a session nobody ever drove and a session someone is
+using look identical from the outside — same processes, same directory, same
+`rig status`. One was found on the desk host with sway, the profiling daemon
+and fake-slack up for 2h19m, and the only thing that distinguished it from a
+live session was that the newest screenshot was from the day before. That is
+too thin a thread to take a rig down on, and the next person will not think
+to pull it. Until the log carries a heartbeat rather than only named steps,
+**say in the session notes when you take a rig and when you are done with
+it**, because the rig cannot say it for you.
+
+### R8. A binary that will not start: read its linker before anything else
+
+If a rho-gui binary dies before the loader says anything — no panic, no
+message, nothing from `main` — **check which linker built it, first, with one
+command**:
+
+```
+strings -n 8 <binary> | grep '^Linker:'
+```
+
+If it says `Wild 0.10.0`, that is a known defect already written down in this
+tree and nothing to do with your code. `.cargo/config.toml` describes it in
+the comment above `[target.x86_64-unknown-linux-gnu]`, and GUI-CRATES-DESIGN
+has it under "The linker, not the size": wild lays a big binary out so that
+PT_DYNAMIC's `p_offset` lands sixteen bytes before the bytes of `.dynamic`, so
+the loader stops on the first entry and the program never reaches `main`. It
+is **the layout, not the size** — the binary that starts can be the larger of
+the two. Confirm without running anything: `ld.so --list <binary>` faults on
+its own, execve, brk, one mmap, then a fault at address 0x8.
+
+**The trap is that this differs per shell, so "it works for me" proves
+nothing.** `.cargo/config.toml` names mold, but a target-section rustflags is
+*replaced*, not merged, by
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which the devshell exports.
+Two engineers on the same commit found different values in that variable on
+the same afternoon — one mold, one wild — and only the wild one saw the
+failure. Check your own before concluding anything about a tree:
+
+```
+echo $CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+```
+
+Two things not to try. The committed `-Clink-arg=-fuse-ld=mold` does **not**
+work with the clang wrapper in this shell (`invalid linker name in argument`),
+so the config as written would not save you if the variable were unset; the
+working form is `--ld-path=<absolute path to mold>`. And appending flags with
+`cargo rustc` does not beat the variable's own `--ld-path` — the variable
+itself has to change, which is a devshell fix and not a code fix.
+
+Found and diagnosed by eng-bgkw, who also corrected the first version of this
+rule: it was written as "the workspace build and the per-package build are two
+different artifacts, only one of which will not start". That framing was
+wrong. The per-package binary flipped to failing as soon as another small edit
+changed the layout, and the split was never the cause — which is itself R9,
+one artifact standing in for the property being measured.
+
+### R9. The measurement that comes to hand is not the measurement of the thing
+
+Five of these happened in one afternoon, by three engineers, none of whom
+noticed it was the same mistake until the fourth:
+
+| what was read | what it was |
+|---|---|
+| `du` said 2.1T of cargo cache on a 1.4T device | `du` counts a reflinked extent once per file pointing at it, so it was not a space figure at all |
+| `du -sh ~/.cargo` said 0 | `~/.cargo` is a **symlink** onto the build device; `du -sh` measured the link |
+| a sweep's output file was empty and the disk had just filled | the run had **finished, exit 0, with results** — the whole run was piped through `awk`, which writes nothing until the pipeline ends |
+| `df -h /` said 616G free while builds failed `No space left on device` | the build directory is a **separate loop device**, 100% full |
+| a sweep counted markers with `grep -c '^SWEEP-ACCOUNTING$'` and found one | under `--nocapture` the harness prints `test tests::foo ... ` **with no newline**, so a test's own stderr continues that line and no anchored pattern sees it. Unanchored, the same file: four |
+
+The fourth one is the one to lead with, because it is the only one with a
+number on both sides: `du` said the desk rig was 64G, `df` before and after
+deleting it said it returned **19.8 GiB**. An overcount of 3.2x, measured. An
+argument that a figure might be wrong is worth much less than a figure that
+was wrong by 3.2x and a second figure that says so.
+
+The fifth is the sharpest, because the second instrument was not a different
+tool at all — it was **the same log, read without the anchor**. One character
+of regex stood between a right answer and a wrong one, and the wrong one was
+used to retract a finding that was correct. The three tests it wrongly cleared
+fail on main today.
+
+It carries a second lesson the other four do not. The measurement that would
+have settled it outright was to run the three tests and read the assertion,
+which takes twenty seconds; instead a whole experiment was built on top of the
+bad read. **When a direct measurement of the thing is available and cheap,
+take it before building an experiment that infers it.** The experiment's own
+result was true and proved nothing, because the other half of the comparison
+had never been established directly.
+
+**The rule is not "distrust your measurements", which nobody can act on. It
+is: when a measurement is load-bearing, take a second one of a different kind
+before you report it.** Every one of the five above had a second instrument
+available that would have answered directly and cost seconds — `df` beside
+`du`, `ls -l` beside `du -sh` on any path that might be a link, an exit code
+or a `wc -l` beside an empty output file, the same grep without its anchor,
+`bcachefs fs usage` beside all of them. Three minutes would have bought all
+five.
+
+Two specific corollaries worth naming, because they recur here:
+
+- **On this filesystem, no `du` figure is a space figure.** jj workspaces are
+  copy-on-write, so build artefacts share extents. The only way to learn what
+  a candidate is worth is to delete it and re-read `df` — which is an argument
+  for deleting one thing at a time, not for deleting the biggest `du` line.
+- **The healthy-looking number is the one a person reaches for by reflex.**
+  Nobody runs `df` on the build directory; they run it on `/`, see a large
+  number, and go looking in the code for an hour. That is what made the loop
+  device cost an afternoon rather than a minute.
+
+Credit: eng-b8os found the reflink cause and the reflex point and set the
+"second instrument of a different kind" rule; the 3.2x measurement is
+eng-8gpr's.
+
 ## The cases
 
 ### C1. Dealing after a restart
