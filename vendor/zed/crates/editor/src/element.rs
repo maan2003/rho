@@ -19,7 +19,7 @@ use crate::{
     RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint, column_pixels,
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
-        HighlightKey, HighlightedChunk, ToDisplayPoint, WrapPriority,
+        HighlightKey, HighlightedChunk, ToDisplayPoint,
     },
     editor_settings::{
         CurrentLineHighlight, DocumentColorsRenderMode, Minimap, MinimapThumb, MinimapThumbBorder,
@@ -8544,14 +8544,7 @@ impl Element for EditorElement {
                                 {
                                     editor.defer_paint_until_initial_wrap = false;
                                 }
-                                // The rows on this screen are laid out at the
-                                // new width before the call returns; the rest
-                                // of the document follows in the background,
-                                // so a width change costs the reader a screen
-                                // and not a document.
-                                let priority =
-                                    reader_rows(&snapshot, bounds.size.height, line_height);
-                                let snapshot = if editor.set_wrap_width(wrap_width, priority, cx) {
+                                let snapshot = if editor.set_wrap_width(wrap_width, cx) {
                                     editor.snapshot(window, cx)
                                 } else {
                                     snapshot
@@ -11306,32 +11299,6 @@ pub fn register_action<T: Action>(
 
 /// Shared between `prepaint` and `compute_auto_height_layout` to ensure
 /// both full and auto-height editors compute wrap widths consistently.
-/// The buffer rows in front of a reader, with a screen of margin above and
-/// below them.
-///
-/// The margin is what keeps a small scroll from finding rows that are still
-/// laid out at the width before this one: by the time the reader gets to a
-/// row, the pass has already been there. Display rows are what a screen is
-/// measured in and buffer rows are what survives the pass that is about to
-/// change what a display row means, so the range is converted here.
-fn reader_rows(snapshot: &EditorSnapshot, height: Pixels, line_height: Pixels) -> WrapPriority {
-    if line_height <= px(0.) {
-        return WrapPriority::DocumentOrder;
-    }
-    let visible_rows = f64::from(height / line_height).ceil() as u32 + 1;
-    let scroll_top = snapshot.scroll_position().y.max(0.) as u32;
-    let max_row = snapshot.max_point().row().0;
-    let first = DisplayRow(scroll_top.saturating_sub(visible_rows).min(max_row));
-    let last = DisplayRow(scroll_top.saturating_add(2 * visible_rows).min(max_row));
-    let start = snapshot
-        .display_point_to_point(DisplayPoint::new(first, 0), Bias::Left)
-        .row;
-    let end = snapshot
-        .display_point_to_point(DisplayPoint::new(last, 0), Bias::Right)
-        .row;
-    WrapPriority::ReaderRows(MultiBufferRow(start)..MultiBufferRow(end))
-}
-
 fn calculate_wrap_width(
     soft_wrap: SoftWrap,
     editor_width: Pixels,
@@ -11383,9 +11350,7 @@ fn compute_auto_height_layout(
     let editor_width = text_width - gutter_dimensions.margin - overscroll.width - em_width;
     let wrap_width = calculate_wrap_width(editor.soft_wrap_mode(cx), editor_width, em_width)
         .map(|width| width.min(editor_width));
-    // A measuring pass has no screen in front of it: it is asking how tall
-    // the editor would be, and every row counts towards the answer.
-    if wrap_width.is_some() && editor.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx) {
+    if wrap_width.is_some() && editor.set_wrap_width(wrap_width, cx) {
         snapshot = editor.snapshot(window, cx);
     }
 
@@ -12842,7 +12807,7 @@ mod tests {
         window
             .update(cx, |editor, _, cx| {
                 editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
-                editor.set_wrap_width(Some(editor_width), WrapPriority::DocumentOrder, cx);
+                editor.set_wrap_width(Some(editor_width), cx);
                 editor.set_show_line_numbers(show_line_numbers, cx);
             })
             .unwrap();

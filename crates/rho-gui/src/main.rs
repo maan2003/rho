@@ -459,7 +459,6 @@ fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
         gpui::profiler::EditorTimingKind::WrapMapSync => "wrap_map_sync",
         gpui::profiler::EditorTimingKind::BlockMapSync => "block_map_sync",
         gpui::profiler::EditorTimingKind::WrapMapUpdate => "wrap_map_update",
-        gpui::profiler::EditorTimingKind::WrapMapRewrap => "wrap_map_rewrap",
     }
 }
 

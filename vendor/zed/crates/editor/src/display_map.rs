@@ -100,10 +100,10 @@ pub use invisibles::{is_invisible, replacement};
 #[cfg(feature = "wrap-test-support")]
 pub use tab_map::TabEdit;
 #[cfg(feature = "wrap-test-support")]
-pub use wrap_map::WrapSyncTrace;
-pub use wrap_map::{WrapPoint, WrapPriority, WrapRow, WrapSnapshot};
+pub use wrap_map::WrapSyncRecord;
 #[cfg(feature = "wrap-test-support")]
-pub use wrap_map::{WrapQueueState, WrapSyncRecord};
+pub use wrap_map::WrapSyncTrace;
+pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
 use gpui::{
@@ -399,12 +399,6 @@ impl DisplayMap {
     ) -> Vec<(Option<Pixels>, Option<Pixels>)> {
         self.wrap_map
             .update(cx, |wrap_map, _| wrap_map.take_wrap_width_changes())
-    }
-
-    /// See [`wrap_map::WrapMap::queue_state`].
-    #[cfg(feature = "wrap-test-support")]
-    pub fn wrap_queue_state(&self, cx: &gpui::App) -> wrap_map::WrapQueueState {
-        self.wrap_map.read(cx).queue_state()
     }
 
     /// See [`wrap_map::WrapSyncRecord`].
@@ -1515,24 +1509,9 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_font_with_size(font, font_size, cx))
     }
 
-    /// Sets the width rows wrap at, and which rows are laid out at it first.
-    ///
-    /// See [`WrapPriority`]: a caller with a screen in front of it passes the
-    /// rows on that screen, and a caller with none says so.
-    pub fn set_wrap_width(
-        &self,
-        width: Option<Pixels>,
-        priority: WrapPriority,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn set_wrap_width(&self, width: Option<Pixels>, cx: &mut Context<Self>) -> bool {
         self.wrap_map
-            .update(cx, |map, cx| map.set_wrap_width(width, priority, cx))
-    }
-
-    /// True while rows outside the reader's are still being laid out at the
-    /// current wrap width.
-    pub fn is_backfilling_wrap(&self, cx: &gpui::App) -> bool {
-        self.wrap_map.read(cx).is_backfilling()
+            .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
     #[instrument(skip_all)]
@@ -3326,9 +3305,7 @@ pub mod tests {
                         Some(px(rng.random_range(0.0..=max_wrap_width)))
                     };
                     log::info!("setting wrap width to {:?}", wrap_width);
-                    map.update(cx, |map, cx| {
-                        map.set_wrap_width(wrap_width, WrapPriority::DocumentOrder, cx)
-                    });
+                    map.update(cx, |map, cx| map.set_wrap_width(wrap_width, cx));
                 }
                 20..=29 => {
                     let mut tab_sizes = vec![1, 2, 3, 4];
