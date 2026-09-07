@@ -570,7 +570,7 @@ fn short(name: &str) -> String {
             _ => {}
         }
     }
-    let out = out.replace(" as ", " as ").replace("::{{closure}}", "");
+    let out = out.replace("::{{closure}}", "");
     let trimmed = out.trim_matches(|c| c == ':' || c == ' ');
     let parts: Vec<&str> = trimmed
         .split("::")

@@ -2089,6 +2089,39 @@ event, which is the next commit. And the transcript's own prepaint, p50
 5.1 ms, is still unexplained: the profile cannot see it because this function
 swamped it, and no frame in the report records how many rows it drew.
 
+
+- **The fake model is now a provider, not a mocked agent loop**
+  (`rho-fake-model`, `rho-inference`, `rho-daemon`, and the
+  `rho-qa fake-model-proof` harness). The fake speaks the same Responses
+  WebSocket/HTTP and Anthropic Messages SSE protocols as production clients.
+  Its seeded personas stream reasoning, text, compaction and function/custom
+  tool calls, including large code-mode programs and shell results; terminal
+  faults and pacing are typed configuration. The output-size generator is a
+  chosen synthetic heavy tail, not an inferred corpus histogram: the source
+  survey established a roughly 227-byte median, mean/median near 18 and
+  p90/max landmarks, but no distribution between them. Parallel calls are an
+  explicit stress setting and default to one because the one-user survey's
+  1.01 results per Sent chiefly says batching was rare.
+  The proof creates no fake runtime path. It starts the fake binary and the
+  real daemon with an isolated synthetic credential, creates 20 native agents
+  through the real UI protocol, lets their real code-mode exec tools run in a
+  temporary jj workspace for one minute, follows the daemon journal, reads
+  every reply body back through `Detail`, and compares the follower's final
+  head with a fresh daemon reader. Global journal sequence and every per-agent
+  story position were dense through head 9,895; the client observed 1,975
+  completed agent replies. The whole process ran in a fresh network namespace
+  whose procfs network view contained only loopback, with no other TCP server,
+  so no live model or other outbound connection was possible.
+  On the required 60-second, 20-agent run the server completed 3,950 requests,
+  sustained **65.83 turns/s**, and streamed **14,807,204 bytes**.
+  End-to-end `Sent`-to-`Replied` request latency was **53 ms p50** and
+  **132 ms p99**. At 20 active agents the fake's RSS was **42,476 KiB** and
+  the daemon's was **194,100 KiB**. A 10-second preflight independently
+  completed 700 requests at 70.00 turns/s, streamed 2,520,506 bytes, measured
+  46/157 ms p50/p99, and ended at journal head 1,770.
+  Gate green: rho-fake-model 2 tests, rho-qa proof helpers 2 tests, clippy
+  `-D warnings` for both crates, and `cargo fmt --check` clean.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

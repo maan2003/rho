@@ -32,11 +32,10 @@ async fn openai_websocket_is_deterministic_and_continues_after_tool_result() {
         "tools":[{"type":"custom","name":"exec"}]
     }).to_string().into())).await.unwrap();
     let second = read_turn(&mut socket).await;
-    assert!(
-        second
-            .iter()
-            .any(|event| event["type"] == "response.output_text.delta")
-    );
+    assert!(second.iter().any(|event| matches!(
+        event["type"].as_str(),
+        Some("response.output_text.delta" | "response.custom_tool_call_input.delta")
+    )));
     assert_eq!(server.metrics().completed_turns, 2);
     server.shutdown().await.unwrap();
 }

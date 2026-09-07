@@ -16,6 +16,7 @@
 //!   `--iroh`.
 
 mod build;
+mod fake_model_proof;
 mod paths;
 mod profile;
 mod rig;
@@ -42,6 +43,8 @@ enum Command {
     Build(rig::BuildArgs),
     /// Run a fake Slack fed from a copy of a real mirror.
     FakeSlack(slack::FakeSlackArgs),
+    /// Exercise twenty native agents against the isolated fake provider.
+    FakeModelProof(fake_model_proof::Args),
     /// Copy the live state into a named, dated snapshot and verify it.
     Snapshot(snapshot::SnapshotArgs),
     /// List the snapshots taken so far.
@@ -61,6 +64,7 @@ fn main() -> Result<()> {
     match Args::parse().command {
         Command::Build(args) => rig::build(args),
         Command::FakeSlack(args) => slack::run(args),
+        Command::FakeModelProof(args) => fake_model_proof::run(args),
         Command::Snapshot(args) => snapshot::take(args),
         Command::Snapshots => snapshot::list(),
         Command::Profile { path } => {

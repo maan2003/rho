@@ -15,6 +15,9 @@ struct Args {
     bind: SocketAddr,
     #[arg(long)]
     wall_clock_timing: bool,
+    /// Disable injected terminal faults for throughput/proof runs.
+    #[arg(long)]
+    no_faults: bool,
 }
 
 #[tokio::main]
@@ -24,6 +27,12 @@ async fn main() -> anyhow::Result<()> {
     config.bind = args.bind;
     if args.wall_clock_timing {
         config.timing.mode = TimingMode::Timed;
+    }
+    if args.no_faults {
+        config.distribution.rate_limit_bps = 0;
+        config.distribution.usage_limit_bps = 0;
+        config.distribution.overload_bps = 0;
+        config.distribution.disconnect_bps = 0;
     }
     let model = FakeModel::start(config).await?;
     println!(

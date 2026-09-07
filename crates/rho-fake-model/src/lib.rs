@@ -69,6 +69,9 @@ pub struct PersonaDistribution {
     pub min_chunk_bytes: usize,
     pub max_chunk_bytes: usize,
     pub large_tool_body_bytes: usize,
+    /// Calls emitted together when a persona chooses tools. Keep this at one
+    /// for corpus-shaped traffic; raise it deliberately to stress batching.
+    pub parallel_tool_calls: usize,
     pub forced_outcome: Option<TerminalOutcome>,
     /// Per-ten-thousand rates, sampled deterministically per request.
     pub rate_limit_bps: u16,
@@ -83,6 +86,7 @@ impl Default for PersonaDistribution {
             min_chunk_bytes: 12,
             max_chunk_bytes: 96,
             large_tool_body_bytes: 13_097,
+            parallel_tool_calls: 1,
             forced_outcome: None,
             rate_limit_bps: 30,
             usage_limit_bps: 10,
@@ -410,37 +414,19 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
     if asks_compaction {
         events.push(json!({"type":"response.output_item.added","output_index":0,"item":{"type":"compaction","id":format!("cmp_{request_number}")}}));
         events.push(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"compaction","id":format!("cmp_{request_number}"),"encrypted_content":format!("fake-compaction-{}-{request_number}",state.config.seed)}}));
-    } else if !has_tool_result && !request.tools.is_empty() {
+    } else if !request.tools.is_empty()
+        && (!has_tool_result || !mix(state.config.seed ^ request_number).is_multiple_of(20))
+    {
         append_reasoning(&mut events, request_number, 0);
         let tool = &request.tools
             [(mix(state.config.seed ^ request_number) as usize) % request.tools.len()];
-        let custom = tool.kind == "custom";
-        let item_type = if custom {
-            "custom_tool_call"
-        } else {
-            "function_call"
-        };
-        let delta_type = if custom {
-            "response.custom_tool_call_input.delta"
-        } else {
-            "response.function_call_arguments.delta"
-        };
-        let id = if custom {
-            format!("ctc_fake_{request_number}")
-        } else {
-            format!("fc_fake_{request_number}")
-        };
-        let call_id = format!("call_fake_{request_number}");
-        let arguments = tool_arguments(
-            tool,
-            state.config.distribution.large_tool_body_bytes,
-            request_number,
-        );
-        events.push(json!({"type":"response.output_item.added","output_index":1,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
-        for chunk in chunks(&arguments, &state.config, request_number) {
-            events.push(json!({"type":delta_type,"output_index":1,"delta":chunk}));
+        // One call at nearly every boundary approximates the observed
+        // results-per-Sent near one. That number came from one user's history
+        // and chiefly says batching was rare; batching is an explicit stress
+        // control rather than something this synthetic distribution invents.
+        for offset in 0..state.config.distribution.parallel_tool_calls.max(1) {
+            append_tool_call(&mut events, state, request_number, offset + 1, tool);
         }
-        events.push(json!({"type":"response.output_item.done","output_index":1,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
     } else {
         append_reasoning(&mut events, request_number, 0);
         let text = persona_text(state.config.seed, request_number, request);
@@ -456,6 +442,42 @@ fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -
     events
 }
 
+fn append_tool_call(
+    events: &mut Vec<Value>,
+    state: &AppState,
+    request_number: u64,
+    output_index: usize,
+    tool: &ProviderTool,
+) {
+    let custom = tool.kind == "custom";
+    let item_type = if custom {
+        "custom_tool_call"
+    } else {
+        "function_call"
+    };
+    let delta_type = if custom {
+        "response.custom_tool_call_input.delta"
+    } else {
+        "response.function_call_arguments.delta"
+    };
+    let id = if custom {
+        format!("ctc_fake_{request_number}_{output_index}")
+    } else {
+        format!("fc_fake_{request_number}_{output_index}")
+    };
+    let call_id = format!("call_fake_{request_number}_{output_index}");
+    let arguments = tool_arguments(
+        tool,
+        state.config.distribution.large_tool_body_bytes,
+        request_number ^ output_index as u64,
+    );
+    events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
+    for chunk in chunks(&arguments, &state.config, request_number) {
+        events.push(json!({"type":delta_type,"output_index":output_index,"delta":chunk}));
+    }
+    events.push(json!({"type":"response.output_item.done","output_index":output_index,"item":{"type":item_type,"id":id,"call_id":call_id,"name":tool.name}}));
+}
+
 fn append_reasoning(events: &mut Vec<Value>, request_number: u64, output_index: usize) {
     let id = format!("rs_fake_{request_number}");
     events.push(json!({"type":"response.output_item.added","output_index":output_index,"item":{"type":"reasoning","id":id}}));
@@ -466,18 +488,28 @@ fn append_reasoning(events: &mut Vec<Value>, request_number: u64, output_index: 
 fn tool_arguments(tool: &ProviderTool, size: usize, request_number: u64) -> String {
     if tool.kind == "custom" || tool.name == "exec" {
         let body = "x".repeat(size.saturating_sub(180));
+        let result_bytes = synthetic_result_bytes(request_number);
         format!(
-            "const payload_{request_number} = {body:?};\nconst result = await tools.exec_command({{cmd:\"printf '%s' \\\"$PAYLOAD\\\"\", max_output_tokens:10000}});\ntext(result.output);"
+            "const payload_{request_number} = {body:?};\nconst result = await tools.exec_command({{cmd:\"python3 -c \\\"print('x' * {result_bytes})\\\"\", max_output_tokens:60000}});\ntext(result.output);"
         )
     } else {
         json!({"cmd":format!("python3 - <<'PY'\nprint('x' * {size})\nPY"),"max_output_tokens":10000}).to_string()
     }
 }
 
+// This is deliberately a synthetic heavy tail, not an empirical fit. The
+// source corpus established only a ~227-byte median and mean/median near 18,
+// plus p90/max landmarks; it did not provide a histogram or joint tool shape.
+fn synthetic_result_bytes(request_number: u64) -> usize {
+    match mix(request_number) % 10_000 {
+        0..=8_749 => 227,
+        8_750..=9_849 => 13_097,
+        _ => 170_448,
+    }
+}
+
 fn persona_text(seed: u64, request_number: u64, request: &OpenAiRequest) -> String {
-    let lengths = [
-        227usize, 227, 227, 620, 2_100, 4_047, 7_800, 13_097, 13_097, 170_448,
-    ];
+    let lengths = [227usize, 227, 227, 620, 2_100, 4_047];
     let length = lengths[(mix(seed.wrapping_add(request_number)) as usize) % lengths.len()];
     let prefix = format!(
         "Completed deterministic turn {request_number} for model {}. The real agent loop supplied {} context items.\n",
