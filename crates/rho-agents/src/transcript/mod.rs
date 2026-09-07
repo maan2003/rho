@@ -29,11 +29,13 @@
 //! the buffer.
 
 mod elisions;
+mod gap;
 mod inlays;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
@@ -82,9 +84,17 @@ pub struct TranscriptModel {
     /// Whether each block renders to anything, kept beside `blocks` so an
     /// elision refresh never re-renders history to find out.
     visible: Vec<bool>,
-    /// How many leading blocks are composed nowhere: `records` and
-    /// `buffers` cover `blocks[uncomposed..]`, and composition grows
-    /// upward as the reader moves into history.
+    /// How many blocks the gap still holds, read by the marker's own
+    /// render so the count falls as the gap closes without the block being
+    /// written again.
+    gap_remaining: Arc<AtomicUsize>,
+    /// Blocks composed at the top for a reader who asked for the top:
+    /// `blocks[..head]`, and the first `head` records. Zero until a reader
+    /// asks for the top, which is the state the transcript opens in.
+    head: usize,
+    /// The end of the gap: `blocks[head..uncomposed]` is composed nowhere.
+    /// `records` and `buffers` cover the head and then `blocks[uncomposed..]`,
+    /// so composition grows from both ends and the gap closes in the middle.
     uncomposed: usize,
     /// What other agents' messages are labelled, kept so history composed
     /// later reads the same as history composed at open.
@@ -116,6 +126,9 @@ struct Attachment {
     elisions: ElisionState,
     inlays: Vec<PlacedInlay>,
     visualizations: Vec<PlacedVisualization>,
+    /// The row that says the gap is still composing, and the block it sits
+    /// above, so it is moved only when that block changes.
+    gap_marker: Option<(CustomBlockId, usize)>,
 }
 
 struct BlockRecord {
@@ -218,6 +231,8 @@ impl TranscriptModel {
             turn_open: false,
             blocks: Vec::new(),
             visible: Vec::new(),
+            gap_remaining: Arc::new(AtomicUsize::new(0)),
+            head: 0,
             uncomposed: 0,
             agent_labels: HashMap::new(),
             records: Vec::new(),
@@ -289,6 +304,7 @@ impl TranscriptModel {
         self.turn_open = crate::store::turn_open(prepared.state.status);
         self.blocks = prepared.state.blocks;
         self.visible = prepared.visible;
+        self.head = 0;
         self.uncomposed = prepared.first_block;
         self.agent_labels = prepared.agent_labels;
         let mut installed = Vec::with_capacity(prepared.chunks.len());
@@ -401,6 +417,7 @@ impl TranscriptModel {
             elisions: ElisionState::default(),
             inlays: Vec::new(),
             visualizations: Vec::new(),
+            gap_marker: None,
         });
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
@@ -429,11 +446,15 @@ impl TranscriptModel {
         if first_changed_block < self.uncomposed {
             // The change is under what is composed, so what is composed no
             // longer describes the transcript: the screen opens again on
-            // its tail, at the cost of what it draws.
+            // its tail, at the cost of what it draws. A head a reader asked
+            // for goes with it — the blocks it holds are the ones that
+            // changed.
             self.recompose(now_ms, cx);
             return;
         }
-        let first_changed = first_changed_block - self.uncomposed;
+        let first_changed = self
+            .record_of(first_changed_block)
+            .expect("a block at or after the gap is composed");
 
         if let Some(incremental) = summary.incremental
             && self.try_incremental_sync(first_changed, incremental, now_ms, cx)
@@ -448,7 +469,7 @@ impl TranscriptModel {
         let label = |id| self.label(id);
         let rendered_blocks = self
             .blocks
-            .get(self.uncomposed + start..)
+            .get(self.block_of(start)..)
             .unwrap_or(&[])
             .iter()
             .map(|block| {
@@ -502,7 +523,7 @@ impl TranscriptModel {
         }
         self.turn_boundary = new_boundary;
 
-        self.refresh_elision_plans(self.uncomposed + start);
+        self.refresh_elision_plans(self.block_of(start));
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
         cx.notify();
     }
@@ -515,11 +536,13 @@ impl TranscriptModel {
                 .buffers
                 .iter()
                 .find(|turn| turn.buffer == record.buffer)
-                .map_or(requested, |turn| turn.start_block - self.uncomposed);
+                .map_or(requested, |turn| {
+                    self.record_of(turn.start_block).unwrap_or(requested)
+                });
         }
         let next_is_response = self
             .blocks
-            .get(self.uncomposed + requested)
+            .get(self.block_of(requested))
             .is_some_and(|block| matches!(block_kind(block), BlockKind::Response { .. }));
         if next_is_response
             && self
@@ -528,7 +551,7 @@ impl TranscriptModel {
                 .is_some_and(|record| matches!(record.kind, BlockKind::Response { .. }))
             && let Some(turn) = self.buffers.last()
         {
-            return turn.start_block - self.uncomposed;
+            return self.record_of(turn.start_block).unwrap_or(requested);
         }
         requested
     }
@@ -545,7 +568,7 @@ impl TranscriptModel {
             .iter()
             .rfind(|turn| turn.composed)
             .map(|turn| turn.start_block);
-        let start_block = self.uncomposed + start;
+        let start_block = self.block_of(start);
         let first_removed = self
             .buffers
             .iter()
@@ -841,13 +864,23 @@ impl TranscriptModel {
             elisions,
             blocks,
             visible,
+            head,
             uncomposed,
             turn_open,
             ..
         } = self;
-        let uncomposed = *uncomposed;
+        let (head, uncomposed) = (*head, *uncomposed);
+        let record_of = |block: usize| {
+            if block < head {
+                Some(block)
+            } else if block >= uncomposed {
+                Some(head + (block - uncomposed))
+            } else {
+                None
+            }
+        };
         elisions.refresh(blocks, first_changed_block, visible, *turn_open, |plan| {
-            plan_anchor_range(records, uncomposed, plan)
+            plan_anchor_range(records, &record_of, plan)
         });
     }
 
@@ -882,51 +915,150 @@ impl TranscriptModel {
         }
     }
 
-    /// How many blocks are rendered and composed nowhere.
+    /// How many blocks are rendered and composed nowhere: the gap between
+    /// the head and the tail.
     pub fn uncomposed_blocks(&self) -> usize {
-        self.uncomposed
+        self.uncomposed - self.head
     }
 
     pub fn has_uncomposed(&self) -> bool {
-        self.uncomposed > 0
+        self.uncomposed > self.head
     }
 
-    /// Renders and composes the history immediately above what is composed
-    /// — at least `rows` more rows of it — and answers whether any history
-    /// is still uncomposed. Composing costs the rows it composes: the
-    /// excerpts below it keep their ids, their anchors and their layout.
+    /// How many leading blocks are composed for a reader at the top.
+    pub fn head_blocks(&self) -> usize {
+        self.head
+    }
+
+    /// The block the gap marker sits above, in the first attachment: what
+    /// the reader is told is still on its way, and `None` when nothing is.
+    pub fn gap_marker_block(&self) -> Option<usize> {
+        self.attachments
+            .first()
+            .and_then(|attachment| attachment.gap_marker)
+            .map(|(_, block)| block)
+    }
+
+    /// Whether a block is composed anywhere: in the head a reader asked
+    /// for, or in the tail the transcript opened on.
+    pub fn is_composed(&self, block: usize) -> bool {
+        block < self.head || block >= self.uncomposed
+    }
+
+    /// The record covering a block, or `None` while the block is in the
+    /// gap. One block renders to one record, so the head's blocks and its
+    /// records are the same run.
+    fn record_of(&self, block: usize) -> Option<usize> {
+        if block < self.head {
+            Some(block)
+        } else if block >= self.uncomposed {
+            Some(self.head + (block - self.uncomposed))
+        } else {
+            None
+        }
+    }
+
+    /// The block a record covers.
+    fn block_of(&self, record: usize) -> usize {
+        if record < self.head {
+            record
+        } else {
+            self.uncomposed + (record - self.head)
+        }
+    }
+
+    /// Renders and composes the history immediately above the tail — at
+    /// least `rows` more rows of it — and answers whether any gap is left.
+    /// What a reader moving up into history asks for.
     pub fn compose_history<V: 'static>(
         &mut self,
         rows: usize,
         now_ms: u64,
         cx: &mut Context<V>,
     ) -> bool {
-        if self.uncomposed == 0 {
+        if !self.has_uncomposed() {
             return false;
         }
         let from = {
             let label = |id| self.label(id);
-            tail_start(&self.blocks, self.uncomposed, rows, now_ms, &label)
+            tail_start(&self.blocks, self.uncomposed, rows, now_ms, &label).max(self.head)
         };
-        let chunks = {
+        self.compose_range(from..self.uncomposed, FillEdge::Tail, now_ms, cx);
+        self.has_uncomposed()
+    }
+
+    /// Renders and composes the top of the transcript — at least `rows`
+    /// rows of it, or what is left of the gap — and answers whether any
+    /// gap is left. What a reader who asked for the top gets first, and the
+    /// end the gap then closes from while they read down it.
+    ///
+    /// A reader who asks for the top waits for a screen, not for the
+    /// transcript: the blocks between the top and the tail are composed
+    /// behind them, and nothing above or below them is laid out again.
+    pub fn compose_head<V: 'static>(
+        &mut self,
+        rows: usize,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) -> bool {
+        if !self.has_uncomposed() {
+            return false;
+        }
+        let end = {
             let label = |id| self.label(id);
-            render_chunks(
+            head_end(
                 &self.blocks,
-                &self.visible,
-                from..self.uncomposed,
+                self.head,
+                self.uncomposed,
+                rows,
                 now_ms,
                 &label,
             )
+        };
+        self.compose_range(self.head..end, FillEdge::Head, now_ms, cx);
+        self.has_uncomposed()
+    }
+
+    /// Composes a range of blocks into one of the two composed runs and
+    /// puts its excerpts in place. Everything either side keeps its ids,
+    /// its anchors and its layout: composing costs the rows it composes.
+    fn compose_range<V: 'static>(
+        &mut self,
+        range: Range<usize>,
+        edge: FillEdge,
+        now_ms: u64,
+        cx: &mut Context<V>,
+    ) {
+        let chunks = {
+            let label = |id| self.label(id);
+            render_chunks(&self.blocks, &self.visible, range.clone(), now_ms, &label)
         };
         let mut gutters_changed = false;
         let (new_buffers, new_records) = Self::build_chunks(chunks, &mut gutters_changed, cx);
         let added_buffers = new_buffers.len();
         let added_records = new_records.len();
-        self.buffers.splice(0..0, new_buffers);
-        self.records.splice(0..0, new_records);
-        self.uncomposed = from;
+        // Both runs meet at the gap, so both fills splice there: the head's
+        // records end where the tail's begin.
+        let first_record = self.head;
+        let first_buffer = self
+            .buffers
+            .partition_point(|turn| turn.start_block < self.head);
+        self.buffers.splice(first_buffer..first_buffer, new_buffers);
+        self.records.splice(first_record..first_record, new_records);
+        match edge {
+            FillEdge::Head => self.head = range.end,
+            FillEdge::Tail => self.uncomposed = range.start,
+        }
+        if self.head == self.uncomposed {
+            // The gap is closed, so the two runs are one run from the first
+            // block, which is the state the model started in.
+            self.head = 0;
+            self.uncomposed = 0;
+        }
+        let added_records = first_record..first_record + added_records;
+        let added_buffers = first_buffer..first_buffer + added_buffers;
 
-        let buffer_ids = self.buffers[..added_buffers]
+        let buffer_ids = self.buffers[added_buffers.clone()]
             .iter()
             .filter(|turn| turn.composed)
             .map(|turn| turn.buffer.read(cx).remote_id())
@@ -943,9 +1075,10 @@ impl TranscriptModel {
         let last_composed = self.buffers.iter().rposition(|turn| turn.composed);
         let mut document_tail = None;
         let turn_open = self.turn_open;
-        let entries = self.buffers[..added_buffers]
+        let entries = self.buffers[added_buffers.clone()]
             .iter()
             .enumerate()
+            .map(|(index, turn)| (index + first_buffer, turn))
             .filter(|(_, turn)| turn.composed)
             .map(|(index, turn)| {
                 let buffer = turn.buffer.read(cx);
@@ -998,18 +1131,19 @@ impl TranscriptModel {
         });
 
         self.turn_boundary = turn_boundary(&self.records);
-        let boundary = self.turn_boundary.min(added_records);
-        let changed_history = classes_in(&self.records[..boundary]);
-        let changed_live = classes_in(&self.records[boundary..added_records]);
-        self.refresh_elision_plans(from);
+        let boundary = self
+            .turn_boundary
+            .clamp(added_records.start, added_records.end);
+        let changed_history = classes_in(&self.records[added_records.start..boundary]);
+        let changed_live = classes_in(&self.records[boundary..added_records.end]);
+        self.refresh_elision_plans(range.start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
-        let composed = self.buffers[..added_buffers]
+        let composed = self.buffers[added_buffers.clone()]
             .iter()
             .map(|turn| turn.buffer.clone())
             .collect::<Vec<_>>();
         Self::warm_syntax(composed, cx);
         cx.notify();
-        self.uncomposed > 0
     }
 
     /// Opens the transcript again on its tail, dropping everything that was
@@ -1022,6 +1156,7 @@ impl TranscriptModel {
             .map(|turn| (transcript_path(turn.start_block), turn.buffer))
             .collect::<Vec<_>>();
         self.records.clear();
+        self.head = 0;
         self.uncomposed = self.blocks.len();
         self.turn_boundary = 0;
         self.elisions = ElisionSync::default();
@@ -1114,7 +1249,7 @@ impl TranscriptModel {
             .records
             .iter()
             .enumerate()
-            .skip(turn.start_block.checked_sub(self.uncomposed)?)
+            .skip(self.record_of(turn.start_block)?)
         {
             if record.buffer != turn.buffer {
                 break;
@@ -1124,7 +1259,7 @@ impl TranscriptModel {
                 break;
             }
             found = Some(StorePoint {
-                block: self.uncomposed + index,
+                block: self.block_of(index),
                 offset: offset - start,
             });
         }
@@ -1133,9 +1268,7 @@ impl TranscriptModel {
 
     /// The buffer anchor a store point names, if its block is composed.
     pub fn place_store_point(&self, point: StorePoint, cx: &gpui::App) -> Option<text::Anchor> {
-        let record = self
-            .records
-            .get(point.block.checked_sub(self.uncomposed)?)?;
+        let record = self.records.get(self.record_of(point.block)?)?;
         let buffer = record.buffer.read(cx);
         let start = record.range.start.to_offset(buffer);
         let end = record.range.end.to_offset(buffer);
@@ -1260,6 +1393,14 @@ impl TranscriptModel {
         self.visualization_cache
             .retain(|id, _| desired_visualization_ids.contains(id.as_str()));
 
+        // Where the gap is, for the row that says so: above the tail's
+        // first block, which stays put while the head grows towards it.
+        let gap_at = (self.head > 0)
+            .then(|| Some((self.records.get(self.head)?.range.start, self.uncomposed)))
+            .flatten();
+        self.gap_remaining
+            .store(self.uncomposed - self.head, Ordering::Relaxed);
+
         let Self {
             document_multi_buffer,
             next_inlay_id,
@@ -1267,6 +1408,7 @@ impl TranscriptModel {
             elisions,
             visualization_client,
             visualization_cache,
+            gap_remaining,
             ..
         } = self;
         attachments.retain_mut(|attachment| {
@@ -1363,6 +1505,14 @@ impl TranscriptModel {
                 cx,
             );
             elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
+            gap::reconcile_marker(
+                &mut attachment.gap_marker,
+                &attachment.multi_buffer,
+                gap_at,
+                gap_remaining,
+                &editor,
+                cx,
+            );
             true
         });
     }
@@ -1372,6 +1522,21 @@ impl TranscriptModel {
 /// fill a window twice over, so opening and the first page of scrolling
 /// draw without composing anything more.
 pub const OPENING_ROWS: usize = 200;
+
+/// Which end of the gap a composition step closes.
+///
+/// The reader names it, the way they name the rows a width change wraps
+/// first: a reader at the top is read downward from the head, and a reader
+/// moving up out of the tail is served from the tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillEdge {
+    /// Downward from the top, which is where a reader who asked for the top
+    /// is about to read.
+    Head,
+    /// Upward from the tail, which is where a reader scrolling back into
+    /// history is about to read.
+    Tail,
+}
 
 /// A point in the transcript as the store sees it: which block, and how
 /// far into that block's rendered text. What a surface remembers when the
@@ -1405,6 +1570,33 @@ fn tail_start(
             .sum::<usize>();
     }
     start
+}
+
+/// The block after the first `rows` rows of `blocks[start..end]`, never
+/// fewer than one block: what a reader who asked for the top is given, and
+/// the unit the gap closes in behind them. The mirror of [`tail_start`],
+/// and as cheap: rendering a block to count its rows costs nothing beside
+/// laying it out.
+fn head_end(
+    blocks: &[Arc<UiBlock>],
+    start: usize,
+    end: usize,
+    rows: usize,
+    now_ms: u64,
+    label: &impl Fn(AgentId) -> String,
+) -> usize {
+    let mut counted = 0;
+    let mut at = start;
+    while at < end && counted < rows {
+        let rendered = render_block_with_agent_labels(&blocks[at], None, now_ms, label);
+        counted += rendered
+            .spans
+            .iter()
+            .map(|span| span.text.matches('\n').count())
+            .sum::<usize>();
+        at += 1;
+    }
+    at
 }
 
 /// Renders `range` into per-buffer chunks, split where the syntax changes.
@@ -1496,17 +1688,11 @@ fn last_visible_kind(records: &[BlockRecord]) -> Option<BlockKind> {
 
 fn plan_anchor_range(
     records: &[BlockRecord],
-    uncomposed: usize,
+    record_of: &impl Fn(usize) -> Option<usize>,
     plan: &ElisionPlan,
 ) -> Option<Range<Anchor>> {
-    let start = records
-        .get(plan.start_block.checked_sub(uncomposed)?)?
-        .range
-        .start;
-    let end = records
-        .get(plan.end_block.checked_sub(uncomposed)?)?
-        .range
-        .end;
+    let start = records.get(record_of(plan.start_block)?)?.range.start;
+    let end = records.get(record_of(plan.end_block)?)?.range.end;
     Some(start..end)
 }
 

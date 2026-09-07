@@ -5265,6 +5265,22 @@ fn uncomposed_blocks(
         .expect("read how much history is composed nowhere")
 }
 
+/// The block the reader is told the gap sits above, if there is a gap.
+fn gap_marker_block(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> Option<usize> {
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .agent_model_for_test(agent_id)
+                .read(cx)
+                .gap_marker_block()
+        })
+        .expect("read where the gap marker is")
+}
+
 fn transcript_point_block(
     workspace: &WindowHandle<Workspace>,
     cx: &mut TestAppContext,
@@ -10655,4 +10671,121 @@ fn the_usage_menu_opens_one_screen_and_another_chart_redraws_it(cx: &mut TestApp
             );
         })
         .unwrap();
+}
+
+/// Rows the wrap map was given to lay out, across a run of sync traces.
+fn wrap_rows(traces: &[editor::display_map::WrapSyncTrace]) -> u32 {
+    traces
+        .iter()
+        .flat_map(|trace| &trace.input)
+        .map(|edit| edit.new.end.row() - edit.new.start.row() + 1)
+        .sum()
+}
+
+/// `gg` gives the reader the top of the transcript, not the transcript.
+///
+/// Going to the top used to compose every block between the tail and the
+/// first one before the point could land there: on a long transcript that is
+/// the whole history laid out — wrapped, folded, blocked — to show one
+/// screen. Composition serves the end the reader asked for now, so the top
+/// is composed first, the point lands on it while the middle is still a gap,
+/// and the gap closes behind them.
+#[gpui::test]
+fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    let editor = active_editor(&workspace, cx);
+    let model = workspace
+        .update(cx, |workspace, _, _cx| {
+            workspace.agent_model_for_test(agent(1))
+        })
+        .expect("the agent's model");
+    workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    map.take_wrap_sync_traces(cx);
+                })
+            })
+        })
+        .expect("the rows the transcript opened on are not the rows gg lays out");
+
+    // What was true the moment the reader's point landed on the top.
+    let landed: std::rc::Rc<std::cell::RefCell<Option<(usize, usize, u32, Option<usize>)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _subscription = {
+        let landed = landed.clone();
+        let editor = editor.clone();
+        cx.update(|cx| {
+            cx.subscribe(&model, move |model, event, cx| {
+                if !matches!(
+                    event,
+                    rho_agents::agent_view::AgentModelEvent::HistoryComposed(_)
+                ) {
+                    return;
+                }
+                let rows = editor.update(cx, |editor, cx| {
+                    editor.display_map.update(cx, |map, cx| {
+                        map.snapshot(cx);
+                        wrap_rows(&map.take_wrap_sync_traces(cx))
+                    })
+                });
+                let model = model.read(cx);
+                *landed.borrow_mut() = Some((
+                    model.head_blocks(),
+                    model.uncomposed_blocks(),
+                    rows,
+                    model.gap_marker_block(),
+                ));
+            })
+        })
+    };
+
+    cx.simulate_keystrokes(*workspace, "escape g g");
+    cx.run_until_parked();
+
+    let (head, uncomposed, rows, marker) = landed.borrow().expect("the point landed on the top");
+    assert!(
+        rows < 400,
+        "the rows laid out to serve gg are the rows the reader is about to \
+         read, not every row above them: {rows}"
+    );
+    assert!(
+        head > 0,
+        "the top of the transcript is composed for the reader who asked for it"
+    );
+    assert!(
+        uncomposed > 0,
+        "and the middle is still a gap when the point lands: the reader waited \
+         for the top, not for the transcript"
+    );
+
+    assert_eq!(
+        marker,
+        Some(head + uncomposed),
+        "the reader is told the middle is on its way, on the row where it is: \
+         a marker above the first block of the tail"
+    );
+
+    assert_eq!(
+        uncomposed_blocks(&workspace, cx, agent(1)),
+        0,
+        "the gap closes behind the reader"
+    );
+    assert_eq!(
+        gap_marker_block(&workspace, cx, agent(1)),
+        None,
+        "and the marker is gone with it"
+    );
+    assert_eq!(
+        transcript_point_block(&workspace, cx, agent(1)),
+        Some(0),
+        "the point is on the first block"
+    );
+    assert!(
+        buffer_text(&workspace, cx).contains("turn 0 line one"),
+        "the top of the history is in the buffer"
+    );
 }

@@ -31,14 +31,23 @@ use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 use crate::now_ms;
 use crate::state::UiAgentState;
 use crate::store::FrameSummary;
-use crate::transcript::{StorePoint, TranscriptModel};
+use crate::transcript::{FillEdge, StorePoint, TranscriptModel};
 
 const PROMPT_PLACEHOLDER_INLAY_ID: usize = 0;
 
-/// How much history one composition step takes on. Small enough that a
-/// step is not a frame, large enough that composing a long transcript is
-/// a few hundred steps.
-const HISTORY_CHUNK_ROWS: usize = 400;
+/// How much history one composition step takes on, in buffer rows.
+///
+/// Sized to the frame budget rather than to a round number. A step runs on
+/// the main thread between two frames, and what it costs is display rows,
+/// not the buffer rows counted here: on the desk snapshot at 1280 logical
+/// columns a buffer row of a transcript is about 3.4 display rows once it
+/// is wrapped, so 400 buffer rows was a step of some 1,400 rows of wrap and
+/// a frame well over the 8 ms budget while the reader was already reading
+/// at the top. At 40 the median step is 136 display rows and 3.2 ms, and
+/// the whole fill draws at p99 7.9 ms. The landing note carries the
+/// measurement and what remains over budget: a single block larger than the
+/// step, which composition cannot yet divide.
+const HISTORY_CHUNK_ROWS: usize = 40;
 
 /// How close to the top of what is composed the reader comes before the
 /// next screenful of history is composed.
@@ -66,13 +75,20 @@ impl HistoryWant {
         }
     }
 
-    /// Whether this much history is composed, `uncomposed` blocks being
-    /// what is not.
-    fn met_by(self, uncomposed: usize) -> bool {
+    /// Whether the transcript has composed what this asked for.
+    fn met_by(self, transcript: &TranscriptModel) -> bool {
         match self {
             Self::Screenful => true,
-            Self::ToBlock(block) => uncomposed <= block,
-            Self::All => uncomposed == 0,
+            Self::ToBlock(block) => transcript.is_composed(block),
+            Self::All => !transcript.has_uncomposed(),
+        }
+    }
+
+    /// The block this wants composed, if it names one.
+    fn block(self) -> Option<usize> {
+        match self {
+            Self::ToBlock(block) => Some(block),
+            Self::Screenful | Self::All => None,
         }
     }
 }
@@ -370,6 +386,18 @@ impl AgentModel {
         self.transcript.uncomposed_blocks()
     }
 
+    /// How much of the transcript is composed at the top, in blocks: what a
+    /// reader who asked for the top is reading while the gap is still open.
+    pub fn head_blocks(&self) -> usize {
+        self.transcript.head_blocks()
+    }
+
+    /// The block the gap marker sits above, if the reader is being told
+    /// that a middle is still on its way.
+    pub fn gap_marker_block(&self) -> Option<usize> {
+        self.transcript.gap_marker_block()
+    }
+
     /// Whether history is still being composed: what the echo line says
     /// while a verb waits for the whole transcript.
     pub fn composing_history(&self) -> bool {
@@ -409,28 +437,82 @@ impl AgentModel {
         }));
     }
 
+    /// Which end of the gap the next step closes.
+    ///
+    /// What the reader asked for while they are still waiting for it — the
+    /// end nearest the block they named, which for the top of the
+    /// transcript is the top — and where they are reading once they are
+    /// not. A reader who has reached the gap is served their own edge, not
+    /// the one the last step happened to be closing.
+    fn fill_edge(&mut self, want: Option<HistoryWant>, cx: &mut Context<Self>) -> FillEdge {
+        let head = self.transcript.head_blocks();
+        if let Some(block) = want.and_then(HistoryWant::block)
+            && !self.transcript.is_composed(block)
+        {
+            let from_head = block.saturating_sub(head);
+            let from_tail = self
+                .transcript
+                .uncomposed_blocks()
+                .saturating_sub(from_head);
+            return if from_head <= from_tail {
+                FillEdge::Head
+            } else {
+                FillEdge::Tail
+            };
+        }
+        if head == 0 {
+            return FillEdge::Tail;
+        }
+        let reading = self
+            .live_editors()
+            .first()
+            .and_then(|editor| {
+                self.transcript
+                    .store_point(&editor.read(cx).selections.newest_anchor().head(), cx)
+            })
+            .map(|point| point.block);
+        match reading {
+            // The point is in the prompt or below the head: the reader is
+            // at the bottom, and the gap closes towards them.
+            Some(block) if block >= head => FillEdge::Tail,
+            None => FillEdge::Tail,
+            Some(_) => FillEdge::Head,
+        }
+    }
+
     /// One composition step. Answers whether another is wanted.
     fn compose_step(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(want) = self.history_want else {
-            self.composing = false;
-            return false;
+        let want = self.history_want;
+        let more = match self.fill_edge(want, cx) {
+            FillEdge::Head => self
+                .transcript
+                .compose_head(HISTORY_CHUNK_ROWS, now_ms(), cx),
+            FillEdge::Tail => self
+                .transcript
+                .compose_history(HISTORY_CHUNK_ROWS, now_ms(), cx),
         };
-        let more = self
-            .transcript
-            .compose_history(HISTORY_CHUNK_ROWS, now_ms(), cx);
-        if more && !want.met_by(self.transcript.uncomposed_blocks()) {
+        if let Some(want) = want {
+            if more && !want.met_by(&self.transcript) {
+                return true;
+            }
+            self.history_want = None;
+            if let Some((editor, point)) = self.pending_point.take()
+                && let Some(editor) = editor.upgrade()
+            {
+                self.place_point(&editor, point, window, cx);
+            }
+            if let Some(agent_id) = self.agent_id {
+                cx.emit(AgentModelEvent::HistoryComposed(agent_id));
+            }
+        }
+        // A gap between the head and the tail is history that is on its way
+        // — the reader is told so in the buffer — and it closes whether or
+        // not anything is still waiting for it. History that was never
+        // asked for is not a gap: it stays uncomposed until it is.
+        if more && self.transcript.head_blocks() > 0 {
             return true;
         }
-        self.history_want = None;
         self.composing = false;
-        if let Some((editor, point)) = self.pending_point.take()
-            && let Some(editor) = editor.upgrade()
-        {
-            self.place_point(&editor, point, window, cx);
-        }
-        if let Some(agent_id) = self.agent_id {
-            cx.emit(AgentModelEvent::HistoryComposed(agent_id));
-        }
         false
     }
 

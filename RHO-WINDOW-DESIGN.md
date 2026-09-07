@@ -162,11 +162,18 @@ three landing notes.
   reaches it through `editor`, so today the window does not own every
   primitive its screens draw with.
 - **A width change rewraps the whole buffer, and so does the wrap map on its
-  own.** That fails the cost rule twice over. Tail-first shrinks what the
-  rewrap sees but does not fix it, it is a vendored-editor primitive, and
-  after the fold trio it is the layer `gg` over a full history still fails
-  on. eng-b8os has it as their next task; it is written here so the list is
-  one list, not to claim it.
+  own.** That fails the cost rule twice over. It is closed for the reader:
+  the wrap map takes the reader's rows as a parameter of the width change,
+  lays those out before the frame, and closes the rest in the background
+  (main `38dd8d32`). The document is still rewrapped in full eventually,
+  which is the cost of a width change and not of a frame.
+- **The inlay map's edit-carrying sync is O(document).** Its per-row cost
+  grows with the buffer rather than with the edit: 3.2 µs per row early in a
+  `gg` over the 262k-row transcript and 13.3 µs per row late in the same
+  drive, measured on desk session 46. That is an editor defect on an edit
+  path, independent of what the composition hands it. Cut A makes it quiet
+  for `gg` by handing it a screen instead of a history; it stays as history
+  scrolling's cost, so it is written here rather than closed.
 - **A block insert costing a rewrap of what is around it is closed.** It was
   two frames over the 8 ms budget when a twenty-six row menu opened into a
   121k-row Home on desk session 30. Re-measured after the fold trio landed,

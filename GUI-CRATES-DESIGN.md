@@ -1433,6 +1433,64 @@ work on it.
   do not show it.
   Gate green: rho-qa 6 tests (2 new), clippy `-D warnings` clean,
   `cargo fmt --check` clean.
+- **`gg` gives the reader the top, not the transcript** (`crates/rho-agents`,
+  `transcript/mod.rs`, `transcript/gap.rs`, `agent_view.rs`). Going to the
+  top used to compose every block between the tail and the first one before
+  the point could land: the whole history wrapped, folded and blocked to
+  show one screen. Composition now serves the end the reader asked for. The
+  transcript keeps a head and a tail with a gap between them — `blocks[..head]`
+  composed for a reader at the top, `blocks[uncomposed..]` the tail it opened
+  on — and both edges splice into the same records and buffers, which the
+  multibuffer already allowed because its excerpts are keyed by start block
+  and so stay ordered whatever order they arrive in.
+  The fill is reading-aware, like the wrap: it closes from the head downward,
+  because that is where reading goes, and a reader who reaches the gap is
+  served their own edge instead of the head's.
+  The step is sized to the frame budget, and the unit that matters is not the
+  one the code counts: `HISTORY_CHUNK_ROWS` is buffer rows, but a step costs
+  display rows, and on the desk snapshot at 1280 logical columns a transcript
+  buffer row is about 3.4 display rows once wrapped. 400 buffer rows was a
+  step of some 1,400 wrapped rows; 40 is a median step of 171 rows and 3.1 ms.
+  Desk sessions 71–73 against 79–81, `gg` on the longest transcript on the
+  snapshot (eng-2cjj's, 235k tokens), three runs a side, first open of a
+  fresh process, 2560x1664 scale 2:
+  before, the reader waits 5.7 s for 85 steps of 486 rows, step p50 10.3 ms,
+  draw p99 15.5 ms with 36 frames over 8 ms of 458;
+  after, the first step is 2.8 ms and it *is* the top — the point lands on
+  block 0 there — and the gap closes 9.6 to 10.3 s later over 143 to 162
+  steps, step p50 3.1 ms, draw p99 7.9, 8.0 and 8.8 ms with 7, 7 and 13
+  frames over 8 ms of about 730.
+  Two of the three runs are inside the budget and the third is not, and what
+  is left over is one thing: a single history block larger than the whole
+  step, up to 2,300 rows and 34 ms, which the composition cannot divide
+  because a block is its unit. That is what cut B removes by eliding before
+  the wrap sees the rows, and it is the reason this note does not claim the
+  budget is met.
+  The inlay map's share of the fill fell from 1,054–1,114 ms to 242–313 ms,
+  not because that defect is fixed — it is on rho-window's owed list, 3.2 to
+  13.3 µs a row as the buffer grows — but because it is no longer handed a
+  history to walk.
+  The gap says so in the buffer: one block, `height: Some(1)`, above the
+  tail's first block, "N blocks still composing", gone when the gap closes.
+  It sits above a block that does not move while the head grows towards it,
+  so a fill step that serves a reader at the top rewrites nothing, and the
+  count is read at paint time so a closing gap counts down without touching
+  the buffer. Nothing blocks scrolling.
+  Proven three ways, because they are three claims: a test asserts the block
+  is inserted in the gap and removed when it closes; a screenshot shows it
+  drawn, one row, "2444 blocks still composing"; and the drawn shot needed a
+  rig-only build with the step slowed to 300 ms to catch it at all, because
+  on the real build the gap is gone in ten seconds — which is also why the
+  mid-fill shot of a normal run shows the top of the transcript and no
+  marker.
+  The failing-without test is rows laid out, not blocks composed: `escape g g`
+  on a 200-turn history, summing the wrap map's sync traces at the moment the
+  point lands. 961 rows before, 144 after.
+  Main-side runs were on 79142ea6 and the change is on 8ac59765; the
+  difference between them is the usage axis label and two handbook entries,
+  nothing the editor or the transcript touches.
+  Gate green: rho-gui 260 tests (1 new), rho-agents 68, `cargo fmt --check`
+  clean.
 
 ## Order
 
