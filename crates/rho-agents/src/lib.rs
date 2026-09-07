@@ -39,6 +39,22 @@ pub use fold::{
 pub use map::{AgentFacts, AgentLife, AgentMap, AgentSummary, HIDE_LABEL};
 pub use rho_hosts::HostId;
 
+// What the composer answers to. Declared here because the composer is
+// here: the fields, what submitting or clearing one means, and what
+// cycling a value does are this crate's, and a host that wants them on a
+// key binds these rather than inventing its own. (The macro documents each
+// action itself, so this cannot be a doc comment.)
+gpui::actions!(
+    rho_agents,
+    [
+        DraftFieldSubmit,
+        DraftFieldClear,
+        DraftValueCycle,
+        RoleCycle,
+        RoleCycleGroup,
+    ]
+);
+
 /// Now, in Unix milliseconds, saturating rather than panicking on a clock
 /// that says something impossible.
 pub fn now_ms() -> u64 {

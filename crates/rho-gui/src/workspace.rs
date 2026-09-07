@@ -34,7 +34,10 @@ use rho_agents::draft::DraftModel;
 use rho_agents::messages::MessageLog;
 use rho_agents::session::ActiveAgents;
 use rho_agents::store::FrameSummary;
-use rho_agents::{AgentMap, HostId, TranscriptFrame};
+use rho_agents::{
+    AgentMap, DraftFieldClear, DraftFieldSubmit, DraftValueCycle, HostId, RoleCycle,
+    RoleCycleGroup, TranscriptFrame,
+};
 use rho_core::ContentPart;
 use rho_hosts::connection::{ConnEvent, Connection, GitApprovalDecision};
 use rho_hosts::hosts::{HostStatus, Hosts};
@@ -80,12 +83,11 @@ use crate::{
     DashboardUndo, DashboardYankRow, DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow,
     GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete,
     MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup, SearchRepeat, SearchRepeatReverse, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
-    SlackEditLast, SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow,
-    SlackReactTo, SlackSearch, SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose,
-    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
-    ZulipNextUnread, ZulipOpenRow,
+    RailOpen, SearchRepeat, SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll,
+    ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage,
+    SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackReactTo, SlackSearch,
+    SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
+    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -10429,17 +10431,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
                 this.cycle_draft_group(window, cx);
             }))
-            .on_action(
-                cx.listener(|this, _: &crate::DraftValueCycle, _window, cx| {
-                    this.cycle_draft_value(cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &crate::DraftFieldSubmit, window, cx| {
-                    this.submit_from_draft_field(window, cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &crate::DraftFieldClear, window, cx| {
+            .on_action(cx.listener(|this, _: &DraftValueCycle, _window, cx| {
+                this.cycle_draft_value(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DraftFieldSubmit, window, cx| {
+                this.submit_from_draft_field(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DraftFieldClear, window, cx| {
                 this.clear_draft_field(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {

@@ -69,11 +69,6 @@ impl Hooks {
     ) -> Self {
         Self(std::rc::Rc::new(configure))
     }
-
-    /// Hooks that do nothing, for a host with no completion of its own.
-    pub fn inert() -> Self {
-        Self::new(|_, _, _, _| {})
-    }
 }
 
 /// The three field buffers an editor is built over, named so the host can

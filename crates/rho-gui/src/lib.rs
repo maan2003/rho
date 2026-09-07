@@ -26,6 +26,7 @@ pub mod walk;
 pub mod workspace;
 
 use gpui::{App, KeyBinding, actions};
+use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup};
 pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
@@ -87,8 +88,6 @@ actions!(
         DashboardDealReply,
         DashboardDealRefresh,
         DashboardDealFile,
-        RoleCycle,
-        RoleCycleGroup,
         TaskBoard,
         BrowserExit,
         RailFocus,
@@ -126,9 +125,6 @@ actions!(
         NoteOpenRow,
         MessagesOpen,
         HomeOpenRow,
-        DraftFieldSubmit,
-        DraftFieldClear,
-        DraftValueCycle
     ]
 );
 

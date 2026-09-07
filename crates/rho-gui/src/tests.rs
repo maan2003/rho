@@ -10361,7 +10361,7 @@ fn enter_in_the_workdir_field_sends_the_draft(cx: &mut TestAppContext) {
         })
         .expect("type the first message");
 
-    cx.dispatch_action(*workspace, crate::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(
@@ -10396,13 +10396,13 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         .expect("open a new-agent draft");
 
     // From the body, backwards is the start row, then the role row.
-    cx.dispatch_action(*workspace, crate::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_start_field_for_test(cx));
         })
         .expect("start row");
-    cx.dispatch_action(*workspace, crate::RoleCycleGroup);
+    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.cursor_in_draft_role_field_for_test(cx));
@@ -10471,7 +10471,7 @@ fn enter_in_a_draft_field_routes_to_the_drafts_submit(cx: &mut TestAppContext) {
             keymap.bindings_for_input(&[Keystroke::parse("enter").unwrap()], &draft);
         assert_eq!(
             bindings.first().map(|binding| binding.action().name()),
-            Some("rho_gui::DraftFieldSubmit"),
+            Some("rho_agents::DraftFieldSubmit"),
             "enter in a draft should reach the draft's submit: {bindings:?}"
         );
     });
@@ -10500,8 +10500,8 @@ fn clearing_a_header_row_keeps_the_typing_in_it(cx: &mut TestAppContext) {
         .expect("seed the workdir row");
 
     cx.simulate_keystrokes(*workspace, "escape");
-    cx.dispatch_action(*workspace, crate::RoleCycle);
-    cx.dispatch_action(*workspace, crate::DraftFieldClear);
+    cx.dispatch_action(*workspace, rho_agents::RoleCycle);
+    cx.dispatch_action(*workspace, rho_agents::DraftFieldClear);
     cx.simulate_keystrokes(*workspace, "o k");
     cx.run_until_parked();
 
