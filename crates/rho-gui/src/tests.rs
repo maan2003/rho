@@ -10851,7 +10851,8 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
         .expect("the rows the transcript opened on are not the rows gg lays out");
 
     // What was true the moment the reader's point landed on the top.
-    let landed: std::rc::Rc<std::cell::RefCell<Option<(usize, usize, u32, Option<usize>)>>> =
+    type LandingSnapshot = (usize, usize, u32, Option<usize>);
+    let landed: std::rc::Rc<std::cell::RefCell<Option<LandingSnapshot>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let _subscription = {
         let landed = landed.clone();
