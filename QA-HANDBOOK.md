@@ -624,3 +624,45 @@ Two rules that come with it. Take the check off before landing; what stays is
 the invariant that earns its place, not the scaffolding that found it. And a
 control that passes with and without the fix is not a guard: say so and land
 the test that fails without it instead.
+
+### Prove the harness before you trust the run
+
+A proof run has two things that can be wrong: the code under test, and the
+harness driving it. A broken harness does not report that it is broken. It
+reports that everything is fine, which is the answer you were hoping for, and
+that is why it survives.
+
+Both of these happened on the three runs that proved the fold fix, and both
+would have produced a confident clean report:
+
+The rig was never restarted. `rho-qa` had been handed the rig's own `HOME`,
+because the wayland driver needs it, so it resolved the rig path underneath it
+and `rig down` and `rig up` both failed with a path error that was being
+discarded by a `tail -1` on the output. The script drove one nine-minute-old
+session three times and printed three runs. The liveness check beside it was
+passing on a pid that was not the GUI and no longer existed. Everything the
+script said was green.
+
+A key was read as not arriving. The first probe screenshot was taken with no
+delay after the key, so it caught the frame before the redraw, and the screen
+looked unchanged. The conclusion available from that - the transcript is not
+taking input - is the one someone had already been wrong about that morning.
+
+So, before a run counts:
+
+Give the harness a question you already know the answer to. A key you know
+reaches the workspace must show a changed screen; if it does not, the harness
+is wrong, not the app. A grep for a fault must find that fault in a log known
+to contain it - the fold fix's zero was worth reporting only because the same
+grep returns 1,440 lines on the session from before the fix.
+
+Do not discard the output of a step you depend on. `tail -1` on a command that
+can fail is how a failure becomes a success.
+
+Check the state moved, not that the command returned. The rig's own journal
+counts its sessions; three runs is three new sessions, and if it is one, you
+drove one session three times.
+
+And say so afterwards. A harness error found and corrected belongs in the
+landing note beside the result, because the number means nothing without the
+account of how it was taken.
