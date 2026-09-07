@@ -50,6 +50,7 @@ use crate::chime::Chime;
 use crate::desk_view::DeskCells;
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::SurfaceKey;
+use crate::search;
 
 /// One context's viewport and the stack behind it, over Rho's own surface
 /// identity. The machine is `rho-window`'s and names nothing above it.
@@ -558,14 +559,9 @@ pub struct Workspace {
     /// of the screen is the host's.
     _draft_subscription: gpui::Subscription,
     agent_model_subscriptions: Vec<gpui::Subscription>,
-    /// A transcript search waiting for the history it has to look through
-    /// to be composed: the agent, the query, and which way it runs.
-    pending_transcript_search: Option<(AgentId, String, bool)>,
-    /// The last search anyone ran, so `n` and `N` have something to repeat.
-    /// One for the whole workspace, the way vim's search register is one for
-    /// the whole editor: the query follows the reader from surface to
-    /// surface, and each surface searches its own buffer with it.
-    last_search: Option<(String, bool)>,
+    /// What was last searched for and what is waiting to be searched, for
+    /// every surface: see [`search`].
+    search: search::Search,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
     pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
     /// What the finder's highlighted row opens, carried from the prompt to
@@ -1042,7 +1038,7 @@ impl Workspace {
                     this.undo_desk_semantic_action(*transaction_id, window, cx);
                 }
                 editor::EditorEvent::SearchRequested { backwards } => {
-                    this.prompt_dashboard_search(*backwards, window, cx);
+                    this.prompt_dashboard_search(search::Direction::of(*backwards), window, cx);
                 }
                 editor::EditorEvent::SelectionsChanged { local: true } => {
                     this.refresh_dashboard(window, cx);
@@ -1170,8 +1166,7 @@ impl Workspace {
             _slack_view_subscriptions: Vec::new(),
             _draft_subscription: draft_subscription,
             agent_model_subscriptions: Vec::new(),
-            pending_transcript_search: None,
-            last_search: None,
+            search: search::Search::default(),
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             pending_find_target: None,
@@ -6634,7 +6629,11 @@ impl Workspace {
                     window,
                     |this, _, event: &editor::EditorEvent, window, cx| {
                         if let editor::EditorEvent::SearchRequested { backwards } = event {
-                            this.prompt_transcript_search(*backwards, window, cx);
+                            this.prompt_transcript_search(
+                                search::Direction::of(*backwards),
+                                window,
+                                cx,
+                            );
                         }
                     },
                 ));
@@ -8907,12 +8906,75 @@ impl Workspace {
         true
     }
 
+    /// Asks for a query and runs `search` with it. Empty input is not a
+    /// search, it is a reader who changed their mind.
+    fn prompt_for_query(
+        &mut self,
+        direction: search::Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run: impl Fn(&mut Self, search::Query, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let text = input.trim().to_owned();
+                if text.is_empty() {
+                    return;
+                }
+                run(workspace, search::Query { text, direction }, window, cx);
+            },
+        );
+        self.open_prompt(
+            direction.prompt(),
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
+    /// Runs `query` in `editor` from the point, selects what it found and
+    /// says so if it wrapped; false if there is no match, because who is
+    /// told about that differs by surface. A match is where the reader
+    /// wanted to be, so the surface stops following its tail.
+    fn search_editor(
+        &mut self,
+        editor: &Entity<editor::Editor>,
+        query: search::Query,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = editor.read(cx).text(cx);
+        let from = search::point_offset(editor, cx);
+        let Some(found) = search::find(&text, &query, from) else {
+            return false;
+        };
+        if found.wrapped {
+            self.echo(query.direction.wrap_notice(), StyleClass::SystemInfo, cx);
+        }
+        let end = found.start + query.text.len();
+        self.search.record(query);
+        editor.update(cx, |editor, cx| {
+            editor.clear_autoscroll_pin(cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([
+                    editor::MultiBufferOffset(found.start)..editor::MultiBufferOffset(end)
+                ]);
+            });
+        });
+        window.focus(&editor.read(cx).focus_handle(cx), cx);
+        true
+    }
+
     /// `/` in a transcript. The buffer's search, as everywhere: history it
     /// has not composed yet is composed first, so what the reader is
     /// looking through is the whole transcript.
     fn prompt_transcript_search(
         &mut self,
-        backwards: bool,
+        direction: search::Direction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8930,28 +8992,13 @@ impl Workspace {
                 model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
             });
         }
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let query = input.trim().to_owned();
-                if query.is_empty() {
-                    return;
-                }
-                workspace.run_transcript_search(agent_id, query, backwards, window, cx);
-            },
-        );
-        self.open_prompt(
-            if backwards {
-                "search backward:"
-            } else {
-                "search:"
-            },
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
+        self.prompt_for_query(
+            direction,
             window,
             cx,
+            move |workspace, query, window, cx| {
+                workspace.run_transcript_search(agent_id, query, window, cx);
+            },
         );
     }
 
@@ -8961,8 +9008,7 @@ impl Workspace {
     fn run_transcript_search(
         &mut self,
         agent_id: AgentId,
-        query: String,
-        backwards: bool,
+        query: search::Query,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8970,43 +9016,23 @@ impl Workspace {
             return;
         };
         if model.read(cx).uncomposed_blocks() > 0 {
-            self.pending_transcript_search = Some((agent_id, query, backwards));
+            self.search.wait_for(search::Pending {
+                agent: agent_id,
+                query,
+            });
             model.update(cx, |model, cx| {
                 model.request_history(rho_agents::agent_view::HistoryWant::All, window, cx);
             });
             return;
         }
-        let text = editor.read(cx).text(cx);
-        let from = point_offset(&editor, cx);
-        let Some((start, wrapped)) = search_from(&text, &query, from, backwards) else {
+        if !self.search_editor(&editor, query, window, cx) {
             self.notice_on(
                 Some(&agent_id),
                 "search: no match",
                 StyleClass::SystemInfo,
                 cx,
             );
-            return;
-        };
-        self.last_search = Some((query.clone(), backwards));
-        if wrapped {
-            self.echo(
-                if backwards {
-                    "search: wrapped to the bottom"
-                } else {
-                    "search: wrapped to the top"
-                },
-                StyleClass::SystemInfo,
-                cx,
-            );
         }
-        editor.update(cx, |editor, cx| {
-            editor.clear_autoscroll_pin(cx);
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([editor::MultiBufferOffset(start)
-                    ..editor::MultiBufferOffset(start + query.len())]);
-            });
-        });
-        window.focus(&editor.read(cx).focus_handle(cx), cx);
     }
 
     /// `n` and `N`: the last search again, from the point, in its own
@@ -9019,46 +9045,31 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some((query, backwards)) = self.last_search.clone() else {
+        let Some(query) = self.search.last().cloned() else {
             return false;
         };
-        let backwards = backwards != reverse;
+        let query = search::Query {
+            direction: if reverse {
+                query.direction.reversed()
+            } else {
+                query.direction
+            },
+            ..query
+        };
         if self.active_transcript().is_some() {
             let Some(agent_id) = self.selection.selected_agent() else {
                 return false;
             };
-            self.run_transcript_search(agent_id, query, backwards, window, cx);
+            self.run_transcript_search(agent_id, query, window, cx);
             return true;
         }
         if !self.dashboard.is_focused(window, cx) {
             return false;
         }
         let editor = self.dashboard.editor().clone();
-        let text = editor.read(cx).text(cx);
-        let from = point_offset(&editor, cx);
-        let Some((start, wrapped)) = search_from(&text, &query, from, backwards) else {
+        if !self.search_editor(&editor, query, window, cx) {
             self.notice_on(None, "search: no match", StyleClass::SystemInfo, cx);
-            return true;
-        };
-        self.last_search = Some((query.clone(), backwards));
-        if wrapped {
-            self.echo(
-                if backwards {
-                    "search: wrapped to the bottom"
-                } else {
-                    "search: wrapped to the top"
-                },
-                StyleClass::SystemInfo,
-                cx,
-            );
         }
-        editor.update(cx, |editor, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([editor::MultiBufferOffset(start)
-                    ..editor::MultiBufferOffset(start + query.len())]);
-            });
-        });
-        window.focus(&editor.read(cx).focus_handle(cx), cx);
         true
     }
 
@@ -9069,70 +9080,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((waiting, query, backwards)) = self.pending_transcript_search.take() else {
+        let Some(query) = self.search.take_waiting_for(agent_id) else {
             return;
         };
-        if waiting != agent_id {
-            self.pending_transcript_search = Some((waiting, query, backwards));
-            return;
-        }
-        self.run_transcript_search(agent_id, query, backwards, window, cx);
+        self.run_transcript_search(agent_id, query, window, cx);
     }
 
+    /// `/` on the dashboard, which searches its own buffer with the same
+    /// query register as everything else.
     fn prompt_dashboard_search(
         &mut self,
-        backwards: bool,
+        direction: search::Direction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let query = input.trim();
-                if query.is_empty() {
-                    return;
-                }
-                let editor = workspace.dashboard.editor().clone();
-                let text = editor.read(cx).text(cx);
-                let from = point_offset(&editor, cx);
-                if let Some((start, wrapped)) = search_from(&text, query, from, backwards) {
-                    workspace.last_search = Some((query.to_owned(), backwards));
-                    if wrapped {
-                        workspace.echo(
-                            if backwards {
-                                "search: wrapped to the bottom"
-                            } else {
-                                "search: wrapped to the top"
-                            },
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    }
-                    editor.update(cx, |editor, cx| {
-                        editor.change_selections(Default::default(), window, cx, |selections| {
-                            selections.select_ranges([editor::MultiBufferOffset(start)
-                                ..editor::MultiBufferOffset(start + query.len())]);
-                        });
-                    });
-                    window.focus(&editor.read(cx).focus_handle(cx), cx);
-                } else {
-                    workspace.notice_on(None, "search: no match", StyleClass::SystemInfo, cx);
-                }
-            },
-        );
-        self.open_prompt(
-            if backwards {
-                "search backward:"
-            } else {
-                "search:"
-            },
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
-            window,
-            cx,
-        );
+        self.prompt_for_query(direction, window, cx, |workspace, query, window, cx| {
+            let editor = workspace.dashboard.editor().clone();
+            if !workspace.search_editor(&editor, query, window, cx) {
+                workspace.notice_on(None, "search: no match", StyleClass::SystemInfo, cx);
+            }
+        });
     }
 
     fn prompt_dashboard_rename_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10680,63 +10647,6 @@ pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
     minutes.checked_mul(60 * 1000)
 }
 
-/// Where the point is in an editor, as an offset into its text — which is
-/// what a search counts from. The start of the selection rather than its
-/// head, because a search leaves the match selected and vim's point in that
-/// state is the match's first character: `n` from there finds the next
-/// match and `N` the previous one, rather than the one already under the
-/// point.
-fn point_offset(editor: &Entity<editor::Editor>, cx: &mut App) -> usize {
-    editor.update(cx, |editor, cx| {
-        editor
-            .selections
-            .newest::<editor::MultiBufferOffset>(&editor.display_snapshot(cx))
-            .start
-            .0
-    })
-}
-
-/// The next match for `query` from the point, wrapping once around the
-/// buffer, and whether it wrapped. A search that always started at the top
-/// could not be repeated: `n` would land on the same match forever. Forward
-/// searches start after the point so a repeat moves on; backward searches
-/// end before it, for the same reason.
-fn search_from(text: &str, query: &str, from: usize, backwards: bool) -> Option<(usize, bool)> {
-    if query.is_empty() || text.is_empty() {
-        return None;
-    }
-    if backwards {
-        // Every match that begins before the point, nearest first — not
-        // `rfind` over the text before it, which would miss a match the
-        // point is standing in the middle of.
-        if let Some((start, _)) = text
-            .match_indices(query)
-            .take_while(|(start, _)| *start < from)
-            .last()
-        {
-            return Some((start, false));
-        }
-        text.rfind(query).map(|start| (start, true))
-    } else {
-        let after = ceil_boundary(text, from.saturating_add(1));
-        if let Some(offset) = text[after..].find(query) {
-            return Some((after + offset, false));
-        }
-        text.find(query).map(|start| (start, true))
-    }
-}
-
-/// The nearest character boundary at or above `index`, so a point that sits
-/// inside a multi-byte character never splits one when the text is sliced
-/// there.
-fn ceil_boundary(text: &str, index: usize) -> usize {
-    let mut index = index.min(text.len());
-    while index < text.len() && !text.is_char_boundary(index) {
-        index += 1;
-    }
-    index
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10744,43 +10654,6 @@ mod tests {
     #[test]
     fn labels_agent_role() {
         assert_eq!(agent_role_label(AgentRole::default()), "eng");
-    }
-
-    /// A forward search starts after the point, so repeating it moves on
-    /// rather than finding the match the point is already sitting on.
-    #[test]
-    fn a_forward_search_starts_after_the_point() {
-        let text = "one two one two";
-        assert_eq!(search_from(text, "one", 0, false), Some((8, false)));
-        assert_eq!(search_from(text, "two", 0, false), Some((4, false)));
-    }
-
-    /// A backward search ends before the point, for the same reason.
-    #[test]
-    fn a_backward_search_ends_before_the_point() {
-        let text = "one two one two";
-        assert_eq!(search_from(text, "one", 8, true), Some((0, false)));
-        assert_eq!(search_from(text, "one", 9, true), Some((8, false)));
-        assert_eq!(search_from(text, "one", 0, true), Some((8, true)));
-    }
-
-    /// Running off the end wraps once and says that it did.
-    #[test]
-    fn a_search_wraps_once_around_the_buffer() {
-        let text = "alpha beta";
-        assert_eq!(search_from(text, "alpha", 6, false), Some((0, true)));
-        assert_eq!(search_from(text, "beta", 6, true), Some((6, true)));
-        assert_eq!(search_from(text, "gamma", 0, false), None);
-        assert_eq!(search_from(text, "", 0, false), None);
-    }
-
-    /// A point inside a multi-byte character is a point on a boundary as
-    /// far as the search is concerned; slicing there would panic.
-    #[test]
-    fn a_search_from_inside_a_character_does_not_split_it() {
-        let text = "→ turn → turn";
-        assert_eq!(search_from(text, "turn", 1, false), Some((4, false)));
-        assert_eq!(search_from(text, "turn", 10, true), Some((4, false)));
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod pane;
 pub mod rho_assets;
 #[cfg(test)]
 mod sampler;
+pub(crate) mod search;
 pub mod slack;
 pub mod telemetry;
 #[doc(hidden)]
