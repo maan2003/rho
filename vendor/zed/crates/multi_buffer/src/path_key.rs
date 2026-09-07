@@ -231,7 +231,7 @@ impl MultiBuffer {
                 old: old_start..old_end,
                 new: old_start..new_end,
             }];
-            let edits = Self::sync_diff_transforms(snapshot, patch, DiffChangeKind::BufferEdited);
+            let edits = Self::sync_diff_transforms(snapshot, patch, DiffChangeKind::BufferEdited).0;
             (edits, suffix_is_empty)
         };
 
@@ -836,7 +836,8 @@ impl MultiBuffer {
             &mut snapshot,
             patch.into_inner(),
             DiffChangeKind::BufferEdited,
-        );
+        )
+        .0;
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
             cx.emit(Event::Edited {
@@ -938,7 +939,7 @@ impl MultiBuffer {
         snapshot.excerpts = new_excerpts;
 
         let edits =
-            Self::sync_diff_transforms(&mut snapshot, vec![edit], DiffChangeKind::BufferEdited);
+            Self::sync_diff_transforms(&mut snapshot, vec![edit], DiffChangeKind::BufferEdited).0;
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }

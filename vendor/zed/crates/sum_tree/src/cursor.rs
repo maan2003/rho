@@ -33,6 +33,7 @@ pub struct Cursor<'a, 'b, T: Item, D> {
     pub position: D,
     did_seek: bool,
     at_end: bool,
+    walked_items: u64,
     cx: <T::Summary as Summary>::Context<'b>,
 }
 
@@ -68,6 +69,7 @@ where
             position: D::zero(cx),
             did_seek: false,
             at_end: tree.is_empty(),
+            walked_items: 0,
             cx,
         }
     }
@@ -77,6 +79,15 @@ where
         self.at_end = self.tree.is_empty();
         self.stack.truncate(0);
         self.position = D::zero(self.cx);
+    }
+
+    /// Returns the cumulative number of leaf items crossed by this cursor.
+    ///
+    /// Seeking and resetting do not clear this count. Items skipped by a leaf
+    /// filter or copied individually by a seek/slice count; shared subtrees do
+    /// not, because their items were not visited individually.
+    pub fn walked_items(&self) -> u64 {
+        self.walked_items
     }
 
     pub fn start(&self) -> &D {
@@ -279,6 +290,7 @@ where
                     }
                 }
                 Node::Leaf { .. } => {
+                    self.walked_items = self.walked_items.saturating_add(1);
                     if descending {
                         break;
                     }
@@ -343,6 +355,7 @@ where
                     Node::Leaf { item_summaries, .. } => {
                         if !descend {
                             let item_summary = &item_summaries[entry.index()];
+                            self.walked_items = self.walked_items.saturating_add(1);
                             entry.index += 1;
                             entry.position.add_summary(item_summary, self.cx);
                             self.position.add_summary(item_summary, self.cx);
@@ -353,6 +366,7 @@ where
                                 if filter_node(next_item_summary) {
                                     return;
                                 } else {
+                                    self.walked_items = self.walked_items.saturating_add(1);
                                     entry.index += 1;
                                     entry.position.add_summary(next_item_summary, self.cx);
                                     self.position.add_summary(next_item_summary, self.cx);
@@ -543,6 +557,7 @@ where
                         if comparison == Ordering::Greater
                             || (comparison == Ordering::Equal && bias == Bias::Right)
                         {
+                            self.walked_items = self.walked_items.saturating_add(1);
                             self.position = child_end;
                             aggregate.push_item(item, item_summary, self.cx);
                             entry.index += 1;
@@ -713,6 +728,10 @@ where
 
     pub fn item_summary(&self) -> Option<&'a T::Summary> {
         self.cursor.item_summary()
+    }
+
+    pub fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
     }
 
     pub fn next(&mut self) {

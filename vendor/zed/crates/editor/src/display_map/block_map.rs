@@ -892,6 +892,19 @@ impl BlockMap {
 
         edits = self.deferred_edits.take().compose(edits);
         if profile.is_enabled() {
+            profile.touched_rows(
+                edits
+                    .edits()
+                    .iter()
+                    .map(|edit| {
+                        u64::from(
+                            (edit.old.end.0 - edit.old.start.0)
+                                .max(edit.new.end.0 - edit.new.start.0)
+                                .max(1),
+                        )
+                    })
+                    .sum(),
+            );
             let input_start = edits
                 .edits()
                 .iter()
@@ -1403,6 +1416,13 @@ impl BlockMap {
         }
 
         new_transforms.append(cursor.suffix(), ());
+        profile.walked_items(
+            cursor
+                .walked_items()
+                .saturating_add(inlay_point_cursor.walked_items())
+                .saturating_add(fold_point_cursor.walked_items())
+                .saturating_add(wrap_point_cursor.walked_items()),
+        );
         debug_assert_eq!(
             new_transforms.summary().input_rows,
             wrap_snapshot.max_point().row() + WrapRow(1),

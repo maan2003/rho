@@ -214,6 +214,18 @@ impl WrapMap {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::WrapMapSync);
         let old_rows = if profile.is_enabled() {
+            profile.touched_rows(
+                edits
+                    .iter()
+                    .map(|edit| {
+                        u64::from(
+                            (edit.old.end.row() - edit.old.start.row())
+                                .max(edit.new.end.row() - edit.new.start.row())
+                                + 1,
+                        )
+                    })
+                    .sum(),
+            );
             let input_start = edits
                 .iter()
                 .map(|edit| edit.new.start.row())
@@ -245,7 +257,7 @@ impl WrapMap {
         if self.wrap_width.is_some() {
             self.pending_edits
                 .push_back((tab_snapshot, self.row_scales.clone(), edits));
-            self.flush_edits(cx);
+            profile.walked_items(self.flush_edits(cx));
         } else {
             self.edits_since_sync = self
                 .edits_since_sync
@@ -423,7 +435,7 @@ impl WrapMap {
             }];
 
             if cfg!(not(target_family = "wasm")) && total_rows < WRAP_YIELD_ROW_INTERVAL {
-                let edits = gpui::block_on(new_snapshot.update(
+                let (edits, _) = gpui::block_on(new_snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
@@ -434,7 +446,7 @@ impl WrapMap {
                 self.edits_since_sync = self.edits_since_sync.compose(&edits);
             } else {
                 let update = async move {
-                    let edits = new_snapshot
+                    let (edits, _) = new_snapshot
                         .update(
                             tab_snapshot,
                             &tab_edits,
@@ -507,7 +519,7 @@ impl WrapMap {
                     .compose(mem::take(&mut this.interpolated_edits).invert())
                     .compose(&edits);
                 this.background_task = None;
-                this.flush_edits(cx);
+                let _ = this.flush_edits(cx);
                 cx.notify();
             })
             .ok();
@@ -515,7 +527,8 @@ impl WrapMap {
     }
 
     #[ztracing::instrument(skip_all)]
-    fn flush_edits(&mut self, cx: &mut Context<Self>) {
+    fn flush_edits(&mut self, cx: &mut Context<Self>) -> u64 {
+        let mut walked_items = 0_u64;
         if !self.snapshot.interpolated {
             let mut to_remove_len = 0;
             for (tab_snapshot, _, _) in &self.pending_edits {
@@ -529,7 +542,7 @@ impl WrapMap {
         }
 
         if self.pending_edits.is_empty() {
-            return;
+            return 0;
         }
 
         if let Some(wrap_width) = self.wrap_width
@@ -548,13 +561,14 @@ impl WrapMap {
                     .into_iter()
                     .next()
                     .expect("pending_edits has one item");
-                let wrap_edits = gpui::block_on(snapshot.update(
+                let (wrap_edits, update_work) = gpui::block_on(snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
                     &row_scales,
                     &mut line_wrapper,
                 ));
+                walked_items = walked_items.saturating_add(update_work);
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
             } else {
@@ -568,6 +582,19 @@ impl WrapMap {
                     // OS thread.
                     profile.thread(0);
                     let old_rows = if profile.is_enabled() {
+                        profile.touched_rows(
+                            pending_edits
+                                .iter()
+                                .flat_map(|(_, _, edits)| edits)
+                                .map(|edit| {
+                                    u64::from(
+                                        (edit.old.end.row() - edit.old.start.row())
+                                            .max(edit.new.end.row() - edit.new.start.row())
+                                            + 1,
+                                    )
+                                })
+                                .sum(),
+                        );
                         let input_edits = pending_edits
                             .iter()
                             .map(|(_, _, edits)| edits.len())
@@ -598,8 +625,9 @@ impl WrapMap {
                         0
                     };
                     let mut edits = Patch::default();
+                    let mut walked_items = 0_u64;
                     for (tab_snapshot, row_scales, tab_edits) in pending_edits {
-                        let wrap_edits = snapshot
+                        let (wrap_edits, walked) = snapshot
                             .update(
                                 tab_snapshot,
                                 &tab_edits,
@@ -608,8 +636,10 @@ impl WrapMap {
                                 &mut line_wrapper,
                             )
                             .await;
+                        walked_items = walked_items.saturating_add(walked);
                         edits = edits.compose(&wrap_edits);
                     }
+                    profile.walked_items(walked_items);
                     if profile.is_enabled() {
                         let output_start = edits
                             .edits()
@@ -684,7 +714,12 @@ impl WrapMap {
         if !was_interpolated {
             self.pending_edits.drain(..to_remove_len);
         }
+        walked_items
     }
+}
+
+fn accumulate_walked_items(total: &mut u64, additional: u64) {
+    *total = total.saturating_add(additional);
 }
 
 /// Counts the rows that wrapping will actually recompute after neighboring
@@ -799,7 +834,7 @@ impl WrapSnapshot {
             },
         );
         self.check_invariants();
-        old_snapshot.compute_edits(tab_edits, self)
+        old_snapshot.compute_edits(tab_edits, self).0
     }
 
     #[ztracing::instrument(skip_all)]
@@ -810,7 +845,7 @@ impl WrapSnapshot {
         wrap_width: Pixels,
         row_scales: &RowScaleSnapshot,
         line_wrapper: &mut LineWrapper,
-    ) -> WrapPatch {
+    ) -> (WrapPatch, u64) {
         #[derive(Debug)]
         struct RowEdit {
             old_rows: Range<u32>,
@@ -841,6 +876,7 @@ impl WrapSnapshot {
         }
 
         let mut new_transforms;
+        let mut walked_items = 0_u64;
         if row_edits.is_empty() {
             new_transforms = self.transforms.clone();
         } else {
@@ -883,6 +919,7 @@ impl WrapSnapshot {
                         };
                     }
                     while let Some(chunk) = remaining.take().or_else(|| chunks.next()) {
+                        accumulate_walked_items(&mut walked_items, 1);
                         if let Some(ix) = chunk.text.find('\n') {
                             flush_renderer!();
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
@@ -995,6 +1032,7 @@ impl WrapSnapshot {
                     new_transforms.append(old_cursor.suffix(), ());
                 }
             }
+            accumulate_walked_items(&mut walked_items, old_cursor.walked_items());
         }
 
         let old_snapshot = mem::replace(
@@ -1006,11 +1044,16 @@ impl WrapSnapshot {
             },
         );
         self.check_invariants();
-        old_snapshot.compute_edits(tab_edits, self)
+        let (edits, comparison_work) = old_snapshot.compute_edits(tab_edits, self);
+        (edits, walked_items.saturating_add(comparison_work))
     }
 
     #[ztracing::instrument(skip_all)]
-    fn compute_edits(&self, tab_edits: &[TabEdit], new_snapshot: &WrapSnapshot) -> WrapPatch {
+    fn compute_edits(
+        &self,
+        tab_edits: &[TabEdit],
+        new_snapshot: &WrapSnapshot,
+    ) -> (WrapPatch, u64) {
         let mut wrap_edits = Vec::with_capacity(tab_edits.len());
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
         let mut new_cursor = new_snapshot.transforms.cursor::<TransformSummary>(());
@@ -1042,8 +1085,11 @@ impl WrapSnapshot {
             });
         }
 
+        let walked_items = old_cursor
+            .walked_items()
+            .saturating_add(new_cursor.walked_items());
         wrap_edits = consolidate_wrap_edits(wrap_edits);
-        Patch::new(wrap_edits)
+        (Patch::new(wrap_edits), walked_items)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -1457,6 +1503,10 @@ pub struct WrapPointCursor<'transforms> {
 }
 
 impl WrapPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     /// Resets the cursor to the start so it can seek backward again.
     pub fn reset(&mut self) {
         self.cursor.reset();
@@ -1800,6 +1850,16 @@ mod tests {
     use std::{cmp, env, num::NonZeroU32};
     use text::Rope;
     use theme::LoadThemes;
+
+    #[test]
+    fn one_row_rewrap_accumulates_chunks_and_cursor_work() {
+        let mut walked_items = 0;
+        for _ in 0..4 {
+            accumulate_walked_items(&mut walked_items, 1);
+        }
+        accumulate_walked_items(&mut walked_items, 3);
+        assert_eq!(walked_items, 7);
+    }
 
     #[test]
     fn multiple_edits_on_one_line_are_one_wrap_row() {

@@ -687,6 +687,18 @@ impl FoldMap {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::FoldMapSync);
         let old_rows = if profile.is_enabled() {
+            profile.touched_rows(
+                inlay_edits
+                    .iter()
+                    .map(|edit| {
+                        let old_start = self.snapshot.inlay_snapshot.to_point(edit.old.start).row();
+                        let old_end = self.snapshot.inlay_snapshot.to_point(edit.old.end).row();
+                        let new_start = inlay_snapshot.to_point(edit.new.start).row();
+                        let new_end = inlay_snapshot.to_point(edit.new.end).row();
+                        u64::from((old_end - old_start).max(new_end - new_start) + 1)
+                    })
+                    .sum(),
+            );
             let input_start = inlay_edits
                 .iter()
                 .map(|edit| inlay_snapshot.to_point(edit.new.start).row())
@@ -707,6 +719,7 @@ impl FoldMap {
         } else {
             0
         };
+        let mut walked_items = 0_u64;
         let fold_edits = if inlay_edits.is_empty() {
             if self.snapshot.inlay_snapshot.version != inlay_snapshot.version {
                 self.snapshot.version += 1;
@@ -775,9 +788,11 @@ impl FoldMap {
                     .folds
                     .cursor::<FoldRange>(&inlay_snapshot.buffer);
                 folds_cursor.seek(&FoldRange(anchor..Anchor::Max), Bias::Left);
+                let folds_cursor_work = std::cell::Cell::new(folds_cursor.walked_items());
 
                 let mut folds = iter::from_fn({
                     let inlay_snapshot = &inlay_snapshot;
+                    let folds_cursor_work = &folds_cursor_work;
                     move || {
                         let item = folds_cursor.item().map(|fold| {
                             let buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
@@ -789,6 +804,7 @@ impl FoldMap {
                             )
                         });
                         folds_cursor.next();
+                        folds_cursor_work.set(folds_cursor.walked_items());
                         item
                     }
                 })
@@ -934,9 +950,12 @@ impl FoldMap {
                         .text_summary_for_range(InlayOffset(sum.input.len)..edit.new.end);
                     push_isomorphic(&mut new_transforms, text_summary);
                 }
+                drop(folds);
+                walked_items = walked_items.saturating_add(folds_cursor_work.get());
             }
 
             new_transforms.append(cursor.suffix(), ());
+            walked_items = walked_items.saturating_add(cursor.walked_items());
             if new_transforms.is_empty() {
                 let text_summary = inlay_snapshot.text_summary();
                 push_isomorphic(&mut new_transforms, text_summary);
@@ -1084,6 +1103,9 @@ impl FoldMap {
                 }
 
                 fold_edits = consolidate_fold_edits(fold_edits);
+                walked_items = walked_items
+                    .saturating_add(old_transforms.walked_items())
+                    .saturating_add(new_transforms.walked_items());
             }
 
             self.snapshot.transforms = new_transforms;
@@ -1093,6 +1115,7 @@ impl FoldMap {
             self.widening_violations.extend(widening_violations);
             fold_edits
         };
+        profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = fold_edits
                 .iter()
@@ -1470,6 +1493,10 @@ pub struct FoldPointCursor<'transforms> {
 }
 
 impl FoldPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     /// Resets the cursor to the start so it can seek backward again.
     pub fn reset(&mut self) {
         self.cursor.reset();

@@ -946,6 +946,12 @@ pub struct EditorTiming {
     pub input_edits: u64,
     pub input_start: u64,
     pub input_rows: u64,
+    /// Sum of each input edit's own old/new row extent (the larger side).
+    pub touched_rows: u64,
+    /// Pipeline items actually visited while processing this stage. SumTree
+    /// cursors count leaf items but not shared untouched subtrees; stages also
+    /// count explicitly scanned non-tree work items.
+    pub walked_items: u64,
     pub output_edits: u64,
     pub output_start: u64,
     pub output_rows: u64,
@@ -1053,6 +1059,8 @@ impl EditorTimingGuard {
                     input_edits: 0,
                     input_start: 0,
                     input_rows: 0,
+                    touched_rows: 0,
+                    walked_items: 0,
                     output_edits: 0,
                     output_start: 0,
                     output_rows: 0,
@@ -1079,6 +1087,18 @@ impl EditorTimingGuard {
             timing.input_edits = edits as u64;
             timing.input_start = start;
             timing.input_rows = rows;
+        }
+    }
+
+    pub fn touched_rows(&mut self, rows: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.touched_rows = rows;
+        }
+    }
+
+    pub fn walked_items(&mut self, items: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.walked_items = timing.walked_items.saturating_add(items);
         }
     }
 
@@ -1302,6 +1322,45 @@ impl FrameTimingCollector {
 mod timing_ring_tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct WalkItem;
+
+    #[derive(Clone, Default)]
+    struct WalkSummary(usize);
+
+    #[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
+    struct WalkCount(usize);
+
+    impl sum_tree::Summary for WalkSummary {
+        type Context<'a> = ();
+
+        fn zero(_: ()) -> Self {
+            Self(0)
+        }
+
+        fn add_summary(&mut self, other: &Self, _: ()) {
+            self.0 += other.0;
+        }
+    }
+
+    impl sum_tree::Item for WalkItem {
+        type Summary = WalkSummary;
+
+        fn summary(&self, _: ()) -> Self::Summary {
+            WalkSummary(1)
+        }
+    }
+
+    impl sum_tree::Dimension<'_, WalkSummary> for WalkCount {
+        fn zero(_: ()) -> Self {
+            Self(0)
+        }
+
+        fn add_summary(&mut self, summary: &WalkSummary, _: ()) {
+            self.0 += summary.0;
+        }
+    }
+
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1391,6 +1450,8 @@ mod timing_ring_tests {
         {
             let mut guard = EditorTimingGuard::new(EditorTimingKind::SpliceInlays);
             guard.spliced(4_000, 120..980, 16);
+            guard.touched_rows(1);
+            guard.walked_items(7);
         }
         let timings = collector.collect_unseen();
         let timing = timings.last().expect("the stage just recorded");
@@ -1399,6 +1460,31 @@ mod timing_ring_tests {
         assert_eq!(timing.affected_end, 980);
         // The offsets, not the span: a splice costs the points it touches.
         assert_eq!(timing.affected_offsets, 16);
+        assert_eq!(timing.touched_rows, 1);
+        assert_eq!(timing.walked_items, 7);
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_small_edit_in_a_large_tree_reports_a_small_walk() {
+        use sum_tree::{Bias, SumTree};
+
+        set_editor_trace_enabled(true);
+        let mut collector = EditorTimingCollector::new();
+        let tree = SumTree::from_iter((0..2_000).map(|_| WalkItem), ());
+        let mut cursor = tree.cursor::<WalkCount>(());
+        let _prefix = cursor.slice(&WalkCount(1_000), Bias::Right);
+        cursor.next();
+
+        let mut guard = EditorTimingGuard::new(EditorTimingKind::FoldMapSync);
+        guard.touched_rows(1);
+        guard.walked_items(cursor.walked_items());
+        drop(guard);
+
+        let timing = collector.collect_unseen().pop().unwrap();
+        assert_eq!(timing.touched_rows, 1);
+        assert!(timing.walked_items > 0);
+        assert!(timing.walked_items < 64);
         set_editor_trace_enabled(false);
     }
 }

@@ -1925,7 +1925,8 @@ impl MultiBuffer {
                 new: start..start,
             }],
             DiffChangeKind::BufferEdited,
-        );
+        )
+        .0;
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }
@@ -2122,7 +2123,8 @@ impl MultiBuffer {
             DiffChangeKind::DiffUpdated {
                 base_changed: base_text_changed,
             },
-        );
+        )
+        .0;
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }
@@ -2168,7 +2170,8 @@ impl MultiBuffer {
                 // We don't read this field for inverted diffs.
                 base_changed: false,
             },
-        );
+        )
+        .0;
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }
@@ -2508,6 +2511,7 @@ impl MultiBuffer {
             excerpt_edits,
             DiffChangeKind::ExpandOrCollapseHunks { expand },
         )
+        .0
     }
 
     pub fn expand_or_collapse_diff_hunks(
@@ -2554,7 +2558,10 @@ impl MultiBuffer {
             .is_enabled()
             .then(|| u64::from(snapshot.max_point().row) + 1)
             .unwrap_or(0);
-        let edits = Self::sync_from_buffer_changes(&mut snapshot, &self.buffers, &self.diffs, cx);
+        let old_snapshot = profile.is_enabled().then(|| snapshot.clone());
+        let (edits, walked_items) =
+            Self::sync_from_buffer_changes(&mut snapshot, &self.buffers, &self.diffs, cx);
+        profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = edits
                 .iter()
@@ -2572,6 +2579,19 @@ impl MultiBuffer {
                 output_end.saturating_sub(output_start) + 1
             };
             profile.output(edits.len(), output_start, output_rows);
+            let old_snapshot = old_snapshot.as_ref().unwrap();
+            profile.touched_rows(
+                edits
+                    .iter()
+                    .map(|edit| {
+                        let old = edit.old.start.to_point(old_snapshot).row
+                            ..edit.old.end.to_point(old_snapshot).row;
+                        let new = edit.new.start.to_point(&snapshot).row
+                            ..edit.new.end.to_point(&snapshot).row;
+                        u64::from((old.end - old.start).max(new.end - new.start) + 1)
+                    })
+                    .sum(),
+            );
         }
         profile.state(old_rows, u64::from(snapshot.max_point().row) + 1, 0, 0);
         if !edits.is_empty() {
@@ -2592,7 +2612,10 @@ impl MultiBuffer {
             .is_enabled()
             .then(|| u64::from(snapshot.max_point().row) + 1)
             .unwrap_or(0);
-        let edits = Self::sync_from_buffer_changes(snapshot, &self.buffers, &self.diffs, cx);
+        let old_snapshot = profile.is_enabled().then(|| snapshot.clone());
+        let (edits, walked_items) =
+            Self::sync_from_buffer_changes(snapshot, &self.buffers, &self.diffs, cx);
+        profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = edits
                 .iter()
@@ -2610,6 +2633,19 @@ impl MultiBuffer {
                 output_end.saturating_sub(output_start) + 1
             };
             profile.output(edits.len(), output_start, output_rows);
+            let old_snapshot = old_snapshot.as_ref().unwrap();
+            profile.touched_rows(
+                edits
+                    .iter()
+                    .map(|edit| {
+                        let old = edit.old.start.to_point(old_snapshot).row
+                            ..edit.old.end.to_point(old_snapshot).row;
+                        let new = edit.new.start.to_point(snapshot).row
+                            ..edit.new.end.to_point(snapshot).row;
+                        u64::from((old.end - old.start).max(new.end - new.start) + 1)
+                    })
+                    .sum(),
+            );
         }
         profile.state(old_rows, u64::from(snapshot.max_point().row) + 1, 0, 0);
 
@@ -2625,7 +2661,7 @@ impl MultiBuffer {
         buffers: &BTreeMap<BufferId, BufferState>,
         diffs: &HashMap<BufferId, DiffState>,
         cx: &App,
-    ) -> Vec<Edit<MultiBufferOffset>> {
+    ) -> (Vec<Edit<MultiBufferOffset>>, u64) {
         let MultiBufferSnapshot {
             excerpts,
             diffs: buffer_diff,
@@ -2674,7 +2710,9 @@ impl MultiBuffer {
         let mut paths_to_edit = Vec::new();
         let mut non_text_state_updated = false;
         let mut edited = false;
+        let mut scanned_items = 0_u64;
         for buffer_state in buffers.values() {
+            scanned_items = scanned_items.saturating_add(1);
             let buffer = buffer_state.buffer.read(cx);
             let last_snapshot = buffer_snapshots
                 .get(&buffer.remote_id())
@@ -2693,6 +2731,7 @@ impl MultiBuffer {
                     None
                 };
                 for (path_key, path_key_index) in &last_snapshot.paths {
+                    scanned_items = scanned_items.saturating_add(1);
                     paths_to_edit.push((
                         path_key.clone(),
                         *path_key_index,
@@ -2782,19 +2821,23 @@ impl MultiBuffer {
         }
         new_excerpts.append(cursor.suffix(), ());
 
+        let mut walked_items = cursor.walked_items().saturating_add(scanned_items);
         drop(cursor);
         *excerpts = new_excerpts;
 
-        Self::sync_diff_transforms(snapshot, edits, DiffChangeKind::BufferEdited)
+        let (edits, diff_work) =
+            Self::sync_diff_transforms(snapshot, edits, DiffChangeKind::BufferEdited);
+        walked_items = walked_items.saturating_add(diff_work);
+        (edits, walked_items)
     }
 
     fn sync_diff_transforms(
         snapshot: &mut MultiBufferSnapshot,
         excerpt_edits: Vec<text::Edit<ExcerptOffset>>,
         change_kind: DiffChangeKind,
-    ) -> Vec<Edit<MultiBufferOffset>> {
+    ) -> (Vec<Edit<MultiBufferOffset>>, u64) {
         if excerpt_edits.is_empty() {
-            return vec![];
+            return (vec![], 0);
         }
 
         let mut excerpts = snapshot.excerpts.cursor::<ExcerptOffset>(());
@@ -2807,6 +2850,7 @@ impl MultiBuffer {
         let mut output_delta = 0_isize;
         let mut at_transform_boundary = true;
         let mut end_of_current_insert = None;
+        let mut walked_items = 0_u64;
 
         let mut excerpt_edits = excerpt_edits.into_iter().peekable();
         while let Some(edit) = excerpt_edits.next() {
@@ -2819,7 +2863,10 @@ impl MultiBuffer {
             if at_transform_boundary {
                 at_transform_boundary = false;
                 let transforms_before_edit = old_diff_transforms.slice(&edit.old.start, Bias::Left);
-                Self::append_diff_transforms(&mut new_diff_transforms, transforms_before_edit);
+                walked_items = walked_items.saturating_add(Self::append_diff_transforms(
+                    &mut new_diff_transforms,
+                    transforms_before_edit,
+                ));
                 if let Some(transform) = old_diff_transforms.item()
                     && old_diff_transforms.end().0 == edit.old.start
                     && old_diff_transforms.start().0 < edit.old.start
@@ -2904,7 +2951,10 @@ impl MultiBuffer {
         }
 
         // Keep any transforms that are after the last edit.
-        Self::append_diff_transforms(&mut new_diff_transforms, old_diff_transforms.suffix());
+        walked_items = walked_items.saturating_add(Self::append_diff_transforms(
+            &mut new_diff_transforms,
+            old_diff_transforms.suffix(),
+        ));
 
         // Ensure there's always at least one buffer content transform.
         if new_diff_transforms.is_empty() {
@@ -2917,6 +2967,9 @@ impl MultiBuffer {
             );
         }
 
+        walked_items = walked_items
+            .saturating_add(old_diff_transforms.walked_items())
+            .saturating_add(excerpts.walked_items());
         drop(old_diff_transforms);
         drop(excerpts);
         snapshot.diff_transforms = new_diff_transforms;
@@ -2924,7 +2977,7 @@ impl MultiBuffer {
 
         #[cfg(any(test, feature = "test-support"))]
         snapshot.check_invariants();
-        output_edits
+        (output_edits, walked_items)
     }
 
     fn recompute_diff_transforms_for_edit(
@@ -3134,7 +3187,7 @@ impl MultiBuffer {
     fn append_diff_transforms(
         new_transforms: &mut SumTree<DiffTransform>,
         subtree: SumTree<DiffTransform>,
-    ) {
+    ) -> u64 {
         if let Some(DiffTransform::BufferContent {
             inserted_hunk_info,
             summary,
@@ -3149,9 +3202,10 @@ impl MultiBuffer {
             cursor.next();
             cursor.next();
             new_transforms.append(cursor.suffix(), ());
-            return;
+            return cursor.walked_items();
         }
         new_transforms.append(subtree, ());
+        0
     }
 
     fn push_diff_transform(new_transforms: &mut SumTree<DiffTransform>, transform: DiffTransform) {

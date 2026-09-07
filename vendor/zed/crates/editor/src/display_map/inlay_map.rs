@@ -641,6 +641,17 @@ impl InlayMap {
         }
 
         if profile.is_enabled() {
+            let touched_rows = buffer_edits
+                .iter()
+                .map(|edit| {
+                    let old_start = self.snapshot.buffer.offset_to_point(edit.old.start).row;
+                    let old_end = self.snapshot.buffer.offset_to_point(edit.old.end).row;
+                    let new_start = buffer_snapshot.offset_to_point(edit.new.start).row;
+                    let new_end = buffer_snapshot.offset_to_point(edit.new.end).row;
+                    u64::from((old_end - old_start).max(new_end - new_start) + 1)
+                })
+                .sum();
+            profile.touched_rows(touched_rows);
             let input_start = buffer_edits
                 .iter()
                 .map(|edit| buffer_snapshot.offset_to_point(edit.new.start).row)
@@ -679,6 +690,7 @@ impl InlayMap {
             (self.snapshot.clone(), Vec::new())
         } else {
             let mut inlay_edits = Vec::with_capacity(buffer_edits.len());
+            let mut walked_items = 0_u64;
             for buffer_edit in &buffer_edits {
                 let old_start = self.snapshot.to_inlay_offset(buffer_edit.old.start);
                 let old_end = self.snapshot.to_inlay_offset(buffer_edit.old.end);
@@ -693,7 +705,11 @@ impl InlayMap {
             let preserved_prefix = (old_rebuild_start == new_rebuild_start).then(|| {
                 let rebuild_start = old_rebuild_start.unwrap();
                 let mut cursor = self.snapshot.transforms.cursor::<MultiBufferOffset>(());
-                cursor.slice(&rebuild_start, Bias::Left)
+                let prefix = cursor.slice(&rebuild_start, Bias::Left);
+                if profile.is_enabled() {
+                    walked_items = walked_items.saturating_add(cursor.walked_items());
+                }
+                prefix
             });
             self.snapshot.buffer = buffer_snapshot;
             if let (Some(mut transforms), Some(rebuild_start)) =
@@ -701,6 +717,12 @@ impl InlayMap {
             {
                 self.concealments
                     .sync_from(rebuild_start, &self.snapshot.buffer);
+                let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                if profile.is_enabled() {
+                    walked_items = walked_items
+                        .saturating_add(self.inlays.len() as u64)
+                        .saturating_add(concealments.len() as u64);
+                }
                 let prefix_end = transforms.summary().input.len;
                 push_isomorphic(
                     &mut transforms,
@@ -712,7 +734,7 @@ impl InlayMap {
                     &mut transforms,
                     &self.snapshot.buffer,
                     &self.inlays,
-                    &self.concealments.ranges(&self.snapshot.buffer),
+                    &concealments,
                     rebuild_start,
                 );
                 if transforms.is_empty() {
@@ -721,11 +743,14 @@ impl InlayMap {
                 self.snapshot.transforms = transforms;
             } else {
                 self.concealments.sync(&self.snapshot.buffer);
-                self.snapshot.transforms = build_transforms(
-                    &self.snapshot.buffer,
-                    &self.inlays,
-                    &self.concealments.ranges(&self.snapshot.buffer),
-                );
+                let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                if profile.is_enabled() {
+                    walked_items = walked_items
+                        .saturating_add(self.inlays.len() as u64)
+                        .saturating_add(concealments.len() as u64);
+                }
+                self.snapshot.transforms =
+                    build_transforms(&self.snapshot.buffer, &self.inlays, &concealments);
             }
             self.snapshot.version += 1;
 
@@ -734,6 +759,7 @@ impl InlayMap {
                     ..self.snapshot.to_inlay_offset(buffer_edit.new.end);
             }
             self.snapshot.check_invariants();
+            profile.walked_items(walked_items);
             (self.snapshot.clone(), Patch::new(inlay_edits).into_inner())
         };
 
@@ -1588,6 +1614,10 @@ pub struct InlayPointCursor<'transforms> {
 }
 
 impl InlayPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn map(&mut self, point: Point, bias: Bias) -> InlayPoint {
         let cursor = &mut self.cursor;

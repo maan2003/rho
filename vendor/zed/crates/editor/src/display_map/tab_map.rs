@@ -47,6 +47,18 @@ impl TabMap {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::TabMapSync);
         let old_rows = if profile.is_enabled() {
+            profile.touched_rows(
+                fold_edits
+                    .iter()
+                    .map(|edit| {
+                        let old_start = edit.old.start.to_point(&self.0.fold_snapshot).row();
+                        let old_end = edit.old.end.to_point(&self.0.fold_snapshot).row();
+                        let new_start = edit.new.start.to_point(&fold_snapshot).row();
+                        let new_end = edit.new.end.to_point(&fold_snapshot).row();
+                        u64::from((old_end - old_start).max(new_end - new_start) + 1)
+                    })
+                    .sum(),
+            );
             let input_start = fold_edits
                 .iter()
                 .map(|edit| edit.new.start.to_point(&fold_snapshot).row())
@@ -67,7 +79,9 @@ impl TabMap {
         } else {
             0
         };
-        let (snapshot, tab_edits) = self.sync_inner(fold_snapshot, fold_edits, tab_size);
+        let (snapshot, tab_edits, walked_items) =
+            self.sync_inner(fold_snapshot, fold_edits, tab_size, profile.is_enabled());
+        profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = tab_edits
                 .iter()
@@ -95,7 +109,8 @@ impl TabMap {
         fold_snapshot: FoldSnapshot,
         mut fold_edits: Vec<FoldEdit>,
         tab_size: NonZeroU32,
-    ) -> (TabSnapshot, Vec<TabEdit>) {
+        record_work: bool,
+    ) -> (TabSnapshot, Vec<TabEdit>, u64) {
         let tab_size = tab_size.min(MAX_TABS);
 
         if self.0.tab_size != tab_size {
@@ -109,6 +124,7 @@ impl TabMap {
                     old: TabPoint::zero()..old_max_point,
                     new: TabPoint::zero()..self.0.max_point(),
                 }],
+                0,
             );
         }
 
@@ -122,7 +138,7 @@ impl TabMap {
             old_snapshot.version = new_version;
             old_snapshot.fold_snapshot = fold_snapshot;
             old_snapshot.tab_size = tab_size;
-            return (old_snapshot.clone(), vec![]);
+            return (old_snapshot.clone(), vec![], 0);
         }
 
         let old_fold_max_point = old_snapshot.fold_snapshot.max_point();
@@ -148,6 +164,7 @@ impl TabMap {
         // already knows its own scan would come up empty, and skips both
         // the scan and the point conversions it would need.
         let mut scanned_tabless_tail: Option<Range<FoldOffset>> = None;
+        let mut walked_items = 0_u64;
 
         for fold_edit in &mut fold_edits {
             if let Some(scanned) = &scanned_tabless_tail
@@ -165,14 +182,18 @@ impl TabMap {
             let mut offset_from_edit = 0;
             let mut first_tab_offset = None;
             let mut last_tab_with_changed_expansion_offset = None;
-            'outer: for chunk in old_snapshot.fold_snapshot.chunks(
+            let mut chunks = old_snapshot.fold_snapshot.chunks(
                 fold_edit.old.end..old_end_row_successor_offset,
                 LanguageAwareStyling {
                     tree_sitter: false,
                     diagnostics: false,
                 },
                 Highlights::default(),
-            ) {
+            );
+            'outer: while let Some(chunk) = chunks.next() {
+                if record_work {
+                    walked_items = walked_items.saturating_add(1);
+                }
                 let mut remaining_tabs = chunk.tabs;
                 while remaining_tabs != 0 {
                     let ix = remaining_tabs.trailing_zeros();
@@ -262,7 +283,7 @@ impl TabMap {
             })
             .collect();
         *old_snapshot = new_snapshot;
-        (old_snapshot.clone(), tab_edits)
+        (old_snapshot.clone(), tab_edits, walked_items)
     }
 }
 
