@@ -235,6 +235,61 @@ three landing notes.
   tap runs the row, and closing is byte-identical to the frame before the
   first tap.
 
+### Elision, and what it must cost
+
+Two things in a transcript are hidden rather than shown, and they are the
+same act at two scales. A settled turn is elided down to its last rows, with
+a chip in place of the rest that opens and closes again. Markup is
+concealed: the `**` around a word is text the reader is never meant to read.
+Both are folds below the wrap map, which is what makes them cheap to draw —
+a hidden row leaves the wrap's input and the block map's entirely, so it
+costs nothing to lay out and nothing to compose.
+
+What they are not is byte arithmetic. The fold map keeps its ranges in inlay
+offsets, so every elision and every concealment is a byte range in a
+coordinate the inlay map moves under it. That is where the cost and the
+faults both come from: an edit landing near a fold has to be widened to the
+fold, in bytes, over the inlays on either side, in the old snapshot and the
+new one at once — and the widening loops are where an output edit stops
+describing a range of any document that exists. The accounting has caught
+three of those on rho's own streaming path, each short by a byte or two, and
+they were reachable by a reader typing into a transcript whose markdown was
+already concealed.
+
+In rho's terms neither hiding is a byte question. A turn hides because the
+model says it is settled; a delimiter hides because the parse says it is
+markup. Both facts are properties of a range that already carries anchors,
+and an anchor survives an edit without anyone subtracting offsets. So the
+cut is to say the range once, in the buffer's own coordinates, and let the
+fold map hold what it is given rather than recompute where it moved to: the
+end side rewritten in buffer offsets, the step over a fold rewritten with
+it, and `text()` sealed so no path builds a fold range out of a rendered
+string.
+
+The cost it must hold to is the rule the rest of the window holds to, and
+one clause more. Per event, O(rows the event touches) + O(log n), and never
+O(elisions the document carries): a keystroke inside one turn must not pay
+for the four hundred settled turns above it, and settling a turn must cost
+that turn. Per frame, O(rows drawn), which folds already give.
+
+The counter that proves it is the walk's own. Every step of the gate prints
+`walk=` with a count per stage — the leaf items each stage's cursors crossed
+— and `fold:` is this map's line in it. Today a keystroke on a 273-row
+transcript reads `fold:4`, and composing a fresh chunk of history reads
+`fold:4` as well, held flat while the composed window climbs from 299 rows
+to 635. That flatness is the bar: a stage of the cut that makes `fold:`
+track `total_rows`, or track the number of ranges the document hides, has
+failed regardless of how the wall clock reads.
+
+What the gate's document does not yet carry is elided turns. Its folds are
+concealment — the drive's tool output is concealed before the tab map ever
+counts it — so `fold:` reads markup today and not settled history, and the
+first stage of the cut is to seed turns that are elided and see what the
+counter says then. A number that comes to hand is not the number of the
+thing until the thing is in the run. Correctness has a counter of its own
+beside it, the fold map's accounting: empty, or naming the edit that
+stopped describing a range. Both are read on every stage.
+
 ### How it will be proven
 
 On the QA rig, on the user's snapshot, with the handbook's Emacs-feel checks:
