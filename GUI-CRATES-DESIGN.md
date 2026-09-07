@@ -2020,6 +2020,75 @@ work on it.
   Gate green: rho-gui 260 tests (1 new), rho-agents 68, `cargo fmt --check`
   clean.
 
+## Landed: the inlay map seeks instead of walking
+
+Found in three telemetry reports the user sent from their own machine, and
+found only because the CPU profile inside them had never been read: **45%,
+48% and 56% of all main-thread samples were inside one function**,
+`InlaySnapshot::output_span_for_buffer_offset`. The caller attribution was
+unanimous — of the 273, 754 and 1,202 samples in it, **100% arrived through
+`refresh_dashboard` → `sync_tree` → `Editor::splice_inlays` →
+`InlayMap::splice`**, under `handle_model_events`. So the GUI spent over half
+its main thread in that function whenever an agent was streaming.
+
+The mechanism is one line of shape. `transforms` is a `SumTree`, and every
+other method in `inlay_map.rs` reaches into it with a cursor; this one alone
+ran `for transform in self.transforms.iter()` over the whole tree.
+`InlayMap::splice` then calls it **twice for every affected offset**
+(inlay_map.rs, the `old:`/`new:` pair), so a splice cost the offsets times
+the transforms — and both grow with the document. The dashboard's `sync_tree`
+re-splices the prefix set of the whole agent tree on a model event, so the
+offsets are the rows: N against N, quadratic, per streamed event.
+
+The change is a seek. The transforms are ordered by input offset, so the ones
+touching a target are contiguous: seek to the first, walk forward while the
+input start is still at or before it. The body of each arm is untouched. One
+subtlety earns its comment in the code: a `Bias::Left` seek can land past
+transforms that still touch the target, because an inlay sitting *on* the
+target has no input width at all and so is never sought to — the cursor steps
+back over that run first, which is bounded by the inlays on one offset.
+
+**Whether it is ours.** The function handles `Transform::Concealed`, which is
+rho's own layer — the module doc describes the `source -> concealment ->
+inlay` flattening as this fork's design — and a concealed range maps a
+non-zero input span to zero output, which is exactly why a *span* is needed
+here where a point would do upstream. The evidence says the walk is ours,
+added with concealment. I could not reach upstream zed from the rig to
+confirm it, and say so rather than implying I checked.
+
+**What it widens:** nothing. Same answer, proven differentially — the walk was
+kept as a debug-only reference and cross-checked on every call across the
+whole `rho-gui` suite: **274 tests green with the assert live**. That the
+suite reaches the function at all was established by a negative control: a
+deliberately wrong reference failed **148 tests**, so the green run is a
+proof and not an absence of coverage.
+
+**Numbers**, per batch splice on the desk host, at the batch shape the
+dashboard actually uses (offsets scaling with the tree):
+
+| transforms | walk    | seek    |
+|------------|---------|---------|
+| 500        | 0.089 s | 0.041 s |
+| 4 000      | 3.683 s | 0.413 s |
+
+**8.9× faster at 4,000**, and the growth for 8× the transforms and 8× the
+batch falls from **41.4× to 10.0×** — from quadratic to the batch's own
+linear cost. A single-inlay splice shows none of this, because the rest of
+`splice` swamps two lookups; the test measures the batch for that reason and
+says so.
+
+The test is `crates/rho-gui/src/tests/inlay_cost.rs`, and it asserts the
+shape rather than a duration: a threshold of 20× sits far above the honest
+linear cost of a bigger batch and far below anything a walk can reach.
+
+Two things this does *not* fix, both still on the board. `splice` keeps other
+linear terms — `inlays.retain` over every inlay, the `Vec::insert`, and
+`sync` rebuilding the transforms — which is why 10× and not 1×; the real
+repair for the dashboard is to stop splicing the whole prefix set on every
+event, which is the next commit. And the transcript's own prepaint, p50
+5.1 ms, is still unexplained: the profile cannot see it because this function
+swamped it, and no frame in the report records how many rows it drew.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

@@ -20,6 +20,7 @@ use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod history;
+mod inlay_cost;
 mod minibuffer;
 mod scene_fuzz;
 mod story;

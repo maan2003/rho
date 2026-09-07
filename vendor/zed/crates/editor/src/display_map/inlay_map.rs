@@ -973,28 +973,55 @@ impl InlayMap {
 }
 
 impl InlaySnapshot {
+    /// The inlay offsets a buffer offset maps to, including any inlays that
+    /// sit exactly on it.
+    ///
+    /// Seeks rather than walks. `transforms` is a `SumTree` and every other
+    /// method here reaches into it with a cursor; this one iterated the whole
+    /// tree, and it is called twice for every affected offset by
+    /// `InlayMap::splice`, so a splice cost the offsets times the transforms.
+    /// On a document with a few thousand transforms that is most of the main
+    /// thread: three telemetry reports from the user had 45%, 48% and 56% of
+    /// all main-thread samples inside this function, every one of them
+    /// reached through `splice`.
+    ///
+    /// The transforms are ordered by input offset, so the ones that touch
+    /// `target` are contiguous: seek to the first and walk forward while the
+    /// input start is still at or before it. The body is what it always was.
     fn output_span_for_buffer_offset(&self, target: MultiBufferOffset) -> Range<InlayOffset> {
-        let mut input = MultiBufferOffset(0);
-        let mut output = MultiBufferOffset(0);
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
+        cursor.seek(&target, Bias::Left);
+        // A seek can land past transforms that still touch `target` — an
+        // inlay at `target` has no input width at all, so it neither
+        // contains the offset nor is sought to. Step back while the item
+        // still starts at or after `target`; the run is the inlays sitting on
+        // one offset, and it ends at the transform before them.
+        while cursor.start().0 >= target && cursor.prev_item().is_some() {
+            cursor.prev();
+        }
         let mut span = None;
-        for transform in self.transforms.iter() {
+        while let Some(transform) = cursor.item() {
+            let input = cursor.start().0;
+            let output = cursor.start().1.0;
+            if input > target {
+                break;
+            }
             match transform {
                 Transform::Isomorphic(summary) => {
                     let end = input + summary.len;
-                    if input <= target && target <= end {
+                    if target <= end {
                         let position = InlayOffset(output + (target - input));
                         span.get_or_insert(position..position);
                     }
-                    input = end;
-                    output += summary.len;
                 }
                 Transform::Concealed(summary) => {
                     let end = input + summary.len;
-                    if input <= target && target <= end {
+                    if target <= end {
                         let position = InlayOffset(output);
                         span.get_or_insert(position..position);
                     }
-                    input = end;
                 }
                 Transform::Inlay(inlay) => {
                     let len = MultiBufferOffset(inlay.text().len());
@@ -1003,12 +1030,12 @@ impl InlaySnapshot {
                         range.start = cmp::min(range.start, InlayOffset(output));
                         range.end = cmp::max(range.end, InlayOffset(output + len));
                     }
-                    output += len;
                 }
             }
+            cursor.next();
         }
         span.unwrap_or_else(|| {
-            let end = InlayOffset(output);
+            let end = InlayOffset(self.transforms.summary().output.len);
             end..end
         })
     }
