@@ -485,15 +485,35 @@ finds the session under the rig's own runtime dir, so `rho wayland` from a
 normal shell with neither `--state-dir` nor `XDG_RUNTIME_DIR` set finds no
 session and the keystrokes go nowhere — and the run still comes up, still
 profiles, still prints a session line that reads like a good result. Desk
-session 64 is the worked case (eng-b8os, the rewrap cut): 312 frames, draw p99
+session 66 is the worked case (eng-b8os, the rewrap cut): 312 frames, draw p99
 2.4 ms, and no drive behind any of it. What gave it away was the row count,
 not the stage name: 2114 rows touched across a whole run whose point was a
 262,000-row transcript being composed. A run that did the thing has a row
 count you could have predicted before it started, so predict it, and read it
 first. Two habits from the same afternoon: drive with `--state-dir` rather
 than an exported environment a subshell may not carry, and `trap` the `rig
-down`, because session 64's `set -e` left the rig up and the next two runs
+down`, because session 64's `set -e` — its first keystroke failed outright
+with "session is not available" — left the rig up and the runs behind it
 refused as already held.
+
+The batch is the other half of the lesson: it failed three different ways and
+only the silent one produced a number. 64's keystroke failed loudly, runs in the same batch
+refused loudly as already held, and 66 came up, drove nothing and wrote a
+clean-looking profile. Loud failures cost minutes.
+The quiet one is the one that gets reported.
+
+The general form, and it is not only about profiles. *Predict the number or
+the state you would get with the mechanism removed, and check that you do not
+get it.* Two cases from the same day. eng-b8os believed the 144 rows laid out
+by the shipped fill only after forcing the fill back to tail-first and
+re-running the same assertion, which gave 961 — the contrast is the evidence,
+not the 144. And a workspace test of mine asserted that back never lands on a
+transcript whose daemon was detached; it passed, and it passed again with the
+`forget` call it was meant to be testing commented out, because an agent's
+context dies with the agent and there was no stack left to walk. A test that
+passes with its mechanism removed and a profile written by a run that never
+drove are the same failure: they look like evidence and cost nothing to
+produce.
 
 *What fails it.*
 
