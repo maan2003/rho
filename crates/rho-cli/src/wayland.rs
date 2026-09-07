@@ -840,14 +840,13 @@ fn stop(root: &Path) -> Result<()> {
     {
         terminate_process_group(application.pid, libc::SIGTERM);
     }
-    if process_is_running(session.compositor) {
-        terminate_process_group(session.compositor.pid, libc::SIGTERM);
-    }
 
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline
-        && (process_is_running(session.compositor)
-            || session.application.is_some_and(process_is_running))
+    // Keep Wayland alive while the application handles SIGTERM. GPUI uses
+    // that signal to close its windows and release their retained entities;
+    // stopping Sway at the same time tears down the event loop first.
+    let application_deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < application_deadline
+        && session.application.is_some_and(process_is_running)
     {
         thread::sleep(Duration::from_millis(50));
     }
@@ -856,6 +855,15 @@ fn stop(root: &Path) -> Result<()> {
         .filter(|process| process_is_running(*process))
     {
         terminate_process_group(application.pid, libc::SIGKILL);
+    }
+
+    if process_is_running(session.compositor) {
+        terminate_process_group(session.compositor.pid, libc::SIGTERM);
+    }
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline && process_is_running(session.compositor) {
+        thread::sleep(Duration::from_millis(50));
     }
     if process_is_running(session.compositor) {
         terminate_process_group(session.compositor.pid, libc::SIGKILL);

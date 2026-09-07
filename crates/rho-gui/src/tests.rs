@@ -20,6 +20,7 @@ use settings::{Settings, SettingsStore};
 use story::ready_with;
 
 mod dashboard_cost;
+mod editor_shutdown;
 mod fold_accounting_streaming;
 mod fold_tail_rows;
 mod fold_widen_bias;
