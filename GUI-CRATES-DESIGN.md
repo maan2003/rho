@@ -2338,6 +2338,42 @@ swamped it, and no frame in the report records how many rows it drew.
   Gate green: rho-fake-slack 7 tests and 1 doc test, clippy `-D warnings`
   clean, `cargo fmt --check` clean, workspace suite green.
 
+## Landed: a call's results are asked for by the chunk that draws it
+
+The story carries every tool call and its arguments but never its output. On
+the user's own transcripts the results are 1.73 GiB against a client mirror of
+1028 MiB with the calls alone, and most are never read, so they can neither
+travel with the story nor be held for the whole transcript.
+
+So the chunk that draws a call asks for it. A call closed by an event keeps
+that event's position, and a chunk, as it composes, asks the daemon for the
+bodies at the positions its calls name: one request per chunk however many
+positions, answered one message per position, each naming what it answers.
+Composing is the only thing that asks, so history nobody has scrolled to costs
+nothing. An answer is drawn into the blocks that asked and nowhere else, and a
+chunk that went away while its answer was in flight is not waiting for it — the
+answer is dropped and the chunk asks again when it composes again. Nothing is
+cached, because a cache would be a second copy of the results the reader did
+not ask for.
+
+A daemon too old to read the extra positions answers one body, and a story
+written before the field leaves it unset. Both draw the call and its arguments
+and nothing under them, which is also what a call still running looks like. The
+client draws what it gets.
+
+*Numbers, and what they are not.* The frame numbers in the landing commit are
+185 frames, draw p50 1.80 ms, p90 3.69, p99 27.20, 9 over the 4 ms bound, with
+the two worst a transcript opening at 27 and 32 ms almost entirely in prepaint,
+and the composer keystrokes at 4.1 to 6.1 ms each. The commit message names
+those as measured on `ced14f55`. **They were not.** Every rig session that
+afternoon launched a `target/profiling/rho-gui` built at 13:29 from
+`ecdec381`, because the rebuilds named `rho-cli` and `rho-daemon` and the rig
+launches the GUI from a third binary that nobody rebuilt. The measurements are
+real and the tip they name is wrong; they describe `ecdec381`, which predates
+the second fold fix and the dashboard patch. The commit message stays as
+history and this is the record. The frame on a folded turn opened by unfolding
+is still owed and is in neither.
+
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

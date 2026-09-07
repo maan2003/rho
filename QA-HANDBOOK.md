@@ -694,6 +694,18 @@ Check the state moved, not that the command returned. The rig's own journal
 counts its sessions; three runs is three new sessions, and if it is one, you
 drove one session three times.
 
+Check that the binary under test is the one you built. "I built it" and "the
+thing that ran is the build I made" are two claims and only the first is easy.
+A rig launches several binaries from several packages; a rebuild that names the
+ones you were thinking about leaves the others at whatever they were. Five
+sessions in a row were driven against a GUI four hours older than the tree, and
+every one of them was reported as evidence about a tip it had never contained -
+including a crash said to survive two fixes that were not in it. Timestamps are
+worth checking and are not proof: the check that settles it is to put something
+in the build that cannot be in the old one - a marker string in a log line the
+run is certain to print - and confirm it appears. That is the known-answer
+check again, aimed at the binary rather than the app.
+
 And say so afterwards. A harness error found and corrected belongs in the
 landing note beside the result, because the number means nothing without the
 account of how it was taken.
