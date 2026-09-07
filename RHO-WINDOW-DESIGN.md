@@ -208,7 +208,10 @@ three landing notes.
   now drives it: a transcript of forty settled turns, a width change, a jump
   to the top, and keystrokes beside them. On that document a width change
   touches all 273 rows and a keystroke touches one, so a rewrap is the width
-  change's alone and an edit already costs the rows it edits.
+  change's alone and an edit already costs the rows it edits. The rewrap is
+  bounded there too: the transcript's composed window saturates at 273 rows
+  however many turns are seeded, so the 262k-row figure below is the
+  file-backed views' and not the transcript's.
 - **The inlay map's edit-carrying sync is O(document).** Its per-row cost
   grows with the buffer rather than with the edit: 3.2 µs per row early in a
   `gg` over the 262k-row transcript and 13.3 µs per row late in the same

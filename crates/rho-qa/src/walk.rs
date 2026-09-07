@@ -27,10 +27,14 @@ const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
     WalkEvent::Idle,
 ];
 
-/// Settled turns seeded before the drive runs. Forty turns is past the
-/// point where the whole document fits a screen, which is what makes a
-/// whole-document rewrap distinguishable from a visible-rows one.
-const LARGE_TRANSCRIPT_TURNS: usize = 40;
+/// Settled turns seeded before the drive runs.
+///
+/// Forty already saturates what the transcript composes: seeding 0, 40 and
+/// 400 turns gives 38, 273 and 273 rows, because the transcript hands the
+/// editor a screen and pages history in forty-row chunks. Four hundred
+/// costs nothing in the composed window and buys the jump to the top a real
+/// chunk to page in - `gg` touches 49 rows at 400 where it touched 6 at 40.
+const LARGE_TRANSCRIPT_TURNS: usize = 400;
 
 #[derive(Args)]
 pub struct WalkArgs {
@@ -71,29 +75,39 @@ pub fn run(args: WalkArgs) -> Result<()> {
     let mut max_draw = 0;
     let mut max_cold = 0;
     let mut max_warm = 0;
+    // Every line is labelled by run rather than by seed: the drive is a
+    // script and not a generated sequence, and it carries seed zero for its
+    // dispatcher, so a seed would name two different runs the same.
     let mut runs = seeds
         .iter()
-        .map(|seed| WalkConfig {
-            seed: *seed,
-            steps,
-            mode,
-            prefill_turns: 0,
-            script: None,
+        .map(|seed| {
+            (
+                format!("seed-{seed}"),
+                WalkConfig {
+                    seed: *seed,
+                    steps,
+                    mode,
+                    prefill_turns: 0,
+                    script: None,
+                },
+            )
         })
         .collect::<Vec<_>>();
     if args.gate {
-        runs.push(WalkConfig {
-            seed: 0,
-            steps: LARGE_TRANSCRIPT_DRIVE.len(),
-            mode,
-            prefill_turns: LARGE_TRANSCRIPT_TURNS,
-            script: Some(LARGE_TRANSCRIPT_DRIVE),
-        });
+        runs.push((
+            "drive".to_owned(),
+            WalkConfig {
+                seed: 0,
+                steps: LARGE_TRANSCRIPT_DRIVE.len(),
+                mode,
+                prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                script: Some(LARGE_TRANSCRIPT_DRIVE),
+            },
+        ));
     }
-    let total_events = runs.iter().map(|config| config.steps).sum::<usize>();
-    for config in &runs {
+    let total_events = runs.iter().map(|(_, config)| config.steps).sum::<usize>();
+    for (run, config) in &runs {
         let config = *config;
-        let seed = &config.seed;
         let report = WalkHarness::new(config).run().map_err(|failure| {
             let script =
                 serde_json::to_string_pretty(&failure.events).unwrap_or_else(|_| "[]".to_owned());
@@ -104,7 +118,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 .and_then(|event| serde_json::to_string(event).ok())
                 .unwrap_or_else(|| "null".to_owned());
             anyhow::anyhow!(
-                "oracle={} seed={seed}\nstep={} event={event}\ncold_draw_us={} warm_draw_us={} event_draw_us={} touched_rows={} walked_items={}\nshrunk sequence:\n{script}\nsub-scene changes (capped at 32):\n{details}",
+                "oracle={} run={run}\nstep={} event={event}\ncold_draw_us={} warm_draw_us={} event_draw_us={} touched_rows={} walked_items={}\nshrunk sequence:\n{script}\nsub-scene changes (capped at 32):\n{details}",
                 failure.oracle,
                 failure.step,
                 failure.cold_draw_micros,
@@ -128,7 +142,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             baseline.sort_by_key(|owner| std::cmp::Reverse(owner.paint_nanos));
             for owner in baseline.into_iter().take(12) {
                 println!(
-                    "WALL_CLOCK_BASELINE_OWNER seed={seed} owner={} paint_ns={} primitives={} bounds={:?}",
+                    "WALL_CLOCK_BASELINE_OWNER run={run} owner={} paint_ns={} primitives={} bounds={:?}",
                     owner.owner, owner.paint_nanos, owner.primitives, owner.bounds
                 );
             }
@@ -137,14 +151,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
             let sequence =
                 serde_json::to_string(&finding.sequence).unwrap_or_else(|_| "[]".to_owned());
             println!(
-                "WALL_CLOCK_FINDING seed={seed} step={} draw_us={} touched_rows={} walked_items={} sequence={sequence}",
+                "WALL_CLOCK_FINDING run={run} step={} draw_us={} touched_rows={} walked_items={} sequence={sequence}",
                 finding.step, finding.draw_micros, finding.touched_rows, finding.walked_items
             );
             let mut owners = report.step_owners[finding.step].iter().collect::<Vec<_>>();
             owners.sort_by_key(|owner| std::cmp::Reverse(owner.paint_nanos));
             for owner in owners.into_iter().take(12) {
                 println!(
-                    "WALL_CLOCK_OWNER seed={seed} step={} owner={} paint_ns={} primitives={} changed={} bounds={:?}",
+                    "WALL_CLOCK_OWNER run={run} step={} owner={} paint_ns={} primitives={} changed={} bounds={:?}",
                     finding.step,
                     owner.owner,
                     owner.paint_nanos,
@@ -164,7 +178,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
             .enumerate()
         {
             println!(
-                "seed={seed} step={step} draw_us={draw} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}"
+                "run={run} step={step} draw_us={draw} touched_rows={touched_rows} walked_items={walked_items} drawn_rows={drawn_rows} total_rows={total_rows}"
             );
         }
     }
