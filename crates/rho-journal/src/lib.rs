@@ -809,7 +809,7 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
 
 static GLOBAL: OnceLock<Journal> = OnceLock::new();
 
-pub fn init(state_dir: &Path) -> std::io::Result<()> {
+pub fn init(state_dir: &Path, dealer_policy: DealerPolicySnapshot) -> std::io::Result<()> {
     let journal = Journal::open(state_dir)?;
     GLOBAL.set(journal).map_err(|_| {
         std::io::Error::new(
@@ -822,7 +822,7 @@ pub fn init(state_dir: &Path) -> std::io::Result<()> {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             git_commit: option_env!("RHO_BUILD_GIT_COMMIT").map(str::to_owned),
         },
-        dealer_policy: crate::dashboard::dealer_policy_snapshot(),
+        dealer_policy,
     });
     Ok(())
 }
@@ -990,7 +990,18 @@ mod tests {
                 version: "1.2.3".into(),
                 git_commit: Some("deadbeef".into()),
             },
-            dealer_policy: crate::dashboard::dealer_policy_snapshot(),
+            dealer_policy: DealerPolicySnapshot {
+                queue_floor: 1.0,
+                blocked_reply_head_start: 2.0,
+                blocked_reply_slope_per_day: 3.0,
+                fyi_reply_pace_days: 4.0,
+                thread_reply_head_start: 5.0,
+                skip_cooldown_minutes: 6,
+                lamp_threshold: 7.0,
+                chime_threshold: 8.0,
+                agent_recency_bonus: 9.0,
+                agent_recency_window_ms: 10,
+            },
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);

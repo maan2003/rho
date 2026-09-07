@@ -343,7 +343,7 @@ impl Workspace {
         surface: crate::workspace::Surface,
         cx: &mut gpui::Context<Self>,
     ) {
-        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Command, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Command, cx);
     }
 
     /// `shift-n`: the next conversation with something unread, or the list
@@ -553,7 +553,7 @@ impl Workspace {
             (edited, attached)
         });
         if let (Some((channel, bytes)), Some(session)) = (attached, self.slack.clone()) {
-            crate::journal::record(crate::journal::Event::SlackFileSent {
+            rho_journal::record(rho_journal::Event::SlackFileSent {
                 conversation: session.read(cx).model().label(&channel),
                 bytes,
             });
@@ -561,7 +561,7 @@ impl Workspace {
         let (Some((channel, ts)), Some(session)) = (edited, self.slack.clone()) else {
             return;
         };
-        crate::journal::record(crate::journal::Event::SlackMessageEdited {
+        rho_journal::record(rho_journal::Event::SlackMessageEdited {
             conversation: session.read(cx).model().label(&channel),
             ts: ts.0,
         });
@@ -879,9 +879,9 @@ impl Workspace {
         let Some(key) = thread_key(thread) else {
             return;
         };
-        crate::journal::record(crate::journal::Event::SlackThreadIgnored {
+        rho_journal::record(rho_journal::Event::SlackThreadIgnored {
             thread: journal_thread_labelled(session.read(cx).model(), &key),
-            by: crate::journal::IgnoredBy::Rho,
+            by: rho_journal::IgnoredBy::Rho,
         });
         session.update(cx, |session, cx| session.ignore_thread(&key, cx));
     }
@@ -924,9 +924,9 @@ impl Workspace {
             .as_ref()
             .map(|session| journal_thread_labelled(session.read(cx).model(), key))
             .unwrap_or_else(|| journal_thread(&Source::Thread(key.clone())));
-        crate::journal::record(crate::journal::Event::SlackThreadIgnored {
+        rho_journal::record(rho_journal::Event::SlackThreadIgnored {
             thread,
-            by: crate::journal::IgnoredBy::Slack,
+            by: rho_journal::IgnoredBy::Slack,
         });
         self.mute_thread_card(card, window, cx);
     }
@@ -1057,7 +1057,7 @@ impl Workspace {
             }
             None => 0,
         };
-        crate::journal::record(crate::journal::Event::SlackMarkedReadBefore {
+        rho_journal::record(rho_journal::Event::SlackMarkedReadBefore {
             cutoff: text.clone(),
             conversations,
             threads,
@@ -1172,12 +1172,12 @@ impl Workspace {
         }
         match event {
             SessionEvent::Connected => {
-                crate::journal::record(crate::journal::Event::SlackConnected {
+                rho_journal::record(rho_journal::Event::SlackConnected {
                     workspace: session.read(cx).model().workspace().0.clone(),
                 });
             }
             SessionEvent::Disconnected(reason) => {
-                crate::journal::record(crate::journal::Event::SlackDisconnected {
+                rho_journal::record(rho_journal::Event::SlackDisconnected {
                     workspace: session.read(cx).model().workspace().0.clone(),
                     reason: reason.clone(),
                 });
@@ -1212,7 +1212,7 @@ impl Workspace {
             }
             SessionEvent::Replied(key) => {
                 let thread = journal_thread_labelled(session.read(cx).model(), key);
-                crate::journal::record(crate::journal::Event::SlackReplied { thread });
+                rho_journal::record(rho_journal::Event::SlackReplied { thread });
             }
             SessionEvent::Health(signal) => match signal {
                 Signal::Degraded(reason) => {
@@ -1234,14 +1234,14 @@ impl Workspace {
 /// The journal's name for a thread. The conversation is the label a person
 /// would recognise; the thread key is kept so two threads in one channel do
 /// not merge in the record.
-pub(crate) fn journal_thread(source: &Source) -> crate::journal::SlackThread {
+pub(crate) fn journal_thread(source: &Source) -> rho_journal::SlackThread {
     match source {
-        Source::Conversation(channel) => crate::journal::SlackThread {
+        Source::Conversation(channel) => rho_journal::SlackThread {
             workspace: String::new(),
             conversation: channel.0.clone(),
             thread: String::new(),
         },
-        Source::Thread(key) => crate::journal::SlackThread {
+        Source::Thread(key) => rho_journal::SlackThread {
             workspace: key.workspace.0.clone(),
             conversation: key.channel.0.clone(),
             thread: key.thread_ts.0.clone(),
@@ -1249,8 +1249,8 @@ pub(crate) fn journal_thread(source: &Source) -> crate::journal::SlackThread {
     }
 }
 
-fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> crate::journal::SlackThread {
-    crate::journal::SlackThread {
+fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> rho_journal::SlackThread {
+    rho_journal::SlackThread {
         workspace: key.workspace.0.clone(),
         conversation: model.label(&key.channel),
         thread: key.thread_ts.0.clone(),

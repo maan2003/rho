@@ -14001,6 +14001,7 @@ dependencies = [
  "rho-files",
  "rho-hosts",
  "rho-iroh-auth",
+ "rho-journal",
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
@@ -14113,6 +14114,28 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "futures 0.3.33",
+ "libc",
+ "redb",
+ "rho-db",
+ "rho-desk",
+ "rho-ui-proto",
+ "senax-encoder",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

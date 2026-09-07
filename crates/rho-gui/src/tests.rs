@@ -6744,14 +6744,13 @@ fn dealing_the_surface_already_shown_pushes_nothing(cx: &mut TestAppContext) {
             workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
             workspace.step_surface_back_for_test(window, cx);
             assert_eq!(workspace.current_surface_name_for_test(), "two");
-            workspace.show_current_history_for_test(crate::journal::SurfaceShowMethod::Deal, cx);
+            workspace.show_current_history_for_test(rho_journal::SurfaceShowMethod::Deal, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
                 vec!["three".to_owned()]
             );
 
-            workspace
-                .show_current_history_for_test(crate::journal::SurfaceShowMethod::Overview, cx);
+            workspace.show_current_history_for_test(rho_journal::SurfaceShowMethod::Overview, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
                 vec!["three".to_owned()],
@@ -9977,7 +9976,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
             workspace.file_page(
                 origin,
                 Some((HostId::default(), project.clone())),
-                crate::journal::CreateMethod::New,
+                rho_journal::CreateMethod::New,
                 window,
                 cx,
             );
@@ -10007,7 +10006,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
             workspace.file_page(
                 burst[0],
                 Some((HostId::default(), project.clone())),
-                crate::journal::CreateMethod::New,
+                rho_journal::CreateMethod::New,
                 window,
                 cx,
             );
@@ -10070,7 +10069,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
             workspace.file_page(
                 origin,
                 None,
-                crate::journal::CreateMethod::TabBirth,
+                rho_journal::CreateMethod::TabBirth,
                 window,
                 cx,
             );

@@ -240,10 +240,10 @@ impl Workspace {
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
-        crate::journal::record(crate::journal::Event::Created {
+        rho_journal::record(rho_journal::Event::Created {
             node_id: created.clone().into(),
-            kind: crate::journal::CreatedKind::Note,
-            method: crate::journal::CreateMethod::New,
+            kind: rho_journal::CreatedKind::Note,
+            method: rho_journal::CreateMethod::New,
             at_root: area.is_none(),
         });
         self.dashboard.move_to_tree_node_when_ready(host, created);

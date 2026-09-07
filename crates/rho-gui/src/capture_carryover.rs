@@ -265,6 +265,6 @@ impl Workspace {
             self.sync_tree_dashboard(host, window, cx);
         }
         mark_carried(&db);
-        crate::journal::record(crate::journal::Event::CaptureCarryover { notes, unreadable });
+        rho_journal::record(rho_journal::Event::CaptureCarryover { notes, unreadable });
     }
 }

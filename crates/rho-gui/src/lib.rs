@@ -10,7 +10,6 @@ pub mod draft_view;
 pub(crate) mod find;
 pub mod home;
 pub(crate) mod image_view;
-pub mod journal;
 pub mod minibuffer;
 pub mod mirror;
 pub(crate) mod model;
@@ -657,3 +656,8 @@ pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
 mod slack_tests;
 #[cfg(test)]
 mod tests;
+
+/// The dealer's policy constants as the journal records them at session start.
+pub fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
+    dashboard::dealer_policy_snapshot()
+}

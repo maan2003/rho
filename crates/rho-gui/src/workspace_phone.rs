@@ -62,15 +62,15 @@ enum PhoneScrollEdge {
 }
 
 impl PhoneScrollEdge {
-    fn permits(self, direction: crate::journal::PhoneFlickDirection) -> bool {
+    fn permits(self, direction: rho_journal::PhoneFlickDirection) -> bool {
         matches!(
             (self, direction),
             (
                 Self::Top | Self::Both,
-                crate::journal::PhoneFlickDirection::Down
+                rho_journal::PhoneFlickDirection::Down
             ) | (
                 Self::Bottom | Self::Both,
-                crate::journal::PhoneFlickDirection::Up
+                rho_journal::PhoneFlickDirection::Up
             )
         )
     }
@@ -122,16 +122,16 @@ impl PhoneFlickGesture {
         self.timestamp = event.timestamp;
     }
 
-    fn direction(&self) -> Option<crate::journal::PhoneFlickDirection> {
+    fn direction(&self) -> Option<rho_journal::PhoneFlickDirection> {
         let dy = (self.position.y - self.start.y).as_f32();
         let dx = (self.position.x - self.start.x).as_f32();
         if dy.abs() < FLICK_SLOP || dy.abs() < dx.abs() * 1.25 {
             return None;
         }
         Some(if dy < 0. {
-            crate::journal::PhoneFlickDirection::Up
+            rho_journal::PhoneFlickDirection::Up
         } else {
-            crate::journal::PhoneFlickDirection::Down
+            rho_journal::PhoneFlickDirection::Down
         })
     }
 
@@ -143,7 +143,7 @@ impl PhoneFlickGesture {
     fn committed_direction(
         &self,
         viewport_height: Pixels,
-    ) -> Option<crate::journal::PhoneFlickDirection> {
+    ) -> Option<rho_journal::PhoneFlickDirection> {
         let direction = self.direction()?;
         if !self.edge.permits(direction) {
             return None;
@@ -234,23 +234,23 @@ impl PhoneUi {
         self.touch_debug
     }
 
-    fn record_flick(&mut self, direction: crate::journal::PhoneFlickDirection, moved_card: bool) {
+    fn record_flick(&mut self, direction: rho_journal::PhoneFlickDirection, moved_card: bool) {
         let direction = match direction {
-            crate::journal::PhoneFlickDirection::Up => "up",
-            crate::journal::PhoneFlickDirection::Down => "down",
+            rho_journal::PhoneFlickDirection::Up => "up",
+            rho_journal::PhoneFlickDirection::Down => "down",
         };
         let outcome = if moved_card { "moved" } else { "stayed" };
         self.last_gesture = Some(format!("flick {direction} · {outcome}"));
     }
 
-    fn record_verdict(&mut self, verdict: crate::journal::PhoneVerdict) {
+    fn record_verdict(&mut self, verdict: rho_journal::PhoneVerdict) {
         let verdict = match verdict {
-            crate::journal::PhoneVerdict::Done => "done",
-            crate::journal::PhoneVerdict::Mute => "mute",
-            crate::journal::PhoneVerdict::Defer => "defer",
-            crate::journal::PhoneVerdict::Todo => "todo",
-            crate::journal::PhoneVerdict::File => "file",
-            crate::journal::PhoneVerdict::Reply => "reply",
+            rho_journal::PhoneVerdict::Done => "done",
+            rho_journal::PhoneVerdict::Mute => "mute",
+            rho_journal::PhoneVerdict::Defer => "defer",
+            rho_journal::PhoneVerdict::Todo => "todo",
+            rho_journal::PhoneVerdict::File => "file",
+            rho_journal::PhoneVerdict::Reply => "reply",
         };
         self.last_gesture = Some(format!("verdict {verdict}"));
     }
@@ -474,7 +474,7 @@ impl Workspace {
         self.start_phone_snap(
             px(-300.),
             px(-800.),
-            Some(crate::journal::PhoneFlickDirection::Up),
+            Some(rho_journal::PhoneFlickDirection::Up),
             window,
             cx,
         );
@@ -712,12 +712,8 @@ impl Workspace {
                     cx.stop_propagation();
                     if self.open_card_in_view(cx).is_some() {
                         let to = match direction {
-                            crate::journal::PhoneFlickDirection::Up => {
-                                -window.viewport_size().height
-                            }
-                            crate::journal::PhoneFlickDirection::Down => {
-                                window.viewport_size().height
-                            }
+                            rho_journal::PhoneFlickDirection::Up => -window.viewport_size().height,
+                            rho_journal::PhoneFlickDirection::Down => window.viewport_size().height,
                         };
                         self.start_phone_snap(from, to, Some(direction), window, cx);
                     } else {
@@ -735,7 +731,7 @@ impl Workspace {
         &mut self,
         from: Pixels,
         to: Pixels,
-        direction: Option<crate::journal::PhoneFlickDirection>,
+        direction: Option<rho_journal::PhoneFlickDirection>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -777,14 +773,14 @@ impl Workspace {
 
     fn commit_phone_flick(
         &mut self,
-        direction: crate::journal::PhoneFlickDirection,
+        direction: rho_journal::PhoneFlickDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let before = self.open_card_in_view(cx);
         match direction {
-            crate::journal::PhoneFlickDirection::Up => self.pull_card(window, cx),
-            crate::journal::PhoneFlickDirection::Down => match self.phone.transitions.pop() {
+            rho_journal::PhoneFlickDirection::Up => self.pull_card(window, cx),
+            rho_journal::PhoneFlickDirection::Down => match self.phone.transitions.pop() {
                 Some(PhoneTransition::Flick(card)) => {
                     // Flicking back is taking the skip back: the card is the
                     // one to look at again, so it opens as it was.
@@ -803,7 +799,7 @@ impl Workspace {
         let after = self.open_card_in_view(cx);
         let moved_card =
             before.as_ref().map(|card| &card.identity) != after.as_ref().map(|card| &card.identity);
-        if direction == crate::journal::PhoneFlickDirection::Up
+        if direction == rho_journal::PhoneFlickDirection::Up
             && moved_card
             && let Some(card) = before
         {
@@ -816,12 +812,12 @@ impl Workspace {
 
     pub(super) fn record_phone_flick(
         &mut self,
-        direction: crate::journal::PhoneFlickDirection,
+        direction: rho_journal::PhoneFlickDirection,
         moved_card: bool,
         cx: &mut Context<Self>,
     ) {
         self.phone.record_flick(direction, moved_card);
-        crate::journal::record(crate::journal::Event::PhoneFlick {
+        rho_journal::record(rho_journal::Event::PhoneFlick {
             direction,
             moved_card,
         });
@@ -830,11 +826,11 @@ impl Workspace {
 
     pub(super) fn record_phone_verdict(
         &mut self,
-        verdict: crate::journal::PhoneVerdict,
+        verdict: rho_journal::PhoneVerdict,
         cx: &mut Context<Self>,
     ) {
         self.phone.record_verdict(verdict);
-        crate::journal::record(crate::journal::Event::PhoneVerdict { verdict });
+        rho_journal::record(rho_journal::Event::PhoneVerdict { verdict });
         cx.notify();
     }
 
@@ -1071,7 +1067,7 @@ impl Workspace {
 
     fn dispatch_phone_verdict(
         &mut self,
-        verdict: crate::journal::PhoneVerdict,
+        verdict: rho_journal::PhoneVerdict,
         action: Box<dyn gpui::Action>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1089,7 +1085,7 @@ impl Workspace {
     /// which each name their own time.
     pub(crate) fn phone_verdict_with(
         &mut self,
-        verdict: crate::journal::PhoneVerdict,
+        verdict: rho_journal::PhoneVerdict,
         run: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1150,7 +1146,7 @@ impl Workspace {
                 item("phone-verdict-done", "✓", "done").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Done,
+                            rho_journal::PhoneVerdict::Done,
                             Box::new(crate::DashboardDealDone),
                             window,
                             cx,
@@ -1162,7 +1158,7 @@ impl Workspace {
                 item("phone-verdict-mute", "×", "mute").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Mute,
+                            rho_journal::PhoneVerdict::Mute,
                             Box::new(crate::DashboardDealMute),
                             window,
                             cx,
@@ -1183,7 +1179,7 @@ impl Workspace {
                 item("phone-verdict-todo", "○", "todo").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Todo,
+                            rho_journal::PhoneVerdict::Todo,
                             Box::new(crate::DashboardDealTodo),
                             window,
                             cx,
@@ -1195,7 +1191,7 @@ impl Workspace {
                 item("phone-verdict-file", "⌂", "file").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::File,
+                            rho_journal::PhoneVerdict::File,
                             Box::new(crate::DashboardDealFile),
                             window,
                             cx,
@@ -1207,7 +1203,7 @@ impl Workspace {
                 item("phone-verdict-reply", "↩", "reply").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Reply,
+                            rho_journal::PhoneVerdict::Reply,
                             Box::new(crate::DashboardDealReply),
                             window,
                             cx,
@@ -1522,13 +1518,13 @@ mod tests {
             let mut phone = PhoneUi::new(cx);
             assert_eq!(phone.touch_debug_label(2), "contacts 2 · last none");
 
-            phone.record_flick(crate::journal::PhoneFlickDirection::Up, false);
+            phone.record_flick(rho_journal::PhoneFlickDirection::Up, false);
             assert_eq!(
                 phone.touch_debug_label(1),
                 "contacts 1 · last flick up · stayed"
             );
 
-            phone.record_verdict(crate::journal::PhoneVerdict::Done);
+            phone.record_verdict(rho_journal::PhoneVerdict::Done);
             assert_eq!(phone.touch_debug_label(0), "contacts 0 · last verdict done");
         });
     }
@@ -1551,7 +1547,7 @@ mod tests {
         at_bottom.update(&end);
         assert_eq!(
             at_bottom.committed_direction(px(600.)),
-            Some(crate::journal::PhoneFlickDirection::Up)
+            Some(rho_journal::PhoneFlickDirection::Up)
         );
 
         let mut in_middle = PhoneFlickGesture::new(&start, PhoneScrollEdge::Middle);
@@ -1570,14 +1566,14 @@ mod tests {
         long_drag.update(&touch(TouchPhase::Ended, 250., 2000));
         assert_eq!(
             long_drag.committed_direction(px(600.)),
-            Some(crate::journal::PhoneFlickDirection::Up)
+            Some(rho_journal::PhoneFlickDirection::Up)
         );
 
         let mut fast = PhoneFlickGesture::new(&start, PhoneScrollEdge::Bottom);
         fast.update(&touch(TouchPhase::Ended, 440., 50));
         assert_eq!(
             fast.committed_direction(px(600.)),
-            Some(crate::journal::PhoneFlickDirection::Up)
+            Some(rho_journal::PhoneFlickDirection::Up)
         );
     }
 }

@@ -215,7 +215,7 @@ fn run() -> Result<()> {
     }) = args.command.as_ref()
     {
         let stdout = std::io::stdout();
-        return rho_gui::journal::dump(&client_state_dir, kind.as_deref(), stdout.lock());
+        return rho_journal::dump(&client_state_dir, kind.as_deref(), stdout.lock());
     }
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::aws_lc_rs::default_provider()
@@ -261,7 +261,8 @@ fn run() -> Result<()> {
         None => rho_ui_proto::RuntimePaths::new(None::<PathBuf>)?,
     }
     .browser_socket();
-    rho_gui::journal::init(&client_state_dir).context("initialize client action journal")?;
+    rho_journal::init(&client_state_dir, rho_gui::dealer_policy_snapshot())
+        .context("initialize client action journal")?;
     // The mirror is a cache: a session that cannot open it starts empty and
     // asks the daemon for everything, which is the old behaviour. Only the
     // path is settled here; the model thread opens it.
@@ -279,12 +280,12 @@ fn run() -> Result<()> {
             const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
             cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
                 gpui::UserIdleEvent::Idle => {
-                    rho_gui::journal::record(rho_gui::journal::Event::UserIdle {
+                    rho_journal::record(rho_journal::Event::UserIdle {
                         timeout_s: USER_IDLE_TIMEOUT.as_secs(),
                     });
                 }
                 gpui::UserIdleEvent::Resumed => {
-                    rho_gui::journal::record(rho_gui::journal::Event::UserResumed);
+                    rho_journal::record(rho_journal::Event::UserResumed);
                 }
             });
             let mut profiler = profiler;
@@ -316,7 +317,7 @@ fn run() -> Result<()> {
                     finish_profiling(profiler);
                 }
                 rho_gui::telemetry::shutdown_passive_cpu_profile();
-                rho_gui::journal::flush();
+                rho_journal::flush();
                 // Closing rather than flushing: a mirror left open is a
                 // file redb finds unclean, and the next start rebuilds its
                 // allocator from every page to be sure of it.

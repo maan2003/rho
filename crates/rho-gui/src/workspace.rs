@@ -240,7 +240,7 @@ struct PendingTreeVerdict {
     event: crate::dashboard::DealerEvent,
     echo: String,
     undo: VerdictUndo,
-    phone_verdict: Option<crate::journal::PhoneVerdict>,
+    phone_verdict: Option<rho_journal::PhoneVerdict>,
 }
 
 #[derive(Clone)]
@@ -1104,7 +1104,7 @@ impl Workspace {
                     return;
                 }
                 last_window_active = Some(focused);
-                crate::journal::record(crate::journal::Event::WindowFocusChanged { focused });
+                rho_journal::record(rho_journal::Event::WindowFocusChanged { focused });
             });
         let mut this = Self {
             hosts,
@@ -1429,9 +1429,9 @@ impl Workspace {
         self.ensure_surface_subscription(&surface.key, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
-        crate::journal::record(crate::journal::Event::SurfaceShown {
+        rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: Self::journal_surface(&surface.key),
-            method: crate::journal::SurfaceShowMethod::Mru,
+            method: rho_journal::SurfaceShowMethod::Mru,
         });
         cx.notify();
     }
@@ -1475,7 +1475,7 @@ impl Workspace {
             return;
         }
         let key = self.active_surface().key.clone();
-        crate::journal::record(crate::journal::Event::SurfaceClosed {
+        rho_journal::record(rho_journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
             dealt_untouched: false,
         });
@@ -1499,16 +1499,16 @@ impl Workspace {
         if let Some(history) = self.history.as_mut() {
             history.forget(key);
         }
-        crate::journal::record(crate::journal::Event::HistoryRemoved {
+        rho_journal::record(rho_journal::Event::HistoryRemoved {
             identity: Self::journal_surface(key),
-            method: crate::journal::HistoryRemoveMethod::Close,
+            method: rho_journal::HistoryRemoveMethod::Close,
         });
     }
 
     fn forget_discarded_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.draft_area = None;
         let key = SurfaceKey::Draft;
-        crate::journal::record(crate::journal::Event::SurfaceClosed {
+        rho_journal::record(rho_journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
             dealt_untouched: false,
         });
@@ -1632,7 +1632,7 @@ impl Workspace {
         self.overview_open = true;
         self.refresh_dashboard(window, cx);
         window.focus(&self.dashboard.focus_handle(cx), cx);
-        crate::journal::record(crate::journal::Event::OverviewOpened);
+        rho_journal::record(rho_journal::Event::OverviewOpened);
         cx.notify();
     }
 
@@ -1745,8 +1745,8 @@ impl Workspace {
         if !self.show_previous_surface(window, cx) {
             return;
         }
-        crate::journal::record(crate::journal::Event::HistoryStepped {
-            direction: crate::journal::HistoryDirection::Back,
+        rho_journal::record(rho_journal::Event::HistoryStepped {
+            direction: rho_journal::HistoryDirection::Back,
             position: self.active_pane().behind(),
             len: self.active_pane().len(),
         });
@@ -1770,8 +1770,8 @@ impl Workspace {
             self.pull_card(window, cx);
             return;
         }
-        crate::journal::record(crate::journal::Event::HistoryStepped {
-            direction: crate::journal::HistoryDirection::Forward,
+        rho_journal::record(rho_journal::Event::HistoryStepped {
+            direction: rho_journal::HistoryDirection::Forward,
             position: self.active_pane().behind(),
             len: self.active_pane().len(),
         });
@@ -1780,8 +1780,8 @@ impl Workspace {
 
     fn journal_card_identity(
         identity: &crate::dashboard::DealCardId,
-    ) -> crate::journal::DealerCardIdentity {
-        crate::journal::DealerCardIdentity {
+    ) -> rho_journal::DealerCardIdentity {
+        rho_journal::DealerCardIdentity {
             host: identity.host.0,
             node_id: identity.node_id.clone().into(),
         }
@@ -1872,11 +1872,11 @@ impl Workspace {
         }
         if lamp_on != self.lamp_on {
             self.lamp_on = lamp_on;
-            crate::journal::record(crate::journal::Event::LampTransition {
+            rho_journal::record(rho_journal::Event::LampTransition {
                 state: if lamp_on {
-                    crate::journal::SignalState::On
+                    rho_journal::SignalState::On
                 } else {
-                    crate::journal::SignalState::Off
+                    rho_journal::SignalState::Off
                 },
                 top_priority: max_priority,
                 card: card.clone(),
@@ -1897,7 +1897,7 @@ impl Workspace {
             if !cfg!(test) {
                 self.chime.play();
             }
-            crate::journal::record(crate::journal::Event::ChimeRing {
+            rho_journal::record(rho_journal::Event::ChimeRing {
                 top_priority: priority,
                 card,
             });
@@ -3647,13 +3647,7 @@ impl Workspace {
                     }
                 };
                 let id = record.id;
-                this.file_page(
-                    id,
-                    parent,
-                    crate::journal::CreateMethod::TabBirth,
-                    window,
-                    cx,
-                );
+                this.file_page(id, parent, rho_journal::CreateMethod::TabBirth, window, cx);
                 this.preview_browser_page(id, window, cx);
                 this.focus_rail(window, cx);
             });
@@ -3668,7 +3662,7 @@ impl Workspace {
         &mut self,
         page: rho_browser::PageId,
         parent: Option<(HostId, rho_desk::cells::Id)>,
-        method: crate::journal::CreateMethod,
+        method: rho_journal::CreateMethod,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3703,9 +3697,9 @@ impl Workspace {
         {
             return;
         }
-        crate::journal::record(crate::journal::Event::Created {
+        rho_journal::record(rho_journal::Event::Created {
             node_id: id.into(),
-            kind: crate::journal::CreatedKind::Page,
+            kind: rho_journal::CreatedKind::Page,
             method,
             at_root,
         });
@@ -4133,7 +4127,7 @@ impl Workspace {
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        crate::journal::record(crate::journal::Event::AgentOpened {
+        rho_journal::record(rho_journal::Event::AgentOpened {
             agent_id: agent_id.into(),
         });
         self.activate_agent(agent_id, cx);
@@ -4495,7 +4489,7 @@ impl Workspace {
 
     pub(crate) fn cmd_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let surface = self.make_surface(SurfaceKey::Messages, window, cx);
-        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Command, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Command, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -4684,7 +4678,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        crate::journal::record(crate::journal::Event::AgentSelected {
+        rho_journal::record(rho_journal::Event::AgentSelected {
             agent_id: agent_id.map(|id| id.encoded()),
         });
         // Any other route to the draft page composes at the root; only
@@ -4890,8 +4884,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn journal_surface(key: &SurfaceKey) -> crate::journal::SurfaceIdentity {
-        use crate::journal::SurfaceIdentity;
+    fn journal_surface(key: &SurfaceKey) -> rho_journal::SurfaceIdentity {
+        use rho_journal::SurfaceIdentity;
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
             SurfaceKey::Home => SurfaceIdentity::Home,
@@ -4972,7 +4966,7 @@ impl Workspace {
         let (surface, rough_position) = if self.dashboard_mode(window, cx) {
             let editor = self.dashboard.editor().clone();
             (
-                crate::journal::SurfaceIdentity::Dashboard,
+                rho_journal::SurfaceIdentity::Dashboard,
                 editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64),
             )
         } else {
@@ -5027,7 +5021,7 @@ impl Workspace {
             cx.background_executor()
                 .timer(Duration::from_millis(350))
                 .await;
-            crate::journal::record(crate::journal::Event::Scroll {
+            rho_journal::record(rho_journal::Event::Scroll {
                 surface,
                 rough_position,
             });
@@ -5069,9 +5063,9 @@ impl Workspace {
 
     pub(crate) fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         let method = if self.overview_open {
-            crate::journal::SurfaceShowMethod::Overview
+            rho_journal::SurfaceShowMethod::Overview
         } else {
-            crate::journal::SurfaceShowMethod::Open
+            rho_journal::SurfaceShowMethod::Open
         };
         self.display_surface_with_method(surface, method, cx);
     }
@@ -5079,7 +5073,7 @@ impl Workspace {
     pub(crate) fn display_surface_with_method(
         &mut self,
         surface: Surface,
-        method: crate::journal::SurfaceShowMethod,
+        method: rho_journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
         self.ensure_surface_subscription(&surface.key, cx);
@@ -5091,7 +5085,7 @@ impl Workspace {
         // Home is not a card on the phone: it is what the feed shows when
         // there is nothing to deal, so it never joins the stack.
         if self.phone.enabled && surface.key != SurfaceKey::Home {
-            if method == crate::journal::SurfaceShowMethod::Deal {
+            if method == rho_journal::SurfaceShowMethod::Deal {
                 self.phone
                     .show_feed(self.active_context, surface.key.clone());
             } else {
@@ -5117,25 +5111,21 @@ impl Workspace {
         };
         self.overview_open = false;
         if let Some(method) = match method {
-            crate::journal::SurfaceShowMethod::Deal => {
-                Some(crate::journal::HistoryAppendMethod::Deal)
+            rho_journal::SurfaceShowMethod::Deal => Some(rho_journal::HistoryAppendMethod::Deal),
+            rho_journal::SurfaceShowMethod::Overview => {
+                Some(rho_journal::HistoryAppendMethod::Overview)
             }
-            crate::journal::SurfaceShowMethod::Overview => {
-                Some(crate::journal::HistoryAppendMethod::Overview)
+            rho_journal::SurfaceShowMethod::Command => {
+                Some(rho_journal::HistoryAppendMethod::Command)
             }
-            crate::journal::SurfaceShowMethod::Command => {
-                Some(crate::journal::HistoryAppendMethod::Command)
-            }
-            crate::journal::SurfaceShowMethod::Open | crate::journal::SurfaceShowMethod::Mru => {
-                None
-            }
+            rho_journal::SurfaceShowMethod::Open | rho_journal::SurfaceShowMethod::Mru => None,
         } {
-            crate::journal::record(crate::journal::Event::HistoryAppended {
+            rho_journal::record(rho_journal::Event::HistoryAppended {
                 identity: Self::journal_surface(&shown.key),
                 method,
             });
         }
-        crate::journal::record(crate::journal::Event::SurfaceShown {
+        rho_journal::record(rho_journal::Event::SurfaceShown {
             surface: Self::journal_surface(&shown.key),
             method,
         });
@@ -5752,7 +5742,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn show_current_history_for_test(
         &mut self,
-        method: crate::journal::SurfaceShowMethod,
+        method: rho_journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
         let surface = self.active_surface().clone();
@@ -5764,7 +5754,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn open_named_surface_for_test(&mut self, name: &str, cx: &mut Context<Self>) {
         let surface = self.test_named_surface(name, cx);
-        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Open, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Open, cx);
     }
 
     #[cfg(test)]
@@ -6938,7 +6928,7 @@ impl Workspace {
             minibuffer.accept_selected(window, cx);
         }
         let (input, on_submit) = minibuffer.into_submission(cx);
-        crate::journal::record(crate::journal::Event::MinibufferSubmitted {
+        rho_journal::record(rho_journal::Event::MinibufferSubmitted {
             prompt,
             input: input.clone(),
         });
@@ -6963,7 +6953,7 @@ impl Workspace {
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
-            crate::journal::record(crate::journal::Event::MinibufferCancelled {
+            rho_journal::record(rho_journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
                 input: minibuffer.input(cx),
             });
@@ -7012,7 +7002,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let prompt = prompt.into();
-        crate::journal::record(crate::journal::Event::MinibufferOpened {
+        rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
         });
         self.capture_overlay_focus(window, cx);
@@ -7445,7 +7435,7 @@ impl Workspace {
             Command::PhoneOpenDesk => self.phone_open_desk(window, cx),
             Command::PhoneSnoozeAhead(unit, count) => {
                 self.phone_verdict_with(
-                    crate::journal::PhoneVerdict::Defer,
+                    rho_journal::PhoneVerdict::Defer,
                     move |workspace, window, cx| {
                         workspace.deal_snooze(unit, Some(count), window, cx)
                     },
@@ -7456,7 +7446,7 @@ impl Workspace {
             Command::PhoneSnoozeAt { hour, tomorrow } => {
                 let at = named_hour(hour, tomorrow);
                 self.phone_verdict_with(
-                    crate::journal::PhoneVerdict::Defer,
+                    rho_journal::PhoneVerdict::Defer,
                     move |workspace, window, cx| workspace.deal_snooze_at(at, window, cx),
                     window,
                     cx,
@@ -7625,7 +7615,7 @@ impl Workspace {
 
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.toggle_raw_mode(cx);
-        crate::journal::record(crate::journal::Event::DeskRawModeToggled {
+        rho_journal::record(rho_journal::Event::DeskRawModeToggled {
             enabled: self.dashboard.raw_mode(),
         });
         self.refresh_dashboard(window, cx);
@@ -7654,7 +7644,7 @@ impl Workspace {
                 )
             }
             crate::dashboard::CardTarget::Agent(agent_id) => {
-                crate::journal::record(crate::journal::Event::AgentOpened {
+                rho_journal::record(rho_journal::Event::AgentOpened {
                     agent_id: agent_id.into(),
                 });
                 self.selection.select_agent(agent_id);
@@ -7694,7 +7684,7 @@ impl Workspace {
                 }
             }
         };
-        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Deal, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Deal, cx);
         if self.phone.enabled {
             window.focus(&self.phone.dashboard_focus, cx);
         } else {
@@ -8025,14 +8015,14 @@ impl Workspace {
 
     fn journal_dealer_verdict(
         verdict: crate::dashboard::DealerVerdict,
-    ) -> crate::journal::DealerVerdict {
+    ) -> rho_journal::DealerVerdict {
         match verdict {
-            crate::dashboard::DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
-            crate::dashboard::DealerVerdict::Done => crate::journal::DealerVerdict::Done,
-            crate::dashboard::DealerVerdict::Mute => crate::journal::DealerVerdict::Mute,
-            crate::dashboard::DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
-            crate::dashboard::DealerVerdict::Open => crate::journal::DealerVerdict::Open,
-            crate::dashboard::DealerVerdict::File => crate::journal::DealerVerdict::File,
+            crate::dashboard::DealerVerdict::Skip => rho_journal::DealerVerdict::Skip,
+            crate::dashboard::DealerVerdict::Done => rho_journal::DealerVerdict::Done,
+            crate::dashboard::DealerVerdict::Mute => rho_journal::DealerVerdict::Mute,
+            crate::dashboard::DealerVerdict::Defer => rho_journal::DealerVerdict::Defer,
+            crate::dashboard::DealerVerdict::Open => rho_journal::DealerVerdict::Open,
+            crate::dashboard::DealerVerdict::File => rho_journal::DealerVerdict::File,
         }
     }
 
@@ -8055,7 +8045,7 @@ impl Workspace {
             self.slack_follow_thread(&thread, cx);
         }
         self.dashboard.clear_skip(&card.identity);
-        crate::journal::record(crate::journal::Event::VerdictUndone {
+        rho_journal::record(rho_journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.identity),
             verdict: Self::journal_dealer_verdict(verdict),
         });
@@ -8162,7 +8152,7 @@ impl Workspace {
             self.echo("undo: notes are unavailable", StyleClass::SystemInfo, cx);
             return;
         }
-        crate::journal::record(crate::journal::Event::SlackMarkReadBeforeUndone { cards: undone });
+        rho_journal::record(rho_journal::Event::SlackMarkReadBeforeUndone { cards: undone });
         self.echo(
             &format!("undid {}: {undone} reopened", entry.verb),
             StyleClass::SystemInfo,
@@ -8260,11 +8250,11 @@ impl Workspace {
             .clone()
             .unwrap_or_else(|| card.identity.node_id.clone());
         let phone_verdict = self.phone.enabled.then_some(match dealt {
-            crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
-            crate::desk_view::DeskVerdict::Mute => crate::journal::PhoneVerdict::Mute,
-            crate::desk_view::DeskVerdict::Defer { .. } => crate::journal::PhoneVerdict::Defer,
-            crate::desk_view::DeskVerdict::Todo { .. } => crate::journal::PhoneVerdict::Todo,
-            crate::desk_view::DeskVerdict::File { .. } => crate::journal::PhoneVerdict::File,
+            crate::desk_view::DeskVerdict::Done => rho_journal::PhoneVerdict::Done,
+            crate::desk_view::DeskVerdict::Mute => rho_journal::PhoneVerdict::Mute,
+            crate::desk_view::DeskVerdict::Defer { .. } => rho_journal::PhoneVerdict::Defer,
+            crate::desk_view::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
+            crate::desk_view::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
         });
         // `x` on a Slack card silences the unit in Slack too: the same
         // keystroke that closes the card here stops Slack raising it
@@ -8488,7 +8478,7 @@ impl Workspace {
             }
         }
         let surface = self.make_surface(SurfaceKey::Usage, window, cx);
-        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Command, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Command, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -9019,7 +9009,7 @@ impl Workspace {
                     window,
                     cx,
                 );
-                crate::journal::record(crate::journal::Event::Find {
+                rho_journal::record(rho_journal::Event::Find {
                     query: input.trim().to_owned(),
                     target: "desk_heading".to_owned(),
                     found,

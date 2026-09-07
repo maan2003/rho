@@ -72,8 +72,8 @@ const AGENT_RECENCY_BONUS: f64 = 1.5;
 /// not a hidden hour-long preference.
 const AGENT_RECENCY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
-pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
-    crate::journal::DealerPolicySnapshot {
+pub(crate) fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
+    rho_journal::DealerPolicySnapshot {
         queue_floor: DEAL_QUEUE_FLOOR,
         skip_cooldown_minutes: SKIP_COOLDOWN.num_minutes(),
         blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
@@ -2040,26 +2040,26 @@ impl Dashboard {
         if verdict != DealerVerdict::Skip {
             self.skipped.remove(&event.card);
         }
-        fn identity(card: &DealCardId) -> crate::journal::DealerCardIdentity {
-            crate::journal::DealerCardIdentity {
+        fn identity(card: &DealCardId) -> rho_journal::DealerCardIdentity {
+            rho_journal::DealerCardIdentity {
                 host: card.host.0,
                 node_id: card.node_id.clone().into(),
             }
         }
         let kind = match event.kind {
-            DealCardKind::Desk => crate::journal::DealerCardKind::Note,
-            DealCardKind::Agent => crate::journal::DealerCardKind::Agent,
-            DealCardKind::Thread => crate::journal::DealerCardKind::Thread,
+            DealCardKind::Desk => rho_journal::DealerCardKind::Note,
+            DealCardKind::Agent => rho_journal::DealerCardKind::Agent,
+            DealCardKind::Thread => rho_journal::DealerCardKind::Thread,
         };
         let verdict = match event.verdict {
-            DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
-            DealerVerdict::Done => crate::journal::DealerVerdict::Done,
-            DealerVerdict::Mute => crate::journal::DealerVerdict::Mute,
-            DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
-            DealerVerdict::Open => crate::journal::DealerVerdict::Open,
-            DealerVerdict::File => crate::journal::DealerVerdict::File,
+            DealerVerdict::Skip => rho_journal::DealerVerdict::Skip,
+            DealerVerdict::Done => rho_journal::DealerVerdict::Done,
+            DealerVerdict::Mute => rho_journal::DealerVerdict::Mute,
+            DealerVerdict::Defer => rho_journal::DealerVerdict::Defer,
+            DealerVerdict::Open => rho_journal::DealerVerdict::Open,
+            DealerVerdict::File => rho_journal::DealerVerdict::File,
         };
-        crate::journal::record(crate::journal::Event::Dealer {
+        rho_journal::record(rho_journal::Event::Dealer {
             card: identity(&event.card),
             kind,
             verdict,

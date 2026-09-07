@@ -65,6 +65,7 @@ rho-agents = { workspace = true }
 rho-hosts = { workspace = true }
 rho-window = { workspace = true }
 rho-iroh-auth = { workspace = true }
+rho-journal = { workspace = true }
 rho-profiling = { workspace = true }
 rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
