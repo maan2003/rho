@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
-    WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    App, Bounds, DevicePixels, ElementId, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams,
+    Result, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle,
+    Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -20,7 +20,7 @@ pub struct GlyphRasterData {
 }
 
 /// Set the text decoration for a run of text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecorationRun {
     /// The length of the run in utf-8 bytes.
     pub len: u32,
@@ -47,6 +47,26 @@ pub struct ShapedLine {
     /// The text that was shaped for this line.
     pub text: SharedString,
     pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
+}
+
+struct ShapedLinePaintKey {
+    layout: Arc<LineLayout>,
+    decoration_runs: SmallVec<[DecorationRun; 32]>,
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    align: TextAlign,
+    align_width: Option<Pixels>,
+}
+
+impl PartialEq for ShapedLinePaintKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.layout, &other.layout)
+            && self.decoration_runs == other.decoration_runs
+            && self.origin == other.origin
+            && self.line_height == other.line_height
+            && self.align == other.align
+            && self.align_width == other.align_width
+    }
 }
 
 impl ShapedLine {
@@ -115,6 +135,41 @@ impl ShapedLine {
         )?;
 
         Ok(())
+    }
+
+    /// Paint the line, reusing the previous frame's paint output when its inputs are unchanged.
+    pub fn paint_cached(
+        &self,
+        id: impl Into<ElementId>,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        let key = ShapedLinePaintKey {
+            layout: self.layout.clone(),
+            decoration_runs: self.decoration_runs.clone(),
+            origin,
+            line_height,
+            align,
+            align_width,
+        };
+        let caching_disabled = window.is_inspector_picking(cx);
+        window.paint_cached(id, key, caching_disabled, |window| {
+            paint_line(
+                origin,
+                &self.layout,
+                line_height,
+                align,
+                align_width,
+                &self.decoration_runs,
+                &[],
+                window,
+                cx,
+            )
+        })
     }
 
     /// Paint the background of the line to the window.

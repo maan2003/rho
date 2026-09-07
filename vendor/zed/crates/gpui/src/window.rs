@@ -999,6 +999,15 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+struct CachedPaintState<K> {
+    key: K,
+    range: Range<PaintIndex>,
+    valid: bool,
+    content_mask: ContentMask<Pixels>,
+    opacity: f32,
+    scale_factor: f32,
+}
+
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
@@ -3577,6 +3586,49 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+    }
+
+    pub(crate) fn paint_cached<K: PartialEq + 'static>(
+        &mut self,
+        id: impl Into<ElementId>,
+        key: K,
+        caching_disabled: bool,
+        paint: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let mut result = Ok(());
+        self.with_global_id(id.into(), |global_id, window| {
+            window.with_element_state::<CachedPaintState<K>, _>(global_id, |state, window| {
+                let start = window.paint_index();
+                let can_reuse = state.as_ref().is_some_and(|state| {
+                    state.valid
+                        && state.key == key
+                        && state.content_mask == content_mask
+                        && state.opacity == opacity
+                        && state.scale_factor == scale_factor
+                }) && !caching_disabled;
+                if let Some(state) = state.filter(|_| can_reuse) {
+                    window.reuse_paint(state.range);
+                } else {
+                    result = paint(window);
+                }
+                let end = window.paint_index();
+                (
+                    (),
+                    CachedPaintState {
+                        key,
+                        range: start..end,
+                        valid: result.is_ok(),
+                        content_mask,
+                        opacity,
+                        scale_factor,
+                    },
+                )
+            })
+        });
+        result
     }
 
     /// Push a text style onto the stack, and call a function with that style active.

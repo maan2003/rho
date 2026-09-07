@@ -7921,10 +7921,14 @@ impl LineWithInvisibles {
                 line_y,
             );
 
-        for fragment in &self.fragments {
+        for (fragment_ix, fragment) in self.fragments.iter().enumerate() {
             match fragment {
                 LineFragment::Text(line) => {
-                    line.paint(
+                    line.paint_cached(
+                        (
+                            "editor-line-fragment",
+                            (u64::from(row.0) << 32) | fragment_ix as u64,
+                        ),
                         fragment_origin,
                         line_height,
                         layout.text_align,
