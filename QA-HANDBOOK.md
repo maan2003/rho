@@ -171,6 +171,34 @@ rather than reporting a green flood case.
 *Closed by:* the flag exists; open until a snapshot of the user's own device
 has been taken with it and a Slack case has run at flood scale.
 
+### R4. The binary you are about to run is the one you built
+
+A build that hits ENOSPC can leave a **truncated binary that cargo will not
+replace**: the stale artefact is exactly the size cargo expects, so a rebuild
+reuses it and reports success. The symptom is `Permission denied` from a file
+that is `-rwxr-xr-x`, owned by you, on a filesystem mounted `rw` — with an
+intact ELF header, because the head of the file was written before the disk
+filled. `cp` reads it happily; only `execve` fails.
+
+Touch a source file in the crate to force a genuine relink. If the rebuilt
+file has the byte-identical size, cargo did not relink and the artefact is
+still the bad one. It cost an hour on 2026-09-07 and was diagnosed as
+everything but what it was.
+
+The related trap is measurement. **On bcachefs, `df` immediately after a
+delete is meaningless**: reclaim is asynchronous and free space kept climbing
+for about eight minutes after each delete on the shared loop device (3.2 GB,
+then 29, 96, 287). A deletion judged by the `df` that follows it will be read
+as having freed almost nothing. Wait, or measure something else.
+
+The same day gave the other half of that: `du` on a rig's state reports the
+snapshot's full size because `rig new` clones with `cp -a --reflink=auto` and
+`du` counts shared extents once per directory it walks. `filefrag -v` shows
+the truth — the rig's file and the snapshot's at identical physical offsets,
+flagged `shared`. A rig costs its divergence from the snapshot, not the
+snapshot. Deleting rigs to free space frees very little; retiring the
+snapshot is what frees the 43 GB, and only once no rig points into it.
+
 ## The cases
 
 ### C1. Dealing after a restart

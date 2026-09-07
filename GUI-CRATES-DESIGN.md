@@ -2205,6 +2205,86 @@ swamped it, and no frame in the report records how many rows it drew.
   to this change); they are in this commit because the gate does not pass
   without them.
 
+%%%%%%% diff from: vrowylnq c0267db9 "editor, rho-gui: a fold emitted whole past an edit's end no longer repeats the input it already described (FoldMap::sync walks the old cursor forward by the overshoot before taking the suffix; boundary and interior landings each covered; FoldMap::check_invariants now also runs under wrap-test-support and named the fault: tree 4473 against inlay 3826; ours because ElisionPolicy::Tail splits a fold by rows so its extent moves with the text; release case: row 73 reported 4,294,966,983 columns wide in a 3,462-byte document; tests crates/rho-gui/src/tests/fold_tail_rows.rs fail on main in debug and release)" (parents of rebased revision)
+\\\\\\\        to: snzszpvs dcdcf399 "rho-gui: one agent's news draws its own rows instead of composing the map" (rebased revision)
++## Landed: one agent's news no longer composes the map
++
++The inlay-map seek made each splice cheaper. It did not stop the dashboard
++splicing itself whole, which is what the splices were *for*, and that is this
++change.
++
++An agent that is streaming says so constantly: every turn, every tool, every
++title the model generates arrives as a `Changed` naming that agent and no
++other. The desk's own delta path has answered such an event correctly for a
++while — `redraw_tree_rows` draws the rows the delta named and leaves the rest
++of the map standing. The model-event path did not share it. `ModelMsg::Changed`
++went to `schedule_desk_sync`, which on the next frame called `sync_tree_rows`,
++which called `refresh_dashboard`, which called `Dashboard::sync`, which called
++`sync_tree` — the full composition. That takes every inlay off the tree
++(`splice_inlays(&old, Vec::new())`), replaces every row buffer, re-anchors
++every excerpt, rebuilds every fold and re-highlights every row, for one
++agent's title.
++
++That is the path the user's telemetry named. Of the samples inside
++`output_span_for_buffer_offset` — 45%, 48% and 56% of the whole main thread in
++the three reports — **100%** arrived through `refresh_dashboard` → `sync_tree`
++→ `splice_inlays` → `InlayMap::splice`.
++
++The change is that a model event may take the delta path too. `set_tree_source`
++now answers whether the map's *shape* survived: the same rows, in the same
++order, under the same parents, each drawn from the same buffer. A shape that
++held is the licence to patch — the excerpts, their order and their folds are
++all still what the editor has, so the only things that can have moved are the
++marker in front of a row, the hint at the end of it, and the words of a machine
++row, which is exactly what `redraw_tree_rows` draws. If the shape moved, or if
++the rows the event names were never drawn, it composes as before.
++
++### The numbers
++
++Per event, 32 successive renames of one agent on a map of filed agents, mean.
++A debug build, so the milliseconds are the machine's and only the shape is
++ours:
++
++| agents | before | after | compositions | rows drawn again |
++| --- | --- | --- | --- | --- |
++| 16 | 21.6 ms | 14.1 ms | 32 → 0 | 0 → 32 |
++| 128 | 116.2 ms | 58.1 ms | 32 → 0 | 0 → 32 |
++
++Thirty-two events draw thirty-two rows again: one row per event, whatever the
++map's size. That is the part that is now O(touched), and it is the part that
++was doing the splicing.
++
++### What this does not fix, stated plainly
++
++It is not yet O(agents touched) + O(log n) end to end. Eight times the agents
++still costs 4.1× the time per event, down from 5.4× but not flat, and the
++residual is upstream of the dashboard: `sync_tree_rows` calls
++`refresh_desk_sources`, `desk_cells.rebuild_map`, `reconcile_buffers` and
++`tree_source`, and each walks the host's nodes before the dashboard is reached
++at all. `set_tree_source`'s own shape comparison is another walk, though a
++cheap one over ids and entity handles that touches no editor — it is paid for
++by a `nodes` vector the sources rebuild every time regardless.
++
++So the composition is gone and the walk is not. Making the desk source
++incremental is the next cut, and it is a change to `desk_view`, not to the
++dashboard.
++
++### The test, and why it can be believed
++
++`crates/rho-gui/src/tests/dashboard_cost.rs` asserts shapes rather than
++milliseconds: compositions must be zero and rows drawn again must be one per
++event.
++
++The first assertion is that a row *was* drawn again, and it is there because
++the test was wrong first. Written as a loop over several sizes it passed on the
++unfixed code, because `schedule_desk_sync` defers to `on_next_frame` and
++`run_until_parked` never draws one — the event reached nothing and every other
++assertion held trivially. Then, with the frame added, only the first size in
++the loop did any work at all. Both readings were the harness, not the subject.
++Each size is now its own test with its own workspace, and the known-answer
++check comes first, which is b8os's rule from the fold cut applied to a cost
++test: give the harness a question whose answer you already know.
++
 ## Order
 
 1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists

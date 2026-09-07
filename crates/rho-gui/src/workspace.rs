@@ -5844,8 +5844,9 @@ impl Workspace {
         // the map draws it from. It gets one here.
         self.desk_cells.reconcile_buffers(host, cx);
         if let Some((nodes, buffers, titles)) = self.desk_cells.tree_source(host, cx) {
-            self.dashboard
-                .set_tree_source(host, nodes, buffers, titles, cx);
+            let shape_held =
+                self.dashboard
+                    .set_tree_source(host, nodes.clone(), buffers, titles, cx);
             // The cards this moved, and only those. A `Changed` names its
             // agents and costs them; a desk that arrived or changed shape
             // names nothing and is made again.
@@ -5855,6 +5856,36 @@ impl Workspace {
                 None => crate::dashboard::DealScope::Whole,
             };
             self.refresh_deal_cards(host, scope, cx);
+            // An agent that is streaming says so constantly, and each time
+            // it names itself and nobody else. If the shape held, the map
+            // the editor has is still the right map: what moved is the
+            // marker in front of those rows, the hint at the end of them,
+            // and the words of a machine row. Drawing those is the desk
+            // delta's path, and a model event has as much right to it —
+            // composing the map again would take every inlay off the tree
+            // and splice them all back for one agent's news, which is what
+            // the user's telemetry caught.
+            if shape_held && let Some(agents) = &moved {
+                let touched = agents
+                    .iter()
+                    .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
+                    .collect::<BTreeSet<_>>();
+                let threads = self.slack_thread_facts(cx);
+                if self.dashboard.redraw_tree_rows(
+                    host,
+                    &touched,
+                    &nodes,
+                    &self.registry,
+                    &threads,
+                    cx,
+                ) {
+                    // The deal bar reads the hand; the map is not composed.
+                    self.dashboard.sync_hand(&self.agent_last_interaction);
+                    self.sync_note_views(host, cx);
+                    cx.notify();
+                    return;
+                }
+            }
             self.refresh_dashboard(window, cx);
             self.sync_note_views(host, cx);
         }

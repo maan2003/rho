@@ -1305,6 +1305,16 @@ impl Dashboard {
         self.focus_handle(cx).is_focused(window)
     }
 
+    /// Answers whether the map's *shape* survived: the same rows, in the
+    /// same order, hanging under the same parents, each drawn from the same
+    /// buffer. A shape that held is the caller's licence to patch the rows
+    /// an event named instead of composing the map again — the excerpts,
+    /// their order and their folds are all still what the editor has, and
+    /// only what is written on a row can have moved.
+    ///
+    /// The comparison walks the rows, which is a cost the caller has
+    /// already paid: the sources hand over a fresh `nodes` every time. It
+    /// compares ids, parents and buffer entities, and touches no editor.
     pub fn set_tree_source(
         &mut self,
         host: HostId,
@@ -1312,7 +1322,19 @@ impl Dashboard {
         buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
         titles: std::rc::Rc<HashMap<rho_desk::cells::Id, String>>,
         cx: &mut Context<Workspace>,
-    ) {
+    ) -> bool {
+        let shape_held = self.tree_hosts.get(&host).is_some_and(|source| {
+            source.nodes.len() == nodes.len()
+                && source.buffers.len() == buffers.len()
+                && source
+                    .nodes
+                    .iter()
+                    .zip(&nodes)
+                    .all(|(held, fresh)| held.id == fresh.id && held.under == fresh.under)
+                && buffers.iter().all(|(id, buffer)| {
+                    source.buffers.get(id).map(Entity::entity_id) == Some(buffer.entity_id())
+                })
+        });
         if self.pending_tree_cursor.is_none()
             && let Some((cursor_host, node_id, offset)) = self.tree_node_cursor_offset(cx)
             && cursor_host == host
@@ -1335,6 +1357,7 @@ impl Dashboard {
                 index,
             },
         );
+        shape_held
     }
 
     /// What a card's node is, which decides the surface it opens.
