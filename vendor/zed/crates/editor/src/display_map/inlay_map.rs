@@ -700,6 +700,50 @@ impl InlayMap {
                 });
             }
 
+            let mut invalidated_inlays = Vec::new();
+            let buffer_changed = self.snapshot.buffer.edit_count() != buffer_snapshot.edit_count()
+                || self.snapshot.buffer.non_text_state_update_count()
+                    != buffer_snapshot.non_text_state_update_count()
+                || self.snapshot.buffer.trailing_excerpt_update_count()
+                    != buffer_snapshot.trailing_excerpt_update_count();
+            if buffer_changed {
+                for buffer_edit in &buffer_edits {
+                    let first = self.inlays.partition_point(|inlay| {
+                        inlay.position.to_offset(&self.snapshot.buffer) < buffer_edit.old.start
+                    });
+                    let end = self.inlays[first..].partition_point(|inlay| {
+                        inlay.position.to_offset(&self.snapshot.buffer) <= buffer_edit.old.end
+                    }) + first;
+                    for inlay in self.inlays[first..end]
+                        .iter()
+                        .filter(|inlay| !inlay.position.is_valid(&buffer_snapshot))
+                    {
+                        let old_offset = inlay.position.to_offset(&self.snapshot.buffer);
+                        let mut cursor = self
+                            .snapshot
+                            .transforms
+                            .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
+                        cursor.seek(&old_offset, Bias::Left);
+                        while let Some(transform) = cursor.item() {
+                            if cursor.start().0 > old_offset {
+                                break;
+                            }
+                            if let Transform::Inlay(old_inlay) = transform
+                                && old_inlay.id == inlay.id
+                            {
+                                invalidated_inlays
+                                    .push((cursor.start().1..cursor.end().1, old_offset));
+                                break;
+                            }
+                            cursor.next();
+                        }
+                        if profile.is_enabled() {
+                            walked_items = walked_items.saturating_add(cursor.walked_items());
+                        }
+                    }
+                }
+            }
+
             let old_rebuild_start = buffer_edits.iter().map(|edit| edit.old.start).min();
             let new_rebuild_start = buffer_edits.iter().map(|edit| edit.new.start).min();
             let preserved_prefix = (old_rebuild_start == new_rebuild_start).then(|| {
@@ -756,8 +800,22 @@ impl InlayMap {
                 inlay_edit.new = self.snapshot.to_inlay_offset(buffer_edit.new.start)
                     ..self.snapshot.to_inlay_offset(buffer_edit.new.end);
             }
+            for (old, old_offset) in invalidated_inlays {
+                if let Some((edit, _)) =
+                    inlay_edits
+                        .iter_mut()
+                        .zip(&buffer_edits)
+                        .find(|(_, buffer_edit)| {
+                            buffer_edit.old.start <= old_offset && old_offset <= buffer_edit.old.end
+                        })
+                {
+                    edit.old.start = edit.old.start.min(old.start);
+                    edit.old.end = edit.old.end.max(old.end);
+                }
+            }
             self.snapshot.check_invariants();
             profile.walked_items(walked_items);
+            inlay_edits.sort_unstable_by_key(|edit| (edit.old.start, edit.old.end));
             (self.snapshot.clone(), Patch::new(inlay_edits).into_inner())
         };
 
