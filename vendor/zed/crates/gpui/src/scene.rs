@@ -17,6 +17,8 @@ use std::{
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::test::{RecordedPrimitive, SceneOwner};
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Instant;
 
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
@@ -68,6 +70,10 @@ pub struct Scene {
     recording_views: Vec<crate::EntityId>,
     #[cfg(any(test, feature = "test-support"))]
     recording_elements: Vec<crate::ElementId>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_owner_elapsed: Vec<(SceneOwner, std::time::Duration)>,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_last_at: Option<Instant>,
 }
 
 #[expect(missing_docs)]
@@ -92,6 +98,8 @@ impl Scene {
             self.recorded_hash = 0xcbf29ce484222325;
             self.recording_views.clear();
             self.recording_elements.clear();
+            self.recorded_owner_elapsed.clear();
+            self.recording_last_at = None;
         }
     }
 
@@ -238,6 +246,7 @@ impl Scene {
             }
         }
         let recorded = recorded.unwrap_or_else(|| self.record_primitive(&primitive));
+        let owner = recorded.owner.clone();
         {
             self.recorded_hash ^= recorded.fingerprint;
             self.recorded_hash = self.recorded_hash.wrapping_mul(0x100000001b3);
@@ -246,6 +255,7 @@ impl Scene {
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
+        self.record_owner_elapsed(&owner);
     }
 
     pub(crate) fn insert_hole(&mut self, hole: Quad) {
@@ -421,6 +431,48 @@ impl Scene {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn recorded_hash(&self) -> u64 {
         self.recorded_hash
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_owner_elapsed(&self) -> &[(SceneOwner, std::time::Duration)] {
+        &self.recorded_owner_elapsed
+    }
+
+    /// Starts coarse paint attribution. Time between primitive emissions is
+    /// charged to the owner of the primitive that follows it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn begin_recording_owner_elapsed(&mut self) {
+        self.recorded_owner_elapsed.clear();
+        self.recording_last_at = Some(Instant::now());
+    }
+
+    /// Charges paint work after the final primitive to its final owner.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn end_recording_owner_elapsed(&mut self) {
+        let Some(started_at) = self.recording_last_at.take() else {
+            return;
+        };
+        if let Some((_, total)) = self.recorded_owner_elapsed.last_mut() {
+            let elapsed = started_at.elapsed();
+            *total += elapsed;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_owner_elapsed(&mut self, owner: &SceneOwner) {
+        let now = Instant::now();
+        if let Some(started_at) = self.recording_last_at.replace(now) {
+            let elapsed = now.duration_since(started_at);
+            if let Some((_, total)) = self
+                .recorded_owner_elapsed
+                .last_mut()
+                .filter(|(previous, _)| previous == owner)
+            {
+                *total += elapsed;
+            } else {
+                self.recorded_owner_elapsed.push((owner.clone(), elapsed));
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]

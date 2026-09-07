@@ -41,6 +41,8 @@ pub struct FrameSubscene {
     pub primitive_count: usize,
     /// Union of the owner's clipped primitive bounds.
     pub bounds: Bounds<ScaledPixels>,
+    /// Coarse CPU time attributed while painting this owner.
+    pub paint_elapsed: std::time::Duration,
 }
 
 /// A primitive which changed between consecutive recorded frames.
@@ -171,6 +173,10 @@ impl SceneOwner {
 fn record<E: Clone>(recording: &mut Recording<E>, scene: &Scene) {
     let primitives: Arc<[RecordedPrimitive]> = scene.recorded_primitives().into();
     let hash = scene.recorded_hash();
+    let mut elapsed_by_owner = HashMap::new();
+    for (owner, elapsed) in scene.recorded_owner_elapsed() {
+        *elapsed_by_owner.entry(owner.clone()).or_default() += *elapsed;
+    }
     let distinct_scene = recording
         .scenes_by_hash
         .get(&hash)
@@ -271,6 +277,7 @@ fn record<E: Clone>(recording: &mut Recording<E>, scene: &Scene) {
                 hash: value.hash,
                 primitive_count: value.primitives.len(),
                 bounds: value.bounds,
+                paint_elapsed: elapsed_by_owner.get(owner).copied().unwrap_or_default(),
             }
         })
         .collect::<Vec<_>>();
@@ -357,5 +364,21 @@ mod tests {
         assert_eq!(frames[2].changes.len(), 2);
         assert_ne!(frames[1].distinct_scene, frames[2].distinct_scene);
         assert_eq!(recorder.distinct_scenes().len(), 2);
+    }
+
+    #[test]
+    fn attributes_elapsed_paint_time_to_scene_owners() {
+        let recorder = SceneRecorder::<Event>::default();
+        let callback = recorder.callback();
+        let mut scene = Scene::default();
+        scene.begin_recording_owner_elapsed();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        scene.insert_primitive(quad(0.));
+        scene.end_recording_owner_elapsed();
+        callback(&scene);
+
+        assert!(
+            recorder.frames()[0].subscenes[0].paint_elapsed >= std::time::Duration::from_millis(1)
+        );
     }
 }

@@ -3223,6 +3223,8 @@ impl Window {
         // Now actually paint the elements.
         let prepaint_end = trace_phases.then(Instant::now);
         self.invalidator.set_phase(DrawPhase::Paint);
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.begin_recording_owner_elapsed();
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3240,6 +3242,9 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.end_recording_owner_elapsed();
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
