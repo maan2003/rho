@@ -851,9 +851,10 @@ wrong at the design, not at the polish.
   makes it go away while `line-tables-only` and
   `split-debuginfo=unpacked` do not. The gate for this change was run that
   way: `CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace` green at 1 659
-  tests, clippy `-D warnings` clean, `cargo fmt --check` clean. The crate
-  is at a ceiling and the next test to land anywhere in `rho-gui` will hit
-  it again.
+  tests, clippy `-D warnings` clean, `cargo fmt --check` clean. It reads
+  here as a ceiling, and that reading is wrong: it is a linker laying a
+  large binary out badly, and it is fixed below in "The linker, not the
+  size".
 
   **Change 4b, the narrowing runs per keystroke.** Change 4 landed with
   the narrowing on submit, because the minibuffer's `CandidateSource` is
@@ -2121,6 +2122,88 @@ swamped it, and no frame in the report records how many rows it drew.
   46/157 ms p50/p99, and ended at journal head 1,770.
   Gate green: rho-fake-model 2 tests, rho-qa proof helpers 2 tests, clippy
   `-D warnings` for both crates, and `cargo fmt --check` clean.
+
+- **The linker, not the size** (`.cargo/config.toml`, `flake.nix`). The
+  `rho-gui` lib test binary built by `cargo test --workspace` did not start:
+  no test line, no Rust frame, the failure inside `ld.so` before `main`.
+  `cargo test -p rho-gui --lib` was fine. It read as a size ceiling — main's
+  binary at 1.148 GB started, one added empty test at 1.149 GB did not — and
+  it is not one. It is the linker.
+  *What is actually wrong with the file.* In the binary that does not start,
+  the `PT_DYNAMIC` program header's `p_offset` is sixteen bytes short of
+  where `.dynamic`'s bytes are: header `0x1539d3e0`, section `0x1539d3f0`,
+  the same `p_vaddr` and `sh_addr`. The loader reads the dynamic array at
+  the header's offset, finds sixteen zero bytes — a `DT_NULL` — stops there,
+  and every entry of its `l_info` table stays empty; the first thing glibc
+  does after that is look up the string table through that empty table,
+  which is the fault at startup. The auxiliary vector is right (`AT_PHDR` is
+  the load address plus `0x40`, `AT_PHNUM` 14, `AT_PHENT` 56), so nothing
+  but the file is wrong.
+  *Where the drift starts, and the one line that checks it.* Inside the RW
+  `LOAD` segment the sections' offsets track the segment's by `0x2000` up to
+  and including `.tdata`, and then drift: `.init_array` by `0x1ff8`,
+  `.data.rel.ro` and `.dynamic` by `0x1ff0`. What sits between them is
+  `.tbss`, which is `NOBITS` — it takes address space and no file bytes, and
+  the layout stops accounting for it consistently. So the check on any
+  future toolchain is one line:
+  `readelf -lW BIN | awk '$1=="DYNAMIC"{print $2}'` against
+  `readelf -SW BIN | awk '$2==".dynamic"{print $5}'` — those two must be the
+  same number.
+  *Which linker.* Not rustc's default: `flake.nix`'s `shellHook` exports
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` naming wild by store
+  path, and a target-specific `RUSTFLAGS` environment variable shadows both
+  `build.rustflags` and `[target.…]` in `.cargo/config.toml` outright. The
+  linker was wild 0.10.0.
+  *The three linkers, same rustc command, same inputs, on the 1,149,986,234
+  byte reproducer.*
+
+  | linker | link | binary | `PT_DYNAMIC` vs `.dynamic` | starts |
+  | --- | --- | --- | --- | --- |
+  | wild 0.10.0 | 5.7–5.9 s | 1,149,973,138 B | `0x1539d3e0` vs `0x1539d3f0` | no |
+  | mold 2.41 | 5.9–9.8 s | 1,530,686,496 B | `0x15c05f00` vs `0x15c05f00` | yes, 278 tests |
+  | GNU ld.bfd 2.46 | 71.7 s | 2,986,342,400 B | `0x15208510` vs `0x15208510` | yes, 278 tests |
+
+  bfd is correct and it is twelve times the link, and this bfd is not built
+  with zstd, so `--compress-debug-sections=zstd` has to come off and the
+  binary is twice mold's. mold is correct and not materially slower than
+  what we had, so mold it is. It is not free: mold's compressed output is
+  about a third larger than wild's, 1.52 GB against 1.15 GB for the same
+  unit, which the build cache pays for.
+  *Where the change is.* Both places, because either one alone is a
+  half-fix: `flake.nix` names mold by store path in the same exported
+  variable (nixpkgs' `mold` is the wrapped one, so the `-rpath` flags nix
+  adds survive and binaries still find `libstdc++`), and `.cargo/config.toml`
+  gains a `[target.x86_64-unknown-linux-gnu]` section with
+  `-Clink-arg=-fuse-ld=mold` for builds outside the dev shell — a target
+  section replaces `build.rustflags` rather than adding to it, so the
+  `tokio_unstable` and frame-pointer flags are repeated in it. **Everyone
+  has to re-enter the dev shell** (`direnv reload`, or leave and re-enter
+  `nix develop`); until they do, their shell still exports wild.
+  *What the user runs is not affected.* The flake's package build sets its
+  own `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` (`--cfg
+  tokio_unstable -Cforce-frame-pointers=yes`) with no linker in it, so
+  `nix build .#rho` links with GNU bfd, as it always did. The installed
+  `rho` is 268 MB with `PT_DYNAMIC` and `.dynamic` both at `0xc40cfa8`:
+  correct, and nowhere near the size where the fault appears.
+  *Proof both ways.* The reproducer was made deliberately by adding one
+  empty test to `rho-gui`'s Slack tests: at 1,149,939,026 and 1,149,964,426
+  bytes the binary starts, at 1,149,986,234 it does not. eng-8gpr saw the
+  same thing from the other side: the workspace-unified build (`45e03a78…`,
+  1.15 GB) failed to start three times of three, run through cargo and run
+  directly, while the per-package build (`7de270bd…`) passed 276. After the
+  change, the workspace form is what it should be: `cargo test --workspace`
+  builds the `rho-gui` lib test binary at 1,523,220,536 bytes, `PT_DYNAMIC`
+  and `.dynamic` agree at `0x15c4c360`, and it lists and runs its tests.
+  *Housekeeping.* This is also why the reactions note above says the crate
+  is at a ceiling; that sentence now points here.
+  Gate green the ordinary way, no environment variable in front of it:
+  `cargo test --workspace` 1 679 tests, 0 failed, and the binary it ran
+  `rho-gui`'s 278 in is the 1.52 GB one above; clippy `-D warnings` clean
+  and `cargo fmt --check` clean. Clippy needed three `.into()` calls
+  removed in `crates/rho-gui/src/tests/scene_fuzz.rs`
+  (`useless_conversion` on `AnyWindowHandle`, already on main and unrelated
+  to this change); they are in this commit because the gate does not pass
+  without them.
 
 ## Order
 

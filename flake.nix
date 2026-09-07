@@ -42,10 +42,11 @@
           ];
         };
         projectName = "rho";
-        # The dev shell's linker. Flakebox's overlay pins wild 0.9.0, which
-        # cannot link the optimised profiles (see the shellHook); take wild
-        # from nixpkgs itself, without the overlay.
-        wildLinker = nixpkgs.legacyPackages.${system}.wild;
+        # The dev shell's linker. Flakebox's overlay pins wild 0.9.0 and
+        # neither wild 0.9.0 nor wild 0.10.0 can be used (see the shellHook);
+        # take mold from nixpkgs itself, without the overlay, so it is the
+        # wrapped mold and keeps the -rpath flags nix adds.
+        moldLinker = nixpkgs.legacyPackages.${system}.mold;
         octoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ./nix/patches/git-http-unix-socket.patch
@@ -426,14 +427,17 @@
             ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
             # Flakebox sets target-specific RUSTFLAGS (its own wild 0.9.0 plus
             # --compress-debug-sections=zstd), which shadow build.rustflags
-            # from .cargo/config.toml. Replace them outright: wild 0.9.0
-            # compresses the SHF_ALLOC section .debug_gdb_scripts and every
-            # optimised binary with line tables then fails to link
-            # ("Insufficient space allocated to section .debug_gdb_scripts");
-            # wild 0.10.0 from plain nixpkgs no longer compresses allocated
-            # debug sections (#2119). The tokio_unstable and frame-pointer
-            # flags are what dial9-tokio-telemetry and CPU stack capture need.
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${wildLinker}/bin/wild -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
+            # and [target.x86_64-unknown-linux-gnu] from .cargo/config.toml,
+            # so this replaces them outright and has to carry every flag.
+            # The linker is mold: wild 0.9.0 compresses the SHF_ALLOC section
+            # .debug_gdb_scripts and every optimised binary with line tables
+            # then fails to link ("Insufficient space allocated to section
+            # .debug_gdb_scripts"), and wild 0.10.0 lays a large binary out
+            # so that the PT_DYNAMIC program header's offset is sixteen bytes
+            # short of the .dynamic section and the binary does not start
+            # (GUI-CRATES-DESIGN.md, "The linker, not the size"). The tokio_unstable and frame-pointer flags are what
+            # dial9-tokio-telemetry and CPU stack capture need.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${moldLinker}/bin/mold -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes"
           '';
         };

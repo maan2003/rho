@@ -39,8 +39,8 @@ fn composer_keystrokes_change_one_composer_scene(cx: &mut TestAppContext) {
     );
 
     let editor = active_editor(&workspace, cx);
-    let recorder = cx.record_scenes::<DriveEvent>((*workspace).into());
-    cx.draw_window((*workspace).into());
+    let recorder = cx.record_scenes::<DriveEvent>(*workspace);
+    cx.draw_window(*workspace);
     let (row_top, row_bottom) = workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| {
@@ -76,7 +76,7 @@ fn composer_keystrokes_change_one_composer_scene(cx: &mut TestAppContext) {
             })
             .expect("type one generated composer character");
         cx.run_until_parked();
-        cx.draw_window((*workspace).into());
+        cx.draw_window(*workspace);
 
         let frames = recorder.frames();
         let event_frames = &frames[frame_start..];

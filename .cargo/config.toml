@@ -13,6 +13,25 @@ codegen-backend = "llvm"
 [build]
 rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
 
+# x86_64 linux links with mold. The default linker of the day, wild 0.10.0,
+# lays a big binary (the rho-gui test binary, over a gigabyte with debug
+# info) out so that PT_DYNAMIC's p_offset lands sixteen bytes before the
+# bytes of .dynamic, so the binary does not start: the loader stops on the
+# first entry and the program never reaches main. The drift starts after the
+# NOBITS .tbss (GUI-CRATES-DESIGN.md, "The
+# linker, not the size"). A target section replaces build.rustflags rather
+# than adding to it, so the two flags above are repeated here. Off nix this
+# needs mold on PATH; inside `nix develop` the shellHook exports
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS, which shadows this
+# section, and names mold by store path.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+  "--cfg",
+  "tokio_unstable",
+  "-Cforce-frame-pointers=yes",
+  "-Clink-arg=-fuse-ld=mold",
+]
+
 # Everything but fortify: _FORTIFY_SOURCE is a hard error in jemalloc's
 # -O0 -Werror configure probes on debug builds. Ignored off-nix.
 [env]
