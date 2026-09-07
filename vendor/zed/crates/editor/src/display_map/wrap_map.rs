@@ -51,6 +51,22 @@ const WRAP_YIELD_ROW_INTERVAL: usize = 100;
 /// for that row and for the frame the batch shares.
 const WRAP_BATCH_BUDGET: Duration = Duration::from_millis(2);
 
+/// How long a width change may hold the frame waiting for its own rewrap
+/// before it gives up and lets the background finish.
+///
+/// A width change is laid out inside the frame that changed the width, so
+/// whatever this is, the frame is at least that long. It was 5 ms against a
+/// 4 ms frame bound: a rewrap that runs to the timeout is a frame over the
+/// bound by construction, and the timeout is the case this branch exists
+/// for. The wait buys one thing - the new width is on screen this frame
+/// rather than the next - and it is not worth a frame the reader can see.
+///
+/// Waiting is still the common case and still the right one: on the walk's
+/// transcript the whole rewrap is about half a millisecond, well inside
+/// this. What changes is the document too big to finish, where the frame
+/// now shows the old width for one frame instead of running long.
+const WRAP_FOREGROUND_BUDGET: Duration = Duration::from_millis(3);
+
 /// When the current batch started, or `None` where there is no clock to ask.
 ///
 /// `Instant::now` has no answer on wasm, where this runs on the browser's
@@ -505,7 +521,7 @@ impl WrapMap {
                     let task = cx.background_spawn(update);
                     match cx
                         .foreground_executor()
-                        .block_with_timeout(Duration::from_millis(5), task)
+                        .block_with_timeout(WRAP_FOREGROUND_BUDGET, task)
                     {
                         Ok((snapshot, edits)) => {
                             self.snapshot = snapshot;
