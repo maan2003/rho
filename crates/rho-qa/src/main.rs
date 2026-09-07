@@ -21,6 +21,7 @@ mod profile;
 mod rig;
 mod slack;
 mod snapshot;
+mod telemetry;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,10 @@ enum Command {
     Snapshots,
     /// Summarize a session's profile: the frame gaps and where the time went.
     Profile { path: std::path::PathBuf },
+    /// Read a telemetry report the user sent: the frames by surface, the
+    /// editor stages against the window they were measured in, and the CPU
+    /// profile embedded in it.
+    Telemetry { path: std::path::PathBuf },
     /// Work with rigs: the runnable copies of a snapshot.
     #[command(subcommand)]
     Rig(rig::RigCommand),
@@ -60,6 +65,10 @@ fn main() -> Result<()> {
         Command::Snapshots => snapshot::list(),
         Command::Profile { path } => {
             println!("{}", profile::summarize(&path)?.line);
+            Ok(())
+        }
+        Command::Telemetry { path } => {
+            print!("{}", telemetry::summarize(&path)?);
             Ok(())
         }
         Command::Rig(command) => rig::run(command),

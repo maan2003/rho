@@ -539,6 +539,56 @@ produce.
 These thresholds are the current bar, not physics. Move them with a reason and
 say so here.
 
+## Reading a telemetry report
+
+When the user says they sent telemetry, the report is a
+`dev.rho.gui-performance-snapshot` JSON file and reading it by eye gets three
+things wrong. `rho-qa telemetry <path>` exists so nobody has to.
+
+```
+cargo run -q -p rho-qa -- telemetry /tmp/rho-telemetry/<report>.json
+```
+
+*What it prints.* The frames broken out **by surface**, because slow is almost
+never the whole GUI and the aggregate hides which window is paying; the editor
+stages set against the window they were actually measured in; and the CPU
+profile decoded, as a leaf leaderboard (what the thread was in), an on-stack
+leaderboard (what it was under), and the callers of the top leaf.
+
+*The three traps it exists to avoid.*
+
+- **The stage ring is not the frame span.** `editor[]` is a 4,096-record ring.
+  On a real report the frames cover minutes and the ring covers seconds, so a
+  stage total and a frame total are not comparable and a stage that looks small
+  against the whole session may be most of the window it was sampled in. The
+  reader prints the ring's own span beside its totals for this reason.
+- **A stage inside a draw is not a stage between draws.** The same stage name
+  means different things depending on whether it ran under the frame or on a
+  model event outside one, and only the second is invisible in the frame
+  numbers. Attribute by `start_ns` against the frame spans, not by name.
+- **The CPU profile is sixteen traces, not one.** `cpu_profile.segments[]` is
+  16 **independent** base64'd `dial9-trace-v4` traces, each with its own header
+  and symbol table, and **the last one is uncompressed** because the tail was
+  unsealed when the report was written. Concatenating them and gunzipping once
+  fails with "invalid gzip header"; so does `MultiGzDecoder`. Decode each
+  segment separately, gunzip only those starting `1f 8b`, and merge the symbol
+  tables — symbol indices are per-segment and mixing them silently mislabels
+  every frame.
+
+*What it found.* On the three reports of 2026-09-07 the leaf leaderboard put
+45%, 48% and 56% of main-thread samples in `output_span_for_buffer_offset`, one
+linear scan of a `SumTree`, reached 100% of the time through `refresh_dashboard`
+-> `sync_tree` -> `splice_inlays` -> `InlayMap::splice`. That is the whole
+reason the seek fix (93af55e4) exists, and no amount of reading the frame
+numbers would have named it: the frames only said the transcript's draw was
+slow.
+
+*What the reports still do not say.* A frame does not record its own scale, so
+the transcript's prepaint at p50 5.1 ms cannot be divided by anything. Until a
+frame carries rows on screen, blocks, excerpts, inlays and cursors, and until
+there are stages around `sync_tree` and `splice_inlays` with transform counts,
+a report can say a frame was slow but not what it was slow per.
+
 ## Adding a case
 
 A new case starts every time the user reports something. Write it before
