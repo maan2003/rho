@@ -149,13 +149,9 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
         "the widening had nothing to report on this document; it said {said:#?}"
     );
 
-    // What the accounting record says here, in full and on purpose. This
-    // is the fault that remains: the fold map tells the layers above the
-    // document lost eight bytes, and its own output extent did not change.
-    // Eight is the length of the `y` inlay spliced above, which is what
-    // ties it to the end of an edit still being widened by one step common
-    // to both sides. This assertion is meant to fail on the day that rule
-    // is fixed rather than guarded.
+    // Widening through the shared buffer boundary includes the eight-byte
+    // `y` inlay on the new side, so the emitted edits describe the unchanged
+    // fold output extent without an accounting exception.
     let books = editor
         .update(cx, |editor, _, cx| {
             editor
@@ -163,16 +159,9 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
                 .update(cx, |map, _| map.take_fold_accounting_violations())
         })
         .expect("read what the accounting recorded");
-    assert_eq!(
-        books.len(),
-        1,
-        "one sync on this document does not account for its own output; it said {books:#?}"
-    );
     assert!(
-        books[0].contains("net -8"),
-        "the edits say the output lost eight bytes, the length of the inlay, \
-         and the output did not shrink; it said {:?}",
-        books[0]
+        books.is_empty(),
+        "every sync on this document accounts for its output; it said {books:#?}"
     );
 
     // And what it does not say. The two ends of an edit meeting at one

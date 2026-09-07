@@ -784,15 +784,17 @@ impl FoldMap {
                     .transforms
                     .find::<InlayOffset, _>((), &edit.old.start, Bias::Left);
                 let transform_prefix = edit.old.start - old_transform_start;
+                let mut scan_old_start = edit.old.start;
+                let mut scan_new_start = edit.new.start;
                 if old_transform.is_some_and(|transform| !transform.is_fold())
                     && transform_prefix <= edit.new.start.0.0
                 {
-                    edit.new.start -= transform_prefix;
-                    edit.old.start = old_transform_start;
+                    scan_new_start -= transform_prefix;
+                    scan_old_start = old_transform_start;
                 }
                 loop {
-                    let old_start = old_inlay_snapshot.to_buffer_offset(edit.old.start);
-                    let new_start = inlay_snapshot.to_buffer_offset(edit.new.start);
+                    let old_start = old_inlay_snapshot.to_buffer_offset(scan_old_start);
+                    let new_start = inlay_snapshot.to_buffer_offset(scan_new_start);
                     let mut folds = intersecting_folds(
                         &old_inlay_snapshot,
                         &self.snapshot.folds,
@@ -813,8 +815,8 @@ impl FoldMap {
                             ..old_inlay_snapshot.to_inlay_offset(old_buffer_end);
                         let new_range = inlay_snapshot.to_inlay_offset(new_buffer_start)
                             ..inlay_snapshot.to_inlay_offset(new_buffer_end);
-                        if (old_range.start < edit.old.start && edit.old.start <= old_range.end)
-                            || (new_range.start < edit.new.start && edit.new.start <= new_range.end)
+                        if (old_range.start < scan_old_start && scan_old_start <= old_range.end)
+                            || (new_range.start < scan_new_start && scan_new_start <= new_range.end)
                         {
                             containing = Some((old_buffer_start, new_buffer_start));
                             break;
@@ -832,6 +834,8 @@ impl FoldMap {
                         .new
                         .start
                         .min(widen_start_over_inlays(&inlay_snapshot, new_buffer_start));
+                    scan_old_start = edit.old.start;
+                    scan_new_start = edit.new.start;
                 }
                 while normalized_edits.last().is_some_and(|previous| {
                     edit.old.start <= previous.old.end || edit.new.start <= previous.new.end
@@ -865,7 +869,13 @@ impl FoldMap {
                     );
                 }
                 new_transforms.append(cursor.slice(&edit.old.start, Bias::Left), ());
-                edit.new.start -= edit.old.start - *cursor.start();
+                let prefix = edit.old.start - *cursor.start();
+                if prefix <= edit.new.start.0.0 {
+                    edit.new.start -= prefix;
+                } else {
+                    let boundary = old_inlay_snapshot.to_buffer_offset(*cursor.start());
+                    edit.new.start = widen_start_over_inlays(&inlay_snapshot, boundary);
+                }
                 edit.old.start = *cursor.start();
 
                 cursor.seek(&edit.old.end, Bias::Right);
@@ -1386,6 +1396,13 @@ impl FoldMap {
                             }
                         }
                     }
+                    // Common-step widening can carry one side past its input
+                    // snapshot when the other side's fold is longer. Map the
+                    // reachable endpoint, not an overshoot beyond the document.
+                    edit.old.end = edit.old.end.min(old_inlay_snapshot.len());
+                    edit.new.end = edit.new.end.min(inlay_snapshot.len());
+                    old_transforms.seek(&edit.old.end, Bias::Right);
+                    new_transforms.seek(&edit.new.end, Bias::Right);
                     let old_end =
                         old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
                     let new_end =
