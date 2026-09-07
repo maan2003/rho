@@ -239,18 +239,12 @@ struct VerdictUndo {
     state: VerdictUndoState,
 }
 
-/// The menu on screen while it is open: the menu itself, and the block it
-/// was put into the buffer as. The anchor is the point it opened over, kept
-/// so a count can redraw the menu without moving it.
+/// The menu on screen while it is open. Nothing here says where it is
+/// drawn: the desk pins it to the bottom edge of the window and the phone
+/// draws it as a sheet, and in neither case does the buffer change, so the
+/// open menu is the menu and the way back and nothing else.
 struct MenuBuffer {
     menu: crate::transient::Menu,
-    editor: gpui::WeakEntity<editor::Editor>,
-    /// The block the menu was drawn as, when it is drawn in the buffer at
-    /// all. The phone draws the same menu as a sheet over the surface —
-    /// a thumb needs a target, not a row — so there is no block there and
-    /// nothing in the buffer moves.
-    block: Option<editor::display_map::CustomBlockId>,
-    anchor: multi_buffer::Anchor,
     /// A count typed in this menu that belongs to the one it opened: `45 s m`
     /// is forty-five minutes, and the digits were typed before the `s`.
     carried_count: Option<u32>,
@@ -5455,16 +5449,6 @@ impl Workspace {
         self.menu_buffer.as_ref().map(|open| open.menu.title())
     }
 
-    /// Whether the open menu is drawn as a block in the buffer. False on
-    /// the phone, where the same menu is a sheet and the surface behind it
-    /// is left alone.
-    #[cfg(test)]
-    pub(crate) fn menu_has_block_for_test(&self) -> bool {
-        self.menu_buffer
-            .as_ref()
-            .is_some_and(|open| open.block.is_some())
-    }
-
     /// The reconnect loop marks test hosts disconnected (their sockets
     /// don't exist); verbs gated on connectivity need this to run.
     #[cfg(test)]
@@ -6790,7 +6774,7 @@ impl Workspace {
         let mut minibuffer = Minibuffer::open(prompt, &text_style, complete, on_submit, window, cx);
         minibuffer.refresh(self, cx);
         self.minibuffer = Some(minibuffer);
-        self.remove_menu_block(cx);
+        self.clear_menu();
         // The strip is single-occupancy; a stale message reappearing after
         // the prompt closes would be confusing.
         self.echo = None;
@@ -6882,9 +6866,7 @@ impl Workspace {
             return true;
         }
         self.capture_overlay_focus(window, cx);
-        if !self.show_menu(crate::transient::verdict_menu(), None, Back::Out, true, cx) {
-            return false;
-        }
+        self.show_menu(crate::transient::verdict_menu(), None, Back::Out, true);
         self.minibuffer = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
@@ -6892,9 +6874,9 @@ impl Workspace {
         true
     }
 
-    /// Open a menu as a block under the point. The bottom strip is not
-    /// involved: the menu is buffer text beside the row the reader is on,
-    /// the surface behind it is undisturbed, and the point does not move.
+    /// Open a menu at the bottom of the window, the way Magit's transient
+    /// sits at the bottom of the frame. The buffer is not touched and the
+    /// point does not move; the reader looks down, and looks back up.
     pub(crate) fn open_menu(
         &mut self,
         menu: crate::transient::Menu,
@@ -6902,18 +6884,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.capture_overlay_focus(window, cx);
-        if !self.show_menu(menu, None, Back::Out, false, cx) {
-            return;
-        }
+        self.show_menu(menu, None, Back::Out, false);
         self.minibuffer = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
         cx.notify();
     }
 
-    /// Put a menu into the buffer under the point. Replaces whatever menu is
-    /// there, which is how `s` becomes the snooze units without the menu
-    /// leaving the row it opened over.
+    /// Put a menu on screen. Replaces whatever menu is there, which is how
+    /// `s` becomes the snooze units in the same place at the bottom of the
+    /// window.
     ///
     /// `verdict` is what a menu opened from nothing declares itself to be; a
     /// menu that replaces one inherits it, so the snooze units under the
@@ -6924,28 +6904,9 @@ impl Workspace {
         carried_count: Option<u32>,
         back: Back,
         verdict: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let previous = self.menu_buffer.take();
-        let anchor = match previous.as_ref() {
-            Some(open) => open.anchor,
-            None => self
-                .active_editor(cx)
-                .read(cx)
-                .selections
-                .newest_anchor()
-                .head(),
-        };
         let verdict = previous.as_ref().map_or(verdict, |open| open.verdict);
-        let editor = self.active_editor(cx);
-        if let Some(open) = &previous
-            && let Some(block) = open.block
-            && let Some(editor) = open.editor.upgrade()
-        {
-            editor.update(cx, |editor, cx| {
-                editor.remove_blocks(std::iter::once(block).collect(), None, cx);
-            });
-        }
         let under = match back {
             Back::Out => Vec::new(),
             Back::Over => previous.map_or_else(Vec::new, |open| {
@@ -6955,68 +6916,18 @@ impl Workspace {
             }),
             Back::Under(under) => under,
         };
-        let block = if self.phone.enabled {
-            None
-        } else {
-            let block = editor
-                .update(cx, |editor, cx| {
-                    editor.insert_blocks([menu.block(anchor)], None, cx)
-                })
-                .into_iter()
-                .next();
-            if block.is_none() {
-                return false;
-            }
-            block
-        };
         self.menu_buffer = Some(MenuBuffer {
             menu,
-            editor: editor.downgrade(),
-            block,
-            anchor,
             carried_count,
             under,
             verdict,
         });
-        true
     }
 
-    /// Redraw the menu where it is: the block renders the count it was built
-    /// with, so a digit is the same menu drawn again over the same anchor.
-    fn reinsert_menu_block(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.menu_buffer.as_ref() else {
-            return;
-        };
-        let (Some(editor), anchor, Some(old)) = (open.editor.upgrade(), open.anchor, open.block)
-        else {
-            // The phone's sheet redraws from the menu itself; there is no
-            // block to put back.
-            return;
-        };
-        let properties = open.menu.block(anchor);
-        let block = editor
-            .update(cx, |editor, cx| {
-                editor.remove_blocks(std::iter::once(old).collect(), None, cx);
-                editor.insert_blocks([properties], None, cx)
-            })
-            .into_iter()
-            .next();
-        if let Some(open) = self.menu_buffer.as_mut() {
-            open.block = block;
-        }
-    }
-
-    fn remove_menu_block(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.menu_buffer.take() else {
-            return;
-        };
-        if let Some(block) = open.block
-            && let Some(editor) = open.editor.upgrade()
-        {
-            editor.update(cx, |editor, cx| {
-                editor.remove_blocks(std::iter::once(block).collect(), None, cx);
-            });
-        }
+    /// Close the menu, drawing nothing: there is no block to take out of a
+    /// buffer, because nothing was ever put into one.
+    fn clear_menu(&mut self) {
+        self.menu_buffer = None;
     }
 
     /// One step back: to the menu this one is standing on, or out of the
@@ -7032,7 +6943,7 @@ impl Workspace {
             Some(parent) => {
                 let count = open.carried_count;
                 let under = std::mem::take(&mut open.under);
-                self.show_menu(parent, count, Back::Under(under), false, cx);
+                self.show_menu(parent, count, Back::Under(under), false);
                 cx.notify();
             }
             None => self.close_menu(window, cx),
@@ -7041,7 +6952,7 @@ impl Workspace {
 
     /// The open menu as the phone draws it: its title, a row per item, and
     /// whether there is anything under it to go back to. The same rows the
-    /// block draws — one menu, read two ways, not two menus.
+    /// desk draws — one menu, read two ways, not two menus.
     pub(crate) fn menu_sheet(&self) -> Option<MenuSheet> {
         let open = self.menu_buffer.as_ref()?;
         Some(MenuSheet {
@@ -7081,12 +6992,12 @@ impl Workspace {
     }
 
     /// Close the menu and give the keyboard back to the surface it opened
-    /// over. The point has not moved: the menu was a block beside it.
+    /// over. The point has not moved: the menu was never in the buffer.
     pub(crate) fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu_buffer.is_none() {
             return;
         }
-        self.remove_menu_block(cx);
+        self.clear_menu();
         self.finish_overlay_focus(window, cx);
         cx.notify();
     }
@@ -7114,7 +7025,8 @@ impl Workspace {
         let carried = open.carried_count;
         match press {
             rho_window::transient::Press::Count(_) => {
-                self.reinsert_menu_block(cx);
+                // The count is drawn in the menu's heading, and the menu is
+                // drawn from `menu_buffer`: a redraw is the whole of it.
                 cx.notify();
             }
             rho_window::transient::Press::Dismiss => self.menu_dismiss(window, cx),
@@ -7184,7 +7096,7 @@ impl Workspace {
             MenuId::Snooze => crate::transient::snooze_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
         };
-        self.show_menu(menu, count, Back::Over, false, cx);
+        self.show_menu(menu, count, Back::Over, false);
         cx.notify();
     }
 
@@ -10521,13 +10433,25 @@ impl Render for Workspace {
             } else {
                 None
             })
-            // A menu under the point is a block in the buffer, not a strip, so
-            // what it needs down here is the keyboard and nothing else:
-            // an element with the focus on it and no size of its own.
-            .children(self.menu_buffer.as_ref().map(|_| {
-                div()
+            // The transient, pinned to the bottom edge of the window and
+            // drawn over the buffer rather than in it or above it: nothing
+            // in the surface reflows, and the point stays where the reader
+            // left it, in view. The phone draws the same menu as a sheet
+            // further down, so here it takes the keyboard and nothing else.
+            .children(self.menu_buffer.as_ref().map(|open| {
+                let holder = div()
                     .track_focus(&self.transient_focus)
-                    .on_key_down(cx.listener(Self::menu_key))
+                    .on_key_down(cx.listener(Self::menu_key));
+                if phone {
+                    return holder.into_any_element();
+                }
+                holder
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(bottom_strip(&text_style, cx).child(open.menu.render(&text_style, cx)))
+                    .into_any_element()
             }))
             .children(match (&self.pending_git_approval, &self.minibuffer) {
                 (Some(pending), _) => {

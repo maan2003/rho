@@ -1331,6 +1331,34 @@ work on it.
 
 ### Landed
 
+- **The transient goes back to the bottom of the window.** The user's ruling,
+  and it overturns eng-en1p's earlier one: the menu was drawn as a block in
+  the buffer under the point, and Magit's transient sits at the bottom of the
+  frame with the point where it was. What the earlier specification got wrong
+  is that it made the menu something that happens to the reader's text —
+  opening one reflowed the surface, and near the bottom of the viewport it
+  drew off the edge of the screen with nothing scrolling it into view (the
+  defect that started this, first on the sweep's list).
+  Only the drawing changed. `Transient<A>`, the items, the keys, the count,
+  the back stack and the phone sheet are exactly as they were.
+  `Menu::block` is gone and `Menu::render` takes its place: an element in the
+  editor's text style, with no opinion about where it goes. The desk pins it
+  to the bottom edge — `absolute().bottom_0()` over the window, not another
+  row in the column — so nothing above it reflows, and it wears the same
+  chrome as the minibuffer (`bottom_strip`) because it is the same piece of
+  furniture in the same place. If the ruling meant no shared chrome either,
+  that is a one-line change.
+  `MenuBuffer` no longer carries a block id, a weak editor or an anchor: it
+  is the menu, the count and the way back, and it now says nothing at all
+  about where the menu is drawn. `show_menu` cannot fail, so it returns
+  nothing; `reinsert_menu_block` and `remove_menu_block` are gone (a count
+  is a redraw, a close is a `None`).
+  The test that read the block's height back is gone with the block.
+  `the_root_menu_opens_at_the_bottom_and_escape_retraces_it` now measures the
+  surface's drawn rows before, during and after: opening the menu adds no row
+  to the buffer, which is the invariant the ruling is about, and the point is
+  unmoved at every step as before.
+
 - **The snapshot and the rig** (`crates/rho-qa`). `rho-qa snapshot` copies the
   live state while the daemon runs and verifies the copy by opening it and
   counting rows; the live directory is read from and never written, never

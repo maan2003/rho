@@ -4555,12 +4555,14 @@ fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppC
         .unwrap();
 }
 
-/// The root menu is a buffer under the point too, and `shift` no longer
-/// reaches Home while it is open: with a menu holding the keyboard, a tap
-/// belongs to the menu. Three steps down and three escapes back, with the
-/// point where it started — the whole way back, not one step of it.
+/// The root menu takes the keyboard, so `shift` no longer reaches Home
+/// while it is open: with a menu up, a tap belongs to the menu. Three steps
+/// down and three escapes back, with the point where it started — the whole
+/// way back, not one step of it. The buffer is not touched on the way: the
+/// menu is drawn at the bottom of the window, over the surface, so no row is
+/// added to make room for it.
 #[gpui::test]
-fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppContext) {
+fn the_root_menu_opens_at_the_bottom_and_escape_retraces_it(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     desk.due_note(None, "Card in view");
 
@@ -4582,8 +4584,25 @@ fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppCo
             .newest_anchor()
             .head()
     };
+    // How many rows the surface draws. A block in the buffer would show up
+    // here as rows the buffer does not have; a thing drawn over the window
+    // cannot.
+    let drawn_rows = |workspace: &mut Workspace, window: &mut gpui::Window, cx: &mut App| {
+        workspace
+            .active_editor(cx)
+            .update(cx, |editor, cx| editor.snapshot(window, cx))
+            .display_snapshot
+            .max_point()
+            .row()
+            .0
+    };
     let before = workspace
         .update(cx, |workspace, _, cx| point(workspace, cx))
+        .unwrap();
+    let rows_before = workspace
+        .update(cx, |workspace, window, cx| {
+            drawn_rows(workspace, window, cx)
+        })
         .unwrap();
 
     workspace
@@ -4591,6 +4610,11 @@ fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppCo
             let subject = workspace.subject(window, cx);
             workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
             assert_eq!(workspace.menu_title_for_test(), Some("rho"));
+            assert_eq!(
+                drawn_rows(workspace, window, cx),
+                rows_before,
+                "the menu drew no rows into the buffer"
+            );
             assert!(
                 !workspace.verdict_transient_open(),
                 "the root menu is not the verdicts, so shift is not Home"
@@ -4627,17 +4651,21 @@ fn the_root_menu_opens_under_the_point_and_escape_retraces_it(cx: &mut TestAppCo
     cx.simulate_keystrokes(*workspace, "escape");
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, cx| {
+        .update(cx, |workspace, window, cx| {
             assert_eq!(workspace.menu_title_for_test(), None, "and then out");
             assert_eq!(point(workspace, cx), before, "the point came back");
+            assert_eq!(
+                drawn_rows(workspace, window, cx),
+                rows_before,
+                "and the buffer is the length it always was"
+            );
         })
         .unwrap();
 }
 
 /// The phone draws the same menu. Not the same picture — a thumb needs a
 /// target, not a row — but the same items, reached by tapping the row a key
-/// would have run, with the same stack behind `back`. And no block: the
-/// sheet is over the surface, so nothing in the buffer moves to make room.
+/// would have run, with the same stack behind `back`.
 #[gpui::test]
 fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
@@ -4674,10 +4702,6 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
                 !sheet.has_back,
                 "the root of the sheet has nothing under it"
             );
-            assert!(
-                !workspace.menu_has_block_for_test(),
-                "the phone's menu is a sheet, not a block in the buffer"
-            );
         })
         .unwrap();
 
@@ -4688,7 +4712,6 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
             let sheet = workspace.menu_sheet().expect("the submenu draws");
             assert_eq!(sheet.title, "status");
             assert!(sheet.has_back, "and the sheet says there is a way back");
-            assert!(!workspace.menu_has_block_for_test());
         })
         .unwrap();
 

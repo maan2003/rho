@@ -2,10 +2,11 @@
 //! and closes.
 //!
 //! Magit's transient, held to the ruling in `RHO-WINDOW-DESIGN.md`. A menu is
-//! a title and rows of key and meaning; it opens as a block under the row the
-//! point is on, drawn with the editor's own text style, so it is buffer text
-//! and not a popup over the buffer. The surface behind it is undisturbed and
-//! the point does not move.
+//! a title and rows of key and meaning; it is drawn at the bottom of the
+//! window, in the editor's own text style, the way Magit's sits at the bottom
+//! of the frame. The buffer above it is not reflowed and the point does not
+//! move: the menu is a place on the screen the reader looks down to, not a
+//! thing that happens to their text.
 //!
 //! Two things make it a window primitive rather than a screen's own widget.
 //!
@@ -24,12 +25,8 @@
 //! is Magit's distinction: a suffix exits, an infix (a toggle, a value the
 //! next key needs) stays. Nothing else stays.
 
-use std::sync::Arc;
-
-use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle};
 use gpui::prelude::*;
-use gpui::{Keystroke, div};
-use multi_buffer::Anchor;
+use gpui::{AnyElement, App, Keystroke, TextStyle, div};
 use theme::ActiveTheme as _;
 
 /// What an item does to the menu when it runs.
@@ -223,15 +220,13 @@ impl<A> Transient<A> {
         }
     }
 
-    /// The menu as a block under the point's row, drawn with the editor's own
-    /// text style. `anchor` is the point: the menu belongs to the row the
-    /// reader is on, not to the bottom of the window.
+    /// The menu as an element, drawn in the editor's own text style. Where it
+    /// goes is the caller's: on the desk it is pinned to the bottom edge of
+    /// the window, over the buffer rather than in it.
     ///
     /// Cost: per frame O(rows in the menu), and a menu is a screenful of keys
     /// at the most.
-    pub fn block(&self, anchor: Anchor) -> BlockProperties<Anchor> {
-        let title = self.title.clone();
-        let count = self.count;
+    pub fn render(&self, text_style: &TextStyle, cx: &App) -> AnyElement {
         let rows: Vec<(String, String, Option<String>)> = self
             .items
             .iter()
@@ -243,18 +238,7 @@ impl<A> Transient<A> {
                 )
             })
             .collect();
-        BlockProperties {
-            placement: BlockPlacement::Below(anchor),
-            // A starting height, not the real one: the editor measures the
-            // element and resizes the block to what it drew. `None` would
-            // mean no height at all — `Block::has_height` is what turns the
-            // measuring on — and the menu would be painted over the rows
-            // below rather than moving them down.
-            height: Some(1),
-            style: BlockStyle::Fixed,
-            render: Arc::new(move |cx| render(&title, count, &rows, cx).into_any_element()),
-            priority: 1,
-        }
+        render(&self.title, self.count, &rows, text_style, cx).into_any_element()
     }
 }
 
@@ -262,10 +246,10 @@ fn render(
     title: &str,
     count: Option<u32>,
     rows: &[(String, String, Option<String>)],
-    cx: &mut BlockContext<'_, '_>,
+    text_style: &TextStyle,
+    cx: &App,
 ) -> impl IntoElement {
-    let text_style = cx.editor_style.text.clone();
-    let colors = cx.app.theme().colors();
+    let colors = cx.theme().colors();
     let accent = colors.text_accent;
     let muted = colors.text_muted;
     let value_color = colors.terminal_ansi_green;
@@ -277,7 +261,6 @@ fn render(
         let mut row = div()
             .flex()
             .gap_1()
-            .h(cx.line_height)
             .child(div().text_color(accent).child(key.clone()))
             .child(div().child(description.clone()));
         if let Some(value) = value {
@@ -290,19 +273,17 @@ fn render(
         Some(count) => format!("{title} {count}"),
         None => title.to_owned(),
     };
-    // A column, explicitly: a gpui div lays its children in a row, and a
-    // block whose element has no height of its own is drawn over the rows
-    // below it instead of moving them down.
+    // A column, explicitly: a gpui div lays its children in a row.
     div()
         .block_mouse_except_scroll()
         .flex()
         .flex_col()
         .w_full()
-        .pl(cx.anchor_x)
+        .px_2()
         .font_family(text_style.font_family.clone())
         .text_size(text_style.font_size)
-        .line_height(cx.line_height)
-        .child(div().h(cx.line_height).text_color(muted).child(heading))
+        .line_height(text_style.line_height)
+        .child(div().text_color(muted).child(heading))
         .children(rendered)
 }
 
@@ -370,16 +351,6 @@ mod tests {
             .item("x", "mute", Verdict::Mute)
             .item("s", "snooze…", Verdict::Snooze)
             .item("shift-s", "snooze the room…", Verdict::Room)
-    }
-
-    /// A menu is a block, and a block with no height is never measured —
-    /// `Block::has_height` is `height.is_some()` — so it paints over the
-    /// rows below instead of moving them down. That is how the verdict menu
-    /// first drew on the rig; the height is read back here so the next menu
-    /// cannot repeat it.
-    #[test]
-    fn a_menu_block_starts_with_a_height() {
-        assert!(verdicts().block(multi_buffer::Anchor::Min).height.is_some());
     }
 
     #[test]

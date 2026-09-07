@@ -71,10 +71,13 @@ the screen and what an item is allowed to touch is replaced.
 
 Concretely, in `rho-window`:
 
-- A transient is a buffer, opened under the point on the surface beneath it,
-  drawn as text through the same editor the surfaces use. Nothing about it is a
-  strip, and the bottom strip stays what it is for: the echo line and the
-  minibuffer.
+- A transient is drawn at the bottom edge of the window, over the surface,
+  in the editor's own text style. (Superseded: this said "a buffer, opened
+  under the point", and it was drawn as a block in the surface's buffer. The
+  user ruled that wrong — Magit's transient sits at the bottom of the frame
+  and the point does not move — so the buffer is no longer touched at all.
+  It is still not a strip: it is pinned over the window rather than added to
+  the column, so nothing above it reflows when it opens.)
 - An item's action is a value, not a closure over the window. The crate that
   supplies the menu says what it wants done in its own vocabulary; the window
   hands that value back to it when the key is pressed. `rho-window` names no
@@ -133,14 +136,15 @@ back is there, not one step of it.
 
 The third batch is the draft's two — `new` and `input` — and with them the
 phone, which is where the primitive's fifth complaint about the old
-transient is answered. The phone does not draw the block: a thumb needs a
+transient is answered. The phone draws the menu as a sheet: a thumb needs a
 target, not a row, so the sheet draws the menu's items as targets and the
 surface behind it is left alone. What makes it one presentation path rather
 than two is that it is the same `Transient<A>` read through `items()`, and a
 tap runs the item a key would have run — `action_at` and `phone_rows` are
-gone for every menu that has moved. The block became optional on the buffer
-rather than conditional at the call site, which is the honest shape: a menu
-is open either way, and only its drawing differs.
+gone for every menu that has moved. A menu is open either way, and only its
+drawing differs. (The desk drew a block in the buffer until the user's
+ruling; now neither does, and `MenuBuffer` says nothing about where the menu
+is drawn.)
 
 What is not done: nothing of the menus. The five usage menus were the last
 readers of the bottom strip and of `phone_rows`; they are now eight items of
