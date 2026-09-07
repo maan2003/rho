@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::os::fd::AsRawFd as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rho_agent::db::{
@@ -159,6 +160,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
     })
 }
 
+#[derive(Debug)]
 struct Snapshot {
     source: PathBuf,
     path: PathBuf,
@@ -170,12 +172,35 @@ fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
         .map(Ok)
         .unwrap_or_else(default_db_path)
         .context("resolve rho db path")?;
+    let paths = rho_ui_proto::RuntimePaths::from_env()?;
+    std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
+    copy_snapshot_from(&source, &paths.daemon_lock())
+}
+
+fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snapshot> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(daemon_lock)
+        .with_context(|| format!("open daemon lock {}", daemon_lock.display()))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "refusing to copy {} while the rho daemon is running; stop the daemon first",
+                source.display()
+            );
+        }
+        return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
+    }
     let temp = tempfile::tempdir().context("create debug db snapshot tempdir")?;
     let snapshot = temp.path().join("rho.redb");
-    std::fs::copy(&source, &snapshot)
+    std::fs::copy(source, &snapshot)
         .with_context(|| format!("copy rho db snapshot from {}", source.display()))?;
     Ok(Snapshot {
-        source,
+        source: source.to_owned(),
         path: snapshot,
         _temp: temp,
     })
@@ -526,5 +551,38 @@ mod render_prompt_tests {
             }
         );
         assert!(parse_role("ultra").is_err());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_daemon_lock_refuses_the_redb_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rho.redb");
+        drop(RhoDb::open(&source));
+        let lock_path = directory.path().join("daemon.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let error = copy_snapshot_from(&source, &lock_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("while the rho daemon is running")
+        );
+
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(lock);
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        drop(RhoDb::open(&snapshot.path));
     }
 }
