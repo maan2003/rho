@@ -75,11 +75,11 @@ pub fn run(args: WalkArgs) -> Result<()> {
         max_warm = max_warm.max(report.warm_draw_micros);
         if !report.wall_clock_findings.is_empty() {
             let mut baseline = report.baseline_owners.iter().collect::<Vec<_>>();
-            baseline.sort_by_key(|owner| std::cmp::Reverse(owner.primitives));
+            baseline.sort_by_key(|owner| std::cmp::Reverse(owner.paint_nanos));
             for owner in baseline.into_iter().take(12) {
                 println!(
-                    "WALL_CLOCK_BASELINE_OWNER seed={seed} owner={} primitives={} bounds={:?}",
-                    owner.owner, owner.primitives, owner.bounds
+                    "WALL_CLOCK_BASELINE_OWNER seed={seed} owner={} paint_ns={} primitives={} bounds={:?}",
+                    owner.owner, owner.paint_nanos, owner.primitives, owner.bounds
                 );
             }
         }
@@ -90,14 +90,14 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 "WALL_CLOCK_FINDING seed={seed} step={} draw_us={} editor_work_rows={} sequence={sequence}",
                 finding.step, finding.draw_micros, finding.editor_work_rows
             );
-            for owner in report.step_owners[finding.step]
-                .iter()
-                .filter(|owner| owner.changed_primitives != 0)
-            {
+            let mut owners = report.step_owners[finding.step].iter().collect::<Vec<_>>();
+            owners.sort_by_key(|owner| std::cmp::Reverse(owner.paint_nanos));
+            for owner in owners.into_iter().take(12) {
                 println!(
-                    "WALL_CLOCK_CHANGED_OWNER seed={seed} step={} owner={} primitives={} changed={} bounds={:?}",
+                    "WALL_CLOCK_OWNER seed={seed} step={} owner={} paint_ns={} primitives={} changed={} bounds={:?}",
                     finding.step,
                     owner.owner,
+                    owner.paint_nanos,
                     owner.primitives,
                     owner.changed_primitives,
                     owner.bounds,

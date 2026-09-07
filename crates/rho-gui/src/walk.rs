@@ -99,6 +99,7 @@ pub struct OwnerFrameSummary {
     pub owner: String,
     pub primitives: usize,
     pub changed_primitives: usize,
+    pub paint_nanos: u64,
     pub bounds: [f32; 4],
 }
 
@@ -586,6 +587,7 @@ fn summarize_owners(
                 .iter()
                 .filter(|change| change.subscene == subscene.id)
                 .count(),
+            paint_nanos: subscene.paint_elapsed.as_nanos() as u64,
             bounds: [
                 subscene.bounds.origin.x.0,
                 subscene.bounds.origin.y.0,
