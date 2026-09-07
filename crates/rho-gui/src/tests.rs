@@ -127,6 +127,25 @@ fn image_inlays_are_fixed_cell_decorations(cx: &mut TestAppContext) {
         .expect("remove image inlay");
 }
 
+/// A fold placeholder stands in for buffer text, so it draws in the
+/// buffer's face. The editor's prepaint pushes the buffer's font size and
+/// line height onto the text style stack but not its family, so a
+/// placeholder that does not name the family draws in the window's UI font
+/// — a proportional caption in the middle of monospace rows, which is what
+/// the transcript's "N tools" rows did.
+#[gpui::test]
+fn a_fold_placeholder_wears_the_buffer_s_face(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    cx.update(|cx| {
+        let buffer_font = theme_settings::ThemeSettings::get_global(cx)
+            .buffer_font
+            .clone();
+        let mut row = rho_agents::transcript::elisions::elision_row("2 tools", cx);
+        let style = gpui::Styled::text_style(&mut row);
+        assert_eq!(style.font_family, Some(buffer_font.family));
+    });
+}
+
 fn init_test_app(cx: &mut App) {
     gpui_tokio::init(cx);
     assets::Assets.load_test_fonts(cx);

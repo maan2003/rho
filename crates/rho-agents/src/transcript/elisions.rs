@@ -23,7 +23,9 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, Context, Entity};
 use multi_buffer::MultiBuffer;
 use rho_window::highlights::excerpt_range;
+use settings::Settings as _;
 use text::Anchor;
+use theme_settings::ThemeSettings;
 use ui::{Icon, IconName, IconSize, div};
 
 use crate::render::elision::{ElisionPlan, elision_label, elision_plans_from, turn_start_index};
@@ -230,9 +232,24 @@ pub enum HistoryFold {}
 
 /// The row a folded turn leaves behind: the same chevron and count the
 /// reader saw when this was a block, drawn now as the fold's placeholder.
+///
+/// A placeholder stands in for buffer text, so it draws in the buffer's
+/// face. It has to say so: the editor's prepaint pushes the buffer's font
+/// size and line height onto the text style stack but not its family, so a
+/// bare `div` here comes out in the window's UI font — a proportional
+/// caption in the middle of monospace rows. Zed's own placeholders take the
+/// same font from the same place; see `FoldPlaceholder::fold_element`.
 fn render_elision(label: &str, cx: &mut App) -> AnyElement {
+    elision_row(label, cx).into_any_element()
+}
+
+/// The placeholder before it is erased, so a guard can read back the face
+/// it asked for. Public for that reason only.
+pub fn elision_row(label: &str, cx: &mut App) -> ui::Div {
     let text_color = rho_window::style::hint_color(cx);
+    let buffer_font = ThemeSettings::get_global(cx).buffer_font.clone();
     div()
+        .font(buffer_font)
         .flex()
         .items_center()
         .gap_1()
@@ -244,5 +261,4 @@ fn render_elision(label: &str, cx: &mut App) -> AnyElement {
                 .color(text_color.into()),
         )
         .child(label.to_owned())
-        .into_any_element()
 }

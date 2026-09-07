@@ -74,7 +74,14 @@ pub(super) fn reconcile_marker<V: 'static>(
 /// thing — there is more of the transcript here than the screen is showing.
 fn render_marker(remaining: usize, cx: &mut BlockContext) -> AnyElement {
     let color = rho_window::style::hint_color(cx);
+    // The marker is a fact about the buffer and reads as one row of it, so
+    // it takes the editor's own text style rather than the window's UI
+    // font, which is what a block's element inherits by default.
+    let text_style = cx.editor_style.text.clone();
     div()
+        .font_family(text_style.font_family.clone())
+        .text_size(text_style.font_size)
+        .line_height(text_style.line_height)
         .flex()
         .items_center()
         .gap_1()

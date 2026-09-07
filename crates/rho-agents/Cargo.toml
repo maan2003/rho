@@ -27,9 +27,11 @@ rho-ui-proto.workspace = true
 rho-window = { workspace = true }
 rustc-hash = "2.1.0"
 senax-encoder.workspace = true
+settings = { path = "../../vendor/zed/crates/settings" }
 serde_json.workspace = true
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { path = "../../vendor/zed/crates/ui" }

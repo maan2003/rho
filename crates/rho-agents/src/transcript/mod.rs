@@ -28,7 +28,7 @@
 //! the block list itself; moving it re-buckets highlights without touching
 //! the buffer.
 
-mod elisions;
+pub mod elisions;
 mod gap;
 mod inlays;
 
