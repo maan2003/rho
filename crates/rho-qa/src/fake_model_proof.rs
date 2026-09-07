@@ -239,6 +239,9 @@ async fn run_async(args: Args) -> Result<()> {
                                 .send(&ClientMessage::Detail {
                                     agent_id: entry.agent_id,
                                     pos: entry.pos,
+                                    // One position per request here; the GUI
+                                    // batches a chunk's positions into one.
+                                    more: Vec::new(),
                                 })
                                 .await?;
                         }

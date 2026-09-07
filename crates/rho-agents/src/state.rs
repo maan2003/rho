@@ -123,6 +123,17 @@ pub struct UiTool {
     pub started_at: Option<UnixMs>,
     pub finished_at: Option<UnixMs>,
     pub metadata: Option<UiToolMetadata>,
+    /// Where the raw log holds this call's output: the position of the event
+    /// that closed it. The story carries the call and its arguments but not
+    /// what the tool said - 1.73 GiB of results against a client mirror of
+    /// 1028 MiB with the calls alone - so a chunk asks the daemon for the
+    /// bodies of the positions its calls name, once, as it composes.
+    ///
+    /// `None` while the call is still running, and on a story written before
+    /// this field, where the transcript then draws the call and its
+    /// arguments and nothing under them.
+    #[senax(default)]
+    pub result_at: Option<rho_ui_proto::mirror::AgentPos>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

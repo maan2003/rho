@@ -144,6 +144,13 @@ pub enum AgentModelEvent {
     Loaded(AgentId),
     /// The history the reader asked for is composed; nothing is waiting.
     HistoryComposed(AgentId),
+    /// Blocks just composed hold calls whose results are in the log and
+    /// not in the story. The screen has no connection; whoever does asks
+    /// for these positions and hands the answers back.
+    BodiesWanted {
+        agent_id: AgentId,
+        positions: Vec<rho_ui_proto::mirror::AgentPos>,
+    },
 }
 
 impl gpui::EventEmitter<AgentModelEvent> for AgentModel {}
@@ -252,8 +259,11 @@ impl AgentModel {
                 .await;
             let text_buffers = reservations.into_iter().zip(text_buffers).collect();
             let Ok(parsing) = this.update(cx, |this, cx| {
-                this.transcript
-                    .install_initial(prepared, text_buffers, now_ms, cx)
+                let parsing = this
+                    .transcript
+                    .install_initial(prepared, text_buffers, now_ms, cx);
+                this.emit_wanted(cx);
+                parsing
             }) else {
                 return;
             };
@@ -491,6 +501,7 @@ impl AgentModel {
                 .transcript
                 .compose_history(HISTORY_CHUNK_ROWS, now_ms(), cx),
         };
+        self.emit_wanted(cx);
         if let Some(want) = want {
             if more && !want.met_by(&self.transcript) {
                 return true;
@@ -612,6 +623,33 @@ impl AgentModel {
     ) {
         self.transcript
             .sync(state, summary, now_ms, agent_label, cx);
+        self.emit_wanted(cx);
+    }
+
+    /// Draws one answer's results under the calls that asked for them.
+    pub fn splice_results(
+        &mut self,
+        pos: rho_ui_proto::mirror::AgentPos,
+        results: &[rho_ui_proto::mirror::DetailResult],
+        now_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.transcript.splice_results(pos, results, now_ms, cx);
+    }
+
+    /// Passes on what the transcript is waiting to be told. Composing is
+    /// the only thing that asks, so this follows every composition.
+    fn emit_wanted(&mut self, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.agent_id else {
+            return;
+        };
+        let positions = self.transcript.take_wanted();
+        if !positions.is_empty() {
+            cx.emit(AgentModelEvent::BodiesWanted {
+                agent_id,
+                positions,
+            });
+        }
     }
 
     pub fn tick_timers(&mut self, now_ms: u64, cx: &mut Context<Self>) {

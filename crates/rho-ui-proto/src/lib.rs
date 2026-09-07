@@ -251,10 +251,23 @@ pub enum ClientMessage {
     Follow {
         since: mirror::Seq,
     },
-    /// The bodies of one raw event: tool output, a response whole.
+    /// The bodies of raw events: tool output, a response whole.
+    ///
+    /// One request per chunk of transcript rather than one per call: a
+    /// chunk's tool calls are one `Sent` each (measured at 1.01 results per
+    /// `Sent` over the whole corpus), so asking per call would ask the same
+    /// events over again. The daemon answers one [`ServerMessage::Detail`]
+    /// per position, each naming its own `pos`, so the answers need no order
+    /// and no correlation id.
+    ///
+    /// `pos` is the first position and `more` the rest. A daemon older than
+    /// `more` skips the field it does not know and answers `pos` alone; the
+    /// client draws the bodies it is given and leaves the rest folded.
     Detail {
         agent_id: AgentId,
         pos: mirror::AgentPos,
+        #[senax(default)]
+        more: Vec<mirror::AgentPos>,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -1327,6 +1340,7 @@ mod tests {
             ClientMessage::Detail {
                 agent_id,
                 pos: mirror::AgentPos(3),
+                more: vec![mirror::AgentPos(4), mirror::AgentPos(9)],
             },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();

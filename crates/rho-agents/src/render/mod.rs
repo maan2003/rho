@@ -523,7 +523,24 @@ fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<
     if !spans.last().is_some_and(|span| span.text.ends_with('\n')) {
         spans.push(Span::new("\n", StyleClass::Default));
     }
+    push_tool_body_spans(spans, tool);
     timer
+}
+
+/// What the call said, under its line and indented so the line still reads
+/// as the line. Nothing at all until the body arrives: the story carries
+/// the call and its arguments, never its output, so a call whose body has
+/// not been asked for - or whose answer has not come back - is the one
+/// line and no more.
+fn push_tool_body_spans(spans: &mut Vec<Span>, tool: &UiTool) {
+    for text in [tool.output.as_deref(), tool.error.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        for line in text.lines() {
+            spans.push(Span::new(format!("    {line}\n"), StyleClass::ToolDetail));
+        }
+    }
 }
 
 fn tool_status_label(status: UiToolStatus) -> &'static str {
@@ -647,6 +664,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             metadata: None,
+            result_at: None,
         }
     }
 

@@ -24,6 +24,7 @@ mod fold_tail_rows;
 mod history;
 mod inlay_cost;
 mod minibuffer;
+mod results_under_folds;
 mod scene_fuzz;
 mod story;
 mod wrap_rows;
@@ -2053,6 +2054,7 @@ fn tool(
     finished_at: Option<u64>,
 ) -> UiTool {
     UiTool {
+        result_at: None,
         id: id.to_owned(),
         name: "shell_command".to_owned(),
         arguments: "echo ok".to_owned(),
@@ -2448,6 +2450,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                 state,
                 index,
                 UiBlock::Tool(UiTool {
+                    result_at: None,
                     id: format!("t1.{}", blocks_count - 1),
                     name: "shell_command".to_owned(),
                     arguments: format!("echo {tick}"),
@@ -3266,6 +3269,7 @@ fn streaming_tool_arguments_update_rendered_label(cx: &mut TestAppContext) {
         state(
             vec![user("run")],
             vec![UiBlock::Tool(UiTool {
+                result_at: None,
                 id: "tool-1".to_owned(),
                 name: "shell_command".to_owned(),
                 arguments: "echo".to_owned(),
@@ -3346,6 +3350,7 @@ fn burst_of_pending_tools_elides_early_tools(cx: &mut TestAppContext) {
     let pending = (0..16)
         .map(|ix| {
             UiBlock::Tool(UiTool {
+                result_at: None,
                 id: format!("tool-{ix}"),
                 name: format!("tool_{ix}"),
                 arguments: format!("arg-{ix}"),

@@ -2537,13 +2537,21 @@ async fn handle_message(
             ));
             Ok(Refresh::None)
         }
-        ClientMessage::Detail { agent_id, pos } => {
-            let body = agent_detail(&agents.db, agent_id, pos);
-            let _ = outgoing_tx.send(ServerMessage::Detail {
-                agent_id,
-                pos,
-                body,
-            });
+        ClientMessage::Detail {
+            agent_id,
+            pos,
+            more,
+        } => {
+            // One answer per position, each naming its own `pos`. A chunk
+            // asks once and is answered as many times as it asked for.
+            for pos in std::iter::once(pos).chain(more) {
+                let body = agent_detail(&agents.db, agent_id, pos);
+                let _ = outgoing_tx.send(ServerMessage::Detail {
+                    agent_id,
+                    pos,
+                    body,
+                });
+            }
             Ok(Refresh::None)
         }
         ClientMessage::SendUserMessage {

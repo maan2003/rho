@@ -673,6 +673,25 @@ impl Workspace {
                     rho_agents::agent_view::AgentModelEvent::HistoryComposed(agent_id) => {
                         workspace.finish_transcript_search(*agent_id, window, cx);
                     }
+                    rho_agents::agent_view::AgentModelEvent::BodiesWanted {
+                        agent_id,
+                        positions,
+                    } => {
+                        // One request for the chunk, naming every position
+                        // its calls came from. The daemon answers each one
+                        // on its own, and each answer names what it answers.
+                        let mut positions = positions.iter().copied();
+                        if let Some(pos) = positions.next() {
+                            workspace.send_to_agent(
+                                *agent_id,
+                                ClientMessage::Detail {
+                                    agent_id: *agent_id,
+                                    pos,
+                                    more: positions.collect(),
+                                },
+                            );
+                        }
+                    }
                 },
             ));
             self.refresh_view_status(&agent_id, &model, cx);
@@ -2182,8 +2201,22 @@ impl Workspace {
             // Rows never reach the main thread as rows: the model folds
             // them and says which agents moved.
             ConnEvent::Log { .. } => {}
-            // Bodies on demand are not yet asked for; nothing to hold.
-            ConnEvent::Detail { .. } => {}
+            // The bodies a composed chunk asked for. A chunk that went
+            // away while its answer was in flight is not waiting for it,
+            // and the model drops it.
+            ConnEvent::Detail {
+                agent_id,
+                pos,
+                body,
+            } => {
+                if let rho_ui_proto::mirror::DetailBody::Results(results) = body
+                    && let Some(model) = self.models.get(&agent_id).cloned()
+                {
+                    model.update(cx, |model, cx| {
+                        model.splice_results(pos, &results, now_ms(), cx);
+                    });
+                }
+            }
             ConnEvent::ChatGptUsage {
                 used_percent,
                 reset_at_unix,
