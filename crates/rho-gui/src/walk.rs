@@ -97,6 +97,11 @@ impl WalkHarness {
     }
 }
 
+/// How many times the settled frame is drawn without the recorder before
+/// the run starts. The first is the window's only cold draw; the rest are
+/// what the bound is read off.
+const DRAW_SAMPLES: usize = 5;
+
 /// Numeric evidence retained from a successful run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalkReport {
@@ -111,6 +116,16 @@ pub struct WalkReport {
     pub max_draw_micros: u64,
     pub cold_draw_micros: u64,
     pub warm_draw_micros: u64,
+    /// Every recorder-free draw of the settled frame, in the order taken.
+    ///
+    /// One draw is a measurement of the machine as much as of the frame: a
+    /// build on the same host took the same frame from 1290 us to 5922 at
+    /// load 71 on 96 cores. The frame's own cost is the smallest of several
+    /// draws of it - a minimum under load is still work the frame did, a
+    /// maximum is the scheduler - so the bound is read off the best and the
+    /// whole spread is printed, which is what makes a loaded machine
+    /// visible rather than mistaken for a regression.
+    pub draw_samples: Vec<u64>,
     pub step_draw_micros: Vec<u64>,
     pub step_touched_rows: Vec<u64>,
     pub step_walked_items: Vec<u64>,
@@ -422,14 +437,19 @@ fn run_events_with_detached_host(
     cx.run_until_parked();
     let editor = active_editor(&workspace, &mut cx)
         .map_err(|_| ("workspace closed", 0, None, 0, 0, 0, 0, 0, Vec::new()))?;
-    let cold_started = Instant::now();
-    cx.draw_window(*workspace);
-    frame_timings.collect_unseen();
-    let cold_draw_micros = cold_started.elapsed().as_micros() as u64;
-    let warm_started = Instant::now();
-    cx.draw_window(*workspace);
-    frame_timings.collect_unseen();
-    let warm_draw_micros = warm_started.elapsed().as_micros() as u64;
+    let mut draw_samples = Vec::with_capacity(DRAW_SAMPLES);
+    for _ in 0..DRAW_SAMPLES {
+        let started = Instant::now();
+        cx.draw_window(*workspace);
+        frame_timings.collect_unseen();
+        draw_samples.push(started.elapsed().as_micros() as u64);
+    }
+    let cold_draw_micros = draw_samples[0];
+    let warm_draw_micros = draw_samples[1..]
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(cold_draw_micros);
     let recorder = cx.record_scenes::<WalkEvent>(*workspace);
     cx.draw_window(*workspace);
     frame_timings.collect_unseen();
@@ -627,6 +647,7 @@ fn run_events_with_detached_host(
         max_draw_micros,
         cold_draw_micros,
         warm_draw_micros,
+        draw_samples,
         step_draw_micros,
         step_touched_rows,
         step_walked_items,
