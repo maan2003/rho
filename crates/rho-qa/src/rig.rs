@@ -173,6 +173,15 @@ struct Session {
     /// note can quote the run rather than re-derive it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<Summary>,
+    /// The last drive this session was named for, and how many steps ran
+    /// under it. Two sessions on one commit came back 4.9% and 79% over
+    /// budget, and the difference was neither the commit nor the machine:
+    /// it was what the reader did. A frame number without these two beside
+    /// it cannot be compared with any other frame number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drive: Option<String>,
+    #[serde(default)]
+    drive_steps: usize,
 }
 
 /// Build what a rig runs. Goes through `crate::build` so the linker the
@@ -465,6 +474,11 @@ fn up(args: UpArgs) -> Result<()> {
         stale_binaries: ran_stale,
         profile: profile_path.clone(),
         summary: None,
+        // Filled on the way down, from the log the driver writes as it
+        // goes. A session that never drove anything keeps these as they
+        // are, and the report says so rather than showing a blank.
+        drive: None,
+        drive_steps: 0,
     });
     save(&root, &rig)?;
     let tree_commit = crate::snapshot::tree_commit().unwrap_or_else(|| "unknown".to_owned());
@@ -483,7 +497,8 @@ fn up(args: UpArgs) -> Result<()> {
         rig.sessions.len()
     );
     println!(
-        "drive it with: rho wayland --session {} <key|input|screenshot|tree>",
+        "drive it with: rho wayland --session {0} drive \"<what this run is>\" \
+         then rho wayland --session {0} <key|input|screenshot|tree>",
         args.name
     );
     Ok(())
@@ -504,9 +519,104 @@ fn down(name: &str) -> Result<()> {
     let bin = binaries(which, false)?;
     stop_gui(&root, &bin, name);
     file_application_log(&root, name);
+    record_drive(&root, name);
+    file_drive_log(&root, name);
     stop_daemon(&root);
     println!("rig {name} down; its state is as the run left it");
     summarize_session(&root)
+}
+
+/// One line of a drive log: the driver writes a `drive` line when a recipe
+/// is named and a `step` line for every key, chord, click or move it sends.
+#[derive(Deserialize)]
+struct DriveLine {
+    #[serde(default)]
+    drive: Option<String>,
+    #[serde(default)]
+    step: Option<String>,
+}
+
+/// What the driver did this session, read from the log it wrote beside the
+/// wayland session directory.
+///
+/// A session may name several drives in turn; what is reported is the last
+/// one and the steps under it, because that is the run whose frames are in
+/// the profile. Steps sent before any drive was named are counted under no
+/// name, which is the case the report has to be loud about rather than hide.
+fn drive_taken(root: &Path, name: &str) -> (Option<String>, usize) {
+    let log = root
+        .join("run")
+        .join("rho-wayland")
+        .join(format!("{name}-drive.log"));
+    let Ok(text) = fs::read_to_string(&log) else {
+        return (None, 0);
+    };
+    let mut drive = None;
+    let mut steps = 0;
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<DriveLine>(line) else {
+            continue;
+        };
+        if let Some(named) = entry.drive {
+            drive = Some(named);
+            steps = 0;
+        } else if entry.step.is_some() {
+            steps += 1;
+        }
+    }
+    (drive, steps)
+}
+
+/// Put the drive on the session and say so, including when there is none.
+///
+/// The silence is the point: a run with no drive named and no steps counted
+/// is a run nobody can compare, and the report says that in words rather
+/// than leaving a reader to assume the recipe was the usual one.
+fn record_drive(root: &Path, name: &str) {
+    let (drive, steps) = drive_taken(root, name);
+    match (&drive, steps) {
+        (Some(drive), steps) => println!("drive   {drive}, {steps} steps"),
+        (None, 0) => println!(
+            "drive   none named and no steps recorded; \
+             this session's numbers cannot be compared with another run's"
+        ),
+        (None, steps) => println!(
+            "drive   unnamed, {steps} steps; \
+             name the next one with `rho wayland --session {name} drive <name>`"
+        ),
+    }
+    let Ok(mut rig) = load(root) else { return };
+    let Some(session) = rig.sessions.last_mut() else {
+        return;
+    };
+    session.drive = drive;
+    session.drive_steps = steps;
+    let _ = save(root, &rig);
+}
+
+/// Keep the drive log next to the profile it belongs to, the way the
+/// application log is kept: the numbers, the errors and the steps that
+/// produced both share a stem.
+fn file_drive_log(root: &Path, name: &str) {
+    let from = root
+        .join("run")
+        .join("rho-wayland")
+        .join(format!("{name}-drive.log"));
+    if !from.exists() {
+        return;
+    }
+    let stem = load(root)
+        .ok()
+        .and_then(|rig| {
+            let session = rig.sessions.last()?;
+            let profile = session.profile.as_ref()?;
+            Some(profile.file_stem()?.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| name.to_owned());
+    let to = root.join("logs").join(format!("{stem}-drive.log"));
+    if fs::rename(&from, &to).is_err() {
+        let _ = fs::copy(&from, &to).and_then(|_| fs::remove_file(&from));
+    }
 }
 
 /// File the stopped session's application log next to the profile it belongs
@@ -611,6 +721,11 @@ fn status(name: &str) -> Result<()> {
                 "  STALE    this session ran binaries older than their sources; \
                  its numbers belong to what was on disk, not to the tree above"
             );
+        }
+        match (&last.drive, last.drive_steps) {
+            (Some(drive), steps) => println!("  drive    {drive}, {steps} steps"),
+            (None, 0) => println!("  drive    none named"),
+            (None, steps) => println!("  drive    unnamed, {steps} steps"),
         }
         if let Some(summary) = &last.summary {
             println!("  profile  {}", summary.line);
@@ -1474,6 +1589,58 @@ mod tests {
             after_doc, newest_at,
             "a markdown file is not something a binary is built from"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The steps counted are the ones under the last drive named, and a
+    /// run with no name is reported as having none rather than as zero
+    /// steps of something.
+    ///
+    /// Both answers are shown before either is trusted: the same log read
+    /// with and without a second `drive` line gives different counts, so
+    /// the reset is doing work rather than the count happening to be right.
+    #[test]
+    fn steps_are_counted_under_the_drive_they_ran_for() {
+        let dir = std::env::temp_dir().join(format!("rho-qa-drive-{}", std::process::id()));
+        let session = dir.join("run").join("rho-wayland");
+        fs::create_dir_all(&session).expect("make the session directory");
+        let log = session.join("desk-drive.log");
+
+        // Two steps before anything is named: no name, and the count is
+        // still reported, because steps nobody named still happened.
+        fs::write(
+            &log,
+            b"{\"at_ms\":1,\"step\":\"key alt+d\"}\n{\"at_ms\":2,\"step\":\"key j\"}\n",
+        )
+        .expect("write the log");
+        let (unnamed, before) = super::drive_taken(&dir, "desk");
+        assert_eq!(unnamed, None, "nothing named the drive");
+        assert_eq!(before, 2, "steps with no name are still steps");
+
+        // A name, then three steps: the count starts again under the name.
+        fs::write(
+            &log,
+            b"{\"at_ms\":1,\"step\":\"key alt+d\"}\n\
+              {\"at_ms\":2,\"drive\":\"09:12 recipe\"}\n\
+              {\"at_ms\":3,\"step\":\"key j\"}\n\
+              {\"at_ms\":4,\"step\":\"key enter\"}\n\
+              {\"at_ms\":5,\"click 10 20\":\"ignored\"}\n\
+              {\"at_ms\":6,\"step\":\"click 10 20\"}\n",
+        )
+        .expect("write the named log");
+        let (named, after) = super::drive_taken(&dir, "desk");
+        assert_eq!(named.as_deref(), Some("09:12 recipe"));
+        assert_eq!(
+            after, 3,
+            "only the steps after the name belong to it, and a line that is \
+             neither a step nor a name is not counted as either"
+        );
+
+        // A log that is not there at all is the third answer, and it is
+        // the one a report has to say out loud.
+        let (missing, none) = super::drive_taken(&dir, "no-such-session");
+        assert_eq!((missing, none), (None, 0));
 
         fs::remove_dir_all(&dir).ok();
     }

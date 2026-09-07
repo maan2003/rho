@@ -100,6 +100,9 @@ enum DriverCommand {
     /// Send keys or chords in one keyboard session, for example `enter`,
     /// `ctrl+shift+p`, or `escape g g`.
     Key { chord: String },
+    /// Name the drive that follows. Every step after this line is counted
+    /// against this name, so a report can say which recipe produced it.
+    Drive { name: String },
     /// Stop the application and compositor and remove the session directory.
     Stop,
 }
@@ -200,30 +203,87 @@ pub(crate) fn run(args: WaylandArgs) -> Result<()> {
         DriverCommand::Move { x, y } => {
             let session = load_live_session(&root)?;
             let mut pointer = virtual_pointer(&session, x, y)?;
+            record_step(&base, &args.session, &format!("move {x} {y}"));
             pointer.move_to(x as u32, y as u32)
         }
         DriverCommand::Click { x, y, button } => {
             let session = load_live_session(&root)?;
             let mut pointer = virtual_pointer(&session, x, y)?;
             pointer.move_to(x as u32, y as u32)?;
+            record_step(&base, &args.session, &format!("click {x} {y}"));
             pointer.click(button.code())
         }
         DriverCommand::Type { text } => {
             let session = load_live_session(&root)?;
+            record_step(
+                &base,
+                &args.session,
+                &format!("type {} chars", text.chars().count()),
+            );
             run_wayland_command(&session, WTYPE, wtype_text_args(text))
         }
         DriverCommand::Input { steps } => {
             let session = load_live_session(&root)?;
-            let args = wtype_input_args(&steps)?;
-            run_wayland_command(&session, WTYPE, args)
+            let wtype = wtype_input_args(&steps)?;
+            // One `input` is one step of a drive however many keys it holds:
+            // it is one thing the reader did.
+            record_step(&base, &args.session, &format!("input {}", steps.join(" ")));
+            run_wayland_command(&session, WTYPE, wtype)
         }
         DriverCommand::Key { chord } => {
             let session = load_live_session(&root)?;
-            let args = wtype_key_args(&chord)?;
-            run_wayland_command(&session, WTYPE, args)
+            let wtype = wtype_key_args(&chord)?;
+            record_step(&base, &args.session, &format!("key {chord}"));
+            run_wayland_command(&session, WTYPE, wtype)
+        }
+        DriverCommand::Drive { name } => {
+            record_drive(&base, &args.session, &name);
+            Ok(())
         }
         DriverCommand::Stop => stop(&root),
     }
+}
+
+/// Where a session's drive log lives: beside the session directory, not
+/// inside it, because `stop` removes the directory and the log is the part
+/// that has to outlive the run.
+fn drive_log(base: &Path, session: &str) -> PathBuf {
+    base.join(format!("{session}-drive.log"))
+}
+
+/// One line per thing the reader did, so a report can say how long a drive
+/// was rather than only how fast its frames were. A number with no drive
+/// behind it cannot be compared with another number, and two runs of
+/// different lengths are not two readings of the same thing.
+///
+/// Recording a step must never fail a step: a driver that refuses to press a
+/// key because it could not write a log line is worse than a log with a gap
+/// in it, so every error here is dropped on purpose.
+fn record_step(base: &Path, session: &str, step: &str) {
+    append_drive_line(base, session, "step", step);
+}
+
+/// The name of the drive the steps after it belong to. A run may name
+/// several in turn; the report reads the last one and the steps under it.
+fn record_drive(base: &Path, session: &str, name: &str) {
+    append_drive_line(base, session, "drive", name);
+}
+
+fn append_drive_line(base: &Path, session: &str, kind: &str, what: &str) {
+    use std::io::Write as _;
+
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    // Escaped by hand rather than through serde: this is two strings and a
+    // number, and the driver is on the path of every key press.
+    let what = what.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!("{{\"at_ms\":{at_ms},\"{kind}\":\"{what}\"}}\n");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(drive_log(base, session))
+        .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
 fn default_state_dir() -> Result<PathBuf> {

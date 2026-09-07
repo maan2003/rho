@@ -278,6 +278,28 @@ Two rules follow, and they are the reason the check is not enough on its own:
   drives; without the drive named, a table of such rows reads as a trend and
   is not one.
 
+### R7. The drive is named, and its steps are counted
+
+The second rule above is now the rig's job rather than the reader's. The
+driver writes one line per thing it does — every `key`, `input`, `type`,
+`click` and `move` — to `<session>-drive.log`, beside the wayland session
+directory rather than inside it, because `stop` removes the directory and the
+log is the part that has to outlive the run. `rho wayland --session <s> drive
+"<name>"` names the drive that follows; the steps after it are counted against
+it, and a later name starts the count again.
+
+`rig down` reads that log, prints the drive and its step count, keeps the log
+in `logs/` under the profile's own stem, and stores both on the session so
+`rig status` says them afterwards. **A run with no drive named is reported as
+having none**, in words, rather than as a blank: a number nobody can attribute
+to a recipe is a number nobody can compare, and the report says so instead of
+letting the row sit in a table looking like the others.
+
+What this does not do is tell you two drives are the same drive. It counts
+steps; it does not compare them. Two runs of "the 09:12 recipe" with different
+step counts are two different drives whatever they are called, and the count
+beside the name is what makes that visible.
+
 ## The cases
 
 ### C1. Dealing after a restart
