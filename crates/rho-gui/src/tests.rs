@@ -28,6 +28,7 @@ mod results_under_folds;
 mod scene_walk;
 mod story;
 mod wrap_rows;
+mod wrap_under_tab;
 use rho_agents::HostId;
 
 use crate::workspace::{AttachTarget, HostSpec, Workspace};
