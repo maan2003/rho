@@ -542,6 +542,22 @@ impl TestAppContext {
             .clone()
     }
 
+    /// Starts recording primitive scenes drawn by `window`.
+    pub fn record_scenes<E: Clone + 'static>(
+        &self,
+        window: AnyWindowHandle,
+    ) -> crate::test::SceneRecorder<E> {
+        let recorder = crate::test::SceneRecorder::default();
+        self.test_window(window).record_scenes(recorder.callback());
+        recorder
+    }
+
+    /// Draws and submits one frame synchronously to the test platform.
+    pub fn draw_window(&mut self, window: AnyWindowHandle) {
+        self.update_window(window, |_, window, cx| window.draw_for_test(cx))
+            .expect("test window closed before draw");
+    }
+
     /// Returns a stream of notifications whenever the Entity is updated.
     pub fn notifications<T: 'static>(
         &mut self,

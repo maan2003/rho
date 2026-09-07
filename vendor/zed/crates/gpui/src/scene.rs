@@ -15,6 +15,9 @@ use std::{
     slice,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::test::{RecordedPrimitive, SceneOwner};
+
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
 pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
@@ -55,6 +58,16 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_primitives: Vec<RecordedPrimitive>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_operations: Vec<Option<RecordedPrimitive>>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_hash: u64,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_views: Vec<crate::EntityId>,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_elements: Vec<crate::ElementId>,
 }
 
 #[expect(missing_docs)]
@@ -72,6 +85,14 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.recorded_primitives.clear();
+            self.recorded_operations.clear();
+            self.recorded_hash = 0xcbf29ce484222325;
+            self.recording_views.clear();
+            self.recording_elements.clear();
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -83,13 +104,18 @@ impl Scene {
         self.layer_stack.push(order);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
+        #[cfg(any(test, feature = "test-support"))]
+        self.recorded_operations.push(None);
     }
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+        #[cfg(any(test, feature = "test-support"))]
+        self.recorded_operations.push(None);
     }
 
+    #[cfg(not(any(test, feature = "test-support")))]
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
@@ -148,14 +174,106 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        self.insert_primitive_recorded(primitive.into(), None);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn insert_primitive_recorded(
+        &mut self,
+        mut primitive: Primitive,
+        recorded: Option<RecordedPrimitive>,
+    ) {
+        let clipped_bounds = primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds);
+
+        if clipped_bounds.is_empty() {
+            return;
+        }
+
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        match &mut primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.order = order;
+                self.shadows.push(*shadow);
+            }
+            Primitive::Quad(quad) => {
+                quad.order = order;
+                self.quads.push(*quad);
+            }
+            Primitive::Hole(hole) => {
+                hole.order = order;
+                self.holes.push(*hole);
+            }
+            Primitive::Path(path) => {
+                path.order = order;
+                path.id = PathId(self.paths.len());
+                self.paths.push(path.clone());
+            }
+            Primitive::Underline(underline) => {
+                underline.order = order;
+                self.underlines.push(*underline);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.order = order;
+                self.monochrome_sprites.push(*sprite);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.order = order;
+                self.subpixel_sprites.push(*sprite);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.order = order;
+                self.polychrome_sprites.push(*sprite);
+            }
+            Primitive::Surface(surface) => {
+                surface.order = order;
+                self.surfaces.push(surface.clone());
+            }
+        }
+        let recorded = recorded.unwrap_or_else(|| self.record_primitive(&primitive));
+        {
+            self.recorded_hash ^= recorded.fingerprint;
+            self.recorded_hash = self.recorded_hash.wrapping_mul(0x100000001b3);
+            self.recorded_primitives.push(recorded.clone());
+            self.recorded_operations.push(Some(recorded));
+        }
+        self.paint_operations
+            .push(PaintOperation::Primitive(primitive));
+    }
+
     pub(crate) fn insert_hole(&mut self, hole: Quad) {
         self.insert_primitive(Primitive::Hole(hole));
     }
 
+    #[cfg(not(any(test, feature = "test-support")))]
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        for (index, operation) in prev_scene.paint_operations[range.clone()]
+            .iter()
+            .enumerate()
+        {
+            match operation {
+                PaintOperation::Primitive(primitive) => self.insert_primitive_recorded(
+                    primitive.clone(),
+                    prev_scene.recorded_operations[range.start + index].clone(),
+                ),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -205,6 +323,124 @@ impl Scene {
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_primitive(&self, primitive: &Primitive) -> RecordedPrimitive {
+        use std::{fmt::Write as _, hash::Hasher as _};
+
+        struct Fingerprint(u64);
+        impl std::fmt::Write for Fingerprint {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                self.write(value.as_bytes());
+                Ok(())
+            }
+        }
+        impl std::hash::Hasher for Fingerprint {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for byte in bytes {
+                    self.0 ^= u64::from(*byte);
+                    self.0 = self.0.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+
+        let mut fingerprint = Fingerprint(0xcbf29ce484222325);
+        match primitive {
+            Primitive::Shadow(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "shadow:{value:?}")
+            }
+            Primitive::Quad(value) | Primitive::Hole(value) => {
+                let kind = if matches!(primitive, Primitive::Hole(_)) {
+                    "hole"
+                } else {
+                    "quad"
+                };
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "{kind}:{value:?}")
+            }
+            Primitive::Path(value) => {
+                let mut value = value.clone();
+                value.order = 0;
+                value.id = PathId(0);
+                write!(&mut fingerprint, "path:{value:?}")
+            }
+            Primitive::Underline(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "underline:{value:?}")
+            }
+            Primitive::MonochromeSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "monochrome:{value:?}")
+            }
+            Primitive::SubpixelSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "subpixel:{value:?}")
+            }
+            Primitive::PolychromeSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "polychrome:{value:?}")
+            }
+            Primitive::Surface(value) => {
+                let mut value = value.clone();
+                value.order = 0;
+                write!(&mut fingerprint, "surface:{value:?}")
+            }
+        }
+        .expect("formatting a primitive cannot fail");
+        let fingerprint = fingerprint.finish();
+        let bounds = primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds);
+        RecordedPrimitive {
+            fingerprint,
+            bounds,
+            owner: SceneOwner {
+                view: self.recording_views.last().copied(),
+                elements: self.recording_elements.clone().into(),
+                vertical_band: bounds.origin.y.0.floor() as i32,
+            },
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_primitives(&self) -> Vec<RecordedPrimitive> {
+        self.recorded_primitives.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_hash(&self) -> u64 {
+        self.recorded_hash
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn push_recording_view(&mut self, view: crate::EntityId) {
+        self.recording_views.push(view);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pop_recording_view(&mut self) {
+        self.recording_views.pop();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn push_recording_element(&mut self, element: crate::ElementId) {
+        self.recording_elements.push(element);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pop_recording_element(&mut self) {
+        self.recording_elements.pop();
     }
 }
 

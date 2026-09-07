@@ -2494,6 +2494,14 @@ impl Window {
         count
     }
 
+    /// Draws and submits one frame synchronously on the test platform.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn draw_for_test(&mut self, cx: &mut App) {
+        let _ = self.draw(cx);
+        self.platform_window.draw(&self.rendered_frame.scene);
+        self.needs_present.set(false);
+    }
+
     /// Spawn the future returned by the given closure on the application thread pool.
     /// The closure is provided a handle to the current window and an `AsyncWindowContext` for
     /// use within your future.
@@ -2763,8 +2771,15 @@ impl Window {
         element_id: impl Into<ElementId>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id.into());
+        let element_id = element_id.into();
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame
+            .scene
+            .push_recording_element(element_id.clone());
+        self.element_id_stack.push(element_id);
         let result = f(self);
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.pop_recording_element();
         self.element_id_stack.pop();
         result
     }
@@ -3800,8 +3815,15 @@ impl Window {
         element_id: impl Into<ElementId>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id.into());
+        let element_id = element_id.into();
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame
+            .scene
+            .push_recording_element(element_id.clone());
+        self.element_id_stack.push(element_id);
         let result = f(self);
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.pop_recording_element();
         self.element_id_stack.pop();
         result
     }
@@ -4924,7 +4946,11 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         self.rendered_entity_stack.push(id);
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.push_recording_view(id);
         let result = f(self);
+        #[cfg(any(test, feature = "test-support"))]
+        self.next_frame.scene.pop_recording_view();
         self.rendered_entity_stack.pop();
         result
     }

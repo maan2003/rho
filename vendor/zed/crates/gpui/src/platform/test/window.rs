@@ -43,6 +43,8 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    scene_recorder: Option<Rc<dyn Fn(&Scene)>>,
 }
 
 #[derive(Clone)]
@@ -101,6 +103,8 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            #[cfg(any(test, feature = "test-support"))]
+            scene_recorder: None,
         })))
     }
 
@@ -172,6 +176,11 @@ impl TestWindow {
 
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn record_scenes(&self, recorder: Rc<dyn Fn(&Scene)>) {
+        self.0.lock().scene_recorder = Some(recorder);
     }
 }
 
@@ -359,6 +368,10 @@ impl PlatformWindow for TestWindow {
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(recorder) = &state.scene_recorder {
+            recorder(scene);
+        }
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
