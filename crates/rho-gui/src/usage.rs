@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, Hsla, PathBuilder, Pixels, Point, Window, canvas,
-    div, point, px, rgb,
+    AnyElement, App, Bounds, Context, Entity, Hsla, PathBuilder, Pixels, Point, TextStyle, Window,
+    canvas, div, point, px, rgb,
 };
 use rho_agents::usage::{
     AgentCostSummary, ChartPoint, CostSummary, QuotaSummary, SeriesColor, ShareSummary,
@@ -351,18 +351,39 @@ fn chart_block(
         // draws the chart at whatever its labels happen to need instead of
         // across the screen it now owns.
         style: editor::display_map::BlockStyle::Flex,
-        render: Arc::new(move |cx| render_chart(&summary, height, cx.app).into_any_element()),
+        render: Arc::new(move |cx| {
+            // The editor's own text style, carried in by hand: a block's
+            // element is not inside the editor's text, so it inherits
+            // gpui's default — a black one, in the buffer's absence of a
+            // font. Everything the chart draws in words hangs off this.
+            let text_style = cx.editor_style.text.clone();
+            render_chart(&summary, height, &text_style, cx.app).into_any_element()
+        }),
         priority: 1,
     }
 }
 
-fn render_chart(summary: &Summary, height: Pixels, cx: &App) -> AnyElement {
-    match summary {
+/// Every chart, wrapped in the one place its words get a colour and a font.
+/// A `div` under a block inherits gpui's defaults, which are black text in a
+/// font that is not the buffer's; the axis labels, the end labels and any
+/// word added here would draw black on a dark theme and in the wrong face.
+/// Setting it at the root rather than per element is what makes that true of
+/// the next label as well as these — a legend entry that wants its series'
+/// colour still says so and wins, because a child overrides its parent.
+fn render_chart(summary: &Summary, height: Pixels, text_style: &TextStyle, cx: &App) -> AnyElement {
+    let chart = match summary {
         Summary::Quota(quota) => render_quota(quota, height, cx),
         Summary::Cost(cost) => render_cost(cost, height, cx),
         Summary::Share(share) => render_share(share, height, cx),
         Summary::AgentCost(agent_cost) => render_agent_cost(agent_cost, height, cx),
-    }
+    };
+    div()
+        .font_family(text_style.font_family.clone())
+        .font_weight(text_style.font_weight)
+        .text_size(text_style.font_size)
+        .text_color(text_style.color)
+        .child(chart)
+        .into_any_element()
 }
 
 fn render_quota(summary: &QuotaSummary, height: Pixels, cx: &App) -> AnyElement {
@@ -594,6 +615,8 @@ fn axis_row(
         .pb_1()
         .flex()
         .items_start()
+        // Smaller than the buffer's text on purpose: an axis is read past,
+        // not read. The face and the colour are the buffer's, inherited.
         .text_size(px(11.))
         .child(
             // No width given: the column is as wide as its widest label,

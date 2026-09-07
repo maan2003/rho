@@ -1331,6 +1331,30 @@ work on it.
 
 ### Landed
 
+- **The usage screen's words get a colour and a font.** Two user reports:
+  text drawing black on the dark background, and fonts wrong in several
+  places. One cause under both. The charts are a block under the header, and
+  a `div` inside a block is not inside the editor's text: it inherits gpui's
+  defaults, which are black and not the buffer's face. The header — the
+  title and the totals — was never affected, because it is buffer text on
+  purpose; everything inside the block was.
+  Drawing black: the axis value labels (`100%`/`50%`/`0%`, `full`/`½`/`0%`,
+  and the agent-cost ticks) and the two end labels under every chart
+  (`−{days}d` and `now`). The legend entries and the `p50`/`p90`/`p99`
+  labels set their own series colour and were never black — which is why
+  only some of the text looked wrong.
+  In the wrong face: all of those, the coloured ones included.
+  The fix is one place rather than five. `render_chart` now takes the
+  editor's text style and wraps every chart in a root that sets the family,
+  the weight, the size and the colour, so the labels inherit them and a
+  child that wants its own colour still overrides its parent. That is what
+  makes it true of the next label somebody adds, not just of these. The axis
+  keeps its explicitly smaller size — an axis is read past, not read — and
+  now wears it in the buffer's face.
+  The transient had the same defect from the same cause and loses it in the
+  commit before this one: its rows had no colour of their own, and at the
+  bottom of the window it inherits the strip's, which is the editor's.
+
 - **The transient goes back to the bottom of the window.** The user's ruling,
   and it overturns eng-en1p's earlier one: the menu was drawn as a block in
   the buffer under the point, and Magit's transient sits at the bottom of the
