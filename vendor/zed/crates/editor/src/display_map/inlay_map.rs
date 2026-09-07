@@ -718,11 +718,6 @@ impl InlayMap {
                 self.concealments
                     .sync_from(rebuild_start, &self.snapshot.buffer);
                 let concealments = self.concealments.ranges(&self.snapshot.buffer);
-                if profile.is_enabled() {
-                    walked_items = walked_items
-                        .saturating_add(self.inlays.len() as u64)
-                        .saturating_add(concealments.len() as u64);
-                }
                 let prefix_end = transforms.summary().input.len;
                 push_isomorphic(
                     &mut transforms,
@@ -730,13 +725,16 @@ impl InlayMap {
                         .buffer
                         .text_summary_for_range(prefix_end..rebuild_start),
                 );
-                append_transforms_from(
+                let rebuilt_items = append_transforms_from(
                     &mut transforms,
                     &self.snapshot.buffer,
                     &self.inlays,
                     &concealments,
                     rebuild_start,
                 );
+                if profile.is_enabled() {
+                    walked_items = walked_items.saturating_add(rebuilt_items);
+                }
                 if transforms.is_empty() {
                     transforms.push(Transform::Isomorphic(Default::default()), ());
                 }
@@ -1773,17 +1771,23 @@ fn append_transforms_from(
     inlays: &[Inlay],
     concealments: &[Range<MultiBufferOffset>],
     start: MultiBufferOffset,
-) {
-    let valid_inlays = inlays
+) -> u64 {
+    // Anchors remain ordered after edits, including when a deletion collapses
+    // several of them onto one offset. Search their resolved offsets so every
+    // inlay now touching `start` stays in the rebuilt suffix.
+    let first_inlay_ix = inlays.partition_point(|inlay| inlay.position.to_offset(buffer) < start);
+    let candidate_inlays = &inlays[first_inlay_ix..];
+    let valid_inlays = candidate_inlays
         .iter()
         .filter(|inlay| inlay.position.is_valid(buffer))
         .map(|inlay| (inlay.position.to_offset(buffer), inlay))
-        .filter(|(offset, _)| *offset >= start)
         .collect::<Vec<_>>();
+    let first_concealment_ix = concealments.partition_point(|range| range.start < start);
+    let candidate_concealments = &concealments[first_concealment_ix..];
     let mut inlay_ix = 0;
     let mut source_offset = start;
 
-    for concealed in concealments.iter().filter(|range| range.start >= start) {
+    for concealed in candidate_concealments {
         while let Some(&(offset, inlay)) = valid_inlays.get(inlay_ix) {
             if offset > concealed.start {
                 break;
@@ -1830,6 +1834,7 @@ fn append_transforms_from(
         transforms,
         buffer.text_summary_for_range(source_offset..buffer.len()),
     );
+    (candidate_inlays.len() + candidate_concealments.len()) as u64
 }
 
 fn normalize_concealments(
@@ -2366,6 +2371,34 @@ mod tests {
             ],
         );
         assert_eq!(snapshot.text(), "visiblea\tX!");
+    }
+
+    #[gpui::test]
+    fn rebuilding_a_suffix_skips_inlays_before_it(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple(&"x".repeat(1_000), cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let inlays = (0..100)
+            .map(|index| {
+                Inlay::mock_hint(
+                    index,
+                    snapshot.anchor_before(MultiBufferOffset(index * 10)),
+                    "i",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut transforms = SumTree::default();
+
+        let walked = append_transforms_from(
+            &mut transforms,
+            &snapshot,
+            &inlays,
+            &[],
+            MultiBufferOffset(900),
+        );
+
+        assert_eq!(walked, 10);
+        assert_eq!(transforms.summary().input.len, MultiBufferOffset(100));
+        assert_eq!(transforms.summary().output.len, MultiBufferOffset(110));
     }
 
     #[gpui::test]
