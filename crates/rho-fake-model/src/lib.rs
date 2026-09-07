@@ -123,6 +123,9 @@ pub struct MetricsSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct RequestOrdinal(pub u64);
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ConversationKey(pub String);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum ProviderProtocol {
     OpenAiResponses,
@@ -134,6 +137,7 @@ pub enum ProviderProtocol {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Observation {
     pub request: RequestOrdinal,
+    pub conversation: ConversationKey,
     pub protocol: ProviderProtocol,
     pub event_type: String,
     pub bytes: usize,
@@ -278,6 +282,8 @@ struct OpenAiRequest {
     tools: Vec<ProviderTool>,
     #[serde(default)]
     previous_response_id: Option<String>,
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -315,6 +321,7 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
             observe(
                 &state,
                 request_number,
+                openai_conversation(&envelope.request),
                 ProviderProtocol::OpenAiResponses,
                 &event,
                 bytes.len(),
@@ -354,7 +361,7 @@ async fn openai_http(
             delay(&timing, index).await;
             let bytes = format!("data: {event}\n\n");
             metrics.bytes_streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            observe(&observed_state, request_number, ProviderProtocol::OpenAiResponses, &event, bytes.len());
+            observe(&observed_state, request_number, openai_conversation(&request), ProviderProtocol::OpenAiResponses, &event, bytes.len());
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(bytes));
             if terminal == TerminalOutcome::Disconnect && index >= 2 { break; }
         }
@@ -565,6 +572,7 @@ fn end_request(metrics: &Metrics, complete: bool) {
 fn observe(
     state: &AppState,
     request: u64,
+    conversation: ConversationKey,
     protocol: ProviderProtocol,
     event: &Value,
     bytes: usize,
@@ -575,6 +583,7 @@ fn observe(
         .expect("observation lock")
         .push(Observation {
             request: RequestOrdinal(request),
+            conversation,
             protocol,
             event_type: event
                 .get("type")
@@ -595,6 +604,8 @@ struct AnthropicRequest {
     tools: Vec<AnthropicTool>,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -643,7 +654,7 @@ async fn anthropic_messages(
             delay(&timing,index).await;
             let bytes = format!("event: {name}\ndata: {event}\n\n");
             metrics.bytes_streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            observe(&observed_state, number, ProviderProtocol::AnthropicMessages, &event, bytes.len());
+            observe(&observed_state, number, anthropic_conversation(&request), ProviderProtocol::AnthropicMessages, &event, bytes.len());
             yield Ok::<Bytes,std::convert::Infallible>(Bytes::from(bytes));
             if terminal == TerminalOutcome::Disconnect && index >= 2 { break; }
         }
@@ -655,6 +666,27 @@ async fn anthropic_messages(
         HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+fn openai_conversation(request: &OpenAiRequest) -> ConversationKey {
+    ConversationKey(
+        request
+            .prompt_cache_key
+            .clone()
+            .unwrap_or_else(|| "openai-unkeyed".to_owned()),
+    )
+}
+
+fn anthropic_conversation(request: &AnthropicRequest) -> ConversationKey {
+    ConversationKey(
+        request
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("user_id"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.model)
+            .to_owned(),
+    )
 }
 
 fn anthropic_turn(
