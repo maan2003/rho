@@ -1361,11 +1361,26 @@ mod timing_ring_tests {
         }
     }
 
-    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The profiler's state is one per process: the trace flags, the
+    /// editor timing ring and the frame work accumulator are all statics.
+    /// A test that touches any of them cannot share the process with
+    /// another that does, so every test here takes this first. Two did
+    /// and four did not, which is why `--test-threads=1` passed all six
+    /// and the default threads either failed two or hung.
+    ///
+    /// A panicking test poisons the lock; the rest take it anyway rather
+    /// than fail on the poison, since the failure to report is the first
+    /// test's and not theirs.
+    fn exclusive_profiler_state() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn editor_timing_snapshot_is_non_destructive_and_bounded() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _state = exclusive_profiler_state();
         set_editor_trace_enabled(false);
         set_editor_trace_enabled(true);
         for _ in 0..MAX_EDITOR_TIMINGS + 17 {
@@ -1380,7 +1395,7 @@ mod timing_ring_tests {
 
     #[test]
     fn editor_collector_survives_trace_toggle() {
-        let _guard = TEST_MUTEX.lock().unwrap();
+        let _state = exclusive_profiler_state();
         set_editor_trace_enabled(false);
         let mut collector = EditorTimingCollector::new();
         set_editor_trace_enabled(true);
@@ -1391,6 +1406,7 @@ mod timing_ring_tests {
 
     #[test]
     fn a_frame_s_work_is_the_sum_of_what_its_elements_reported() {
+        let _state = exclusive_profiler_state();
         set_frame_trace_enabled(true);
         let _ = take_frame_work();
 
@@ -1423,6 +1439,7 @@ mod timing_ring_tests {
 
     #[test]
     fn work_outside_a_frame_is_recorded_with_its_owner_and_counted() {
+        let _state = exclusive_profiler_state();
         set_frame_trace_enabled(true);
         let before = snapshot_main_thread_work().1;
 
@@ -1445,6 +1462,7 @@ mod timing_ring_tests {
 
     #[test]
     fn a_stage_can_say_what_it_worked_on() {
+        let _state = exclusive_profiler_state();
         set_editor_trace_enabled(true);
         let mut collector = EditorTimingCollector::new();
         {
@@ -1467,6 +1485,7 @@ mod timing_ring_tests {
 
     #[test]
     fn a_small_edit_in_a_large_tree_reports_a_small_walk() {
+        let _state = exclusive_profiler_state();
         use sum_tree::{Bias, SumTree};
 
         set_editor_trace_enabled(true);
