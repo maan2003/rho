@@ -27,6 +27,35 @@ const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
     WalkEvent::Idle,
 ];
 
+/// Paging history in, one chunk at a time.
+///
+/// Each pair is a jump to the top and the idle that composes the next
+/// forty-row chunk of history, so the run climbs the document a chunk at a
+/// time while the drawn screen stays the same size. What it pins is that
+/// composing a chunk costs the chunk and not the document: over eight pairs
+/// the composed window more than doubles, from 299 rows to 635, and every
+/// stage's walk holds flat - the multibuffer at 152 to 154 items for a
+/// 48-row chunk, the wrap map at 91. A stage that starts growing with
+/// `total_rows` here is a per-event O(document) on the reader's own path.
+const HISTORY_PAGING_DRIVE: &[WalkEvent] = &[
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+];
+
 /// Settled turns seeded before the drive runs.
 ///
 /// Forty already saturates what the transcript composes: seeding 0, 40 and
@@ -117,6 +146,16 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
                 script: Some(LARGE_TRANSCRIPT_DRIVE),
+            },
+        ));
+        runs.push((
+            "paging".to_owned(),
+            WalkConfig {
+                seed: 0,
+                steps: HISTORY_PAGING_DRIVE.len(),
+                mode,
+                prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                script: Some(HISTORY_PAGING_DRIVE),
             },
         ));
     }
