@@ -10146,3 +10146,95 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// The tag this test's fold carries, so the fold is this test's and no
+/// other's.
+enum FoldedInThisTest {}
+
+/// A row takes its scale from the sync that wrote it, so every path to the
+/// wrap map has to carry the scales the display map holds — folding above
+/// all, because folding is also what flushes a pending buffer edit. A
+/// transcript composes history and then folds it, and the fold's own sync is
+/// what wraps the rows composition just wrote: wrapped without their scale
+/// they come out 1.12 too wide and nothing rewrites them.
+#[gpui::test]
+fn a_fold_wraps_the_rows_it_flushes_at_their_scale(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let alpha = "alpha ".repeat(60);
+    let charlie = "charlie ".repeat(10);
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text(format!("{alpha}\n{charlie}\n"), window, cx);
+        editor
+    });
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            window.refresh();
+        })
+        .expect("soft wrap at the editor's width");
+    cx.simulate_window_resize(*editor, gpui::size(gpui::px(300.), gpui::px(400.)));
+    cx.run_until_parked();
+    cx.update_window(*editor, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("wrap the text this editor opened on");
+    cx.run_until_parked();
+
+    // Compose a row, scale it, and fold something else — in one pass, with
+    // no display snapshot in between, which is the order a transcript
+    // composing history works in.
+    let bravo = "bravo ".repeat(60);
+    editor
+        .update(cx, |editor, _, cx| {
+            let end = editor.buffer().read(cx).len(cx);
+            editor.buffer().update(cx, |buffer, cx| {
+                buffer.edit([(end..end, format!("{bravo}\n"))], None, cx);
+            });
+            let end = end.0;
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let scaled = snapshot.anchor_before(multi_buffer::MultiBufferOffset(end))
+                ..snapshot.anchor_after(multi_buffer::MultiBufferOffset(end + bravo.len()));
+            let folded = snapshot.anchor_before(multi_buffer::MultiBufferOffset(alpha.len() + 1))
+                ..snapshot.anchor_after(multi_buffer::MultiBufferOffset(
+                    alpha.len() + 1 + charlie.len(),
+                ));
+            editor.display_map.update(cx, |map, cx| {
+                map.set_row_scales(vec![(scaled, 1.5)], cx);
+                map.fold(
+                    vec![editor::display_map::Crease::simple(
+                        folded,
+                        editor::FoldPlaceholder::concealed(
+                            std::any::TypeId::of::<FoldedInThisTest>(),
+                        ),
+                    )],
+                    cx,
+                );
+            });
+        })
+        .expect("compose a scaled row and fold in one pass");
+    cx.run_until_parked();
+
+    let (unscaled, scaled) = editor
+        .update(cx, |editor, _, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let mut unscaled = 0;
+            let mut scaled = 0;
+            for line in snapshot.text().lines() {
+                if line.starts_with("alpha") {
+                    unscaled = unscaled.max(line.chars().count());
+                } else if line.starts_with("bravo") {
+                    scaled = scaled.max(line.chars().count());
+                }
+            }
+            (unscaled, scaled)
+        })
+        .expect("measure the wrapped rows");
+    assert!(
+        unscaled > 0 && scaled > 0,
+        "both rows wrap: {unscaled} {scaled}"
+    );
+    assert!(
+        scaled < unscaled,
+        "the scaled row breaks earlier than the unscaled one: \
+         {scaled} characters against {unscaled}"
+    );
+}
