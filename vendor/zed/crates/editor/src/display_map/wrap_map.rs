@@ -10,7 +10,14 @@ use futures_lite::future::yield_now;
 use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
-use std::{cmp, collections::VecDeque, mem, ops::Range, sync::LazyLock, time::Duration};
+use std::{
+    cmp,
+    collections::VecDeque,
+    mem,
+    ops::Range,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
 
@@ -28,6 +35,30 @@ pub type WrapPatch = text::Patch<WrapRow>;
 pub struct WrapRow(pub u32);
 
 const WRAP_YIELD_ROW_INTERVAL: usize = 100;
+
+/// How long one batch of background rewrapping may run before it yields.
+///
+/// A batch used to be a count of rows, and a count of rows is not a
+/// quantity the user can feel. A row that wraps into twenty lines costs
+/// twenty times one that fits, so a hundred rows was anything between well
+/// under a frame and several of them; measured, it was p99 18.8 ms a batch
+/// at 999 rows, which is the frame the reader feels on `gg` and on every
+/// resize.
+///
+/// The clock is read once a row, and a row cannot be interrupted part way
+/// through, so what this bounds is the budget plus the cost of the row that
+/// crosses it. The budget is set well under the 4 ms frame to leave room
+/// for that row and for the frame the batch shares.
+const WRAP_BATCH_BUDGET: Duration = Duration::from_millis(2);
+
+/// When the current batch started, or `None` where there is no clock to ask.
+///
+/// `Instant::now` has no answer on wasm, where this runs on the browser's
+/// main thread; there the row interval stands in for the budget, which is
+/// what the whole map did before.
+fn wrap_batch_started() -> Option<Instant> {
+    cfg!(not(target_family = "wasm")).then(Instant::now)
+}
 
 impl_for_row_types! {
     WrapRow => RowDelta
@@ -888,6 +919,7 @@ impl WrapSnapshot {
                 Bias::Right,
             );
 
+            let mut batch_started = wrap_batch_started();
             while let Some(edit) = row_edits.next() {
                 if edit.new_rows.start > new_transforms.summary().input.lines.row {
                     let summary = new_tab_snapshot.text_summary_for_range(
@@ -993,8 +1025,13 @@ impl WrapSnapshot {
 
                     line.clear();
                     line_fragments.clear();
-                    if i % WRAP_YIELD_ROW_INTERVAL == WRAP_YIELD_ROW_INTERVAL - 1 {
+                    let batch_is_spent = match batch_started {
+                        Some(started) => started.elapsed() >= WRAP_BATCH_BUDGET,
+                        None => i % WRAP_YIELD_ROW_INTERVAL == WRAP_YIELD_ROW_INTERVAL - 1,
+                    };
+                    if batch_is_spent {
                         yield_now().await;
+                        batch_started = wrap_batch_started();
                     }
                 }
 
