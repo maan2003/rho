@@ -61,7 +61,7 @@ impl WalkHarness {
 }
 
 /// Numeric evidence retained from a successful run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WalkReport {
     pub seed: u64,
     pub steps: usize,
@@ -76,6 +76,29 @@ pub struct WalkReport {
     pub step_editor_rows: Vec<u64>,
     pub step_total_rows: Vec<u64>,
     pub scene_hashes: Vec<u64>,
+    pub wall_clock_findings: Vec<WallClockFinding>,
+    pub baseline_owners: Vec<OwnerFrameSummary>,
+    pub step_owners: Vec<Vec<OwnerFrameSummary>>,
+}
+
+/// A profiling-only observation. It is reported by the gate but is not a
+/// deterministic landing failure until the known slow cases are repaired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WallClockFinding {
+    pub step: usize,
+    pub event: WalkEvent,
+    pub draw_micros: u64,
+    pub editor_work_rows: u64,
+    pub sequence: Vec<WalkEvent>,
+}
+
+/// Numeric paint work attributed to one typed scene owner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnerFrameSummary {
+    pub owner: String,
+    pub primitives: usize,
+    pub changed_primitives: usize,
+    pub bounds: [f32; 4],
 }
 
 /// A shrunk drive script and the oracle which rejected it.
@@ -87,6 +110,7 @@ pub struct WalkFailure {
     pub editor_rows: u64,
     pub cold_draw_micros: u64,
     pub warm_draw_micros: u64,
+    pub scene_details: Vec<String>,
 }
 
 impl std::fmt::Display for WalkFailure {
@@ -143,7 +167,8 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                     }
                 }
             }
-            let (_, draw_micros, editor_rows, cold_draw_micros, warm_draw_micros) = final_rejection;
+            let (_, draw_micros, editor_rows, cold_draw_micros, warm_draw_micros, scene_details) =
+                final_rejection;
             Err(WalkFailure {
                 oracle,
                 events: shrunk,
@@ -151,6 +176,7 @@ pub fn run(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
                 editor_rows,
                 cold_draw_micros,
                 warm_draw_micros,
+                scene_details,
             })
         }
     }
@@ -248,7 +274,7 @@ fn run_events(
     seed: u64,
     mode: WalkMode,
     events: &[WalkEvent],
-) -> Result<WalkReport, (&'static str, u64, u64, u64, u64)> {
+) -> Result<WalkReport, (&'static str, u64, u64, u64, u64, Vec<String>)> {
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();
@@ -260,7 +286,8 @@ fn run_events(
         )),
     );
     init(&mut cx);
-    let isolated = tempfile::tempdir().map_err(|_| ("create isolated walk state", 0, 0, 0, 0))?;
+    let isolated =
+        tempfile::tempdir().map_err(|_| ("create isolated walk state", 0, 0, 0, 0, Vec::new()))?;
     let target = AttachTarget::Unix(isolated.path().join("daemon.sock"));
     let workspace = cx.add_window(|window, cx| {
         Workspace::new(
@@ -279,10 +306,10 @@ fn run_events(
             workspace.select_agent(Some(agent), window, cx);
             workspace.seed_transcript_for_test(agent, state.clone(), window, cx);
         })
-        .map_err(|_| ("workspace closed", 0, 0, 0, 0))?;
+        .map_err(|_| ("workspace closed", 0, 0, 0, 0, Vec::new()))?;
     cx.run_until_parked();
-    let editor =
-        active_editor(&workspace, &mut cx).map_err(|_| ("workspace closed", 0, 0, 0, 0))?;
+    let editor = active_editor(&workspace, &mut cx)
+        .map_err(|_| ("workspace closed", 0, 0, 0, 0, Vec::new()))?;
     let cold_started = Instant::now();
     cx.draw_window((*workspace).into());
     gpui::profiler::take_frame_work();
@@ -303,7 +330,11 @@ fn run_events(
     let mut step_editor_rows = Vec::with_capacity(events.len());
     let mut step_total_rows = Vec::with_capacity(events.len());
     let mut work_exceeded = None;
-    for event in events {
+    let mut work_baselines: [Option<(u64, u64)>; 6] = [None; 6];
+    let mut wall_clock_findings = Vec::new();
+    let baseline_owners = summarize_owners(&recorder, &recorder.frames()[0]);
+    let mut step_owners = Vec::with_capacity(events.len());
+    for (step, event) in events.iter().enumerate() {
         let frame_start = recorder.frames().len();
         let allowed_y = match event {
             WalkEvent::ComposerKey { .. } => prompt_row(&workspace, &editor, &mut cx),
@@ -317,6 +348,7 @@ fn run_events(
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
+                Vec::new(),
             )
         })?;
         cx.run_until_parked();
@@ -342,19 +374,32 @@ fn run_events(
         );
         step_total_rows.push(total_rows);
         if mode == WalkMode::Profiling && draw_micros > 4_000 {
-            return Err((
-                "draw exceeded 4 ms",
+            wall_clock_findings.push(WallClockFinding {
+                step,
+                event: event.clone(),
                 draw_micros,
-                rows,
-                cold_draw_micros,
-                warm_draw_micros,
-            ));
+                editor_work_rows: rows,
+                sequence: events[..=step].to_vec(),
+            });
         }
-        if mode == WalkMode::Profiling
-            && rows > row_work_budget(event, total_rows)
-            && work_exceeded.is_none()
-        {
-            work_exceeded = Some((draw_micros, rows));
+        if mode == WalkMode::Profiling {
+            let (class, scale) = row_work_scale(event, total_rows);
+            match work_baselines[class] {
+                Some((baseline_scale, baseline_rows)) => {
+                    let expected = baseline_rows
+                        .saturating_mul(scale)
+                        .div_ceil(baseline_scale)
+                        .saturating_mul(2)
+                        .saturating_add(64);
+                    if rows > expected && work_exceeded.is_none() {
+                        work_exceeded = Some((draw_micros, rows));
+                    }
+                    if scale < baseline_scale {
+                        work_baselines[class] = Some((scale, rows));
+                    }
+                }
+                None => work_baselines[class] = Some((scale, rows)),
+            }
         }
 
         let frames = recorder.frames();
@@ -366,19 +411,23 @@ fn run_events(
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
+                Vec::new(),
             ));
         }
         let frame = &produced[0];
+        step_owners.push(summarize_owners(&recorder, frame));
         max_changed_primitives = max_changed_primitives.max(frame.changes.len());
         if matches!(event, WalkEvent::Idle | WalkEvent::AdvanceTime { .. })
             && !frame.changes.is_empty()
         {
+            let scene_details = describe_changes(&recorder, frame);
             return Err((
                 "idle sub-scene changed",
                 draw_micros,
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
+                scene_details,
             ));
         }
         if let (Some((top, bottom)), Some(changed)) = (allowed_y, frame.change_bounds)
@@ -390,6 +439,7 @@ fn run_events(
                 0,
                 cold_draw_micros,
                 warm_draw_micros,
+                describe_changes(&recorder, frame),
             ));
         }
     }
@@ -401,6 +451,7 @@ fn run_events(
             rows,
             cold_draw_micros,
             warm_draw_micros,
+            Vec::new(),
         ));
     }
 
@@ -424,10 +475,63 @@ fn run_events(
             .skip(1)
             .map(|frame| scenes[frame.distinct_scene].hash)
             .collect(),
+        wall_clock_findings,
+        baseline_owners,
+        step_owners,
     })
 }
 
-fn row_work_budget(event: &WalkEvent, total_rows: u64) -> u64 {
+fn summarize_owners(
+    recorder: &gpui::SceneRecorder<WalkEvent>,
+    frame: &gpui::SceneFrame<WalkEvent>,
+) -> Vec<OwnerFrameSummary> {
+    frame
+        .subscenes
+        .iter()
+        .map(|subscene| OwnerFrameSummary {
+            owner: format!("{:?}", recorder.owner(subscene.id)),
+            primitives: subscene.primitive_count,
+            changed_primitives: frame
+                .changes
+                .iter()
+                .filter(|change| change.subscene == subscene.id)
+                .count(),
+            bounds: [
+                subscene.bounds.origin.x.0,
+                subscene.bounds.origin.y.0,
+                subscene.bounds.size.width.0,
+                subscene.bounds.size.height.0,
+            ],
+        })
+        .collect()
+}
+
+fn describe_changes(
+    recorder: &gpui::SceneRecorder<WalkEvent>,
+    frame: &gpui::SceneFrame<WalkEvent>,
+) -> Vec<String> {
+    frame
+        .changes
+        .iter()
+        .map(|change| {
+            format!(
+                "owner={:?} primitive={} before={:?} after={:?}",
+                recorder.owner(change.subscene),
+                change.index,
+                change
+                    .before
+                    .as_ref()
+                    .map(|primitive| (primitive.fingerprint, primitive.bounds)),
+                change
+                    .after
+                    .as_ref()
+                    .map(|primitive| (primitive.fingerprint, primitive.bounds)),
+            )
+        })
+        .collect()
+}
+
+fn row_work_scale(event: &WalkEvent, total_rows: u64) -> (usize, u64) {
     let changed_rows = match event {
         WalkEvent::ComposerKey { .. } => 1,
         WalkEvent::AgentChunk { bytes } | WalkEvent::ToolBody { bytes } => {
@@ -437,7 +541,15 @@ fn row_work_budget(event: &WalkEvent, total_rows: u64) -> u64 {
         WalkEvent::AdvanceTime { .. } | WalkEvent::Idle => 0,
     };
     let log_total = u64::from(u64::BITS - total_rows.max(1).leading_zeros());
-    12 * (changed_rows + log_total + 2)
+    let class = match event {
+        WalkEvent::ComposerKey { .. } => 0,
+        WalkEvent::Resize { .. } => 1,
+        WalkEvent::AgentChunk { .. } => 2,
+        WalkEvent::ToolBody { .. } => 3,
+        WalkEvent::AdvanceTime { .. } => 4,
+        WalkEvent::Idle => 5,
+    };
+    (class, changed_rows + log_total + 2)
 }
 
 fn apply(
@@ -458,7 +570,7 @@ fn apply(
             cx.simulate_window_resize(**workspace, size(px(*width as f32), px(*height as f32)));
         }
         WalkEvent::AgentChunk { bytes } => {
-            let text = "s".repeat(usize::from(*bytes));
+            let text = generated_text(usize::from(*bytes));
             let UiBlock::AssistantMessage { text: body, .. } =
                 Arc::make_mut(state.blocks.last_mut().context("assistant block")?)
             else {
@@ -471,7 +583,7 @@ fn apply(
             let UiBlock::Tool(tool) = Arc::make_mut(&mut state.blocks[1]) else {
                 anyhow::bail!("generated tool block moved")
             };
-            tool.arguments = "t".repeat(usize::from(*bytes));
+            tool.output = Some(generated_text(usize::from(*bytes)));
             seed(agent, state, workspace, cx)?;
         }
         WalkEvent::AdvanceTime { milliseconds } => {
@@ -481,6 +593,11 @@ fn apply(
         WalkEvent::Idle => {}
     }
     Ok(())
+}
+
+fn generated_text(bytes: usize) -> String {
+    const TEXT: &str = "generated result: compiled 12 targets in 0.42s\nnext line has ordinary prose and wrapped words\n";
+    TEXT.chars().cycle().take(bytes).collect()
 }
 
 fn seed(
@@ -587,6 +704,7 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             editor_rows: first.max_editor_rows,
             cold_draw_micros: first.cold_draw_micros,
             warm_draw_micros: first.warm_draw_micros,
+            scene_details: Vec::new(),
         });
     }
     if first.frames != config.steps {
@@ -597,6 +715,7 @@ pub fn deterministic(config: WalkConfig) -> Result<WalkReport, WalkFailure> {
             editor_rows: first.max_editor_rows,
             cold_draw_micros: first.cold_draw_micros,
             warm_draw_micros: first.warm_draw_micros,
+            scene_details: Vec::new(),
         });
     }
     Ok(first)

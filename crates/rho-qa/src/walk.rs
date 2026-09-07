@@ -50,8 +50,9 @@ pub fn run(args: WalkArgs) -> Result<()> {
         let report = WalkHarness::new(config).run().map_err(|failure| {
             let script =
                 serde_json::to_string_pretty(&failure.events).unwrap_or_else(|_| "[]".to_owned());
+            let details = failure.scene_details.join("\n");
             anyhow::anyhow!(
-                "seed={seed} walk oracle `{}` failed: cold_draw_us={} warm_draw_us={} event_draw_us={} editor_rows={}\nshrunk sequence:\n{script}",
+                "seed={seed} walk oracle `{}` failed: cold_draw_us={} warm_draw_us={} event_draw_us={} editor_rows={}\nshrunk sequence:\n{script}\nsub-scene changes:\n{details}",
                 failure.oracle,
                 failure.cold_draw_micros,
                 failure.warm_draw_micros,
@@ -66,6 +67,37 @@ pub fn run(args: WalkArgs) -> Result<()> {
         max_draw = max_draw.max(report.max_draw_micros);
         max_cold = max_cold.max(report.cold_draw_micros);
         max_warm = max_warm.max(report.warm_draw_micros);
+        if !report.wall_clock_findings.is_empty() {
+            let mut baseline = report.baseline_owners.iter().collect::<Vec<_>>();
+            baseline.sort_by_key(|owner| std::cmp::Reverse(owner.primitives));
+            for owner in baseline.into_iter().take(12) {
+                println!(
+                    "WALL_CLOCK_BASELINE_OWNER seed={seed} owner={} primitives={} bounds={:?}",
+                    owner.owner, owner.primitives, owner.bounds
+                );
+            }
+        }
+        for finding in &report.wall_clock_findings {
+            let sequence =
+                serde_json::to_string(&finding.sequence).unwrap_or_else(|_| "[]".to_owned());
+            println!(
+                "WALL_CLOCK_FINDING seed={seed} step={} draw_us={} editor_work_rows={} sequence={sequence}",
+                finding.step, finding.draw_micros, finding.editor_work_rows
+            );
+            for owner in report.step_owners[finding.step]
+                .iter()
+                .filter(|owner| owner.changed_primitives != 0)
+            {
+                println!(
+                    "WALL_CLOCK_CHANGED_OWNER seed={seed} step={} owner={} primitives={} changed={} bounds={:?}",
+                    finding.step,
+                    owner.owner,
+                    owner.primitives,
+                    owner.changed_primitives,
+                    owner.bounds,
+                );
+            }
+        }
         for (step, ((draw, editor_rows), total_rows)) in report
             .step_draw_micros
             .iter()
