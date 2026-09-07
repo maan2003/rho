@@ -810,3 +810,20 @@ check again, aimed at the binary rather than the app.
 And say so afterwards. A harness error found and corrected belongs in the
 landing note beside the result, because the number means nothing without the
 account of how it was taken.
+
+Count a marker anywhere on the line, not at the start of one. Under
+`--nocapture` the harness prints `test tests::name ... ` without a newline
+and the test's own output continues that same line, so a marker a test
+prints lands mid-line and a line-anchored pattern does not see it. A sweep
+of the fold map's accounting record counted one violation with
+`grep -c '^MARKER$'` and four with `grep -c MARKER` on the same log, and
+the three it missed were the three that mattered - transcript tests
+carrying the fault on the path the user sits in all day.
+
+And read the assertion directly before retracting a finding. That miscount
+was used to withdraw a correct result, and an experiment on another commit
+was then built on the withdrawal; the experiment's answer was true and
+proved nothing, because the other half of the comparison had never been
+measured. Running the three tests and reading what they said took twenty
+seconds. When a direct measurement of the thing is available and cheap,
+take it before building an experiment that infers it.
