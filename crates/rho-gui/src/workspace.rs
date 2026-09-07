@@ -4882,6 +4882,16 @@ impl Workspace {
         method: rho_journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
+        // Leaving a Slack conversation is the only thing that tells Slack
+        // it has been read, so the surface being replaced is marked on the
+        // way out — the same summary-buffer exit the Zulip narrows do.
+        let leaving = self
+            .history
+            .as_ref()
+            .map(|history| history.current().surface.key.clone());
+        if leaving.is_some_and(|key| key != surface.key) {
+            self.leave_slack_conversation(cx);
+        }
         self.ensure_surface_subscription(&surface.key, cx);
         let list = self.surfaces.entry(self.active_context).or_default();
         match list.iter_mut().find(|s| **s == surface) {

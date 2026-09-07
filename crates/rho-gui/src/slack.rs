@@ -285,6 +285,20 @@ impl Workspace {
     /// Shows one conversation: a channel, a group, a DM, or a thread. A
     /// thread opened from a channel is a child surface, so `ctrl-k` returns
     /// to the channel it came from.
+    /// Marks the Slack conversation being left read, which is the only
+    /// thing that tells Slack the reader has seen it: a Gnus summary
+    /// buffer's exit, and the rule the Zulip narrows already follow.
+    /// Without it, reading a channel here leaves every other client the
+    /// reader owns badging it for messages they have read.
+    ///
+    /// The mark is at the newest message loaded, which is what Slack itself
+    /// does when a channel is opened.
+    pub(crate) fn leave_slack_conversation(&mut self, cx: &mut gpui::Context<Self>) {
+        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
+            view.clone().update(cx, |view, cx| view.mark_read(cx));
+        }
+    }
+
     pub(crate) fn open_slack_source(
         &mut self,
         source: Source,
