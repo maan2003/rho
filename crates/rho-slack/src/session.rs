@@ -924,6 +924,21 @@ impl Session {
         &self.model
     }
 
+    /// Whether there is a listing to draw at all, as against a status line.
+    pub fn has_rows(&self) -> bool {
+        self.model.conversation_count() > 0
+    }
+
+    /// What the conversation list has done since the drawer last asked.
+    /// `None` when the drawer has to write the listing again.
+    pub fn take_row_edits(&mut self) -> Option<Vec<crate::model::RowEdit>> {
+        self.model.take_row_edits()
+    }
+
+    pub fn forget_row_edits(&mut self) {
+        self.model.forget_row_edits();
+    }
+
     /// Where a dealt card lands the reader: the oldest message from someone
     /// else past the cursor their last verdict left. Three mentions in a
     /// channel are one card, and this is the first of the three.
@@ -2182,6 +2197,13 @@ pub fn restore_units(model: &mut Model, mirror: &Mirror) {
 /// The units the mirror's own history implies, raised into the model.
 /// Every conversation the mirror knows and every followed thread is walked,
 /// and the model decides which messages are the user's business.
+///
+/// **This is the explicit rebuild, and nothing on the start path calls it.**
+/// It reads every message in the mirror, which is O(messages) and is the
+/// cost the units table exists to avoid; a start reads [`restore_units`]
+/// instead, one row per unit. The one time a start may reach this is a
+/// mirror written before the units table existed, which pays it once and
+/// then records that it has. Calling it at boot would put the cost back.
 pub fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
     let workspace = model.workspace().0.clone();
     let mut scopes = mirror

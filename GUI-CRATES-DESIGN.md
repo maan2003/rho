@@ -717,6 +717,79 @@ wrong at the design, not at the polish.
   the surface behind it undisturbed, and back returns to it. Reactions and
   search are shaped around it and it is not built in `rho-slack`.
   Gate green: rho-slack 153 (119 lib, 8 mirror, 26 transport), rho-gui 276.
+  **Change 2b, the conversation list.** The list is an index, not a sort.
+  `order` is a `BTreeMap<RowKey, ConversationRow>` whose own order is the
+  order on screen, `placed` remembers the key each conversation currently
+  has, and an event takes one row out and puts it back: no pass over the
+  list, no comparator run n log n times a draw. A first draw is O(n) once.
+  After it the buffer is never rebuilt; the model hands over a log of what
+  moved and the view edits those lines, one line out and one line in, as
+  rope edits at a `Point`.
+  An edit names conversations, never places. The line to take out is the
+  one the view put that conversation on, and the line to put back is the
+  one its new neighbour is on — `before`, the next key in the order, which
+  the tree finds in its own depth. This is not a detail: the first cut of
+  2b reported places as numbers, and a number costs the distance down the
+  list to count. Measured, that made every event O(position) and the
+  roster landing O(n²) — 678 ms at 20 000, startup-visible, exactly what
+  the cost rule exists to stop. Naming the neighbour instead is what the
+  numbers below are.
+  The point follows the conversation, not the line number. It is read
+  before the edits as the conversation it was on and put back on that
+  conversation's line afterwards, so rows arriving above the reader do not
+  move the reader. `rows_moving_above_the_point_leave_the_point_on_its_conversation`
+  in `rho-gui` asserts it against the fake, through a real session.
+  Narrowing stays model-side, so `/`, `n`, `G` and yank see the whole list.
+  A narrowed listing is not the model's list, so the log cannot be applied
+  to it and the view rebuilds; the same for a first draw, a health banner
+  appearing, and a log that reached its cap.
+  The journey this is measured against is **J5**, read and answer a Slack
+  conversation, whose rule is that mark read sticks and *the list row
+  moves once per event, not the list*. The second half is what this change
+  is: one event edits the lines it touches and leaves the rest of the
+  buffer alone. The first half landed in change 1. J5's `today` is still
+  pending measurement on the rig, and the rig's Slack numbers only became
+  meaningful at 9efbed8d, so the keystroke count is QA's to take, not
+  this note's to claim.
+  Numbers, `cargo run --release --example list_cost`, this machine:
+
+  | | 5 000 | 20 000 |
+  | --- | --- | --- |
+  | the first draw, once | 721 µs | 4.74 ms |
+  | one draw, sorted per draw (what it did) | 1.34 ms | 5.11 ms |
+  | one draw, a screenful of 50 | 3.03 µs | 3.20 µs |
+  | one badge, row unmoved | 1.04 µs | 910 ns |
+  | one row, bottom to top | 1.18 µs | 1.44 µs |
+  | one message arriving | 1.78 µs | 2.62 µs |
+  | the roster landing, once a session | 6.43 ms | 30.9 ms |
+
+  Read the shape, not the absolutes: a badge is flat in n, a move and a
+  message grow like log n, and the roster landing — the one event that
+  legitimately renames every row — grows like n log n and asks for the
+  list again rather than logging an edit per row, because n edits cost
+  more to replay than one draw. Before the neighbour fix the same three
+  rows read 31.7 µs, 16.5 µs and 35.7 µs at 20 000, growing with the list.
+  What is still O(n) per refresh and said so: `paint` re-anchors every
+  highlight in the buffer, and the view's `drawn` vector shifts on an
+  insert. Both are one pass over lines already in memory with no
+  allocation, and neither is on the frame path — but neither is O(log n)
+  either, and the next pass at this file is where they go.
+  Gate green on b6cb0dbe: rho-slack 157 (123 lib, 8 mirror, 26 transport)
+  and rho-gui, this change's live view test among them; clippy
+  `-D warnings` and `cargo fmt --check` clean across the workspace.
+  The live view test waits for the row to move rather than for the gpui
+  executor to park. The frame crosses a real socket into the session's own
+  tokio loop and comes back, and parking says nothing about whether that
+  has happened — under a loaded suite it had not, and the test's own
+  `assert_ne!` guard caught it. A loaded machine can now only make the
+  test slower, never make it lie.
+  Two things seen on the way in and now gone, recorded because they cost
+  a gate run each: on 2ac218a7 rho-gui's lib test binary segfaulted at
+  load, before enumerating a test, under both codegen backends; on
+  9efbed8d clippy stopped on `echo_text_for_test`, used only from
+  `src/tests.rs` and so dead to the plain lib build. Both reproduced on a
+  clean checkout of main with nothing of this change in the tree, and
+  both are fixed on 0bb4ffc9.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is

@@ -7034,6 +7034,7 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
             assert_eq!(routes("s", &list), Some("rho_gui::SlackSearch"));
             assert_eq!(routes("shift-n", &list), Some("rho_gui::SlackNextUnread"));
             assert_eq!(routes("m", &list), Some("rho_gui::SlackMarkReadBefore"));
+            assert_eq!(routes("w", &list), Some("rho_gui::SlackWatchChannel"));
             assert_eq!(routes("q", &list), Some("rho_gui::SurfaceClose"));
             // The composer and the rewrite belong to a conversation. On the
             // list the keys go back to vim, the way they do on every other
@@ -11000,5 +11001,105 @@ fn serving_a_reader_s_rows_at_an_unchanged_width_reports_the_rows_moved(cx: &mut
     assert!(
         said_so,
         "and the call said so, so the caller knows to take a fresh snapshot"
+    );
+}
+
+/// The point follows the conversation, not the line number.
+///
+/// A message arriving in a busier conversation moves rows above the reader.
+/// If the point stayed on its line it would land on whatever slid under it,
+/// which is how a reader opens the wrong conversation by pressing nothing.
+///
+/// Stood up against the fake Slack server, the way the surface stands up in
+/// production: there is no stubbed client here and no test-only path
+/// through the session.
+#[gpui::test]
+async fn rows_moving_above_the_point_leave_the_point_on_its_conversation(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+
+    cx.update(init_test_app);
+    // A real server on a real socket, so the deterministic test executor
+    // has to be allowed to wait on it.
+    cx.executor().allow_parking();
+    // The fake is a real server on a real socket, so it has to be started
+    // inside the tokio runtime the session's own loops run in.
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, cx));
+        rho_slack::ui::ListView::new(session, rho_slack::ui::Hooks::inert(), window, cx)
+    });
+    cx.run_until_parked();
+
+    // Sit on a conversation in the middle of the reference workspace's
+    // listing, with rows both above and below it.
+    let held = rho_slack::types::ChannelId("C2".into());
+    window
+        .update(cx, |view, window, cx| {
+            let at = view
+                .row_of_for_test(&held)
+                .expect("#random is in the listing");
+            view.place_cursor_for_test(at, window, cx);
+        })
+        .unwrap();
+    let (before, was_at) = window
+        .update(cx, |view, _, cx| {
+            (view.cursor_source(cx), view.row_of_for_test(&held))
+        })
+        .unwrap();
+    assert_eq!(
+        before,
+        Some(rho_slack::session::Source::Conversation(held.clone())),
+        "the reader is on #random"
+    );
+
+    // Something lands in the group message at the bottom of the listing.
+    // Unread sorts above read, so its row goes to the top and every row
+    // between there and the reader moves down one.
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "G1",
+        "ts": "9000.0",
+        "user": "UD",
+        "text": "anyone about?",
+    }));
+
+    // The frame crosses a real socket into the session's own tokio loop
+    // and comes back, and the gpui executor going quiet says nothing about
+    // whether that has happened yet. So wait for the row to move rather
+    // than for the executor to park: a loaded machine can then only make
+    // this test slower, never make it lie.
+    let mut now_at = was_at;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        now_at = window
+            .update(cx, |view, _, _| view.row_of_for_test(&held))
+            .unwrap();
+        if now_at != was_at {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    let after = window
+        .update(cx, |view, _, cx| view.cursor_source(cx))
+        .unwrap();
+    assert_ne!(
+        was_at, now_at,
+        "the listing has to have moved, or this proves nothing"
+    );
+    assert_eq!(
+        after, before,
+        "a row moving above the reader must not move the reader"
     );
 }

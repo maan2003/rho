@@ -9,6 +9,7 @@
 //! Only mentions, direct messages, and threads the user has posted in become
 //! obligations. Channel traffic is kept for reading and never raised.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
@@ -195,6 +196,54 @@ pub struct Suggestion {
     pub detail: String,
 }
 
+/// Where one conversation sits in the list.
+///
+/// Every field is stored the way it sorts, so the map's own order *is* the
+/// list's order and drawing never compares anything. `Reverse` is what puts
+/// unread, then the loudest, then the newest at the top; `muted` is plain,
+/// because muted belongs at the bottom.
+///
+/// The label is in the key because the list is alphabetical between
+/// conversations that are otherwise equal, and the id is last so that two
+/// conversations with the same name still have distinct keys.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey {
+    muted: bool,
+    unread: Reverse<bool>,
+    mentions: Reverse<u32>,
+    latest: Reverse<i64>,
+    label: String,
+    id: ChannelId,
+}
+
+/// One thing that happened to the list: a row left the place it was in, a
+/// row arrived at a place, or both, which is a row that moved.
+///
+/// A badge changing without moving the row is `from` and `at` being the
+/// same place, and is one line rewritten. A conversation rho has just heard
+/// of has no `from`; one that has gone has no `at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowEdit {
+    pub channel: ChannelId,
+    /// The conversation had a line in the list and that line has to come
+    /// out. A place is not given: a number would cost the distance down
+    /// the list to count, and the drawer already knows which line it put
+    /// this conversation on.
+    pub was_listed: bool,
+    /// The conversation the row now sits above, or `None` for the end of
+    /// the list. A neighbour rather than a place, for the same reason:
+    /// the next key is one step from this one, whereas how many rows are
+    /// above it is a walk.
+    pub before: Option<ChannelId>,
+    /// The row to draw, so a drawer never has to ask again.
+    pub row: Option<ConversationRow>,
+}
+
+/// How many unread list edits are kept before the log is thrown away and
+/// the next drawer is told to rebuild. Well past a screenful of traffic,
+/// and far below the point where replaying them beats redrawing.
+const ROW_EDIT_CAP: usize = 4_096;
+
 /// One line of the conversation list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationRow {
@@ -246,6 +295,35 @@ pub struct Model {
     /// fact, not Slack's, so it lives in rho's own file and comes back off
     /// it at startup.
     watched: BTreeSet<ChannelId>,
+    /// The conversation list, in the order it is read, and the key each
+    /// conversation currently sits at.
+    ///
+    /// Kept rather than sorted, because sorting is O(n log n) and a frame
+    /// may not cost that. Every event that can move a row — a message,
+    /// Slack's counts, a mark, a mute, an opt-in, the roster — puts that
+    /// row back in its place and leaves the rest standing.
+    order: BTreeMap<RowKey, ConversationRow>,
+    placed: BTreeMap<ChannelId, RowKey>,
+    /// What the list has done since a drawer last asked: one entry per
+    /// reindex, in the order they happened, each saying where a row left
+    /// and where it arrived.
+    ///
+    /// Replaying these against a buffer that held the last list reproduces
+    /// this one exactly, which is what lets a message cost two line edits
+    /// instead of a redraw. They are in order and each position is the
+    /// position *at that moment*, so they must be applied in order and
+    /// none may be skipped.
+    ///
+    /// Taken rather than read, because a drawer that has been told is
+    /// caught up. That makes one drawer the owner of this; there is one
+    /// today, the conversation list. A drawer holding nothing rebuilds in
+    /// full, so the failure of a second one forgetting this is a slow list
+    /// and never a wrong one.
+    edits: Vec<RowEdit>,
+    /// Set when the log was dropped for growing too long — nobody has drawn
+    /// the list in a long time — and the next drawer must rebuild rather
+    /// than replay.
+    resync: bool,
     /// The units asking for the reader right now, and what for.
     ///
     /// Kept rather than worked out, because working it out is a pass over
@@ -302,6 +380,10 @@ impl Model {
             conversation_read: BTreeMap::new(),
             thread_read: BTreeMap::new(),
             watched: BTreeSet::new(),
+            order: BTreeMap::new(),
+            placed: BTreeMap::new(),
+            edits: Vec::new(),
+            resync: false,
             asking: BTreeMap::new(),
         }
     }
@@ -322,6 +404,9 @@ impl Model {
         for user in users {
             self.users.insert(user.id.clone(), user);
         }
+        // A direct message is named after the person in it, so the roster
+        // landing renames rows and moves the alphabetical ones among them.
+        self.reindex_all();
     }
 
     /// Registers conversations. Names are not stored: a label is built from
@@ -329,8 +414,9 @@ impl Model {
     /// before the roster is still named once the roster lands.
     pub fn add_conversations(&mut self, conversations: impl IntoIterator<Item = Conversation>) {
         for conversation in conversations {
-            self.conversations
-                .insert(conversation.id.clone(), conversation);
+            let id = conversation.id.clone();
+            self.conversations.insert(id.clone(), conversation);
+            self.reindex(&id);
         }
     }
 
@@ -445,6 +531,7 @@ impl Model {
             // nothing about a badge when the cursor did not move.
             self.refresh_badge(&channel);
             self.refresh_channel(&channel);
+            self.reindex(&channel);
         }
     }
 
@@ -463,6 +550,7 @@ impl Model {
         self.muted = now;
         for channel in touched {
             self.refresh_channel(&channel);
+            self.reindex(&channel);
         }
     }
 
@@ -493,17 +581,24 @@ impl Model {
         }
         // Posting is reading: a message the user sent from any client marks
         // the conversation read in Slack, so rho must not badge it here.
-        if from_you {
-            count.has_unreads = false;
-            count.mention_count = 0;
-            count.unread_count = 0;
-            return;
+        match from_you {
+            true => {
+                count.has_unreads = false;
+                count.mention_count = 0;
+                count.unread_count = 0;
+            }
+            false => {
+                count.has_unreads = true;
+                count.unread_count += 1;
+                if pings_you {
+                    count.mention_count += 1;
+                }
+            }
         }
-        count.has_unreads = true;
-        count.unread_count += 1;
-        if pings_you {
-            count.mention_count += 1;
-        }
+        // Every message moves the row: its badge, its count, and the time
+        // it last spoke are all in what the list is ordered by. One row.
+        let channel = message.channel.clone();
+        self.reindex(&channel);
     }
 
     /// The DMs Slack says are unread, raised as the cards they would have
@@ -539,42 +634,165 @@ impl Model {
     /// by recency, and the muted ones under both. Within a group, the
     /// noisier conversation sorts first.
     pub fn conversation_rows(&self) -> Vec<ConversationRow> {
-        let mut rows = self
-            .conversations
+        self.order.values().cloned().collect()
+    }
+
+    /// A slice of the list, for a drawer that only has a screen to fill.
+    /// The rows come out already in order, so this costs the rows asked
+    /// for and the walk to reach them, and never the workspace.
+    pub fn conversation_window(&self, from: usize, count: usize) -> Vec<ConversationRow> {
+        self.order
             .values()
-            .map(|conversation| {
-                let count = self.counts.get(&conversation.id);
-                ConversationRow {
-                    id: conversation.id.clone(),
-                    label: self.label(&conversation.id),
-                    unread: count.is_some_and(|count| count.has_unreads),
-                    mention_count: count.map_or(0, |count| count.mention_count),
-                    unread_count: count.map_or(0, |count| count.unread_count),
-                    muted: self.muted.contains(&conversation.id),
-                    watched: self.watched.contains(&conversation.id),
-                    latest: count.and_then(|count| count.latest.clone()),
-                }
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| {
-            // Muted goes to the bottom whatever it holds: the whole point of
-            // muting is that its traffic stops competing for the top.
-            left.muted
-                .cmp(&right.muted)
-                .then_with(|| right.unread.cmp(&left.unread))
-                .then_with(|| right.mention_count.cmp(&left.mention_count))
-                .then_with(|| {
-                    let latest = |row: &ConversationRow| {
-                        row.latest
-                            .as_ref()
-                            .map(Ts::epoch_seconds)
-                            .unwrap_or_default()
-                    };
-                    latest(right).total_cmp(&latest(left))
-                })
-                .then_with(|| left.label.cmp(&right.label))
+            .skip(from)
+            .take(count)
+            .cloned()
+            .collect()
+    }
+
+    pub fn conversation_count(&self) -> usize {
+        self.order.len()
+    }
+
+    /// What the list has done since this was last asked, in order, and
+    /// forgets it. `None` means the log was dropped and the caller has to
+    /// draw the list again from scratch.
+    pub fn take_row_edits(&mut self) -> Option<Vec<RowEdit>> {
+        match std::mem::take(&mut self.resync) {
+            true => {
+                self.edits = Vec::new();
+                None
+            }
+            false => Some(std::mem::take(&mut self.edits)),
+        }
+    }
+
+    /// Forgets the log without applying it: for a drawer that has just
+    /// built the list in full and is therefore already caught up.
+    pub fn forget_row_edits(&mut self) {
+        self.edits = Vec::new();
+        self.resync = false;
+    }
+
+    /// Where one conversation sits now, and the row to draw there. `None`
+    /// for a conversation that has gone, which is the drawer's cue to take
+    /// its line out.
+    ///
+    /// The place is counted, so this costs the distance from the top of
+    /// the list. Nothing on an event path calls it; it is here for a test
+    /// or a caller that genuinely wants a number.
+    pub fn row_position(&self, channel: &ChannelId) -> Option<(usize, ConversationRow)> {
+        let key = self.placed.get(channel)?;
+        let at = self.order.range(..key).count();
+        Some((at, self.order.get(key)?.clone()))
+    }
+
+    /// Puts one conversation back in its place in the list, and nothing
+    /// else: the cost of a message, a mark or a mute is the conversation it
+    /// happened in.
+    ///
+    /// Both halves are needed. The key is what the list is ordered by, and
+    /// it has to come out of the set before it changes or the set would be
+    /// ordered by a key that is no longer there; `placed` is what remembers
+    /// which key a conversation currently has, since the key itself cannot
+    /// be worked backwards from the conversation once its counts have
+    /// moved.
+    fn reindex(&mut self, channel: &ChannelId) {
+        let was_listed = match self.placed.remove(channel) {
+            Some(held) => {
+                self.order.remove(&held);
+                true
+            }
+            None => false,
+        };
+        let Some(conversation) = self.conversations.get(channel) else {
+            self.note_row_edit(RowEdit {
+                channel: channel.clone(),
+                was_listed,
+                before: None,
+                row: None,
+            });
+            return;
+        };
+        let count = self.counts.get(channel);
+        let label = crate::emoji::render(&self.raw_label(conversation));
+        let key = RowKey {
+            // Muted goes to the bottom whatever it holds: the whole point
+            // of muting is that its traffic stops competing for the top.
+            muted: self.muted.contains(channel),
+            unread: Reverse(count.is_some_and(|count| count.has_unreads)),
+            mentions: Reverse(count.map_or(0, |count| count.mention_count)),
+            // Milliseconds rather than the timestamp itself, because a
+            // timestamp is a string and the integer part grows a digit
+            // every few years: byte order and time order agree today and
+            // would quietly stop agreeing.
+            latest: Reverse(
+                count
+                    .and_then(|count| count.latest.as_ref())
+                    .map_or(0, Ts::millis),
+            ),
+            label: label.clone(),
+            id: channel.clone(),
+        };
+        let row = ConversationRow {
+            id: channel.clone(),
+            label,
+            unread: count.is_some_and(|count| count.has_unreads),
+            mention_count: count.map_or(0, |count| count.mention_count),
+            unread_count: count.map_or(0, |count| count.unread_count),
+            muted: self.muted.contains(channel),
+            watched: self.watched.contains(channel),
+            latest: count.and_then(|count| count.latest.clone()),
+        };
+        // The neighbour, not the place: one step past this key in the
+        // order, which the tree finds in the depth of the tree. Counting
+        // how many rows are above it instead would cost the distance, and
+        // doing that on every message is what the list is here to avoid.
+        let before = self
+            .order
+            .range(&key..)
+            .next()
+            .map(|(next, _)| next.id.clone());
+        self.placed.insert(channel.clone(), key.clone());
+        self.order.insert(key, row.clone());
+        self.note_row_edit(RowEdit {
+            channel: channel.clone(),
+            was_listed,
+            before,
+            row: Some(row),
         });
-        rows
+    }
+
+    /// Notes one list edit, or gives up on the log. Giving up is the right
+    /// answer when nobody has drawn the list in a long time: replaying ten
+    /// thousand edits is slower than drawing the list once, and holding
+    /// them costs memory for a screen nobody is looking at.
+    fn note_row_edit(&mut self, edit: RowEdit) {
+        if self.resync {
+            return;
+        }
+        if self.edits.len() >= ROW_EDIT_CAP {
+            self.edits = Vec::new();
+            self.resync = true;
+            return;
+        }
+        self.edits.push(edit);
+    }
+
+    /// Every conversation put back in its place. For the events that move
+    /// all of them at once and genuinely have to: the roster landing, which
+    /// renames every direct message, and the workspace's own emoji
+    /// arriving, which re-renders every name that carries one. Those happen
+    /// once a session, not on a keypress and not on a frame.
+    fn reindex_all(&mut self) {
+        // Every row moved, so there is nothing for a log of moved rows to
+        // say. Telling the drawer to draw the list again is both cheaper
+        // than n edits and what it would decide for itself on reading
+        // them.
+        self.resync = true;
+        self.edits = Vec::new();
+        for channel in self.conversations.keys().cloned().collect::<Vec<_>>() {
+            self.reindex(&channel);
+        }
     }
 
     /// What the composer offers for the token being typed. `@` is the
@@ -851,6 +1069,7 @@ impl Model {
         self.watched = now;
         for channel in touched {
             self.refresh_channel(&channel);
+            self.reindex(&channel);
         }
     }
 
@@ -868,6 +1087,7 @@ impl Model {
         };
         if moved {
             self.refresh_channel(channel);
+            self.reindex(channel);
         }
         moved
     }
@@ -906,8 +1126,10 @@ impl Model {
         self.conversation_read.insert(channel.clone(), ts.clone());
         self.refresh_badge(channel);
         // The cursor moved past somebody's message, so the units in this
-        // conversation may have stopped asking. Only this conversation's.
+        // conversation may have stopped asking, and its badge may have gone
+        // out from under its place in the list. Only this conversation's.
         self.refresh_channel(channel);
+        self.reindex(channel);
         true
     }
 
@@ -1666,6 +1888,184 @@ mod tests {
             model.attention(&Unit::conversation(&design)),
             Some(Attention::Mentioned)
         );
+    }
+
+    /// Replaying the log against the list a drawer already had must give
+    /// the list the model holds now. This is the whole contract the
+    /// incremental redraw rests on: if it can drift, the list on screen
+    /// drifts from Slack and nothing ever corrects it.
+    #[test]
+    fn replaying_the_edits_rebuilds_the_list_the_model_holds() {
+        let mut model = model();
+        // The drawer starts caught up, holding the list as it stands.
+        let mut held = model
+            .conversation_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        model.forget_row_edits();
+
+        let replay = |model: &mut Model, held: &mut Vec<ChannelId>, at: &str| {
+            let edits = model.take_row_edits().expect("the log was not dropped");
+            for edit in edits {
+                if edit.was_listed {
+                    let from = held
+                        .iter()
+                        .position(|line| line == &edit.channel)
+                        .unwrap_or_else(|| panic!("{at}: no line to take out"));
+                    held.remove(from);
+                }
+                if edit.row.is_some() {
+                    let to = match &edit.before {
+                        Some(before) => held
+                            .iter()
+                            .position(|line| line == before)
+                            .unwrap_or_else(|| panic!("{at}: no neighbour to sit above")),
+                        None => held.len(),
+                    };
+                    held.insert(to, edit.channel.clone());
+                }
+            }
+            assert_eq!(
+                *held,
+                model
+                    .conversation_rows()
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>(),
+                "{at}"
+            );
+        };
+
+        model.note_counts(&message("C1", "100", "U1", "morning"));
+        replay(&mut model, &mut held, "a message lands");
+        model.note_counts(&message("D1", "110", "U1", "lunch?"));
+        replay(&mut model, &mut held, "and one in a direct message");
+        // A badge changing without the row moving: the line comes out and
+        // goes back above the same neighbour, which the rope handles as a
+        // rewrite of one line.
+        model.note_counts(&message("D1", "111", "U1", "still lunch?"));
+        replay(&mut model, &mut held, "the same conversation speaks again");
+        model.mark_read(&ChannelId("D1".into()), &Ts("111".into()));
+        replay(&mut model, &mut held, "it is read");
+        model.set_muted([ChannelId("C1".into())]);
+        replay(&mut model, &mut held, "a channel is muted to the bottom");
+        model.set_muted([]);
+        replay(&mut model, &mut held, "and comes back up");
+        model.add_conversations([Conversation {
+            id: ChannelId("C9".into()),
+            kind: ConversationKind::Channel,
+            name: "new".to_owned(),
+            user: None,
+            members: Vec::new(),
+        }]);
+        replay(&mut model, &mut held, "a conversation rho had not heard of");
+        // The roster is the one event that moves every row, and it asks
+        // for the list again rather than handing over an edit per row: n
+        // edits cost more to replay than one draw, and the drawer would
+        // reach that conclusion itself on reading them.
+        model.add_users([User {
+            id: UserId("U1".into()),
+            name: "Zara".to_owned(),
+            handle: "zara".to_owned(),
+        }]);
+        assert!(
+            model.take_row_edits().is_none(),
+            "the roster landing asks for the list again"
+        );
+    }
+
+    /// A log nobody drains is dropped rather than grown without bound, and
+    /// the drawer is told to start again instead of being handed a log that
+    /// no longer begins where its list does.
+    #[test]
+    fn a_list_nobody_draws_gives_up_its_log_rather_than_growing() {
+        let mut model = model();
+        model.forget_row_edits();
+        for at in 0..(ROW_EDIT_CAP + 10) {
+            model.note_counts(&message("C1", &format!("{at}"), "U1", "traffic"));
+        }
+        assert!(
+            model.take_row_edits().is_none(),
+            "the drawer is told to rebuild"
+        );
+        assert!(
+            model.take_row_edits().is_some_and(|edits| edits.is_empty()),
+            "and is caught up again once it has"
+        );
+    }
+
+    /// The kept order and a sort must say the same thing after anything
+    /// that can move a row. The list is the way in to Slack; a row in the
+    /// wrong place is a conversation the reader cannot find, and an index
+    /// that drifts is worse than a sort because nothing recomputes it.
+    #[test]
+    fn the_kept_order_and_a_sort_never_drift() {
+        /// What the list used to do on every draw, kept here as the thing
+        /// the index has to agree with.
+        fn sorted(model: &Model) -> Vec<ChannelId> {
+            let mut rows = model.conversation_rows();
+            rows.sort_by(|left, right| {
+                left.muted
+                    .cmp(&right.muted)
+                    .then_with(|| right.unread.cmp(&left.unread))
+                    .then_with(|| right.mention_count.cmp(&left.mention_count))
+                    .then_with(|| {
+                        let latest = |row: &ConversationRow| {
+                            row.latest
+                                .as_ref()
+                                .map(Ts::epoch_seconds)
+                                .unwrap_or_default()
+                        };
+                        latest(right).total_cmp(&latest(left))
+                    })
+                    .then_with(|| left.label.cmp(&right.label))
+            });
+            rows.into_iter().map(|row| row.id).collect()
+        }
+        let mut model = model();
+        let agrees = |model: &Model, at: &str| {
+            assert_eq!(
+                model
+                    .conversation_rows()
+                    .into_iter()
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>(),
+                sorted(model),
+                "{at}"
+            );
+        };
+
+        agrees(&model, "the roster has just landed");
+        model.note_counts(&message("C1", "100", "U1", "morning"));
+        agrees(&model, "a message lands in a channel");
+        model.note_counts(&message("D1", "110", "U1", "lunch?"));
+        agrees(&model, "and one in a direct message");
+        model.note_counts(&message("C1", "120", "U1", "hey <@ME>"));
+        agrees(&model, "and a mention, which is louder");
+        model.mark_read(&ChannelId("C1".into()), &Ts("120".into()));
+        agrees(&model, "the channel is read");
+        model.set_muted([ChannelId("D1".into())]);
+        agrees(&model, "the direct message is muted");
+        model.set_muted([]);
+        agrees(&model, "and unmuted");
+        model.set_watching(&ChannelId("C1".into()), true);
+        agrees(&model, "a channel is opted into");
+        model.add_users([User {
+            id: UserId("U1".into()),
+            name: "Zara".to_owned(),
+            handle: "zara".to_owned(),
+        }]);
+        agrees(&model, "and the roster renames the person the DM is with");
+        model.set_counts([ConversationCount {
+            channel: ChannelId("D1".into()),
+            has_unreads: true,
+            mention_count: 3,
+            unread_count: 9,
+            latest: Some(Ts("900".into())),
+            last_read: None,
+        }]);
+        agrees(&model, "and Slack's own counts arrive");
     }
 
     /// The kept set and the rule must say the same thing after anything
