@@ -101,6 +101,7 @@ fn read_wait(arguments: &str) -> (Option<Duration>, ToolOutput) {
         seconds: u64,
     }
     let reply = |status, text: String| ToolOutput {
+        full_output: None,
         images: Arc::new(Vec::new()),
         output: Arc::new(text),
         status,
@@ -1257,6 +1258,7 @@ impl Agent {
                         call_id: call.id.clone(),
                         tool_type: call.tool_type,
                         body: ToolOutput {
+                            full_output: None,
                             images: std::sync::Arc::new(Vec::new()),
                             output: Arc::new(String::new()),
                             status: ToolOutputStatus::Cancelled,
@@ -1315,6 +1317,7 @@ impl Agent {
                             call_id: tool.call.id.clone(),
                             tool_type: tool.call.tool_type,
                             output: output.output,
+                            full_output: output.full_output,
                             at: now,
                         }));
                     }
@@ -1622,6 +1625,7 @@ impl Agent {
             Some(tool) => tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
             None => Box::new(BornExited {
                 output: ToolOutput {
+                    full_output: None,
                     images: std::sync::Arc::new(Vec::new()),
                     output: Arc::new(format!("unknown tool: {}", call.name.as_str())),
                     status: ToolOutputStatus::Error,
@@ -1912,6 +1916,7 @@ impl FutureTool for SpecOnly {
         let name = self.0.name.clone();
         Box::pin(async move {
             ToolOutput {
+                full_output: None,
                 images: std::sync::Arc::new(Vec::new()),
                 output: Arc::new(format!("{} is not available here", name.as_str())),
                 status: ToolOutputStatus::Error,

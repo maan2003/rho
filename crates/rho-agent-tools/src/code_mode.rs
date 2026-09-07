@@ -271,6 +271,7 @@ impl CellSession {
             body.push_str("Script error:\n");
             body.push_str(&error);
         }
+        let full_output = Arc::new(body.clone());
         let mut bounded = BoundedOutput::for_tokens(self.max_output_tokens);
         bounded.push(body.as_bytes());
         let body = decode_output_lossy(bounded.into_bytes());
@@ -284,6 +285,7 @@ impl CellSession {
         };
         ToolOutput {
             output: Arc::new(format!("{status_line}{wall}\nOutput:\n{body}")),
+            full_output: Some(full_output),
             images: Arc::new(images),
             status,
         }

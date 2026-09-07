@@ -247,7 +247,7 @@ async fn a_script_notify_is_urgent_and_its_end_arrives_as_an_update() {
         call(
             "c1",
             "exec",
-            json!("notify('halfway'); await new Promise(r => setTimeout(r, 700)); text('done');"),
+            json!("notify('halfway'); await new Promise(r => setTimeout(r, 700)); text('x'.repeat(50000));"),
         ),
         SourceWaker::new(Arc::clone(&wake)),
     );
@@ -269,7 +269,8 @@ async fn a_script_notify_is_urgent_and_its_end_arrives_as_an_update() {
         "{}",
         update.output
     );
-    assert!(update.output.contains("done"), "{}", update.output);
+    assert!(update.output.contains("truncated"), "{}", update.output);
+    assert_eq!(update.recorded_output(), "x".repeat(50_000));
     assert!(session.done());
 }
 

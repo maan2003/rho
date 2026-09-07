@@ -52,6 +52,7 @@ struct FakeReady {
 struct FakeMetrics {
     completed_turns: u64,
     bytes_streamed: u64,
+    max_input_tool_output_bytes: u64,
 }
 
 struct Children(Vec<Child>);
@@ -445,6 +446,7 @@ async fn run_async(args: Args) -> Result<()> {
             clarifying,
             result_sizes: &result_sizes,
             latencies: &latencies,
+            model_result_max: metrics.max_input_tool_output_bytes,
         },
     )
     .err();
@@ -452,7 +454,7 @@ async fn run_async(args: Args) -> Result<()> {
     sorted_result_sizes.sort_unstable();
     let elapsed = started.elapsed().as_secs_f64().min(args.seconds as f64);
     println!(
-        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} daemon_vmrss_kib={} journal_head={}",
+        "scenario={} agents={} duration_s={} replies={} failures={} retrying_failures={} tool_calls={} compacted={} clarifying={} results={} result_bytes={} result_p50={} result_mean={} result_p90={} result_max={} model_result_max={} turns_per_sec={:.2} fake_completed_turns={} fake_bytes={} sent_replied_p50_ms={} sent_replied_p99_ms={} fake_vmrss_kib={} daemon_vmrss_kib={} journal_head={}",
         args.scenario.as_str(),
         agent_count,
         args.seconds,
@@ -468,6 +470,7 @@ async fn run_async(args: Args) -> Result<()> {
         result_sizes.iter().sum::<usize>() / result_sizes.len().max(1),
         usize_percentile(&sorted_result_sizes, 90),
         sorted_result_sizes.last().copied().unwrap_or(0),
+        metrics.max_input_tool_output_bytes,
         metrics.completed_turns as f64 / elapsed,
         metrics.completed_turns,
         metrics.bytes_streamed,
@@ -512,6 +515,7 @@ struct ScenarioResults<'a> {
     clarifying: u64,
     result_sizes: &'a [usize],
     latencies: &'a [u64],
+    model_result_max: u64,
 }
 
 fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<()> {
@@ -541,6 +545,22 @@ fn verify_scenario(scenario: Scenario, results: &ScenarioResults<'_>) -> Result<
             ensure!(
                 results.result_sizes.len() == 100,
                 "expected 100 tool results"
+            );
+            let mut sorted = results.result_sizes.to_vec();
+            sorted.sort_unstable();
+            ensure!(usize_percentile(&sorted, 50) == 227, "result p50 drifted");
+            ensure!(
+                results.result_sizes.iter().sum::<usize>() / 100 == 4_047,
+                "result mean drifted"
+            );
+            ensure!(
+                usize_percentile(&sorted, 90) == 13_097,
+                "result p90 drifted"
+            );
+            ensure!(sorted.last() == Some(&170_448), "result max drifted");
+            ensure!(
+                results.model_result_max <= 40_100,
+                "model-facing result exceeded its 10,000-token budget"
             );
         }
         Scenario::FortyToolCalls => {

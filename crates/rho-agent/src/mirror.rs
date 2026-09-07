@@ -145,10 +145,17 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             results: blocks
                 .iter()
                 .flat_map(|block| match block {
-                    ContextBlock::ToolResults { results } => results.as_slice(),
-                    _ => &[],
+                    ContextBlock::ToolResults { results } => {
+                        results.iter().map(tool_outcome).collect::<Vec<_>>()
+                    }
+                    ContextBlock::ToolUpdate(update) => vec![ToolOutcome {
+                        id: update.call_id.as_str().to_owned(),
+                        status: ToolStatus::Success,
+                        started_at: update.at,
+                        finished_at: update.at,
+                    }],
+                    _ => Vec::new(),
                 })
-                .map(tool_outcome)
                 .collect(),
             compaction: blocks
                 .iter()
@@ -428,7 +435,9 @@ fn is_compaction_summary(text: &str) -> bool {
 mod tests {
     use std::borrow::Cow;
 
-    use rho_core::{ContentPart, MessageDelivery, ToolOutput, ToolOutputStatus, ToolResult};
+    use rho_core::{
+        ContentPart, MessageDelivery, ToolOutput, ToolOutputStatus, ToolResult, ToolUpdate,
+    };
 
     use super::*;
 
@@ -441,6 +450,7 @@ mod tests {
                     tool_type: rho_core::ToolType::Function,
                     body: ToolOutput {
                         output: std::sync::Arc::new("x".repeat(10_000)),
+                        full_output: None,
                         images: std::sync::Arc::new(Vec::new()),
                         status: ToolOutputStatus::Error,
                     },
@@ -466,6 +476,34 @@ mod tests {
             }
         );
         assert!(senax_encoder::encode(&stripped).unwrap().len() < 200);
+    }
+
+    #[test]
+    fn a_sent_update_is_a_result_whose_detail_can_be_requested() {
+        let event = AgentEvent::Sent {
+            blocks: Cow::Owned(vec![ContextBlock::ToolUpdate(ToolUpdate {
+                call_id: "call-1".try_into().unwrap(),
+                tool_type: rho_core::ToolType::Custom,
+                output: std::sync::Arc::new("bounded".to_owned()),
+                full_output: Some(std::sync::Arc::new("complete".to_owned())),
+                at: UnixMs(2),
+            })]),
+            at: UnixMs(3),
+        };
+
+        assert_eq!(
+            strip(&event),
+            Some(MirrorEvent::Sent {
+                results: vec![ToolOutcome {
+                    id: "call-1".into(),
+                    status: ToolStatus::Success,
+                    started_at: UnixMs(2),
+                    finished_at: UnixMs(2),
+                }],
+                compaction: false,
+                at: UnixMs(3),
+            })
+        );
     }
 
     #[test]

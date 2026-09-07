@@ -3462,6 +3462,9 @@ fn agent_detail(
                     rho_core::ContextBlock::ToolResults { results } => {
                         results.iter().map(detail_result).collect::<Vec<_>>()
                     }
+                    rho_core::ContextBlock::ToolUpdate(update) => {
+                        vec![detail_update(update)]
+                    }
                     _ => Vec::new(),
                 })
                 .collect(),
@@ -3525,7 +3528,16 @@ fn detail_result(result: &rho_core::ToolResult) -> rho_ui_proto::mirror::DetailR
             rho_core::ToolOutputStatus::Error => ToolStatus::Error,
             rho_core::ToolOutputStatus::Cancelled => ToolStatus::Cancelled,
         },
-        output: result.body.output.to_string(),
+        output: result.body.recorded_output().to_owned(),
+        error: None,
+    }
+}
+
+fn detail_update(update: &rho_core::ToolUpdate) -> rho_ui_proto::mirror::DetailResult {
+    rho_ui_proto::mirror::DetailResult {
+        id: update.call_id.as_str().to_owned(),
+        status: rho_ui_proto::mirror::ToolStatus::Success,
+        output: update.recorded_output().to_owned(),
         error: None,
     }
 }
@@ -3621,6 +3633,34 @@ mod tests {
         merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
         quota_summaries, start_runtime_sockets, validate_image_content,
     };
+
+    #[test]
+    fn tool_detail_reads_the_complete_host_record() {
+        let result = rho_core::ToolResult {
+            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_core::ToolType::Custom,
+            body: rho_core::ToolOutput {
+                output: Arc::new("bounded model view".to_owned()),
+                full_output: Some(Arc::new("complete host record".to_owned())),
+                images: Arc::new(Vec::new()),
+                status: rho_core::ToolOutputStatus::Success,
+            },
+            started_at: rho_core::UnixMs(1),
+            finished_at: rho_core::UnixMs(2),
+            metadata: None,
+        };
+
+        assert_eq!(super::detail_result(&result).output, "complete host record");
+
+        let update = rho_core::ToolUpdate {
+            call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
+            tool_type: rho_core::ToolType::Custom,
+            output: Arc::new("bounded update".to_owned()),
+            full_output: Some(Arc::new("complete update".to_owned())),
+            at: rho_core::UnixMs(3),
+        };
+        assert_eq!(super::detail_update(&update).output, "complete update");
+    }
 
     #[tokio::test]
     async fn explicit_socket_keeps_runtime_files_beside_it() {

@@ -59,11 +59,13 @@ impl WebSearchTools {
         Box::pin(async move {
             match tools.call_inner(call, context).await {
                 Ok(output) => ToolOutput {
+                    full_output: None,
                     images: std::sync::Arc::new(Vec::new()),
                     output: Arc::new(output),
                     status: ToolOutputStatus::Success,
                 },
                 Err(error) => ToolOutput {
+                    full_output: None,
                     images: std::sync::Arc::new(Vec::new()),
                     output: Arc::new(error),
                     status: ToolOutputStatus::Error,

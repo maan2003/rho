@@ -162,6 +162,7 @@ pub struct MetricsSnapshot {
     pub bytes_streamed: u64,
     pub active_requests: u64,
     pub peak_active_requests: u64,
+    pub max_input_tool_output_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -194,6 +195,7 @@ struct Metrics {
     bytes_streamed: AtomicU64,
     active_requests: AtomicU64,
     peak_active_requests: AtomicU64,
+    max_input_tool_output_bytes: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -305,6 +307,7 @@ fn snapshot(metrics: &Metrics) -> MetricsSnapshot {
         bytes_streamed: metrics.bytes_streamed.load(Ordering::Relaxed),
         active_requests: metrics.active_requests.load(Ordering::Relaxed),
         peak_active_requests: metrics.peak_active_requests.load(Ordering::Relaxed),
+        max_input_tool_output_bytes: metrics.max_input_tool_output_bytes.load(Ordering::Relaxed),
     }
 }
 
@@ -354,6 +357,7 @@ async fn serve_openai_socket(mut socket: WebSocket, state: AppState) {
             continue;
         }
         let request_number = begin_request(&state.metrics, &state.next_request);
+        observe_input_tool_outputs(&state.metrics, &envelope.request);
         let events = openai_turn(&state, request_number, &envelope.request);
         for (index, event) in events.into_iter().enumerate() {
             delay(&state.config, index, &event).await;
@@ -394,6 +398,7 @@ async fn openai_http(
     Json(request): Json<OpenAiRequest>,
 ) -> Response {
     let request_number = begin_request(&state.metrics, &state.next_request);
+    observe_input_tool_outputs(&state.metrics, &request);
     let terminal = outcome(&state.config, request_number);
     if terminal != TerminalOutcome::Complete && terminal != TerminalOutcome::Disconnect {
         end_request(&state.metrics, false);
@@ -433,6 +438,33 @@ async fn openai_http(
         HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+fn observe_input_tool_outputs(metrics: &Metrics, request: &OpenAiRequest) {
+    let max = request
+        .input
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .filter_map(|item| item.get("output"))
+        .map(|output| match output {
+            Value::String(text) => text.len(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .map(str::len)
+                .sum(),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    metrics
+        .max_input_tool_output_bytes
+        .fetch_max(max as u64, Ordering::Relaxed);
 }
 
 fn openai_turn(state: &AppState, request_number: u64, request: &OpenAiRequest) -> Vec<Value> {

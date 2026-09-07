@@ -310,6 +310,7 @@ fn tool_result(tool_use_id: &str, content: &Value, is_error: bool) -> anyhow::Re
         call_id: ToolCallId::try_from(tool_use_id)?,
         tool_type: ToolType::Function,
         body: ToolOutput {
+            full_output: None,
             images: Arc::new(Vec::new()),
             output: Arc::new(output),
             status: if is_error {

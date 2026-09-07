@@ -472,6 +472,7 @@ fn format_response(
         }
         body.push_str(&format!("Script error:\n{error}"));
     }
+    let full_output = Arc::new(body.clone());
     let body = truncate_middle(&body, max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS));
 
     let wall_time_seconds = (wall_time.as_secs_f32() * 10.0).round() / 10.0;
@@ -479,6 +480,7 @@ fn format_response(
         output: Arc::new(format!(
             "{status_line}\nWall time {wall_time_seconds:.1} seconds\nOutput:\n{body}"
         )),
+        full_output: Some(full_output),
         images: Arc::new(images),
         status: output_status,
     }
@@ -489,6 +491,7 @@ fn missing_cell_output(cell_id: &str) -> ToolOutput {
         output: Arc::new(format!(
             "Script failed\nWall time 0.0 seconds\nOutput:\nScript error:\nexec cell {cell_id} not found"
         )),
+        full_output: None,
         images: Arc::new(Vec::new()),
         status: ToolOutputStatus::Error,
     }
@@ -497,6 +500,7 @@ fn missing_cell_output(cell_id: &str) -> ToolOutput {
 fn error_output(error: String) -> ToolOutput {
     ToolOutput {
         output: Arc::new(error),
+        full_output: None,
         images: Arc::new(Vec::new()),
         status: ToolOutputStatus::Error,
     }

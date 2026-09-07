@@ -508,6 +508,7 @@ impl ShellTools {
         match self.call_inner(&call).await {
             Ok((output, metadata)) => ShellToolOutput {
                 body: ToolOutput {
+                    full_output: None,
                     images: std::sync::Arc::new(Vec::new()),
                     output: Arc::from(output),
                     status: ToolOutputStatus::Success,
@@ -516,6 +517,7 @@ impl ShellTools {
             },
             Err(error) => ShellToolOutput {
                 body: ToolOutput {
+                    full_output: None,
                     images: std::sync::Arc::new(Vec::new()),
                     output: Arc::from(error.to_string()),
                     status: ToolOutputStatus::Error,

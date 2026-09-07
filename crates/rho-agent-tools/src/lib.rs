@@ -211,6 +211,7 @@ impl Drop for OneShot {
 pub(crate) fn output(text: impl Into<String>, status: ToolOutputStatus) -> ToolOutput {
     ToolOutput {
         output: Arc::new(text.into()),
+        full_output: None,
         images: Arc::new(Vec::new()),
         status,
     }

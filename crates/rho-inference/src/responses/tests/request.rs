@@ -92,7 +92,11 @@ fn builds_responses_request_with_tools_and_item_timeline() {
                 }],
             ),
             Arc::new(ContextBlock::ToolResults {
-                results: vec![tool_result_success(tool_call_id("call-1"), "done")],
+                results: vec![{
+                    let mut result = tool_result_success(tool_call_id("call-1"), "done");
+                    result.body.full_output = Some(Arc::new("the complete host record".to_owned()));
+                    result
+                }],
             }),
             Arc::new(ContextBlock::CompactionTrigger),
         ],
@@ -117,6 +121,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
     assert_eq!(json["input"][1]["arguments"], r#"{"command":"pwd"}"#);
     assert_eq!(json["input"][2]["type"], "function_call_output");
     assert_eq!(json["input"][2]["call_id"], "call-1");
+    assert_eq!(json["input"][2]["output"], "done");
     assert_eq!(json["input"][3]["type"], "compaction_trigger");
     assert_eq!(json["tools"][0]["name"], "shell_run");
     assert_eq!(json["tool_choice"], "auto");
@@ -610,6 +615,7 @@ fn serializes_custom_tool_calls_and_results() {
         call_id: tool_call_id("call-1"),
         tool_type: ToolType::Custom,
         body: ToolOutput {
+            full_output: None,
             images: Arc::new(vec![rho_core::ImageContent {
                 media_type: "image/png".to_owned(),
                 data: vec![1, 2, 3],

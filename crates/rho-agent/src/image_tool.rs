@@ -59,11 +59,13 @@ impl ImageTools {
                     prepared.width,
                     prepared.height
                 )),
+                full_output: None,
                 images: Arc::new(vec![prepared.content]),
                 status: ToolOutputStatus::Success,
             },
             Err(error) => ToolOutput {
                 output: Arc::new(error.to_string()),
+                full_output: None,
                 images: Arc::new(Vec::new()),
                 status: ToolOutputStatus::Error,
             },

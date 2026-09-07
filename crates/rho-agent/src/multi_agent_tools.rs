@@ -308,11 +308,13 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
     };
     match result {
         Ok(output) => ToolOutput {
+            full_output: None,
             images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(output),
             status: ToolOutputStatus::Success,
         },
         Err(error) => ToolOutput {
+            full_output: None,
             images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(error.to_string()),
             status: ToolOutputStatus::Error,

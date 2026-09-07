@@ -584,6 +584,7 @@ async fn output_is_truncated_to_budget() {
         .await;
     assert!(result.output.contains("truncated"), "{}", result.output);
     assert!(result.output.len() < 2_000, "{}", result.output.len());
+    assert_eq!(result.recorded_output(), "x".repeat(10_000));
 }
 
 #[tokio::test]
