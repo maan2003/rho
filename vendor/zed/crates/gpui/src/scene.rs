@@ -76,6 +76,35 @@ pub struct Scene {
     recording_last_at: Option<Instant>,
 }
 
+/// Whether a scene records every primitive it is handed.
+///
+/// Recording is not free and is not a thing the reader pays for: it
+/// fingerprints each primitive by formatting its `Debug` into a hash,
+/// clones the record twice, clones the owner path (two `String`s), and
+/// reads the clock once, all per primitive. It was unconditional in
+/// `test` and `test-support` builds, which meant a harness measuring a
+/// frame's wall clock measured mostly this.
+#[cfg(any(test, feature = "test-support"))]
+static SCENE_RECORDERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one recorder as attached. Paired with [`scene_recorder_detached`].
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn scene_recorder_attached() {
+    SCENE_RECORDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one recorder as gone.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn scene_recorder_detached() {
+    SCENE_RECORDERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scene_recording_enabled() -> bool {
+    SCENE_RECORDERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
@@ -245,17 +274,24 @@ impl Scene {
                 self.surfaces.push(surface.clone());
             }
         }
-        let recorded = recorded.unwrap_or_else(|| self.record_primitive(&primitive));
-        let owner = recorded.owner.clone();
-        {
+        if scene_recording_enabled() {
+            let recorded = recorded.unwrap_or_else(|| self.record_primitive(&primitive));
+            let owner = recorded.owner.clone();
             self.recorded_hash ^= recorded.fingerprint;
             self.recorded_hash = self.recorded_hash.wrapping_mul(0x100000001b3);
             self.recorded_primitives.push(recorded.clone());
             self.recorded_operations.push(Some(recorded));
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+            self.record_owner_elapsed(&owner);
+        } else {
+            // The slot is still filled so that `replay` stays index-aligned
+            // with `paint_operations`; a replayed primitive that was never
+            // recorded is recorded then, by the scene replaying it.
+            self.recorded_operations.push(recorded);
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
-        self.record_owner_elapsed(&owner);
     }
 
     pub(crate) fn insert_hole(&mut self, hole: Quad) {

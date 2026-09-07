@@ -93,6 +93,17 @@ struct Recording<E> {
     previous: HashMap<SceneOwner, PreviousSubscene>,
     owners: HashMap<SceneOwner, SubsceneId>,
     owner_index: Vec<SceneOwner>,
+    /// How many windows this recorder was attached to, so that the scenes
+    /// stop recording when the last one goes.
+    attached: usize,
+}
+
+impl<E> Drop for Recording<E> {
+    fn drop(&mut self) {
+        for _ in 0..self.attached {
+            crate::scene::scene_recorder_detached();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -112,6 +123,7 @@ impl<E> Default for Recording<E> {
             previous: HashMap::new(),
             owners: HashMap::new(),
             owner_index: Vec::new(),
+            attached: 0,
         }
     }
 }
@@ -152,6 +164,8 @@ impl<E: Clone + 'static> SceneRecorder<E> {
     }
 
     pub(crate) fn callback(&self) -> Rc<dyn Fn(&Scene)> {
+        crate::scene::scene_recorder_attached();
+        self.0.borrow_mut().attached += 1;
         let state = self.0.clone();
         Rc::new(move |scene| record(&mut state.borrow_mut(), scene))
     }
