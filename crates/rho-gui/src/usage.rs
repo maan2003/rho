@@ -380,7 +380,6 @@ fn render_quota(summary: &QuotaSummary, height: Pixels, cx: &App) -> AnyElement 
         .child(
             axis_row(
                 height,
-                px(36.),
                 ["100%", "50%", "0%"].into_iter().map(str::to_owned),
                 summary.days,
                 canvas(
@@ -425,7 +424,6 @@ fn render_cost(summary: &CostSummary, height: Pixels, cx: &App) -> AnyElement {
         .child(
             axis_row(
                 height,
-                px(64.),
                 [
                     format!("${:.2}", summary.total),
                     format!("${:.2}", summary.total / 2.0),
@@ -489,7 +487,6 @@ fn render_share(summary: &ShareSummary, height: Pixels, cx: &App) -> AnyElement 
         .child(
             axis_row(
                 height,
-                px(64.),
                 ["full", "½", "0%"].into_iter().map(str::to_owned),
                 summary.days,
                 canvas(
@@ -545,7 +542,6 @@ fn render_agent_cost(summary: &AgentCostSummary, height: Pixels, cx: &App) -> An
         .child(
             axis_row(
                 height,
-                px(64.),
                 summary.ticks.clone().into_iter(),
                 summary.days,
                 canvas(
@@ -589,7 +585,6 @@ fn legend_row(legend: &[rho_agents::usage::Legend], cx: &App) -> gpui::Div {
 /// and how far back the left edge is under it.
 fn axis_row(
     height: Pixels,
-    label_width: Pixels,
     labels: impl Iterator<Item = String>,
     days: u64,
     chart: AnyElement,
@@ -601,9 +596,14 @@ fn axis_row(
         .items_start()
         .text_size(px(11.))
         .child(
+            // No width given: the column is as wide as its widest label,
+            // which is the only width that is right for every chart. A
+            // number picked for one of them wrapped `100%` onto two lines
+            // while `50%` fit.
             div()
                 .h(height)
-                .w(label_width)
+                .flex_none()
+                .whitespace_nowrap()
                 .pr_2()
                 .flex()
                 .flex_col()
