@@ -796,6 +796,68 @@ mod tests {
         );
     }
 
+    /// The last few tool calls of a running turn stay visible.
+    ///
+    /// Before 5 September they were: the turn in progress keeps its final
+    /// working fold open to a limited tail, and the reader watches the calls
+    /// arrive. On a story-made transcript they stopped, and the link that
+    /// broke is this one - the mirror never says `Streaming`, because it is
+    /// not the live tail, so it reports a running turn as `Unloaded`, and
+    /// `turn_open` read that as a turn that had finished. The last plan then
+    /// took `tail_rows` 0 and the calls folded away whole.
+    #[test]
+    fn a_running_turn_read_back_from_the_mirror_keeps_its_tail() {
+        let mut events = vec![
+            user("go", 1),
+            MirrorEvent::Turn {
+                edge: TurnEdge::Started,
+                at: UnixMs(2),
+            },
+        ];
+        for nth in 0..3 {
+            events.push(MirrorEvent::Sent {
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(3 + nth),
+            });
+            events.push(MirrorEvent::Replied {
+                text: String::new(),
+                calls: vec![ToolCallLine {
+                    id: format!("call-{nth}"),
+                    name: "shell".to_owned(),
+                    what: ToolLine::Command(format!("echo {nth}")),
+                    arguments: format!("{{\"cmd\":\"echo {nth}\"}}"),
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(3 + nth),
+            });
+        }
+        // No `TurnEdge::Finished`: this turn is still running, which is the
+        // state a reader opens a working agent in.
+        let state = told(events);
+        assert!(
+            crate::store::turn_open(state.status),
+            "a turn the mirror saw running is a turn in progress"
+        );
+
+        let visible = vec![true; state.blocks.len()];
+        let plans = crate::render::elision::elision_plans_from(
+            &state.blocks,
+            &visible,
+            0,
+            None,
+            crate::store::turn_open(state.status),
+        );
+        let last = plans.last().expect("the calls of the open turn elide");
+        assert_eq!(
+            last.tail_rows,
+            crate::render::elision::LIMITED_TAIL_ROWS,
+            "the open turn's last fold keeps its tail: {plans:?}"
+        );
+    }
+
     fn only_tool(state: &UiAgentState) -> &UiTool {
         state
             .blocks

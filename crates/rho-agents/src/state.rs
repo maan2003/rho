@@ -76,8 +76,14 @@ pub enum UiAgentStatus {
     /// The turn failed permanently; the error text is the trailing unsealed
     /// [`UiBlock::Notice`].
     Error,
-    /// The daemon stopped this client's live state stream. Retained transcript
-    /// content may still be displayed, but it is no longer being updated.
+    /// The daemon is not streaming to this client, and a turn was running
+    /// when it last heard. Retained transcript content is still displayed
+    /// and is no longer being updated.
+    ///
+    /// Only the mirror produces this, and only for a turn it saw running, so
+    /// [`crate::store::turn_open`] treats it as an open turn. A settled agent
+    /// read back from the story is `Idle`; do not widen this variant to cover
+    /// one without moving that decision with it.
     Unloaded,
 }
 

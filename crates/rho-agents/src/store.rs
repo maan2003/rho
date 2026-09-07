@@ -329,7 +329,12 @@ pub fn turn_open(status: UiAgentStatus) -> bool {
         UiAgentStatus::Streaming
         | UiAgentStatus::ToolCalling { .. }
         | UiAgentStatus::UnfinishedTurn { .. } => true,
-        UiAgentStatus::Idle | UiAgentStatus::Error | UiAgentStatus::Unloaded => false,
+        // The mirror's word for a turn in progress. It never says `Streaming`
+        // - it is not the live tail and cannot claim to be - so a running
+        // turn read back from the story arrives here, and the rows a reader
+        // came for are the last few of it.
+        UiAgentStatus::Unloaded => true,
+        UiAgentStatus::Idle | UiAgentStatus::Error => false,
     }
 }
 
