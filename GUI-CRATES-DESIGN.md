@@ -1033,6 +1033,21 @@ wrong at the design, not at the polish.
   Gate green on main dca5c374 (rebased onto b8os's transcript tail): rho-gui
   250 passed and 3 ignored, rho-window 11, clippy `-D warnings` clean,
   `cargo fmt --check` clean.
+- **Landed, the sweep for blocks that are never measured** (`rho-window`
+  modules touched: `style`, `transient`). The rule the refusal left behind
+  — read `rho-window` for `height: None` — read once, and then made
+  something a reader does not have to remember. The sweep found nothing to
+  fix: the three blocks the chrome hands out (the attachment chips, the
+  refusal, a transient's menu) all start at `Some(1)` and are resized to
+  what the element draws, and no `BlockProperties` built anywhere in
+  `crates/` is missing a height. So the change is two tests rather than a
+  fix. Each asserts that the block a constructor returns starts with a
+  height, which is the whole of the defect: `Block::has_height` is
+  `height.is_some()`, and a block without one is painted over the rows
+  below instead of moving them down — invisible on a surface with nothing
+  under it, which is why the refusal's took a rig session and a reading to
+  find. Proven by putting `refusal_block` back to `None` and watching the
+  test fail. Gate: rho-window 13 passed, `cargo fmt --check` clean.
 - **Dealing is composition, not a crate of its own.** Each source crate
   hands the dealer cards: the facts a card is ranked by and the reason
   it claims attention. A Find hit shares the reason type with a card but

@@ -372,6 +372,16 @@ mod tests {
             .item("shift-s", "snooze the room…", Verdict::Room)
     }
 
+    /// A menu is a block, and a block with no height is never measured —
+    /// `Block::has_height` is `height.is_some()` — so it paints over the
+    /// rows below instead of moving them down. That is how the verdict menu
+    /// first drew on the rig; the height is read back here so the next menu
+    /// cannot repeat it.
+    #[test]
+    fn a_menu_block_starts_with_a_height() {
+        assert!(verdicts().block(multi_buffer::Anchor::Min).height.is_some());
+    }
+
     #[test]
     fn one_key_runs_the_item_it_is_on_and_closes() {
         let mut menu = verdicts();

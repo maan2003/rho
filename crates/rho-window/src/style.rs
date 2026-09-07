@@ -268,3 +268,29 @@ fn render_attachment_block(labels: &[String], cx: &mut BlockContext<'_, '_>) -> 
     }
     row
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block with no height is never measured — `Block::has_height` is
+    /// `height.is_some()` — so it is drawn over the rows below it instead of
+    /// moving them down, and on a surface with nothing below it that defect
+    /// is invisible until something is added there. Both of the chrome's
+    /// blocks were `None` once and were found on the rig, one of them only
+    /// by reading for it. This is the rule read back as a test, so a block
+    /// added here without a height fails before it is ever drawn.
+    #[test]
+    fn every_block_the_chrome_draws_starts_with_a_height() {
+        assert!(
+            attachment_block(Anchor::Min, &[]).height.is_some(),
+            "the attachment chips are measured"
+        );
+        assert!(
+            refusal_block(Anchor::Min, "the daemon refused it".into())
+                .height
+                .is_some(),
+            "the refusal is measured"
+        );
+    }
+}
