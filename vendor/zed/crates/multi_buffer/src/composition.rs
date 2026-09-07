@@ -761,6 +761,9 @@ mod tests {
             tail: Vec::new(),
         };
         cx.update(|cx| composition.sync(&multibuffer, &spec, cx));
-        assert_eq!(text(&multibuffer, cx), "card\n");
+        // An end on the byte after the newline is narrowed to before it, so
+        // that the following line is not shown; the section's own newline
+        // goes with it.
+        assert_eq!(text(&multibuffer, cx), "card");
     }
 }
