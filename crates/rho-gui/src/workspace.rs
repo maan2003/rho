@@ -63,7 +63,8 @@ pub(crate) struct WarmSurface {
 }
 
 type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
-use crate::zed_remote::{FileView, RemoteProject};
+use rho_files::{FileView, RemoteProject};
+
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
     DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealDone,
@@ -159,7 +160,7 @@ pub(crate) enum SurfaceView {
         model: Entity<rho_shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
     },
-    Diff(Entity<crate::diff_view::DiffView>),
+    Diff(Entity<rho_files::DiffView>),
     Terminal(Entity<rho_terminal::TerminalView>),
     Browser(Entity<rho_browser::PageView>),
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
@@ -424,7 +425,7 @@ pub struct Workspace {
     /// closes, the remote channel and cache entry naturally expire.
     remote_projects: HashMap<
         (HostId, rho_ui_proto::WorkspaceInfo),
-        gpui::WeakEntity<crate::zed_remote::RemoteProjectState>,
+        gpui::WeakEntity<rho_files::RemoteProjectState>,
     >,
     pending_diff_loads: HashMap<AgentId, Task<()>>,
     /// Accumulated change summaries for materialized but hidden views; they
@@ -5188,7 +5189,7 @@ impl Workspace {
         let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
             let connection = self.connection_for(agent_id)?;
-            Some(crate::zed_remote::open_remote_project(
+            Some(rho_files::open_remote_project(
                 connection,
                 workspace.clone(),
                 cx,
@@ -5213,7 +5214,7 @@ impl Workspace {
                     }) else {
                         return;
                     };
-                    crate::zed_remote::open_file_buffer(&project, path, cx)
+                    rho_files::open_file_buffer(&project, path, cx)
                         .await
                         .map(|buffer| (project, buffer))
                 }
@@ -5345,10 +5346,10 @@ impl Workspace {
         let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
             let connection = self.connection_for(agent_id).expect("host still attached");
-            crate::zed_remote::open_remote_project(connection, workspace.clone(), cx)
+            rho_files::open_remote_project(connection, workspace.clone(), cx)
         });
         let task = cx.spawn(async move |this, cx| {
-            let result: anyhow::Result<(RemoteProject, crate::diff_view::PreparedDiff)> = async {
+            let result: anyhow::Result<(RemoteProject, rho_files::PreparedDiff)> = async {
                 let opened = match cached {
                     Some(project) => project,
                     None => project_task
@@ -5361,14 +5362,14 @@ impl Workspace {
                         this.cache_remote_project(host, workspace.clone(), opened)
                     })
                     .map_err(|_| anyhow::anyhow!("GUI closed while loading diff"))?;
-                let live_paths = cx.update(|cx| crate::diff_view::dirty_paths(&project, cx));
+                let live_paths = cx.update(|cx| rho_files::dirty_paths(&project, cx));
                 let snapshot_task = cx.update(|cx| {
                     diff_client.snapshot(workspace.clone(), None, live_paths.clone(), cx)
                 });
                 let snapshot = snapshot_task
                     .await?
                     .context("initial diff snapshot unexpectedly unchanged")?;
-                let prepared = crate::diff_view::PreparedDiff::load(
+                let prepared = rho_files::PreparedDiff::load(
                     &project,
                     &diff_client,
                     workspace.clone(),
@@ -5386,15 +5387,9 @@ impl Workspace {
                 Ok((project, prepared)) => {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let model = cx.new(|cx| {
-                            crate::diff_view::DiffModel::new(
-                                project,
-                                diff_client,
-                                workspace,
-                                prepared,
-                                cx,
-                            )
+                            rho_files::DiffModel::new(project, diff_client, workspace, prepared, cx)
                         });
-                        let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
+                        let view = cx.new(|cx| rho_files::DiffView::new(model, window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Diff(view));
                         this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);

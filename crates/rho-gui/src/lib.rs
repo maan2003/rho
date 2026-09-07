@@ -6,7 +6,6 @@ pub(crate) mod commands;
 pub(crate) mod create;
 pub mod dashboard;
 pub mod desk_view;
-pub(crate) mod diff_view;
 pub mod draft_view;
 pub(crate) mod find;
 pub mod home;
@@ -28,9 +27,9 @@ pub(crate) mod usage;
 #[cfg(feature = "walk-support")]
 pub mod walk;
 pub mod workspace;
-pub(crate) mod zed_remote;
 
 use gpui::{App, KeyBinding, actions};
+pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
     TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalScrollBottom,
@@ -94,7 +93,6 @@ actions!(
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
-        FileSave,
         BrowserExit,
         RailFocus,
         RailOpen,

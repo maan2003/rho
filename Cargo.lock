@@ -13933,6 +13933,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-files"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buffer_diff",
+ "camino",
+ "clock",
+ "editor",
+ "futures 0.3.33",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "path",
+ "rho-hosts",
+ "rho-rpc",
+ "rho-ui-proto",
+ "rho-window",
+ "text",
+ "theme",
+ "tracing",
+]
+
+[[package]]
 name = "rho-gui"
 version = "0.1.0"
 dependencies = [
@@ -13975,6 +13998,7 @@ dependencies = [
  "rho-core",
  "rho-db",
  "rho-desk",
+ "rho-files",
  "rho-hosts",
  "rho-iroh-auth",
  "rho-profiling",
