@@ -23,6 +23,7 @@ mod rig;
 mod slack;
 mod snapshot;
 mod telemetry;
+mod walk;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -55,6 +56,8 @@ enum Command {
     /// editor stages against the window they were measured in, and the CPU
     /// profile embedded in it.
     Telemetry { path: std::path::PathBuf },
+    /// Drive the real GUI headlessly with deterministic generated events.
+    Walk(walk::WalkArgs),
     /// Work with rigs: the runnable copies of a snapshot.
     #[command(subcommand)]
     Rig(rig::RigCommand),
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
             print!("{}", telemetry::summarize(&path)?);
             Ok(())
         }
+        Command::Walk(args) => walk::run(args),
         Command::Rig(command) => rig::run(command),
     }
 }

@@ -26,6 +26,7 @@ rho-fake-model.workspace = true
 rho-ui-proto.workspace = true
 rustls.workspace = true
 rho-slack = { workspace = true, features = ["fake", "ui"] }
+rho-gui = { path = "../rho-gui", features = ["walk-support"] }
 serde = { workspace = true }
 serde_json.workspace = true
 sha2.workspace = true

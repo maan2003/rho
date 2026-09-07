@@ -25,7 +25,7 @@ mod history;
 mod inlay_cost;
 mod minibuffer;
 mod results_under_folds;
-mod scene_fuzz;
+mod scene_walk;
 mod story;
 mod wrap_rows;
 use rho_agents::HostId;

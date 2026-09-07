@@ -6054,7 +6054,7 @@ impl Workspace {
     /// A transcript handed in whole, for a test that drives the view
     /// without a mirror to fold. Not an event: `rho-hosts` carries what a
     /// daemon said, and no daemon says this.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "walk-support"))]
     pub(crate) fn seed_transcript_for_test(
         &mut self,
         agent_id: AgentId,

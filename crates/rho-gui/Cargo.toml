@@ -17,6 +17,7 @@ path = "src/main.rs"
 [features]
 # Exposes internal entry points for `benches/`.
 bench-support = []
+walk-support = ["gpui/test-support", "dep:gpui_wgpu"]
 
 [dependencies]
 anyhow.workspace = true
@@ -43,6 +44,7 @@ gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-featur
   "wayland",
 ] }
 gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
+gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu", optional = true }
 iroh = { workspace = true }
 language = { path = "../../vendor/zed/crates/language" }
 libc = { version = "0.2" }
@@ -129,3 +131,4 @@ editor = { path = "../../vendor/zed/crates/editor", features = [
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }
+gpui_wgpu = { path = "../../vendor/zed/crates/gpui_wgpu" }

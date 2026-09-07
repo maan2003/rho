@@ -27,6 +27,8 @@ pub mod telemetry;
 pub(crate) mod terminal_view;
 pub mod transient;
 pub(crate) mod usage;
+#[cfg(feature = "walk-support")]
+pub mod walk;
 pub mod workspace;
 pub(crate) mod zed_remote;
 

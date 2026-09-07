@@ -11,6 +11,13 @@ enum DriveEvent {
 /// last excerpt must not repaint wrapped transcript or tool rows above it.
 #[gpui::test]
 fn composer_keystrokes_change_one_composer_scene(cx: &mut TestAppContext) {
+    *cx = TestAppContext::build_with_text_system(
+        gpui::TestDispatcher::new(0),
+        None,
+        Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
+            "Lilex",
+        )),
+    );
     let workspace = test_workspace(cx);
     cx.simulate_window_resize(*workspace, size(px(720.), px(800.)));
 
