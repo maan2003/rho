@@ -249,6 +249,35 @@ The first is caught by a known-answer check. The second is only caught by
 asking what the instrument *cannot* see, which is a question worth writing down
 beside every new check.
 
+### R6. The rig says which binaries it launched
+
+`rig up` prints, and writes to `logs/rig.log`, the tree commit and every
+binary's content hash, mtime and path. It **refuses to start** when any binary
+is older than the newest file under `crates/`, `vendor/` or `Cargo.lock`.
+`--allow-stale-binaries` overrides it, prints `STALE` on the ready line, and
+records `stale_binaries` in the session so `rig status` says so afterwards.
+
+This exists because on 2026-09-07 five consecutive sessions ran a GUI binary
+three hours older than the tree — a rebuild had picked up `rho-cli` and
+`rho-daemon` and not the GUI — and were reported as a commit that was never in
+them. It withdrew a crash result and a whole table of frame numbers, including
+one already sent onward. Nothing had ever checked, on a rig whose entire
+purpose is numbers over commits.
+
+The scoping to source that can affect a binary is deliberate: a doc-only edit
+must not make every binary look stale, or the override becomes habit and the
+check becomes noise.
+
+Two rules follow, and they are the reason the check is not enough on its own:
+
+- **A commit is a claim about the tree, not about the binaries.** Never
+  attribute a number to a commit without the identity line from the same
+  session that produced it.
+- **A report carries the drive's name and step count beside the commit.** One
+  commit produced 16%, 79% and 4.9% of frames over budget on three different
+  drives; without the drive named, a table of such rows reads as a trend and
+  is not one.
+
 ## The cases
 
 ### C1. Dealing after a restart

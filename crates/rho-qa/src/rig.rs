@@ -92,6 +92,12 @@ pub struct UpArgs {
     #[arg(long)]
     no_profile: bool,
 
+    /// Start even when a binary is older than the sources it was built
+    /// from. Every session that used this says so in its own report, and
+    /// its numbers belong to whatever was actually on disk.
+    #[arg(long)]
+    allow_stale_binaries: bool,
+
     /// Take a rig that is already up, stopping whatever is running on it.
     /// Without this, `up` refuses and says whose session holds it.
     #[arg(long)]
@@ -150,6 +156,15 @@ struct Session {
     by: Option<String>,
     binaries: String,
     tree_commit: Option<String>,
+    /// What was actually launched. The commit alone is a claim about the
+    /// tree, not about the binaries built from it, and the two came apart
+    /// for five sessions in one afternoon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    binary_hashes: Vec<String>,
+    /// Whether this session ran binaries older than their sources. A
+    /// session that did must never be readable as one that did not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stale_binaries: bool,
     /// What the GUI was told to profile to, so `rig down` knows which files
     /// this session left behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,6 +286,91 @@ fn up(args: UpArgs) -> Result<()> {
     {
         bail!("{held}");
     }
+    // Which binaries these actually are, before anything is started and
+    // before any number is attributed to a commit. This exists because five
+    // sessions in one afternoon ran a GUI three hours older than the tree
+    // and were reported as a commit that was never in them.
+    let mut identities = vec![
+        Identity::of("daemon", bin.daemon()),
+        Identity::of("rho", bin.rho()),
+        Identity::of("fake_slack", bin.fake_slack()),
+    ];
+    if !args.no_gui {
+        identities.push(Identity::of("gui", bin.gui()));
+    }
+    let repo = repo_root()?;
+    let newest = newest_source(&repo);
+    let mut ran_stale = false;
+    println!(
+        "tree    {} ({} binaries)",
+        crate::snapshot::tree_commit().unwrap_or_else(|| "unknown".to_owned()),
+        bin.label,
+    );
+    for identity in &identities {
+        println!("{}", identity.line());
+    }
+    // The same line into the rig's own log. A terminal scrolls away and a
+    // report is written from the log; the identity has to be in both or it
+    // is not there when it is needed.
+    {
+        use std::io::Write as _;
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("logs").join("rig.log"))?;
+        writeln!(
+            log,
+            "\n{} rig up: tree {} ({} binaries)\n{}",
+            chrono::Local::now().to_rfc3339(),
+            crate::snapshot::tree_commit().unwrap_or_else(|| "unknown".to_owned()),
+            bin.label,
+            identities
+                .iter()
+                .map(Identity::line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )?;
+    }
+    if let Some((source_at, source)) = &newest {
+        let stale = identities
+            .iter()
+            .filter(|identity| identity.modified.is_some_and(|at| at < *source_at))
+            .map(|identity| identity.name)
+            .collect::<Vec<_>>();
+        println!(
+            "  newest source {} ({})",
+            source
+                .strip_prefix(&repo)
+                .unwrap_or(source.as_path())
+                .display(),
+            source_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs().to_string())
+                .unwrap_or_else(|_| "unknown".to_owned()),
+        );
+        if !stale.is_empty() {
+            if !args.allow_stale_binaries {
+                bail!(
+                    "{} older than {}: build before running, or pass \
+                     --allow-stale-binaries and own the numbers",
+                    stale.join(", "),
+                    source
+                        .strip_prefix(&repo)
+                        .unwrap_or(source.as_path())
+                        .display(),
+                );
+            }
+            // Loud, and in the log as well as on the terminal: a session
+            // that ran stale binaries must be impossible to read as one
+            // that did not.
+            ran_stale = true;
+            println!(
+                "STALE   {} older than the sources, started anyway (--allow-stale-binaries)",
+                stale.join(", "),
+            );
+        }
+    }
+
     // Anything still running from the last session is the last session's, not
     // this one's.
     stop_gui(&root, &bin, &args.name);
@@ -358,6 +458,11 @@ fn up(args: UpArgs) -> Result<()> {
         by: holder(),
         binaries: bin.label.clone(),
         tree_commit: crate::snapshot::tree_commit(),
+        binary_hashes: identities
+            .iter()
+            .map(|identity| format!("{}:{}", identity.name, identity.hash))
+            .collect(),
+        stale_binaries: ran_stale,
         profile: profile_path.clone(),
         summary: None,
     });
@@ -495,6 +600,18 @@ fn status(name: &str) -> Result<()> {
     println!("  sessions {}", rig.sessions.len());
     if let Some(last) = rig.sessions.last() {
         println!("  last     {} on {} binaries", last.at, last.binaries);
+        if let Some(commit) = &last.tree_commit {
+            println!("  tree     {commit}");
+        }
+        if !last.binary_hashes.is_empty() {
+            println!("  ran      {}", last.binary_hashes.join(" "));
+        }
+        if last.stale_binaries {
+            println!(
+                "  STALE    this session ran binaries older than their sources; \
+                 its numbers belong to what was on disk, not to the tree above"
+            );
+        }
         if let Some(summary) = &last.summary {
             println!("  profile  {}", summary.line);
         }
@@ -1003,6 +1120,102 @@ fn binaries(which: Binaries, gui: bool) -> Result<Build> {
     Ok(bin)
 }
 
+/// What a binary is, so a session can be believed.
+///
+/// Every number the rig has ever produced was attributed to a commit on the
+/// assumption that the binaries were built from it. On 2026-09-07 five
+/// sessions ran a GUI three hours older than the tree and were reported as a
+/// commit that was never in them, which withdrew a crash result and a whole
+/// table of frame numbers. Nothing had ever checked.
+struct Identity {
+    name: &'static str,
+    path: PathBuf,
+    /// A short content hash. The mtime says when it was written; this says
+    /// whether it is the same binary as last time, which is the question
+    /// when a rebuild silently does nothing.
+    hash: String,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Identity {
+    fn of(name: &'static str, path: PathBuf) -> Self {
+        let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        // The whole file, hashed. These are hundreds of megabytes and this
+        // runs once per `rig up`, against a session that takes half a
+        // minute to become usable — the cost is not worth avoiding, and a
+        // hash of the first block would miss exactly the case that matters.
+        let hash = fs::read(&path)
+            .map(|bytes| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hasher::write(&mut hasher, &bytes);
+                format!("{:016x}", std::hash::Hasher::finish(&hasher))
+            })
+            .unwrap_or_else(|_| "missing".to_owned());
+        Self {
+            name,
+            path,
+            hash,
+            modified,
+        }
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "  {:<12} {} {}  {}",
+            self.name,
+            &self.hash,
+            self.modified
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| format!("mtime {}", since.as_secs()))
+                .unwrap_or_else(|| "mtime unknown".to_owned()),
+            self.path.display(),
+        )
+    }
+}
+
+/// The newest thing that could change a binary.
+///
+/// Scoped to `crates/`, `vendor/` and `Cargo.lock` rather than the whole
+/// tree: a doc-only edit is most of some engineers' commits and must not
+/// make every binary look stale, or the override becomes habit and the
+/// check becomes noise.
+fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    fn walk(dir: &Path, newest: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                // `target` is output, not source, and walking it would take
+                // longer than the rest of the tree put together.
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                walk(&path, newest);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && let Ok(at) = entry.metadata().and_then(|meta| meta.modified())
+                && newest.as_ref().is_none_or(|(held, _)| at > *held)
+            {
+                *newest = Some((at, path));
+            }
+        }
+    }
+
+    let mut newest = None;
+    walk(&root.join("crates"), &mut newest);
+    walk(&root.join("vendor"), &mut newest);
+    if let Ok(at) = fs::metadata(root.join("Cargo.lock")).and_then(|meta| meta.modified())
+        && newest.as_ref().is_none_or(|(held, _)| at > *held)
+    {
+        newest = Some((at, root.join("Cargo.lock")));
+    }
+    newest
+}
+
 fn repo_root() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("RHO_QA_REPO") {
         return Ok(PathBuf::from(dir));
@@ -1208,5 +1421,68 @@ mod tests {
             0o600
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The staleness check, shown to fail before it is trusted to pass.
+    ///
+    /// R5: an instrument that has only ever said "fine" has not been shown
+    /// capable of saying anything else. This builds a tree where a source
+    /// file is newer than a binary and asserts the comparison catches it,
+    /// then makes the binary newer and asserts it does not — the same
+    /// check, both answers, so a green `rig up` means something.
+    #[test]
+    fn a_binary_older_than_its_sources_is_seen_as_older() {
+        let dir = std::env::temp_dir().join(format!("rho-qa-staleness-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(dir.join("crates").join("thing").join("src")).expect("make a tree");
+
+        let binary = dir.join("binary");
+        fs::write(&binary, b"a binary").expect("write the binary");
+        // Sleep-free: set the times explicitly, so the test is about the
+        // comparison and not about how fast the filesystem's clock ticks.
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let new = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
+        let source = dir.join("crates").join("thing").join("src").join("lib.rs");
+        fs::write(&source, b"fn main() {}").expect("write the source");
+
+        set_modified(&binary, old);
+        set_modified(&source, new);
+        let (newest_at, newest_path) = super::newest_source(&dir).expect("a source was found");
+        assert_eq!(newest_path, source, "it must name the file it found");
+        let identity = super::Identity::of("binary", binary.clone());
+        assert!(
+            identity.modified.expect("the binary has an mtime") < newest_at,
+            "a binary written before its sources must read as older"
+        );
+
+        // The other answer. Without this the assertion above could hold for
+        // a check that always says "older".
+        set_modified(&binary, new + std::time::Duration::from_secs(1));
+        let identity = super::Identity::of("binary", binary);
+        assert!(
+            identity.modified.expect("the binary has an mtime") > newest_at,
+            "a binary written after its sources must read as newer"
+        );
+
+        // And a doc-only change must not make anything look stale, or the
+        // override becomes habit and the check becomes noise.
+        let doc = dir.join("crates").join("thing").join("NOTES.md");
+        fs::write(&doc, b"words").expect("write the doc");
+        set_modified(&doc, new + std::time::Duration::from_secs(600));
+        let (after_doc, _) = super::newest_source(&dir).expect("a source is still found");
+        assert_eq!(
+            after_doc, newest_at,
+            "a markdown file is not something a binary is built from"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open to set the time");
+        file.set_modified(at).expect("set the time");
     }
 }
