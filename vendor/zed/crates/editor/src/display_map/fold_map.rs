@@ -768,12 +768,83 @@ impl FoldMap {
             self.snapshot.inlay_snapshot = inlay_snapshot;
             Vec::new()
         } else {
-            let mut inlay_edits_iter = inlay_edits.iter().cloned().peekable();
-
             // The snapshot the old tree is written against. Lengths on the
             // two sides are only comparable through the buffer, so both
             // snapshots have to be in hand to convert either way.
             let old_inlay_snapshot = self.snapshot.inlay_snapshot.clone();
+
+            // A retained fold can straddle the start of a later edit in the
+            // batch. Widen that edit before either cursor starts walking, so
+            // overlapping widened edits are coalesced and the fold is rebuilt
+            // once from its beginning rather than appended at its old extent.
+            let mut normalized_edits: Vec<InlayEdit> = Vec::with_capacity(inlay_edits.len());
+            for mut edit in inlay_edits {
+                let (old_transform_start, _, old_transform) = self
+                    .snapshot
+                    .transforms
+                    .find::<InlayOffset, _>((), &edit.old.start, Bias::Left);
+                let transform_prefix = edit.old.start - old_transform_start;
+                if old_transform.is_some_and(|transform| !transform.is_fold())
+                    && transform_prefix <= edit.new.start.0.0
+                {
+                    edit.new.start -= transform_prefix;
+                    edit.old.start = old_transform_start;
+                }
+                loop {
+                    let old_start = old_inlay_snapshot.to_buffer_offset(edit.old.start);
+                    let new_start = inlay_snapshot.to_buffer_offset(edit.new.start);
+                    let mut folds = intersecting_folds(
+                        &old_inlay_snapshot,
+                        &self.snapshot.folds,
+                        old_start..old_inlay_snapshot.buffer.len(),
+                        true,
+                    );
+                    let mut containing = None;
+                    while let Some(fold) = folds.item() {
+                        let old_buffer_start =
+                            fold.range.start.to_offset(&old_inlay_snapshot.buffer);
+                        let old_buffer_end = fold.range.end.to_offset(&old_inlay_snapshot.buffer);
+                        let new_buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
+                        let new_buffer_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
+                        if old_buffer_start > old_start && new_buffer_start > new_start {
+                            break;
+                        }
+                        let old_range = old_inlay_snapshot.to_inlay_offset(old_buffer_start)
+                            ..old_inlay_snapshot.to_inlay_offset(old_buffer_end);
+                        let new_range = inlay_snapshot.to_inlay_offset(new_buffer_start)
+                            ..inlay_snapshot.to_inlay_offset(new_buffer_end);
+                        if (old_range.start < edit.old.start && edit.old.start <= old_range.end)
+                            || (new_range.start < edit.new.start && edit.new.start <= new_range.end)
+                        {
+                            containing = Some((old_buffer_start, new_buffer_start));
+                            break;
+                        }
+                        folds.next();
+                    }
+                    let Some((old_buffer_start, new_buffer_start)) = containing else {
+                        break;
+                    };
+                    edit.old.start = edit.old.start.min(widen_start_over_inlays(
+                        &old_inlay_snapshot,
+                        old_buffer_start,
+                    ));
+                    edit.new.start = edit
+                        .new
+                        .start
+                        .min(widen_start_over_inlays(&inlay_snapshot, new_buffer_start));
+                }
+                while normalized_edits.last().is_some_and(|previous| {
+                    edit.old.start <= previous.old.end || edit.new.start <= previous.new.end
+                }) {
+                    let previous = normalized_edits.pop().unwrap();
+                    edit.old.start = edit.old.start.min(previous.old.start);
+                    edit.old.end = edit.old.end.max(previous.old.end);
+                    edit.new.start = edit.new.start.min(previous.new.start);
+                    edit.new.end = edit.new.end.max(previous.new.end);
+                }
+                normalized_edits.push(edit);
+            }
+            let mut inlay_edits_iter = normalized_edits.iter().cloned().peekable();
 
             let mut new_transforms = SumTree::<Transform>::default();
             let mut cursor = self.snapshot.transforms.cursor::<InlayOffset>(());
@@ -810,15 +881,13 @@ impl FoldMap {
                 edit.new.end = InlayOffset(MultiBufferOffset(
                     ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
                 ));
-
-                let anchor = inlay_snapshot
-                    .buffer
-                    .anchor_before(inlay_snapshot.to_buffer_offset(edit.new.start));
-                let mut folds_cursor = self
-                    .snapshot
-                    .folds
-                    .cursor::<FoldRange>(&inlay_snapshot.buffer);
-                folds_cursor.seek(&FoldRange(anchor..Anchor::Max), Bias::Left);
+                let edit_start = inlay_snapshot.to_buffer_offset(edit.new.start);
+                let mut folds_cursor = intersecting_folds(
+                    &inlay_snapshot,
+                    &self.snapshot.folds,
+                    edit_start..inlay_snapshot.buffer.len(),
+                    false,
+                );
                 let folds_cursor_work = std::cell::Cell::new(folds_cursor.walked_items());
 
                 let mut folds = iter::from_fn({
@@ -851,6 +920,11 @@ impl FoldMap {
                         let (fold, mut fold_range) = folds.next().unwrap();
                         let sum = new_transforms.summary();
 
+                        // Historical anchors at the edit boundary can make the
+                        // intersection cursor include a fold already copied in full.
+                        if fold_range.end.0 <= sum.input.len {
+                            continue;
+                        }
                         assert!(fold_range.start.0 >= sum.input.len);
 
                         while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
@@ -1071,7 +1145,7 @@ impl FoldMap {
 
             drop(cursor);
 
-            let mut fold_edits = Vec::with_capacity(inlay_edits.len());
+            let mut fold_edits = Vec::with_capacity(normalized_edits.len());
             #[cfg(feature = "wrap-test-support")]
             let mut widening_violations = Vec::new();
             #[cfg(feature = "wrap-test-support")]
@@ -1092,7 +1166,7 @@ impl FoldMap {
                     .cursor::<Dimensions<InlayOffset, FoldOffset>>(());
                 let mut new_transforms =
                     new_transforms.cursor::<Dimensions<InlayOffset, FoldOffset>>(());
-                for mut edit in inlay_edits {
+                for mut edit in normalized_edits {
                     // An edit landing inside a fold is widened to the fold,
                     // which has to be re-emitted whole. Both sides of the
                     // edit name the same boundary in the text - the bytes
@@ -3164,7 +3238,7 @@ mod tests {
                 expected_text
             );
 
-            for (output_row, line) in expected_text.lines().enumerate() {
+            for (output_row, line) in expected_text.split('\n').enumerate() {
                 let line_len = snapshot.line_len(output_row as u32);
                 assert_eq!(line_len, line.len() as u32);
             }
