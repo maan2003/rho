@@ -20,7 +20,6 @@ pub mod pane;
 pub mod rho_assets;
 #[cfg(test)]
 mod sampler;
-pub(crate) mod shell_view;
 pub mod slack;
 #[doc(hidden)]
 pub mod telemetry;
@@ -32,6 +31,7 @@ pub mod workspace;
 pub(crate) mod zed_remote;
 
 use gpui::{App, KeyBinding, actions};
+pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
     TerminalNormalMode, TerminalPaste, TerminalRawMode, TerminalScrollBottom,
     TerminalScrollHalfPageDown, TerminalScrollHalfPageUp, TerminalScrollLineDown,
@@ -106,11 +106,6 @@ actions!(
         MinibufferComplete,
         GitApprovalAllow,
         GitApprovalDeny,
-        ShellInterrupt,
-        ShellEof,
-        ShellPagerMore,
-        ShellPagerAll,
-        ShellPagerQuit,
         VoiceToggle,
         UploadGuiTelemetry,
         ZulipOpenRow,

@@ -25,6 +25,17 @@ use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use theme::ActiveTheme as _;
 
+gpui::actions!(
+    rho_shell_view,
+    [
+        ShellInterrupt,
+        ShellEof,
+        ShellPagerMore,
+        ShellPagerAll,
+        ShellPagerQuit
+    ]
+);
+
 const PROMPT_INLAY_ID: usize = 0;
 const ANSI_HIGHLIGHT_KEY_BASE: usize = usize::MAX / 2;
 const MAX_RENDERED_STYLE_SPANS: usize = MAX_STYLE_SPANS;

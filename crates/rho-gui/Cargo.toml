@@ -69,6 +69,7 @@ rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
 rho-ui-proto.workspace = true
 rho-slack = { workspace = true, features = ["ui"] }
+rho-shell-view = { workspace = true }
 rho-terminal = { workspace = true }
 rho-transcript.workspace = true
 image = { version = "0.25", default-features = false }

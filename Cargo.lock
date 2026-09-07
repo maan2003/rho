@@ -13980,6 +13980,7 @@ dependencies = [
  "rho-profiling",
  "rho-rpc",
  "rho-rtc",
+ "rho-shell-view",
  "rho-slack",
  "rho-terminal",
  "rho-transcript",
@@ -14216,6 +14217,24 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "senax-encoder",
+ "tokio",
+]
+
+[[package]]
+name = "rho-shell-view"
+version = "0.1.0"
+dependencies = [
+ "editor",
+ "futures 0.3.33",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "rho-hosts",
+ "rho-terminal",
+ "rho-ui-proto",
+ "rho-window",
+ "text",
+ "theme",
  "tokio",
 ]
 

@@ -156,7 +156,7 @@ pub(crate) enum SurfaceView {
     },
     File(Entity<FileView>),
     Shell {
-        model: Entity<crate::shell_view::ShellModel>,
+        model: Entity<rho_shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
     },
     Diff(Entity<crate::diff_view::DiffView>),
@@ -5262,7 +5262,7 @@ impl Workspace {
             match result {
                 Ok(channel) => {
                     let _ = this.update_in(cx, |this, window, cx| {
-                        let model = cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
+                        let model = cx.new(|cx| rho_shell_view::ShellModel::new(channel, cx));
                         let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Shell { model, editor });
                         this.display_surface(surface, cx);
