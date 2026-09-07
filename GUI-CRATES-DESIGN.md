@@ -997,6 +997,72 @@ wrong at the design, not at the polish.
   owed list. The menu's own cost is session 41's, ten round trips and
   nothing else, none over 8 ms.
 
+- **The rig proof for surfaces and history, and what `S` is** (`rho-window`
+  `history` doc; `RHO-WINDOW-DESIGN.md` the section). Desk session 84, first
+  open of a fresh process on the user's snapshot at 2560x1664 scale 2, main
+  0caf8671. Frames compared byte for byte by md5; every claim below has a
+  no-input control taken over the same span on the same surface, because a
+  frame of Home is not equal to itself — the agent ages tick and the row
+  moves between "next" and "running" while you watch.
+  **The question first, because it decides whether the rest matters.**
+  eng-en1p read `back` dropping the surface it leaves and asked whether that
+  destroys the view, which would break the Emacs rule on the ordinary path:
+  leaving a buffer never kills it. It does not. `S` is a handle — every
+  `SurfaceView` variant is a refcounted `Entity`, and the context's buffer
+  list (`surfaces: HashMap<ContextId, Vec<Surface>>`) holds a clone that
+  `make_surface` returns rather than building a second view — so dropping the
+  entry drops a handle. The machine's doc now says `S` must be a handle and
+  why, and the design section says it in the same words. The one path that
+  really destroys a view is eviction, `release_agent`, and it already has the
+  warm store: `warm_surface` rebuilds the transcript if back reaches it.
+  **Proven on the rig, three pairs, each against its control.**
+  (1) A desk node with the point set, the usage screen opened over it, back:
+  the frame on the node is byte-identical to the frame before leaving
+  (`5c4ebc6b`… twice; the usage frame in between `2e3f345a`). Control: the
+  node frame is stable over 5 s with no input.
+  (2) The same node scrolled twenty-five rows down, left for the usage
+  screen, back: byte-identical again, same digest.
+  (3) A transcript — 275k, eng-en1p's, scrolled eighty rows up into history
+  with a fold opened so the display map is not its default — left for the
+  usage screen in the same context and returned to: byte-identical
+  (`f39e9e01`… twice), control clean.
+  **And the case en1p added: the surface back drops, reopened.** The node was
+  dropped by a second back, then reopened from Home. 1,512 pixels of
+  4,259,840 differ, 0.036%, in exactly two bands eighteen pixels wide and one
+  text row tall: the cursor leaving the row it was on and arriving on the row
+  Home named. The scroll — twenty-five rows into the document — is identical,
+  which is the whole answer: a rebuilt view would have started at the top.
+  The point moves because opening from Home *is* "go to this node", so the
+  open path places it; history did not lose it.
+  **The one case not run, and why.** "The thing behind B is deleted while it
+  is in the stack" is not reachable from the keyboard now that history is per
+  context: an agent's transcript lives in that agent's context, and
+  `prune_contexts` drops the whole context when the agent goes, so there is
+  no stack left to walk. I checked that rather than assuming it — the
+  workspace test for it passes with the `forget` call commented out. The
+  invariant is proven on the machine instead, where a key can be forgotten
+  under a stack that outlives it: `a_forgotten_surface_is_never_shown_again`
+  and `forgetting_removes_every_entry_for_that_key`.
+  **Cost.** Nothing in the profile belongs to the history machine, which is
+  what O(1) with nothing walked at draw time looks like from outside. The
+  session's own numbers, reported as they came: 1,404 frames, draw p99 9.4 ms
+  with 29 frames over 8 ms, dirty-to-draw p99 82 ms and a worst gap of
+  275 ms, 88,507 editor events. That fails the handbook on both counts and
+  the drive is why — it is a first open of a 275k transcript and of the whole
+  desk tree with eighty-key scroll bursts, not a controlled comparison. One
+  number in it is worth someone's time and is not mine: `wrap_map_update`,
+  30 calls, `input_rows` p50 and p99 both 1,048, `duration_ms` p50 2.84 ms
+  and max 1,519 ms. A 500× spread at constant input size is not the row
+  count, and b8os's `wrap_map_rewrap` puts 500 rows at 2.1 ms, so it is a
+  cold or contended path inside the update rather than work proportional to
+  anything. Filed for cut B's owner rather than fixed here.
+  **Two drive details for whoever runs the next one.** `ctrl-k` does not
+  reach the application through the rig's driver — `f21`, bound to the same
+  `SurfaceBack`, does, and every back above was driven with it. And the
+  leader menu draws past the bottom of the screen: `space` then `s` shows
+  entries clipped by the window edge, which is a defect for the sweep, not
+  for this note.
+
 - **Landed, surfaces and history are one machine** (`rho-window` module
   added: `history`; `rho-gui` `pane` cut down to `SurfaceKey`, `workspace`,
   `workspace_phone`, and `create` and `slack` where they read the viewport;

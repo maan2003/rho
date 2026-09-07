@@ -12,6 +12,15 @@
 //! selections, scroll and folds. Nothing here remembers a position, which
 //! is why nothing here can be wrong about one.
 //!
+//! What `S` must be. Leaving a surface drops this machine's copy of it, so
+//! `S` has to be a *handle* to a view the caller keeps elsewhere, not the
+//! view itself. In `rho-gui` it is `Surface`, whose every variant is a
+//! refcounted `Entity`, and the context's own buffer list holds a clone;
+//! dropping an entry drops a handle and nothing else, which is why leaving
+//! a buffer here never kills it, exactly as in Emacs. A caller that stored
+//! the only copy of a view in an entry would lose it on the way back, and
+//! that is a bug in the caller, not a behaviour this machine offers.
+//!
 //! What it costs. A push is one `Vec::push` and one map write. Going back
 //! pops, skipping entries that are no longer the newest for their key;
 //! each such entry is skipped at most once in the life of the stack, so

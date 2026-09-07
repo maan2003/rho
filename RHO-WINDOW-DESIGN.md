@@ -295,6 +295,25 @@ Restoring by replay — remembering a line and a column and seeking to them —
 is the design this rejects, because it is a second copy of the truth that is
 wrong whenever the buffer changed underneath.
 
+It follows that what the stack stores is a handle, never the only copy of a
+view. Going back drops the machine's entry for the surface being left, so if
+that entry owned the view, leaving B and returning to it would find B fresh
+with its point, scroll and folds gone — the Emacs rule broken on the ordinary
+path, since leaving a buffer never kills it. It is not: every `SurfaceView`
+variant is a refcounted `Entity`, and the context's buffer list
+(`surfaces: HashMap<ContextId, Vec<Surface>>`) holds a clone, which
+`make_surface` returns rather than building a second view. Dropping the entry
+drops a handle. The one path that really destroys a view is eviction —
+`release_agent` takes an unshown transcript out of the buffer list and drops
+its model — and that path already has the warm store this design would
+otherwise need: `warm_surface` rebuilds the transcript if back reaches it.
+
+Worth naming while it is in view, as an item rather than a change here:
+closing a surface removes it from history but leaves it in the buffer list,
+so `q` is `bury-buffer` and not `kill-buffer`. That is what main did too and
+nothing depends on it either way, but the two words mean different things and
+the code currently says only one of them.
+
 It does not restore a menu. A menu is open over a surface, not part of one,
 and leaving closes it; coming back finds the surface as it was with nothing
 over it. The alternative — history entries that carry a transient — would
