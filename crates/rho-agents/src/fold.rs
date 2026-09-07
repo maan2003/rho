@@ -542,7 +542,10 @@ impl TranscriptFold {
                         UiBlock::Tool(UiTool {
                             id: call.id.clone(),
                             name: call.name.clone(),
-                            arguments: call.what.text(),
+                            // What the model sent, whole. `what` is the
+                            // label's field and reduces a call to one of
+                            // them; a reader is reading the call.
+                            arguments: call.arguments.clone(),
                             preview: None,
                             // Until the `Sent` that carries its result says
                             // otherwise.
@@ -793,6 +796,87 @@ mod tests {
         );
     }
 
+    fn only_tool(state: &UiAgentState) -> &UiTool {
+        state
+            .blocks
+            .iter()
+            .find_map(|block| match &**block {
+                UiBlock::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("the call is a tool block")
+    }
+
+    /// A code-mode `exec` call's arguments are JavaScript source, not JSON,
+    /// so no field of `ToolLine` can name them and `what` is `Nothing`. The
+    /// call has to carry them itself or the transcript shows the word
+    /// "exec" and the code is gone, which is what the user saw.
+    #[test]
+    fn an_exec_call_folds_to_a_tool_whose_arguments_are_the_code() {
+        let code = "const files = await tools.exec_command({ cmd: 'ls' });\nconsole.log(files);\n";
+        let state = told(vec![
+            user("what is in there", 1),
+            MirrorEvent::Turn {
+                edge: TurnEdge::Started,
+                at: UnixMs(2),
+            },
+            MirrorEvent::Sent {
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(2),
+            },
+            MirrorEvent::Replied {
+                text: String::new(),
+                calls: vec![ToolCallLine {
+                    id: "call-1".to_owned(),
+                    name: "exec".to_owned(),
+                    what: ToolLine::Nothing,
+                    arguments: code.to_owned(),
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(2),
+            },
+        ]);
+        let tool = only_tool(&state);
+        assert_eq!(tool.arguments, code, "the whole cell, every line of it");
+    }
+
+    /// And the reduction that lost it is still the label's: a shell call
+    /// reads its command out of the arguments it now carries.
+    #[test]
+    fn a_shell_call_still_labels_with_its_command() {
+        let state = told(vec![
+            user("build it", 1),
+            MirrorEvent::Turn {
+                edge: TurnEdge::Started,
+                at: UnixMs(2),
+            },
+            MirrorEvent::Sent {
+                results: Vec::new(),
+                compaction: false,
+                at: UnixMs(2),
+            },
+            MirrorEvent::Replied {
+                text: String::new(),
+                calls: vec![ToolCallLine {
+                    id: "call-1".to_owned(),
+                    name: "shell_command".to_owned(),
+                    what: ToolLine::Command("cargo build".to_owned()),
+                    arguments: r#"{"command":"cargo build"}"#.to_owned(),
+                }],
+                compacted: false,
+                usage: None,
+                context_used: None,
+                at: UnixMs(2),
+            },
+        ]);
+        let tool = only_tool(&state);
+        let (label, _) = crate::render::tool_label(&tool.name, &tool.arguments);
+        assert_eq!(label, "$ cargo build");
+    }
+
     #[test]
     fn a_told_turn_reads_as_a_transcript() {
         let state = told(vec![
@@ -812,6 +896,7 @@ mod tests {
                     id: "call-1".to_owned(),
                     name: "Read".to_owned(),
                     what: ToolLine::Path("/tmp/README.md".into()),
+                    arguments: r#"{"file_path":"/tmp/README.md"}"#.to_owned(),
                 }],
                 compacted: false,
                 usage: Some(Usage {
@@ -860,7 +945,11 @@ mod tests {
         let UiBlock::Tool(tool) = &*state.blocks[1] else {
             panic!("the call is a tool block");
         };
-        assert_eq!(tool.arguments, "/tmp/README.md");
+        assert_eq!(
+            tool.arguments, r#"{"file_path":"/tmp/README.md"}"#,
+            "the call carries what the model sent; the label reads the path \
+             out of it at render time"
+        );
         assert_eq!(tool.status, UiToolStatus::Error);
         assert_eq!(tool.finished_at, Some(UnixMs(4)));
         assert_eq!(tool.output, None, "the mirror never carries tool output");

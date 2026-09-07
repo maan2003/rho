@@ -217,6 +217,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         what: tool_line(&call.arguments),
+                        arguments: call.arguments.clone(),
                     })
                     .collect(),
                 compacted: false,
@@ -368,6 +369,7 @@ fn replied(
                 id: id.as_str().to_owned(),
                 name: name.as_str().to_owned(),
                 what: tool_line(arguments),
+                arguments: arguments.clone(),
             }),
             InferenceResponseItem::Compaction { .. } => compacted = true,
             InferenceResponseItem::EncryptedReasoning { .. }
@@ -386,8 +388,9 @@ fn replied(
 }
 
 /// What a call shows next to its name, read out of its arguments: the
-/// first of the fields a person would recognise, whole. The rest of the
-/// arguments are a body, asked for by position.
+/// first of the fields a person would recognise, whole. The arguments
+/// themselves travel beside it, so a call whose arguments no field of this
+/// can name still draws what the model sent.
 pub fn tool_line(arguments: &str) -> ToolLine {
     let Ok(serde_json::Value::Object(fields)) =
         serde_json::from_str::<serde_json::Value>(arguments)

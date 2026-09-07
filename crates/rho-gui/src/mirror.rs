@@ -31,13 +31,23 @@ pub const FILE_NAME: &str = "agent-mirror.redb";
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; a daemon with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v1");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v2");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v1");
 /// One agent's mirror, ordered by position, agent first: a range read
 /// gives one agent's events and nothing else.
+/// The version in the name is the story's format, not redb's. A fold that
+/// drops something the daemon sent cannot be repaired from what is on
+/// disk — the rows here are all the client has — so the version moves and
+/// the old table goes, and the copy starts over from the daemon's raw log
+/// with the cursor beside it. That is why `HOSTS` moves with it: a cursor
+/// kept past the rows it counted would ask only for what is new.
+///
+/// v2: tool calls carry the arguments the model sent. v1 kept only the one
+/// field a label names, so a code-mode `exec` call — whose arguments are
+/// JavaScript, not JSON — stored nothing at all.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
-    TableDefinition::new("gui_mirror_events_v1");
+    TableDefinition::new("gui_mirror_events_v2");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
@@ -61,12 +71,16 @@ struct VerdictName;
 impl RecordedTypeName for VerdictName {
     const NAME: &'static str = "rho-db::Sen<rho_registry::fold::Verdict>";
 }
-/// The rows the story kept, and the attention the view once stored.
-/// Nothing reads them.
-const RETIRED_TABLES: [&str; 3] = [
+/// Tables nothing reads: retired folds, and the rows and cursor of a story
+/// format the client has moved past. Dropped on open, every open.
+const RETIRED_TABLES: [&str; 5] = [
     "gui_agent_head_v1",
     "gui_agent_story_v1",
     "gui_agent_attention_v1",
+    // The story's v1 rows and the cursor that counted them. Deleted rather
+    // than migrated: the daemon has the raw log and the client re-derives.
+    "gui_mirror_events_v1",
+    "gui_mirror_host_v1",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]

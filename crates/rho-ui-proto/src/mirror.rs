@@ -137,13 +137,26 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
-/// One call a response made: enough to draw its row. `what` is the
-/// argument a person recognises, whole; the rest is a body.
+/// One call a response made: enough to draw it. `what` is the argument a
+/// person recognises, for the row's label; `arguments` is what the model
+/// actually sent, whole, because that is what a reader of a transcript is
+/// reading. A code-mode `exec` call has no field a label could name — its
+/// arguments are JavaScript source, not JSON — so without this it drew as
+/// the word "exec" and the code was gone.
+///
+/// A result is still a body fetched by position. Arguments are not: they
+/// are small next to an output, they are what the reader came for, and
+/// asking for them by position would mean a transcript that cannot be read
+/// until it is asked twice.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct ToolCallLine {
     pub id: String,
     pub name: String,
     pub what: ToolLine,
+    /// Empty when the row came from a daemon older than this field; the
+    /// client then draws the label alone, as it did before.
+    #[senax(default)]
+    pub arguments: String,
 }
 
 /// How one call ended. The output is a body; ask for it by position.

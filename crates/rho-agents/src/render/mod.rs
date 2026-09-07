@@ -578,7 +578,7 @@ pub fn format_running_duration(started_at_ms: u64, now_ms: u64) -> String {
 /// `$ command`. Claude's file tools render as `read/write/edit path` so the
 /// transcript shows the touched file instead of raw JSON arguments. Argument
 /// extraction tolerates the partial JSON seen while arguments stream.
-fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
+pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
     match name {
         "shell" | "shell_command" | "Bash" => {
             let command = shell_command_argument_label(arguments);
