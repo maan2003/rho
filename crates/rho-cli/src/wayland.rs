@@ -634,15 +634,25 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
 }
 
 fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
-    let mut parts: Vec<_> = chord.split('+').collect();
-    let key = parts
-        .pop()
+    // Modifiers come off the front, separated by either `+` or `-`. The `-`
+    // spelling is the one every keymap in this repo uses (`ctrl-k` in
+    // `bind_rho_key_overrides`), so a drive script written from a binding
+    // has to work; taking only `+` meant `key:ctrl-k` reached wtype as one
+    // key name and failed with "Unknown key". A leading segment that is not
+    // a modifier ends the scan, so a key whose own name has a dash is left
+    // whole.
+    let mut rest = chord;
+    let mut modifiers = Vec::new();
+    while let Some(position) = rest.find(['+', '-']) {
+        let Ok(modifier) = wtype_modifier(&rest[..position]) else {
+            break;
+        };
+        modifiers.push(modifier);
+        rest = &rest[position + 1..];
+    }
+    let key = Some(rest)
         .filter(|key| !key.is_empty())
         .context("key chord is empty")?;
-    let mut modifiers = Vec::new();
-    for modifier in parts {
-        modifiers.push(wtype_modifier(modifier)?);
-    }
     // A bare modifier is pressed and released as a modifier, not typed as a
     // keysym: an app that decides a tap from the modifier state has to see
     // it go down and come back up, which `-k Shift_L` never does.
@@ -940,6 +950,50 @@ mod tests {
             [
                 "-s", "50", "-M", "ctrl", "-M", "shift", "-k", "Return", "-m", "shift", "-m",
                 "ctrl", "-s", "50"
+            ]
+        );
+    }
+
+    /// The keymap spells a chord `ctrl-k`, so the driver has to take it.
+    /// Before this, `-` was not a separator and the whole chord went to
+    /// wtype as one key name: `Unknown key 'ctrl-k'`, exit 1, which is loud
+    /// but only if the drive script is reading stderr.
+    #[test]
+    fn a_chord_may_be_spelled_the_way_the_keymap_spells_it() {
+        let dashed = wtype_key_args("ctrl-k").unwrap();
+        let plussed = wtype_key_args("ctrl+k").unwrap();
+        assert_eq!(dashed, plussed);
+        let args: Vec<_> = dashed.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "ctrl", "-k", "k", "-m", "ctrl", "-s", "50"
+            ]
+        );
+        assert_eq!(
+            wtype_key_args("ctrl-shift-backspace").unwrap(),
+            wtype_key_args("ctrl+shift+backspace").unwrap()
+        );
+    }
+
+    /// The scan stops at the first segment that is not a modifier, so a key
+    /// whose own name holds a dash is still one key.
+    #[test]
+    fn a_dash_that_is_not_a_modifier_stays_part_of_the_key() {
+        let args = wtype_key_args("some-key").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "-k", "some-key", "-s", "50"]);
+    }
+
+    /// And a chord whose key *is* the dash still names it.
+    #[test]
+    fn the_minus_key_survives_being_the_separator() {
+        let args = wtype_key_args("ctrl+-").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "ctrl", "-k", "-", "-m", "ctrl", "-s", "50"
             ]
         );
     }
