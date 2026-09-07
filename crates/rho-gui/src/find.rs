@@ -221,7 +221,7 @@ pub(crate) fn rank_names(candidates: &[(Vec<String>, i64)], query: &str) -> Vec<
 
 /// Slack conversations and threads as findable paths. A thread hangs
 /// under the conversation it is in, which is how the reader names it.
-fn slack_candidates(
+pub(crate) fn slack_candidates(
     rows: Vec<rho_slack::model::ConversationRow>,
     threads: Vec<(
         rho_slack::types::ThreadKey,
@@ -259,7 +259,8 @@ impl Workspace {
     /// it means. The one seam onto the tree: slice 2 changes what a target
     /// carries, not the prompt.
     pub(crate) fn find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
-        let mut candidates = self.dashboard.find_candidates(&self.registry, cx);
+        let mut candidates =
+            crate::candidates::find_candidates(&self.desk_cells, &self.registry, cx);
         let mut slack = self.slack_find_candidates(cx);
         // A Slack room is findable because Slack says it exists rather than
         // because the tree holds a row for it, so its labels are joined on
@@ -304,11 +305,13 @@ impl Workspace {
     /// What the finder's `row`th match for `query` opens. Two agents can
     /// share a name, and so a path: which of them the reader highlighted
     /// is the row, never the text.
-    pub(crate) fn find_target_at(&self, query: &str, row: usize, cx: &App) -> Option<FindTarget> {
-        ranked_find_candidates(self.find_candidates(cx), query)
+    pub(crate) fn find_target_at(&self, query: &str, row: usize) -> Option<FindTarget> {
+        self.find_snapshot
+            .as_ref()?
+            .ranked(query)
             .into_iter()
             .nth(row)
-            .map(|candidate| candidate.target)
+            .map(|candidate| candidate.target.clone())
     }
 
     /// Slack's side of the tree: one path per conversation, and one per
@@ -336,17 +339,67 @@ impl Workspace {
         slack_candidates(session.rows(), threads)
     }
 
+    /// What one keystroke in the finder costs: the candidates rebuilt and
+    /// ranked, which is what the completion closure below does on every
+    /// character typed.
+    #[cfg(test)]
+    pub(crate) fn find_rows_for_test(&self, input: &str, cx: &App) -> Vec<Candidate> {
+        self.find_rows_over_for_test(Vec::new(), input, cx)
+    }
+
+    /// What the picker's open costs: the whole candidate set and the names
+    /// it will be ranked by, which is the frame the reader pays for.
+    #[cfg(test)]
+    pub(crate) fn find_snapshot_for_test(
+        &self,
+        slack: Vec<FindCandidate>,
+        cx: &App,
+    ) -> FindSnapshot {
+        let mut candidates = self.find_candidates(cx);
+        candidates.extend(slack);
+        FindSnapshot::of(candidates)
+    }
+
+    /// What a keystroke costs: the ranking, over a set already in hand.
+    #[cfg(test)]
+    pub(crate) fn find_rows_in_for_test(snapshot: &FindSnapshot, input: &str) -> Vec<Candidate> {
+        snapshot.rows(input)
+    }
+
+    /// The same keystroke with `slack` standing in for what a connected
+    /// session would have contributed.
+    ///
+    /// A Slack workspace's rooms are a large part of what the finder ranks,
+    /// and standing up a real session — a client, a mirror, a socket — to
+    /// count them would measure the session rather than the finder. So the
+    /// rows are handed in and everything after them is the real path:
+    /// `find_candidates` builds the desk's half exactly as the completion
+    /// closure does, the two halves are concatenated the same way, and the
+    /// ranking is the ranking.
+    #[cfg(test)]
+    pub(crate) fn find_rows_over_for_test(
+        &self,
+        slack: Vec<FindCandidate>,
+        input: &str,
+        cx: &App,
+    ) -> Vec<Candidate> {
+        let mut candidates = self.find_candidates(cx);
+        candidates.extend(slack);
+        FindSnapshot::of(candidates).rows(input)
+    }
+
     /// The finder itself: type a path, `enter` opens it.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, cx: &App| {
-            ranked_find_candidates(workspace.find_candidates(cx), input)
-                .into_iter()
-                .map(|candidate| Candidate {
-                    value: candidate.path,
-                    description: candidate.kind.to_owned(),
-                })
-                .collect()
-        });
+        // Everything there is to find, taken here and held by the prompt's
+        // own closures, so it lives exactly as long as the prompt does and
+        // no keystroke rebuilds it. The reader cannot file a note or start
+        // an agent while the finder is up, so a snapshot is not stale: what
+        // it holds is what there was when they asked.
+        let snapshot = std::rc::Rc::new(FindSnapshot::of(self.find_candidates(cx)));
+        let held = snapshot.clone();
+        self.find_snapshot = Some(snapshot);
+        let complete =
+            std::rc::Rc::new(move |_: &Workspace, input: &str, _: &App| held.rows(input));
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
@@ -366,6 +419,7 @@ impl Workspace {
     /// Opens the target the chosen path names, the ordinary way each
     /// surface is opened from the dashboard.
     fn find_open(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let snapshot = self.find_snapshot.take();
         // The row the reader highlighted, when they chose one: rows can
         // share a path, so the text alone would always open the first.
         if let Some(target) = self.pending_find_target.take() {
@@ -376,17 +430,15 @@ impl Workspace {
         if path.is_empty() {
             return;
         }
-        let candidates = self.find_candidates(cx);
         // The reader may have submitted a query rather than completing a
-        // row, so the best-ranked match is what they asked for.
-        let paths = candidates
-            .iter()
-            .map(|candidate| (candidate.names(), candidate.recency))
-            .collect::<Vec<_>>();
-        let exact = candidates
-            .iter()
-            .position(|candidate| candidate.path == path);
-        let Some(index) = exact.or_else(|| rank_names(&paths, path).first().copied()) else {
+        // row, so the best-ranked match is what they asked for — ranked
+        // over the same set the rows they were looking at came from, not
+        // over a set built again underneath them.
+        let Some(target) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.best_for(path))
+            .cloned()
+        else {
             self.notice_on(
                 None,
                 &format!("nothing matching `{path}`"),
@@ -395,7 +447,7 @@ impl Workspace {
             );
             return;
         };
-        self.open_find_target(candidates[index].target.clone(), window, cx);
+        self.open_find_target(target, window, cx);
     }
 
     /// What the row the reader chose names, opened the ordinary way each
@@ -425,23 +477,83 @@ impl Workspace {
 
 /// The finder's rows for a query, best first. This is the list the prompt
 /// shows, so the row a reader highlighted is this list's nth.
+/// What the finder has to choose from, taken once when the picker opens.
+///
+/// A keystroke ranks and draws, and nothing else. Building the candidate
+/// set is a pass over the desk and over every Slack unit rho tracks, and
+/// doing it per character made every character cost the workspace; it is
+/// done once, here, and each keystroke reads what is already in hand.
+///
+/// The names go with it. Nothing a candidate is matched by can change while
+/// the prompt is open, so the string each query is scored against is made
+/// once rather than cloned out of the candidate on every character.
+pub(crate) struct FindSnapshot {
+    candidates: Vec<FindCandidate>,
+    names: Vec<(Vec<String>, i64)>,
+}
+
+impl FindSnapshot {
+    fn of(candidates: Vec<FindCandidate>) -> Self {
+        let names = candidates
+            .iter()
+            .map(|candidate| (candidate.names(), candidate.recency))
+            .collect();
+        Self { candidates, names }
+    }
+
+    /// The best matches for `query`, best first, in the order the prompt
+    /// shows them.
+    fn ranked(&self, query: &str) -> Vec<&FindCandidate> {
+        rank_names(&self.names, query)
+            .into_iter()
+            .take(FIND_LIMIT)
+            .map(|index| &self.candidates[index])
+            .collect()
+    }
+
+    /// The rows the prompt draws for `query`.
+    fn rows(&self, query: &str) -> Vec<Candidate> {
+        self.ranked(query)
+            .into_iter()
+            .map(|candidate| Candidate {
+                value: candidate.path.clone(),
+                description: candidate.kind.to_owned(),
+            })
+            .collect()
+    }
+
+    /// What a submitted query names, when the reader typed rather than
+    /// chose a row: an exact path if there is one, else the best match.
+    fn best_for(&self, path: &str) -> Option<&FindTarget> {
+        let exact = self
+            .candidates
+            .iter()
+            .position(|candidate| candidate.path == path);
+        let index = exact.or_else(|| rank_names(&self.names, path).first().copied())?;
+        Some(&self.candidates[index].target)
+    }
+}
+
+/// The prompt shows a window of candidates; ranking past that is work the
+/// reader never sees.
+const FIND_LIMIT: usize = 50;
+
+/// The old whole-of-it call, kept for the tests that check ranking itself.
+#[cfg(test)]
 fn ranked_find_candidates(candidates: Vec<FindCandidate>, query: &str) -> Vec<FindCandidate> {
-    let paths = candidates
-        .iter()
-        .map(|candidate| (candidate.names(), candidate.recency))
+    let snapshot = FindSnapshot::of(candidates);
+    let order = rank_names(&snapshot.names, query);
+    let mut candidates = snapshot
+        .candidates
+        .into_iter()
+        .map(Some)
         .collect::<Vec<_>>();
-    let order = rank_names(&paths, query);
-    let mut candidates = candidates.into_iter().map(Some).collect::<Vec<_>>();
     order
         .into_iter()
         .take(FIND_LIMIT)
         .filter_map(|index| candidates[index].take())
         .collect()
 }
-
-/// The prompt shows a window of candidates; ranking past that is work the
-/// reader never sees.
-const FIND_LIMIT: usize = 50;
 
 #[cfg(test)]
 mod tests {

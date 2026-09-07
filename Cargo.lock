@@ -13998,6 +13998,7 @@ dependencies = [
  "rho-core",
  "rho-db",
  "rho-desk",
+ "rho-fake-slack",
  "rho-files",
  "rho-hosts",
  "rho-iroh-auth",

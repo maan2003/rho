@@ -128,6 +128,9 @@ backtrace = "0.3"
 # The fake Slack server, so a Slack surface can be stood up in a test the
 # way it stands up in production: against a server, never a stubbed client.
 rho-slack = { workspace = true, features = ["ui", "fake"] }
+# The default Slack world's own numbers, for the one measurement that has to
+# be at the scale the user runs at rather than at a scale chosen here.
+rho-fake-slack.workspace = true
 rho-hosts = { workspace = true, features = ["test-support"] }
 criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = [

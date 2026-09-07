@@ -135,8 +135,24 @@ Jn  goal
 
     from:    anywhere
     end:     that agent's transcript, point where it last was
-    today:   pending measurement
+    today:   the keystroke count is already the target; what was wrong was the
+             frame. 445 candidates (145 desk + 300 slack, at 128 agents and the
+             fake Slack default world): the open 1.86 ms, a keystroke 3.53 ms,
+             and a keystroke down the path this replaced 5.48 ms. Measured by
+             find_cost in a debug harness, not a rig session, and part of it is
+             gpui's test-support recording per primitive, so the absolute
+             figures fall when that is gated; the comparison between the two
+             paths is taken in the same run and does not. Two runs on a quiet
+             machine agree to within 5%; a third, taken while the machine was
+             building under load, read half again as high across all three
+             figures, which is the reason for saying so here rather than
+             quoting one run.
     target:  the find minibuffer, the first letters, enter: 2 keystrokes plus the
              letters
-    rule:    the match list narrows per keystroke in O(log n); enter is the only
-             confirmation
+    rule:    a keystroke ranks what is already in hand and rebuilds nothing; the
+             candidate set is taken once and updated per event, never per
+             character; enter is the only confirmation
+    cost:    ranking is O(candidates) per keystroke — a fuzzy match scores every
+             candidate, and no implementation makes that O(log n). The frame bound
+             is met by keeping the set small, which is the matters rule, not by the
+             scorer.

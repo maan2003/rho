@@ -496,6 +496,14 @@ pub struct Dashboard {
     buffers: HashMap<LineKey, Entity<Buffer>>,
     /// Non-owning references to the workspace-owned Desk source buffers.
     tree_hosts: BTreeMap<HostId, TreeHostSource>,
+    /// What the dealer reads: one host's nodes as the store client holds
+    /// them, with no buffers and no editor behind them.
+    ///
+    /// This used to be `tree_hosts`, which the dashboard knew because it
+    /// had just composed those nodes into a map. A card's facts are the
+    /// store's, not a surface's, so they are read from the store — and the
+    /// dealer keeps working when the map is gone.
+    deal_hosts: BTreeMap<HostId, crate::candidates::HostNodes>,
     /// Reconciles the multibuffer to the generated spec by element
     /// identity, so unchanged excerpts — and cursors in them — survive.
     composition: Composition,
@@ -625,22 +633,6 @@ impl TreeHostSource {
         self.index.by_id.get(id).map(|at| &self.nodes[*at])
     }
 
-    fn children(
-        &self,
-        id: &rho_desk::cells::Id,
-    ) -> impl Iterator<Item = &crate::desk_view::DeskNode> {
-        self.index
-            .children
-            .get(id)
-            .into_iter()
-            .flatten()
-            .map(|at| &self.nodes[*at])
-    }
-
-    fn agent_node(&self, agent: AgentId) -> Option<&crate::desk_view::DeskNode> {
-        self.index.by_agent.get(&agent).map(|at| &self.nodes[*at])
-    }
-
     /// What a row is called: a note's own first line, or the title the map
     /// derives for everything else.
     fn title(&self, id: &rho_desk::cells::Id) -> Option<&str> {
@@ -762,7 +754,7 @@ impl Dashboard {
     fn heading_context(
         &self,
         host: HostId,
-        source: &TreeHostSource,
+        source: &crate::candidates::HostNodes,
         heading: &crate::desk_view::DeskNode,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> Option<HeadingContext> {
@@ -780,7 +772,7 @@ impl Dashboard {
         if ancestor_deferred {
             return None;
         }
-        let breadcrumb = tree_breadcrumb(&heading.id, source);
+        let breadcrumb = source.breadcrumb(&heading.id);
         let room = breadcrumb.split(" › ").next().map(str::to_owned);
         let bindings = source
             .children(&heading.id)
@@ -849,7 +841,7 @@ impl Dashboard {
     /// unfiled agents does not deal it twice.
     fn agent_card(
         &self,
-        source: &TreeHostSource,
+        source: &crate::candidates::HostNodes,
         agent_id: AgentId,
         context: &HeadingContext,
         order: usize,
@@ -904,7 +896,7 @@ impl Dashboard {
     /// them, the ones they spawned.
     fn agent_cards_under(
         &self,
-        source: &TreeHostSource,
+        source: &crate::candidates::HostNodes,
         context: &HeadingContext,
         order: usize,
         facts: &DealerFacts<'_>,
@@ -990,7 +982,7 @@ impl Dashboard {
         facts: &DealerFacts<'_>,
     ) -> Option<RankedDealCard> {
         let node = self
-            .tree_hosts
+            .deal_hosts
             .get(&agent.host)
             .and_then(|source| source.agent_node(agent.agent_id));
         // A handled, muted or deferred agent is the user's verdict on this
@@ -1104,8 +1096,8 @@ impl Dashboard {
         node_id: rho_desk::cells::Id,
         _cx: &App,
     ) -> Option<DealCard> {
-        let source = self.tree_hosts.get(&host)?;
-        let node = source.nodes.iter().find(|node| node.id == node_id)?;
+        let source = self.deal_hosts.get(&host)?;
+        let node = source.node(&node_id)?;
         let kind = match (node.slack().is_some(), node_agent(node)) {
             (true, _) => DealCardKind::Thread,
             (false, Some(_)) => DealCardKind::Agent,
@@ -1129,16 +1121,15 @@ impl Dashboard {
     }
 
     fn breadcrumb_for_node(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<String> {
-        let source = self.tree_hosts.get(&host)?;
-        Some(tree_breadcrumb(&node_id, source))
+        Some(self.deal_hosts.get(&host)?.breadcrumb(&node_id))
     }
 
     fn room_for_node(&self, host: HostId, mut node_id: rho_desk::cells::Id) -> Option<DeskRoom> {
-        let source = self.tree_hosts.get(&host)?;
+        let source = self.deal_hosts.get(&host)?;
         loop {
-            let node = source.nodes.iter().find(|node| node.id == node_id)?;
+            let node = source.node(&node_id)?;
             let Some(ref parent) = node.parent else { break };
-            let parent_node = source.nodes.iter().find(|node| node.id == *parent)?;
+            let parent_node = source.node(parent)?;
             if !parent_node.is_note() {
                 break;
             }
@@ -1225,6 +1216,7 @@ impl Dashboard {
             editor,
             buffers: HashMap::new(),
             tree_hosts: BTreeMap::new(),
+            deal_hosts: BTreeMap::new(),
             composition: Composition::default(),
             element_keys: HashMap::new(),
             tree_element_keys: HashMap::new(),
@@ -1360,12 +1352,22 @@ impl Dashboard {
         shape_held
     }
 
+    /// The nodes the dealer deals from, read out of the store client.
+    ///
+    /// Held rather than rebuilt per card: making a hand walks a host's
+    /// nodes once, and the incremental paths — one row's cards, one
+    /// agent's card — are lookups against these indexes. Rebuilding the
+    /// source for each of those would make every event cost the desk.
+    pub(crate) fn set_deal_source(&mut self, host: HostId, source: crate::candidates::HostNodes) {
+        self.deal_hosts.insert(host, source);
+    }
+
     /// What a card's node is, which decides the surface it opens.
     pub fn card_target(&self, card: DealCardId) -> CardTarget {
         let Some(node) = self
-            .tree_hosts
+            .deal_hosts
             .get(&card.host)
-            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+            .and_then(|source| source.node(&card.node_id))
         else {
             // An unfiled agent is a card with no node behind it, and it
             // still opens its transcript: the id says which agent, and
@@ -1405,11 +1407,9 @@ impl Dashboard {
 
     /// The thread a card stands for, if it is a thread card at all.
     pub fn card_thread(&self, card: DealCardId) -> Option<SlackUnit> {
-        self.tree_hosts
+        self.deal_hosts
             .get(&card.host)?
-            .nodes
-            .iter()
-            .find(|node| node.id == card.node_id)
+            .node(&card.node_id)
             .and_then(node_unit)
     }
 
@@ -1417,11 +1417,11 @@ impl Dashboard {
     /// backlog command needs them all at once rather than the one the
     /// cursor is on.
     pub fn open_thread_cards(&self) -> Vec<(DealCardId, SlackUnit)> {
-        self.tree_hosts
+        self.deal_hosts
             .iter()
             .flat_map(|(host, source)| {
                 source
-                    .nodes
+                    .nodes()
                     .iter()
                     .filter(|node| node.state == rho_desk::cells::State::Open)
                     .filter_map(move |node| {
@@ -1440,18 +1440,18 @@ impl Dashboard {
     /// Whether a card's node still wants attention. A node a verdict
     /// closed is not re-dealt until something reopens it.
     pub fn node_is_open(&self, card: DealCardId) -> bool {
-        self.tree_hosts
+        self.deal_hosts
             .get(&card.host)
-            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+            .and_then(|source| source.node(&card.node_id))
             .is_some_and(|node| node.state == rho_desk::cells::State::Open)
     }
 
     /// When a card is put down until, as the view derives it: a snooze a
     /// newer message has voided reads as no snooze at all.
     pub fn node_defer_until(&self, card: DealCardId) -> Option<rho_desk::cells::Timestamp> {
-        self.tree_hosts
+        self.deal_hosts
             .get(&card.host)
-            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+            .and_then(|source| source.node(&card.node_id))
             .and_then(|node| node.defer_until)
     }
 
@@ -1459,9 +1459,9 @@ impl Dashboard {
         &self,
         matches: impl Fn(&crate::desk_view::DeskNode) -> bool,
     ) -> Option<DealCardId> {
-        self.tree_hosts.iter().find_map(|(host, source)| {
+        self.deal_hosts.iter().find_map(|(host, source)| {
             source
-                .nodes
+                .nodes()
                 .iter()
                 .find(|node| matches(node))
                 .map(|node| DealCardId {
@@ -1630,6 +1630,18 @@ impl Dashboard {
         threads: &HashMap<SlackUnit, SlackFacts>,
         cx: &mut Context<Workspace>,
     ) -> bool {
+        // The dealer reads its own source now, not the map's, so the rows
+        // a delta names have to reach both. A verdict moves a card's state
+        // and this is the only path it travels between syncs; without this
+        // the dealer answers from the desk as it stood at the last sync,
+        // which is what made a muted thread's card stay open.
+        if !self
+            .deal_hosts
+            .get_mut(&host)
+            .is_some_and(|source| source.patch(touched, nodes))
+        {
+            return false;
+        }
         let Some(source) = self.tree_hosts.get_mut(&host) else {
             return false;
         };
@@ -1757,7 +1769,7 @@ impl Dashboard {
     /// every breadcrumb below it, so an edit to them moves the cards of its
     /// subtree and of nothing outside it.
     pub fn subtree_ids(&self, host: HostId, id: &rho_desk::cells::Id) -> Vec<rho_desk::cells::Id> {
-        let Some(source) = self.tree_hosts.get(&host) else {
+        let Some(source) = self.deal_hosts.get(&host) else {
             return Vec::new();
         };
         let mut ids = vec![id.clone()];
@@ -1788,13 +1800,13 @@ impl Dashboard {
             node_id: node_id.clone(),
         };
         self.dealer.retire(&identity);
-        let Some(source) = self.tree_hosts.get(&host) else {
+        let Some(source) = self.deal_hosts.get(&host) else {
             return;
         };
-        let Some(order) = source.index.by_id.get(node_id).copied() else {
+        let Some(order) = source.order_of(node_id) else {
             return;
         };
-        let node = source.nodes[order].clone();
+        let node = source.nodes()[order].clone();
         // The row's own cards need no agent facts: a dated mark is the
         // note's, and a thread's wait is the mirror's.
         let facts = DealerFacts {
@@ -1823,7 +1835,7 @@ impl Dashboard {
         // the ones already carded there, which is where a spawned agent
         // reached through its parent's filing shows up.
         let mut agents = self
-            .tree_hosts
+            .deal_hosts
             .get(&host)
             .into_iter()
             .flat_map(|source| source.children(node_id))
@@ -1856,7 +1868,7 @@ impl Dashboard {
             self.dealer.cards.remove(&id);
         }
         self.dealer.of_agent.retain(|_, id| id.host != host);
-        let Some(source) = self.tree_hosts.get(&host) else {
+        let Some(source) = self.deal_hosts.get(&host) else {
             return;
         };
         let agents = deal_agent_facts(registry);
@@ -1866,7 +1878,7 @@ impl Dashboard {
         // an agent reached through a note is only skipped by the pass below
         // to keep it from being carded twice.
         let mut carded = HashSet::new();
-        for (order, node) in source.nodes.iter().enumerate() {
+        for (order, node) in source.nodes().iter().enumerate() {
             if node.is_note() {
                 let Some(context) = self.heading_context(host, source, node, now) else {
                     continue;
@@ -1928,10 +1940,10 @@ impl Dashboard {
         // a host with no desk yet reaches nothing either, which is what
         // makes the card a loose one at the root.
         let context = self
-            .tree_hosts
+            .deal_hosts
             .get(&host)
             .and_then(|source| self.heading_for_agent(host, source, agent_id, registry, now));
-        let card = match (context, self.tree_hosts.get(&host)) {
+        let card = match (context, self.deal_hosts.get(&host)) {
             (Some(context), Some(source)) => {
                 self.agent_card(source, agent_id, &context, order, &facts, &mut carded)
             }
@@ -1945,9 +1957,9 @@ impl Dashboard {
     /// The tie-break an agent's card carries: where its row sits in the
     /// map, or after everything when it has no row.
     fn agent_order(&self, host: HostId, agent_id: AgentId) -> usize {
-        self.tree_hosts
+        self.deal_hosts
             .get(&host)
-            .and_then(|source| source.index.by_agent.get(&agent_id).copied())
+            .map(|source| source.agent_order(agent_id))
             .unwrap_or(usize::MAX)
     }
 
@@ -1958,7 +1970,7 @@ impl Dashboard {
     fn heading_for_agent(
         &self,
         host: HostId,
-        source: &TreeHostSource,
+        source: &crate::candidates::HostNodes,
         agent_id: AgentId,
         registry: &AgentMap,
         now: chrono::DateTime<chrono::FixedOffset>,
@@ -1975,7 +1987,7 @@ impl Dashboard {
                 && let Some(parent) = &node.parent
                 && let Some(heading) = source.node(parent)
                 && heading.is_note()
-                && let Some(at) = source.index.by_id.get(&heading.id).copied()
+                && let Some(at) = source.order_of(&heading.id)
                 && best.is_none_or(|(held, _)| at < held)
             {
                 best = Some((at, heading));
@@ -2002,8 +2014,8 @@ impl Dashboard {
                 soonest = Some(at);
             }
         };
-        for source in self.tree_hosts.values() {
-            for node in &source.nodes {
+        for source in self.deal_hosts.values() {
+            for node in source.nodes() {
                 for at in [node.defer_until, node.deadline].into_iter().flatten() {
                     if let Some(at) = desk_time(at) {
                         consider(at);
@@ -2094,14 +2106,14 @@ impl Dashboard {
     /// The room a card belongs to: the note it hangs under, walked up to
     /// the outermost note, which is what `shift-s` snoozes.
     pub fn tree_room_node(&self, card: &DealCard) -> Option<(HostId, rho_desk::cells::Id)> {
-        let source = self.tree_hosts.get(&card.host)?;
+        let source = self.deal_hosts.get(&card.host)?;
         let mut node_id = card.topic_node_id.clone();
         loop {
-            let node = source.nodes.iter().find(|node| node.id == node_id)?;
+            let node = source.node(&node_id)?;
             let Some(ref parent) = node.parent else {
                 return Some((card.host, node_id));
             };
-            let parent_node = source.nodes.iter().find(|node| node.id == *parent)?;
+            let parent_node = source.node(parent)?;
             if !parent_node.is_note() {
                 return Some((card.host, node_id));
             }
@@ -3146,7 +3158,7 @@ fn node_closed(
 /// The same question for an agent reached through a note, which knows the
 /// agent id but not which row stands for it.
 fn agent_node_closed(
-    source: &TreeHostSource,
+    source: &crate::candidates::HostNodes,
     agent_id: AgentId,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> bool {
@@ -3278,33 +3290,6 @@ fn derived_title(
 /// Every label as the path a person would type, `rho/agent`. The label
 /// axis only: a label filed under something that is not a label is named
 /// by its own name, because the path is the filing rather than the place.
-fn label_paths(
-    nodes: &HashMap<rho_desk::cells::Id, &crate::desk_view::DeskNode>,
-) -> HashMap<rho_desk::cells::Id, String> {
-    let mut paths = HashMap::new();
-    for (id, node) in nodes {
-        if !matches!(id, rho_desk::cells::Id::Label(_)) {
-            continue;
-        }
-        let Some(name) = node.name.clone() else {
-            continue;
-        };
-        let mut segments = vec![name];
-        let mut parent = node.parent.clone();
-        while let Some(above) =
-            parent.filter(|above| matches!(above, rho_desk::cells::Id::Label(_)))
-        {
-            let Some(node) = nodes.get(&above) else { break };
-            let Some(name) = node.name.clone() else { break };
-            segments.push(name);
-            parent = node.parent.clone();
-        }
-        segments.reverse();
-        paths.insert(id.clone(), segments.join("/"));
-    }
-    paths
-}
-
 fn area_kind(id: &rho_desk::cells::Id) -> &'static str {
     use rho_desk::cells::Id;
 
@@ -3494,139 +3479,6 @@ impl Dashboard {
             }
         }
         areas
-    }
-
-    /// Every tree node the finder can open, as its full path and target.
-    /// Headings carry their own breadcrumb; an agent or a page hangs its
-    /// title under its parent's.
-    pub(crate) fn find_candidates(
-        &self,
-        registry: &AgentMap,
-        cx: &App,
-    ) -> Vec<crate::find::FindCandidate> {
-        use crate::find::{FindCandidate, FindTarget};
-
-        let mut candidates = Vec::new();
-        for (host, source) in &self.tree_hosts {
-            let nodes = source
-                .nodes
-                .iter()
-                .map(|node| (node.id.clone(), node))
-                .collect::<HashMap<_, _>>();
-            let titles = source.all_titles(cx);
-            let title_of = |node_id: rho_desk::cells::Id| {
-                titles
-                    .get(&node_id)
-                    .and_then(|text| text.lines().next())
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_owned)
-            };
-            let label_paths = label_paths(&nodes);
-            for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(&node.id, source);
-                let under = |title: String| {
-                    if breadcrumb.is_empty() {
-                        title
-                    } else {
-                        format!("{breadcrumb} › {title}")
-                    }
-                };
-                // A thing is as often remembered by what it is filed under
-                // as by where it sits, so each label names it too.
-                let labelled = |title: &str| {
-                    node.labels
-                        .iter()
-                        .filter_map(|label| label_paths.get(label))
-                        .map(|path| format!("{path} › {title}"))
-                        .collect::<Vec<_>>()
-                };
-                let candidate = match &node.id {
-                    rho_desk::cells::Id::Note(_) => {
-                        if breadcrumb.is_empty() {
-                            continue;
-                        }
-                        FindCandidate {
-                            labels: labelled(&breadcrumb),
-                            aka: Vec::new(),
-                            path: breadcrumb.clone(),
-                            kind: "topic",
-                            target: FindTarget::Topic {
-                                host: *host,
-                                node_id: node.id.clone(),
-                            },
-                            recency: self
-                                .tree_heading_agents
-                                .get(&(*host, node.id.clone()))
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|agent_id| registry.agent_last_active(*agent_id))
-                                .map(|active| active.0 as i64)
-                                .max()
-                                .unwrap_or_default(),
-                        }
-                    }
-                    rho_desk::cells::Id::Agent(_) => {
-                        let Some(agent_id) = node.agent() else {
-                            continue;
-                        };
-                        // Which names an agent answers to is the agent
-                        // crate's; where it sits in the tree is this row's.
-                        let hit =
-                            rho_agents::find::hit(registry, agent_id, title_of(node.id.clone()));
-                        FindCandidate {
-                            labels: labelled(&hit.title),
-                            aka: hit.aka,
-                            path: under(hit.title),
-                            kind: "agent",
-                            target: FindTarget::Agent(agent_id),
-                            recency: hit.recency,
-                        }
-                    }
-                    rho_desk::cells::Id::Page(_) => {
-                        let Some(page_id) = node_page(node) else {
-                            continue;
-                        };
-                        let Some(title) = title_of(node.id.clone()) else {
-                            continue;
-                        };
-                        FindCandidate {
-                            labels: labelled(&title),
-                            aka: Vec::new(),
-                            path: under(title),
-                            kind: "page",
-                            target: FindTarget::Page(page_id),
-                            recency: 0,
-                        }
-                    }
-                    _ => continue,
-                };
-                candidates.push(candidate);
-            }
-        }
-        // An agent nobody filed is findable all the same: filing says where
-        // a thing sits, and the finder is for the ones the reader cannot
-        // point at.
-        let filed = self
-            .tree_hosts
-            .values()
-            .flat_map(|source| source.nodes.iter().filter_map(|node| node.agent()))
-            .collect::<std::collections::HashSet<_>>();
-        for agent_id in registry.known_agents().copied() {
-            if filed.contains(&agent_id) || registry.agent_hidden(agent_id) {
-                continue;
-            }
-            let hit = rho_agents::find::hit(registry, agent_id, None);
-            candidates.push(crate::find::FindCandidate {
-                labels: Vec::new(),
-                aka: hit.aka,
-                path: hit.title,
-                kind: "agent",
-                target: crate::find::FindTarget::Agent(agent_id),
-                recency: hit.recency,
-            });
-        }
-        candidates
     }
 
     pub fn heading_candidates(

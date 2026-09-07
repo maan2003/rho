@@ -597,6 +597,9 @@ pub struct Workspace {
     /// its submit handler: the submitted text cannot tell two rows with the
     /// same path apart.
     pub(crate) pending_find_target: Option<crate::find::FindTarget>,
+    /// Everything there is to find, taken when the finder opened and held
+    /// until it closes. A keystroke ranks this; it does not rebuild it.
+    pub(crate) find_snapshot: Option<std::rc::Rc<crate::find::FindSnapshot>>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     pub(crate) minibuffer: Option<Minibuffer>,
@@ -1200,6 +1203,7 @@ impl Workspace {
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             pending_find_target: None,
+            find_snapshot: None,
             scroll_journal_task: None,
             minibuffer: None,
             transient_focus: cx.focus_handle(),
@@ -5924,6 +5928,15 @@ impl Workspace {
             // The cards this moved, and only those. A `Changed` names its
             // agents and costs them; a desk that arrived or changed shape
             // names nothing and is made again.
+            // The dealer's own source, read from the store client rather
+            // than from what the map just composed.
+            //
+            // Made on every sync, not only when the shape changed: a note
+            // whose first line was edited keeps its shape and moves every
+            // breadcrumb beneath it. This is the nodes and the indexes and
+            // no rope, which is what the map's own index cost here before.
+            let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
+            self.dashboard.set_deal_source(host, source);
             let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
             let scope = match &moved {
                 Some(agents) => crate::dashboard::DealScope::Agents(agents),
@@ -6927,7 +6940,7 @@ impl Workspace {
         // rewrites the input into that row's text.
         if prompt == "find:" && minibuffer.accepts_selected(cx) {
             self.pending_find_target =
-                self.find_target_at(&minibuffer.input(cx), minibuffer.selected_row(), cx);
+                self.find_target_at(&minibuffer.input(cx), minibuffer.selected_row());
         }
         if prompt == "file under:"
             && let Some((candidate, occurrence)) = minibuffer.selected_candidate()
@@ -6971,6 +6984,10 @@ impl Workspace {
                 prompt: minibuffer.prompt().to_owned(),
                 input: minibuffer.input(cx),
             });
+            // What there was to find goes with the prompt that asked. A
+            // snapshot is only honest for as long as the reader is looking
+            // at the rows it made.
+            self.find_snapshot = None;
             self.finish_overlay_focus(window, cx);
             self.restore_slack_search(window, cx);
             cx.notify();
@@ -7128,6 +7145,7 @@ impl Workspace {
         self.capture_overlay_focus(window, cx);
         self.show_menu(crate::transient::verdict_menu(), None, Back::Out, true);
         self.minibuffer = None;
+        self.find_snapshot = None;
         self.slack_search_before = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);
@@ -7147,6 +7165,7 @@ impl Workspace {
         self.capture_overlay_focus(window, cx);
         self.show_menu(menu, None, Back::Out, false);
         self.minibuffer = None;
+        self.find_snapshot = None;
         self.slack_search_before = None;
         self.echo = None;
         window.focus(&self.transient_focus, cx);

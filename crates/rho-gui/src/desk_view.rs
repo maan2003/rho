@@ -1037,12 +1037,31 @@ impl DeskCells {
         }
     }
 
+    /// Every note's title, refreshed. Comparing buffer versions is what
+    /// makes asking cheap, so the dealer can ask on every sync: only the
+    /// notes whose bodies moved are reread.
+    ///
+    /// Machine rows are not in here. Their titles are derived from live
+    /// metadata, and nothing that ranks or files a card needs them: a
+    /// breadcrumb is made of notes.
+    pub fn note_titles(&mut self, host: HostId, cx: &gpui::App) -> Option<Rc<HashMap<Id, String>>> {
+        self.refresh_titles(host, cx);
+        Some(self.hosts.get(&host)?.titles.clone())
+    }
+
     /// What a screen is handed to draw one host's tree.
     pub fn tree_source(&mut self, host: HostId, cx: &gpui::App) -> Option<TreeSource> {
         self.refresh_titles(host, cx);
         let nodes = self.nodes(host);
         let desk = self.hosts.get(&host)?;
         Some((nodes.to_vec(), desk.buffers.clone(), desk.titles.clone()))
+    }
+
+    /// Every host whose cells this client holds. The finder asks the store
+    /// what there is rather than asking a screen what it drew, so it needs
+    /// the hosts without going through one.
+    pub fn hosts(&self) -> impl Iterator<Item = HostId> + '_ {
+        self.hosts.keys().copied()
     }
 
     pub fn buffer(&self, host: HostId, id: &Id) -> Option<&Entity<Buffer>> {
