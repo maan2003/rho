@@ -80,9 +80,9 @@ use crate::{
     RailOpen, RoleCycle, RoleCycleGroup, SearchRepeat, SearchRepeatReverse, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
     SlackEditLast, SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow,
-    SlackSearch, SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
-    TranscriptTop, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow,
+    SlackReactTo, SlackSearch, SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose,
+    TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
+    ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -564,6 +564,12 @@ pub struct Workspace {
     /// A readable name per open conversation, so naming a surface never has
     /// to reach into the session.
     pub(crate) slack_labels: HashMap<rho_slack::session::Source, String>,
+    /// The message a reaction menu is open over, held while the menu is up
+    /// so the emoji lands on the message the reader pressed `r` on rather
+    /// than on whatever the point is over when they choose. A timestamp,
+    /// because that is what a message is; the line it sits on can move
+    /// under a menu the same as under anything else.
+    pub(crate) slack_reacting: Option<rho_slack::types::Ts>,
     pub(crate) _slack_subscription: Option<gpui::Subscription>,
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
@@ -1139,6 +1145,7 @@ impl Workspace {
             slack: None,
             slack_degraded: None,
             slack_labels: HashMap::new(),
+            slack_reacting: None,
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
             agent_model_subscriptions: Vec::new(),
@@ -7087,7 +7094,7 @@ impl Workspace {
         let Some(item) = open.menu.items().get(index) else {
             return;
         };
-        let action = *item.action();
+        let action = item.action().clone();
         let closes = item.kind() == rho_window::transient::Kind::Suffix;
         let count = open.carried_count;
         self.run_menu_action(action, count, closes, window, cx);
@@ -7139,7 +7146,7 @@ impl Workspace {
                 count,
                 closes,
             } => {
-                let action = *open.menu.items()[item].action();
+                let action = open.menu.items()[item].action().clone();
                 let count = count.or(carried);
                 self.run_menu_action(action, count, closes, window, cx);
             }
@@ -7256,6 +7263,8 @@ impl Workspace {
             Command::NewTerminal => self.cmd_term(true, window, cx),
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
             Command::Quit => cx.quit(),
+            Command::SlackReact(name) => self.slack_react(&name, window, cx),
+            Command::SlackReactByName => self.prompt_slack_react(window, cx),
             Command::SlackConversations => self.open_slack(window, cx),
             Command::SlackAttach => self.prompt_slack_attach(window, cx),
             Command::SlackMarkReadBefore => self.prompt_slack_mark_read_before(window, cx),
@@ -10034,6 +10043,12 @@ impl Render for Workspace {
                 // Not on a message of the reader's own: `e` is vim's own
                 // word motion again.
                 if !this.slack_edit_message(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SlackReactTo, window, cx| {
+                // Not on a message: `r` is vim's own key again.
+                if !this.slack_open_react_menu(window, cx) {
                     cx.propagate();
                 }
             }))

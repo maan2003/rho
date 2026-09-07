@@ -1632,3 +1632,79 @@ async fn only_what_slack_would_badge_is_handed_over() {
         "opted into, so what lands there is handed over"
     );
 }
+
+/// Reacting is one state, not two presses.
+///
+/// The client asks the server to put an emoji on and to take it off, and
+/// the server is what says whether it is there. Slack refuses the second
+/// add with `already_reacted` and a remove of nothing with `no_reaction`;
+/// both are the state the caller asked for, so both come back `Ok` — a
+/// reader pressing the same key twice on two clients must not see an
+/// error for agreeing with themselves.
+#[tokio::test]
+async fn a_reaction_goes_on_and_comes_off_and_agreeing_twice_is_not_an_error() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "100.0", "user": "U1", "text": "shipping it"}),
+    );
+    let client = client(&fake);
+    let channel = ChannelId("C1".into());
+    let ts = Ts("100.0".into());
+
+    client.add_reaction(&channel, &ts, "tada").await.unwrap();
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![("tada".to_owned(), vec!["ME".to_owned()])],
+        "the server holds it, under the signed-in user"
+    );
+    client
+        .add_reaction(&channel, &ts, "tada")
+        .await
+        .expect("already there is the state asked for");
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![("tada".to_owned(), vec!["ME".to_owned()])],
+        "and it is not counted twice"
+    );
+
+    client.remove_reaction(&channel, &ts, "tada").await.unwrap();
+    assert!(
+        fake.reactions("C1", "100.0").is_empty(),
+        "off the message entirely once nobody holds it"
+    );
+    client
+        .remove_reaction(&channel, &ts, "tada")
+        .await
+        .expect("already off is the state asked for");
+}
+
+/// Someone else's reaction and the reader's own sit side by side on the
+/// same emoji, and taking the reader's off leaves theirs standing.
+#[tokio::test]
+async fn the_readers_reaction_comes_off_without_taking_anyone_elses() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "100.0", "user": "U1", "text": "shipping it"}),
+    );
+    fake.live_reaction("C1", "100.0", "UD", "tada");
+    let client = client(&fake);
+    let channel = ChannelId("C1".into());
+    let ts = Ts("100.0".into());
+
+    client.add_reaction(&channel, &ts, "tada").await.unwrap();
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![("tada".to_owned(), vec!["UD".to_owned(), "ME".to_owned()])]
+    );
+
+    client.remove_reaction(&channel, &ts, "tada").await.unwrap();
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![("tada".to_owned(), vec!["UD".to_owned()])],
+        "one reader taking theirs off is not the reaction going away"
+    );
+}

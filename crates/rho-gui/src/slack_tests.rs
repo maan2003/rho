@@ -240,3 +240,153 @@ async fn typing_a_word_of_a_name_leaves_the_rows_it_reaches(cx: &mut TestAppCont
         .unwrap();
     assert_eq!(widened, whole, "clearing the query puts every row back");
 }
+
+/// `r` on a message: what the menu offers, and that pressing it lands on
+/// Slack.
+///
+/// Through a real session against the fake, with the fake as the only
+/// authority on whether the reaction is there: the assertion is what the
+/// server holds, not what the client drew.
+#[gpui::test]
+async fn reacting_puts_the_emoji_on_the_server_and_pressing_again_takes_it_off(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, Ts};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    // One message, so the point is on it without any walking, and one
+    // reaction already there from someone else — joining a reaction is the
+    // commonest thing anyone does with one.
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "UD", "text": "shipping it"}),
+    );
+    fake.live_reaction("C1", "100.0", "UD", "tada");
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            source,
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The history crosses a real socket, so wait for the message rather
+    // than for the executor to go quiet.
+    let mut choices = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        choices = window
+            .update(cx, |view, _, cx| view.reaction_choices(cx))
+            .unwrap();
+        if choices.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    let choices = choices.expect("the message reached the surface");
+    assert_eq!(choices.ts, Ts("100.0".into()));
+    assert_eq!(
+        choices
+            .on_message
+            .iter()
+            .map(|choice| (choice.name.as_str(), choice.glyph.as_str(), choice.mine))
+            .collect::<Vec<_>>(),
+        vec![("tada", "🎉", false)],
+        "what is already on the message, and it is not the reader's"
+    );
+    assert!(
+        !choices.recent.is_empty() && !choices.recent.iter().any(|choice| choice.name == "tada"),
+        "then what the reader reaches for, without repeating the row above"
+    );
+
+    // The menu the reader reads: the row that is already on the message
+    // first, then what they reach for, then by name. No id, no "you".
+    let menu = crate::transient::slack_react_menu(&choices);
+    let rows: Vec<(&str, &str)> = menu
+        .items()
+        .iter()
+        .map(|item| (item.key(), item.description()))
+        .collect();
+    assert_eq!(rows.first(), Some(&("a", "🎉 tada")));
+    assert_eq!(rows.last(), Some(&("/", "by name…")));
+    for (_, description) in &rows {
+        assert!(
+            !description.contains("U") && !description.to_lowercase().contains("you"),
+            "the menu reads as names, not as ids or as \"you\": {description}"
+        );
+    }
+
+    window
+        .update(cx, |view, _, cx| {
+            view.react(&Ts("100.0".into()), "tada", cx)
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if fake
+            .reactions("C1", "100.0")
+            .iter()
+            .any(|(_, users)| users.iter().any(|user| user == fake.self_id()))
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![(
+            "tada".to_owned(),
+            vec!["UD".to_owned(), fake.self_id().to_owned()]
+        )],
+        "the server has it, beside the one that was already there"
+    );
+
+    // And the same key again is the other half of the one state.
+    window
+        .update(cx, |view, _, cx| {
+            view.react(&Ts("100.0".into()), "tada", cx)
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if !fake
+            .reactions("C1", "100.0")
+            .iter()
+            .any(|(_, users)| users.iter().any(|user| user == fake.self_id()))
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        fake.reactions("C1", "100.0"),
+        vec![("tada".to_owned(), vec!["UD".to_owned()])],
+        "taking the reader's off leaves the other standing"
+    );
+}

@@ -23,7 +23,7 @@ use crate::workspace::Subject;
 /// workspace can only be written by something that already has the
 /// workspace, which is every screen and no source crate. An item that is
 /// data can be put in a menu by the crate that owns the thing it acts on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     /// Open this menu in place of the one on screen, over the same row.
     /// Escape goes back to it: a submenu is a step, not a new place.
@@ -56,7 +56,7 @@ pub(crate) enum MenuId {
 /// A command a menu item runs, which is the whole of what the item means.
 /// One variant per item and no arguments beyond what the item itself says,
 /// so the match that runs them reads as the list of what the menus can do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
     // The root menu.
     Voice,
@@ -79,6 +79,14 @@ pub(crate) enum Command {
     UndoVerdict,
     Quit,
     // Slack.
+    /// Put this emoji on the message under the point, or take the
+    /// reader's own off if it is already there. Slack's shortcode without
+    /// the colons, which is what the API takes and what the emoji table
+    /// keys on — and what the menu row shows beside the glyph, so a
+    /// reader learns the name of the thing they keep pressing.
+    SlackReact(gpui::SharedString),
+    /// Any emoji at all, typed by name in the minibuffer.
+    SlackReactByName,
     SlackConversations,
     SlackAttach,
     SlackMarkReadBefore,
@@ -309,6 +317,45 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
         )
         .item("shift-s", "slack…", MenuAction::Open(MenuId::Slack))
         .item("q", "quit", MenuAction::Command(Command::Quit))
+}
+
+/// The keys a reaction menu hands out, in the order the rows are read.
+/// The home row first because that is where the fingers are; nothing
+/// mnemonic is possible when the rows are emoji.
+const REACTION_KEYS: [&str; 12] = ["a", "s", "d", "f", "g", "h", "j", "k", "l", "q", "w", "e"];
+
+/// `r` on a message: what to react with.
+///
+/// Two groups, in the order a reader wants them. What is already on the
+/// message comes first, because joining a reaction is the commonest thing
+/// anyone does with one, and a row for one the reader already has says
+/// "remove" — the key is one state, not two. Then what this reader
+/// reaches for, most recent first. Anything else is `/`, by name.
+///
+/// Cost: one row per choice, and the choices are what the menu draws.
+pub(crate) fn slack_react_menu(choices: &rho_slack::ui::ReactionChoices) -> Menu {
+    let mut menu = Menu::new("react");
+    let rows = choices
+        .on_message
+        .iter()
+        .chain(choices.recent.iter())
+        .take(REACTION_KEYS.len());
+    for (key, choice) in REACTION_KEYS.iter().zip(rows) {
+        let description = match choice.mine {
+            true => format!("{} {} — remove", choice.glyph, choice.name),
+            false => format!("{} {}", choice.glyph, choice.name),
+        };
+        menu = menu.item(
+            *key,
+            description,
+            MenuAction::Command(Command::SlackReact(choice.name.clone().into())),
+        );
+    }
+    menu.item(
+        "/",
+        "by name…",
+        MenuAction::Command(Command::SlackReactByName),
+    )
 }
 
 pub(crate) fn slack_menu() -> Menu {

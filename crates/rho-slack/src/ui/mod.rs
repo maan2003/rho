@@ -12,7 +12,7 @@ pub mod list;
 
 use std::ops::Range;
 
-pub use conversation::ConversationView;
+pub use conversation::{ConversationView, ReactionChoice, ReactionChoices};
 use editor::{Editor, HighlightKey};
 use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Window};
 use language::Buffer;

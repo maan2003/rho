@@ -790,6 +790,70 @@ wrong at the design, not at the polish.
   `clippy::type_complexity` on a `Rc<RefCell<Option<(usize, usize, u32,
   Option<usize>)>>>` — main's line, present on a clean checkout with
   nothing of this change in the tree, reported and not worked around.
+
+  **Change 3, reacting.** `r` on the message under the point opens a
+  transient rather than acting. Two groups, in the order a reader wants
+  them: what is already on the message first, because joining a reaction
+  is the commonest thing anyone does with one, and a row for one the
+  reader already has says "— remove", so the key is one state and not
+  two. Then what this reader reaches for, most recent first, never
+  repeating a row above it. Then `/`, any emoji by name, off the same
+  table the composer completes `:` from, so what a reader can type in a
+  message they can react with.
+  The emoji goes on locally the moment the key is pressed and the server
+  is told afterwards; if Slack refuses, the local one comes back off and
+  the echo line says so. `already_reacted` and `no_reaction` are not
+  refusals — they are the state the reader asked for, so both map to
+  `Ok(())` and pressing the same key twice from two places is not an
+  error. The recents are the reader's, not the workspace's: nine deep,
+  move-to-front, seeded with six an empty account can still use, kept in
+  the mirror under `rho_slack_reacted_with_v1` so a restart opens the
+  menu the reader left.
+  The cost. A reaction names one message, so it touches that message,
+  the reader's nine names, and the two mirror rows those live in — never
+  the mirror, the list or the loaded run. The message a reaction lands
+  on is found by binary search over the loaded run, the way `insert`
+  places one; it was a walk, and the walk is gone from both `Loaded::react`
+  and the reload the session does after it. Per frame the menu draws its
+  rows and no more: at most twelve emoji plus `/`, which is four rows in
+  each of four columns.
+  Numbers, `cargo run --release --example react_cost -- 20000`, this
+  machine, a workspace of 20 000 conversations and a conversation of
+  20 000 messages in the mirror:
+
+  | one toggle | cost |
+  | --- | --- |
+  | the recents list, move-to-front | 50 ns (9 remembered) |
+  | the message written back | 71 µs (one row of 20 000) |
+  | the recents written back | 57 µs (9 names) |
+  | reading the recents at a start | 794 ns |
+
+  Both writes are one redb commit each and neither reads the rows beside
+  it, which is why the workspace's size is absent from the table: the
+  same two numbers hold at 20 conversations and at 20 000.
+  What the tests prove is what the *server* holds, not what the client
+  drew: `reacting_puts_the_emoji_on_the_server_and_pressing_again_takes_it_off`
+  in `crates/rho-gui/src/slack_tests.rs` puts a reaction on through a real
+  session against the fake, waits for the fake to have it beside the one
+  someone else already put there, presses again and waits for the
+  reader's to be the only one gone. The fake gained `reactions.add` and
+  `reactions.remove`, one mutation shared with the socket path so a
+  reaction the API adds and a reaction a frame adds cannot disagree, and
+  the two refusals above. `rho-slack`'s transport tests cover the same
+  two shapes end to end.
+  One stop, and it is the tree's rather than this change's: the `rho-gui`
+  lib test binary under `cargo test --workspace` is 1.149 GB, and glibc's
+  loader segfaults in `dl_main` before a line of Rust runs. Main's own is
+  1.148 GB and loads; a single extra test tips it. It is not the test's
+  content — an empty one does it — and it is not this change's logic: the
+  crash is in `ld.so`, the core's only frames are `dl_main`,
+  `_dl_sysdep_start`, `_dl_start`, `_start`, and `CARGO_PROFILE_DEV_DEBUG=0`
+  makes it go away while `line-tables-only` and
+  `split-debuginfo=unpacked` do not. The gate for this change was run that
+  way: `CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace` green at 1 659
+  tests, clippy `-D warnings` clean, `cargo fmt --check` clean. The crate
+  is at a ceiling and the next test to land anywhere in `rho-gui` will hit
+  it again.
 - **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
   across hosts: notes, labels, parents, verdicts. The crate keeps the
   store and gains the map screen and the note views. The screen is

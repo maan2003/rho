@@ -606,6 +606,89 @@ impl Workspace {
     }
 
     /// The attach prompt: the keyboard's way to the same thing a drop does.
+    /// `r` on a message: the reaction menu over it.
+    ///
+    /// Answers false when the point is not on a message, so the key goes
+    /// back to the editor rather than being swallowed on a blank line.
+    pub(crate) fn slack_open_react_menu(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return false;
+        };
+        let view = view.clone();
+        let Some(choices) = view.update(cx, |view, cx| view.reaction_choices(cx)) else {
+            return false;
+        };
+        self.slack_reacting = Some(choices.ts.clone());
+        self.open_menu(crate::transient::slack_react_menu(&choices), window, cx);
+        true
+    }
+
+    /// One key from that menu: the emoji goes on, or the reader's own comes
+    /// off if it was already there.
+    pub(crate) fn slack_react(
+        &mut self,
+        name: &str,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(ts) = self.slack_reacting.clone() else {
+            return;
+        };
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return;
+        };
+        view.clone()
+            .update(cx, |view, cx| view.react(&ts, name, cx));
+    }
+
+    /// `/` from the reaction menu: any emoji, by name.
+    ///
+    /// The same table the composer completes `:` from, so what the reader
+    /// can type in a message they can react with, and the name they see in
+    /// the menu afterwards is the name they typed.
+    pub(crate) fn prompt_slack_react(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.slack_reacting.is_none() {
+            return;
+        }
+        self.open_prompt(
+            "react:",
+            std::rc::Rc::new(|workspace: &Workspace, typed: &str, cx: &gpui::App| {
+                let SurfaceView::SlackConversation(view) = &workspace.active_surface().view else {
+                    return Vec::new();
+                };
+                let view = view.read(cx);
+                let channel = view.source().channel().clone();
+                view.session()
+                    .read(cx)
+                    .model()
+                    .suggestions(&channel, ':', typed.trim().trim_matches(':'))
+                    .into_iter()
+                    .map(|found| Candidate {
+                        value: found.value.trim_matches(':').to_owned(),
+                        description: found.detail,
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
+                let name = input.trim().trim_matches(':').to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                workspace.slack_react(&name, window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
     pub(crate) fn prompt_slack_attach(
         &mut self,
         window: &mut gpui::Window,

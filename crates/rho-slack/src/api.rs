@@ -609,6 +609,62 @@ impl Client {
         Ok(())
     }
 
+    /// Puts an emoji on a message, as the signed-in user.
+    ///
+    /// `name` is Slack's shortcode without the colons — `thumbsup`, not
+    /// `:thumbsup:` — which is the form the API takes, the form the wire
+    /// carries back in `reaction_added`, and the form the emoji table
+    /// keys on. Slack answers `already_reacted` if it is already there,
+    /// which the caller treats as done rather than as a failure: two
+    /// clients racing to agree is not an error.
+    pub async fn add_reaction(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        match self
+            .post_form(
+                "reactions.add",
+                &[
+                    ("channel", channel.0.clone()),
+                    ("timestamp", ts.0.clone()),
+                    ("name", name.to_owned()),
+                ],
+            )
+            .await
+        {
+            Err(error) if format!("{error}").contains("already_reacted") => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// Takes the user's own emoji off a message. `no_reaction` means it is
+    /// already off, which is the state asked for.
+    pub async fn remove_reaction(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        match self
+            .post_form(
+                "reactions.remove",
+                &[
+                    ("channel", channel.0.clone()),
+                    ("timestamp", ts.0.clone()),
+                    ("name", name.to_owned()),
+                ],
+            )
+            .await
+        {
+            Err(error) if format!("{error}").contains("no_reaction") => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Ok(()),
+        }
+    }
+
     /// Sends `text`. With `thread_ts` it is a reply inside that thread;
     /// without, a new message in the channel or DM.
     pub async fn post_message(

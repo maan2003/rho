@@ -424,6 +424,36 @@ impl Fake {
         )
     }
 
+    /// What the server itself has on a message: each emoji with the users
+    /// who put it there. A reaction is proven against this rather than
+    /// against the client's copy of it, which is the copy under test.
+    pub fn reactions(&self, channel: &str, ts: &str) -> Vec<(String, Vec<String>)> {
+        let state = self.state.lock().unwrap();
+        state
+            .history
+            .get(channel)
+            .into_iter()
+            .flatten()
+            .find(|message| message["ts"] == json!(ts))
+            .and_then(|message| message["reactions"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|reaction| {
+                let users = reaction["users"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|user| user.as_str().map(str::to_owned))
+                    .collect();
+                (
+                    reaction["name"].as_str().unwrap_or_default().to_owned(),
+                    users,
+                )
+            })
+            .collect()
+    }
+
     /// Slack's read cursor for a conversation, as the next client to ask
     /// would be told it.
     pub fn last_read(&self, channel: &str) -> Option<String> {
@@ -894,44 +924,12 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             // Taking one off is the same route: Slack has one reaction on a
             // message from the client's side, added or removed.
             let removing = request["remove"].as_bool().unwrap_or(false);
-            let Some(message) = message_mut(state, &channel, &ts) else {
-                return json!({"ok": false, "error": "message_not_found"});
-            };
-            let mut reactions = message["reactions"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|mut reaction| {
-                    if reaction["name"] == json!(name) {
-                        let mut users = reaction["users"].as_array().cloned().unwrap_or_default();
-                        if removing {
-                            users.retain(|held| held != &json!(user));
-                        } else {
-                            users.push(json!(user));
-                        }
-                        reaction["count"] = json!(users.len());
-                        reaction["users"] = json!(users);
-                    }
-                    reaction
-                })
-                .filter(|reaction| reaction["count"] != json!(0))
-                .collect::<Vec<_>>();
-            let had = reactions
-                .iter()
-                .any(|reaction| reaction["name"] == json!(name));
-            if !had && !removing {
-                reactions.push(json!({"name": name, "users": [user], "count": 1}));
+            match react(
+                state, frames, &channel, &ts, &user, &name, removing, &event_ts,
+            ) {
+                true => json!({"ok": true, "ts": ts}),
+                false => json!({"ok": false, "error": "message_not_found"}),
             }
-            message["reactions"] = json!(reactions);
-            push(json!({
-                "type": if removing { "reaction_removed" } else { "reaction_added" },
-                "user": user,
-                "reaction": name,
-                "item": {"type": "message", "channel": channel, "ts": ts},
-                "event_ts": event_ts,
-            }));
-            json!({"ok": true, "ts": ts})
         }
         "edit" => {
             let ts = field("ts");
@@ -1014,6 +1012,84 @@ fn feed_ts(item: &Value) -> f64 {
         .or_else(|| entry["bundle_info"]["payload"]["thread_entry"]["latest_ts"].as_str())
         .and_then(|ts| ts.parse().ok())
         .unwrap_or(0.0)
+}
+
+/// One reaction going on or off a message, and the frame that says so.
+///
+/// The same route whether it was the reader who pressed a key or someone
+/// else in the workspace: Slack has one reaction on a message and one
+/// event for it, so the fake has one place where a message's reactions
+/// change. Answers whether the message was there to react to.
+#[allow(clippy::too_many_arguments)]
+fn react(
+    state: &mut State,
+    frames: &broadcast::Sender<Frame>,
+    channel: &str,
+    ts: &str,
+    user: &str,
+    name: &str,
+    removing: bool,
+    event_ts: &str,
+) -> bool {
+    let Some(message) = message_mut(state, channel, ts) else {
+        return false;
+    };
+    let mut reactions = message["reactions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut reaction| {
+            if reaction["name"] == json!(name) {
+                let mut users = reaction["users"].as_array().cloned().unwrap_or_default();
+                if removing {
+                    users.retain(|held| held != &json!(user));
+                } else if !users.contains(&json!(user)) {
+                    users.push(json!(user));
+                }
+                reaction["count"] = json!(users.len());
+                reaction["users"] = json!(users);
+            }
+            reaction
+        })
+        .filter(|reaction| reaction["count"] != json!(0))
+        .collect::<Vec<_>>();
+    let had = reactions
+        .iter()
+        .any(|reaction| reaction["name"] == json!(name));
+    if !had && !removing {
+        reactions.push(json!({"name": name, "users": [user], "count": 1}));
+    }
+    message["reactions"] = json!(reactions);
+    let _ = frames.send(Frame::Text(
+        json!({
+            "type": if removing { "reaction_removed" } else { "reaction_added" },
+            "user": user,
+            "reaction": name,
+            "item": {"type": "message", "channel": channel, "ts": ts},
+            "event_ts": event_ts,
+        })
+        .to_string()
+        .into(),
+    ));
+    true
+}
+
+/// Whether `user` already has `name` on this message, which is the one
+/// question `reactions.add` and `reactions.remove` refuse on.
+fn reacted_by(message: &Value, name: &str, user: &str) -> bool {
+    message["reactions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .any(|reaction| {
+            reaction["name"] == json!(name)
+                && reaction["users"]
+                    .as_array()
+                    .map(|users| users.contains(&json!(user)))
+                    .unwrap_or(false)
+        })
 }
 
 fn message_mut<'a>(state: &'a mut State, channel: &str, ts: &str) -> Option<&'a mut Value> {
@@ -1385,6 +1461,37 @@ fn handle(
                 })
                 .collect::<Vec<_>>();
             json!({"ok": true, "messages": messages, "has_more": false})
+        }
+        // The reader's own reaction. Slack signs it as whoever the token
+        // is, which here is `ME`, and refuses a second one rather than
+        // counting it twice.
+        method @ ("reactions.add" | "reactions.remove") => {
+            let removing = method == "reactions.remove";
+            let ts = field("timestamp");
+            let name = field("name");
+            let channel = field("channel");
+            let already = message_mut(&mut state, &channel, &ts)
+                .map(|message| reacted_by(message, &name, "ME"))
+                .unwrap_or(false);
+            if already == !removing {
+                let error = if removing {
+                    "no_reaction"
+                } else {
+                    "already_reacted"
+                };
+                return json!({"ok": false, "error": error});
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default();
+            let event_ts = format!("{now}.000100");
+            match react(
+                &mut state, frames, &channel, &ts, "ME", &name, removing, &event_ts,
+            ) {
+                true => json!({"ok": true}),
+                false => json!({"ok": false, "error": "message_not_found"}),
+            }
         }
         "conversations.mark" => {
             // Reading moves the cursor, here as on the server: the next

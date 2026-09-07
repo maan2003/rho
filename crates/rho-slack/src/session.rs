@@ -235,9 +235,16 @@ impl Loaded {
     /// message it landed on, so the count is kept here rather than paid for
     /// with a refetch of the whole conversation.
     fn react(&mut self, ts: &Ts, user: &UserId, name: &str, added: bool) -> bool {
-        let Some(held) = self.messages.iter_mut().find(|held| &held.ts == ts) else {
+        // The messages are in timestamp order, so the one a reaction names
+        // is found the way `insert` places one: by search, not by walking
+        // the loaded run.
+        let Ok(index) = self
+            .messages
+            .binary_search_by(|held| held.ts.epoch_seconds().total_cmp(&ts.epoch_seconds()))
+        else {
             return false;
         };
+        let held = &mut self.messages[index];
         let at = held.reactions.iter().position(|held| held.name == name);
         match (at, added) {
             (None, true) => held.reactions.push(Reaction {
@@ -267,6 +274,16 @@ impl Loaded {
         }
         self.record(Update::Replaced(ts.clone()));
         true
+    }
+
+    /// The held message with this timestamp, found by search over the run
+    /// rather than by walking it.
+    pub fn held(&self, ts: &Ts) -> Option<&Message> {
+        let index = self
+            .messages
+            .binary_search_by(|held| held.ts.epoch_seconds().total_cmp(&ts.epoch_seconds()))
+            .ok()?;
+        self.messages.get(index)
     }
 
     fn remove(&mut self, ts: &Ts) -> bool {
@@ -434,6 +451,7 @@ impl Session {
         // into is one whose ordinary traffic raises units: read the opt-in
         // after and a restart would forget every card it earned.
         self.model.set_watched(mirror.watched(&workspace));
+        self.model.set_reacted_with(mirror.reacted_with(&workspace));
         seed_read_cursors(&mut self.model, &mirror);
         // The units as the last run left them: one range scan, one row per
         // unit, no messages read. A mirror written before rho kept them has
@@ -819,7 +837,7 @@ impl Session {
             if let Some(loaded) = self.loaded.get_mut(&source)
                 && loaded.react(ts, user, name, added)
             {
-                reacted = loaded.messages.iter().find(|held| &held.ts == ts).cloned();
+                reacted = loaded.held(ts).cloned();
             }
         }
         let Some(message) = reacted else {
@@ -1870,6 +1888,111 @@ impl Session {
     /// A refusal takes the line back and hands the text to the caller,
     /// which is what keeps it out of the reader's way and in their
     /// composer.
+    /// Puts the reader's own emoji on a message, or takes theirs off if it
+    /// is already there. One key means one state, not two.
+    ///
+    /// `name` is the shortcode without colons, the form Slack's API takes
+    /// and the wire carries back. The change is made here before the
+    /// request goes, so the line under the point answers the key at once,
+    /// and put back if Slack refuses. Slack's own echo of it is then a
+    /// no-op: `Loaded::react` ignores a user already in the list, so the
+    /// count never counts the reader twice.
+    ///
+    /// Cost: the reactions on that one message and the two surfaces that
+    /// can hold it, never a pass over the conversation.
+    pub fn toggle_reaction(
+        &mut self,
+        source: &Source,
+        ts: &Ts,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            cx.emit(SessionEvent::Notice(
+                "slack: not connected, the reaction was not sent".to_owned(),
+            ));
+            return;
+        };
+        let user = self.model.self_id().clone();
+        let adding = !self.reacted_by_reader(source, ts, name);
+        let channel = source.channel().clone();
+        self.react(&channel, ts, &user, name, adding);
+        if adding {
+            self.note_reaction_used(name);
+        }
+        cx.notify();
+
+        let sent_name = name.to_owned();
+        let sent_ts = ts.clone();
+        let sent_channel = channel.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            match adding {
+                true => {
+                    client
+                        .add_reaction(&sent_channel, &sent_ts, &sent_name)
+                        .await
+                }
+                false => {
+                    client
+                        .remove_reaction(&sent_channel, &sent_ts, &sent_name)
+                        .await
+                }
+            }
+        });
+        let name = name.to_owned();
+        let ts = ts.clone();
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let sent = match task.await {
+                Ok(sent) => sent,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            let Err(error) = sent else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                // Refused: the line goes back to what Slack still holds,
+                // rather than showing a reaction that is not there.
+                tracing::warn!(error = %error, "slack reaction failed");
+                session.react(&channel, &ts, &user, &name, !adding);
+                cx.emit(SessionEvent::Notice(format!("slack: {error:#}")));
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Remembers what the reader reacted with, here and on disk, so the
+    /// menu opens on the emoji they actually use — after a restart too.
+    /// One short list written back, and only when it moved.
+    fn note_reaction_used(&mut self, name: &str) {
+        if !self.model.note_reaction_used(name) {
+            return;
+        }
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_reacted_with(&self.model.workspace().0.clone(), self.model.reacted_with());
+        }
+    }
+
+    /// The emoji the reader reaches for, most recent first.
+    pub fn reacted_with(&self) -> &[String] {
+        self.model.reacted_with()
+    }
+
+    /// Whether the reader's own emoji is already on this message. Asked of
+    /// the surface that holds it, so it costs that message's reactions.
+    pub fn reacted_by_reader(&self, source: &Source, ts: &Ts, name: &str) -> bool {
+        let user = self.model.self_id();
+        self.loaded
+            .get(source)
+            .and_then(|loaded| loaded.messages.iter().find(|held| &held.ts == ts))
+            .map(|message| {
+                message
+                    .reactions
+                    .iter()
+                    .any(|reaction| reaction.name == name && reaction.users.contains(user))
+            })
+            .unwrap_or(false)
+    }
+
     pub fn send(
         &mut self,
         source: &Source,

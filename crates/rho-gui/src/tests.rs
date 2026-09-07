@@ -7039,6 +7039,8 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
             // is worse than no binding.
             assert_ne!(routes("i", &list), Some("rho_gui::SlackCompose"));
             assert_ne!(routes("e", &list), Some("rho_gui::SlackEditMessage"));
+            // Reacting belongs to a message, and the list has none.
+            assert_ne!(routes("r", &list), Some("rho_gui::SlackReactTo"));
 
             let conversation = surface("RhoSlackConversation", mode);
             assert_eq!(
@@ -7047,6 +7049,7 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
             );
             assert_eq!(routes("i", &conversation), Some("rho_gui::SlackCompose"));
             assert_eq!(routes("s", &conversation), Some("rho_gui::SlackSearch"));
+            assert_eq!(routes("r", &conversation), Some("rho_gui::SlackReactTo"));
             assert_eq!(
                 routes("e", &conversation),
                 Some("rho_gui::SlackEditMessage")

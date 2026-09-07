@@ -128,6 +128,30 @@ impl Attached {
     }
 }
 
+/// One emoji a reaction menu can offer: the shortcode Slack takes, the
+/// glyph the reader reads, and whether the reader is already one of the
+/// reactors — which is what decides whether pressing it puts theirs on or
+/// takes it off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionChoice {
+    pub name: String,
+    pub glyph: String,
+    pub mine: bool,
+}
+
+/// What a reaction menu over the message under the point is about.
+///
+/// Two rows of choices, in the order a reader wants them: what is already
+/// on the message, because joining a reaction is the commonest thing
+/// anyone does with one, and then what this reader reaches for. Anything
+/// else is typed by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionChoices {
+    pub ts: Ts,
+    pub on_message: Vec<ReactionChoice>,
+    pub recent: Vec<ReactionChoice>,
+}
+
 /// What asking for an edit did. A message that is not the reader's own is
 /// the one case worth telling them about: nothing happens, and silence
 /// would read as a broken key.
@@ -398,6 +422,12 @@ impl ConversationView {
         &self.editor
     }
 
+    /// The session behind this surface, for a host that has to ask it
+    /// something the view does not wrap — the emoji table, say.
+    pub fn session(&self) -> &Entity<Session> {
+        &self.session
+    }
+
     pub fn source(&self) -> &Source {
         &self.source
     }
@@ -504,6 +534,53 @@ impl ConversationView {
         self.shown_messages(cx)
             .into_iter()
             .find(|message| message.ts == ts)
+    }
+
+    /// The emoji a reaction menu should offer over the message under the
+    /// point, or `None` when the point is not on a message.
+    ///
+    /// Cost: the reactions on that one message plus the remembered list,
+    /// which are exactly the rows the menu draws. (Finding the message
+    /// under the point is the transcript's own lookup, as it is for `e`.)
+    pub fn reaction_choices(&self, cx: &mut Context<Self>) -> Option<ReactionChoices> {
+        let message = self.cursor_message(cx)?;
+        let session = self.session.read(cx);
+        let mine = session.model().self_id().clone();
+        let on_message = message
+            .reactions
+            .iter()
+            .map(|reaction| ReactionChoice {
+                glyph: crate::emoji::render(&format!(":{}:", reaction.name)),
+                mine: reaction.users.contains(&mine),
+                name: reaction.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let recent = session
+            .reacted_with()
+            .iter()
+            .filter(|name| !on_message.iter().any(|choice| &&choice.name == name))
+            .map(|name| ReactionChoice {
+                glyph: crate::emoji::render(&format!(":{name}:")),
+                name: name.clone(),
+                mine: false,
+            })
+            .collect();
+        Some(ReactionChoices {
+            ts: message.ts,
+            on_message,
+            recent,
+        })
+    }
+
+    /// Puts the reader's own emoji on a message, or takes it off. The
+    /// surface's own source, so a reaction in a thread goes to the thread.
+    pub fn react(&mut self, ts: &Ts, name: &str, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        let name = name.to_owned();
+        let ts = ts.clone();
+        self.session.update(cx, |session, cx| {
+            session.toggle_reaction(&source, &ts, &name, cx);
+        });
     }
 
     /// `e`: rewrite the message under the cursor. Only the reader's own can

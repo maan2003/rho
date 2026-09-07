@@ -181,6 +181,24 @@ pub struct MarkPlan {
 /// emoji; a list longer than this is not read, it is scrolled past.
 const SUGGESTION_LIMIT: usize = 20;
 
+/// How many of the reader's own emoji the reaction menu remembers. A
+/// menu is read at a glance, so this is a short row of keys and not a
+/// history.
+pub const REACTIONS_REMEMBERED: usize = 9;
+
+/// What the menu offers before the reader has reacted to anything. Not a
+/// preference and not a ranking: a first menu with nothing in it teaches
+/// nobody what the key does, and one use puts the reader's own choice at
+/// the front of the row for good.
+const FIRST_REACTIONS: [&str; 6] = [
+    "thumbsup",
+    "white_check_mark",
+    "eyes",
+    "tada",
+    "heart",
+    "pray",
+];
+
 /// Whether a character can be part of a handle or a channel name, which is
 /// what bounds a mention in typed text.
 fn is_name_char(character: char) -> bool {
@@ -273,6 +291,10 @@ pub struct ConversationRow {
 pub struct Model {
     workspace: WorkspaceName,
     self_id: UserId,
+    /// The emoji the reader has reacted with, most recent first and
+    /// capped at what a picker shows. Kept here so the menu is built from
+    /// a list rather than worked out from the conversation.
+    reacted_with: Vec<String>,
     users: BTreeMap<UserId, User>,
     conversations: BTreeMap<ChannelId, Conversation>,
     counts: BTreeMap<ChannelId, ConversationCount>,
@@ -403,6 +425,10 @@ impl Model {
         Self {
             workspace,
             self_id: UserId(String::new()),
+            reacted_with: FIRST_REACTIONS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
             users: BTreeMap::new(),
             conversations: BTreeMap::new(),
             counts: BTreeMap::new(),
@@ -436,6 +462,38 @@ impl Model {
 
     pub fn self_id(&self) -> &UserId {
         &self.self_id
+    }
+
+    /// The emoji the reader reaches for, most recent first. What the
+    /// reaction menu offers before anything else.
+    pub fn reacted_with(&self) -> &[String] {
+        &self.reacted_with
+    }
+
+    /// What a previous run remembered. An empty list is a workspace the
+    /// reader has not reacted in yet, which leaves the starting row
+    /// standing rather than emptying the menu.
+    pub fn set_reacted_with(&mut self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        self.reacted_with = names;
+        self.reacted_with.truncate(REACTIONS_REMEMBERED);
+    }
+
+    /// Remembers an emoji the reader just used, newest first.
+    ///
+    /// Answers whether the list changed, so a caller writes it back only
+    /// when it did. The cost is the length of the list, which is capped at
+    /// what the menu shows.
+    pub fn note_reaction_used(&mut self, name: &str) -> bool {
+        if self.reacted_with.first().map(String::as_str) == Some(name) {
+            return false;
+        }
+        self.reacted_with.retain(|held| held != name);
+        self.reacted_with.insert(0, name.to_owned());
+        self.reacted_with.truncate(REACTIONS_REMEMBERED);
+        true
     }
 
     pub fn add_users(&mut self, users: impl IntoIterator<Item = User>) {

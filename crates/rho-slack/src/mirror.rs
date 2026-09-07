@@ -53,6 +53,12 @@ const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_
 /// The channels the reader opted into. Its own table rather than a flag in
 /// `CURSORS`, because the question asked of it is "which ones", and that is
 /// a range scan over a workspace rather than a lookup per channel.
+/// The emoji the reader has reacted with, most recent first. One row per
+/// workspace: the question asked of it is "which ones, in what order",
+/// which is one list and not a scan. Persisted because a picker that
+/// forgets what the reader always uses is a picker they stop using.
+const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
+    TableDefinition::new("rho_slack_reacted_with_v1");
 const WATCHED: TableDefinition<&str, Sen<StoredWatch>> =
     TableDefinition::new("rho_slack_watched_v1");
 
@@ -141,6 +147,7 @@ impl Mirror {
             write.open_table(CONVERSATIONS);
             write.open_table(CURSORS);
             write.open_table(WATCHED);
+            write.open_table(REACTED_WITH);
             write.open_table(UNITS);
             write.commit();
         });
@@ -543,6 +550,32 @@ impl Mirror {
 
     /// The channels the reader opted into, read back at startup. This is
     /// what makes an opt-in outlive the session that made it.
+    /// The emoji the reader reacted with, most recent first.
+    pub fn reacted_with(&self, workspace: &str) -> Vec<String> {
+        let txn = self.db.read();
+        let table = txn.open_table(REACTED_WITH);
+        table
+            .get(workspace)
+            .map(|stored| stored.value().as_ref().names.clone())
+            .unwrap_or_default()
+    }
+
+    /// Writes the list back whole. It is capped at what the picker shows,
+    /// so this is a handful of short strings and not a growing row.
+    pub fn set_reacted_with(&self, workspace: &str, names: &[String]) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(REACTED_WITH);
+            table.insert(
+                workspace,
+                SenValue::owned(StoredReactedWith {
+                    names: names.to_vec(),
+                }),
+            );
+        }
+        txn.commit();
+    }
+
     pub fn watched(&self, workspace: &str) -> Vec<ChannelId> {
         let txn = self.db.read();
         let table = txn.open_table(WATCHED);
@@ -717,6 +750,13 @@ fn unit_key(workspace: &str, unit: &Unit) -> String {
 
 /// A watched channel. The id is in the key already; it is repeated in the
 /// value so a reader of the table never has to take a key apart.
+/// The reader's own reaction history: shortcodes without colons, most
+/// recent first, capped where the picker stops showing them.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct StoredReactedWith {
+    names: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct StoredWatch {
     channel: String,

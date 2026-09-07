@@ -347,6 +347,7 @@ A conversation:
 | `i` | go to the composer |
 | `e` | rewrite your own message under the cursor |
 | `s` | search the conversation |
+| `r` | react to the message under the cursor: a menu of emoji |
 | `shift-n` | next conversation with something unread |
 | `ctrl-k` | out of a thread, back to the channel |
 | `q` | close the surface |
@@ -359,6 +360,12 @@ The composer:
 | `shift-enter` | a second line |
 | `up` | rewrite the last thing you said, when the composer is empty |
 | `escape` | put back what the composer held, then normal mode |
+
+`r` opens a transient rather than acting: what is already on the message
+comes first, so joining a reaction is one key, and a row for one you have
+already put on says "remove", because the key is one state and not two.
+Then the emoji you reached for most recently, then `/` for any emoji by
+name. On the list `r` is vim's, because a list has no message to react to.
 
 `G` is vim's and is not bound here: it clears the `n new` count because it
 puts the end of the conversation on screen, which is what reading them

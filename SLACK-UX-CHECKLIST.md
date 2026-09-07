@@ -114,8 +114,9 @@ under test. If the fake cannot produce a state, extend the fake.
       never the channel body. The `in thread` marker goes away.
 - [x] 1.7 Reactions. Now absent. Rho: one muted line under the message,
       `👍 3 · 🎉 1`; a reaction the user added renders in the "you" class
-      instead of muted, no word for it. Reading them is in scope; adding
-      stays deferred.
+      instead of muted, no word for it. Reading them landed first; adding
+      no longer stays deferred — `r` on a message opens the reaction
+      transient (item 2.29), and the same key twice is on and off again.
 - [x] 1.8 Edited and deleted. `(edited)` in the muted class at the end of
       the body (landed there rather than after the time, so 1.4's fixed
       clock column never shifts);
@@ -814,6 +815,17 @@ done right after the transcript primitive (2.4) and before 2.10:
       Deleting a letter widens by the same diff run backwards. `/`, `n`,
       `G` and yank still see the whole list, because narrowing is the
       model's and not the buffer's.
+- [x] 2.29 Reacting. `r` on the message under the cursor opens a transient:
+      what is already on the message first, because joining a reaction is
+      the commonest thing anyone does with one, and a row for one you have
+      already put on reads "— remove", so the key is one state rather than
+      two. Then the emoji you reached for most recently, most recent first
+      and never repeating the row above. Then `/`, which asks for any emoji
+      by name out of the same table the composer completes `:` from. The
+      emoji goes on locally the moment the key is pressed and the server is
+      told afterwards; a refusal puts it back and says so on the echo line.
+      What the reader reaches for is remembered across restarts, nine deep,
+      in the mirror. Nothing in the menu shows an id or the word "you".
 
 ## Phase 3: composing
 
@@ -975,10 +987,9 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 Presence and typing, automatic token extraction, dialogs and modals.
 
-File upload, edit and delete have since been built. Adding reactions and
-message search are no longer deferred: they are items 3 and 4 of the
-`rho-slack` order in `GUI-CRATES-DESIGN.md`, where what a client owes the
-user is now settled.
+File upload, edit, delete, adding reactions and message search have all
+since been built; the last two were items 3 and 4 of the `rho-slack` order
+in `GUI-CRATES-DESIGN.md`, where what a client owes the user is settled.
 
 ## Done means
 
