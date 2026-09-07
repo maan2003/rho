@@ -56,6 +56,30 @@ const HISTORY_PAGING_DRIVE: &[WalkEvent] = &[
     WalkEvent::Idle,
 ];
 
+/// A transcript whose settled turns are elided, typed into and paged
+/// through.
+///
+/// The keystroke first, on the composed screen, then five pairs of a jump
+/// to the top and the idle that composes the next chunk of history - the
+/// same climb the paging run makes, over a document that hides most of
+/// itself. What it is here to read is the `fold:` count, which is elision's
+/// line in a step's walk: the paging run's document is concealed markup
+/// only, and markup's number is not elision's.
+const ELIDED_HISTORY_DRIVE: &[WalkEvent] = &[
+    WalkEvent::ComposerKey { character: 'a' },
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+];
+
 /// Settled turns seeded before the drive runs.
 ///
 /// Forty already saturates what the transcript composes: seeding 0, 40 and
@@ -132,6 +156,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     steps,
                     mode,
                     prefill_turns: 0,
+                    prefill_tools: false,
                     script: None,
                 },
             )
@@ -145,6 +170,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 steps: LARGE_TRANSCRIPT_DRIVE.len(),
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                prefill_tools: false,
                 script: Some(LARGE_TRANSCRIPT_DRIVE),
             },
         ));
@@ -155,7 +181,19 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 steps: HISTORY_PAGING_DRIVE.len(),
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                prefill_tools: false,
                 script: Some(HISTORY_PAGING_DRIVE),
+            },
+        ));
+        runs.push((
+            "elided".to_owned(),
+            WalkConfig {
+                seed: 0,
+                steps: ELIDED_HISTORY_DRIVE.len(),
+                mode,
+                prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                prefill_tools: true,
+                script: Some(ELIDED_HISTORY_DRIVE),
             },
         ));
     }
