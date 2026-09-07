@@ -62,6 +62,18 @@ never fired, and read as evidence of health. Recording where the clamp bites
 rather than where the subtraction would have wrapped is the difference
 between a live instrument and a decoration.
 
+The assertion had the same problem from the other side, and eng-b8os found
+it. It asked only that *a* clamp had been reported, and the record it was
+reading also contained `new 214..3` — an edit whose start is past its own
+end, sitting in the same three lines, passed over by an assertion satisfied
+by the fault standing next to the one it was checking. The record is now
+characterised in full: three lines, each named, including the inverted edit.
+
+That line is a fault, not a feature. The clamp stops the unsigned wrap and
+leaves an inverted edit behind; it is a better failure and still a failure.
+The assertion names it rather than tolerating it, and this test is meant to
+fail on the day the widening rule is fixed rather than guarded.
+
 ## Whose
 
 The faults are eng-b8os's, from their two fold cuts, and the fixes are

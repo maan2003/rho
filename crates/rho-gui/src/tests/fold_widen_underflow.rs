@@ -129,11 +129,43 @@ fn a_splice_inside_a_fold_that_starts_at_zero_does_not_underflow(cx: &mut TestAp
                 .update(cx, |map, _| map.take_fold_widening_violations())
         })
         .expect("read what the widening recorded");
+    // Every line of it, not one line of it. An earlier version of this
+    // assertion asked only that a clamp had been reported, and passed over
+    // the inverted edit sitting in the same record — an assertion satisfied
+    // by the fault standing next to the one it was checking. eng-b8os found
+    // that by asserting the record empty instead; this is the same reading
+    // written down so it cannot be passed over again.
+    assert_eq!(
+        said.len(),
+        3,
+        "the record is characterised here in full, so a change to it is \
+         visible rather than absorbed; it said {said:#?}"
+    );
     assert!(
-        said.iter()
-            .any(|said| said.contains("did not name the same boundary")),
-        "the widening had to clamp one side against the other and must say \
-         so; it said {said:#?}"
+        said[0].contains("move by 219")
+            && said[0].contains("old side at 5")
+            && said[0].contains("could only move by 5"),
+        "the inlay inside the fold moves the new side and not the fold's \
+         start, so the two sides are asked to move by 219 and the old side \
+         has 5; it said {:?}",
+        said[0]
+    );
+    assert!(
+        said[1].contains("move by 214") && said[1].contains("could only move by 0"),
+        "and the round after it clamps to nothing, which is where the loop \
+         breaks with the new side still inside its fold; it said {:?}",
+        said[1]
+    );
+    // The fault that remains, named rather than tolerated. The clamp stops
+    // the unsigned wrap and leaves an edit whose start is past its own end,
+    // which is a better failure and still a failure. This line goes when
+    // the widening rule is fixed rather than guarded, and this test is
+    // meant to fail on that day.
+    assert!(
+        said[2].contains("widened to 214..3") && said[2].contains("starts after it ends"),
+        "the clamp converts the underflow into an inverted edit, and the \
+         record has to say so for as long as that is true; it said {:?}",
+        said[2]
     );
 
     // The map still describes one document: what the fold map says it has,
