@@ -474,8 +474,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     let iroh_listener = iroh.map(|(listener, _)| listener);
 
-    drop_converted_tables(&agents.db).await;
-
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
             agents.clone(),
@@ -1184,20 +1182,6 @@ impl AgentRegistry {
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
         self.pool.load(agent_id).await
     }
-}
-
-/// The tables slice B leaves behind, dropped on the start that no longer
-/// needs them. `projects` goes only once this same start has put its rows
-/// in the store; `view_config` has been unread by every client since the
-/// fold toggle became session state, so there is nothing to convert.
-/// `agent_attention_until_slice_b` stays: the story backfill still reads
-/// it for an agent's spawner, and it goes with the conversion code.
-async fn drop_converted_tables(db: &RhoDb) {
-    let mut write = db.write().await;
-    write.delete_table("projects");
-    write.delete_table("view_config");
-    write.delete_table("agent_attention_until_slice_b");
-    write.commit();
 }
 
 async fn serve_connection(
