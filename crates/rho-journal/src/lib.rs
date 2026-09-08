@@ -951,7 +951,7 @@ mod tests {
             TableDefinition::new("gui_action_journal_v3");
 
         let dir = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(&dir.path().join(FILE_NAME));
+        let db = RhoDb::open(dir.path().join(FILE_NAME));
         futures::executor::block_on(async {
             let mut write = db.write().await;
             let entry = Entry {
