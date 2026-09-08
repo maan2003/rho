@@ -344,21 +344,28 @@ impl Session {
     pub fn new(credentials: Credentials, paths: Paths, cx: &mut Context<Self>) -> Self {
         match Client::new(credentials.clone()) {
             Ok(client) => Self::with_client(Arc::new(client), paths, cx),
-            Err(error) => Self {
-                client: None,
-                model: Model::new(credentials.workspace),
-                status: Status::Failed(format!("{error:#}")),
-                health: Health::default(),
-                loaded: HashMap::new(),
-                catch_up: Arc::new(Notify::new()),
-                pending_sends: 0,
-                cached_files: HashMap::new(),
-                mirror: open_mirror(&paths.mirror),
-                paths,
-                focused: None,
-                connected_once: false,
-                _tasks: Vec::new(),
-            },
+            Err(error) => Self::without_client(credentials, paths, format!("{error:#}")),
+        }
+    }
+
+    /// A session whose client could not be built at all. There is no
+    /// reconnect from here: `client` is set once, in the constructor, and
+    /// this workspace will make no request for as long as it exists.
+    fn without_client(credentials: Credentials, paths: Paths, reason: String) -> Self {
+        Self {
+            client: None,
+            model: Model::new(credentials.workspace),
+            status: Status::Failed(reason),
+            health: Health::default(),
+            loaded: HashMap::new(),
+            catch_up: Arc::new(Notify::new()),
+            pending_sends: 0,
+            cached_files: HashMap::new(),
+            mirror: open_mirror(&paths.mirror),
+            paths,
+            focused: None,
+            connected_once: false,
+            _tasks: Vec::new(),
         }
     }
 
@@ -1091,7 +1098,6 @@ impl Session {
         self.loaded.insert(
             source.clone(),
             Loaded {
-                loading: true,
                 messages: cached,
                 reached_oldest,
                 // The mirror's own run is not a change, it is where the
@@ -1270,9 +1276,6 @@ impl Session {
             }
             return;
         };
-        if let Some(loaded) = self.loaded.get_mut(source) {
-            loaded.loading = true;
-        }
         match request {
             Older::Cursor(cursor) => self.fetch(source.clone(), Some(cursor), false, None, cx),
             Older::Before(latest) => self.fill_gap(source.clone(), latest, cx),
@@ -1286,6 +1289,11 @@ impl Session {
         let Some(client) = self.client.clone() else {
             return;
         };
+        // Set here rather than by the caller, because here is where it is
+        // cleared: a request that is never made must not leave the
+        // conversation saying it is loading, since that flag is also the
+        // gate on asking again.
+        self.mark_loading(&source);
         let request = source.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             match &request {
@@ -1396,14 +1404,16 @@ impl Session {
         if self.loaded.contains_key(&source) {
             return;
         }
-        self.loaded.insert(
-            source.clone(),
-            Loaded {
-                loading: true,
-                ..Loaded::default()
-            },
-        );
+        self.loaded.insert(source.clone(), Loaded::default());
         self.fetch(source, None, false, None, cx);
+    }
+
+    /// Says a request is in flight for this conversation. Only ever called
+    /// once the request is certain to be made.
+    fn mark_loading(&mut self, source: &Source) {
+        if let Some(loaded) = self.loaded.get_mut(source) {
+            loaded.loading = true;
+        }
     }
 
     fn fetch(
@@ -1417,6 +1427,9 @@ impl Session {
         let Some(client) = self.client.clone() else {
             return;
         };
+        // See `fill_gap`: the function that clears the flag is the one that
+        // sets it, after the client check.
+        self.mark_loading(&source);
         let request = source.clone();
         // Kept out of the request future, which takes ownership: the result
         // handler needs to know whether this was a bounded tail fetch.
@@ -3243,5 +3256,50 @@ mod tests {
         assert!(model.mark_read(&ChannelId("C1".into()), &Ts("900.0".into())));
         assert!(!model.conversation_rows()[0].unread);
         assert_eq!(model.conversation_rows()[0].mention_count, 0);
+    }
+
+    /// A workspace whose client never built asks for nothing, and must not
+    /// leave the conversation saying it is loading — the flag is also the
+    /// gate on asking again, so a stuck one is a conversation that will
+    /// never load history for as long as it exists.
+    #[gpui::test]
+    fn a_scroll_with_no_client_leaves_the_conversation_free_to_ask_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = tempfile::tempdir().expect("a state directory of this test's own");
+        let credentials = Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+        let session = cx.new(|_| {
+            Session::without_client(
+                credentials,
+                Paths::under(state.path()),
+                "the client never built".to_owned(),
+            )
+        });
+        let source = Source::Conversation(ChannelId("C1".into()));
+
+        session.update(cx, |session, cx| {
+            session.loaded.insert(
+                source.clone(),
+                Loaded {
+                    older_cursor: Some("page-2".to_owned()),
+                    ..Loaded::default()
+                },
+            );
+            session.load_older(&source, cx);
+        });
+
+        let (loading, reached_oldest, cursor) = session.read_with(cx, |session, _| {
+            let loaded = &session.loaded[&source];
+            (
+                loaded.loading,
+                loaded.reached_oldest,
+                loaded.older_cursor.clone(),
+            )
+        });
+        assert!(!loading, "no request was made, so nothing is in flight");
+        assert!(
+            older_request(loading, reached_oldest, cursor, None).is_some(),
+            "and the next scroll is still allowed to ask"
+        );
     }
 }
