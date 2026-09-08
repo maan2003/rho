@@ -488,7 +488,6 @@ fn run_events_with_detached_host(
         if let WalkEvent::AdvanceTime { milliseconds } = event {
             virtual_time += Duration::from_millis(u64::from(*milliseconds));
         }
-        let frame_start = recorder.frames().len();
         let allowed_y = match event {
             WalkEvent::ComposerKey { .. } => prompt_row(&workspace, &editor, &mut cx),
             _ => None,
@@ -507,15 +506,24 @@ fn run_events_with_detached_host(
                 Vec::new(),
             )
         })?;
-        cx.run_until_parked();
+        // The frame the reader gets is the one drawn after the effect
+        // cycle the event queued and before anything the event started has
+        // been waited for. Draw it, then draw again once everything has
+        // settled: the second frame is what the first one should have
+        // been, and any difference between them is what the reader sees
+        // flash.
+        cx.update(|_| {});
+        let frame_start = recorder.frames().len();
         let draw_started = Instant::now();
+        cx.draw_window(*workspace);
+        let draw_micros = draw_started.elapsed().as_micros() as u64;
+        cx.run_until_parked();
         cx.draw_window(*workspace);
         let work = frame_timings
             .collect_unseen()
             .last()
             .map(|timing| timing.work)
             .unwrap_or_default();
-        let draw_micros = draw_started.elapsed().as_micros() as u64;
         max_draw_micros = max_draw_micros.max(draw_micros);
         step_draw_micros.push(draw_micros);
         let event_timings = timings.collect_unseen();
@@ -563,9 +571,9 @@ fn run_events_with_detached_host(
 
         let frames = recorder.frames();
         let produced = &frames[frame_start..];
-        if produced.len() != 1 {
+        if produced.len() != 2 {
             return Err((
-                "one event did not produce exactly one frame",
+                "one event did not produce its frame and its settled frame",
                 step,
                 Some(event.clone()),
                 draw_micros,
@@ -577,6 +585,23 @@ fn run_events_with_detached_host(
             ));
         }
         let frame = &produced[0];
+        // Paging history in is composed on the frame after the jump, by
+        // design: HISTORY_PAGING_DRIVE is written as a jump and then the
+        // idle that composes the next forty-row chunk. So a jump is the
+        // one event whose frame is allowed not to be its last.
+        if !matches!(event, WalkEvent::ScrollToTop) && !produced[1].changes.is_empty() {
+            return Err((
+                "the frame an event produced is not the frame it settled to",
+                step,
+                Some(event.clone()),
+                draw_micros,
+                0,
+                0,
+                cold_draw_micros,
+                warm_draw_micros,
+                describe_changes(&recorder, &produced[1]),
+            ));
+        }
         step_owners.push(summarize_owners(&recorder, frame));
         max_changed_primitives = max_changed_primitives.max(frame.changes.len());
         if matches!(event, WalkEvent::Idle) && !frame.changes.is_empty() {
@@ -650,7 +675,10 @@ fn run_events_with_detached_host(
     Ok(WalkReport {
         seed,
         steps: events.len(),
-        frames: frames.len().saturating_sub(1),
+        // Every event draws twice, its own frame and the settled frame
+        // that says whether the first one was the answer, so what an event
+        // produced is half of what was recorded past the baseline.
+        frames: frames.len().saturating_sub(1) / 2,
         distinct_scenes: scenes.len(),
         max_changed_primitives,
         max_touched_rows,
@@ -959,7 +987,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
                 text: "generated request near a wrapping boundary ".repeat(8),
             }),
             Arc::new(UiBlock::AssistantMessage {
-                text: "generated streaming tail ".repeat(8),
+                text: "generated **streaming** tail ".repeat(8),
                 phase: Some(UiMessagePhase::FinalAnswer),
             }),
         ]);
@@ -982,7 +1010,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         }
         blocks.push(Arc::new(UiBlock::AssistantMessage {
             text: format!(
-                "settled answer {turn}: compiled 12 targets in 0.42s\nand a second line of ordinary prose that wraps\nand a third that does not\n"
+                "settled answer {turn}: `compiled 12 targets` in 0.42s\nand a **second** line of ordinary prose that wraps\nand a third that does not\n"
             ),
             phase: Some(UiMessagePhase::FinalAnswer),
         }));
@@ -993,7 +1021,7 @@ fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
         }),
         Arc::new(UiBlock::Tool(tool)),
         Arc::new(UiBlock::AssistantMessage {
-            text: "generated streaming tail ".repeat(8),
+            text: "generated **streaming** tail ".repeat(8),
             phase: Some(UiMessagePhase::FinalAnswer),
         }),
     ]);
@@ -1072,7 +1100,9 @@ mod tests {
         })
         .expect("generated scene sequence");
         assert_eq!(report.frames, 8);
-        assert_eq!(report.scene_hashes.len(), 8);
+        // Two hashes an event: the frame it produced and the frame it
+        // settled to.
+        assert_eq!(report.scene_hashes.len(), 16);
     }
 
     #[test]
