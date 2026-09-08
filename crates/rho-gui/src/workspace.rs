@@ -5294,12 +5294,22 @@ impl Workspace {
             return;
         }
         if !delta.shape {
-            let nodes = self.desk_cells.nodes(host).to_vec();
-            if self.dashboard.deal_shape_held(host, &nodes)
-                && self
-                    .dashboard
-                    .patch_deal_source(host, &delta.touched, &nodes)
-            {
+            // The desk owns the nodes and the dealer owns its source, so
+            // the two are borrowed apart rather than the nodes copied: a
+            // copy is every row's name and labels cloned for an event that
+            // reads them and puts them down again, and this is the path
+            // every cell of a streaming turn takes.
+            let patched = {
+                let Self {
+                    desk_cells,
+                    dashboard,
+                    ..
+                } = self;
+                let nodes = desk_cells.nodes(host);
+                dashboard.deal_shape_held(host, nodes)
+                    && dashboard.patch_deal_source(host, &delta.touched, nodes)
+            };
+            if patched {
                 // The user's own words about an agent — its name, its
                 // labels, whether it is put away — are on the rows this
                 // delta named, and a patch is the path they arrive by. A

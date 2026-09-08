@@ -1743,6 +1743,119 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
     );
 }
 
+/// A burst of quiet cells costs the rows it names, whatever the desk is
+/// sized. Every one of these verdicts moves a note's state where it sits
+/// and moves no shape, so each is patched into the dealer's source where
+/// it landed; none of them takes the source again, and none of them reads
+/// the whole map. A hundred rows is where the whole-map copy this path
+/// used to make was worth 25 microseconds an event, and the user's desk
+/// is ten times that.
+#[gpui::test]
+async fn a_burst_of_quiet_cells_costs_its_own_rows(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Desk");
+    let notes = (0..100)
+        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
+        .collect::<Vec<_>>();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+
+    let (taken, patched) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.deal_work_for_test()
+        })
+        .expect("read the dealer's work");
+    let burst = 8;
+    for note in notes.iter().take(burst) {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                assert!(workspace.apply_verdict_for_test(
+                    HostId::default(),
+                    note,
+                    crate::desk_view::DeskVerdict::Done,
+                    window,
+                    cx,
+                ));
+            })
+            .expect("mark a note done");
+    }
+    cx.run_until_parked();
+
+    let (taken_after, patched_after) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.deal_work_for_test()
+        })
+        .expect("read the dealer's work");
+    assert_eq!(
+        taken_after, taken,
+        "a hundred quiet rows made the source be taken again"
+    );
+    assert_eq!(
+        patched_after - patched,
+        burst,
+        "each quiet cell is one patch and no more"
+    );
+}
+
+/// A shape that moved is the one case that composes the map. Filing a
+/// note writes its parent, which is where the row sits, so the dealer
+/// cannot patch it where it was: the source is taken again. This is the
+/// other half of the quiet-cell rule, and it is here so that cutting the
+/// cost of a quiet delta cannot quietly cut the correctness of a loud one.
+#[gpui::test]
+async fn filing_a_note_moves_the_shape_and_takes_the_source(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Desk");
+    let other = desk.note(Some(parent.clone()), "elsewhere");
+    let notes = (0..16)
+        .map(|nth| desk.note(Some(parent.clone()), &format!("note {nth}")))
+        .collect::<Vec<_>>();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+
+    let (taken, _) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.deal_work_for_test()
+        })
+        .expect("read the dealer's work");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &notes[3],
+                crate::desk_view::DeskVerdict::File {
+                    parent: other.clone()
+                },
+                window,
+                cx,
+            ));
+        })
+        .expect("file one note");
+    cx.run_until_parked();
+
+    let (taken_after, _) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard.deal_work_for_test()
+        })
+        .expect("read the dealer's work");
+    assert!(
+        taken_after > taken,
+        "a row moved and the source was patched where it no longer is"
+    );
+}
+
 /// A verdict costs the cells it writes. Marking one note done moves that
 /// note's state where it sits and moves no shape, so the dealer's source
 /// is patched where the verdict landed rather than taken again. Written
