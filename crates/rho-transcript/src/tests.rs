@@ -458,12 +458,49 @@ fn measure_the_pipeline_and_not_the_validation() {
 fn one_replacement_costs_what_it_touches(cx: &mut TestAppContext) {
     measure_the_pipeline_and_not_the_validation();
     init_editor(cx);
-    let small = replacement_cost(cx, 100);
-    let big = replacement_cost(cx, 5000);
+    let small = replacement_cost(cx, 100, None);
+    let big = replacement_cost(cx, 5000, None);
     println!("100 items: {small:?}, 5000 items: {big:?}");
     assert!(
         big < small * SIZE_FACTOR,
         "a replacement follows what it touched, not the transcript: \
+         {small:?} at a hundred items against {big:?} at five thousand"
+    );
+}
+
+/// The same replacement with a tenth of the items carrying a block, which
+/// is roughly a Slack conversation of pictures and cards.
+///
+/// Its own bench because a block is the editor's block map rather than this
+/// crate's bookkeeping, and because the block map was suspected of a
+/// per-message cost that follows the transcript. It is not there at this
+/// size: 3.04 ms at a hundred items against 11.1 ms at five thousand, so
+/// fifty times the items costs 3.6 times the replacement, under the
+/// `SIZE_FACTOR` the block-free bench holds to as well.
+///
+/// That pair is the number, and it was taken with the wrap guard off, which
+/// is what `measure_the_pipeline_and_not_the_validation` is for. The same
+/// bench with the guard in the build reads 4.99 ms and 688 ms, and that is
+/// not a cost figure at all: 677 of those milliseconds are
+/// `rows_within_their_document` walking the document on every wrap sync.
+/// A number from a build with the validation in it says nothing about the
+/// pipeline, which is why this one says which build it came from.
+///
+/// ```text
+/// cargo test -p rho-transcript a_replacement_among_blocks_costs_what_it_touches \
+///     -- --ignored --nocapture
+/// ```
+#[gpui::test]
+#[ignore = "measures a per-event cost, so it needs a quiet machine"]
+fn a_replacement_among_blocks_costs_what_it_touches(cx: &mut TestAppContext) {
+    measure_the_pipeline_and_not_the_validation();
+    init_editor(cx);
+    let small = replacement_cost(cx, 100, Some(10));
+    let big = replacement_cost(cx, 5000, Some(10));
+    println!("100 items: {small:?}, 5000 items: {big:?}");
+    assert!(
+        big < small * SIZE_FACTOR,
+        "a replacement among blocks follows what it touched, not the transcript: \
          {small:?} at a hundred items against {big:?} at five thousand"
     );
 }
@@ -478,14 +515,31 @@ const SIZE_FACTOR: u32 = 4;
 /// How long one item's replacement takes, averaged over enough of them that
 /// a single scheduling hiccup does not carry the number.
 ///
-/// No item carries a block. What a block costs to place is the editor's
-/// block map, not this crate's bookkeeping, and it is large enough to bury
-/// the thing being measured here: see the note on the block map in the
-/// window's design.
-fn replacement_cost(cx: &mut TestAppContext, items: usize) -> std::time::Duration {
+/// `block_every` gives every nth item one block; `None` gives none of them
+/// any. What a block costs to place is the editor's block map rather than
+/// this crate's bookkeeping, so the two are measured apart: see the note on
+/// the block map in the window's design.
+fn replacement_cost(
+    cx: &mut TestAppContext,
+    items: usize,
+    block_every: Option<usize>,
+) -> std::time::Duration {
     let (buffer, editor) = on_screen(cx);
     let mut sheet = Sheet::new(buffer.clone());
-    let shown = |index: usize, text: &str| item(&format!("m{index}"), text);
+    let shown = |index: usize, text: &str| {
+        let shown = item(&format!("m{index}"), text);
+        match block_every {
+            Some(every) if index.is_multiple_of(every) => {
+                shown.with_blocks(vec![crate::BlockSpec {
+                    line: 0,
+                    height: 4,
+                    render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+                    priority: 0,
+                }])
+            }
+            _ => shown,
+        }
+    };
     let run = (0..items)
         .map(|index| shown(index, &format!("message {index}\n")))
         .collect::<Vec<_>>();
