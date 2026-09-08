@@ -316,6 +316,13 @@ two thousand ranges takes four thousand rows out of the layout. The wall
 clock there is measuring the rows a fold hides. The cost rule is written in
 counts, and the count is what the test asserts.
 
+`block:` is flat over the same climb, 28 at 233 rows and 28 at 469, and it
+is flat because it counts the walk and only the walk: rho's elisions are
+folds below the wrap map, and the block map's own display elisions - which
+it scans in full twice per sync, resolving two anchors through four maps
+each time - have no caller outside tests, in rho or in zed, so that scan
+never runs over anything on the reader's path.
+
 ### How it will be proven
 
 On the QA rig, on the user's snapshot, with the handbook's Emacs-feel checks:
