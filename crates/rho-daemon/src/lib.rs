@@ -431,8 +431,8 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let agents = Arc::new(
-        AgentRegistry::new(
+    let services = Arc::new(
+        Services::new(
             db,
             inference,
             path_overrides,
@@ -443,12 +443,12 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         )
         .await?,
     );
-    spawn_inference_projection(Arc::clone(&agents));
+    spawn_inference_projection(Arc::clone(&services));
     // One probe per account: a subscription's headroom is the account's, and
     // agents move between accounts. The probe has no view to mount an
     // account into, so it names the account directory outright.
     for account in rho_claude::accounts::list()? {
-        let quota_environment = agents.user_environment.clone();
+        let quota_environment = services.user_environment.clone();
         let quota_path_overrides = quota_path_overrides.clone();
         let account_dir = rho_claude::accounts::account_dir(&account)?;
         spawn_claude_quota_recorder(
@@ -466,9 +466,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
                 default_db_path()?.with_file_name(format!("claude-quota-probe-{account}")),
             ),
             account,
-            agents.db.clone(),
-            agents.inference.clone(),
-            agents.events.clone(),
+            services.db.clone(),
+            services.inference.clone(),
+            services.events.clone(),
         );
     }
 
@@ -476,7 +476,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
 
     if let Some(listener) = iroh_listener {
         tokio::spawn(run_iroh_listener(
-            agents.clone(),
+            services.clone(),
             listener,
             iroh_auth.clone(),
         ));
@@ -488,15 +488,15 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                agents.pool.flush_agent_usage(None).await;
+                services.pool.flush_agent_usage(None).await;
                 return Ok(());
             }
             connection = runtime.server.accept() => {
                 let connection = connection?;
-                let agents = agents.clone();
+                let services = services.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(agents, iroh_auth, connection).await {
+                    if let Err(error) = serve_connection(services, iroh_auth, connection).await {
                         eprintln!("rho daemon connection error: {error:#}");
                     }
                 });
@@ -525,7 +525,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 /// Serves application streams from connections already approved by
 /// [`rho_rpc::AuthenticatedIrohListener`].
 async fn run_iroh_listener(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut listener: rho_rpc::AuthenticatedIrohListener,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
 ) {
@@ -537,14 +537,14 @@ async fn run_iroh_listener(
                 continue;
             }
         };
-        let agents = agents.clone();
+        let services = services.clone();
         let iroh_auth = iroh_auth.clone();
         tokio::spawn(async move {
             // One UI control session per iroh connection; the rest of its
             // streams are dedicated (files, shells, one-shot queries).
             let control_claimed = Arc::new(AtomicBool::new(false));
             while let Ok((send, recv)) = connection.accept_bi().await {
-                let agents = agents.clone();
+                let services = services.clone();
                 let control_claimed = control_claimed.clone();
                 let iroh_auth = iroh_auth.clone();
                 tokio::spawn(async move {
@@ -604,7 +604,7 @@ async fn run_iroh_listener(
                         }
                         let send = rho_rpc::Writer::new(send);
                         let result =
-                            serve_connection_io(agents, iroh_auth, recv, send, None, Some(first))
+                            serve_connection_io(services, iroh_auth, recv, send, None, Some(first))
                                 .await;
                         if control {
                             control_claimed.store(false, Ordering::Release);
@@ -813,7 +813,11 @@ struct DeskSession {
     binding: Arc<DeskBinding>,
 }
 
-struct AgentRegistry {
+/// Everything the daemon owns that a connection may need: the agent pool,
+/// the database, the stores, the locks and the brokers. It is not a
+/// registry of agents — the pool is that — but the one bundle a connection
+/// is handed so it does not carry a dozen handles of its own.
+struct Services {
     pool: Arc<AgentPool>,
     db: RhoDb,
     desk_cells: desk_cells::DeskCellStore,
@@ -845,7 +849,7 @@ struct AgentRegistry {
     voice_lease: Arc<TokioMutex<()>>,
 }
 
-impl AgentRegistry {
+impl Services {
     async fn new(
         db: RhoDb,
         inference: Inference,
@@ -1185,7 +1189,7 @@ impl AgentRegistry {
 }
 
 async fn serve_connection(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     connection: ServerConnection,
 ) -> anyhow::Result<()> {
@@ -1196,13 +1200,13 @@ async fn serve_connection(
     });
     let stream = connection.into_stream();
     let (reader, writer) = stream.into_split();
-    serve_connection_io(agents, iroh_auth, reader, writer, land_holder, None).await
+    serve_connection_io(services, iroh_auth, reader, writer, land_holder, None).await
 }
 
 /// One UI protocol session over any framed byte stream (Unix socket or an
 /// iroh bi-stream from an enrolled remote client).
 async fn serve_connection_io<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     iroh_auth: Option<rho_iroh_auth::IrohAuth>,
     reader: R,
     writer: W,
@@ -1228,10 +1232,10 @@ where
         .map_err(|_| anyhow::anyhow!("Unix stream first frame timed out"))??,
     };
     if let ClientMessage::ChannelOpen { workspace } = first {
-        return serve_workspace_channel(agents, reader, writer, workspace).await;
+        return serve_workspace_channel(services, reader, writer, workspace).await;
     }
     if let ClientMessage::RealtimeOpen { offer_sdp } = first {
-        return realtime::serve(agents, reader, writer, offer_sdp).await;
+        return realtime::serve(services, reader, writer, offer_sdp).await;
     }
     if let ClientMessage::DiffSnapshot {
         workspace,
@@ -1239,7 +1243,7 @@ where
         include_paths,
     } = first
     {
-        return serve_diff_snapshot(agents, writer, workspace, known_commit_id, include_paths)
+        return serve_diff_snapshot(services, writer, workspace, known_commit_id, include_paths)
             .await;
     }
     if let ClientMessage::DiffBaseContents {
@@ -1249,15 +1253,22 @@ where
         paths,
     } = first
     {
-        return serve_diff_base_contents(agents, writer, workspace, operation_id, commit_id, paths)
-            .await;
+        return serve_diff_base_contents(
+            services,
+            writer,
+            workspace,
+            operation_id,
+            commit_id,
+            paths,
+        )
+        .await;
     }
     if let ClientMessage::GuiTelemetryUpload { snapshot } = first {
         return serve_gui_telemetry_upload(writer, snapshot).await;
     }
     if let ClientMessage::VisualizationGet { id } = first {
         let mut writer = writer;
-        let response = match agents.visualizations.get(&id) {
+        let response = match services.visualizations.get(&id) {
             Some(visualization) => ServerMessage::VisualizationContent {
                 id,
                 mime_type: visualization.mime_type,
@@ -1279,7 +1290,17 @@ where
     } = first
     {
         let open = TerminalOpenKind::Create { attach };
-        return serve_terminal(agents, reader, writer, agent, terminal_id, open, cols, rows).await;
+        return serve_terminal(
+            services,
+            reader,
+            writer,
+            agent,
+            terminal_id,
+            open,
+            cols,
+            rows,
+        )
+        .await;
     }
     if let ClientMessage::TerminalAttach {
         agent,
@@ -1289,16 +1310,26 @@ where
     } = first
     {
         let open = TerminalOpenKind::Attach;
-        return serve_terminal(agents, reader, writer, agent, terminal_id, open, cols, rows).await;
+        return serve_terminal(
+            services,
+            reader,
+            writer,
+            agent,
+            terminal_id,
+            open,
+            cols,
+            rows,
+        )
+        .await;
     }
     if let ClientMessage::TerminalList { agent } = first {
-        return serve_terminal_list(agents, writer, agent).await;
+        return serve_terminal_list(services, writer, agent).await;
     }
     if let ClientMessage::ShellAttach { agent } = first {
-        return serve_shell(agents, reader, writer, agent).await;
+        return serve_shell(services, reader, writer, agent).await;
     }
     if let ClientMessage::GitTransportRequest { request } = first {
-        return serve_git_transport_request(agents, reader, writer, request).await;
+        return serve_git_transport_request(services, reader, writer, request).await;
     }
     if let ClientMessage::GitTransportProvide {
         request_id,
@@ -1307,7 +1338,7 @@ where
     } = first
     {
         return serve_git_transport_provider(
-            agents,
+            services,
             reader,
             writer,
             request_id,
@@ -1318,7 +1349,7 @@ where
     }
     if let ClientMessage::GitTransportQuery { host } = first {
         let pat_available =
-            host == "github.com" && agents.platform_secrets.contains_nonempty("GITHUB_TOKEN");
+            host == "github.com" && services.platform_secrets.contains_nonempty("GITHUB_TOKEN");
         let mut writer = writer;
         write_frame(
             &mut writer,
@@ -1341,9 +1372,9 @@ where
     // Creations update lightweight registry summaries. Subscribe before
     // building Ready so a concurrent creation is either in its snapshot or
     // arrives on this receiver (occasionally both, harmlessly).
-    let mut created_rx = agents.pool.subscribe_created();
-    let mut events_rx = agents.events.subscribe();
-    let _ = outgoing_tx.send(agents.ready_message().await);
+    let mut created_rx = services.pool.subscribe_created();
+    let mut events_rx = services.events.subscribe();
+    let _ = outgoing_tx.send(services.ready_message().await);
     // Names this connection's wants in the pool's live set, so they leave
     // with it.
     let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1353,7 +1384,7 @@ where
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
     {
-        let agents = Arc::clone(&agents);
+        let services = Arc::clone(&services);
         let outgoing_tx = outgoing_tx.clone();
         tokio::spawn(async move {
             loop {
@@ -1364,13 +1395,13 @@ where
                                 agent_id: created.agent_id,
                             })
                             .is_err()
-                            || outgoing_tx.send(agents.ready_message().await).is_err()
+                            || outgoing_tx.send(services.ready_message().await).is_err()
                         {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if outgoing_tx.send(agents.ready_message().await).is_err() {
+                        if outgoing_tx.send(services.ready_message().await).is_err() {
                             break;
                         }
                     }
@@ -1428,20 +1459,20 @@ where
                 match read {
                     None => {
                         for (repo, _) in &land_leases {
-                            agents.clear_land_holder(repo).await;
+                            services.clear_land_holder(repo).await;
                         }
                         break Ok(());
                     }
                     Some(Ok(Some(message))) => message,
                     Some(Ok(None)) => {
                         for (repo, _) in &land_leases {
-                            agents.clear_land_holder(repo).await;
+                            services.clear_land_holder(repo).await;
                         }
                         break Ok(());
                     }
                     Some(Err(error)) => {
                         for (repo, _) in &land_leases {
-                            agents.clear_land_holder(repo).await;
+                            services.clear_land_holder(repo).await;
                         }
                         break Err(error);
                     }
@@ -1449,7 +1480,7 @@ where
             }
         };
         match handle_message(
-            &agents,
+            &services,
             iroh_auth.as_ref(),
             &outgoing_tx,
             &mut land_leases,
@@ -1465,7 +1496,7 @@ where
                 // Registry changes show on every client (GUI rails and a
                 // waiting CLI), so the refreshed snapshot goes through
                 // the daemon-wide event fanout, not just this connection.
-                let _ = agents.events.send(agents.ready_message().await);
+                let _ = services.events.send(services.ready_message().await);
             }
             Ok(Refresh::None) => {}
             Err(error) => {
@@ -1482,7 +1513,7 @@ where
     // Let go of the device only if the hold is still this connection's: a
     // newer window may have taken it, and ending must not unbind theirs.
     if let Some(session) = desk_session {
-        let mut devices = agents.desk_devices.lock().await;
+        let mut devices = services.desk_devices.lock().await;
         if devices
             .get(&session.device)
             .is_some_and(|held| Arc::ptr_eq(held, &session.binding))
@@ -1494,7 +1525,7 @@ where
     if let Some(log_follow) = log_follow {
         log_follow.abort();
     }
-    agents
+    services
         .pool
         .set_live_wants(connection_id, HashSet::new())
         .await;
@@ -1504,7 +1535,7 @@ where
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn serve_git_transport_request<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     reader: R,
     mut writer: W,
     request: rho_ui_proto::GitTransportRequest,
@@ -1513,7 +1544,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let provider = match agents.git_transport.request(request).await {
+    let provider = match services.git_transport.request(request).await {
         Ok(provider) => provider,
         Err(error) => {
             write_frame(
@@ -1533,7 +1564,7 @@ where
 }
 
 async fn serve_git_transport_provider<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     reader: R,
     mut writer: W,
     request_id: u64,
@@ -1544,7 +1575,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    match agents
+    match services
         .git_transport
         .claim(request_id, provider_id, claim)
         .await?
@@ -1571,20 +1602,20 @@ where
 /// Durable presentation changes refresh the normal snapshot for every
 /// connection. Broadcast loss is harmless because `Ready` is reconstructed
 /// from the agent cache, including after daemon restart.
-fn spawn_inference_projection(agents: Arc<AgentRegistry>) {
-    let mut state = agents.inference.subscribe();
-    let agents = Arc::downgrade(&agents);
+fn spawn_inference_projection(services: Arc<Services>) {
+    let mut state = services.inference.subscribe();
+    let services = Arc::downgrade(&services);
     tokio::spawn(async move {
         while state.changed().await.is_ok() {
-            let Some(agents) = agents.upgrade() else {
+            let Some(services) = services.upgrade() else {
                 break;
             };
             let _ = state.borrow_and_update();
-            let _ = agents.events.send(ServerMessage::AuthState {
-                auth: agents.auth_state(),
+            let _ = services.events.send(ServerMessage::AuthState {
+                auth: services.auth_state(),
             });
-            let _ = agents.events.send(ServerMessage::QuotaUsage {
-                summaries: combined_quota_summaries(&agents.db, &agents.inference),
+            let _ = services.events.send(ServerMessage::QuotaUsage {
+                summaries: combined_quota_summaries(&services.db, &services.inference),
             });
         }
     });
@@ -1951,7 +1982,7 @@ const LOG_PAGE: usize = 512;
 /// before that would be an append to a tail the client does not hold.
 /// After a lag the same is done again, since deltas were lost.
 fn spawn_log_follow(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     outgoing_tx: mpsc::UnboundedSender<ServerMessage>,
     since: rho_ui_proto::mirror::Seq,
 ) -> tokio::task::JoinHandle<()> {
@@ -1959,13 +1990,13 @@ fn spawn_log_follow(
     tokio::spawn(async move {
         // Subscribed before the catch-up read, so a row appended during it
         // is queued rather than lost; the seq drops the duplicates.
-        let mut feed = rho_agent::mirror::feed(&agents.db);
+        let mut feed = rho_agent::mirror::feed(&services.db);
         let mut sent = since;
-        if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
+        if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
             return;
         }
         let mut told = false;
-        agents.pool.tell_tails().await;
+        services.pool.tell_tails().await;
         loop {
             match feed.recv().await {
                 Ok(Feed::Live { agent_id, live }) => {
@@ -1994,7 +2025,7 @@ fn spawn_log_follow(
                         continue;
                     }
                     if appended.seq != sent.next() {
-                        if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
+                        if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
                             return;
                         }
                         continue;
@@ -2011,11 +2042,11 @@ fn spawn_log_follow(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if !send_journal_from(&agents.db, &outgoing_tx, &mut sent).await {
+                    if !send_journal_from(&services.db, &outgoing_tx, &mut sent).await {
                         return;
                     }
                     told = false;
-                    agents.pool.tell_tails().await;
+                    services.pool.tell_tails().await;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -2067,7 +2098,7 @@ enum Refresh {
 /// (creation events, pongs) are sent inline before the caller's `Ready`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
-    agents: &Arc<AgentRegistry>,
+    services: &Arc<Services>,
     iroh_auth: Option<&rho_iroh_auth::IrohAuth>,
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     land_leases: &mut Vec<(Utf8PathBuf, OwnedMutexGuard<()>)>,
@@ -2089,12 +2120,12 @@ async fn handle_message(
             {
                 anyhow::bail!("Desk connection is already bound to another device");
             }
-            let node_namespace = agents
+            let node_namespace = services
                 .desk_cells
                 .node_namespace(device)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            let delta = agents
+            let delta = services
                 .desk_cells
                 .sync_since(&known)
                 .map_err(anyhow::Error::msg)?;
@@ -2116,7 +2147,7 @@ async fn handle_message(
                     // transport gave up on the old connection, which over
                     // iroh is the ten minutes of
                     // `rho_iroh_auth::AUTHENTICATED_IDLE_TIMEOUT`.
-                    if let Some(held) = agents
+                    if let Some(held) = services
                         .desk_devices
                         .lock()
                         .await
@@ -2140,7 +2171,7 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::DeskSynced {
                 node_namespace,
                 delta,
-                bodies: agents.desk_cells.bodies(),
+                bodies: services.desk_cells.bodies(),
             });
             Ok(Refresh::None)
         }
@@ -2164,11 +2195,11 @@ async fn handle_message(
                 return Ok(Refresh::None);
             }
             let device = session.device;
-            match agents.desk_cells.apply_mutation(device, mutation).await {
+            match services.desk_cells.apply_mutation(device, mutation).await {
                 Ok(()) => {
                     let _ = outgoing_tx.send(ServerMessage::DeskMutationAccepted { stamp });
-                    let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = agents
+                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                    let _ = services
                         .events
                         .send(ServerMessage::DeskCellsAvailable { frontier });
                 }
@@ -2191,7 +2222,7 @@ async fn handle_message(
                 "The desk moved to a newer window on this device"
             );
             let namespace = session.node_namespace;
-            if agents
+            if services
                 .desk_cells
                 .apply_body(
                     namespace,
@@ -2202,7 +2233,7 @@ async fn handle_message(
                 .await
                 .map_err(anyhow::Error::msg)?
             {
-                let _ = agents.events.send(ServerMessage::DeskTextApplied {
+                let _ = services.events.send(ServerMessage::DeskTextApplied {
                     id,
                     operation,
                     transaction,
@@ -2211,7 +2242,7 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ClaudeAccounts => {
-            let _ = outgoing_tx.send(claude_accounts_message(&agents.db)?);
+            let _ = outgoing_tx.send(claude_accounts_message(&services.db)?);
             Ok(Refresh::None)
         }
         ClientMessage::SetClaudeAccount { name } => {
@@ -2219,32 +2250,32 @@ async fn handle_message(
             // a switch to a name with no directory would fail at the next
             // turn of every agent at once.
             rho_claude::accounts::bootstrap(&name)?;
-            let mut write = agents.db.write().await;
+            let mut write = services.db.write().await;
             write.set_claude_account(&name);
             write.commit();
-            let _ = outgoing_tx.send(claude_accounts_message(&agents.db)?);
+            let _ = outgoing_tx.send(claude_accounts_message(&services.db)?);
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {
-            let id = agents.visualizations.record(mime_type, content).await?;
+            let id = services.visualizations.record(mime_type, content).await?;
             let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
             Ok(Refresh::None)
         }
         ClientMessage::ChatGptUsage => {
             let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
-                summaries: combined_quota_summaries(&agents.db, &agents.inference),
+                summaries: combined_quota_summaries(&services.db, &services.inference),
             });
             Ok(Refresh::None)
         }
         ClientMessage::QuotaHistory => {
             let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
-                series: quota_history(&agents.db, &agents.inference),
+                series: quota_history(&services.db, &services.inference),
             });
             Ok(Refresh::None)
         }
         ClientMessage::GlobalUsage { since_ms } => {
-            agents.pool.flush_agent_usage(None).await;
-            let usage = agents
+            services.pool.flush_agent_usage(None).await;
+            let usage = services
                 .db
                 .read()
                 .global_agent_usage(rho_core::UnixMs(since_ms));
@@ -2256,12 +2287,13 @@ async fn handle_message(
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
             const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_ui_proto::AGENT_COST_WINDOW_DAYS;
 
-            agents.pool.flush_agent_usage(None).await;
+            services.pool.flush_agent_usage(None).await;
             let now = rho_core::UnixMs::now().0;
             let earliest = since_ms
                 .saturating_sub(rho_ui_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
                 .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
-            let response = match hourly_agent_cost_series(&agents.db, rho_core::UnixMs(earliest)) {
+            let response = match hourly_agent_cost_series(&services.db, rho_core::UnixMs(earliest))
+            {
                 Ok(series) => ServerMessage::AgentCostDistribution { series },
                 Err(error) => ServerMessage::Error {
                     message: error.to_string(),
@@ -2271,10 +2303,10 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ShellStart { request_id, agent } => {
-            let agents = Arc::clone(agents);
+            let services = Arc::clone(services);
             let outgoing_tx = outgoing_tx.clone();
             tokio::spawn(async move {
-                let response = match shell_start(&agents, &agent).await {
+                let response = match shell_start(&services, &agent).await {
                     Ok(()) => ServerMessage::ShellStarted { request_id },
                     Err(error) => ServerMessage::ShellRequestFailed {
                         request_id,
@@ -2286,7 +2318,7 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ShellList { request_id, agent } => {
-            let response = match shell_list(agents, agent.as_deref()).await {
+            let response = match shell_list(services, agent.as_deref()).await {
                 Ok(shells) => ServerMessage::ShellList { request_id, shells },
                 Err(error) => ServerMessage::ShellRequestFailed {
                     request_id,
@@ -2297,10 +2329,10 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ShellClose { request_id, agent } => {
-            let agents = Arc::clone(agents);
+            let services = Arc::clone(services);
             let outgoing_tx = outgoing_tx.clone();
             tokio::spawn(async move {
-                let response = match shell_close(&agents, &agent).await {
+                let response = match shell_close(&services, &agent).await {
                     Ok(()) => ServerMessage::ShellClosed { request_id },
                     Err(error) => ServerMessage::ShellRequestFailed {
                         request_id,
@@ -2312,12 +2344,12 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::GitTransportRegister => {
-            agents.git_transport.register(outgoing_tx.clone()).await;
+            services.git_transport.register(outgoing_tx.clone()).await;
             Ok(Refresh::None)
         }
         ClientMessage::PlatformSecretsSet { secrets } => {
             let wants_octo = secrets.iter().any(|(key, _)| key == "GITHUB_TOKEN");
-            let (running, detail) = match agents.platform_secrets.install_merge(secrets) {
+            let (running, detail) = match services.platform_secrets.install_merge(secrets) {
                 Ok((store, stashed)) => {
                     let persistence = if stashed {
                         " and stashed in the systemd fd store"
@@ -2350,7 +2382,7 @@ async fn handle_message(
                         title,
                         body,
                         review_bots: _,
-                    } => agents
+                    } => services
                         .pr_monitor
                         .create(rho_pr_monitor::CreatePullRequest {
                             owner,
@@ -2367,7 +2399,7 @@ async fn handle_message(
                             .to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Status { url } => agents
+                    rho_ui_proto::PrCommand::Status { url } => services
                         .pr_monitor
                         .status(&url)
                         .await
@@ -2381,17 +2413,17 @@ async fn handle_message(
                         url,
                         reply_comment,
                         body,
-                    } => agents
+                    } => services
                         .pr_monitor
                         .comment(&url, reply_comment, &body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Comments { url } => agents
+                    rho_ui_proto::PrCommand::Comments { url } => services
                         .pr_monitor
                         .comments(&url)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Checks { url } => agents
+                    rho_ui_proto::PrCommand::Checks { url } => services
                         .pr_monitor
                         .checks(&url)
                         .await
@@ -2401,18 +2433,18 @@ async fn handle_message(
                         base,
                         title,
                         body,
-                    } => agents
+                    } => services
                         .pr_monitor
                         .edit(&url, base, title, body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Rerun { url, run_id } => agents
+                    rho_ui_proto::PrCommand::Rerun { url, run_id } => services
                         .pr_monitor
                         .rerun(&url, run_id)
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Logs { url, run_id } => {
-                        agents.pr_monitor.logs(&url, run_id).await.map(|data| {
+                        services.pr_monitor.logs(&url, run_id).await.map(|data| {
                             (format!("downloaded logs for run {run_id}"), data.to_vec())
                         })
                     }
@@ -2442,7 +2474,7 @@ async fn handle_message(
             }
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
-            let (_, agent) = agents.create(role, start).await?;
+            let (_, agent) = services.create(role, start).await?;
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
@@ -2452,14 +2484,14 @@ async fn handle_message(
             Ok(Refresh::Ready)
         }
         ClientMessage::AcquireLandLease { repo, agent_id } => {
-            let lock = agents.land_lock(repo.clone()).await;
+            let lock = services.land_lock(repo.clone()).await;
             let lease = match lock.clone().try_lock_owned() {
                 Ok(lease) => lease,
                 Err(_) => {
-                    agents
+                    services
                         .set_land_status(repo.clone(), agent_id, LandStatus::Queued)
                         .await;
-                    let holder = agents.land_holder(&repo).await;
+                    let holder = services.land_holder(&repo).await;
                     let _ = outgoing_tx.send(ServerMessage::LandLeaseQueued {
                         repo: repo.clone(),
                         holder,
@@ -2468,7 +2500,7 @@ async fn handle_message(
                 }
             };
             if let Some(holder) = land_holder {
-                agents.set_land_holder(repo.clone(), holder).await;
+                services.set_land_holder(repo.clone(), holder).await;
             }
             land_leases.push((repo.clone(), lease));
             let _ = outgoing_tx.send(ServerMessage::LandLeaseGranted { repo });
@@ -2479,10 +2511,10 @@ async fn handle_message(
             agent_id,
             status,
         } => {
-            agents
+            services
                 .set_land_status(repo.clone(), agent_id, status.clone())
                 .await;
-            let _ = agents.events.send(ServerMessage::LandStatus {
+            let _ = services.events.send(ServerMessage::LandStatus {
                 repo,
                 agent_id,
                 status,
@@ -2495,7 +2527,7 @@ async fn handle_message(
                 .position(|(leased_repo, _)| *leased_repo == repo)
             {
                 land_leases.swap_remove(index);
-                agents.clear_land_holder(&repo).await;
+                services.clear_land_holder(&repo).await;
             }
             Ok(Refresh::None)
         }
@@ -2504,7 +2536,7 @@ async fn handle_message(
             // Focus is what this client is looking at, nothing more: it
             // never loads an agent. The pool unions it across connections
             // into the live set; a loaded agent in it tells its tail.
-            agents
+            services
                 .pool
                 .set_live_wants(connection_id, agent_ids.into_iter().collect())
                 .await;
@@ -2515,7 +2547,7 @@ async fn handle_message(
                 previous.abort();
             }
             *log_follow = Some(spawn_log_follow(
-                Arc::clone(agents),
+                Arc::clone(services),
                 outgoing_tx.clone(),
                 since,
             ));
@@ -2529,7 +2561,7 @@ async fn handle_message(
             // One answer per position, each naming its own `pos`. A chunk
             // asks once and is answered as many times as it asked for.
             for pos in std::iter::once(pos).chain(more) {
-                let body = agent_detail(&agents.db, agent_id, pos);
+                let body = agent_detail(&services.db, agent_id, pos);
                 let _ = outgoing_tx.send(ServerMessage::Detail {
                     agent_id,
                     pos,
@@ -2544,7 +2576,7 @@ async fn handle_message(
             delivery,
         } => {
             prepare_image_content(&mut content).await?;
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.send_user_content_accepted(content, delivery).await?;
             Ok(Refresh::None)
         }
@@ -2554,37 +2586,37 @@ async fn handle_message(
             agent_id,
             delivery: _,
         } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.compact();
             Ok(Refresh::None)
         }
         ClientMessage::ChangeAgentRole { agent_id, role } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.change_role(role).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::ChangePromptCacheKey { agent_id } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.change_prompt_cache_key()?;
             Ok(Refresh::None)
         }
         ClientMessage::SetAuthAccountEnabled { name, enabled } => {
-            agents.set_auth_account_enabled(&name, enabled).await;
+            services.set_auth_account_enabled(&name, enabled).await;
             Ok(Refresh::None)
         }
         ClientMessage::CancelTurn { agent_id } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.cancel();
             let _ = outgoing_tx.send(ServerMessage::TurnCancelled { agent_id });
             Ok(Refresh::None)
         }
         ClientMessage::RewindAgent { agent_id, turns } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.rewind(turns).await?;
             Ok(Refresh::Ready)
         }
         ClientMessage::ContinueTurn { agent_id } => {
-            let (_, agent, _) = agents.load(agent_id).await?;
+            let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
             Ok(Refresh::None)
         }
@@ -2593,7 +2625,7 @@ async fn handle_message(
             self_agent_id,
             request,
         } => {
-            let result = agents.mcp_agent_tool(self_agent_id, request).await;
+            let result = services.mcp_agent_tool(self_agent_id, request).await;
             let response = match result {
                 Ok(output) => McpAgentToolResponse {
                     request_id,
@@ -2678,7 +2710,7 @@ async fn handle_message(
 /// Attaches a dedicated Comint-style shell stream. The daemon retains the
 /// process when this client detaches.
 async fn serve_shell<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut reader: R,
     mut writer: W,
     agent: String,
@@ -2687,7 +2719,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let client = shell_attach(&agents, &agent).await;
+    let client = shell_attach(&services, &agent).await;
     let shell::ShellClient {
         mut frames,
         mut exit,
@@ -2840,16 +2872,16 @@ where
     result
 }
 
-async fn shell_start(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = agents.resolve_display_agent_id(agent).await?;
-    let record = agents.load(agent_id).await?.1.head();
+async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
+    let agent_id = services.resolve_display_agent_id(agent).await?;
+    let record = services.load(agent_id).await?.1.head();
     shell::ensure_supported_workdirs(&record.config.workdirs)?;
-    let view = agents
+    let view = services
         .pool
         .materialize_view(&record.config.workdirs)
         .await
         .context("materialize agent view")?;
-    agents
+    services
         .shells
         .start(
             agent_id,
@@ -2863,23 +2895,20 @@ async fn shell_start(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result
         .await
 }
 
-async fn shell_attach(
-    agents: &Arc<AgentRegistry>,
-    agent: &str,
-) -> anyhow::Result<shell::ShellClient> {
-    let agent_id = agents.resolve_display_agent_id(agent).await?;
-    agents.shells.attach(agent_id).await
+async fn shell_attach(services: &Arc<Services>, agent: &str) -> anyhow::Result<shell::ShellClient> {
+    let agent_id = services.resolve_display_agent_id(agent).await?;
+    services.shells.attach(agent_id).await
 }
 
 async fn shell_list(
-    agents: &Arc<AgentRegistry>,
+    services: &Arc<Services>,
     agent: Option<&str>,
 ) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
     let filter = match agent {
-        Some(agent) => Some(agents.resolve_display_agent_id(agent).await?),
+        Some(agent) => Some(services.resolve_display_agent_id(agent).await?),
         None => None,
     };
-    Ok(agents
+    Ok(services
         .shells
         .list()
         .await
@@ -2892,9 +2921,9 @@ async fn shell_list(
         .collect())
 }
 
-async fn shell_close(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = agents.resolve_display_agent_id(agent).await?;
-    agents.shells.close(agent_id).await
+async fn shell_close(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
+    let agent_id = services.resolve_display_agent_id(agent).await?;
+    services.shells.close(agent_id).await
 }
 
 fn rho_shell_program() -> std::ffi::OsString {
@@ -2930,7 +2959,7 @@ fn rho_pager_program() -> std::ffi::OsString {
 /// Loads one bounded parent-content batch from an already immutable diff
 /// operation. This intentionally does not snapshot the working copy.
 async fn serve_diff_base_contents<W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut writer: W,
     workspace: WorkspaceInfo,
     operation_id: String,
@@ -2943,7 +2972,7 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = agents.pool.open_workspace(&workspace).await?;
+        let workspace = services.pool.open_workspace(&workspace).await?;
         workspace
             .diff_base_contents(&operation_id, &commit_id, &paths)
             .await
@@ -3041,7 +3070,7 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
 /// manifest on a dedicated stream, avoiding control-session head-of-line
 /// blocking.
 async fn serve_diff_snapshot<W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut writer: W,
     workspace: WorkspaceInfo,
     known_commit_id: Option<String>,
@@ -3053,7 +3082,7 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = agents.pool.open_workspace(&workspace).await?;
+        let workspace = services.pool.open_workspace(&workspace).await?;
         workspace
             .diff_snapshot(known_commit_id.as_deref(), &include_paths)
             .await
@@ -3099,7 +3128,7 @@ enum TerminalOpenKind {
 /// returns without attaching.
 #[expect(clippy::too_many_arguments)]
 async fn serve_terminal<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut reader: R,
     mut writer: W,
     agent: String,
@@ -3113,7 +3142,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let create = matches!(open, TerminalOpenKind::Create { .. });
-    let attached = terminal_attach(&agents, &agent, terminal_id, create, cols, rows).await;
+    let attached = terminal_attach(&services, &agent, terminal_id, create, cols, rows).await;
     let client = match attached {
         Ok(attached) => attached,
         Err(error) => {
@@ -3182,21 +3211,21 @@ where
 /// `create`, builds the spawn spec for its default shell inside its view and
 /// spawns a fresh one.
 async fn terminal_attach(
-    agents: &Arc<AgentRegistry>,
+    services: &Arc<Services>,
     agent: &str,
     terminal_id: u64,
     create: bool,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<terminal::TerminalClient> {
-    let agent_id = agents.resolve_display_agent_id(agent).await?;
+    let agent_id = services.resolve_display_agent_id(agent).await?;
     if !create {
-        return agents
+        return services
             .terminals
             .attach(agent_id, terminal_id, cols, rows)
             .await;
     }
-    let record = agents.load(agent_id).await?.1.head();
+    let record = services.load(agent_id).await?.1.head();
     anyhow::ensure!(
         !record
             .config
@@ -3205,18 +3234,18 @@ async fn terminal_attach(
             .any(|workdir| matches!(workdir, WorkspaceInfo::Sandbox { .. })),
         "sandboxed agents have no terminals yet"
     );
-    let view = agents
+    let view = services
         .pool
         .materialize_view(&record.config.workdirs)
         .await
         .context("materialize agent view")?;
-    let shell = agents
+    let shell = services
         .user_environment
         .get("SHELL")
         .and_then(|shell| shell.to_str())
         .unwrap_or("bash")
         .to_owned();
-    agents
+    services
         .terminals
         .create(
             agent_id,
@@ -3230,7 +3259,7 @@ async fn terminal_attach(
 
 /// Answers a [`ClientMessage::TerminalList`] one-shot stream.
 async fn serve_terminal_list<W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut writer: W,
     agent: Option<String>,
 ) -> anyhow::Result<()>
@@ -3238,7 +3267,7 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let filter = match &agent {
-        Some(agent) => match agents.resolve_display_agent_id(agent).await {
+        Some(agent) => match services.resolve_display_agent_id(agent).await {
             Ok(agent_id) => Some(agent_id),
             Err(error) => {
                 let _ = write_frame(
@@ -3253,7 +3282,7 @@ where
         },
         None => None,
     };
-    let terminals = agents
+    let terminals = services
         .terminals
         .list()
         .await
@@ -3273,7 +3302,7 @@ where
 
 /// Serves a bounded typed file channel rooted in one workspace checkout.
 async fn serve_workspace_channel<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut reader: R,
     mut writer: W,
     workspace: WorkspaceInfo,
@@ -3282,7 +3311,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let workspace = match agents.pool.open_workspace(&workspace).await {
+    let workspace = match services.pool.open_workspace(&workspace).await {
         Ok(workspace) => workspace,
         Err(error) => {
             let _ = write_frame(
@@ -3611,11 +3640,11 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        AgentRegistry, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
-        GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets,
-        claude_quota_history, configure_octo_git_transport, hourly_global_usage_series,
-        merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
-        quota_summaries, start_runtime_sockets, validate_image_content,
+        AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim, GitTransportBroker,
+        MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets, Services, claude_quota_history,
+        configure_octo_git_transport, hourly_global_usage_series, merge_hourly_agent_cost_bucket,
+        persist_gui_telemetry, prepare_image_content, quota_burn, quota_summaries,
+        start_runtime_sockets, validate_image_content,
     };
 
     #[test]
@@ -4233,7 +4262,7 @@ mod tests {
         };
 
         let temp = tempfile::tempdir().unwrap();
-        let agents = test_registry(temp.path()).await;
+        let services = test_services(temp.path()).await;
         let device = DeviceId([7; 16]);
 
         let (older_tx, mut older_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4245,10 +4274,10 @@ mod tests {
             device,
             known: Version::default(),
         };
-        desk_message(&agents, &older_tx, 1, &mut older, sync(device))
+        desk_message(&services, &older_tx, 1, &mut older, sync(device))
             .await
             .expect("the first window binds the device");
-        desk_message(&agents, &newer_tx, 2, &mut newer, sync(device))
+        desk_message(&services, &newer_tx, 2, &mut newer, sync(device))
             .await
             .expect("and the window the user just restarted binds it too");
 
@@ -4276,7 +4305,7 @@ mod tests {
             verdict: None,
         };
         desk_message(
-            &agents,
+            &services,
             &older_tx,
             1,
             &mut older,
@@ -4300,7 +4329,7 @@ mod tests {
 
         // The window that took the device writes.
         desk_message(
-            &agents,
+            &services,
             &newer_tx,
             2,
             &mut newer,
@@ -4320,7 +4349,7 @@ mod tests {
     /// One desk message through the daemon's own handler, with everything a
     /// desk message does not use left empty.
     async fn desk_message(
-        agents: &Arc<AgentRegistry>,
+        services: &Arc<Services>,
         outgoing: &tokio::sync::mpsc::UnboundedSender<ServerMessage>,
         connection: u64,
         session: &mut Option<DeskSession>,
@@ -4328,7 +4357,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let mut log_follow = None;
         super::handle_message(
-            agents,
+            services,
             None,
             outgoing,
             &mut Vec::new(),
@@ -4342,12 +4371,12 @@ mod tests {
         .map(|_| ())
     }
 
-    async fn test_registry(root: &std::path::Path) -> Arc<AgentRegistry> {
+    async fn test_services(root: &std::path::Path) -> Arc<Services> {
         let db = RhoDb::open(root.join("rho.redb"));
         db.write().await.init_agent_tables();
         let inference = rho_inference::Inference::new(db.clone()).await.unwrap();
         Arc::new(
-            AgentRegistry::new(
+            Services::new(
                 db,
                 inference,
                 Default::default(),

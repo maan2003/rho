@@ -17,7 +17,7 @@ use rho_ui_proto::{ServerMessage, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::AgentRegistry;
+use crate::Services;
 
 const NO_BACKEND_REPLY: &str =
     "No agent is attached to the voice session in this build, so that cannot be done by voice yet.";
@@ -27,7 +27,7 @@ const CALL_URL: &str =
     "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
 
 pub(crate) async fn serve<R, W>(
-    agents: Arc<AgentRegistry>,
+    services: Arc<Services>,
     mut reader: R,
     mut writer: W,
     offer_sdp: String,
@@ -36,7 +36,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let _lease = match agents.voice_lease.clone().try_lock_owned() {
+    let _lease = match services.voice_lease.clone().try_lock_owned() {
         Ok(lease) => lease,
         Err(_) => {
             write_frame(
@@ -50,7 +50,7 @@ where
         }
     };
     let opened = async {
-        let auth = agents.inference.auth().await?;
+        let auth = services.inference.auth().await?;
         let credential = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
             .context("join realtime OAuth resolver")??;
@@ -177,7 +177,7 @@ async fn create_call(credential: ResolvedOAuth, offer_sdp: String) -> anyhow::Re
             model: RealtimeModel::GptLive1Codex,
             instructions: "You are Rho's voice assistant. Be concise, natural, warm, and \
                  interruption-friendly. No agent is attached to this session, so when a \
-                 request needs work done in the user's repositories or agents, say plainly \
+                 request needs work done in the user's repositories or services, say plainly \
                  that voice cannot do that yet."
                 .to_owned(),
             audio: SessionAudio {
