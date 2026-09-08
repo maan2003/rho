@@ -881,8 +881,8 @@ impl FoldMap {
                             ..old_inlay_snapshot.to_inlay_offset(old_buffer_end);
                         let new_range = inlay_snapshot.to_inlay_offset(new_buffer_start)
                             ..inlay_snapshot.to_inlay_offset(new_buffer_end);
-                        if (old_range.start < scan_old_start && scan_old_start <= old_range.end)
-                            || (new_range.start < scan_new_start && scan_new_start <= new_range.end)
+                        if (old_range.start < scan_old_start && scan_old_start < old_range.end)
+                            || (new_range.start < scan_new_start && scan_new_start < new_range.end)
                         {
                             containing = Some((old_buffer_start, new_buffer_start));
                             break;
@@ -3036,6 +3036,33 @@ mod tests {
         writer.unfold_intersecting(Some(Point::new(0, 4)..Point::new(0, 4)), true);
         let (snapshot6, _) = map.read(inlay_snapshot, vec![]);
         assert_eq!(snapshot6.text(), "123aaaaa\nbbbbbb\nccc123456eee");
+    }
+
+    #[gpui::test]
+    fn test_insertion_at_fold_end_stays_local(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("prefix\nabcdEF", cx);
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(1, 0)..Point::new(1, 4),
+            FoldPlaceholder::test(),
+        )]);
+        assert_eq!(snapshot.text(), "prefix\n⋯EF");
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(1, 4)..Point::new(1, 4), "X")], None, cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, edits) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.text(), "prefix\n⋯XEF");
+        assert!(edits.iter().all(|edit| edit.old.start.0.0 >= 7));
     }
 
     #[gpui::test]
