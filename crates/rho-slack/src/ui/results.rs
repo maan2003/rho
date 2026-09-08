@@ -11,6 +11,7 @@ use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{Context, Entity, Window, div};
 use language::{Buffer, Capability, Point};
+use multi_buffer::ToPoint as _;
 use text::Anchor;
 use theme::ActiveTheme as _;
 
@@ -200,13 +201,10 @@ impl ResultsView {
 
     /// The place the cursor is on: what `enter` opens.
     pub fn cursor_place(&self, cx: &mut Context<Self>) -> Option<Place> {
-        let row = self.editor.update(cx, |editor, cx| {
-            editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head()
-                .row as usize
-        });
+        // A buffer position, not a display one: see `ListView::cursor_row`.
+        let head = self.editor.read(cx).selections.newest_anchor().head();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let row = head.to_point(&snapshot).row as usize;
         self.drawn.get(row).and_then(|line| line.place.clone())
     }
 

@@ -1581,13 +1581,11 @@ async fn one_arriving_message_costs_what_it_touches(cx: &mut TestAppContext) {
 /// How much bigger a redraw of the listing may be against three hundred
 /// conversations than against a handful.
 ///
-/// Not three, which is what the rule wants and what the highlights now
-/// cost: reading the cursor at the top of a redraw asks the editor for a
-/// display snapshot, and that resyncs the whole buffer however little of it
-/// moved. That is the same pass the frame pays and it is the next thing to
-/// fix; this bound comes down with it. Twenty-five still catches a redraw
-/// that walks the listing itself, which is what it is here for.
-const LISTING_FACTOR: u32 = 25;
+/// Three and not one, because a longer buffer is genuinely more text to
+/// hold and the editor's own bookkeeping is in these numbers too. What it
+/// catches is a redraw that walks the listing rather than the row that
+/// moved, which is a ratio of tens and not of one.
+const LISTING_FACTOR: u32 = 3;
 
 /// How much bigger a redraw of the open conversation may be when the
 /// listing beside it is fifty times longer and its own transcript is the

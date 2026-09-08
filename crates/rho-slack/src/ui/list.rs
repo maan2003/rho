@@ -15,6 +15,7 @@ use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{Context, Entity, Window, div};
 use language::{Buffer, Capability, Point};
+use multi_buffer::ToPoint as _;
 use text::Anchor;
 use theme::ActiveTheme as _;
 
@@ -240,14 +241,18 @@ impl ListView {
         self.drawn.iter().position(|line| line.id.is_some())
     }
 
+    /// The line the cursor is on.
+    ///
+    /// Read as a position in the buffer, not on the screen. Asking the
+    /// editor for a display snapshot makes it resync the whole buffer
+    /// however little of it moved, and this is read once a message: a pass
+    /// over the listing on the path an arriving message takes. The answer
+    /// is the same either way -- the dimension asked for is a buffer point
+    /// in both -- so only the resync is given up.
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
-        self.editor.update(cx, |editor, cx| {
-            editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head()
-                .row as usize
-        })
+        let head = self.editor.read(cx).selections.newest_anchor().head();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        head.to_point(&snapshot).row as usize
     }
 
     fn place_cursor(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {

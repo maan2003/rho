@@ -20,7 +20,7 @@ use editor::{
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, Task, Window, div};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
 use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
 
@@ -513,14 +513,18 @@ impl ConversationView {
             .collect()
     }
 
+    /// The line the cursor is on.
+    ///
+    /// Read as a position in the buffer, not on the screen. Asking the
+    /// editor for a display snapshot makes it resync the whole buffer
+    /// however little of it moved, and this is read once a message: a pass
+    /// over the listing on the path an arriving message takes. The answer
+    /// is the same either way -- the dimension asked for is a buffer point
+    /// in both -- so only the resync is given up.
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
-        self.editor.update(cx, |editor, cx| {
-            editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head()
-                .row as usize
-        })
+        let head = self.editor.read(cx).selections.newest_anchor().head();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        head.to_point(&snapshot).row as usize
     }
 
     /// The URL the cursor's line stands for: a link's label shows no address,
