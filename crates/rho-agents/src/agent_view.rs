@@ -252,10 +252,8 @@ impl AgentModel {
                 .await;
             let text_buffers = reservations.into_iter().zip(text_buffers).collect();
             let Ok(parsing) = this.update(cx, |this, cx| {
-                let parsing = this
-                    .transcript
-                    .install_initial(prepared, text_buffers, now_ms, cx);
-                parsing
+                this.transcript
+                    .install_initial(prepared, text_buffers, now_ms, cx)
             }) else {
                 return;
             };
