@@ -15,7 +15,7 @@ use std::ops::Range;
 
 pub use conversation::{ConversationView, ReactionChoice, ReactionChoices};
 use editor::{Editor, HighlightKey};
-use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Window};
+use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Hsla, Window};
 use language::Buffer;
 pub use list::ListView;
 use multi_buffer::MultiBuffer;
@@ -35,6 +35,9 @@ pub struct Hooks {
     pub configure_editor: fn(&mut Editor, &mut Window, &mut Context<Editor>),
     /// Attaches the host's Markdown syntax pipeline to a message buffer.
     pub configure_markdown: fn(&mut Buffer, &mut Context<Buffer>),
+    /// The colour of the bar the host draws in the gutter beside a message,
+    /// which is what marks the lines hung off one here.
+    pub gutter_colour: fn(&App) -> Hsla,
 }
 
 impl Hooks {
@@ -44,6 +47,7 @@ impl Hooks {
         Self {
             configure_editor: |_, _, _| {},
             configure_markdown: |_, _| {},
+            gutter_colour: |_| gpui::transparent_black(),
         }
     }
 }
@@ -74,12 +78,11 @@ impl rho_transcript::Style for Class {
         self.resolve(cx)
     }
 
-    /// An unfurl is a card, not a run of words: a faint tint behind the whole
-    /// of it is what makes it read as one.
+    /// The message a reader was sent to is a card, not a run of words: a
+    /// faint tint behind the whole of it is what makes it read as one.
     fn background(self, bucket: u32, cx: &App) -> Option<(HighlightKey, gpui::Hsla)> {
         let colors = cx.theme().colors();
         let tint = match self {
-            Class::Unfurl => colors.element_background,
             Class::Dealt => colors.element_selected,
             Class::Found => colors.element_hover,
             _ => return None,
@@ -113,17 +116,6 @@ pub enum Class {
     Muted,
     /// A failure notice.
     Error,
-    /// A link: the label the reader sees, whose URL `enter` opens.
-    Link,
-    /// An unfurl's quote box, which reads as one card rather than as loose
-    /// lines: the bar down its left and a faint tint over the whole of it.
-    Unfurl,
-    /// Slack's own emphasis, markers and all: the text keeps `*bold*` so a
-    /// yanked line pastes back, and the style is what makes it read as
-    /// formatting rather than as punctuation.
-    Bold,
-    Italic,
-    Struck,
     /// The message a deal is about, tinted so the reader lands on it and can
     /// still see it after scrolling around. It stays until the surface
     /// closes: a deal is one thing to answer, not a flash.
@@ -136,7 +128,7 @@ pub enum Class {
 }
 
 impl Class {
-    pub const ALL: [Class; 16] = [
+    pub const ALL: [Class; 11] = [
         Class::Sender,
         Class::You,
         Class::Time,
@@ -146,11 +138,6 @@ impl Class {
         Class::Mention,
         Class::Muted,
         Class::Error,
-        Class::Link,
-        Class::Unfurl,
-        Class::Bold,
-        Class::Italic,
-        Class::Struck,
         Class::Dealt,
         Class::Found,
     ];
@@ -166,13 +153,8 @@ impl Class {
             Self::Mention => 6,
             Self::Muted => 7,
             Self::Error => 8,
-            Self::Link => 9,
-            Self::Unfurl => 10,
-            Self::Bold => 11,
-            Self::Italic => 12,
-            Self::Struck => 13,
-            Self::Dealt => 14,
-            Self::Found => 15,
+            Self::Dealt => 9,
+            Self::Found => 10,
         }
     }
 
@@ -194,20 +176,6 @@ impl Class {
 
     pub fn resolve(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
-        // Emphasis is shape, not colour: the run stays the body's own text
-        // colour and reads as bold, italic or struck through.
-        if matches!(self, Self::Bold | Self::Italic | Self::Struck) {
-            return HighlightStyle {
-                color: Some(colors.text.into()),
-                font_weight: (self == Self::Bold).then_some(FontWeight::BOLD),
-                font_style: (self == Self::Italic).then_some(gpui::FontStyle::Italic),
-                strikethrough: (self == Self::Struck).then(|| gpui::StrikethroughStyle {
-                    thickness: gpui::px(1.0),
-                    color: Some(colors.text.into()),
-                }),
-                ..HighlightStyle::default()
-            };
-        }
         let (color, weight) = match self {
             Self::Sender => (colors.terminal_ansi_cyan, FontWeight::BOLD),
             Self::You => (colors.text_accent, FontWeight::BOLD),
@@ -218,9 +186,7 @@ impl Class {
             Self::Mention => (colors.terminal_ansi_yellow, FontWeight::BOLD),
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
-            Self::Link | Self::Unfurl => (colors.link_text_hover, FontWeight::NORMAL),
             Self::Dealt | Self::Found => (colors.text, FontWeight::NORMAL),
-            Self::Bold | Self::Italic | Self::Struck => unreachable!("styled above"),
         };
         HighlightStyle {
             color: Some(color.into()),

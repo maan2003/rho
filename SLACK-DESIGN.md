@@ -386,6 +386,44 @@ attachments as titles. Nothing interactive in the first version.
 **Why:** the reader wants the message, not the layout; text is what the
 editor can search and the user can yank.
 
+### A conversation is the transcript's document, in the transcript's markdown
+
+The conversation surface renders through the primitives the agent
+transcript renders through, and owns none of its own. Concretely:
+
+- The buffer is markdown, configured by the host's own pipeline
+  (`Hooks::configure_markdown`, which is `rho_window::markdown::configure_buffer`
+  under the GUI). The parse styles emphasis, code, quotes, lists and links
+  and conceals their markers, exactly as it does for an assistant turn.
+- Slack speaks `mrkdwn`, which is the same ideas in different characters, so
+  a message is converted at the block: `*bold*` to `**bold**`, `_italic_` to
+  `*italic*`, `~struck~` to `~~struck~~`, `<url|text>` to `[text](url)`,
+  mentions and channel refs to names, code and fences as they are. That
+  conversion is `rho-slack`'s `markdown` module and the one place the two
+  markups are told apart; `block.rs` resolves the ids, links and lists the
+  same way for both.
+- A message is one block of the document, keyed by its `ts`. A turn is named
+  the way the transcript names one: the sender and the time. One line of
+  speech reads `name: what they said  time`; words the parse would read as a
+  block of their own — a list, a quote, a fence, a table — cannot begin after
+  a name, so there the name and time are a line of their own and the words
+  start under them at the margin. Nothing is indented into place.
+- The day break and the unread line are the document's own headings, whose
+  markers the parse hides.
+- What came with a message rather than being it — an attachment's card, a
+  link preview, a file — is marked with the gutter bar the transcript puts
+  beside the user's own message, and starts at the margin like everything
+  else. No bar is drawn into the text and no tint is painted behind it.
+- What the surface still paints for itself is only what the parse cannot
+  know: who is speaking, when, a file's caption, the reader's own mention,
+  and the tint on the message a card or a search sent them to.
+
+**Why:** the transcript has been solving this problem well for longer, and a
+second renderer means a second set of bugs, a second theme to keep in step,
+and markup painted by hand that the parse already understands. It also means
+the concealment, the folds and the gutter come to Slack for free as they
+land in `rho-window`.
+
 ### Silence never looks like quiet
 
 Reconnect with backoff. If the websocket has been down for more than a

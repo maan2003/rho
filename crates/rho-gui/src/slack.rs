@@ -411,6 +411,7 @@ impl Workspace {
         rho_slack::ui::Hooks {
             configure_editor: rho_window::editor_config::configure,
             configure_markdown: rho_window::markdown::configure_buffer,
+            gutter_colour: rho_window::style::user_prompt_gutter_color,
         }
     }
 

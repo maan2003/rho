@@ -243,7 +243,10 @@ a chip in place of the rest that opens and closes again. Markup is
 concealed: the `**` around a word is text the reader is never meant to read.
 Both are folds below the wrap map, which is what makes them cheap to draw —
 a hidden row leaves the wrap's input and the block map's entirely, so it
-costs nothing to lay out and nothing to compose.
+costs nothing to lay out and nothing to compose. The agent transcript is not
+the only reader of this: the Slack conversation surface is a client of the
+same pipeline, so what is said here about markdown, concealment and the
+gutter bar holds for a Slack message too.
 
 What they are not is byte arithmetic. The fold map keeps its ranges in inlay
 offsets, so every elision and every concealment is a byte range in a

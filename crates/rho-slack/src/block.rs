@@ -100,7 +100,7 @@ pub fn render_parts_as(
     };
     let mut chrome = Vec::new();
     for attachment in attachments {
-        chrome.extend(render_attachment(attachment, names));
+        chrome.extend(render_attachment(flavour, attachment, names));
     }
     for file in files {
         // A picture is just the picture: its name and size say nothing the
@@ -276,8 +276,9 @@ fn mrkdwn_links(text: &str, found: &mut Vec<Link>) {
     }
 }
 
-/// The bar down the left of an unfurl. Every line of the card carries it,
-/// which is what makes the card one thing rather than several lines.
+/// The bar down the left of an unfurl, for a surface with no gutter of its
+/// own to draw one in. Every line of the card carries it, which is what
+/// makes the card one thing rather than several lines.
 pub const UNFURL_BAR: &str = "\u{258e} ";
 
 /// How much of someone else's page an unfurl is allowed to bring with it.
@@ -286,15 +287,18 @@ const UNFURL_LINES: usize = 2;
 /// An attachment: a link preview, or an app's own card.
 ///
 /// Either way it is a quote box hanging off the message. Loose lines behind
-/// a dash read as a stray dash in the middle of speech; the bar down the
-/// left and the tint make the card one thing the reader can skip past.
+/// a dash read as a stray dash in the middle of speech; a bar down the left
+/// makes the card one thing the reader can skip past. In markdown the bar
+/// is the gutter's, drawn beside the lines rather than typed into them --
+/// the same bar the agent transcript puts beside a message -- so the card's
+/// own words start at the margin like everything else.
 ///
 /// A preview collapses to its title. Slack paints the whole page under the
 /// message, which buries the conversation the reader came for; the title is
 /// the part they act on and the link is already in the message above it.
 /// An app card keeps what it was given: its pretext, title, body, and the
 /// labelled values it hung under them.
-fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> {
+fn render_attachment(flavour: Flavour, attachment: &Attachment, names: &dyn Names) -> Vec<String> {
     let headline = attachment
         .title
         .clone()
@@ -305,21 +309,21 @@ fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> 
         return Vec::new();
     }
     // The title names the page and the site says where it is.
-    let title = render_mrkdwn(&headline, names);
+    let title = render_mrkdwn_as(flavour, &headline, names);
     let mut lines = Vec::new();
     if let Some(pretext) = attachment
         .pretext
         .as_deref()
         .filter(|_| !attachment.is_unfurl)
     {
-        lines.push(render_mrkdwn(pretext, names));
+        lines.push(render_mrkdwn_as(flavour, pretext, names));
     }
     lines.push(match attachment.service.as_deref() {
         Some(site) if !site.is_empty() => format!("{title} · {site}"),
         _ => title,
     });
     if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
-        let body = render_mrkdwn(text, names);
+        let body = render_mrkdwn_as(flavour, text, names);
         let body = body
             .lines()
             .filter(|line| !line.trim().is_empty())
@@ -338,15 +342,20 @@ fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> 
             attachment
                 .fields
                 .iter()
-                .map(|(title, value)| format!("{title}: {}", render_mrkdwn(value, names)))
+                .map(|(title, value)| {
+                    format!("{title}: {}", render_mrkdwn_as(flavour, value, names))
+                })
                 .collect::<Vec<_>>()
                 .join(" · "),
         );
     }
-    lines
-        .into_iter()
-        .map(|line| format!("{UNFURL_BAR}{line}"))
-        .collect()
+    match flavour {
+        Flavour::Mrkdwn => lines
+            .into_iter()
+            .map(|line| format!("{UNFURL_BAR}{line}"))
+            .collect(),
+        Flavour::Markdown => lines,
+    }
 }
 
 fn push_line(target: &mut String, line: &str) {

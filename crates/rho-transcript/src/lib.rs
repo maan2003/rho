@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -79,6 +80,11 @@ pub struct Item<K, C, M> {
     /// One entry per line of `text`, for whatever the surface reads back
     /// under the cursor (Slack: the thread and the file a line offers).
     pub lines: Vec<M>,
+    /// The run of the item's text the gutter bar marks, if any: the same
+    /// bar the agent transcript draws beside a message, which is how a
+    /// surface says "this is hung off the words" without spending a column
+    /// of the text on it.
+    pub gutter: Option<Range<usize>>,
 }
 
 impl<K, C, M> Item<K, C, M> {
@@ -94,6 +100,7 @@ impl<K, C, M> Item<K, C, M> {
             backgrounds: Vec::new(),
             blocks: Vec::new(),
             lines: Vec::new(),
+            gutter: None,
         }
     }
 
@@ -117,6 +124,11 @@ impl<K, C, M> Item<K, C, M> {
         self
     }
 
+    pub fn with_gutter(mut self, gutter: Range<usize>) -> Self {
+        self.gutter = Some(gutter);
+        self
+    }
+
     fn normalized(mut self) -> Self {
         if !self.text.ends_with('\n') {
             self.text.push('\n');
@@ -135,6 +147,8 @@ struct Record<K, C, M> {
     anchored_backgrounds: Vec<(C, Range<Anchor>)>,
     blocks: Vec<BlockSpec>,
     lines: Vec<M>,
+    gutter: Option<Range<usize>>,
+    anchored_gutter: Option<Range<Anchor>>,
     bucket: u32,
 }
 
@@ -150,7 +164,12 @@ struct Attachment {
 /// The ranges each class paints in one bucket.
 type Classes<C> = HashMap<C, Vec<Range<Anchor>>>;
 
-pub struct Transcript<K, C, M> {
+/// The gutter bar's owner: one marker type, one bar, so two surfaces in
+/// one editor cannot overwrite each other's. A transcript that never marks
+/// a gutter takes the default and never touches one.
+pub struct NoGutter;
+
+pub struct Transcript<K, C, M, G = NoGutter> {
     buffer: Entity<Buffer>,
     items: Vec<Record<K, C, M>>,
     index: HashMap<K, usize>,
@@ -162,13 +181,19 @@ pub struct Transcript<K, C, M> {
     /// Buckets re-sent by the last operation. Diagnostics, and what the
     /// tests assert on.
     last_painted: Vec<u32>,
+    /// What colour the gutter bar is, from the host. Without one no item's
+    /// gutter is drawn, which is the state of every surface that does not
+    /// ask for one.
+    gutter: Option<fn(&App) -> Hsla>,
+    marker: PhantomData<G>,
 }
 
-impl<K, C, M> Transcript<K, C, M>
+impl<K, C, M, G> Transcript<K, C, M, G>
 where
     K: Clone + Eq + Hash,
     C: Style,
     M: Clone + PartialEq,
+    G: 'static,
 {
     pub fn new(buffer: Entity<Buffer>) -> Self {
         Self {
@@ -179,7 +204,16 @@ where
             painted: HashMap::new(),
             next_bucket: 0,
             last_painted: Vec::new(),
+            gutter: None,
+            marker: PhantomData,
         }
+    }
+
+    /// Draws the gutter bar in the host's colour. Until this is called an
+    /// item's `gutter` range is remembered and not drawn, so a host with no
+    /// bar of its own costs nothing.
+    pub fn set_gutter(&mut self, colour: fn(&App) -> Hsla) {
+        self.gutter = Some(colour);
     }
 
     pub fn buffer(&self) -> &Entity<Buffer> {
@@ -368,6 +402,12 @@ where
         }
 
         let buckets = self.buckets_for(&range, items.len());
+        // Taken before the records go: the bar is drawn against the editor,
+        // so what leaves has to be named to be unmarked.
+        let dropped = self.items[range.clone()]
+            .iter()
+            .filter_map(|item| item.anchored_gutter.clone())
+            .collect::<Vec<_>>();
         let removed = self.items.splice(range.clone(), Vec::new()).count();
         debug_assert_eq!(removed, range.len());
 
@@ -394,6 +434,11 @@ where
             };
             let anchored = anchor(&item.styles);
             let anchored_backgrounds = anchor(&item.backgrounds);
+            let anchored_gutter = item.gutter.clone().map(|span| {
+                let start = (item_start + span.start).min(offset);
+                let end = (item_start + span.end).min(offset);
+                snapshot.anchor_after(start)..snapshot.anchor_before(end)
+            });
             fresh.push(Record {
                 key: item.key,
                 text: item.text,
@@ -404,6 +449,8 @@ where
                 anchored_backgrounds,
                 blocks: item.blocks,
                 lines: item.lines,
+                gutter: item.gutter,
+                anchored_gutter,
                 bucket,
             });
         }
@@ -412,6 +459,7 @@ where
         let at = range.start;
         self.items.splice(at..at, fresh);
         self.reindex(at);
+        self.mark_gutter(dropped, at..at + inserted, cx);
 
         let mut touched = buckets.into_iter().collect::<HashSet<_>>();
         // Removing an item leaves its bucket short: repaint it too, so the
@@ -534,6 +582,48 @@ where
             }
             self.apply(*bucket, text, background, cx);
         }
+    }
+
+    /// Unmarks what left and marks what arrived, a range at a time. The
+    /// editor keeps one sorted list per marker type, so this costs what it
+    /// touched and never re-sends a bar that did not move.
+    fn mark_gutter(&mut self, dropped: Vec<Range<Anchor>>, inserted: Range<usize>, cx: &mut App) {
+        let Some(colour) = self.gutter else {
+            return;
+        };
+        let added = self
+            .items
+            .get(inserted)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.anchored_gutter.clone())
+            .collect::<Vec<_>>();
+        if dropped.is_empty() && added.is_empty() {
+            return;
+        }
+        self.attachments.retain(|attachment| {
+            let Some(editor) = attachment.editor.upgrade() else {
+                return false;
+            };
+            let snapshot = attachment.multi_buffer.read(cx).snapshot(cx);
+            let resolve = |range: &Range<Anchor>| {
+                Some(
+                    snapshot.anchor_in_excerpt(range.start)?
+                        ..snapshot.anchor_in_excerpt(range.end)?,
+                )
+            };
+            let dropped = dropped.iter().filter_map(resolve).collect::<Vec<_>>();
+            let added = added.iter().filter_map(resolve).collect::<Vec<_>>();
+            editor.update(cx, |editor, cx| {
+                if !dropped.is_empty() {
+                    editor.remove_gutter_highlights::<G>(dropped, cx);
+                }
+                for range in added {
+                    editor.insert_gutter_highlight::<G>(range, colour, cx);
+                }
+            });
+            true
+        });
     }
 
     fn apply(
@@ -662,6 +752,7 @@ where
         buckets.sort_unstable();
         self.painted.clear();
         self.paint(&buckets, cx);
+        self.mark_gutter(Vec::new(), 0..self.items.len(), cx);
         self.place_blocks(cx);
     }
 }
@@ -676,6 +767,7 @@ where
             && self.styles == item.styles
             && self.backgrounds == item.backgrounds
             && self.lines == item.lines
+            && self.gutter == item.gutter
             && self.blocks.len() == item.blocks.len()
             && self
                 .blocks

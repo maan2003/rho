@@ -345,3 +345,80 @@ fn item_rows_are_where_the_item_starts(cx: &mut TestAppContext) {
         assert_eq!(range.start.to_point(&snapshot).row, 1);
     });
 }
+
+/// The gutter bar, which is how a surface says a run of lines came with a
+/// message rather than being the words in it.
+struct Bar;
+
+fn bar(_: &App) -> gpui::Hsla {
+    gpui::blue()
+}
+
+#[gpui::test]
+fn a_marked_item_takes_the_gutter_and_gives_it_back(cx: &mut TestAppContext) {
+    init_editor(cx);
+    let transcript = buffer(cx);
+    let multi_buffer = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                transcript.clone(),
+                [Point::zero()..transcript.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multi_buffer
+        })
+    });
+    let window = cx.add_window(|window, cx| {
+        Editor::new(
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: true,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            },
+            multi_buffer.clone(),
+            None,
+            window,
+            cx,
+        )
+    });
+    let editor = window.root(cx).expect("the editor is the window's root");
+
+    let mut sheet: Transcript<String, Class, (), Bar> = Transcript::new(transcript.clone());
+    cx.update(|cx| {
+        sheet.set_gutter(bar);
+        sheet.insert_before(
+            None,
+            vec![
+                item("a", "alice hello\n"),
+                item("b", "bob hello\n").with_gutter(0..4),
+            ],
+            cx,
+        );
+        sheet.attach(&editor, cx);
+    });
+    let marked = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |editor, window, cx| {
+                editor.all_gutter_highlights(window, cx)
+            })
+            .expect("the window is open")
+            .len()
+    };
+
+    assert_eq!(marked(cx), 1, "only the item that asked for it is marked");
+
+    cx.update(|cx| {
+        sheet.insert_before(None, vec![item("c", "carol hello\n").with_gutter(0..5)], cx);
+    });
+    assert_eq!(marked(cx), 2, "the appended item brings its own bar");
+
+    // The one that leaves takes its bar with it: a stale anchor would leave
+    // a bar beside whatever moved up into its place.
+    cx.update(|cx| {
+        sheet.remove(&"b".to_owned(), cx);
+    });
+    assert_eq!(marked(cx), 1, "what left is unmarked");
+}

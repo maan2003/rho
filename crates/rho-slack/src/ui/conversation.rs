@@ -37,12 +37,18 @@ const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
 /// prompt marker worn by the Slack surface.
 pub struct ComposeGutter;
 
+/// The stripe beside what hangs off a message: an attachment's card, a link
+/// preview, a file. The agent transcript marks the user's own message this
+/// way, and here it says the same thing -- these lines came with the
+/// message rather than being the words in it.
+pub struct ChromeGutter;
+
 pub struct ConversationView {
     session: Entity<Session>,
     source: Source,
     /// The messages on screen, each keyed and each owning its own range: a
     /// new message rewrites one item, not the conversation.
-    transcript: Transcript<Row, Class, LineMeta>,
+    transcript: Transcript<Row, Class, LineMeta, ChromeGutter>,
     input: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
@@ -433,7 +439,11 @@ impl ConversationView {
         let mut view = Self {
             session: session.clone(),
             source: source.clone(),
-            transcript: Transcript::new(transcript),
+            transcript: {
+                let mut transcript = Transcript::new(transcript);
+                transcript.set_gutter(hooks.gutter_colour);
+                transcript
+            },
             input,
             multi_buffer,
             editor,
@@ -1927,7 +1937,7 @@ trait Placed {
     fn below(&self, key: &Row) -> Option<Row>;
 }
 
-impl Placed for Transcript<Row, Class, LineMeta> {
+impl Placed for Transcript<Row, Class, LineMeta, ChromeGutter> {
     fn holds(&self, key: &Row) -> bool {
         self.contains(key)
     }
@@ -2423,14 +2433,17 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         spans.push(Span::plain("\n"));
         lines.extend(said.split('\n').map(&meta));
     }
+    // What came with the message rather than being it -- an attachment's
+    // card, a link preview, a file -- is marked in the gutter and starts at
+    // the margin like anything else. Nothing is drawn into the text to say
+    // so: that is what the bar beside it is for.
+    let mut gutter = None;
     if !chrome.is_empty() {
-        let text = chrome
-            .iter()
-            .map(|line| format!("{indent}{line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = chrome.join("\n");
+        let from = width(&spans);
         push_body(&mut spans, &text, model, &message.files);
         spans.push(Span::plain("\n"));
+        gutter = Some(from..width(&spans));
         lines.extend(text.split('\n').map(&meta));
     }
     // The pictures hang under everything the message said and named, and
@@ -2483,7 +2496,17 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             images: Vec::new(),
         });
     }
-    item(Row::Message(message.ts.clone()), spans, lines)
+    let item = item(Row::Message(message.ts.clone()), spans, lines);
+    match gutter {
+        Some(gutter) => item.with_gutter(gutter),
+        None => item,
+    }
+}
+
+/// How far into the item's text the spans have got, which is where the next
+/// one starts. The item's own text is what a gutter range is measured in.
+fn width(spans: &[Span]) -> usize {
+    spans.iter().map(|span| span.text.len()).sum()
 }
 
 /// What the empty composer says it is for. A thread's composer says so in
@@ -2615,36 +2638,7 @@ fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {
 
 fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
     let (text, styles) = lay_out(&spans);
-    let backgrounds = unfurl_ranges(&text);
-    Item::new(key, text)
-        .with_styles(styles)
-        .with_backgrounds(backgrounds)
-        .with_lines(lines)
-}
-
-/// The runs of lines an unfurl covers, each one tinted so the card reads as
-/// a box rather than as a bar beside loose lines.
-fn unfurl_ranges(text: &str) -> Vec<(Class, Range<usize>)> {
-    let mut ranges: Vec<(Class, Range<usize>)> = Vec::new();
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        if line
-            .trim_start()
-            .starts_with(crate::block::UNFURL_BAR.trim_end())
-        {
-            // One tint per row, each starting at the bar: a range spanning
-            // the newline between two rows would tint the indent of the
-            // second and leave the first starting a column further in, so
-            // the card's left edge came out ragged.
-            let start = offset + (line.len() - line.trim_start().len());
-            ranges.push((
-                Class::Unfurl,
-                start..offset + line.trim_end_matches('\n').len(),
-            ));
-        }
-        offset += line.len();
-    }
-    ranges
+    Item::new(key, text).with_styles(styles).with_lines(lines)
 }
 
 /// Where a continuation line, a reaction row, a thread count and a picture
@@ -2740,7 +2734,6 @@ fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, files: &[FileSumm
     // Lines the renderer added rather than the author: an attachment's card,
     // preview or app card alike. They read as chrome, not as speech.
     let mut offset = 0;
-    let mut in_unfurl = false;
     for line in body.split('\n') {
         let trimmed = line.trim_start();
         let start = offset + (line.len() - trimmed.len());
@@ -2749,21 +2742,6 @@ fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, files: &[FileSumm
         // lands on.
         if files.iter().any(|file| trimmed == file.line()) {
             marked.push((start..offset + line.len(), Class::Muted));
-        }
-        if trimmed.starts_with(crate::block::UNFURL_BAR.trim_end()) {
-            // The bar is the card's edge, the first line names the page:
-            // both read as the link. What follows is the page's own words.
-            let bar = start + crate::block::UNFURL_BAR.len();
-            marked.push((
-                start..match in_unfurl {
-                    true => bar.min(offset + line.len()),
-                    false => offset + line.len(),
-                },
-                Class::Link,
-            ));
-            in_unfurl = true;
-        } else {
-            in_unfurl = false;
         }
         offset += line.len() + 1;
     }
@@ -3593,14 +3571,10 @@ mod tests {
             "a bot is named like anyone: {text}"
         );
         assert!(text.contains("branch: main"), "{text}");
-        // An app card is the same quote box as a preview: no stray dash in
-        // the middle of the conversation.
-        assert!(
-            text.lines().any(|line| {
-                line.trim_start() == format!("{}pipeline", crate::block::UNFURL_BAR)
-            }),
-            "{text}"
-        );
+        // An app card is the same quote box as a preview: it starts at the
+        // margin with the bar beside it, not a stray dash in the middle of
+        // the conversation.
+        assert!(text.lines().any(|line| line == "pipeline"), "{text}");
         assert!(!text.contains("— pipeline"), "{text}");
         let _ = &styles;
         assert_eq!(lines.len(), text.matches('\n').count());
@@ -3623,22 +3597,18 @@ mod tests {
         let (text, styles, lines) =
             render_messages(std::slice::from_ref(&preview), &model(), false);
         assert!(
-            text.contains("\u{258e} Worth a read · example.com"),
+            text.contains("Worth a read · example.com"),
             "the title names the page and the site says where it is: {text}"
         );
         assert!(
-            text.contains("\u{258e} the second line") && !text.contains("the third line"),
+            text.contains("the second line") && !text.contains("the third line"),
             "two lines of someone else's page, no more: {text}"
         );
         assert!(
-            !text.contains("\u{258e} \n"),
-            "no blank lines inside the box: {text}"
+            !text.contains("\u{258e}"),
+            "the card's edge is the gutter's bar, not a column of text: {text}"
         );
-        let linked = classed(&text, &styles, Class::Link);
-        assert!(
-            linked.iter().any(|span| span.contains("Worth a read")),
-            "the card's first line reads as the link: {linked:?}"
-        );
+        let _ = &styles;
         assert!(
             text.contains("[the post](https://example.com/post)"),
             "the body's own link is markdown, for the parse to render: {text}"
@@ -3651,19 +3621,20 @@ mod tests {
                 >= 2,
             "every line of the card opens the page it stands for"
         );
+        // The card is marked in the gutter, which is the whole of what
+        // makes it one thing: the bar runs beside every row of it and
+        // beside nothing the sender said.
         let item = message_item(&preview, &model(), false);
-        let tints = item
-            .backgrounds
-            .iter()
-            .filter(|(class, _)| *class == Class::Unfurl)
-            .map(|(_, range)| item.text[range.clone()].to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(tints.len(), 3, "every row of the card is tinted: {tints:?}");
-        assert!(
-            tints
-                .iter()
-                .all(|row| row.starts_with(crate::block::UNFURL_BAR.trim_end())),
-            "the card's left edge is the bar on every row: {tints:?}"
+        let marked = item.gutter.clone().expect("the card is marked");
+        assert_eq!(
+            item.text[marked].lines().collect::<Vec<_>>(),
+            vec![
+                "Worth a read · example.com",
+                "the first line",
+                "the second line"
+            ],
+            "the bar covers the card and stops there: {:?}",
+            item.text
         );
     }
 
@@ -3810,13 +3781,14 @@ mod tests {
             text.contains("**bold**, *italic*, ~~struck~~, `inline code`"),
             "Slack's markers become markdown's: {text}"
         );
-        for class in [Class::Bold, Class::Italic, Class::Struck] {
-            assert!(
-                classed(&text, &styles, class).is_empty(),
-                "the parse styles emphasis and conceals its markers, so \
-                 nothing here paints it: {class:?}"
-            );
-        }
+        // What is left painted is who spoke, when, and the day above them:
+        // emphasis is the parse's, which styles it and conceals its markers.
+        assert!(
+            styles
+                .iter()
+                .all(|(class, _)| matches!(class, Class::Sender | Class::Time | Class::Muted)),
+            "nothing here paints emphasis: {styles:?}"
+        );
     }
 
     #[test]
