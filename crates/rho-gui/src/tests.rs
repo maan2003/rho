@@ -21,6 +21,7 @@ use story::ready_with;
 
 mod dashboard_cost;
 mod editor_shutdown;
+mod elision_block_geometry;
 mod elision_tail_rebuild;
 mod elision_unfold;
 mod find_cost;
@@ -34,6 +35,7 @@ mod history;
 mod inlay_cost;
 mod minibuffer;
 mod record_anchors;
+mod removing_a_turn_after_growth;
 mod running_turn_elapsed;
 mod scene_walk;
 mod story;
