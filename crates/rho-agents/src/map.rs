@@ -63,51 +63,6 @@ struct HostSnapshot {
     agent_counter: u64,
 }
 
-/// One agent as the rails read it: its head, what its story folded to, and
-/// the user's own filing, which comes from the store rather than the wire.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentSummary {
-    pub agent_id: AgentId,
-    pub parent_agent: Option<AgentId>,
-    pub display_name: Option<String>,
-    pub created_at: rho_core::UnixMs,
-    pub role: rho_ui_proto::AgentRole,
-    pub workspace: rho_ui_proto::WorkspaceInfo,
-    pub last_active: rho_core::UnixMs,
-    /// The user filed this agent away: the store's `Muted`, fed in by the
-    /// view rather than read here.
-    pub hidden: bool,
-    pub last_user_message_text: String,
-    pub activity: Option<String>,
-    pub labels: Vec<String>,
-}
-
-impl AgentSummary {
-    fn of(mirrored: &MirroredAgent) -> Self {
-        let identity = &mirrored.identity;
-        let digest = &mirrored.digest;
-        Self {
-            agent_id: identity.agent_id,
-            parent_agent: identity.parent,
-            display_name: mirrored.title().map(str::to_owned),
-            created_at: identity.created_at,
-            role: identity.role,
-            // Every agent is created with at least one workdir, so the
-            // fallback is only for a creation that arrived malformed.
-            workspace: identity.workspace().cloned().unwrap_or(
-                rho_ui_proto::WorkspaceInfo::UserCheckout {
-                    repo: Default::default(),
-                },
-            ),
-            last_active: digest.last_active.max(identity.created_at),
-            hidden: false,
-            last_user_message_text: digest.last_user_message_text.clone(),
-            activity: digest.activity.clone(),
-            labels: Vec::new(),
-        }
-    }
-}
-
 /// The user's own filing of an agent, which lives on the desk and never on
 /// the wire: whether they put it away, the labels they placed it under, and
 /// the name they gave it after it was running.
@@ -157,8 +112,11 @@ pub struct AgentMap {
     /// The user's filing, from the store: hidden agents, their labels,
     /// and what the user called them.
     filing: BTreeMap<AgentId, AgentFiling>,
-    /// One row per agent, in agent-id order: what the rails read.
-    summaries: BTreeMap<AgentId, AgentSummary>,
+    /// Where each agent is currently filed in the `children` and
+    /// `tag_agents` indexes. An index has to be told what to remove as well
+    /// as what to add, and the fold holds only what the agent is now, so
+    /// this holds what it was indexed as. Nothing else reads it.
+    indexed_as: BTreeMap<AgentId, (Option<AgentId>, &'static str)>,
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     hosts: BTreeMap<HostId, HostSnapshot>,
 
@@ -279,7 +237,7 @@ impl AgentMap {
             self.filing.remove(agent_id);
             self.last_active.remove(agent_id);
             self.announced_hosts.remove(agent_id);
-            self.summaries.remove(agent_id);
+            self.indexed_as.remove(agent_id);
         }
     }
 
@@ -358,9 +316,9 @@ impl AgentMap {
         true
     }
 
-    /// Every agent this client knows, in agent-id order.
-    pub fn summaries(&self) -> impl ExactSizeIterator<Item = &AgentSummary> {
-        self.summaries.values()
+    /// Every agent this client knows, folded, in agent-id order.
+    pub fn all_mirrored(&self) -> impl ExactSizeIterator<Item = &MirroredAgent> {
+        self.mirror.values()
     }
 
     /// Agents read back from the client's own copy, digest and all, so
@@ -445,22 +403,15 @@ impl AgentMap {
             return;
         };
         let host = mirrored.host;
-        let mut summary = AgentSummary::of(mirrored);
-        if let Some(filing) = self.filing.get(&agent_id) {
-            summary.hidden = filing.hidden;
-            summary.labels = filing.labels.clone();
-            // What the user called it wins over what the runtime titled
-            // it: the runtime's title is a guess from the first thing said
-            // to the agent, and a name is the user saying which agent this
-            // is.
-            if let Some(name) = filing.name.clone().filter(|name| !name.trim().is_empty()) {
-                summary.display_name = Some(name);
-            }
-        }
+        let identity = &mirrored.identity;
+        let digest = &mirrored.digest;
+        let activity = digest.activity.clone();
+        let last_active = digest.last_active.max(identity.created_at);
+        let now = (identity.parent, identity.role.handle_prefix());
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
-        match &summary.activity {
+        match activity {
             Some(activity) => {
-                self.activities.insert(agent_id, activity.clone());
+                self.activities.insert(agent_id, activity);
             }
             None => {
                 self.activities.remove(&agent_id);
@@ -470,11 +421,9 @@ impl AgentMap {
             .last_active
             .entry(agent_id)
             .or_insert(rho_core::UnixMs(0));
-        *active = (*active).max(summary.last_active);
+        *active = (*active).max(last_active);
 
-        let previous = self.summaries.get(&agent_id);
-        let was = previous.map(|row| (row.parent_agent, row.role.handle_prefix()));
-        let now = (summary.parent_agent, summary.role.handle_prefix());
+        let was = self.indexed_as.get(&agent_id).copied();
         let moved_host = self.agent_hosts.insert(agent_id, host) != Some(host);
         if moved_host {
             self.by_host.retain(|owner, agents| {
@@ -511,7 +460,7 @@ impl AgentMap {
                 tagged.insert(at, entry);
             }
         }
-        self.summaries.insert(agent_id, summary);
+        self.indexed_as.insert(agent_id, now);
     }
 
     /// Whether a screen draws this agent at all: the user's filing is the
@@ -521,10 +470,7 @@ impl AgentMap {
             return;
         };
         let entry = (key, agent_id);
-        let hidden = self
-            .summaries
-            .get(&agent_id)
-            .is_some_and(|summary| summary.hidden);
+        let hidden = self.agent_hidden(agent_id);
         if hidden {
             self.visible.remove(&entry);
         } else {
@@ -542,9 +488,7 @@ impl AgentMap {
                 self.by_host.remove(&host);
             }
         }
-        if let Some(row) = self.summaries.get(&agent_id) {
-            let parent = row.parent_agent;
-            let tag = row.role.handle_prefix();
+        if let Some((parent, tag)) = self.indexed_as.remove(&agent_id) {
             if let Some(parent) = parent {
                 self.remove_child(parent, agent_id);
             }
@@ -615,8 +559,7 @@ impl AgentMap {
             .insert(agent_id, rho_core::UnixMs(now_ms()));
     }
     pub fn agent_folded(&self, agent_id: AgentId) -> bool {
-        self.agent_summary(agent_id)
-            .is_some_and(|agent| agent.hidden)
+        self.agent_hidden(agent_id)
     }
 
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
@@ -629,7 +572,7 @@ impl AgentMap {
             for child in self.children.get(&cursor).map_or(&[][..], Vec::as_slice) {
                 if seen.insert(*child) {
                     queue.push(*child);
-                    if !self.agent_summary(*child).is_some_and(|a| a.hidden) {
+                    if !self.agent_hidden(*child) {
                         descendants.push(*child);
                     }
                 }
@@ -663,8 +606,8 @@ impl AgentMap {
             });
         let len = prefix_id::uniform_prefix_len(counter, LABEL_HEADROOM).max(4);
         let prefix = self
-            .agent_summary(agent_id)
-            .map(|a| a.role.handle_prefix())
+            .agent_identity(agent_id)
+            .map(|identity| identity.role.handle_prefix())
             .unwrap_or("eng");
         let label = format!("{prefix}-{}", &agent_id.encoded()[..len]);
         match host.filter(|_| self.hosts.len() > 1) {
@@ -692,23 +635,27 @@ impl AgentMap {
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
-        self.agent_summary(agent_id)
-            .map(|a| a.workspace.repo().to_owned())
+        self.agent_workspace(agent_id)
+            .map(|workspace| workspace.repo().to_owned())
     }
+    /// Every agent is created with at least one workdir, so an agent with
+    /// none is a creation that arrived malformed rather than an ordinary
+    /// state, and it reads as no workspace at all.
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
-        self.agent_summary(agent_id).map(|a| &a.workspace)
+        self.agent_identity(agent_id)
+            .and_then(|identity| identity.workspace())
     }
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
-        self.agent_summary(agent_id)
-            .and_then(|a| a.workspace.workspace_id())
+        self.agent_workspace(agent_id)
+            .and_then(|workspace| workspace.workspace_id())
             .map(|id| format!("ws-{}", id.encoded()))
     }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
-        self.agent_summary(agent_id).map(|a| a.role)
+        self.agent_identity(agent_id).map(|identity| identity.role)
     }
     pub fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
-        self.agent_summary(agent_id)
-            .and_then(|agent| agent.parent_agent)
+        self.agent_identity(agent_id)
+            .and_then(|identity| identity.parent)
     }
     /// The user made this agent themself. An agent created by an agent
     /// belongs to its creator: it is not dealt, not on Home, not in the
@@ -719,20 +666,27 @@ impl AgentMap {
         self.agent_parent(agent_id).is_none()
     }
     pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
-        self.agent_summary(agent_id)
-            .is_some_and(|agent| agent.hidden)
+        self.filing
+            .get(&agent_id)
+            .is_some_and(|filing| filing.hidden)
     }
     pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
-        self.agent_summary(agent_id)
-            .is_some_and(|agent| agent.labels.iter().any(|label| label == "pin"))
+        self.agent_labels(agent_id)
+            .iter()
+            .any(|label| label == "pin")
+    }
+    fn agent_labels(&self, agent_id: AgentId) -> &[String] {
+        self.filing
+            .get(&agent_id)
+            .map_or(&[][..], |filing| filing.labels.as_slice())
     }
     pub fn agent_attention_reason(&self, agent_id: AgentId) -> Option<&str> {
         self.agent_digest(agent_id)
             .and_then(|digest| digest.wants.as_ref())
             .and_then(|wants| wants.summary.as_deref())
             .or_else(|| {
-                self.agent_summary(agent_id)
-                    .map(|agent| agent.last_user_message_text.as_str())
+                self.agent_digest(agent_id)
+                    .map(|digest| digest.last_user_message_text.as_str())
             })
             .filter(|reason| !reason.trim().is_empty())
     }
@@ -756,12 +710,17 @@ impl AgentMap {
             errored: digest.errored.is_some(),
         }
     }
-    fn agent_summary(&self, agent_id: AgentId) -> Option<&AgentSummary> {
-        self.summaries.get(&agent_id)
-    }
+    /// What the agent is called: the name the user gave it if they gave
+    /// one, else what the runtime titled it. A name is the user saying
+    /// which agent this is; a title is a guess from the first thing said
+    /// to it, so the name wins.
     pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
-        self.agent_summary(agent_id)
-            .and_then(|a| a.display_name.as_deref())
+        self.filing
+            .get(&agent_id)
+            .and_then(|filing| filing.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .or_else(|| self.mirror.get(&agent_id).and_then(MirroredAgent::title))
     }
     pub fn agent_display_label(&self, agent_id: AgentId) -> String {
         let id = self.agent_id_label(agent_id);
@@ -777,36 +736,29 @@ impl AgentMap {
     /// An agent filed nowhere reads exactly as it did before: a name with
     /// no labels has nothing to say about placement.
     pub fn agent_name_with_labels(&self, agent_id: AgentId, name: String) -> String {
-        match self.agent_summary(agent_id) {
-            Some(agent) if !agent.labels.is_empty() => {
-                format!("{name} · {}", agent.labels.join(" › "))
-            }
+        match self.agent_labels(agent_id) {
+            labels if !labels.is_empty() => format!("{name} · {}", labels.join(" › ")),
             _ => name,
         }
     }
     /// What the user last said to the agent, for finding it by the words
     /// they remember rather than by a name they never gave it.
     pub fn agent_last_user_message(&self, agent_id: AgentId) -> Option<&str> {
-        self.agent_summary(agent_id)
-            .map(|agent| agent.last_user_message_text.trim())
+        self.agent_digest(agent_id)
+            .map(|digest| digest.last_user_message_text.trim())
             .filter(|text| !text.is_empty())
     }
     pub fn agent_human_name(&self, agent_id: AgentId) -> String {
-        let Some(agent) = self.agent_summary(agent_id) else {
+        let Some(role) = self.agent_role(agent_id) else {
             return "Untitled agent".into();
         };
-        if let Some(name) = agent
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-        {
+        if let Some(name) = self.agent_display_name(agent_id) {
             return name.into();
         }
-        if !agent.last_user_message_text.trim().is_empty() {
-            return agent.last_user_message_text.trim().into();
+        if let Some(said) = self.agent_last_user_message(agent_id) {
+            return said.into();
         }
-        if agent.role.is_engineer() {
+        if role.is_engineer() {
             "Engineer".into()
         } else {
             "Advisor".into()
@@ -1069,7 +1021,7 @@ mod tests {
             registry.agent_attention_reason(agent_id),
             Some("do the thing")
         );
-        assert_eq!(registry.summaries().len(), 1);
+        assert_eq!(registry.all_mirrored().len(), 1);
         assert_eq!(registry.host_of_agent(agent_id), Some(host));
 
         registry.tell(
@@ -1117,7 +1069,7 @@ mod tests {
         assert_eq!(registry.agent_digest(agent_id).unwrap().newest, AgentPos(5));
 
         registry.reset_host(host);
-        assert_eq!(registry.summaries().len(), 0);
+        assert_eq!(registry.all_mirrored().len(), 0);
     }
 
     /// The order is what the user moves through, and it is handed out
@@ -1224,7 +1176,7 @@ mod tests {
         // A host that starts over takes its agents out of every index.
         let departed = map.reset_host(host);
         assert_eq!(departed.into_iter().collect::<Vec<_>>(), all);
-        assert_eq!(map.summaries().len(), 0);
+        assert_eq!(map.all_mirrored().len(), 0);
         assert!(map.agent_children(agent(1)).is_empty());
         assert_eq!(map.host_agents(host), []);
         assert_eq!(map.agent_by_tag(host, tag), None);
