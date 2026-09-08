@@ -23,6 +23,7 @@ mod dashboard_cost;
 mod editor_shutdown;
 mod find_cost;
 mod fold_accounting_streaming;
+mod fold_cost;
 mod fold_tail_rows;
 mod fold_widen_bias;
 mod fold_widen_underflow;

@@ -290,6 +290,32 @@ thing until the thing is in the run. Correctness has a counter of its own
 beside it, the fold map's accounting: empty, or naming the edit that
 stopped describing a range. Both are read on every stage.
 
+The cut is finished, and the counter says the clause holds. What the gate's
+five paging steps show is a transient, not a slope: lengthened to fifteen,
+the elided run's `fold:` rises to 184, settles at 137 and stays there —
+`fold:137` at 515 rows, at 707, at 899, while `wrap:359` and `block:113`
+sit flat beside it. The 66 at 232 rows and 136 at 473 that the shorter
+window shows are the climb up to that plateau. The level is the elisions
+the composing chunk crosses, 137 leaf items for a 48-row chunk of elided
+history against 4 for the same rows unelided, and it does not follow the
+document.
+
+Because a plateau in one drive is not the property, the clause has a test of
+its own: folds spread over the same rows in both cases so only their number
+differs, an edit at the foot below every one of them, counting the fold
+map's leaf items rather than milliseconds — 36 walked under 32 folds and 32
+under 256, and 45 against 44 at 125 and 1000. Eight times the folds, the
+same walk.
+
+The clock is no use for this and it is worth saying why, because it reads
+like the fault. Timed rather than counted, that edit costs 0.136s under 250
+folds and 1.200s under 2000 — a clean 8.8× — but only because that version
+grew the document along with the fold count. With the document held fixed
+the clock inverts, 3.22s at 250 folds against 1.17s at 2000, since folding
+two thousand ranges takes four thousand rows out of the layout. The wall
+clock there is measuring the rows a fold hides. The cost rule is written in
+counts, and the count is what the test asserts.
+
 ### How it will be proven
 
 On the QA rig, on the user's snapshot, with the handbook's Emacs-feel checks:
