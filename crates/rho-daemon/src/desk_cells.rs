@@ -1406,6 +1406,7 @@ mod tests {
                         verdict: Verdict::Label {
                             label: label.clone(),
                             present,
+                            instead_of: Vec::new(),
                         },
                         at: stamp,
                         changes,

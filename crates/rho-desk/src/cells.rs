@@ -387,9 +387,18 @@ pub enum Verdict {
     /// `l`: the thing carries this label, or stops carrying it. Taking a
     /// label off is a decision like putting one on, so it is the same
     /// verdict with `present: false` rather than a write nothing records.
+    ///
+    /// `instead_of` is the labels the same act took off because this one is
+    /// nested under them and says where the thing is on its own: the set
+    /// kept is the smallest one. They belong to the verdict rather than to
+    /// the writes beside it, because what the reader decided was "it is
+    /// under this label now", and an undo of that decision puts back every
+    /// cell it moved. Older entries have none and read as empty.
     Label {
         label: Id,
         present: bool,
+        #[senax(skip_default)]
+        instead_of: Vec<Id>,
     },
 }
 
@@ -486,11 +495,26 @@ pub fn verdict_changes(
     // A label is a second axis, not a close: it says nothing about whether
     // the thing is still owed, so it is the same one cell on every kind of
     // id, a Slack unit included.
-    if let Verdict::Label { label, present } = verdict {
-        return one(Property::Labeled {
+    if let Verdict::Label {
+        label,
+        present,
+        instead_of,
+    } = verdict
+    {
+        if instead_of.contains(label) {
+            return Err("Desk label verdict replaces the label it puts on".into());
+        }
+        let mut changes = vec![change(Property::Labeled {
             label: label.clone(),
             present: *present,
-        });
+        })];
+        changes.extend(instead_of.iter().map(|held| {
+            change(Property::Labeled {
+                label: held.clone(),
+                present: false,
+            })
+        }));
+        return Ok(changes);
     }
     // A Slack unit is closed by moving its cursor, not by a state: whatever
     // Slack sends afterwards, the only question the card asks is "is there
@@ -1200,6 +1224,82 @@ mod tests {
                     },
                 )
                 .is_err()
+        );
+    }
+
+    /// Filing under a label the thing is already inside states both cells:
+    /// the label it now carries and the shallower one that came off with
+    /// it. Undo reads the entry, so what the entry states is what an undo
+    /// can put back, and a filing that moved two cells has to state two.
+    #[test]
+    fn a_label_verdict_states_the_labels_it_took_off_as_well() {
+        let rho = Id::Label(Uuid([1; 16]));
+        let agent = Id::Label(Uuid([2; 16]));
+        // The thing carries `rho` before the filing, which is the reading
+        // undo has to put back.
+        let carried = |key: &PropertyKey| match key {
+            PropertyKey::Labeled(label) if *label == Id::Label(Uuid([1; 16])) => {
+                Some(Property::Labeled {
+                    label: label.clone(),
+                    present: true,
+                })
+            }
+            _ => None,
+        };
+        let changes = verdict_changes(
+            &note(1),
+            &Verdict::Label {
+                label: agent.clone(),
+                present: true,
+                instead_of: vec![rho.clone()],
+            },
+            &carried,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.after.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Property::Labeled {
+                    label: agent.clone(),
+                    present: true,
+                }),
+                Some(Property::Labeled {
+                    label: rho.clone(),
+                    present: false,
+                }),
+            ]
+        );
+        // Undo replays the before-values, so the shallower label comes
+        // back on: the state before the filing is what is restored, not
+        // the one cell the filing is named after.
+        assert_eq!(
+            changes[1].before,
+            Some(Property::Labeled {
+                label: rho,
+                present: true,
+            })
+        );
+        // A verdict cannot take off the label it puts on.
+        assert!(
+            verdict_changes(
+                &note(1),
+                &Verdict::Label {
+                    label: agent.clone(),
+                    present: true,
+                    instead_of: vec![agent],
+                },
+                &|_| None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
         );
     }
 

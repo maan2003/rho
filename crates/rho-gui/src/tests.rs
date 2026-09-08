@@ -31,7 +31,6 @@ mod fold_widening_check;
 mod history;
 mod inlay_cost;
 mod minibuffer;
-mod rebuild_bound;
 mod record_anchors;
 mod running_turn_elapsed;
 mod scene_walk;
@@ -9513,6 +9512,97 @@ fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext)
                     .and_then(|node| node.under),
                 Some(area.clone()),
                 "the place it was in is where it is again"
+            );
+        })
+        .unwrap();
+}
+
+/// Undo puts back the state the verdict changed, not the one cell it is
+/// named after: filing a thing carrying `rho` under `rho/agent` moves two
+/// cells, so undoing it takes `rho/agent` off and puts `rho` back on.
+#[gpui::test]
+fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "Deal QA note");
+    let rho = desk.label("rho");
+    desk.labelled(dealt.clone(), rho.clone());
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.label_card(HostId::default(), dealt.clone(), "rho/agent", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let (stamp, agent) = workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
+            let agent = workspace
+                .desk_cells
+                .label_paths(HostId::default())
+                .into_iter()
+                .find(|(_, path)| path == "rho/agent")
+                .map(|(id, _)| id)
+                .expect("the deeper label exists");
+            assert!(
+                mutation.writes.iter().any(|write| write.id == dealt
+                    && write.property
+                        == rho_desk::cells::Property::Labeled {
+                            label: rho.clone(),
+                            present: false,
+                        }),
+                "the shallower label comes off with the filing: {:?}",
+                mutation.writes
+            );
+            (mutation.stamp, agent)
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::UndoVerdict);
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation = take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
+            let wrote = |label: &rho_desk::cells::Id, present: bool| {
+                mutation.writes.iter().any(|write| {
+                    write.id == dealt
+                        && write.property
+                            == rho_desk::cells::Property::Labeled {
+                                label: label.clone(),
+                                present,
+                            }
+                })
+            };
+            assert!(
+                wrote(&agent, false),
+                "undo takes the label the filing put on back off: {:?}",
+                mutation.writes
+            );
+            assert!(
+                wrote(&rho, true),
+                "and puts back the one it took off: {:?}",
+                mutation.writes
             );
         })
         .unwrap();

@@ -1737,29 +1737,28 @@ impl DeskCells {
         let present = !carried.contains(&label);
         // The set kept is the smallest one that says where the thing is:
         // a label the new one is nested under says nothing once the deeper
-        // one is on, so it comes off in the same mutation.
-        if present {
+        // one is on, so it comes off in the same act. It is part of the
+        // verdict rather than a write beside it, so an undo of "file under
+        // rho/agent" puts back every cell that act moved.
+        let instead_of = match present {
+            false => Vec::new(),
             // The path just walked names the labels above this one, minted
             // or not; a label on the map may also be nested under labels
             // the path did not spell, so both are asked.
-            let mut implied = self.label_chain(host, &label);
-            implied.extend(chain.iter().cloned());
-            writes.extend(
+            true => {
+                let mut implied = self.label_chain(host, &label);
+                implied.extend(chain.iter().cloned());
                 carried
                     .iter()
                     .filter(|held| *held != &label && implied.contains(held))
-                    .map(|held| CellWrite {
-                        id: id.clone(),
-                        property: Property::Labeled {
-                            label: held.clone(),
-                            present: false,
-                        },
-                    }),
-            );
-        }
+                    .cloned()
+                    .collect()
+            }
+        };
         let verdict = Verdict::Label {
             label: label.clone(),
             present,
+            instead_of,
         };
         let view = &self.hosts.get(&host)?.view;
         let changes = rho_desk::cells::verdict_changes(
