@@ -45,17 +45,94 @@ happens later, when the context makes the right parent obvious.
 eventually you stop capturing. The brain lets go of a thought only when it
 trusts the system to bring it back (GTD).
 
-## Filing is the parent, and "notes for this" is one key
+## Placement is the labels a thing carries
 
-A node's parent is its context, and that is the whole filing system. A note
-under a Slack thread is notes for that thread; a note under an agent is
-notes on that agent's work. One key on any surface opens the note filed
-under whatever is on screen, creating it the first time.
+The user's call, 8 Sep: a thing is placed by its labels and carries no
+parent. `Parent` nests labels and nothing else. An agent, a note, a page, a
+Slack unit or a file carries a set of `Labeled` cells and otherwise sits at
+the root, and the label's own parent chain is what makes `rho/agent` count
+as `rho`. `STORE-DESIGN.md` already writes this rule down under "Labels are
+the filing; parent is only for labels"; what follows is what the code still
+does instead, and what the placement gestures become.
 
-**Why:** a note about a thing wants to be found from the thing, not from a
-folder that happens to be named after it. Since the parent is the only
-place filing lives, "notes for this" is a lookup rather than a feature: the
-child note of the node the surface is about.
+**Why:** a parent is one place and a thing is in several. An agent working
+in the rho checkout on a Slack thread's bug belongs under both, and the
+parent forced a choice that was wrong half the time; the label set does
+not. It also collapses two filing systems into one: `f` already writes
+labels, and a place was a second thing it could write.
+
+### What the store already gives
+
+`Labeled { label, present }` is a set — the label is part of the key, so
+two devices tagging at once do not fight, and the merge is add-wins. A
+label is `Id::Label(uuid)` with a `Name` and its own `Parent`, so a label
+path is minted and found by name (`label_path_writes`), listed as a path
+(`label_paths`), and renamed in one cell. A label may carry a `Project`,
+which is how a workdir is inherited: the chain walked is the label's, not
+the thing's. The registry is already fed the labels of every agent and
+nothing else about placement (`agent_filing` → `AgentFiling`), and Home
+rows, cards and tabs now read them after the agent's name.
+
+Nothing in the store has to change. The rule is a rule about what rho
+writes, and the store already accepts both.
+
+### What the draft already gives
+
+`n a`, `n p`, `n n` all open the area picker first, so a new thing always
+has somewhere to be. The picker offers every node on the desk plus `root`,
+ranks the node in context first, and hands what was chosen to
+`filing_property`, which writes `Labeled` for a label and `Parent(Some(…))`
+for anything else. So the draft is already half of the new rule: choose a
+label and a new thing is placed the way the rule says.
+
+Three places still write a parent on a thing, and they are the work:
+
+- **`filing_property`** — a new thing filed under a note or an agent.
+- **`file_under`** — the `f` picker's non-label rows ("anything else picked
+  is a place, and a thing is in one place").
+- **notes for this** — the note it creates is the child of the thing on
+  screen, and it finds an existing one by `parent == the thing`.
+
+The first two become label writes and their pickers stop offering places.
+The third is the one that is not filing at all: a note *about* the thing on
+screen. `About(Id)` is the cell for that and it already exists, so the key
+keeps its meaning and stops using the placement axis to say it.
+
+### The picker offers the smallest set that says where it is
+
+A thing that carries `rho/agent` is under `rho` already, so the picker
+neither shows nor writes `rho` beside it: the set kept is the minimal one,
+with any label that another carried label already implies dropped. Adding
+`rho` to a thing carrying `rho/agent` is a no-op the picker says nothing
+about; adding `rho/agent` to a thing carrying `rho` takes `rho` off and
+leaves the deeper one.
+
+**Why:** without it every thing accumulates its own ancestry, the rows grow
+a tail of labels that say the same thing, and "which labels is this under"
+stops having one answer. The set is small enough to read on a Home row,
+which is where it is now shown.
+
+### Create from here
+
+On a Slack message, on an agent's transcript, on a note — the new-thing
+verb takes the labels of what is on screen rather than asking. The picker
+is still there for a thing that belongs somewhere else, but the common
+case, "another agent for this same work", stops being a question the user
+answers twice.
+
+### Left to decide
+
+- Whether `About` is written by the notes-for-this key alone, or whether
+  every relation rho already derives (`FromSlack`, `FromPage`, an agent's
+  spawner) reads the same way to the user.
+- What the map draws for a thing with two labels: it is under both, and an
+  outline draws each row once. Drawing it under each is the honest answer
+  and the one that costs a reader nothing; a "primary label" would be the
+  parent again under another name.
+- Whether the existing parents on things are converted or left. They are
+  the user's own filing, so leaving them unread is losing it; converting
+  each to the label of the same name is a one-shot with the same shape as
+  the outline conversion, and that one is now deleted rather than kept.
 
 ## One lifecycle for everything
 
