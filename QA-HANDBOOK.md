@@ -912,6 +912,25 @@ the reader was compiled to do before you change the file. The file was
 telling the truth — `.symtab` sat uncompressed in the same binary with all
 534,913 names in it the whole time.
 
+*Read a chain structurally, and never a leaf's name alone.* A named frame is
+not the same as a true one. These binaries are built with inlining on, so the
+symbolizer attributes an address to whichever inlined function sits nearest
+it, and near is not the same as responsible. The 4% third leaf on the GUI
+thread came back as `runtime`, which is a real function name — a one-line
+`ActionTiming::runtime` accessor in gpui's profiler — and the Wayland event
+loop those samples were actually in does not call it. Two checks settled it in
+minutes and neither needed a rerun: `nm --defined-only` on the binary found no
+such symbol in 558,809, so the name came from debug info rather than the
+symbol table; and every sibling leaf under the same parent was a calloop or
+rustix internal, which says what the neighbourhood is. The same profile put
+`is_some<FocusId>` above functions it cannot have called.
+
+So read the frame you can defend. A chain is trustworthy where its shape is —
+`prepaint`, `dispatch_events`, a syscall wrapper — and unreliable at the one
+frame you most want to quote. When the answer has to be exact, spans beat
+symbols: a span is recorded by the code that ran, and no amount of inlining
+can move it.
+
 ## Adding a case
 
 A new case starts every time the user reports something. Write it before
