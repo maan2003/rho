@@ -1109,6 +1109,11 @@ pub struct Editor {
     highlighted_rows: TypeIdHashMap<Vec<RowHighlight>>,
     background_highlights: HashMap<HighlightKey, BackgroundHighlight>,
     syntax_concealments_dirty: bool,
+    /// Ranges over which parsed concealments are dropped, sorted and
+    /// non-overlapping. A document may hold text that is markdown to the
+    /// parser but literal to the reader — words someone typed, quoted back
+    /// — and hiding markup there hides what they wrote.
+    concealment_exclusions: Vec<Range<Anchor>>,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
     allow_git_diff_scrollbar_markers: bool,
@@ -2569,6 +2574,7 @@ impl Editor {
             highlighted_rows: Default::default(),
             background_highlights: HashMap::default(),
             syntax_concealments_dirty: true,
+            concealment_exclusions: Vec::new(),
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
             allow_git_diff_scrollbar_markers: false,
@@ -10147,12 +10153,46 @@ impl Editor {
         !was_dirty
     }
 
+    /// Suppresses concealment over the given ranges, replacing whatever was
+    /// suppressed before. Ranges must be sorted and must not overlap.
+    pub fn set_concealment_exclusions(
+        &mut self,
+        ranges: Vec<Range<Anchor>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.concealment_exclusions == ranges {
+            return;
+        }
+        self.concealment_exclusions = ranges;
+        self.invalidate_syntax_concealments();
+        cx.notify();
+    }
+
     fn refresh_syntax_concealments(&mut self, cx: &mut Context<Self>) {
         if !self.syntax_concealments_dirty {
             return;
         }
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let concealed = snapshot.concealed_ranges().collect::<Vec<_>>();
+        let mut concealed = snapshot.concealed_ranges().collect::<Vec<_>>();
+        if !self.concealment_exclusions.is_empty() {
+            let excluded = self
+                .concealment_exclusions
+                .iter()
+                .map(|range| range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
+                .collect::<Vec<_>>();
+            // Both sequences are in document order, so one pass over each
+            // decides every concealment: an excluded range is only left
+            // behind once no later concealment can touch it.
+            let mut next = 0;
+            concealed.retain(|range| {
+                while next < excluded.len() && excluded[next].end <= range.start {
+                    next += 1;
+                }
+                !excluded
+                    .get(next)
+                    .is_some_and(|excluded| excluded.start < range.end)
+            });
+        }
         self.syntax_concealments_dirty = false;
         let display_map = self.display_map.clone();
         display_map.update(cx, |display_map, cx| {
