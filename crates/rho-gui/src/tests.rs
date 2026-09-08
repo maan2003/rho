@@ -21,6 +21,7 @@ use story::ready_with;
 
 mod dashboard_cost;
 mod editor_shutdown;
+mod elision_tail_rebuild;
 mod elision_unfold;
 mod find_cost;
 mod fold_accounting_streaming;
