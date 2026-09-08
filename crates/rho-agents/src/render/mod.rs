@@ -238,6 +238,7 @@ pub fn render_block_with_agent_labels(
             }
             spans.extend(separator(prev, kind));
             gutter_span = Some(spans.len());
+            markdown = true;
             spans.push(Span::new(format!("{text}\n\n"), StyleClass::UserMessage));
         }
         UiBlock::AssistantMessage { text, .. } => {

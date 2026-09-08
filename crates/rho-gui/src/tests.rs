@@ -37,6 +37,7 @@ mod scene_walk;
 mod story;
 mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
+mod turn_is_one_buffer;
 mod wrap_rows;
 mod wrap_under_tab;
 use rho_agents::HostId;

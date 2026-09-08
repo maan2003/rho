@@ -588,6 +588,7 @@ impl TranscriptModel {
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         let mut rows = 0;
+        let mut fence_open = false;
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
             let block_index = start_block + offset;
             let markdown = rendered.markdown;
@@ -597,11 +598,13 @@ impl TranscriptModel {
                 markdown,
                 rows,
                 block_rows,
+                fence_open,
             ) {
                 chunks.push((block_index, markdown, Vec::new()));
                 rows = 0;
             }
             rows += block_rows;
+            fence_open = leaves_fence_open(&rendered);
             chunks.last_mut().unwrap().2.push(rendered);
         }
 
@@ -1494,6 +1497,12 @@ impl TranscriptModel {
                     .map(|(_, range)| range.clone())
                     .collect();
                 editor.update(cx, |editor, cx| {
+                    // The user's own words are quoted back exactly as they
+                    // were typed. They share a buffer with the model's
+                    // markdown so a turn is one buffer, so the parser sees
+                    // their asterisks and backticks as markup; concealing
+                    // there would hide what they wrote.
+                    editor.set_concealment_exclusions(user_ranges.clone(), cx);
                     editor.highlight_gutter::<UserMessageGutter>(
                         user_ranges,
                         rho_window::style::user_prompt_gutter_color,
@@ -1653,6 +1662,7 @@ fn render_chunks(
         .map(|index| block_kind(&blocks[index]));
     let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
     let mut rows = 0;
+    let mut fence_open = false;
     for index in range {
         let rendered = render_block_with_agent_labels(&blocks[index], prev, now_ms, label);
         if rendered.visible() {
@@ -1665,11 +1675,13 @@ fn render_chunks(
             markdown,
             rows,
             block_rows,
+            fence_open,
         ) {
             chunks.push((index, markdown, Vec::new()));
             rows = 0;
         }
         rows += block_rows;
+        fence_open = leaves_fence_open(&rendered);
         chunks.last_mut().unwrap().2.push(rendered);
     }
     chunks
@@ -1702,14 +1714,42 @@ fn rendered_rows(rendered: &RenderedBlock) -> usize {
         .sum()
 }
 
-/// Whether a block starts a new chunk: a different language, or a chunk
-/// already at the cap. `rows` is the rows the open chunk holds and is reset
-/// by the caller when a chunk starts.
-fn starts_chunk(current: Option<bool>, markdown: bool, rows: usize, block_rows: usize) -> bool {
+/// Whether a block starts a new chunk: a different language, a chunk
+/// already at the cap, or a chunk whose last block left a code fence open.
+/// `rows` is the rows the open chunk holds and is reset by the caller when
+/// a chunk starts.
+fn starts_chunk(
+    current: Option<bool>,
+    markdown: bool,
+    rows: usize,
+    block_rows: usize,
+    fence_open: bool,
+) -> bool {
     match current {
         None => true,
-        Some(current) => current != markdown || (rows > 0 && rows + block_rows > MAX_CHUNK_ROWS),
+        Some(current) => {
+            current != markdown || fence_open || (rows > 0 && rows + block_rows > MAX_CHUNK_ROWS)
+        }
     }
+}
+
+/// Whether a block's own text ends inside a fenced code block. A blank line
+/// closes every other markdown construct and every block ends with one, so
+/// a fence is the only markup that can reach past the block that opened it.
+/// It must not: the next block is another turn, or the user's own words,
+/// and a stray fence would draw all of it as code.
+fn leaves_fence_open(rendered: &RenderedBlock) -> bool {
+    rendered
+        .spans
+        .iter()
+        .flat_map(|span| span.text.lines())
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("```") || line.starts_with("~~~")
+        })
+        .count()
+        % 2
+        == 1
 }
 
 fn chunk_text_and_spans(rendered: &[RenderedBlock]) -> (String, Vec<Range<usize>>) {
