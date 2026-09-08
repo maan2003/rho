@@ -9784,7 +9784,10 @@ fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext)
             let paths = workspace
                 .find_candidates(cx)
                 .into_iter()
-                .flat_map(|candidate| std::iter::once(candidate.path).chain(candidate.labels))
+                .flat_map(|candidate| {
+                    std::iter::once(candidate.path)
+                        .chain(candidate.labels.into_iter().map(|label| label.name))
+                })
                 .collect::<Vec<_>>();
             assert!(
                 paths.iter().any(|path| path.starts_with("rho/agent › ")),
@@ -10262,7 +10265,7 @@ fn find_matches_a_thing_by_the_label_it_carries(cx: &mut TestAppContext) {
                 labelled
                     .labels
                     .iter()
-                    .any(|name| name.starts_with("rho/agent")),
+                    .any(|name| name.name.starts_with("rho/agent")),
                 "the label path is one of its names, got {:?}",
                 labelled.labels
             );

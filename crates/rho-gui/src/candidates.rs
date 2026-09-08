@@ -296,7 +296,7 @@ pub(crate) fn find_candidates(
                 node.labels
                     .iter()
                     .filter_map(|label| source.label_paths.get(label))
-                    .map(|path| format!("{path} › {title}"))
+                    .map(|path| crate::find::LabelName::new(path, title))
                     .collect::<Vec<_>>()
             };
             let candidate = match &node.id {

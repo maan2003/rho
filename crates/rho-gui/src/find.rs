@@ -11,6 +11,16 @@
 //! `nixos › poco on linux` while a query that only lands mid-word ranks
 //! below it.
 //!
+//! A query is its words, not its letters. Each word is matched on its own
+//! and every one of them must land somewhere, but they need not land on
+//! the same name: `rho agent foo` finds the agent `foo` filed under
+//! `rho/agent`, with `rho` and `agent` landing on the label path and `foo`
+//! on the name. One subsequence over the whole query could never do that,
+//! because the space in the query has no space in the name to land on.
+//! A word that is a label path entire — `rho/agent` — is the reader
+//! naming a filing rather than spelling a thing, so everything filed
+//! there is what they asked for, agents first and newest first.
+//!
 //! `find_candidates` is the single seam onto the tree. Slice 2 swaps what
 //! it yields from a path string to a `NodeId` without the prompt or the
 //! scorer noticing.
@@ -38,6 +48,12 @@ const BONUS_CONSECUTIVE: i32 = 8;
 /// The query's first character weighs double, so `p` prefers the path that
 /// starts with it.
 const BONUS_FIRST_MULTIPLIER: i32 = 2;
+
+/// A word that is exactly a label path is the reader naming the filing,
+/// not spelling letters that happen to be in it. It outweighs anything an
+/// incidental subsequence can earn, so `rho/agent` lists what is filed
+/// under `rho/agent` rather than everything containing those letters.
+const BONUS_LABEL_PATH: i32 = 4096;
 
 /// Characters that end a path segment.
 const SEPARATORS: [char; 3] = ['›', '/', '>'];
@@ -67,7 +83,7 @@ pub(crate) struct FindCandidate {
     /// The same thing named by each label it carries, `rho/agent › name`.
     /// The reader remembers the filing as often as the place, so a label
     /// path finds a thing exactly as its parent path does.
-    pub labels: Vec<String>,
+    pub labels: Vec<LabelName>,
     /// Names the query matches but the row never shows: an agent's tag and
     /// the last thing the user said to it. The reader looks for what they
     /// remember, which is rarely the title something ended up with.
@@ -77,17 +93,55 @@ pub(crate) struct FindCandidate {
     pub recency: i64,
 }
 
+/// A thing named by one of its labels: the filing path on its own, and the
+/// name that path makes. The path is kept apart from the name because a
+/// query that is the path entire means something the letters do not.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LabelName {
+    pub path: String,
+    pub name: String,
+}
+
+impl LabelName {
+    pub(crate) fn new(path: &str, title: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            name: format!("{path} › {title}"),
+        }
+    }
+}
+
+/// One name a query is matched against, and the label path it belongs to
+/// when it is a label's.
+#[derive(Clone, Debug)]
+pub(crate) struct FindName {
+    text: String,
+    label_path: Option<String>,
+}
+
+impl FindName {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            label_path: None,
+        }
+    }
+}
+
 impl FindCandidate {
     #[cfg(test)]
     pub(crate) fn names_for_test(&self) -> Vec<String> {
-        self.names()
+        self.names().into_iter().map(|name| name.text).collect()
     }
 
     /// Every name the query is matched against, the shown path first.
-    fn names(&self) -> Vec<String> {
-        let mut names = vec![self.path.clone()];
-        names.extend(self.labels.iter().cloned());
-        names.extend(self.aka.iter().cloned());
+    fn names(&self) -> Vec<FindName> {
+        let mut names = vec![FindName::plain(self.path.clone())];
+        names.extend(self.labels.iter().map(|label| FindName {
+            text: label.name.clone(),
+            label_path: Some(label.path.clone()),
+        }));
+        names.extend(self.aka.iter().cloned().map(FindName::plain));
         names
     }
 }
@@ -175,8 +229,9 @@ pub(crate) fn take_find_steps() -> (u64, u64) {
 /// Scores `query` against `path`, or `None` when the query is not a
 /// subsequence of it. An empty query matches everything at zero.
 pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
-    // Whitespace in the query is the reader's own spacing, not part of
-    // what they are looking for: `nix poco` and `nixpoco` are one query.
+    // A term never carries whitespace by the time it is here — the query
+    // was split on it — but a caller with one word and a stray space is
+    // asking the same question, so it is dropped rather than failed.
     let query = query
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -255,16 +310,74 @@ pub(crate) fn rank(candidates: &[(String, i64)], query: &str) -> Vec<usize> {
     rank_names(&names, query)
 }
 
+/// What one word of the query is worth against one name, with the filing
+/// counted: a word that is exactly this name's label path is the reader
+/// naming the filing, and that is worth more than the letters.
+fn score_name(name: &FindName, term: &str) -> Option<i32> {
+    let score = score(&name.text, term)?;
+    let named_the_filing = name
+        .label_path
+        .as_deref()
+        .is_some_and(|path| path.eq_ignore_ascii_case(term));
+    Some(if named_the_filing {
+        score + BONUS_LABEL_PATH
+    } else {
+        score
+    })
+}
+
+/// What a whole query is worth against everything one thing is called.
+///
+/// Every word must land, but they need not land on the same name: the
+/// filing can answer one word and the title another, which is how a reader
+/// who remembers `rho/agent` and `foo` finds the thing that is both. Each
+/// word takes the best name it can find and the words are summed, so a
+/// thing that answers two words beats a thing that answers one twice.
+pub(crate) fn score_terms(names: &[FindName], query: &str) -> Option<i32> {
+    let mut total = 0;
+    let mut any = false;
+    for term in query.split_whitespace() {
+        any = true;
+        total += names
+            .iter()
+            .filter_map(|name| score_name(name, term))
+            .max()?;
+    }
+    // An empty query matches everything at zero, as one word of nothing did.
+    if !any {
+        return Some(0);
+    }
+    Some(total)
+}
+
 /// `rank` where a thing has more than one name: the best-scoring name is
-/// the thing's score, so a label path competes with the parent path rather
-/// than replacing it. Ties break on the first name, which is the path the
-/// row shows.
+/// the thing's score for each word of the query, so a label path competes
+/// with the parent path rather than replacing it. Ties break on the first
+/// name, which is the path the row shows.
 pub(crate) fn rank_names(candidates: &[(Vec<String>, i64)], query: &str) -> Vec<usize> {
+    let named = candidates
+        .iter()
+        .map(|(names, recency)| {
+            (
+                names
+                    .iter()
+                    .cloned()
+                    .map(FindName::plain)
+                    .collect::<Vec<_>>(),
+                *recency,
+            )
+        })
+        .collect::<Vec<_>>();
+    rank_find_names(&named, query)
+}
+
+/// The ranking itself, over names that know their filing.
+pub(crate) fn rank_find_names(candidates: &[(Vec<FindName>, i64)], query: &str) -> Vec<usize> {
     let mut scored = candidates
         .iter()
         .enumerate()
         .filter_map(|(index, (names, recency))| {
-            let best = names.iter().filter_map(|name| score(name, query)).max()?;
+            let best = score_terms(names, query)?;
             Some((index, best, *recency))
         })
         .collect::<Vec<_>>();
@@ -273,7 +386,13 @@ pub(crate) fn rank_names(candidates: &[(Vec<String>, i64)], query: &str) -> Vec<
             .1
             .cmp(&left.1)
             .then_with(|| right.2.cmp(&left.2))
-            .then_with(|| candidates[left.0].0.cmp(&candidates[right.0].0))
+            .then_with(|| {
+                candidates[left.0]
+                    .0
+                    .first()
+                    .map(|name| &name.text)
+                    .cmp(&candidates[right.0].0.first().map(|name| &name.text))
+            })
     });
     scored.into_iter().map(|(index, _, _)| index).collect()
 }
@@ -353,7 +472,7 @@ impl Workspace {
                     .labels
                     .iter()
                     .filter_map(|label| paths.get(label))
-                    .map(|path| format!("{path} › {title}"))
+                    .map(|path| LabelName::new(path, &title))
                     .collect();
             }
         }
@@ -545,7 +664,7 @@ impl Workspace {
 /// once rather than cloned out of the candidate on every character.
 pub(crate) struct FindSnapshot {
     candidates: Vec<FindCandidate>,
-    names: Vec<(Vec<String>, i64)>,
+    names: Vec<(Vec<FindName>, i64)>,
 }
 
 impl FindSnapshot {
@@ -560,20 +679,111 @@ impl FindSnapshot {
     /// The best matches for `query`, best first, in the order the prompt
     /// shows them.
     fn ranked(&self, query: &str) -> Vec<&FindCandidate> {
-        rank_names(&self.names, query)
+        self.order(query)
             .into_iter()
-            .take(FIND_LIMIT)
             .map(|index| &self.candidates[index])
             .collect()
     }
 
+    /// The order the prompt shows, as indices.
+    ///
+    /// A query that is a label path and nothing else is a different
+    /// question from a query of letters: the reader named a filing, so the
+    /// answer is what is filed there, and among things filed together an
+    /// agent is what they came for and the newest one first. The scorer
+    /// already puts that set on top; this says how the set itself reads.
+    fn order(&self, query: &str) -> Vec<usize> {
+        let mut order = rank_find_names(&self.names, query);
+        if let Some(path) = self.bare_label_path(query) {
+            let under = |index: &usize| self.filed_under(*index, &path);
+            let mut filed = order
+                .iter()
+                .copied()
+                .filter(|index| under(index))
+                .collect::<Vec<_>>();
+            filed.sort_by(|left, right| {
+                self.is_agent(*right)
+                    .cmp(&self.is_agent(*left))
+                    .then_with(|| {
+                        self.candidates[*right]
+                            .recency
+                            .cmp(&self.candidates[*left].recency)
+                    })
+                    .then_with(|| {
+                        self.candidates[*left]
+                            .path
+                            .cmp(&self.candidates[*right].path)
+                    })
+            });
+            let rest = order.into_iter().filter(|index| !under(index));
+            filed.extend(rest);
+            order = filed;
+        }
+        order.truncate(FIND_LIMIT);
+        order
+    }
+
+    /// The label path a query names entire, when it names one at all.
+    fn bare_label_path(&self, query: &str) -> Option<String> {
+        let mut terms = query.split_whitespace();
+        let term = terms.next()?;
+        if terms.next().is_some() {
+            return None;
+        }
+        self.candidates
+            .iter()
+            .flat_map(|candidate| candidate.labels.iter())
+            .find(|label| label.path.eq_ignore_ascii_case(term))
+            .map(|label| label.path.clone())
+    }
+
+    fn filed_under(&self, index: usize, path: &str) -> bool {
+        self.candidates[index]
+            .labels
+            .iter()
+            .any(|label| label.path.eq_ignore_ascii_case(path))
+    }
+
+    fn is_agent(&self, index: usize) -> bool {
+        matches!(self.candidates[index].target, FindTarget::Agent(_))
+    }
+
+    /// The label path a row matched on, when a label answered the query
+    /// better than the place the thing sits. The reader asked by filing,
+    /// so the row says which filing it came back for.
+    fn matched_label(&self, index: usize, query: &str) -> Option<String> {
+        let candidate = &self.candidates[index];
+        let here = score_terms(&[FindName::plain(candidate.path.clone())], query);
+        let mut best: Option<(i32, &LabelName)> = None;
+        for label in &candidate.labels {
+            let name = FindName {
+                text: label.name.clone(),
+                label_path: Some(label.path.clone()),
+            };
+            if let Some(score) = score_terms(&[name], query)
+                && best.as_ref().is_none_or(|(held, _)| score > *held)
+            {
+                best = Some((score, label));
+            }
+        }
+        let (score, label) = best?;
+        (here.is_none_or(|here| score > here)).then(|| label.path.clone())
+    }
+
     /// The rows the prompt draws for `query`.
     fn rows(&self, query: &str) -> Vec<Candidate> {
-        self.ranked(query)
+        self.order(query)
             .into_iter()
-            .map(|candidate| Candidate {
-                value: candidate.path.clone(),
-                description: candidate.kind.to_owned(),
+            .map(|index| {
+                let candidate = &self.candidates[index];
+                let description = match self.matched_label(index, query) {
+                    Some(path) => format!("{} · {path}", candidate.kind),
+                    None => candidate.kind.to_owned(),
+                };
+                Candidate {
+                    value: candidate.path.clone(),
+                    description,
+                }
             })
             .collect()
     }
@@ -585,7 +795,7 @@ impl FindSnapshot {
             .candidates
             .iter()
             .position(|candidate| candidate.path == path);
-        let index = exact.or_else(|| rank_names(&self.names, path).first().copied())?;
+        let index = exact.or_else(|| self.order(path).first().copied())?;
         Some(&self.candidates[index].target)
     }
 }
@@ -598,7 +808,7 @@ const FIND_LIMIT: usize = 50;
 #[cfg(test)]
 fn ranked_find_candidates(candidates: Vec<FindCandidate>, query: &str) -> Vec<FindCandidate> {
     let snapshot = FindSnapshot::of(candidates);
-    let order = rank_names(&snapshot.names, query);
+    let order = snapshot.order(query);
     let mut candidates = snapshot
         .candidates
         .into_iter()
@@ -626,6 +836,98 @@ mod tests {
             aka: Vec::new(),
             recency: 0,
         }
+    }
+
+    /// An agent filed under a label, named by the place it sits and by
+    /// the filing it carries.
+    fn filed_agent(path: &str, id: u64, label: &str, recency: i64) -> FindCandidate {
+        let title = path.rsplit(" › ").next().unwrap_or(path);
+        FindCandidate {
+            labels: vec![LabelName::new(label, title)],
+            recency,
+            ..agent_row(path, id)
+        }
+    }
+
+    /// The reader types what they remember: the filing, then the name. The
+    /// two are not one subsequence — there is no space in `rho/agent › foo`
+    /// for the space in `rho agent foo` to land on — so a query is its
+    /// words, each landing wherever it can among the thing's names.
+    #[test]
+    fn a_query_of_words_lands_them_on_whichever_name_answers() {
+        let candidates = vec![
+            filed_agent("rig › foo", 1, "rho/agent", 10),
+            filed_agent("rig › bar", 2, "rho/agent", 20),
+        ];
+        let rows = ranked_find_candidates(candidates, "rho agent foo");
+        let paths = rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            paths.first().copied(),
+            Some("rig › foo"),
+            "the filing answered two words and the name the third, got {paths:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "`foo` lands on nothing `bar` is called, so `bar` is not a match"
+        );
+    }
+
+    /// A label path typed alone is the reader naming a filing rather than
+    /// spelling letters. Everything filed there is the answer, agents
+    /// first and the newest agent before the older one, and a thing that
+    /// merely contains those letters is not in front of them.
+    #[test]
+    fn a_bare_label_path_lists_what_is_filed_under_it() {
+        let candidates = vec![
+            FindCandidate {
+                recency: 99,
+                ..agent_row("notes › rho/agenting", 3)
+            },
+            filed_agent("rig › older", 1, "rho/agent", 10),
+            filed_agent("rig › newer", 2, "rho/agent", 20),
+            FindCandidate {
+                kind: "topic",
+                labels: vec![LabelName::new("rho/agent", "the topic")],
+                target: FindTarget::Topic {
+                    host: HostId::default(),
+                    node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([7; 16])),
+                },
+                recency: 40,
+                ..agent_row("rig › the topic", 4)
+            },
+        ];
+        let rows = ranked_find_candidates(candidates, "rho/agent");
+        let paths = rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            &paths[..3],
+            &["rig › newer", "rig › older", "rig › the topic"],
+            "what is filed there comes first, agents by recency, got {paths:?}"
+        );
+        assert_eq!(
+            paths.get(3).copied(),
+            Some("notes › rho/agenting"),
+            "a thing that only spells the letters ranks below the filing"
+        );
+    }
+
+    /// The row says which filing it came back for, because the reader
+    /// asked by the filing and the path the row shows is somewhere else.
+    #[test]
+    fn a_row_found_by_its_label_shows_that_label() {
+        let snapshot = FindSnapshot::of(vec![filed_agent("rig › foo", 1, "rho/agent", 10)]);
+        let rows = snapshot.rows("rho agent foo");
+        assert_eq!(
+            rows.first().map(|row| row.description.as_str()),
+            Some("agent · rho/agent"),
+            "the label path the query matched on is not on the row, got {rows:?}"
+        );
+        let plain = snapshot.rows("foo");
+        assert_eq!(
+            plain.first().map(|row| row.description.as_str()),
+            Some("agent"),
+            "a query the place answered says nothing about a filing"
+        );
     }
 
     /// Two agents can be called the same thing, so the rows the prompt
