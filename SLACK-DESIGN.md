@@ -464,6 +464,37 @@ results shown are the last query's and never an older one arriving late. A
 query that fails says so on one line and leaves the results that were
 there.
 
+**The token has to be allowed to search.** The session holds what the
+register prompt was given and nothing else: the desktop client's own
+`xoxc` user token and the `d` cookie that authenticates it, the same pair
+every other call in this design already carries. `search.messages` is a
+user-token method behind `search:read`, which a desktop session normally
+has because the web client searches with it; when it does not, Slack
+answers `ok: false` with `missing_scope` or `not_allowed_token_type`, and
+the reader sees one line -- that this Slack session is not allowed to
+search, and that a fresh token and cookie will fix it. Nothing else
+changes: the search fails, no other call is affected, and the lamp is not
+lit, because the connection is fine and only this method was refused.
+Getting a session that may search is the user's act in their browser and
+their registration prompt; rho neither inspects, refreshes, nor repairs a
+credential, and this design adds no exception to that.
+
+**A results row is spans, like every other Slack surface.** The buffer is
+an editor over laid-out lines, so a hit is `Vec<Span>` through `lay_out`
+and `apply_highlights` exactly as a conversation row is. Two lines per
+hit: a header of the author's name (`Class::Sender`, or `Class::You` when
+it is the reader's own), two spaces, the conversation's name
+(`Class::Conversation`), two spaces, the day from `when_label`
+(`Class::Time`); then the matched message's own line, rendered by the
+same block walker the transcript uses, so a hit reads the way it will
+read when it opens. The words the query asked for are not styled here --
+the reader typed them and the row is a place, not a diff -- and the
+message the reader lands on when the hit opens takes a tint of its own,
+a sibling of `Class::Dealt` rather than `Dealt` itself, because "what I
+searched for" and "what rho is asking me to answer" are two different
+reasons for a message to be lit and a reader should not have to guess
+which one they are looking at.
+
 The query goes to Slack as the reader typed it. `from:@dana staging` works
 without rho knowing what `from:` means, because Slack parses its own
 modifiers -- the same reason blocks are rendered rather than reinterpreted.
