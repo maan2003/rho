@@ -761,13 +761,10 @@ impl Dashboard {
         // out — which is how a snoozed agent was dealt again on every cold
         // open, for as long as the first sync took. Nothing is dealt until
         // the desk has answered; when it does, the whole host is made again.
-        let Some(source) = self
+        let source = self
             .deal_hosts
             .get(&agent.host)
-            .filter(|source| source.desk_synced())
-        else {
-            return None;
-        };
+            .filter(|source| source.desk_synced())?;
         let node = source.agent_node(agent.agent_id);
         if node.is_some_and(|node| node_closed(node, facts.now)) {
             return None;

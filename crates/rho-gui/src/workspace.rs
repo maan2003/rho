@@ -71,18 +71,18 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 use rho_files::{FileView, RemoteProject};
 
 use crate::{
-    AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
-    DashboardDealExit, DashboardDealFile, DashboardDealMute, DashboardDealNext,
-    DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
-    DashboardDealTodo, DashboardDeleteRow, DashboardPasteRow, DashboardPasteRowBefore,
-    DashboardYankRow, DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
-    HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat,
-    SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackFindMessage,
-    SlackMarkReadBefore, SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict,
-    UploadGuiTelemetry, VerdictMenu, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone, DashboardDealExit,
+    DashboardDealFile, DashboardDealMute, DashboardDealNext, DashboardDealRefresh,
+    DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
+    DashboardDeleteRow, DashboardPasteRow, DashboardPasteRowBefore, DashboardYankRow,
+    DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny, HomeOpenRow,
+    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat, SearchRepeatReverse, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
+    SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackNextUnread,
+    SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -3881,50 +3881,6 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
         }
         agent
-    }
-
-    /// One verdict per agent of the row, written into the store like any
-    /// other verdict: the cursor lands on where the agent's story stands,
-    /// so what it said before the press is handled and what it says after
-    /// is not.
-    fn deal_agents(
-        &mut self,
-        targets: Vec<AgentId>,
-        command: &str,
-        verdict: crate::desk_view::DeskVerdict,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(&first) = targets.first() else {
-            let message = format!("{command}: no agent under the cursor");
-            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            return false;
-        };
-        let Some(host) = self.registry.host_of_agent(first) else {
-            return false;
-        };
-        // Name what the press covered. A verdict is otherwise the one action
-        // whose success looks exactly like a key that did nothing, which is
-        // how a row that will not settle stays a mystery.
-        let subject = match targets.as_slice() {
-            [agent_id] => self.registry.agent_display_label(*agent_id),
-            agents => format!("{} agents", agents.len()),
-        };
-        self.echo(&format!("{command}: {subject}"), StyleClass::SystemInfo, cx);
-        for agent_id in targets {
-            let id = rho_desk::cells::Id::Agent(agent_id);
-            let Some((writes, verdict_entry)) =
-                self.desk_cells.verdict_writes(host, &id, verdict.clone())
-            else {
-                continue;
-            };
-            self.apply_desk_writes(host, writes, Some(verdict_entry), window, cx);
-        }
-        let change = self.refresh_desk_sources(host, None, cx);
-        self.desk_cells.apply_source_change(host, change);
-        self.invalidate_dealer_signals(cx);
-        cx.notify();
-        true
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
