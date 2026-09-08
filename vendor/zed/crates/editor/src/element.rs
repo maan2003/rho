@@ -8387,7 +8387,7 @@ struct PrepaintPasses {
 impl PrepaintPasses {
     /// Marks a prepaint can hold. One more than it has passes, so a pass
     /// added without a slot added is a dropped mark and not a panic.
-    const MAX: usize = 12;
+    const MAX: usize = 15;
 
     /// The prepaint worth naming. The bound the user set is 4 ms on the whole
     /// draw, of which prepaint is one part beside paint and the present, so
@@ -9060,6 +9060,8 @@ impl Element for EditorElement {
                         }
                     }
 
+                    passes.mark("prepaint/selections");
+
                     let gutter = Gutter {
                         line_height,
                         range: start_row..end_row,
@@ -9161,6 +9163,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/shape_lines");
                     #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
                     self.editor.update(cx, |editor, _| {
                         editor.image_renderer_element_counts.clear();
@@ -9263,6 +9266,8 @@ impl Element for EditorElement {
                         cx,
                     )
                     .width;
+
+                    passes.mark("prepaint/longest_line");
 
                     let scrollbar_layout_information = ScrollbarLayoutInformation::new(
                         text_hitbox.bounds,
