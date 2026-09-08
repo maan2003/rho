@@ -2,8 +2,11 @@
 //!
 //! Surfaces render from here first and refresh behind it, so a restart shows
 //! the conversation before the socket is up and an offline workspace is
-//! fully readable. The file is the GUI's own (`~/.local/state/rho/slack.redb`,
-//! mode 0600); nothing else reads it.
+//! fully readable. These are tables in the client's own database
+//! (`~/.local/state/rho/rho-client.redb`, mode 0600), which the client
+//! opens once and hands in; nothing else reads them. A mirror in a file
+//! of its own is still what a test, an example or a tool reading a copy
+//! gets.
 //!
 //! The shape is matrix-rust-sdk's event cache, simplified for Slack. There, a
 //! room's history is a chain of chunks with explicit gaps between them. Slack
@@ -127,14 +130,30 @@ pub struct Mirror {
 }
 
 impl Mirror {
-    /// Opens the mirror, creating it if this is the first run. The file holds
-    /// the user's messages, so it is theirs alone to read.
+    /// A mirror in a file of its own, at `path`. For tests, examples and
+    /// the tools that read a copy; a rho client's own mirror is tables in
+    /// the client's one database and comes through [`Mirror::open_on`].
     pub fn open(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = RhoDb::open(path);
+        let mirror = Self::open_on(RhoDb::open(path))?;
+        // The file holds the user's messages, so it is theirs alone to
+        // read. The client's own database is made the same way where it
+        // is opened.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(mirror)
+    }
+
+    /// The mirror's tables in a database somebody else opened. The file
+    /// holds every other kind of client state too, under its own names;
+    /// this touches Slack's and nothing else.
+    pub fn open_on(db: RhoDb) -> anyhow::Result<Self> {
         // Tables are created up front so a read on a fresh mirror is a miss
         // rather than a panic.
         futures::executor::block_on(async {
@@ -148,11 +167,6 @@ impl Mirror {
             write.open_table(UNITS);
             write.commit();
         });
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
         Ok(Self { db })
     }
 

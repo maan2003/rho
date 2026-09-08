@@ -5,6 +5,7 @@
 //! answers. [`model`] turns connection events into the events a screen
 //! reacts to, on its own thread, feeding the mirror as it goes.
 
+pub mod client_db;
 pub mod desk;
 pub mod mirror;
 pub mod model;

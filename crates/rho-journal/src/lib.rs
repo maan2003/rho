@@ -9,17 +9,12 @@
 //! browser profile; the standalone dump command is correspondingly offline and
 //! must be run after the GUI exits.
 
-use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{OnceLock, mpsc};
 
 use redb::{TableDefinition, TableHandle as _};
 use rho_db::{RhoDb, SenAs, SenValue};
 use serde::{Deserialize, Serialize};
-
-pub const FILE_NAME: &str = "action-journal.redb";
-const LOCK_FILE_NAME: &str = "action-journal.lock";
 
 /// The name this table was written under, from before `Entry` moved out
 /// of `rho-gui` and into this crate. redb records the Rust path of a value
@@ -722,17 +717,21 @@ enum Message {
 
 pub struct Journal {
     db: RhoDb,
-    _lock: File,
     sender: mpsc::Sender<Message>,
-    path: PathBuf,
 }
 
 impl Journal {
+    /// Opens the client's database at `state_dir` and takes the journal's
+    /// tables in it. For tests and tools; the session's own database is
+    /// opened once by the model thread and handed to [`Journal::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
-        let lock = acquire_lock(state_dir)?;
-        let path = state_dir.join(FILE_NAME);
-        let db = RhoDb::open(&path);
+        Self::open_on(rho_db::client::open(state_dir)?)
+    }
+
+    /// The journal's tables in a database somebody else opened. The file
+    /// holds every other kind of client state too, under its own names;
+    /// this touches the journal's and nothing else.
+    pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
@@ -746,12 +745,7 @@ impl Journal {
         std::thread::Builder::new()
             .name("rho-action-journal".into())
             .spawn(move || writer(writer_db, sequence, receiver))?;
-        Ok(Self {
-            db,
-            _lock: lock,
-            sender,
-            path,
-        })
+        Ok(Self { db, sender })
     }
 
     pub fn record(&self, event: Event) {
@@ -762,10 +756,6 @@ impl Journal {
         if self.sender.send(Message::Entry(entry)).is_err() {
             tracing::error!("action journal writer stopped");
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn dump(&self, kind: Option<&str>, output: impl std::io::Write) -> anyhow::Result<()> {
@@ -787,26 +777,6 @@ impl Journal {
             )
         })
     }
-}
-
-fn acquire_lock(state_dir: &Path) -> std::io::Result<File> {
-    let path = state_dir.join(LOCK_FILE_NAME);
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        // The lock is the file's only purpose; nothing is ever written to
-        // it, so there is nothing to truncate.
-        .truncate(false)
-        .open(&path)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return Err(std::io::Error::new(
-            error.kind(),
-            "action journal is in use; exit the GUI before opening or dumping it",
-        ));
-    }
-    Ok(file)
 }
 
 fn next_sequence(db: &RhoDb) -> u64 {
@@ -849,8 +819,10 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
 
 static GLOBAL: OnceLock<Journal> = OnceLock::new();
 
-pub fn init(state_dir: &Path, dealer_policy: DealerPolicySnapshot) -> std::io::Result<()> {
-    let journal = Journal::open(state_dir)?;
+/// Takes the journal's tables in the client's database, which `main` has
+/// asked to be handed when the model thread opens it.
+pub fn init(db: RhoDb, dealer_policy: DealerPolicySnapshot) -> std::io::Result<()> {
+    let journal = Journal::open_on(db)?;
     GLOBAL.set(journal).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -889,12 +861,12 @@ pub fn dump(
     kind: Option<&str>,
     output: impl std::io::Write,
 ) -> anyhow::Result<()> {
-    let path = state_dir.join(FILE_NAME);
-    if !path.exists() {
+    if !rho_db::client::path(state_dir).exists() {
         return Ok(());
     }
-    let _lock = acquire_lock(state_dir)?;
-    let db = RhoDb::open(path);
+    // Exclusively: the journal is tables in the client's one database, and
+    // a GUI holding it is a GUI whose rows are still being written.
+    let db = rho_db::client::open(state_dir)?;
     dump_db(&db, kind, output)
 }
 
@@ -966,7 +938,7 @@ mod tests {
             TableDefinition::new("gui_action_journal_v3");
 
         let dir = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(dir.path().join(FILE_NAME));
+        let db = RhoDb::open(rho_db::client::path(dir.path()));
         futures::executor::block_on(async {
             let mut write = db.write().await;
             let entry = Entry {
@@ -1041,7 +1013,6 @@ mod tests {
         journal.record(Event::UserResumed);
         journal.flush().unwrap();
 
-        assert!(journal.path().exists());
         let mut output = Vec::new();
         journal.dump(None, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();

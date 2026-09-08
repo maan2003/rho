@@ -2849,8 +2849,15 @@ pub fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
 /// a library that resolves the user's state directory hands every test
 /// and every rig the user's live Slack data, which is what this used to
 /// do.
+/// The Slack mirror this session writes into: tables in the client's one
+/// database when a client opened one, and a file of its own otherwise —
+/// a test, an example, or a tool reading a copy.
 fn open_mirror(path: &std::path::Path) -> Option<Arc<Mirror>> {
-    match Mirror::open(path) {
+    let opened = match rho_db::client::shared() {
+        Some(db) => Mirror::open_on(db),
+        None => Mirror::open(path),
+    };
+    match opened {
         Ok(mirror) => Some(Arc::new(mirror)),
         Err(error) => {
             tracing::warn!(error = %error, "slack mirror unavailable");

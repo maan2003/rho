@@ -5,7 +5,8 @@
 //! test rendering against and the wrong thing to test a client against, because
 //! the client's problem is the flood — hundreds of conversations, thousands of
 //! messages, threads the user replied to from a phone. That state exists
-//! already, in the user's `slack.redb`, and a snapshot carries it.
+//! already, in the Slack tables of the user's `rho-client.redb`, and a
+//! snapshot carries it.
 //!
 //! So this reads a mirror and hands the fake what it holds: the roster, the
 //! conversations with their kinds, the history of each, the threads under it,

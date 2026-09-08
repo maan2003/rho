@@ -53,21 +53,14 @@ fn home() -> Result<PathBuf> {
 pub const SNAPSHOT_CONTENTS: &[&str] = &[
     // The store: the DAG of cells across hosts, and the biggest thing here.
     "rho.redb",
-    // The GUI's own files.
-    "agent-mirror.redb",
-    // The client's copy of the desk cells. A client opens holding it, so a
-    // rig that starts without it is a colder open than the user's own.
-    "desk-mirror.redb",
-    "action-journal.redb",
-    "inbox.redb",
+    // Which device this is.
     "desk-device",
-    // The Slack mirror, as a fallback only: it is the client's file, written
-    // by `rho-slack`'s session into whichever device ran the GUI, and the
-    // copy beside a daemon is whatever that box happens to hold — here, QA's
-    // own `acme` fixture. A snapshot taken with `--gui-state` overwrites this
-    // with the real one; see [`GUI_SNAPSHOT_CONTENTS`].
-    "slack.redb",
-    // The client's own store.
+    // The client's one database: the agent mirror, the desk replica, the
+    // Slack mirror and its cursors, the action journal and the inbox, each
+    // under its own tables. Beside a daemon it is a fallback only — it is
+    // whatever the box that ran a GUI happens to hold, here QA's own `acme`
+    // fixture — and a snapshot taken with `--gui-state` overwrites it with
+    // the real one; see [`GUI_SNAPSHOT_CONTENTS`].
     "rho-client.redb",
 ];
 
@@ -89,24 +82,18 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
 ///   directory. A client never has it.
 /// - `gui-telemetry`, `qlog`, `debug`: what a run wrote, not what it needs.
 pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
-    // What the screens read: the agent mirror, the desk the client already
-    // holds, and the inbox behind Home.
-    "agent-mirror.redb",
-    "desk-mirror.redb",
-    "inbox.redb",
-    // What a verdict wrote, so undo means something after a restart.
-    "action-journal.redb",
     // Which device this is. The desk device says yes; it names a device,
     // not a person, and a rig that lies about it deals the wrong hand.
     "desk-device",
-    // The client's own store.
+    // The client's one database, and with it everything the screens read:
+    // the agent mirror and the inbox behind Home, the desk the client
+    // already holds, what a verdict wrote so undo means something after a
+    // restart, and the Slack flood as the user's own device has it.
+    // `rho-slack`'s session writes every arriving message into it and the
+    // daemon never touches it, so this copy is the real one and the
+    // daemon-side copy is the fixture. The overlay in `rig new` is what
+    // makes this one win.
     "rho-client.redb",
-    // The Slack mirror: the client's file and the flood as the user's own
-    // device has it. `rho-slack`'s session writes every arriving message
-    // into it under the client's state directory and the daemon never
-    // touches it, so this copy is the real one and the daemon-side copy is
-    // the fixture. The overlay in `rig new` is what makes this one win.
-    "slack.redb",
 ];
 
 #[cfg(test)]
@@ -139,9 +126,9 @@ mod tests {
 
     /// The store is the daemon's and a client never has it; copying one from
     /// a client would make a rig disagree with itself about which device it
-    /// is. The Slack mirror is the other way round — it is the client's, and
-    /// it is on both lists on purpose, the daemon-side copy being the
-    /// fallback for a snapshot taken without `--gui-state`.
+    /// is. The client's own database is the other way round — it is the
+    /// client's, and it is on both lists on purpose, the daemon-side copy
+    /// being the fallback for a snapshot taken without `--gui-state`.
     #[test]
     fn the_gui_half_holds_no_daemon_store() {
         for entry in GUI_SNAPSHOT_CONTENTS {
@@ -151,8 +138,8 @@ mod tests {
             );
         }
         assert!(
-            GUI_SNAPSHOT_CONTENTS.contains(&"slack.redb"),
-            "the Slack mirror is the client's; the GUI half is where the real one is"
+            GUI_SNAPSHOT_CONTENTS.contains(&"rho-client.redb"),
+            "the client's database is the client's; the GUI half is where the real one is"
         );
     }
 }

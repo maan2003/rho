@@ -47,6 +47,11 @@ pub struct Paths {
 impl Paths {
     /// The layout under a client's state directory. Which directory that
     /// is stays the caller's to resolve.
+    ///
+    /// `mirror` is the fallback path only. A rho client's Slack tables are
+    /// in the one database it opens for all of its state; this names where
+    /// a mirror lives for something that has no such database — a test, an
+    /// example, a tool reading a copy.
     pub fn under(state_dir: &Path) -> Self {
         Self {
             mirror: state_dir.join("slack.redb"),

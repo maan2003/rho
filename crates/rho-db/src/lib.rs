@@ -18,6 +18,8 @@ use redb::{
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub mod client;
+
 const CACHE_SIZE: usize = 10 * 1024 * 1024;
 
 /// redb key/value wrapper using senax encoding.
@@ -79,6 +81,11 @@ pub struct RhoDb {
     /// deep inside a transaction publish what they wrote through it, so no
     /// call site has to carry a channel down to the table.
     observer: Arc<OnceLock<Box<dyn Any + Send + Sync>>>,
+    /// An exclusive lock on the file, for a database that was opened
+    /// through one. Held here so it lives exactly as long as the handle
+    /// does: the lock's whole purpose is to say the file is in use, and a
+    /// lock dropped at the end of the call that took it says nothing.
+    _lock: Option<Arc<std::fs::File>>,
 }
 
 /// Read transaction wrapper. Methods panic on local database errors.
@@ -319,7 +326,14 @@ impl RhoDb {
             database: Arc::new(database),
             write_lock: Arc::new(Mutex::new(())),
             observer: Arc::new(OnceLock::new()),
+            _lock: None,
         }
+    }
+
+    /// The same database, holding `lock` for as long as it lives.
+    fn holding(mut self, lock: std::fs::File) -> Self {
+        self._lock = Some(Arc::new(lock));
+        self
     }
 
     /// Print what the file at `path` holds: bytes stored per table, and the

@@ -23,7 +23,7 @@
 //! Like the agent mirror it is a copy, never a source. Anything doubted is
 //! dropped and asked for again from the start.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 
 use redb::TableDefinition;
@@ -31,8 +31,6 @@ use rho_db::{RhoDb, Sen, SenValue};
 use rho_ui_proto::desk_tree::cells::{
     BodySnapshot, Cell, DeviceId, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
 };
-
-pub const FILE_NAME: &str = "desk-mirror.redb";
 
 /// How far this client has read a host's store, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
@@ -134,9 +132,15 @@ pub struct DeskMirror {
 }
 
 impl DeskMirror {
+    /// Opens the client's database at `state_dir` and takes the replica's
+    /// tables in it. For tests; the session's own database is opened once
+    /// by the model thread and handed to [`DeskMirror::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
-        let db = RhoDb::open(path(state_dir));
+        Self::open_on(rho_db::client::open(state_dir)?)
+    }
+
+    /// The replica's tables in a database somebody else opened.
+    pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
@@ -259,10 +263,6 @@ impl Drop for DeskMirror {
             let _ = writer.join();
         }
     }
-}
-
-pub fn path(state_dir: &Path) -> PathBuf {
-    state_dir.join(FILE_NAME)
 }
 
 fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
@@ -400,11 +400,11 @@ fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {
 /// Opens the replica in the state directory `main` named, if it named one.
 /// Called from the model thread, like the agent mirror's, so that no frame
 /// waits on the file being opened.
-pub fn open_stated() {
-    let Some(state_dir) = crate::mirror::state_dir() else {
+pub fn open_stated(db: Option<RhoDb>) {
+    let Some(db) = db else {
         return;
     };
-    if let Err(error) = init(state_dir) {
+    if let Err(error) = init(db) {
         tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
     }
 }
@@ -413,8 +413,8 @@ pub fn open_stated() {
 /// no-op and the GUI starts with no desk until the daemon answers, which
 /// is exactly what it did before this existed — and what a test wants,
 /// since a test names no state directory.
-pub fn init(state_dir: &Path) -> std::io::Result<()> {
-    let mirror = DeskMirror::open(state_dir)?;
+pub fn init(db: RhoDb) -> std::io::Result<()> {
+    let mirror = DeskMirror::open_on(db)?;
     let mut global = GLOBAL
         .get_or_init(|| std::sync::RwLock::new(None))
         .write()

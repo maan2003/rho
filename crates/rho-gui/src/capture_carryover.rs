@@ -11,7 +11,6 @@
 //! build once), so it is written to delete cleanly: drop this file, its
 //! `mod` line, its call in `handle_event`, and the journal event.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Context, Window};
@@ -170,10 +169,6 @@ impl redb::Key for StoredKey {
 
 const STORED: TableDefinition<StoredKey, StoredBytes> = TableDefinition::new(ITEMS);
 
-fn store_path() -> Option<PathBuf> {
-    Some(dirs::state_dir()?.join("rho/inbox.redb"))
-}
-
 /// The text of every capture, oldest first, and how many rows could not be
 /// read at all.
 fn captures(db: &RhoDb) -> (Vec<String>, u32) {
@@ -235,10 +230,12 @@ impl Workspace {
         if ATTEMPTED.swap(true, Ordering::Relaxed) {
             return;
         }
-        let Some(path) = store_path().filter(|path| path.exists()) else {
+        // The inbox is tables in the client's one database, opened by the
+        // model thread. No client database is a session with no inbox,
+        // which is what a test is.
+        let Some(db) = rho_db::client::shared() else {
             return;
         };
-        let db = RhoDb::open(path);
         if already_carried(&db) {
             return;
         }

@@ -844,7 +844,7 @@ fn start_fake_model(root: &Path, bin: &Build) -> Result<FakeModel> {
 fn start_fake_slack(root: &Path, bin: &Build) -> Result<FakeSlack> {
     let path = root.join("logs").join("fake-slack.log");
     let log = fs::File::create(&path)?;
-    let mirror = root.join("state").join("rho").join("slack.redb");
+    let mirror = root.join("state").join("rho").join("rho-client.redb");
     let fixture = !mirror.exists();
     let mut process = if !fixture {
         let mut loader = command(std::env::current_exe()?, root);

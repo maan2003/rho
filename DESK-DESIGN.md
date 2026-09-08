@@ -219,9 +219,12 @@ asks for the rest; the desk keeps a `StoredHost` per host with the
 One is a scalar and one is a map per device, and that is the only
 difference that matters.
 
-**The file.** `desk-mirror.redb`, beside `agent-mirror.redb` in the client
-state directory that `main` resolves — a library never reaches for it, the
-rule that already governs `desk_device()` and the agent mirror. Tables: the
+**The file.** The client's own database, `rho-client.redb` in the state
+directory that `main` resolves — a library never reaches for it, the rule
+that already governs `desk_device()` and the agent mirror. The replica is
+tables in it, beside the agent mirror's, the Slack mirror's, the journal's
+and the inbox's; one file, opened once, each crate keeping its own names
+and its own types. Tables: the
 cells by id, the verdict events by `(id, stamp)`, the note bodies by id,
 and one `StoredHost` per host holding the version and the store's identity.
 The device id stays where it is, in `desk-device`; it is already persistent,

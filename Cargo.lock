@@ -13880,6 +13880,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "libc",
  "redb",
  "senax-encoder",
  "tempfile",
@@ -14129,7 +14130,6 @@ dependencies = [
  "bytes",
  "chrono",
  "futures 0.3.33",
- "libc",
  "redb",
  "rho-db",
  "rho-desk",

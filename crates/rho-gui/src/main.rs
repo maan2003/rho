@@ -301,11 +301,24 @@ fn run() -> Result<()> {
         None => rho_ui_proto::RuntimePaths::new(None::<PathBuf>)?,
     }
     .browser_socket();
-    rho_journal::init(&client_state_dir, rho_gui::dealer_policy_snapshot())
-        .context("initialize client action journal")?;
-    // The mirror is a cache: a session that cannot open it starts empty and
-    // asks the daemon for everything, which is the old behaviour. Only the
-    // path is settled here; the model thread opens it.
+    // The client keeps one database, the way the daemon does, and `main`
+    // only names where it lives: the model thread opens it, because after
+    // an unclean stop redb rebuilds its allocator from every page and no
+    // frame may wait on that. Everything that would otherwise open a file
+    // of its own is handed this one when it opens. A session that cannot
+    // open it keeps nothing and asks the daemon for everything, which is
+    // the behaviour every one of these caches has always promised.
+    // Taken here, on the main thread, because it is a `flock` on an empty
+    // file and because a second rho must stop rather than run on with none
+    // of its own state. The database itself is opened later and elsewhere.
+    rho_db::client::lock(&client_state_dir)
+        .context("take the client database; exit the other rho first")?;
+    let dealer_policy = rho_gui::dealer_policy_snapshot();
+    rho_db::client::on_open(move |db| {
+        if let Err(error) = rho_journal::init(db.clone(), dealer_policy) {
+            tracing::warn!(%error, "the action journal is unavailable; this session records nothing");
+        }
+    });
     rho_mirror::mirror::set_state_dir(client_state_dir.clone());
     rho_gui::telemetry::enable();
     if profiler.is_none()

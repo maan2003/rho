@@ -2,8 +2,8 @@
 //! own thread.
 //!
 //! The main thread draws. Everything between a daemon's frames and what is
-//! drawn happens here: rows are folded into agents, written to
-//! `agent-mirror.redb`, and announced to the main thread as changes. A
+//! drawn happens here: rows are folded into agents, written to the agent
+//! mirror's tables, and announced to the main thread as changes. A
 //! reconnect's catch-up is thousands of pages, and the main thread hears
 //! one message for the whole of it.
 //!
@@ -418,15 +418,17 @@ async fn run(
     mut incoming: futures_mpsc::UnboundedReceiver<ToModel>,
     changes: futures_mpsc::UnboundedSender<ModelEvent>,
 ) {
-    // The mirror opens here, not in `main`: after an unclean stop redb
-    // rebuilds its allocator from every page, and on the rig's 539 MB
-    // mirror that was 17.1s of a blocked main thread before the window
-    // existed. Until it is open the GUI is simply a session with no copy,
-    // which is what the mirror has always promised to be.
-    crate::mirror::open_stated();
-    // The desk's copy opens beside the agents', on the same thread and for
-    // the same reason: it is a file, and no frame waits on a file.
-    crate::desk::open_stated();
+    // The client's database opens here, not in `main`: after an unclean
+    // stop redb rebuilds its allocator from every page, and on the rig's
+    // 539 MB mirror that was 17.1s of a blocked main thread before the
+    // window existed. Until it is open the GUI is simply a session with
+    // no caches, which is what they have always promised to be. Opening
+    // it also hands it to everything that asked `main` to be told.
+    let db = crate::client_db::open_stated();
+    crate::mirror::open_stated(db.clone());
+    // The desk's copy is tables in the same file, taken on the same
+    // thread and for the same reason: no frame waits on a file.
+    crate::desk::open_stated(db);
     let mut model = Model::new();
     while let Some(item) = incoming.next().await {
         let out = match item {

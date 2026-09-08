@@ -25,8 +25,6 @@ use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 
-pub const FILE_NAME: &str = "agent-mirror.redb";
-
 /// Where this client stands in a host's journal, by the host's name. The
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
@@ -197,9 +195,17 @@ pub struct Mirror {
 }
 
 impl Mirror {
+    /// Opens the client's database at `state_dir` and takes the mirror's
+    /// tables in it. For tests and tools; the session's own database is
+    /// opened once by the model thread and handed to [`Mirror::open_on`].
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
-        let db = RhoDb::open(path(state_dir));
+        Self::open_on(rho_db::client::open(state_dir)?)
+    }
+
+    /// The mirror's tables in a database somebody else opened. Every other
+    /// kind of client state is in there too, under its own names; this
+    /// touches the agent mirror's and nothing else.
+    pub fn open_on(db: RhoDb) -> std::io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
@@ -371,10 +377,6 @@ impl Drop for Mirror {
     }
 }
 
-pub fn path(state_dir: &Path) -> PathBuf {
-    state_dir.join(FILE_NAME)
-}
-
 fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -515,13 +517,14 @@ pub fn state_dir() -> Option<&'static Path> {
     STATE_DIR.get().map(PathBuf::as_path)
 }
 
-/// Opens the mirror named by `set_state_dir`, if one was. Called from the
-/// model thread as its first act.
-pub fn open_stated() {
-    let Some(state_dir) = STATE_DIR.get() else {
+/// Takes the mirror's tables in the client's database, if this process
+/// opened one. Called from the model thread as its first act, after the
+/// database itself is open.
+pub fn open_stated(db: Option<RhoDb>) {
+    let Some(db) = db else {
         return;
     };
-    if let Err(error) = init(state_dir) {
+    if let Err(error) = init(db) {
         tracing::warn!(%error, "the agent mirror is unavailable; this session starts from the daemon");
     }
 }
@@ -534,8 +537,8 @@ pub fn open_stated() {
 /// every page, which on the rig's 539 MB mirror was 17.1s in a debug
 /// build. Nothing on the main thread waits for it; a reader that arrives
 /// first reads an empty mirror and asks the daemon instead.
-pub fn init(state_dir: &Path) -> std::io::Result<()> {
-    let mirror = Mirror::open(state_dir)?;
+pub fn init(db: RhoDb) -> std::io::Result<()> {
+    let mirror = Mirror::open_on(db)?;
     let mut global = GLOBAL
         .get_or_init(|| std::sync::RwLock::new(None))
         .write()
@@ -796,7 +799,7 @@ mod tests {
         > = TableDefinition::new("gui_agent_digest_v1");
 
         let dir = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(path(dir.path()));
+        let db = RhoDb::open(rho_db::client::path(dir.path()));
         let verdict = Verdict {
             handled_through: AgentPos(7),
             muted: true,
