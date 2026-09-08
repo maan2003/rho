@@ -692,8 +692,27 @@ impl InlayMap {
             let mut inlay_edits = Vec::with_capacity(buffer_edits.len());
             let mut walked_items = 0_u64;
             for buffer_edit in &buffer_edits {
-                let old_start = self.snapshot.to_inlay_offset(buffer_edit.old.start);
-                let old_end = self.snapshot.to_inlay_offset(buffer_edit.old.end);
+                let (old_start, old_end) =
+                    if buffer_edit.old.is_empty() && !buffer_edit.new.is_empty() {
+                        let span = self
+                            .snapshot
+                            .output_span_for_buffer_offset(buffer_edit.old.start);
+                        (span.start, span.end)
+                    } else if !buffer_edit.old.is_empty() && buffer_edit.new.is_empty() {
+                        (
+                            self.snapshot
+                                .output_span_for_buffer_offset(buffer_edit.old.start)
+                                .start,
+                            self.snapshot
+                                .output_span_for_buffer_offset(buffer_edit.old.end)
+                                .end,
+                        )
+                    } else {
+                        (
+                            self.snapshot.to_inlay_offset(buffer_edit.old.start),
+                            self.snapshot.to_inlay_offset(buffer_edit.old.end),
+                        )
+                    };
                 inlay_edits.push(Edit {
                     old: old_start..old_end,
                     new: InlayOffset::default()..InlayOffset::default(),
@@ -801,8 +820,33 @@ impl InlayMap {
             self.snapshot.version += 1;
 
             for (inlay_edit, buffer_edit) in inlay_edits.iter_mut().zip(&buffer_edits) {
-                inlay_edit.new = self.snapshot.to_inlay_offset(buffer_edit.new.start)
-                    ..self.snapshot.to_inlay_offset(buffer_edit.new.end);
+                let (new_start, new_end) = if buffer_changed
+                    && buffer_edit.old.is_empty()
+                    && !buffer_edit.new.is_empty()
+                {
+                    (
+                        self.snapshot
+                            .output_span_for_buffer_offset(buffer_edit.new.start)
+                            .start,
+                        self.snapshot
+                            .output_span_for_buffer_offset(buffer_edit.new.end)
+                            .end,
+                    )
+                } else if buffer_changed
+                    && !buffer_edit.old.is_empty()
+                    && buffer_edit.new.is_empty()
+                {
+                    let span = self
+                        .snapshot
+                        .output_span_for_buffer_offset(buffer_edit.new.start);
+                    (span.start, span.end)
+                } else {
+                    (
+                        self.snapshot.to_inlay_offset(buffer_edit.new.start),
+                        self.snapshot.to_inlay_offset(buffer_edit.new.end),
+                    )
+                };
+                inlay_edit.new = new_start..new_end;
             }
             for (old, old_offset) in invalidated_inlays {
                 if let Some((edit, _)) =
