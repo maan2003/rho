@@ -2175,33 +2175,57 @@ impl Session {
     /// Rewrites a message the reader already sent. What appears is Slack's
     /// own `message_changed` coming back down the socket, so the screen
     /// shows the edit that landed rather than the one that was asked for.
-    pub fn edit_message(&mut self, source: &Source, ts: Ts, text: String, cx: &mut Context<Self>) {
+    /// Posts a rewrite of a message already sent. The answer says whether it
+    /// went, the same as `send`, so the surface can put a refused rewrite
+    /// back in the reader's hands rather than drop it.
+    pub fn edit_message(
+        &mut self,
+        source: &Source,
+        ts: Ts,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
         let Some(client) = self.client.clone() else {
-            return;
+            cx.emit(SessionEvent::Notice(
+                "slack: not connected, the rewrite was not sent".to_owned(),
+            ));
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
         };
+        // An empty rewrite is not a delete, and Slack would refuse it. The
+        // surface never sends one; saying no here is what makes that true
+        // of every caller rather than of the one.
         if text.trim().is_empty() {
-            return;
+            return Task::ready(Err(anyhow::anyhow!("an empty rewrite is not a delete")));
         }
         let channel = source.channel().clone();
         let source = source.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client.update_message(&channel, &ts, &text).await
         });
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let sent = match task.await {
                 Ok(sent) => sent,
                 Err(error) => Err(anyhow::anyhow!("{error}")),
             };
-            let _ = this.update(cx, |session, cx| {
-                if let Err(error) = sent {
-                    tracing::warn!(error = %error, "slack edit failed");
-                    if let Some(loaded) = session.loaded.get_mut(&source) {
-                        loaded.error = Some(format!("{error:#}"));
-                    }
+            let error = match sent {
+                Ok(()) => {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                    return Ok(());
                 }
+                Err(error) => format!("{error:#}"),
+            };
+            tracing::warn!(error = %error, "slack edit failed");
+            let _ = this.update(cx, |session, cx| {
+                if let Some(loaded) = session.loaded.get_mut(&source) {
+                    loaded.error = Some(error.clone());
+                }
+                // Said once, where the user reads what rho has to tell them,
+                // the same as a send that did not happen.
+                cx.emit(SessionEvent::Notice(format!("slack: {error}")));
                 cx.notify();
             });
-        }));
+            Err(anyhow::anyhow!("{error}"))
+        })
     }
 
     /// The message Slack accepted, shown at once. Slack echoes it back over

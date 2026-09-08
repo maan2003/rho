@@ -496,11 +496,17 @@ impl ConversationView {
             // make the edit, the same as cancelling: the rewrite is done
             // with, and the half-written message is not.
             let held = self.held_compose.take().unwrap_or_default();
-            self.set_compose(held, cx);
+            self.set_compose(held.clone(), cx);
             self.retint(&ts, cx);
-            self.session.update(cx, |session, cx| {
-                session.edit_message(&source, ts, text, cx)
+            let editing = self.session.update(cx, |session, cx| {
+                session.edit_message(&source, ts.clone(), text.clone(), cx)
             });
+            cx.spawn(async move |this, cx| {
+                if editing.await.is_err() {
+                    let _ = this.update(cx, |this, cx| this.restore_edit(ts, text, held, cx));
+                }
+            })
+            .detach();
             return;
         }
         self.set_compose(String::new(), cx);
@@ -523,6 +529,28 @@ impl ConversationView {
         let held = self.input.read(cx).text();
         self.set_compose(restored_compose(text, &held), cx);
         cx.notify();
+    }
+
+    /// Puts a refused rewrite back the way the reader left it: the message
+    /// is being edited again, their words are in the composer, and what they
+    /// had set aside to make the edit is set aside again. A rewrite is text
+    /// that was typed, and text that was typed is never dropped on the floor.
+    ///
+    /// Unless the reader has moved on. If they have started another edit, or
+    /// touched the composer since, that is what they are looking at and it
+    /// wins; the refused words go under it, the same as a refused send.
+    fn restore_edit(&mut self, ts: Ts, text: String, held: String, cx: &mut Context<Self>) {
+        let composer = self.input.read(cx).text();
+        match refused_rewrite(self.editing_message.is_some(), &composer, &held) {
+            Refused::UnderTheComposer => self.restore_compose(text, cx),
+            Refused::BackIntoTheEdit => {
+                self.held_compose = Some(held);
+                self.editing_message = Some(ts.clone());
+                self.set_compose(text, cx);
+                self.retint(&ts, cx);
+                cx.notify();
+            }
+        }
     }
 
     /// The message the cursor is on, if the transcript has one there.
@@ -2007,6 +2035,28 @@ fn restored_compose(refused: String, held: &str) -> String {
     }
 }
 
+/// Where a refused rewrite goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// The edit is reopened on the message and the rewrite is the composer
+    /// again: nothing of the reader's has moved since, so the surface can
+    /// put them back exactly where they pressed enter.
+    BackIntoTheEdit,
+    /// The reader has started something else. It wins, and the refused words
+    /// go under it, the same as a refused send.
+    UnderTheComposer,
+}
+
+/// Whether the surface may reopen the edit, given whether another one is
+/// already open and whether the composer still holds exactly what closing
+/// the edit put there.
+fn refused_rewrite(editing: bool, composer: &str, held: &str) -> Refused {
+    match editing || composer != held {
+        true => Refused::UnderTheComposer,
+        false => Refused::BackIntoTheEdit,
+    }
+}
+
 /// A message still on its way out: the whole line goes muted, so the reader
 /// can tell what has landed from what has not without a marker to decode.
 fn mark_pending(item: &mut Rendered) {
@@ -3328,6 +3378,31 @@ mod tests {
             restored_compose("refused".into(), "typed since"),
             "refused\ntyped since",
             "neither the refused message nor the new one is dropped"
+        );
+    }
+
+    #[test]
+    fn a_refused_rewrite_goes_back_into_the_edit_it_came_from() {
+        assert_eq!(
+            refused_rewrite(false, "half a sentence", "half a sentence"),
+            Refused::BackIntoTheEdit,
+            "the composer still holds what closing the edit put there, so \
+             nothing of the reader's is at risk in reopening it"
+        );
+        assert_eq!(
+            refused_rewrite(false, "", ""),
+            Refused::BackIntoTheEdit,
+            "an edit made from an empty composer is the ordinary case"
+        );
+        assert_eq!(
+            refused_rewrite(false, "typed since", ""),
+            Refused::UnderTheComposer,
+            "the reader has written something since; it is not overwritten"
+        );
+        assert_eq!(
+            refused_rewrite(true, "another rewrite", "another rewrite"),
+            Refused::UnderTheComposer,
+            "a second edit is already open and it is what the reader sees"
         );
     }
 
