@@ -858,8 +858,13 @@ fn apply(
     Ok(())
 }
 
+/// What a model streams: prose with markup in it. The backticks and the
+/// emphasis are the point. Their delimiters are concealed, so every chunk
+/// that lands mid-markup changes the concealed set and reflows the rows
+/// around it, and a walk over plain words never puts the pipeline through
+/// that.
 fn generated_text(bytes: usize) -> String {
-    const TEXT: &str = "generated result: compiled 12 targets in 0.42s\nnext line has ordinary prose and wrapped words\n";
+    const TEXT: &str = "generated result: `compiled 12 targets` in 0.42s\nnext line has **ordinary** prose and wrapped words\n";
     TEXT.chars().cycle().take(bytes).collect()
 }
 
