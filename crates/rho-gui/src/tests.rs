@@ -31,6 +31,7 @@ mod fold_widening_check;
 mod history;
 mod inlay_cost;
 mod minibuffer;
+mod rebuild_bound;
 mod record_anchors;
 mod running_turn_elapsed;
 mod scene_walk;

@@ -587,15 +587,21 @@ impl TranscriptModel {
             .collect::<Vec<_>>();
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
+        let mut rows = 0;
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
             let block_index = start_block + offset;
             let markdown = rendered.markdown;
-            let starts_chunk = chunks
-                .last()
-                .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown);
-            if starts_chunk {
+            let block_rows = rendered_rows(&rendered);
+            if starts_chunk(
+                chunks.last().map(|(_, markdown, _)| *markdown),
+                markdown,
+                rows,
+                block_rows,
+            ) {
                 chunks.push((block_index, markdown, Vec::new()));
+                rows = 0;
             }
+            rows += block_rows;
             chunks.last_mut().unwrap().2.push(rendered);
         }
 
@@ -1536,6 +1542,19 @@ impl TranscriptModel {
 /// draw without composing anything more.
 pub const OPENING_ROWS: usize = 200;
 
+/// The most rows a chunk carries, and so the most a buffer holds.
+///
+/// A buffer is replaced whole — `rebuild_start` pulls a change back to the
+/// start of the buffer that holds it — so without a cap a block arriving at
+/// the end of a long run of one kind rewrites the whole run: forty finished
+/// calls and one more makes forty-one records, for one block. The cap makes
+/// that rebuild cost the cap instead of the document, and a cap under a
+/// window means the worst one is still smaller than a screen.
+///
+/// A block is never split, so a single block longer than this is its own
+/// chunk and the cap is a floor rather than a ceiling for it.
+const MAX_CHUNK_ROWS: usize = 32;
+
 /// A window's rows, which is what the opening tail is two of by the line
 /// above. What the open parses, since at open there is no laid-out editor
 /// to say which rows those are.
@@ -1633,18 +1652,24 @@ fn render_chunks(
         .rposition(|visible| *visible)
         .map(|index| block_kind(&blocks[index]));
     let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
+    let mut rows = 0;
     for index in range {
         let rendered = render_block_with_agent_labels(&blocks[index], prev, now_ms, label);
         if rendered.visible() {
             prev = Some(rendered.kind);
         }
         let markdown = rendered.markdown;
-        if chunks
-            .last()
-            .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
-        {
+        let block_rows = rendered_rows(&rendered);
+        if starts_chunk(
+            chunks.last().map(|(_, markdown, _)| *markdown),
+            markdown,
+            rows,
+            block_rows,
+        ) {
             chunks.push((index, markdown, Vec::new()));
+            rows = 0;
         }
+        rows += block_rows;
         chunks.last_mut().unwrap().2.push(rendered);
     }
     chunks
@@ -1667,6 +1692,26 @@ fn render_chunks(
 /// and the byte span each block takes in that text. Both come out of the
 /// same pass, so nothing downstream has to re-measure a rendered string to
 /// find out where a block sits.
+/// The rows a rendered block takes, counted the way the buffer will hold
+/// them: one per newline in its own text.
+fn rendered_rows(rendered: &RenderedBlock) -> usize {
+    rendered
+        .spans
+        .iter()
+        .map(|span| span.text.matches('\n').count())
+        .sum()
+}
+
+/// Whether a block starts a new chunk: a different language, or a chunk
+/// already at the cap. `rows` is the rows the open chunk holds and is reset
+/// by the caller when a chunk starts.
+fn starts_chunk(current: Option<bool>, markdown: bool, rows: usize, block_rows: usize) -> bool {
+    match current {
+        None => true,
+        Some(current) => current != markdown || (rows > 0 && rows + block_rows > MAX_CHUNK_ROWS),
+    }
+}
+
 fn chunk_text_and_spans(rendered: &[RenderedBlock]) -> (String, Vec<Range<usize>>) {
     let mut text = String::new();
     let mut spans = Vec::with_capacity(rendered.len());
