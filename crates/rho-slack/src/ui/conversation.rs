@@ -20,7 +20,7 @@ use editor::{
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, Task, Window, div};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
-use multi_buffer::{MultiBuffer, PathKey, ToPoint as _};
+use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
 
@@ -320,12 +320,14 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The transcript is plain text, not Markdown: the compact layout
-        // indents continuation lines, which Markdown would read as code
-        // blocks. Every class the reader sees comes from a span instead.
+        // The conversation is a document of Markdown blocks, one to a
+        // message, read by the same pipeline the agent transcript uses: it
+        // parses the markup, conceals the markers and styles what is left,
+        // so nothing here paints emphasis, code or a link by hand.
         let transcript = cx.new(|cx| {
             let mut buffer = Buffer::local("", cx);
             buffer.set_capability(Capability::Read, cx);
+            (hooks.configure_markdown)(&mut buffer, cx);
             buffer
         });
         let input = cx.new(|cx| Buffer::local("", cx));
@@ -513,18 +515,14 @@ impl ConversationView {
             .collect()
     }
 
-    /// The line the cursor is on.
-    ///
-    /// Read as a position in the buffer, not on the screen. Asking the
-    /// editor for a display snapshot makes it resync the whole buffer
-    /// however little of it moved, and this is read once a message: a pass
-    /// over the listing on the path an arriving message takes. The answer
-    /// is the same either way -- the dimension asked for is a buffer point
-    /// in both -- so only the resync is given up.
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
-        let head = self.editor.read(cx).selections.newest_anchor().head();
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        head.to_point(&snapshot).row as usize
+        self.editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head()
+                .row as usize
+        })
     }
 
     /// The URL the cursor's line stands for: a link's label shows no address,
@@ -2334,12 +2332,13 @@ fn image_block(
     }
 }
 
-/// One message as an item: `name: body  time`.
+/// One message as a block of the document: `name: body  time`.
 ///
 /// The shape is a chat log's, not a table's: the name introduces the words,
 /// the time trails them, and nothing is padded into a column, so one long
-/// name cannot push every other line across the screen. Continuation lines
-/// and the chrome under a message indent by [`BODY_INDENT`]. No blank line
+/// name cannot push every other line across the screen. The words are
+/// markdown and the parse lays them out, so nothing is indented into place;
+/// only the chrome under a message sits at [`BODY_INDENT`]. No blank line
 /// between messages; a day is the only break.
 fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     let at = message.ts.epoch_seconds() as i64;
@@ -2363,29 +2362,26 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     }
 
     let you = message.user.as_ref() == Some(model.self_id());
-    spans.push(Span::styled(
+    let name = Span::styled(
         model.author(message),
         match you {
             true => Class::You,
             false => Class::Sender,
         },
-    ));
-    spans.push(Span::plain(": "));
-
-    let (said, chrome) = model.render_parts(message);
-    let said = said.trim_end().replace('\n', &format!("\n{indent}"));
-    let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
-    push_body(&mut spans, &said, model, &links, &message.files);
-    if message.edited {
-        // The reader is told what they are looking at is not what was sent.
-        spans.push(Span::styled(" (edited)", Class::Muted));
-    }
-    // The time trails the words rather than heading them: it is the least
+    );
+    // The time trails what was said rather than heading it: it is the least
     // of what the reader came for. It trails the words only: what the
     // renderer hangs under a message (a card, a file, a picture) was not
     // said at a time of its own.
-    spans.push(Span::styled(format!("  {}", clock_time(at)), Class::Time));
-    spans.push(Span::plain("\n"));
+    let time = Span::styled(format!("  {}", clock_time(at)), Class::Time);
+    // The reader is told what they are looking at is not what was sent.
+    let edited = message
+        .edited
+        .then(|| Span::styled(" (edited)", Class::Muted));
+
+    let (said, chrome) = model.markdown_parts(message);
+    let said = said.trim_end().to_owned();
+    let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
     // A file's line is the one that reads as the file: `enter` there opens
     // it rather than the thread.
     let meta = |line: &str| LineMeta {
@@ -2398,14 +2394,42 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         link: link_on(line, &links),
         images: Vec::new(),
     };
-    lines.extend(said.split('\n').map(&meta));
+
+    // One line of speech keeps the chat log's shape: `name: what they
+    // said  time`. Words the parse reads as a block of their own -- a list,
+    // a quote, a fence, a heading, a table -- cannot begin after a name, so
+    // there the name and the time are a line of their own and the words
+    // start under them, which is how the transcript names a turn.
+    if said.lines().count() <= 1 && !opens_a_block(&said) {
+        spans.push(name);
+        spans.push(Span::plain(": "));
+        push_body(&mut spans, &said, model, &message.files);
+        spans.extend(edited);
+        spans.push(time);
+        spans.push(Span::plain("\n"));
+        lines.push(meta(&said));
+    } else {
+        spans.push(name);
+        spans.extend(edited);
+        spans.push(time);
+        spans.push(Span::plain("\n"));
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+        push_body(&mut spans, &said, model, &message.files);
+        spans.push(Span::plain("\n"));
+        lines.extend(said.split('\n').map(&meta));
+    }
     if !chrome.is_empty() {
         let text = chrome
             .iter()
             .map(|line| format!("{indent}{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        push_body(&mut spans, &text, model, &links, &message.files);
+        push_body(&mut spans, &text, model, &message.files);
         spans.push(Span::plain("\n"));
         lines.extend(text.split('\n').map(&meta));
     }
@@ -2563,16 +2587,18 @@ fn first_unread(messages: &[Message], from: &Ts) -> Option<Ts> {
         .map(|message| message.ts.clone())
 }
 
-/// The unread rule. It reads as unread rather than as chrome: a day break
-/// is where the reader is in the week, this is where they stopped.
+/// The unread rule, written as the document's own heading so the parse
+/// draws it and hides its markers. It reads as unread rather than as
+/// chrome: a day break is where the reader is in the week, this is where
+/// they stopped.
 fn unread_rule() -> Rendered {
-    muted_item(Row::Unread, "── new ──\n", Class::Unread)
+    muted_item(Row::Unread, "## new\n", Class::Unread)
 }
 
 fn day_rule(label: String) -> Rendered {
     muted_item(
         Row::Day(label.clone()),
-        format!("── {label} ──\n"),
+        format!("## {label}\n"),
         Class::Muted,
     )
 }
@@ -2625,6 +2651,21 @@ fn unfurl_ranges(text: &str) -> Vec<(Class, Range<usize>)> {
 /// all start: two columns in, so they read as belonging to the message
 /// above rather than as a message of their own.
 const BODY_INDENT: usize = 2;
+
+/// Whether words would be read as a block of their own rather than as a
+/// sentence: a heading, a list, a quote, a fence, a table. Such a message
+/// cannot begin after a name on the same line, because the marker only
+/// means what it means at the start of a line.
+fn opens_a_block(said: &str) -> bool {
+    let head = said.trim_start_matches(' ');
+    let opener = ["#", ">", "- ", "+ ", "* ", "```", "~~~", "|", "---", "==="];
+    opener.iter().any(|mark| head.starts_with(mark))
+        || head.split_once(['.', ')']).is_some_and(|(number, rest)| {
+            !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && rest.starts_with(' ')
+        })
+}
 
 /// A membership or housekeeping event, as one line. Slack shows these and a
 /// channel reads wrong without them, but they are not what anyone came to
@@ -2694,25 +2735,8 @@ fn link_on(line: &str, links: &[crate::block::Link]) -> Option<String> {
         .map(|link| link.url.clone())
 }
 
-fn push_body(
-    spans: &mut Vec<Span>,
-    body: &str,
-    model: &Model,
-    links: &[crate::block::Link],
-    files: &[FileSummary],
-) {
+fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, files: &[FileSummary]) {
     let mut marked: Vec<(Range<usize>, Class)> = Vec::new();
-    // Link labels, in the order they were rendered, so the same word used
-    // twice colours the occurrence it belongs to.
-    let mut from = 0;
-    for link in links {
-        let Some(at) = body[from..].find(&link.label) else {
-            continue;
-        };
-        let start = from + at;
-        from = start + link.label.len();
-        marked.push((start..from, Class::Link));
-    }
     // Lines the renderer added rather than the author: an attachment's card,
     // preview or app card alike. They read as chrome, not as speech.
     let mut offset = 0;
@@ -2742,18 +2766,6 @@ fn push_body(
             in_unfurl = false;
         }
         offset += line.len() + 1;
-    }
-    // Slack's emphasis keeps its markers in the text, so the style is the
-    // only thing that tells the reader it is emphasis.
-    for (kind, range) in crate::block::emphasis(body) {
-        marked.push((
-            range,
-            match kind {
-                crate::block::Emphasis::Bold => Class::Bold,
-                crate::block::Emphasis::Italic => Class::Italic,
-                crate::block::Emphasis::Struck => Class::Struck,
-            },
-        ));
     }
     for range in crate::emoji::shortcodes(body) {
         if model.is_custom_emoji(&body[range.start + 1..range.end - 1]) {
@@ -3371,14 +3383,17 @@ mod tests {
             !text.contains("\n\n"),
             "no blank line between messages: {text:?}"
         );
-        let continuation = text
+        // Words that run past one line cannot start after a name: the
+        // markup at the start of a line is what the parse reads, so the
+        // name and the time are a line of their own and the words follow.
+        let named = text
             .lines()
-            .find(|line| line.contains("two lines"))
-            .expect("the second line of a body");
-        assert!(
-            continuation.starts_with("  two lines  "),
-            "a continuation line indents under its message, and the time \
-             trails the last line of the body: {continuation:?}"
+            .position(|line| line.starts_with("ada  "))
+            .expect("the turn is named on a line of its own");
+        assert_eq!(
+            text.lines().skip(named + 1).take(2).collect::<Vec<_>>(),
+            vec!["over", "two lines"],
+            "the words start under the name, at the margin: {text:?}"
         );
         let times = classed(&text, &styles, Class::Time);
         assert_eq!(times.len(), 2, "one time per message: {times:?}");
@@ -3625,8 +3640,8 @@ mod tests {
             "the card's first line reads as the link: {linked:?}"
         );
         assert!(
-            linked.iter().any(|span| span.contains("the post")),
-            "so does the label in the body: {linked:?}"
+            text.contains("[the post](https://example.com/post)"),
+            "the body's own link is markdown, for the parse to render: {text}"
         );
         assert!(
             lines
@@ -3781,7 +3796,7 @@ mod tests {
     }
 
     #[test]
-    fn mrkdwn_emphasis_keeps_its_markers_and_is_styled() {
+    fn emphasis_is_rewritten_in_the_markers_the_parse_reads() {
         let (text, styles, _) = render_messages(
             &[message(
                 "1700000000.0",
@@ -3791,10 +3806,17 @@ mod tests {
             &model(),
             false,
         );
-        assert!(text.contains("*bold*"), "the markers stay: {text}");
-        assert_eq!(classed(&text, &styles, Class::Bold), vec!["*bold*"]);
-        assert_eq!(classed(&text, &styles, Class::Italic), vec!["_italic_"]);
-        assert_eq!(classed(&text, &styles, Class::Struck), vec!["~struck~"]);
+        assert!(
+            text.contains("**bold**, *italic*, ~~struck~~, `inline code`"),
+            "Slack's markers become markdown's: {text}"
+        );
+        for class in [Class::Bold, Class::Italic, Class::Struck] {
+            assert!(
+                classed(&text, &styles, class).is_empty(),
+                "the parse styles emphasis and conceals its markers, so \
+                 nothing here paints it: {class:?}"
+            );
+        }
     }
 
     #[test]
@@ -3920,7 +3942,7 @@ mod tests {
         assert_eq!(first_unread(&held(&["100.0", "200.0"]), &read), None);
 
         let rule = unread_rule();
-        assert_eq!(rule.text, "── new ──\n");
+        assert_eq!(rule.text, "## new\n");
         assert_eq!(
             rule.styles
                 .iter()

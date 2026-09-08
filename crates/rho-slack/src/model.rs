@@ -1928,6 +1928,18 @@ impl Model {
         )
     }
 
+    /// The same, written as markdown, which is what the conversation's
+    /// document of blocks is read as.
+    pub fn markdown_parts(&self, message: &Message) -> (String, Vec<String>) {
+        crate::markdown::parts(
+            &message.blocks,
+            &message.text,
+            &message.attachments,
+            &message.files,
+            self,
+        )
+    }
+
     pub fn render(&self, message: &Message) -> String {
         render_message(
             &message.blocks,
