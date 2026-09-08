@@ -1377,8 +1377,12 @@ impl Workspace {
             .dashboard
             .dealer_hand(now, &self.agent_last_interaction);
         let registry = &self.registry;
+        // The name the user gave it, with the handle beside it to tell two
+        // of the same name apart — the same label a transcript tab carries,
+        // because a card and the surface it opens are the same agent and
+        // were reading as two.
         let mut rows = crate::home::split_hand(&hand.cards, |card| {
-            crate::home::card_title(card, |agent_id| registry.agent_id_label(agent_id))
+            crate::home::card_title(card, |agent_id| registry.agent_display_label(agent_id))
         });
         let now_ms = now.timestamp_millis();
         let mut running = self
@@ -1387,14 +1391,16 @@ impl Workspace {
             .copied()
             .filter(|agent_id| self.registry.agent_facts(*agent_id).turn_running)
             .collect::<Vec<_>>();
-        running.sort_by_key(|agent_id| self.registry.agent_id_label(*agent_id));
+        // Sorted by what the row shows, or the order is of something the
+        // reader cannot see.
+        running.sort_by_key(|agent_id| self.registry.agent_display_label(*agent_id));
         rows.running = running
             .into_iter()
             .map(|agent_id| {
                 let facts = self.registry.agent_facts(agent_id);
                 crate::home::RunningRow {
                     agent_id,
-                    name: self.registry.agent_id_label(agent_id),
+                    name: self.registry.agent_display_label(agent_id),
                     // Where it is filed, not the whole path: the row is
                     // about the agent, and the leaf is what names the work.
                     topic: self
@@ -4219,7 +4225,7 @@ impl Workspace {
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
-                format!("shell {}", self.registry.agent_id_label(*agent_id))
+                format!("shell {}", self.registry.agent_display_label(*agent_id))
             }
             SurfaceKey::Diff { agent_id } => {
                 format!("changes {}", self.registry.agent_display_label(*agent_id))
@@ -4229,7 +4235,7 @@ impl Workspace {
                 terminal_id,
             } => format!(
                 "term {}/{terminal_id}",
-                self.registry.agent_id_label(*agent_id)
+                self.registry.agent_display_label(*agent_id)
             ),
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
@@ -8601,8 +8607,14 @@ impl Workspace {
                 .agent_display_name(*agent_id)
                 .map(str::to_owned);
             candidates.push(crate::commands::Candidate {
+                // The handle stays the value: this is the token the reader
+                // types to name an agent, and a name with a space in it is
+                // not one. What they read while choosing is the name, and
+                // "agent" told them nothing about which.
                 value: id_label.clone(),
-                description: display_name.clone().unwrap_or_else(|| "agent".to_owned()),
+                description: display_name
+                    .clone()
+                    .unwrap_or_else(|| self.registry.agent_human_name(*agent_id)),
             });
         }
         candidates
