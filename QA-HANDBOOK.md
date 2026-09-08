@@ -861,6 +861,40 @@ frame carries rows on screen, blocks, excerpts, inlays and cursors, and until
 there are stages around `sync_tree` and `splice_inlays` with transform counts,
 a report can say a frame was slow but not what it was slow per.
 
+## Reading a rig's own profile
+
+Every `rig up` leaves a profile behind and `rho-qa profile <path>` prints one
+line from it: the frame gaps, the worst stage, what the main thread did
+between frames, and the top three leaves of the CPU samples. That line is
+what a landing note quotes.
+
+*When to ask for the chains.* The line names leaves, and a leaf says what
+the thread was in, not what put it there — `__syscall_cancel_arch_end` at 8%
+is not an answer, it is a question. `--stacks` prints the whole callchain
+behind each sample, most samples first:
+
+```
+cargo run -q -p rho-qa -- profile <path>.bin --stacks              # every chain
+cargo run -q -p rho-qa -- profile <path>.bin --stacks memcpy       # only these leaves
+```
+
+It is off by default because a run of any length holds tens of thousands of
+chains. Turn it on the moment a leaf is a library function, a syscall wrapper
+or an allocator: those name a mechanism and never a path, and the path is
+always the thing that can be changed. The 8% of GUI-thread CPU that this
+answered on 2026-09-08 came back as `sendmsg < wl_connection_flush <
+wl_display_flush` and `recvmsg < wl_connection_read < wl_display_read_events`
+— the Wayland socket, per frame, nothing of rho's under it — which no leaf
+leaderboard could have said.
+
+*What it cannot tell you yet.* Only the frames whose mapping symbolized come
+back as names. In that same profile every rho frame printed as an address,
+because the profiling build links with `-Wl,--compress-debug-sections=zstd`
+and the symbolizer abandons a mapping whose debug section it cannot read —
+even though `.symtab` sits uncompressed in the same binary with every name in
+it. A chain of addresses is not an answer, so check that rho's own frames are
+named before drawing anything from a chain that passes through them.
+
 ## Adding a case
 
 A new case starts every time the user reports something. Write it before

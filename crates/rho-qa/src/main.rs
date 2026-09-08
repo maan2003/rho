@@ -51,7 +51,15 @@ enum Command {
     /// List the snapshots taken so far.
     Snapshots,
     /// Summarize a session's profile: the frame gaps and where the time went.
-    Profile { path: std::path::PathBuf },
+    Profile {
+        path: std::path::PathBuf,
+        /// Print the whole callchain behind each sample, not just the leaf.
+        ///
+        /// Takes a substring of the leaf to print chains for, or nothing
+        /// for all of them. The summary line still prints after them.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        stacks: Option<String>,
+    },
     /// Read a telemetry report the user sent: the frames by surface, the
     /// editor stages against the window they were measured in, and the CPU
     /// profile embedded in it.
@@ -70,8 +78,9 @@ fn main() -> Result<()> {
         Command::FakeModelProof(args) => fake_model_proof::run(args),
         Command::Snapshot(args) => snapshot::take(args),
         Command::Snapshots => snapshot::list(),
-        Command::Profile { path } => {
-            println!("{}", profile::summarize(&path)?.line);
+        Command::Profile { path, stacks } => {
+            let summary = profile::summarize_with_chains(&path, stacks.as_deref())?;
+            println!("{}", summary.line);
             Ok(())
         }
         Command::Telemetry { path } => {

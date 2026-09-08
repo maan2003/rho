@@ -91,10 +91,20 @@ pub struct Symbol {
 /// Read the three sidecars beside `profile` — the path `rig up` passed to
 /// `--cpu-profile`, whose own file is never written.
 pub fn summarize(profile: &Path) -> Result<Summary> {
+    summarize_with_chains(profile, None)
+}
+
+/// The summary, and optionally the whole callchain behind each sample.
+///
+/// A leaf says what the thread was in; only the chain says what put it
+/// there, and the two answers are different questions. `chains` names the
+/// leaves to print - the empty string for all of them - and the reader
+/// prints them richest first, one line each, deepest frame leftmost.
+pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Summary> {
     let frames: FrameLog = read_json(&sidecar(profile, ".frames.json"))?;
     let editor: EditorLog = read_json(&sidecar(profile, ".editor.json")).unwrap_or_default();
     let work: WorkLog = read_json(&sidecar(profile, ".work.json")).unwrap_or_default();
-    let cpu = symbols(&cpu_path(profile)).unwrap_or_default();
+    let cpu = symbols(&cpu_path(profile), chains).unwrap_or_default();
 
     let over_budget = frames
         .frames
@@ -282,7 +292,7 @@ struct Cpu {
 /// Where the samples landed. A sample is attributed to its leaf frame — the
 /// function that was running, not the ones waiting on it — which is what
 /// "the main thread is doing X" means.
-fn symbols(path: &Path) -> Result<Cpu> {
+fn symbols(path: &Path, chains: Option<&str>) -> Result<Cpu> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("open the CPU profile {}", path.display()))?;
     let mut bytes = Vec::new();
@@ -297,6 +307,9 @@ fn symbols(path: &Path) -> Result<Cpu> {
     let mut names: HashMap<u64, (u64, String)> = HashMap::new();
     // Leaf address per sample, with the thread it came from.
     let mut leaves: Vec<(u64, Option<String>)> = Vec::new();
+    // The whole chain per sample, kept only when it is asked for: a run of
+    // any length holds tens of thousands of them.
+    let mut callchains: Vec<(Vec<u64>, Option<String>)> = Vec::new();
     decoder
         .for_each_event(|event| match event.name {
             "SymbolTableEntry" => {
@@ -322,20 +335,26 @@ fn symbols(path: &Path) -> Result<Cpu> {
             "CpuSampleEvent" => {
                 let mut leaf = None;
                 let mut thread = None;
+                let mut stack = None;
                 for (field, value) in event.field_names().zip(event.fields) {
                     match (field, value) {
                         ("callchain", FieldValueRef::PooledStackFrames(held)) => {
-                            leaf = event
-                                .stack_pool
-                                .get(*held)
+                            let frames = event.stack_pool.get(*held);
+                            leaf = frames
                                 .and_then(|frames| frames.iter().find(|addr| **addr != 0))
                                 .copied();
+                            if let (Some(frames), Some(_)) = (frames, chains) {
+                                stack = Some(frames.to_vec());
+                            }
                         }
                         ("thread_name", FieldValueRef::PooledString(held)) => {
                             thread = event.string_pool.get(*held).map(str::to_owned);
                         }
                         _ => {}
                     }
+                }
+                if let Some(stack) = stack {
+                    callchains.push((stack, thread.clone()));
                 }
                 if let Some(leaf) = leaf {
                     leaves.push((leaf, thread));
@@ -373,6 +392,10 @@ fn symbols(path: &Path) -> Result<Cpu> {
         .map(|(leaf, _)| *leaf)
         .collect();
 
+    if let Some(wanted) = chains {
+        print_chains(&callchains, &names, thread.as_deref(), wanted);
+    }
+
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for leaf in &mine {
         let name = names.get(leaf).map_or("unknown", |(_, name)| name.as_str());
@@ -393,6 +416,46 @@ fn symbols(path: &Path) -> Result<Cpu> {
             })
             .collect(),
     })
+}
+
+/// Every distinct callchain whose leaf matches `wanted`, most samples
+/// first, on the thread the summary is about.
+///
+/// The names come from the trace's own symbol table, which is written
+/// against the addresses the process had. Where a mapping failed to
+/// symbolize the frame prints as an address, and a chain of addresses is
+/// not an answer - see the handbook on what makes rho's own frames name
+/// themselves.
+fn print_chains(
+    callchains: &[(Vec<u64>, Option<String>)],
+    names: &HashMap<u64, (u64, String)>,
+    thread: Option<&str>,
+    wanted: &str,
+) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for (frames, held) in callchains {
+        if thread.is_some() && held.as_deref() != thread {
+            continue;
+        }
+        let named = frames
+            .iter()
+            .filter(|addr| **addr != 0)
+            .map(|addr| {
+                names
+                    .get(addr)
+                    .map_or_else(|| format!("{addr:#x}"), |(_, name)| name.clone())
+            })
+            .collect::<Vec<_>>();
+        if !wanted.is_empty() && !named.first().is_some_and(|leaf| leaf.contains(wanted)) {
+            continue;
+        }
+        *counts.entry(named.join(" < ")).or_default() += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for (chain, count) in ranked {
+        println!("{count} {chain}");
+    }
 }
 
 /// A Rust symbol with its generic arguments taken off and cut to something
