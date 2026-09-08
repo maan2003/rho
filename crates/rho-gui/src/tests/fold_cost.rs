@@ -85,7 +85,14 @@ fn fold_items_walked_by_an_edit(cx: &mut TestAppContext, held: usize) -> f64 {
     // The edit is at the foot of the document, below every fold: the row a
     // reader is typing on, with the settled turns above it.
     let repeats = 8;
+    // The trace is a process-wide ring shared with any test running beside
+    // this one, so the counting is by thread. Without that, a suite with
+    // another editor-heavy test in it reads a fraction of this edit's own
+    // walk and a ratio that is about the schedule rather than the folds.
     gpui::profiler::set_editor_trace_enabled(true);
+    let _claim = gpui::profiler::claim_editor_trace_for_this_thread();
+    // SAFETY: gettid has no arguments or memory-safety preconditions.
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
     let mut collector = gpui::profiler::EditorTimingCollector::new();
     workspace
         .update(cx, |_, _window, cx| {
@@ -103,7 +110,10 @@ fn fold_items_walked_by_an_edit(cx: &mut TestAppContext, held: usize) -> f64 {
     let walked: u64 = collector
         .collect_unseen()
         .iter()
-        .filter(|timing| matches!(timing.kind, gpui::profiler::EditorTimingKind::FoldMapSync))
+        .filter(|timing| {
+            timing.tid == tid
+                && matches!(timing.kind, gpui::profiler::EditorTimingKind::FoldMapSync)
+        })
         .map(|timing| timing.walked_items)
         .sum();
     walked as f64 / repeats as f64

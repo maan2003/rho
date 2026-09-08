@@ -1662,6 +1662,7 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
     // this one, so the counting is by thread. Nothing turns it back off:
     // the flag is only ever set, and the ring is bounded.
     gpui::profiler::set_editor_trace_enabled(true);
+    let _claim = gpui::profiler::claim_editor_trace_for_this_thread();
     // SAFETY: gettid has no arguments or memory-safety preconditions.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) as u64 };
     let mut timings = gpui::profiler::EditorTimingCollector::new();
