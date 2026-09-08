@@ -1462,9 +1462,15 @@ impl Model {
     /// shows them, starting after `from`. Wraps, so reading through the
     /// unread ones is one key pressed repeatedly; `None` when there is
     /// nothing left, which is what sends the reader back to the list.
+    ///
+    /// The whole order, never the narrowed rows. A query is what the reader
+    /// is looking at; this is a question about what the workspace holds,
+    /// and a query left standing from an hour ago must not answer it. It
+    /// reads the same set `mark_plan` does, so the two cannot disagree
+    /// about how much is waiting.
     pub fn next_unread(&self, from: Option<&ChannelId>) -> Option<ChannelId> {
-        let rows = self.conversation_rows();
-        let unread = |row: &ConversationRow| !row.muted && (row.unread || row.mention_count > 0);
+        let rows = self.order.values().collect::<Vec<_>>();
+        let unread = |row: &&ConversationRow| !row.muted && (row.unread || row.mention_count > 0);
         let at = from
             .and_then(|from| rows.iter().position(|row| &row.id == from))
             .map_or(0, |at| at + 1);
@@ -3421,6 +3427,44 @@ mod tests {
         // still thinks it is: they are looking at it.
         model.set_counts([count("C1", false), count("D1", true)]);
         assert_eq!(model.next_unread(Some(&ChannelId("D1".into()))), None);
+    }
+
+    /// A query is what the reader is looking at, not what the workspace
+    /// holds. Before this, `next_unread` walked the narrowed rows: a search
+    /// left standing from an hour ago answered "nothing unread" while a DM
+    /// outside it waited, and the key that exists to find unread messages
+    /// was the one thing that could not see them.
+    #[test]
+    fn a_query_standing_does_not_hide_an_unread_from_the_key_that_looks_for_one() {
+        let mut model = model();
+        let count = |channel: &str| ConversationCount {
+            channel: ChannelId(channel.into()),
+            has_unreads: true,
+            mention_count: 0,
+            unread_count: 0,
+            latest: Some(Ts("100".into())),
+            last_read: None,
+        };
+        // Unread in the DM, which is the one the query will not reach.
+        model.set_counts([count("D1")]);
+        model.narrow("design");
+        assert_eq!(
+            model.conversation_rows().len(),
+            1,
+            "the list is narrowed to #design, which is what the reader sees"
+        );
+        assert_eq!(
+            model.next_unread(None),
+            Some(ChannelId("D1".into())),
+            "and the unread outside the query is still where the key goes"
+        );
+        // The same set `mark read before` reads, so the two cannot come to
+        // disagree about how much is waiting.
+        assert_eq!(
+            model.mark_plan(f64::MAX).conversations.len(),
+            1,
+            "and the backlog says the same one is waiting"
+        );
     }
 
     #[test]
