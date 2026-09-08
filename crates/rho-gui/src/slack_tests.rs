@@ -2305,3 +2305,70 @@ async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestA
         0
     );
 }
+
+/// A unit is a virtual node: it is Slack's ids and nothing rho writes, and
+/// it becomes a row of rho's own only when a cell is written that Slack has
+/// no place for — a snooze, a name, labels, About. The done cursor is not
+/// one of those. So a unit the mirror has stopped mentioning is off the map
+/// even though the `SlackHandledThrough` cell an older rho wrote for it is
+/// still in the store: nothing deletes those cells, the desk stops reading
+/// them. A unit the user did name stays, because the name is theirs.
+#[gpui::test]
+fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppContext) {
+    let mut desk = crate::tests::DeskFixture::new();
+    // Asking: the mirror still has something to say about it.
+    let asking = desk.thread_row(None, "C1", "500.0");
+    // Stale: no source, and one cell, the cursor a version of rho before
+    // 8 Sep wrote when the user pressed `d`.
+    let stale = rho_desk::cells::Id::Slack(slack_unit("C2", Some("300.0")));
+    desk.set(
+        stale.clone(),
+        rho_desk::cells::Property::SlackHandledThrough(rho_desk::cells::SlackTs(
+            "300.5".to_owned(),
+        )),
+    );
+    // Named: no source either, but the name is a fact Slack has nowhere to
+    // keep, so the unit is a node of rho's own.
+    let named = rho_desk::cells::Id::Slack(slack_unit("C3", Some("400.0")));
+    desk.set(
+        named.clone(),
+        rho_desk::cells::Property::Name("the release".to_owned()),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            crate::tests::story::feed(
+                workspace,
+                rho_agents::HostId::default(),
+                desk.synced(),
+                window,
+                cx,
+            );
+            workspace.set_slack_sources_for_test(
+                rho_agents::HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            let rows = workspace
+                .desk_cells
+                .nodes(rho_agents::HostId::default())
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                rows.contains(&asking),
+                "the unit the mirror is still asking about is a row"
+            );
+            assert!(
+                rows.contains(&named),
+                "the name is rho's own, so the unit it is on is a row: {rows:?}"
+            );
+            assert!(
+                !rows.contains(&stale),
+                "a cursor cell is not a node: {rows:?}"
+            );
+        })
+        .unwrap();
+}

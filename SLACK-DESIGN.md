@@ -199,6 +199,17 @@ another machine the same day. Leaving them is idempotent, costs nothing
 to write, and can be done later against the definition above if the space
 ever matters. `SlackSnoozedAt` goes with eng-8gpr's pending removal.
 
+Landed 8 Sep: `compute_nodes` in `rho-gui/src/desk_view.rs` drops a stored
+`Id::Slack` row that neither the mirror is asking about nor carries a cell
+of rho's own — `rho_wrote_of_unit` names them: a filing, a name, labels,
+About, a snooze, a mute, a dismissal. A cursor cell is not one, so the
+`SlackHandledThrough` rows the versions before today wrote leave nothing on
+the map. Nothing deletes them and no pass looks for them: the walk that
+already reads every fact reads one field more. The write of units as desk
+sources on attention was already gone with the card rule; what is left of
+it is the unused `SlackThreadBound` journal event, kept because the journal
+decodes old files by variant order.
+
 **Why:** every one of these takes a fact rho was keeping and gives it back
 to whoever owns it. Slack owns what has been read, what is muted and what
 is followed, and rho was keeping private copies that drifted the moment

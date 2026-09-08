@@ -207,8 +207,11 @@ position, never by a state: `d` on an agent writes
 `AgentHandledThrough(the position of its latest event)`. A Slack unit is
 the same rule in a different file (8 Sep): its cursor is rho's own half of
 a join with Slack's read mark, both halves live in the Slack mirror, and
-`d` on a unit writes no cell at all. `SLACK-DESIGN.md`, "How a Slack unit
-sits in rho". The card is
+`d` on a unit writes no cell at all, and a unit is a node here only while
+it carries a cell Slack has no place for -- a filing, a name, labels,
+About, a snooze, a mute, a dismissal -- so the cursor cells older versions
+left behind are read by nothing and shown by nothing.
+`SLACK-DESIGN.md`, "How a Slack unit sits in rho". The card is
 open again the moment the source has an event that wants the user past
 the cursor (a reply from them, an agent turn ending on a question or a
 tag), with a fresh wait; the user's own message to either never reopens

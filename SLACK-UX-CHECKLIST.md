@@ -620,7 +620,10 @@ done right after the transcript primitive (2.4) and before 2.10:
       the mirror at display time; `d`, `t` write `SlackHandledThrough :=
       newest` (superseded 8 Sep: that cursor is rho's own half of a join
       with Slack's read mark and lives in the Slack mirror; the cells are
-      seeded from once and then never read, and nothing deletes them); snooze records `SlackSnoozedAt(newest)` beside
+      seeded from once and then never read, and nothing deletes them; the
+      desk stops reading a unit node that carries no cell of rho's own, so
+      those cells leave nothing on the map, which is the virtual-node rule
+      landed 8 Sep); snooze records `SlackSnoozedAt(newest)` beside
       `DeferUntil` and is voided when `newest_from_other` passes it, the
       cursor untouched; `Name` beats the derived title on any id but a
       note; the dealer deals DMs and mentioned channels, not only threads;

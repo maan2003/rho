@@ -38,7 +38,7 @@ mod record_anchors;
 mod removing_a_turn_after_growth;
 mod running_turn_elapsed;
 mod scene_walk;
-mod story;
+pub(super) mod story;
 mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
 mod turn_is_one_buffer;
@@ -7603,7 +7603,7 @@ fn story_wanting(agent_id: AgentId, at: UnixMs) -> ConnEvent {
     )
 }
 
-struct DeskFixture {
+pub(super) struct DeskFixture {
     store: rho_desk::cells::Store,
     bodies: Vec<rho_desk::cells::BodySnapshot>,
     next_node: u64,
@@ -7617,7 +7617,7 @@ impl DeskFixture {
     const NAMESPACE: u16 = 42;
     const DAEMON_NAMESPACE: u16 = 1;
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let device = rho_desk::cells::DeviceId([9; 16]);
         Self {
             store: rho_desk::cells::Store::new(device),
@@ -7663,7 +7663,7 @@ impl DeskFixture {
 
     /// A Slack thread the user filed. Nothing creates it: the unit is the
     /// id, and filing it is the only fact the store holds.
-    fn thread_row(
+    pub(super) fn thread_row(
         &mut self,
         parent: Option<rho_desk::cells::Id>,
         channel: &str,
@@ -7702,7 +7702,7 @@ impl DeskFixture {
     /// What the mirror says about the rows `thread_row` made: every unit
     /// has one message from someone else and nothing handled yet, which is
     /// the state a card is dealt in.
-    fn slack_sources(&self) -> Vec<crate::desk_view::SlackSource> {
+    pub(super) fn slack_sources(&self) -> Vec<crate::desk_view::SlackSource> {
         self.slack_units
             .iter()
             .map(|(unit, newest)| crate::desk_view::SlackSource {
@@ -7795,11 +7795,11 @@ impl DeskFixture {
         rho_desk::cells::Uuid(bytes)
     }
 
-    fn set(&mut self, id: rho_desk::cells::Id, property: rho_desk::cells::Property) {
+    pub(super) fn set(&mut self, id: rho_desk::cells::Id, property: rho_desk::cells::Property) {
         self.store.write(id, property).unwrap();
     }
 
-    fn synced(&self) -> ConnEvent {
+    pub(super) fn synced(&self) -> ConnEvent {
         ConnEvent::DeskSynced {
             node_namespace: Self::NAMESPACE,
             delta: self.store.snapshot(),

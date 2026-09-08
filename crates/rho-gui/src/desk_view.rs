@@ -447,6 +447,29 @@ struct SlackCard {
 /// card, and a mention already read elsewhere has stopped asking. The
 /// second is the desk's own, and is the one comparison a replayed history
 /// page cannot change.
+/// Whether a Slack unit is a node of rho's own. A unit is a virtual node:
+/// it is identified by Slack's ids and by nothing rho writes, and it
+/// becomes real only when a cell is written that Slack has no place for --
+/// a snooze, a name, labels, About, a filing, a mute, a dismissal. What
+/// Slack owns is not on that list, and neither is the done cursor: the
+/// `SlackHandledThrough` cells the versions before 8 Sep wrote are read
+/// once by the seed and never again, so a unit carrying only one of those
+/// is stale. Nothing deletes them; the desk stops asking.
+fn rho_wrote_of_unit(facts: &Facts) -> bool {
+    facts.filed
+        || facts.parent.is_some()
+        || facts.about.is_some()
+        || !facts.labels.is_empty()
+        || facts.name.is_some()
+        || facts.state != State::Open
+        || facts.defer_until.is_some()
+        || facts.deadline.is_some()
+        || facts.pace_days != 0
+        || facts.slack_snoozed_at.is_some()
+        || facts.deleted
+        || facts.created_at.is_some()
+}
+
 fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
     let Id::Slack(unit) = id else {
         return None;
@@ -1014,6 +1037,13 @@ impl DeskCells {
             .view
             .all_facts()
             .into_iter()
+            // A unit Slack is still telling rho about is a row for as long
+            // as it says so; one it has stopped telling rho about is a row
+            // only if the user wrote something Slack has no place for.
+            .filter(|(id, facts)| match id {
+                Id::Slack(unit) => sources.unit(unit).is_some() || rho_wrote_of_unit(facts),
+                _ => true,
+            })
             .collect::<BTreeMap<Id, Facts>>();
         // Open by its source: a waiting agent and a Slack unit with new
         // traffic matter even when the user has never said anything.
