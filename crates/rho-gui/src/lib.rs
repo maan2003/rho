@@ -120,7 +120,6 @@ actions!(
         SlackFindMessage,
         SlackOpenFound,
         SlackMarkReadBefore,
-        SlackWatchChannel,
         SlackNextUnread,
         SlackEditMessage,
         SlackReactTo,
@@ -501,12 +500,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoSlackList > Editor && vim_mode == normal && !VimDeal",
         "RhoSlackList > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
-        cx.bind_keys([
-            KeyBinding::new("m", SlackMarkReadBefore, Some(context)),
-            // Opting a channel into being handed to the reader is a verdict
-            // about the channel, so it is made on the channel's own line.
-            KeyBinding::new("w", SlackWatchChannel, Some(context)),
-        ]);
+        cx.bind_keys([KeyBinding::new("m", SlackMarkReadBefore, Some(context))]);
     }
     cx.bind_keys([
         KeyBinding::new(

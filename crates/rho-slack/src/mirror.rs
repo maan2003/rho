@@ -59,8 +59,6 @@ const UNITS: TableDefinition<&str, Sen<StoredUnit>> = TableDefinition::new("rho_
 /// forgets what the reader always uses is a picker they stop using.
 const REACTED_WITH: TableDefinition<&str, Sen<StoredReactedWith>> =
     TableDefinition::new("rho_slack_reacted_with_v1");
-const WATCHED: TableDefinition<&str, Sen<StoredWatch>> =
-    TableDefinition::new("rho_slack_watched_v1");
 
 /// One run of history: a conversation, or one thread inside it. A thread is
 /// its own run because Slack pages it separately.
@@ -146,7 +144,6 @@ impl Mirror {
             write.open_table(USERS);
             write.open_table(CONVERSATIONS);
             write.open_table(CURSORS);
-            write.open_table(WATCHED);
             write.open_table(REACTED_WITH);
             write.open_table(UNITS);
             write.commit();
@@ -570,33 +567,6 @@ impl Mirror {
             .collect()
     }
 
-    /// Records the reader opting into a channel, or out of it. Opting out
-    /// deletes the row: the file says which channels are watched, and a row
-    /// saying "not this one" would be a second way to say the same nothing.
-    pub fn set_watched(&self, workspace: &str, channel: &ChannelId, watching: bool) {
-        let mut txn = self.write();
-        {
-            let mut table = txn.open_table(WATCHED);
-            let key = format!("{workspace}{SEPARATOR}{}", channel.as_str());
-            match watching {
-                true => {
-                    table.insert(
-                        key.as_str(),
-                        SenValue::owned(StoredWatch {
-                            channel: channel.0.clone(),
-                        }),
-                    );
-                }
-                false => {
-                    table.remove(key.as_str());
-                }
-            }
-        }
-        txn.commit();
-    }
-
-    /// The channels the reader opted into, read back at startup. This is
-    /// what makes an opt-in outlive the session that made it.
     /// The emoji the reader reacted with, most recent first.
     pub fn reacted_with(&self, workspace: &str) -> Vec<String> {
         let txn = self.db.read();
@@ -621,20 +591,6 @@ impl Mirror {
             );
         }
         txn.commit();
-    }
-
-    pub fn watched(&self, workspace: &str) -> Vec<ChannelId> {
-        let txn = self.db.read();
-        let table = txn.open_table(WATCHED);
-        let prefix = format!("{workspace}{SEPARATOR}");
-        let end = format!(
-            "{workspace}{}",
-            char::from_u32(SEPARATOR as u32 + 1).unwrap()
-        );
-        table
-            .range(prefix.as_str()..end.as_str())
-            .map(|(_, value)| ChannelId(value.value().as_ref().channel.clone()))
-            .collect()
     }
 
     /// Writes one unit's facts. Called on the event that moved them, and
@@ -751,7 +707,7 @@ impl StoredUnit {
                 Reason::Mention => 0,
                 Reason::DirectMessage => 1,
                 Reason::Thread => 2,
-                Reason::Watched => 3,
+                Reason::Channel => 3,
             },
             newest: facts.newest.0.clone(),
             newest_from_other: facts.newest_from_other.as_ref().map(|ts| ts.0.clone()),
@@ -765,7 +721,7 @@ impl StoredUnit {
             0 => Reason::Mention,
             1 => Reason::DirectMessage,
             2 => Reason::Thread,
-            3 => Reason::Watched,
+            3 => Reason::Channel,
             _ => return None,
         };
         Some((
@@ -778,6 +734,10 @@ impl StoredUnit {
                 newest: Ts(self.newest.clone()),
                 newest_from_other: self.newest_from_other.as_ref().map(|ts| Ts(ts.clone())),
                 newest_from_you: self.newest_from_you,
+                // Whether somebody else had already answered is about the
+                // run the reader is in the middle of, not about the unit,
+                // so a restart starts it again rather than storing it.
+                others_replied: false,
                 first_seen_ms: self.first_seen_ms,
             },
         ))
@@ -795,18 +755,11 @@ fn unit_key(workspace: &str, unit: &Unit) -> String {
     )
 }
 
-/// A watched channel. The id is in the key already; it is repeated in the
-/// value so a reader of the table never has to take a key apart.
 /// The reader's own reaction history: shortcodes without colons, most
 /// recent first, capped where the picker stops showing them.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct StoredReactedWith {
     names: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-struct StoredWatch {
-    channel: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

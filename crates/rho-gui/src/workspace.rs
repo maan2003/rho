@@ -81,9 +81,8 @@ use crate::{
     SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
     SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackFindMessage,
     SlackMarkReadBefore, SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch,
-    SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
-    UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict,
+    UploadGuiTelemetry, VerdictMenu, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -8924,9 +8923,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &SlackWatchChannel, window, cx| {
-                this.toggle_slack_watch(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TranscriptTop, window, cx| {
                 // Only a transcript composes its way to the top; anywhere

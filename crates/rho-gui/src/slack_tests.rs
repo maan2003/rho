@@ -1758,7 +1758,7 @@ async fn arrival_cost(cx: &mut TestAppContext, channels: usize) -> ArrivalCost {
 
 /// A message that asks for the reader becomes a card, by every route that
 /// makes one: named in a channel, a direct message, a reply in a followed
-/// thread, and traffic in a channel the reader opted into.
+/// thread, and ordinary traffic in a channel.
 ///
 /// Written for a report of no Slack cards after three changes to the
 /// arrival path. It runs the whole way — socket frame, model, the facts
@@ -1799,12 +1799,11 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     );
     let state = tempfile::tempdir().expect("a state directory of this test's own");
     let paths = rho_slack::config::Paths::under(state.path());
-    let session = workspace
+    workspace
         .update(cx, |workspace, window, cx| {
             let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
-            workspace.install_slack_session_for_test(session.clone(), window, cx);
+            workspace.install_slack_session_for_test(session, window, cx);
             workspace.open_slack(window, cx);
-            session
         })
         .unwrap();
     for _ in 0..200 {
@@ -1819,15 +1818,6 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
             .timer(std::time::Duration::from_millis(10))
             .await;
     }
-    // The opt-in is rho's own fact and nothing arrives to make it.
-    workspace
-        .update(cx, |_, _, cx| {
-            session.update(cx, |session, cx| {
-                session.set_watching(&rho_slack::types::ChannelId("C4".into()), true, cx)
-            })
-        })
-        .unwrap();
-
     fake.push_frame(serde_json::json!({
         "type": "message",
         "channel": "C1",
@@ -1892,7 +1882,7 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
     );
     assert_eq!(asking.get("@ada"), Some(&Attention::DirectMessage));
     assert_eq!(asking.get("#dev-ops"), Some(&Attention::FollowedThread));
-    assert_eq!(asking.get("#ops-alerts"), Some(&Attention::WatchedChannel));
+    assert_eq!(asking.get("#ops-alerts"), Some(&Attention::ChannelTraffic));
 
     // And every one of them ranks above the floor the dealer drops cards at.
     let now = chrono::Local::now().fixed_offset();

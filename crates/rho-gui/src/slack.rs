@@ -9,7 +9,7 @@ use gpui::AppContext as _;
 use rho_desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
-use rho_slack::model::{Change, Model, NextUnread, Unit, Waiting};
+use rho_slack::model::{Change, Model, NextUnread, Unit};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::{Attaching, EditStart};
@@ -614,45 +614,6 @@ impl Workspace {
         if let Some(source) = source {
             self.open_slack_source(source, window, cx);
         }
-    }
-
-    /// Opts the channel under the point into being handed to the reader, or
-    /// out of it, and says which in the echo line.
-    ///
-    /// The verdict is about a channel, so it is only asked of a channel:
-    /// the row under the point in the list. Nothing is sent to Slack — this
-    /// is rho's own standing word about whose traffic it hands over — and
-    /// the desk is rebuilt at once, so a channel opted into now shows the
-    /// cards its unread traffic has already earned.
-    pub(crate) fn toggle_slack_watch(
-        &mut self,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        let SurfaceView::SlackList(view) = &self.active_surface().view else {
-            return;
-        };
-        let source = view.clone().update(cx, |view, cx| view.cursor_source(cx));
-        let Some(Source::Conversation(channel)) = source else {
-            return;
-        };
-        let Some(session) = self.slack.session() else {
-            return;
-        };
-        let (watching, label) = session.update(cx, |session, cx| {
-            let watching = !session.watches(&channel);
-            session.set_watching(&channel, watching, cx);
-            (watching, session.model().label(&channel))
-        });
-        let said = match watching {
-            true => format!("{label}: handing over what lands here"),
-            false => format!("{label}: back to the list"),
-        };
-        self.echo(&said, StyleClass::SystemInfo, cx);
-        if let Some(host) = self.hosts.primary() {
-            self.sync_tree_dashboard(host, window, cx);
-        }
-        self.invalidate_dealer_signals(cx);
     }
 
     /// A picture opens in rho, not in the desktop's viewer: the bytes are
@@ -1642,12 +1603,9 @@ impl Workspace {
                         reason: card.attention,
                         raised_at,
                         wait_days: card.wait_days,
-                        waiting_on: match card.waiting {
-                            Waiting::OnThem => Some(card.conversation),
-                            Waiting::OnYou => None,
-                        },
                         latest: card.newest.0,
                         newest_from_other: card.newest_from_other.map(|ts| ts.0),
+                        others_replied: card.others_replied,
                     },
                 ))
             })

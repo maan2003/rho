@@ -325,7 +325,6 @@ fn slack_rooms() -> Vec<crate::find::FindCandidate> {
             mention_count: 0,
             unread_count: 0,
             muted: false,
-            watched: false,
             latest: None,
         })
         .collect();

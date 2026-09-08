@@ -772,11 +772,14 @@ done right after the transcript primitive (2.4) and before 2.10:
       place, asked of Slack's own read state and not of rho's dealing
       cursor: a DM or group DM with something unread, a mention, a reply in
       a followed thread since the reader last looked, or unread traffic in
-      a channel the reader opted into. A channel with plain unreads is in
-      the list with its count and is never a card, which is the flood.
+      a channel. (Superseded 8 Sep by "How a Slack unit sits in rho" in
+      `SLACK-DESIGN.md`: a channel with plain unreads is a card too, on a
+      curve that fades and never reaches a thread's. What holds the flood
+      back now is that the chatter after a mention does not touch the
+      mention's own wait.)
       Every card says what it is for in the words a reader reads —
       `mentioned in #design`, `a reply in a followed thread in #design`,
-      `unread in @ada`, `unread in #random, watched here` — built at draw
+      `unread in @ada`, `unread in #random` — built at draw
       time from the fact and the roster's current label, never stored, so a
       conversation named late is not left reading a stale sentence.
       This reverses something the crate used to hold, and it should be read
@@ -787,13 +790,11 @@ done right after the transcript primitive (2.4) and before 2.10:
       can see the reader has read is not something to go on handing them. A
       verdict — done, skip, defer — is still the reader's key alone and the
       desk's cursors are untouched.
-- [x] 2.26 Opting a channel in. A channel whose ordinary traffic the reader
-      does want handed to them: `w` on its row in the list, echoed, and the
-      word `watched` on the line from then on. rho's own fact and not
-      Slack's, so it lives in rho's own file — a typed table in
-      `slack.redb` — and comes back at startup. Opting out stops the
-      asking and leaves the unit standing, so Find still reaches it and a
-      row the reader half filed is not pulled out from under them.
+- [x] 2.26 Opting a channel in. Landed 5 Sep as a `w` key, a `watched`
+      word on the row and a table in `slack.redb`; deleted 8 Sep on the
+      user's decision that there is no watch at all. Every channel with
+      unread traffic is a unit now, so there is nothing left to opt into.
+      See "How a Slack unit sits in rho" in `SLACK-DESIGN.md`.
 
 - [x] 2.27 The list is a buffer built once and edited per event. Every
       row exists from the first draw and the model's order *is* the order

@@ -6779,7 +6779,6 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
             assert_eq!(routes("s", &list), Some("rho_gui::SlackSearch"));
             assert_eq!(routes("shift-n", &list), Some("rho_gui::SlackNextUnread"));
             assert_eq!(routes("m", &list), Some("rho_gui::SlackMarkReadBefore"));
-            assert_eq!(routes("w", &list), Some("rho_gui::SlackWatchChannel"));
             assert_eq!(routes("q", &list), Some("rho_gui::SurfaceClose"));
             // The composer and the rewrite belong to a conversation. On the
             // list the keys go back to vim, the way they do on every other

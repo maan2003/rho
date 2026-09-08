@@ -1036,7 +1036,6 @@ mod tests {
                 mention_count: 0,
                 unread_count: 0,
                 muted: false,
-                watched: false,
                 latest: Some(Ts::from("120.000000")),
             }],
             vec![(
@@ -1051,6 +1050,7 @@ mod tests {
                     first_seen_ms: 0,
                     newest: Ts::from("140.000000"),
                     newest_from_other: None,
+                    others_replied: false,
                 },
                 "release date".to_owned(),
             )],

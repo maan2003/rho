@@ -577,10 +577,11 @@ wrong at the design, not at the polish.
   read on the phone leaves. A verdict is the reader's key alone, and the
   desk's cursors are untouched. The test that asserted the old behaviour is
   rewritten to assert the new one and says why.
-  The opt-in is rho's own fact, not Slack's, so it lives in rho's own file:
-  a typed `rho_slack_watched_v1` table in `slack.redb`, written where the
-  reader opts in with `w` on the row in the list, read back at startup, and
-  shown as the word `watched` on the line it was made on.
+  There is no opt-in any more (8 Sep): every channel with unread traffic
+  from someone else is a unit, on a curve that starts far below a direct
+  message or a thread and fades, so nothing has to be opted into for its
+  traffic to be seen. The `w` key, the `watched` word on the row and the
+  `rho_slack_watched_v1` table are gone with it.
   Under the cost rule. The rule keeps `asking`, the set of units currently
   a card, maintained by every event that can change it — a message, a mark,
   a mute, a follow, an opt-in, Slack's counts — each touching only the units

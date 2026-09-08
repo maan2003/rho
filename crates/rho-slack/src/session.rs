@@ -499,10 +499,6 @@ impl Session {
         if let Some(id) = mirror.self_id(&workspace) {
             self.model.set_self(id);
         }
-        // Before the units are read, because a channel the reader opted
-        // into is one whose ordinary traffic raises units: read the opt-in
-        // after and a restart would forget every card it earned.
-        self.model.set_watched(mirror.watched(&workspace));
         self.model.set_reacted_with(mirror.reacted_with(&workspace));
         seed_read_cursors(&mut self.model, &mirror);
         // The units as the last run left them: one range scan, one row per
@@ -1968,38 +1964,6 @@ impl Session {
         }));
     }
 
-    /// Opts the reader into a channel, or out of it: the standing word that
-    /// this channel's ordinary traffic is to be handed to them rather than
-    /// left in the list with a count.
-    ///
-    /// Slack has nothing to say about this, so nothing is sent: it is rho's
-    /// own fact and it goes straight to rho's own file. Opting in takes
-    /// effect on what the mirror already holds, so a channel opted into
-    /// this second raises the cards its unread traffic has earned rather
-    /// than waiting for the next message to arrive.
-    pub fn set_watching(
-        &mut self,
-        channel: &ChannelId,
-        watching: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.model.set_watching(channel, watching) {
-            return false;
-        }
-        if let Some(mirror) = self.mirror.as_ref() {
-            mirror.set_watched(&self.model.workspace().0.clone(), channel, watching);
-        }
-        if watching {
-            self.derive_units_from_mirror();
-        }
-        cx.notify();
-        true
-    }
-
-    pub fn watches(&self, channel: &ChannelId) -> bool {
-        self.model.watches(channel)
-    }
-
     /// Slack's ignore thread: the mute the user just made here, made
     /// everywhere they read Slack. One request, and rho keeps no
     /// subscription state of its own, so the socket's `thread_unsubscribed`
@@ -2781,6 +2745,7 @@ mod tests {
                 newest: Ts("300.0".into()),
                 newest_from_other: Some(Ts("300.0".into())),
                 newest_from_you: false,
+                others_replied: false,
                 first_seen_ms: 1_000,
             },
         );
@@ -2815,25 +2780,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    /// The opt-in is the reader's standing word, so it outlives the session
-    /// that made it. It is rho's own fact and lives in rho's own file.
-    #[test]
-    fn the_opt_in_comes_back_off_the_file_after_a_restart() {
-        let (_dir, mirror, mut model) = seeded();
-        let design = ChannelId("C1".into());
-        assert!(model.set_watching(&design, true));
-        mirror.set_watched("T1", &design, true);
-
-        let mut next = Model::new(crate::config::WorkspaceName("T1".into()));
-        next.set_watched(mirror.watched("T1"));
-        assert!(next.watches(&design));
-
-        mirror.set_watched("T1", &design, false);
-        let mut after = Model::new(crate::config::WorkspaceName("T1".into()));
-        after.set_watched(mirror.watched("T1"));
-        assert!(!after.watches(&design));
     }
 
     /// A restart is another source of the same messages and may only raise

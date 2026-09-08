@@ -844,7 +844,7 @@ fn render_row(row: &ConversationRow, now: i64) -> Vec<Span> {
         ));
     }
     // A number when there is one to give. Slack counts DMs for us and rho
-    // counts what it watched land; a channel unread since before the last
+    // counts what it has seen land; a channel unread since before the last
     // start has neither, and says so in words.
     if row.unread_count > 0 {
         waiting.push(Span::styled(
@@ -860,12 +860,6 @@ fn render_row(row: &ConversationRow, now: i64) -> Vec<Span> {
             _ => " · ",
         }));
         spans.push(span);
-    }
-    // The opt-in reads where it was made, and reads as a word rather than a
-    // glyph: a mark nobody can name is a mark nobody undoes.
-    if row.watched {
-        spans.push(Span::plain("  "));
-        spans.push(Span::styled("watched", Class::Muted));
     }
     if let Some(latest) = &row.latest {
         spans.push(Span::plain("  "));
@@ -900,7 +894,6 @@ mod tests {
             mention_count: mentions,
             unread_count: 0,
             muted: false,
-            watched: false,
             latest: None,
         }
     }

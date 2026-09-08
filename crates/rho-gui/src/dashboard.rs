@@ -40,6 +40,15 @@ const FYI_REPLY_PACE_DAYS: f64 = 3.0;
 /// ping of the same wait comes first; an agent the user just spoke to still
 /// outranks it through the recency bonus, which is far larger.
 const THREAD_REPLY_HEAD_START: f64 = 1.1;
+/// Unread traffic in a channel nobody addressed the user in. It starts far
+/// below a direct message or a thread they are in and fades instead of
+/// rising, so it can never overtake one however long it sits: a room is
+/// worth a look today and worth nothing by the weekend.
+const CHANNEL_TRAFFIC_HEAD_START: f64 = 0.3;
+/// What being answered by somebody else takes off a channel's card. The
+/// room is already being dealt with, so it falls under the floor in a
+/// little over two days instead of four.
+const CHANNEL_ANSWERED_DROP: f64 = 0.6;
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
@@ -151,13 +160,15 @@ pub struct SlackFacts {
     /// message: the wait a `needs reply` card rises on, and the age a
     /// `replied` card decays from.
     pub wait_days: f64,
-    /// Who the ball is with, when it is not the user.
-    pub waiting_on: Option<String>,
     /// The newest message in the unit: a new one voids a skip.
     pub latest: String,
     /// The newest message from someone else, which is what a verdict cursor
     /// is compared against. `None` when only the user has written here.
     pub newest_from_other: Option<String>,
+    /// Whether somebody else has already answered in this run. A room where
+    /// the talk is going on without the reader asks for them less, so a
+    /// channel's card is lower again for it.
+    pub others_replied: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2072,11 +2083,22 @@ pub(crate) fn thread_card_facts(
     let reason = thread
         .reason
         .map(|reason| rho_slack::model::reason_text(reason, &thread.conversation));
-    let (state, priority) = match thread.waiting_on.is_some() {
-        // The user answered: the thread is theirs to carry now, so the card
-        // is a reminder that fades, not a demand that grows.
-        true => ("replied", fyi_reply_priority(thread.wait_days)),
-        false => (
+    // A room is not a person waiting: it fades from the moment it is seen,
+    // and lower again when somebody else is already answering in it. A
+    // mention in the same room is not this card — it carries `Mentioned`
+    // and rises like any other ping.
+    let (state, priority) = match thread.reason {
+        Some(rho_slack::model::Attention::ChannelTraffic) => {
+            let answered = match thread.others_replied {
+                true => CHANNEL_ANSWERED_DROP,
+                false => 0.0,
+            };
+            (
+                "unread",
+                CHANNEL_TRAFFIC_HEAD_START - answered - thread.wait_days / FYI_REPLY_PACE_DAYS,
+            )
+        }
+        _ => (
             "needs reply",
             THREAD_REPLY_HEAD_START + BLOCKED_REPLY_SLOPE_PER_DAY * thread.wait_days,
         ),
@@ -2105,18 +2127,18 @@ mod tests {
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let thread = |waiting_on: Option<&str>, wait_days: f64| SlackFacts {
+        let thread = |wait_days: f64| SlackFacts {
             title: "can you look at the deploy?".into(),
             conversation: "#design".into(),
             raised_at: now - chrono::Duration::days(2),
             wait_days,
-            waiting_on: waiting_on.map(str::to_owned),
             latest: "500.0".into(),
             newest_from_other: Some("500.0".into()),
+            others_replied: false,
             reason: Some(rho_slack::model::Attention::FollowedThread),
         };
 
-        let (label, priority) = thread_card_facts(&thread(None, 2.0), now);
+        let (label, priority) = thread_card_facts(&thread(2.0), now);
         assert_eq!(
             label, "a reply in a followed thread in #design · needs reply · 2.0d",
             "the card says why it is here before it says whose turn it is"
@@ -2128,17 +2150,59 @@ mod tests {
             priority,
             THREAD_REPLY_HEAD_START + 2.0 * BLOCKED_REPLY_SLOPE_PER_DAY
         );
+    }
 
-        // Answering flips the word and the curve: the card fades from the
-        // reply instead of rising, and is under the floor after three days.
-        let (label, replied) = thread_card_facts(&thread(Some("#design"), 2.0), now);
-        assert_eq!(
-            label,
-            "a reply in a followed thread in #design · replied · 2.0d"
+    /// A room is not a person waiting. It says `unread`, it starts far
+    /// below a thread of any age, it fades instead of rising, and it drops
+    /// further still when the talk is going on without the reader.
+    ///
+    /// There is no `replied` card any more: a unit the reader answered has
+    /// no attention at all until somebody answers back, which the model
+    /// says by giving it no reason.
+    #[test]
+    fn a_channel_fades_and_never_overtakes_a_thread() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let room = |wait_days: f64, others_replied: bool| SlackFacts {
+            title: "deploy is green".into(),
+            conversation: "#random".into(),
+            raised_at: now - chrono::Duration::days(2),
+            wait_days,
+            latest: "500.0".into(),
+            newest_from_other: Some("500.0".into()),
+            others_replied,
+            reason: Some(rho_slack::model::Attention::ChannelTraffic),
+        };
+        let thread = |wait_days: f64| SlackFacts {
+            reason: Some(rho_slack::model::Attention::FollowedThread),
+            conversation: "#design".into(),
+            ..room(wait_days, false)
+        };
+
+        let (label, fresh) = thread_card_facts(&room(0.0, false), now);
+        assert_eq!(label, "unread in #random · unread · 0m");
+        assert_eq!(fresh, CHANNEL_TRAFFIC_HEAD_START);
+
+        // Under the floor in four days, and in a little over two when
+        // somebody else is already answering in there.
+        assert!(thread_card_facts(&room(3.0, false), now).1 > DEAL_QUEUE_FLOOR);
+        assert!(thread_card_facts(&room(4.0, false), now).1 <= DEAL_QUEUE_FLOOR);
+        assert!(thread_card_facts(&room(2.0, true), now).1 > DEAL_QUEUE_FLOOR);
+        assert!(thread_card_facts(&room(2.5, true), now).1 <= DEAL_QUEUE_FLOOR);
+        assert!(
+            thread_card_facts(&room(1.0, true), now).1
+                < thread_card_facts(&room(1.0, false), now).1,
+            "a room being answered without the reader asks for them less"
         );
-        assert_eq!(replied, fyi_reply_priority(2.0));
-        assert!(replied > DEAL_QUEUE_FLOOR);
-        assert!(thread_card_facts(&thread(Some("#design"), 3.5), now).1 <= DEAL_QUEUE_FLOOR);
+
+        // The oldest room there can be against the freshest thread there
+        // can be: the room is still below it, because the curves never
+        // cross.
+        assert!(fresh < thread_card_facts(&thread(0.0), now).1);
     }
 
     #[test]

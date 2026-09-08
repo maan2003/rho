@@ -172,7 +172,6 @@ fn model(mirror: &Mirror, name: &WorkspaceName) -> Model {
     }
     model.add_users(mirror.users(&name.0));
     model.add_conversations(mirror.conversations(&name.0));
-    model.set_watched(mirror.watched(&name.0));
     seed_read_cursors(&mut model, mirror);
     model
 }

@@ -81,8 +81,8 @@ pub struct ThreadKey {
     pub thread_ts: Ts,
 }
 
-/// Why a thread is rho's business at all. Channel traffic the user was not
-/// addressed in never becomes an item, so this is a closed set.
+/// Why a unit is rho's business at all: the strongest thing that has
+/// happened in it, which is a closed set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reason {
     /// The user was named, by handle, group, or a channel-wide broadcast.
@@ -91,10 +91,10 @@ pub enum Reason {
     DirectMessage,
     /// A reply in a thread the user has posted in.
     Thread,
-    /// Ordinary traffic in a channel the reader asked rho to watch. Slack
-    /// would not badge it as a ping, but the reader said this channel is
-    /// one they want handed to them, and that opt-in is rho's own fact.
-    Watched,
+    /// Ordinary traffic in a channel the reader is in. Slack would not
+    /// badge it as a ping; a room with something unread in it still asks
+    /// for the reader, quietly and on its own curve.
+    Channel,
 }
 
 /// Where a conversation lives, for the one line of chrome above a thread.

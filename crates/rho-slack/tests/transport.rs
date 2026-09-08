@@ -1644,9 +1644,16 @@ async fn only_what_slack_would_badge_is_handed_over() {
         reasons,
         vec![
             "mentioned in #design".to_owned(),
+            "unread in #random".to_owned(),
             "unread in @ada".to_owned()
         ],
-        "two cards, longest wait first, each saying what it is for; #random is not among them"
+        "three cards, longest wait first, each saying what it is for"
+    );
+    assert!(
+        cards
+            .iter()
+            .any(|card| card.conversation == "#random" && card.others_replied),
+        "and the room nobody addressed the reader in has two voices in it"
     );
 
     // The reader reads the mention on their phone. Slack recomputes its own
@@ -1664,22 +1671,21 @@ async fn only_what_slack_would_badge_is_handed_over() {
             .into_iter()
             .map(|card| card.conversation)
             .collect::<Vec<_>>(),
-        vec!["@ada".to_owned()]
+        vec!["#random".to_owned(), "@ada".to_owned()],
+        "the mention is gone; the room and the direct message are not"
     );
 
-    // And the reader opts into #random, which is the one way a channel with
-    // plain traffic becomes theirs.
-    let random = ChannelId("C2".into());
-    assert!(model.set_watching(&random, true));
-    let history = client.conversations_history(&random, None).await.unwrap();
-    for message in &history.messages {
-        model.note_message(message, 0);
-    }
-    let cards = model.cards(0);
-    assert!(
-        cards.iter().any(|card| card.conversation == "#random"
-            && card.attention == Some(rho_slack::model::Attention::WatchedChannel)),
-        "opted into, so what lands there is handed over"
+    // And the room goes the same way: Slack's own cursor moving past it,
+    // from whichever client moved it, is what ends the asking.
+    fake.live_mark("C2", None);
+    model.set_counts(client.counts().await.unwrap().conversations);
+    assert_eq!(
+        model
+            .cards(0)
+            .into_iter()
+            .map(|card| card.conversation)
+            .collect::<Vec<_>>(),
+        vec!["@ada".to_owned()]
     );
 }
 
