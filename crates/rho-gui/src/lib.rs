@@ -61,7 +61,6 @@ actions!(
         DashboardJump,
         DashboardGoto,
         DashboardToggleAgentTree,
-        DashboardToggleSubagents,
         DashboardCycleGlobal,
         DashboardHeadingBelow,
         DashboardHeadingAbove,
@@ -583,8 +582,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("enter", RailOpen, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
-            KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
-            KeyBinding::new("z a", DashboardToggleSubagents, Some(context)),
             KeyBinding::new("shift-tab", DashboardCycleGlobal, Some(context)),
             KeyBinding::new("> >", DashboardDemote, Some(context)),
             KeyBinding::new("< <", DashboardPromote, Some(context)),
