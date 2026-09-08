@@ -97,6 +97,13 @@ pub struct Loaded {
     /// them, so the reader sees what they sent without being told it
     /// arrived before it did.
     pending: Vec<Ts>,
+    /// Why the last attempt to load this conversation's history failed, if
+    /// it did. Drawn as a line above the transcript, and cleared by the next
+    /// page that lands — which is why nothing but a load may write it. A
+    /// failed send has no page coming to clear it, so its error would sit
+    /// there over history the reader has since scrolled past, still saying
+    /// so after they retried and got through; a write says what happened in
+    /// the notice line instead, once, beside the composer it happened at.
     pub error: Option<String>,
     /// Bumped by every change to `messages`, so a surface knows whether what
     /// it is showing is current.
@@ -2074,9 +2081,6 @@ impl Session {
                                 loaded.drop_local(&local);
                             }
                         }
-                        if let Some(loaded) = session.loaded.get_mut(&source) {
-                            loaded.error = Some(error.clone());
-                        }
                         // Said once, where the user reads what rho has to
                         // tell them: a send that did not happen is not a
                         // detail of the conversation surface.
@@ -2149,7 +2153,6 @@ impl Session {
         };
         let channel = source.channel().clone();
         let thread_ts = source.thread_ts().cloned();
-        let source = source.clone();
         // A caption is a message like any other: a name in it has to reach
         // the person named.
         let text = self.model.encode(&text);
@@ -2166,10 +2169,11 @@ impl Session {
             if let Err(error) = &sent {
                 tracing::warn!(error = %error, "slack file send failed");
                 let message = format!("{error:#}");
-                let _ = this.update(cx, |session, cx| {
-                    if let Some(loaded) = session.loaded.get_mut(&source) {
-                        loaded.error = Some(message);
-                    }
+                let _ = this.update(cx, |_, cx| {
+                    // The same word a refused send gets. The surface has
+                    // already put the picture and the caption back on the
+                    // chip; this is what says why they came back.
+                    cx.emit(SessionEvent::Notice(format!("slack: {message}")));
                     cx.notify();
                 });
             }
@@ -2180,9 +2184,9 @@ impl Session {
     /// Rewrites a message the reader already sent. What appears is Slack's
     /// own `message_changed` coming back down the socket, so the screen
     /// shows the edit that landed rather than the one that was asked for.
-    /// Posts a rewrite of a message already sent. The answer says whether it
-    /// went, the same as `send`, so the surface can put a refused rewrite
-    /// back in the reader's hands rather than drop it.
+    /// The answer says whether it went, the same as `send`, so the surface
+    /// can put a refused rewrite back in the reader's hands rather than
+    /// drop it.
     pub fn edit_message(
         &mut self,
         source: &Source,
@@ -2208,7 +2212,6 @@ impl Session {
         // was the one way to type `@ada` in rho and have nobody told.
         let text = self.model.encode(&text);
         let channel = source.channel().clone();
-        let source = source.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client.update_message(&channel, &ts, &text).await
         });
@@ -2225,10 +2228,7 @@ impl Session {
                 Err(error) => format!("{error:#}"),
             };
             tracing::warn!(error = %error, "slack edit failed");
-            let _ = this.update(cx, |session, cx| {
-                if let Some(loaded) = session.loaded.get_mut(&source) {
-                    loaded.error = Some(error.clone());
-                }
+            let _ = this.update(cx, |_, cx| {
                 // Said once, where the user reads what rho has to tell them,
                 // the same as a send that did not happen.
                 cx.emit(SessionEvent::Notice(format!("slack: {error}")));
