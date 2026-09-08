@@ -94,6 +94,7 @@ struct ProfileCheckpoint {
     final_written: AtomicBool,
     frame_path: PathBuf,
     editor_path: PathBuf,
+    work_path: PathBuf,
 }
 
 struct ProfileState {
@@ -139,6 +140,43 @@ struct FrameRecord {
     finish_ns: u64,
     dirty_to_draw_ns: Option<u64>,
     invalidations: u64,
+}
+
+/// Main-thread work outside any frame, as a rig session leaves it behind.
+///
+/// The frame log accounts for time inside `Window::draw`, so the work that
+/// makes the *next* frame late is in neither it nor the editor log: a run
+/// could say a desk sync was slow only through a telemetry report the user
+/// sent, which is not something a rig can produce. `owners` against
+/// `work_units` is the per-event side of the cost rule, the way
+/// `input_rows` is for a stage.
+#[derive(serde::Serialize)]
+struct WorkProfile {
+    span_count: usize,
+    /// How many spans have ever been pushed, against however many the ring
+    /// still holds: without it a total here is a total over an unknown
+    /// window.
+    pushed: u64,
+    owners: BTreeMap<&'static str, WorkOwnerSummary>,
+    spans: Vec<WorkRecord>,
+}
+
+#[derive(serde::Serialize)]
+struct WorkOwnerSummary {
+    count: usize,
+    duration_ms: Distribution,
+    work_units: Distribution,
+    /// What the whole owner cost, which is the number a run is judged on:
+    /// a cheap span run often is not cheap.
+    total_ms: f64,
+}
+
+#[derive(serde::Serialize)]
+struct WorkRecord {
+    owner: &'static str,
+    start_ns: u64,
+    duration_ns: u64,
+    work_units: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -229,6 +267,7 @@ fn run() -> Result<()> {
             let cpu = rho_profiling::CpuProfiler::start(path)?;
             let frame_path = rho_profiling::sidecar_path(cpu.path(), ".frames.json");
             let editor_path = rho_profiling::sidecar_path(cpu.path(), ".editor.json");
+            let work_path = rho_profiling::sidecar_path(cpu.path(), ".work.json");
             Ok::<_, anyhow::Error>(GuiProfiler {
                 checkpoint: Arc::new(ProfileCheckpoint {
                     state: Mutex::new(ProfileState {
@@ -242,6 +281,7 @@ fn run() -> Result<()> {
                     final_written: AtomicBool::new(false),
                     frame_path,
                     editor_path,
+                    work_path,
                 }),
                 cpu,
                 draw_tid: 0,
@@ -402,6 +442,10 @@ fn finish_profiling(profiler: GuiProfiler) {
                 "rho-gui: wrote editor profile to {}",
                 profiler.checkpoint.editor_path.display()
             );
+            eprintln!(
+                "rho-gui: wrote main-thread work profile to {}",
+                profiler.checkpoint.work_path.display()
+            );
         }
         Err(error) => eprintln!("rho-gui: failed to write GUI profile: {error:#}"),
     }
@@ -480,8 +524,12 @@ impl ProfileCheckpoint {
             return Ok(());
         }
         WRITING_PROFILE.set(true);
+        // The work ring is global and keeps its own history, so it is read
+        // here rather than collected into the snapshot: there is nothing
+        // per-checkpoint to accumulate.
         let result = export_frame_profile(&self.frame_path, snapshot.frames.clone())
-            .and_then(|()| export_editor_profile(&self.editor_path, snapshot.editor.clone()));
+            .and_then(|()| export_editor_profile(&self.editor_path, snapshot.editor.clone()))
+            .and_then(|()| export_work_profile(&self.work_path));
         WRITING_PROFILE.set(false);
         result
     }
@@ -618,6 +666,50 @@ fn export_editor_profile(path: &Path, timings: Vec<gpui::profiler::EditorTiming>
         event_count: events.len(),
         stages,
         events,
+    };
+    write_json_atomic(path, &profile)
+}
+
+fn export_work_profile(path: &Path) -> Result<()> {
+    let (work, pushed) = gpui::profiler::snapshot_main_thread_work();
+    let anchor = work.first().map(|work| work.start);
+    let spans = work
+        .into_iter()
+        .map(|work| WorkRecord {
+            owner: rho_gui::telemetry::main_thread_work_owner(work.owner),
+            start_ns: anchor
+                .map(|anchor| duration_ns(work.start.saturating_duration_since(anchor)))
+                .unwrap_or(0),
+            duration_ns: duration_ns(work.end.saturating_duration_since(work.start)),
+            work_units: work.work_units,
+        })
+        .collect::<Vec<_>>();
+    let mut grouped = BTreeMap::<_, Vec<&WorkRecord>>::new();
+    for span in &spans {
+        grouped.entry(span.owner).or_default().push(span);
+    }
+    let owners = grouped
+        .into_iter()
+        .map(|(owner, spans)| {
+            (
+                owner,
+                WorkOwnerSummary {
+                    count: spans.len(),
+                    duration_ms: distribution(
+                        spans.iter().map(|span| span.duration_ns),
+                        1_000_000.0,
+                    ),
+                    work_units: distribution(spans.iter().map(|span| span.work_units), 1.0),
+                    total_ms: spans.iter().map(|span| span.duration_ns).sum::<u64>() as f64 / 1e6,
+                },
+            )
+        })
+        .collect();
+    let profile = WorkProfile {
+        span_count: spans.len(),
+        pushed,
+        owners,
+        spans,
     };
     write_json_atomic(path, &profile)
 }
@@ -773,6 +865,7 @@ mod profile_checkpoint_tests {
     fn checkpoint(directory: &Path) -> ProfileCheckpoint {
         let frame_path = directory.join("run.frames.json");
         let editor_path = directory.join("run.editor.json");
+        let work_path = directory.join("run.work.json");
         ProfileCheckpoint {
             state: Mutex::new(ProfileState {
                 frames: gpui::profiler::FrameTimingCollector::new(),
@@ -785,6 +878,7 @@ mod profile_checkpoint_tests {
             final_written: AtomicBool::new(false),
             frame_path: frame_path.clone(),
             editor_path: editor_path.clone(),
+            work_path: work_path.clone(),
         }
     }
 
@@ -793,8 +887,10 @@ mod profile_checkpoint_tests {
         let directory = tempfile::tempdir().unwrap();
         let frame_path = directory.path().join("run.frames.json");
         let editor_path = directory.path().join("run.editor.json");
+        let work_path = directory.path().join("run.work.json");
         fs::write(&frame_path, "incomplete").unwrap();
         fs::write(&editor_path, "incomplete").unwrap();
+        fs::write(&work_path, "incomplete").unwrap();
         let checkpoint = checkpoint(directory.path());
 
         flush_profile_after_panic(&checkpoint);
@@ -803,9 +899,12 @@ mod profile_checkpoint_tests {
             .expect("the panic-side frame checkpoint is complete JSON");
         let editor: serde_json::Value = serde_json::from_slice(&fs::read(&editor_path).unwrap())
             .expect("the panic-side editor checkpoint is complete JSON");
+        let work: serde_json::Value = serde_json::from_slice(&fs::read(&work_path).unwrap())
+            .expect("the panic-side work checkpoint is complete JSON");
         assert!(frames["frames"].is_array());
         assert!(editor["events"].is_array());
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert!(work["spans"].is_array());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
     }
 
     #[test]
@@ -826,5 +925,6 @@ mod profile_checkpoint_tests {
 
         assert!(checkpoint.frame_path.exists());
         assert!(checkpoint.editor_path.exists());
+        assert!(checkpoint.work_path.exists());
     }
 }

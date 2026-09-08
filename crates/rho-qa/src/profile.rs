@@ -1,11 +1,12 @@
 //! Reading back what a rig's GUI wrote while it ran.
 //!
 //! Every `rig up` runs the GUI with the profiler on, and every `rig down`
-//! leaves three files behind: the frame log, the editor log and the CPU
-//! profile. The numbers a landing note needs are all in them, and until now
-//! getting at them meant standing a viewer up over the directory. So `rig
-//! down` reads them itself and prints one line: the worst frame gap, how many
-//! frames went over budget, and where the main thread actually was.
+//! leaves four files behind: the frame log, the editor log, the log of
+//! main-thread work outside any frame, and the CPU profile. The numbers a
+//! landing note needs are all in them, and until now getting at them meant
+//! standing a viewer up over the directory. So `rig down` reads them itself and
+//! prints one line: the worst frame gap, how many frames went over budget, and
+//! where the main thread actually was.
 //!
 //! The frame and editor logs are JSON the GUI writes on the way out. The CPU
 //! profile is a Dial9 trace, which is symbolized where it is written — the
@@ -45,6 +46,10 @@ pub struct Summary {
     /// The editor stage with the worst p99, and the rows it had in hand —
     /// the pair is the per-event side of the cost rule.
     pub slowest_stage: Option<Stage>,
+    /// What the main thread did between frames, by owner and costliest
+    /// first. A frame number cannot see any of this, and it is what makes
+    /// the next frame late.
+    pub work: Vec<Work>,
     pub events: u64,
     /// Where the samples landed, deepest frame first, richest three.
     pub top: Vec<Symbol>,
@@ -62,6 +67,21 @@ pub struct Stage {
     pub rows_p99: f64,
 }
 
+/// One owner's share of the work between frames. `units` is what the owner
+/// counts — agents an event named, rows patched — so `per_unit` is the
+/// per-event side of the cost rule for work that has no rows: an owner
+/// whose span cost follows the desk rather than what the event named is
+/// the failure this exists to show.
+#[derive(Serialize, Deserialize)]
+pub struct Work {
+    pub owner: String,
+    pub spans: usize,
+    pub total_ms: f64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub units: f64,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
@@ -73,6 +93,7 @@ pub struct Symbol {
 pub fn summarize(profile: &Path) -> Result<Summary> {
     let frames: FrameLog = read_json(&sidecar(profile, ".frames.json"))?;
     let editor: EditorLog = read_json(&sidecar(profile, ".editor.json")).unwrap_or_default();
+    let work: WorkLog = read_json(&sidecar(profile, ".work.json")).unwrap_or_default();
     let cpu = symbols(&cpu_path(profile)).unwrap_or_default();
 
     let over_budget = frames
@@ -98,6 +119,20 @@ pub fn summarize(profile: &Path) -> Result<Summary> {
             rows_p99: stage.input_rows.p99,
         });
 
+    let mut work = work
+        .owners
+        .into_iter()
+        .map(|(owner, log)| Work {
+            owner,
+            spans: log.count,
+            total_ms: log.total_ms,
+            p50_ms: log.duration_ms.p50,
+            p99_ms: log.duration_ms.p99,
+            units: log.work_units.p50,
+        })
+        .collect::<Vec<_>>();
+    work.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
+
     let mut summary = Summary {
         profile: profile
             .file_name()
@@ -111,6 +146,7 @@ pub fn summarize(profile: &Path) -> Result<Summary> {
         worst_gap_ms,
         gap_p99_ms: frames.summary.dirty_to_draw_ms.p99,
         slowest_stage,
+        work,
         events: editor.event_count,
         top: cpu.top,
         samples: cpu.samples,
@@ -131,6 +167,15 @@ impl Summary {
             line.push_str(&format!(
                 "; {} events, slowest stage {} p99 {:.2} ms at {:.0} rows",
                 self.events, stage.name, stage.p99_ms, stage.rows_p99
+            ));
+        }
+        // Costliest owner only: the point of the line is that work between
+        // frames exists and how much of it there is, and the sidecar holds
+        // the rest for anyone who asks.
+        if let Some(work) = self.work.first() {
+            line.push_str(&format!(
+                "; between frames {} {} spans {:.0} ms total, p50 {:.2} p99 {:.2} ms at {:.0} units",
+                work.owner, work.spans, work.total_ms, work.p50_ms, work.p99_ms, work.units
             ));
         }
         if self.top.is_empty() {
@@ -190,6 +235,20 @@ struct Frame {
 }
 
 #[derive(Default, Deserialize)]
+struct WorkLog {
+    #[serde(default)]
+    owners: std::collections::BTreeMap<String, WorkOwnerLog>,
+}
+
+#[derive(Deserialize)]
+struct WorkOwnerLog {
+    count: usize,
+    total_ms: f64,
+    duration_ms: Distribution,
+    work_units: Distribution,
+}
+
+#[derive(Default, Deserialize)]
 struct EditorLog {
     #[serde(default)]
     event_count: u64,
@@ -205,6 +264,8 @@ struct StageLog {
 
 #[derive(Default, Deserialize)]
 struct Distribution {
+    #[serde(default)]
+    p50: f64,
     #[serde(default)]
     p99: f64,
     #[serde(default)]
@@ -383,6 +444,7 @@ mod tests {
             worst_gap_ms: 10.8,
             gap_p99_ms: 10.8,
             slowest_stage: None,
+            work: Vec::new(),
             events: 0,
             top: Vec::new(),
             samples: 0,
@@ -401,6 +463,14 @@ mod tests {
                 rows_p99: 2.0,
             }),
             events: 11471,
+            work: vec![Work {
+                owner: "desk_sync".to_owned(),
+                spans: 412,
+                total_ms: 913.4,
+                p50_ms: 1.84,
+                p99_ms: 6.02,
+                units: 1.0,
+            }],
             top: vec![Symbol {
                 name: "memcpy".to_owned(),
                 share: 0.1333,
@@ -413,6 +483,7 @@ mod tests {
             full.render(),
             "81 frames, draw p99 3.6 ms, 0 over 4 ms; worst gap 11 ms, p99 11 ms; \
              11471 events, slowest stage buffer_edit p99 0.04 ms at 2 rows; \
+             between frames desk_sync 412 spans 913 ms total, p50 1.84 p99 6.02 ms at 1 units; \
              90 samples on rho-gui: memcpy 13%"
         );
     }

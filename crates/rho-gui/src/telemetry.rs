@@ -562,7 +562,10 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn main_thread_work_owner(kind: gpui::profiler::MainThreadWorkKind) -> &'static str {
+/// What a span of main-thread work is called in a report or a profile.
+/// Public because the rig's `.work.json` sidecar names owners the same way,
+/// and two spellings of `desk_sync` would be two things to a reader.
+pub fn main_thread_work_owner(kind: gpui::profiler::MainThreadWorkKind) -> &'static str {
     use gpui::profiler::MainThreadWorkKind::*;
     match kind {
         ModelEvent => "model_event",

@@ -656,7 +656,7 @@ the rule is about growth, and growth only shows at size. Say which snapshot in
 the note.
 
 *What the rig already writes.* Every `rig up` runs the GUI with the profiler
-on, and `rig down` leaves three files in the rig's `profiles/`:
+on, and `rig down` leaves four files in the rig's `profiles/`:
 
 - `<name>.bin.frames.json` — per frame `draw_ns`, `prepaint_ns`, `paint_ns`,
   `finish_ns`, `dirty_to_draw_ns`, `invalidations`, and a summary with
@@ -664,16 +664,28 @@ on, and `rig down` leaves three files in the rig's `profiles/`:
 - `<name>.bin.editor.json` — per stage `count`, `duration_ms` percentiles and
   **`input_rows`**. `input_rows` against `duration_ms` is the per-event side:
   it is the evidence that work is O(touched) and not O(all).
+- `<name>.bin.work.json` — main-thread work that happened **outside any
+  frame**, per span and summarised per owner: `count`, `duration_ms`
+  percentiles, `work_units` and the owner's total. The frame log accounts for
+  time inside `Window::draw` and nothing else, so the work that makes the
+  *next* frame late is in neither of the two above. This is the file that
+  answers "what did one event cost the main thread", and its `work_units` is
+  to a span what `input_rows` is to a stage: an owner whose span cost follows
+  the desk rather than what the event named is O(all) again, wearing a
+  different disguise. Until 2026-09-08 the ring behind it was readable only
+  through a telemetry report the user sent, which is not something a rig can
+  produce, so no rig run could see this at all.
 - `<name>.0.bin.gz` — the CPU profile, for when the two above say something is
   wrong but not where. It is symbolized where it was written — the frames in it
   carry Rust names, not bare addresses — so reading it needs the trace decoder
   and not the binary it came from. `dial9 serve --local-dir .` opens the whole
   thing when you need the flame graph.
 
-`rig down` reads all three and prints the line the run earned: frames drawn,
+`rig down` reads all four and prints the line the run earned: frames drawn,
 `draw_ms` p99, how many frames went over the 4 ms budget, the worst
 dirty-to-draw gap and its p99, the editor stage with the worst p99 and the rows
-it had in hand, and where the GUI thread's samples landed. The same line goes
+it had in hand, the costliest owner of the work between frames with its spans,
+total and percentiles, and where the GUI thread's samples landed. The same line goes
 into the rig's session entry in `rig.json`, so a landing note quotes the run
 instead of re-deriving it. `rho-qa profile <name>.bin` prints it again for any
 session, including an old one.
@@ -686,7 +698,11 @@ session, including an old one.
    second is the one the user feels, because it is the wait between something
    changing and the pixels moving.
 3. From `editor.json`: for each stage the change touches, `duration_ms` p99 and
-   the `input_rows` beside it.
+   the `input_rows` beside it. From `work.json`: for each owner the change
+   touches, `duration_ms` p50 and p99 against `work_units`. A change to how an
+   event is answered — a map patched instead of rebuilt, a source read instead
+   of walked — shows up in the second file and in no other, because none of it
+   happens inside a frame.
 4. Repeat on a snapshot half the size, or with half the rows in view. Both
    numbers should move with what is drawn or touched, not with what exists.
 
@@ -778,7 +794,8 @@ produce.
 - `dirty_to_draw_ms` p99 above 50 ms: a visible lag between act and paint.
 - A stage whose `duration_ms` grows with the snapshot while its `input_rows`
   does not: that is O(all) wearing O(touched)'s clothes, and it is the failure
-  the rule exists to catch.
+  the rule exists to catch. The same reading applies to an owner in
+  `work.json` against its `work_units`.
 - Any main-thread sample inside ingest, dealing or the store in the CPU
   profile: the main thread does nothing but draw.
 
