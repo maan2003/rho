@@ -572,10 +572,11 @@ pub struct Workspace {
     menu_buffer: Option<MenuBuffer>,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
-    /// Focus beneath the single modal overlay. Transients, minibuffers, and
-    /// Git approval hand this target between them so borrowing keyboard
-    /// focus never changes dashboard/work mode.
-    overlay_return_focus: Option<gpui::FocusHandle>,
+    /// Focus beneath the single modal overlay. Transients, minibuffers,
+    /// menus and Git approval hand this target between them so borrowing
+    /// keyboard focus never changes dashboard/work mode: see
+    /// [`crate::overlay::OverlayFocus`].
+    overlay_focus: crate::overlay::OverlayFocus,
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
@@ -1147,7 +1148,7 @@ impl Workspace {
             minibuffer: None,
             transient_focus: cx.focus_handle(),
             menu_buffer: None,
-            overlay_return_focus: None,
+            overlay_focus: crate::overlay::OverlayFocus::default(),
             echo: None,
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
@@ -2332,6 +2333,11 @@ impl Workspace {
                 prompt,
                 response,
             } => {
+                // Deliberately not has_modal_overlay: an open menu does
+                // not deny the request. Denying answers the daemon with a
+                // no, and a menu is a choice with nothing typed into it,
+                // reopened at no cost — a prompt has the reader's text in
+                // it, and that is what "another prompt is active" means.
                 if self.minibuffer.is_some() || self.git_approval.waiting() {
                     let _ = response.send(GitApprovalDecision::Deny);
                     let source = self.error_source(host);
@@ -2352,7 +2358,7 @@ impl Workspace {
                     false => prompt,
                 };
                 self.git_approval.ask(request_id, prompt, response);
-                self.capture_overlay_focus(window, cx);
+                self.overlay_focus.capture(window, cx);
                 window.focus(self.git_approval.focus_handle(), cx);
                 self.echo = None;
                 cx.notify();
@@ -6451,7 +6457,7 @@ impl Workspace {
         }
         let handle = self.active_surface_focus(cx);
         if self.has_modal_overlay() {
-            self.overlay_return_focus = Some(handle);
+            self.overlay_focus.set(handle);
         } else {
             window.focus(&handle, cx);
         }
@@ -6726,7 +6732,7 @@ impl Workspace {
         rho_journal::record(rho_journal::Event::MinibufferOpened {
             prompt: prompt.to_string(),
         });
-        self.capture_overlay_focus(window, cx);
+        self.overlay_focus.capture(window, cx);
         let text_style = self
             .active_editor(cx)
             .update(cx, |editor, cx| editor.style(cx).text.clone());
@@ -6832,7 +6838,7 @@ impl Workspace {
         if self.menu_buffer.is_some() {
             return true;
         }
-        self.capture_overlay_focus(window, cx);
+        self.overlay_focus.capture(window, cx);
         self.show_menu(crate::transient::verdict_menu(), None, Back::Out, true);
         self.minibuffer = None;
         self.find_snapshot = None;
@@ -6852,7 +6858,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.capture_overlay_focus(window, cx);
+        self.overlay_focus.capture(window, cx);
         self.show_menu(menu, None, Back::Out, false);
         self.minibuffer = None;
         self.find_snapshot = None;
@@ -7202,25 +7208,17 @@ impl Workspace {
 
     /// Captures normal focus on the first overlay in a chain. Replacements
     /// such as transient -> minibuffer inherit the original target.
-    fn capture_overlay_focus(&mut self, window: &Window, cx: &App) {
-        if self.overlay_return_focus.is_none() {
-            self.overlay_return_focus = window.focused(cx);
-        }
-    }
-
-    fn restore_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.overlay_return_focus.clone() {
+    /// Gives focus back to whatever the chain of overlays borrowed it
+    /// from, and ends the chain. With nothing remembered the reader goes
+    /// to the surface they are on, which is where they would have been.
+    fn finish_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.overlay_focus.finish() {
             Some(handle) => {
                 window.focus(&handle, cx);
                 cx.notify();
             }
             None => self.focus_active_surface(window, cx),
         }
-    }
-
-    fn finish_overlay_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.restore_overlay_focus(window, cx);
-        self.overlay_return_focus = None;
     }
 
     /// Prompt for a path to open from the current agent's workspace.
@@ -9516,7 +9514,7 @@ impl Workspace {
             .preview()
             .is_some_and(|preview| preview.view.read(cx).focus_handle(cx).is_focused(window));
         self.overview_open
-            || self.overlay_return_focus.as_ref() == Some(&dashboard)
+            || self.overlay_focus.target() == Some(&dashboard)
             || browser_preview_focused
     }
 

@@ -13,6 +13,7 @@ pub(crate) mod git_approval;
 pub mod home;
 pub mod minibuffer;
 pub mod note_view;
+pub(crate) mod overlay;
 pub mod pane;
 pub mod rho_assets;
 #[cfg(test)]
