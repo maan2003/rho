@@ -177,6 +177,11 @@ pub struct Transcript<K, C, M, G = NoGutter> {
     /// Classes each bucket currently paints, so a bucket that loses a class
     /// clears it instead of leaving stale ranges behind.
     painted: HashMap<u32, HashSet<C>>,
+    /// Which items are in each bucket. Repainting a bucket needs its
+    /// members and nothing else, and a bucket holds at most [`BUCKET`] of
+    /// them, so this is what keeps a paint off the length of the
+    /// transcript.
+    members: HashMap<u32, HashSet<K>>,
     next_bucket: u32,
     /// Buckets re-sent by the last operation. Diagnostics, and what the
     /// tests assert on.
@@ -202,6 +207,7 @@ where
             index: HashMap::new(),
             attachments: Vec::new(),
             painted: HashMap::new(),
+            members: HashMap::new(),
             next_bucket: 0,
             last_painted: Vec::new(),
             gutter: None,
@@ -408,8 +414,16 @@ where
             .iter()
             .filter_map(|item| item.anchored_gutter.clone())
             .collect::<Vec<_>>();
-        let removed = self.items.splice(range.clone(), Vec::new()).count();
-        debug_assert_eq!(removed, range.len());
+        let gone = self
+            .items
+            .splice(range.clone(), Vec::new())
+            .collect::<Vec<_>>();
+        debug_assert_eq!(gone.len(), range.len());
+        for item in &gone {
+            if let Some(members) = self.members.get_mut(&item.bucket) {
+                members.remove(&item.key);
+            }
+        }
 
         let snapshot = self.buffer.read(cx).snapshot();
         let mut offset = start;
@@ -457,6 +471,12 @@ where
         drop(snapshot);
         let inserted = fresh.len();
         let at = range.start;
+        for item in &fresh {
+            self.members
+                .entry(item.bucket)
+                .or_default()
+                .insert(item.key.clone());
+        }
         self.items.splice(at..at, fresh);
         self.reindex(at);
         self.mark_gutter(dropped, at..at + inserted, cx);
@@ -522,10 +542,7 @@ where
     }
 
     fn bucket_len(&self, bucket: u32) -> usize {
-        self.items
-            .iter()
-            .filter(|item| item.bucket == bucket)
-            .count()
+        self.members.get(&bucket).map_or(0, HashSet::len)
     }
 
     fn reindex(&mut self, from: usize) {
@@ -544,23 +561,17 @@ where
         if buckets.is_empty() || self.attachments.is_empty() {
             return;
         }
-        let mut per_bucket: HashMap<u32, (Classes<C>, Classes<C>)> = HashMap::new();
         for bucket in buckets {
-            per_bucket.entry(*bucket).or_default();
-        }
-        for item in &self.items {
-            let Some((text, background)) = per_bucket.get_mut(&item.bucket) else {
-                continue;
-            };
-            for (class, range) in &item.anchored {
-                text.entry(*class).or_default().push(range.clone());
+            let (mut text, mut background): (Classes<C>, Classes<C>) = Default::default();
+            for index in self.rows_in(*bucket) {
+                let item = &self.items[index];
+                for (class, range) in &item.anchored {
+                    text.entry(*class).or_default().push(range.clone());
+                }
+                for (class, range) in &item.anchored_backgrounds {
+                    background.entry(*class).or_default().push(range.clone());
+                }
             }
-            for (class, range) in &item.anchored_backgrounds {
-                background.entry(*class).or_default().push(range.clone());
-            }
-        }
-        for bucket in buckets {
-            let (text, background) = per_bucket.remove(bucket).unwrap_or_default();
             // A class the bucket has lost still has ranges in the editor, so
             // it is re-sent empty rather than left behind.
             let present = text
@@ -624,6 +635,21 @@ where
             });
             true
         });
+    }
+
+    /// Where a bucket's items are, in display order. The order matters:
+    /// the editor is given a bucket's ranges as one list, and a list out of
+    /// order is a list it has to sort.
+    fn rows_in(&self, bucket: u32) -> Vec<usize> {
+        let mut rows = self
+            .members
+            .get(&bucket)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.index.get(key).copied())
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
     }
 
     fn apply(

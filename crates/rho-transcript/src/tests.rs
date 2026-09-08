@@ -422,3 +422,113 @@ fn a_marked_item_takes_the_gutter_and_gives_it_back(cx: &mut TestAppContext) {
     });
     assert_eq!(marked(cx), 1, "what left is unmarked");
 }
+
+/// One item replaced costs what it touches, whatever else is on screen.
+///
+/// The rule the surfaces hold to is per event O(rows the event touches) +
+/// O(log n), and a transcript is where an arriving message lands: a Slack
+/// conversation replaces one item when a reaction arrives, an agent's does
+/// it while a turn streams. Anything here that walks every item is that
+/// cost paid on every message.
+///
+/// What is timed is this crate's own work -- the buffer edit, the anchors,
+/// the highlights, the blocks -- and not what the editor does with it
+/// afterwards, which is the frame and is measured where the frame is.
+///
+/// What is asserted is the shape, not the wall clock: the same replacement
+/// is timed against a hundred items and against five thousand, and a cost
+/// that follows the transcript shows up as a ratio between the two. Not in
+/// the ordinary run, because a machine building on every core can make any
+/// ratio say anything. Run by name when the numbers are wanted:
+///
+/// ```text
+/// cargo test -p rho-transcript one_replacement_costs_what_it_touches \
+///     -- --ignored --nocapture
+/// ```
+#[gpui::test]
+#[ignore = "measures a per-event cost, so it needs a quiet machine"]
+fn one_replacement_costs_what_it_touches(cx: &mut TestAppContext) {
+    init_editor(cx);
+    let small = replacement_cost(cx, 100);
+    let big = replacement_cost(cx, 5000);
+    println!("100 items: {small:?}, 5000 items: {big:?}");
+    assert!(
+        big < small * SIZE_FACTOR,
+        "a replacement follows what it touched, not the transcript: \
+         {small:?} at a hundred items against {big:?} at five thousand"
+    );
+}
+
+/// How much dearer a replacement may be against fifty times the items.
+///
+/// Not one: a longer buffer is genuinely more text to edit into, and the
+/// anchor arithmetic behind one edit is not free either. What this catches
+/// is a replacement that walks the transcript, which is a ratio of tens.
+const SIZE_FACTOR: u32 = 4;
+
+/// How long one item's replacement takes, averaged over enough of them that
+/// a single scheduling hiccup does not carry the number.
+fn replacement_cost(cx: &mut TestAppContext, items: usize) -> std::time::Duration {
+    let (buffer, editor) = on_screen(cx);
+    let mut sheet = Sheet::new(buffer.clone());
+    let run = (0..items)
+        .map(|index| item(&format!("m{index}"), &format!("message {index}\n")))
+        .collect::<Vec<_>>();
+    cx.update(|cx| {
+        sheet.insert_before(None, run, cx);
+        sheet.attach(&editor, cx);
+    });
+
+    const REPLACEMENTS: usize = 50;
+    let spent = cx.update(|cx| {
+        let started = std::time::Instant::now();
+        for round in 0..REPLACEMENTS {
+            // Spread through the transcript rather than in one bucket, so
+            // no run of replacements can sit in a cache the real traffic
+            // would not.
+            let index = round * items / REPLACEMENTS;
+            let key = format!("m{index}");
+            sheet.replace(
+                &key,
+                item(&key, &format!("message {index} ({round})\n")),
+                cx,
+            );
+        }
+        started.elapsed()
+    });
+    spent / REPLACEMENTS as u32
+}
+
+/// A transcript in an editor in a window, which is what makes the paint and
+/// the blocks real: neither costs anything with nothing attached.
+fn on_screen(cx: &mut TestAppContext) -> (Entity<Buffer>, Entity<Editor>) {
+    let transcript = buffer(cx);
+    let multi_buffer = cx.update(|cx| {
+        cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::without_headers(Capability::Read);
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                transcript.clone(),
+                [Point::zero()..transcript.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multi_buffer
+        })
+    });
+    let window = cx.add_window(|window, cx| {
+        Editor::new(
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: true,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            },
+            multi_buffer.clone(),
+            None,
+            window,
+            cx,
+        )
+    });
+    let editor = window.root(cx).expect("the editor is the window's root");
+    (transcript, editor)
+}
