@@ -13,20 +13,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gpui::{Entity, Subscription, Task};
-use rho_browser::{PageId, PageView};
+use gpui::{Subscription, Task};
+use rho_browser::PageId;
 
 /// How long a page nothing refers to is kept before it is closed.
 pub(crate) const GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// The page shown beside the dashboard, and the view drawing it.
-pub(crate) struct Preview {
-    pub(crate) id: PageId,
-    pub(crate) view: Entity<PageView>,
-}
-
-/// Which pages the desk knows about, which are waiting to be closed, and
-/// which one is being previewed.
+/// Which pages the desk knows about and which are waiting to be closed.
 #[derive(Default)]
 pub(crate) struct Pages {
     /// What the map referred to at the last reconcile, kept only to notice
@@ -39,7 +32,6 @@ pub(crate) struct Pages {
     /// One subscription for the whole browser: the model polls the
     /// metadata revision, so a burst of new tabs arrives as one event.
     metadata: Option<Subscription>,
-    preview: Option<Preview>,
 }
 
 impl Pages {
@@ -84,26 +76,5 @@ impl Pages {
     /// Keeps the subscription that says when the browser has moved.
     pub(crate) fn observe(&mut self, subscription: Subscription) {
         self.metadata = Some(subscription);
-    }
-
-    /// The page beside the dashboard, if one is being previewed.
-    pub(crate) fn preview(&self) -> Option<&Preview> {
-        self.preview.as_ref()
-    }
-
-    /// Whether `page` is the one already being previewed, so showing it
-    /// again is not a change.
-    pub(crate) fn previewing(&self, page: PageId) -> bool {
-        self.preview.as_ref().is_some_and(|it| it.id == page)
-    }
-
-    /// Shows `page` beside the dashboard.
-    pub(crate) fn preview_page(&mut self, id: PageId, view: Entity<PageView>) {
-        self.preview = Some(Preview { id, view });
-    }
-
-    /// Stops previewing.
-    pub(crate) fn clear_preview(&mut self) {
-        self.preview = None;
     }
 }

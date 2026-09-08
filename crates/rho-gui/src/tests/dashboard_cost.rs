@@ -82,11 +82,11 @@ fn cost_of_one_agent_s_news(
     count: u64,
 ) -> (usize, usize, std::time::Duration) {
     let (workspace, agents) = desk_of_agents(cx, count);
-    let (composed, redrawn) = workspace
+    let (taken, patched) = workspace
         .update(cx, |workspace, _, _| {
-            workspace.dashboard.map_work_for_test()
+            workspace.dashboard.deal_work_for_test()
         })
-        .expect("read the map's work");
+        .expect("read the dealer's work");
 
     // One event is a noisy thing to time, and a single one could be paid
     // for out of work the build left pending. A run of them, each a real
@@ -117,12 +117,12 @@ fn cost_of_one_agent_s_news(
     }
     let took = started.elapsed() / EVENTS;
 
-    let (composed_after, redrawn_after) = workspace
+    let (taken_after, patched_after) = workspace
         .update(cx, |workspace, _, _| {
-            workspace.dashboard.map_work_for_test()
+            workspace.dashboard.deal_work_for_test()
         })
-        .expect("read the map's work");
-    (composed_after - composed, redrawn_after - redrawn, took)
+        .expect("read the dealer's work");
+    (taken_after - taken, patched_after - patched, took)
 }
 
 /// What one agent's news must cost, whatever the map's size.
@@ -132,22 +132,24 @@ fn cost_of_one_agent_s_news(
 /// satisfy every other assertion here trivially, which is the way a test
 /// like this is usually wrong.
 fn assert_one_agent_s_news_is_cheap(cx: &mut gpui::TestAppContext, count: u64) {
-    let (composed, redrawn, took) = cost_of_one_agent_s_news(cx, count);
-    eprintln!("{count} agents: composed {composed}, redrawn {redrawn}, {took:?} per event");
+    let (taken, patched, took) = cost_of_one_agent_s_news(cx, count);
+    eprintln!("{count} agents: taken {taken}, patched {patched}, {took:?} per event");
     assert!(
-        redrawn >= 32,
-        "one agent's news drew no row again on a map of {count} agents: the \
-         event reached nothing, so this measured nothing"
+        patched >= 32,
+        "one agent's news patched nothing on a desk of {count} agents: the \
+         event reached the dealer's source not at all, so this measured \
+         nothing"
     );
     assert_eq!(
-        composed, 0,
-        "one agent's news composed the map of {count} agents: the rows and \
-         their order did not move, so nothing needed composing"
+        taken, 0,
+        "one agent's news took the whole desk of {count} agents again; the \
+         nodes and their order did not move, so there was nothing to read \
+         again"
     );
     assert!(
-        redrawn <= 64,
-        "32 events drew {redrawn} rows again on a map of {count} agents; \
-         each names one agent and must cost that agent's rows"
+        patched <= 64,
+        "32 events patched {patched} times on a desk of {count} agents; each \
+         names one agent and must cost that agent and no more"
     );
 }
 

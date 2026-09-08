@@ -40,6 +40,7 @@ pub(crate) struct HostNodes {
     /// which is what made dealing one expensive; it is an index instead.
     children: HashMap<Id, Vec<usize>>,
     by_agent: HashMap<rho_core::AgentId, usize>,
+    by_page: HashMap<rho_desk::PageId, usize>,
     titles: HashMap<Id, String>,
     /// Every label's full filing path, `rho/agent`.
     label_paths: HashMap<Id, String>,
@@ -96,6 +97,7 @@ impl HostNodes {
         let mut by_id = HashMap::with_capacity(nodes.len());
         let mut children: HashMap<Id, Vec<usize>> = HashMap::new();
         let mut by_agent = HashMap::new();
+        let mut by_page = HashMap::new();
         for (at, node) in nodes.iter().enumerate() {
             by_id.insert(node.id.clone(), at);
             if let Some(parent) = &node.parent {
@@ -104,12 +106,16 @@ impl HostNodes {
             if let Some(agent) = node.agent() {
                 by_agent.insert(agent, at);
             }
+            if let Some(page) = node.page() {
+                by_page.insert(page, at);
+            }
         }
         let mut source = Self {
             nodes,
             by_id,
             children,
             by_agent,
+            by_page,
             titles,
             label_paths,
             heading_agents: HashMap::new(),
@@ -147,6 +153,11 @@ impl HostNodes {
         self.by_agent.get(&agent).map(|at| &self.nodes[*at])
     }
 
+    /// The row a page is filed as, if it is filed at all.
+    pub(crate) fn page_node(&self, page: rho_desk::PageId) -> Option<&DeskNode> {
+        self.by_page.get(&page).map(|index| &self.nodes[*index])
+    }
+
     pub(crate) fn node(&self, id: &Id) -> Option<&DeskNode> {
         self.by_id.get(id).map(|index| &self.nodes[*index])
     }
@@ -162,6 +173,26 @@ impl HostNodes {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_owned)
+    }
+
+    /// The agents filed anywhere under a heading, in the store's order.
+    pub(crate) fn agents_under(&self, heading: &Id) -> &[rho_core::AgentId] {
+        self.heading_agents
+            .get(heading)
+            .map_or(&[], |agents| agents.as_slice())
+    }
+
+    /// The same nodes in the same places: ids and parents, in order. Asked
+    /// against the desk's own node list, which is already to hand, and not
+    /// against another source — building one to find out whether it was
+    /// needed is the cost this question exists to avoid.
+    pub(crate) fn same_shape_as(&self, nodes: &[DeskNode]) -> bool {
+        self.nodes.len() == nodes.len()
+            && self
+                .nodes
+                .iter()
+                .zip(nodes)
+                .all(|(held, fresh)| held.id == fresh.id && held.under == fresh.under)
     }
 
     /// The rows a delta named, copied across. The dealer's source stands
@@ -317,9 +348,13 @@ pub(crate) fn find_candidates(
                     else {
                         continue;
                     };
-                    let Some(title) = source.shown_title(&node.id) else {
-                        continue;
-                    };
+                    // The map wrote a page's name into its read-only row and
+                    // the finder read it back out. Nothing draws that row
+                    // now, so the name comes from the browser, which is
+                    // where it came from in the first place.
+                    let title = source.shown_title(&node.id).unwrap_or_else(|| {
+                        rho_browser::live_page_name(page_id).unwrap_or_else(|| "page".to_owned())
+                    });
                     FindCandidate {
                         labels: labelled(&title),
                         aka: Vec::new(),

@@ -1138,20 +1138,27 @@ fn undo_verdict_reaches_the_desk_tree_outside_a_deal(cx: &mut TestAppContext) {
     });
 }
 
+/// Written when the map's `DashboardNewSibling` was the verb and the
+/// question was whether it could work with no row to stand on. The map is
+/// gone and `n n` is the route, but the subject is the same one: a reader
+/// with an empty desk can still write its first note, and it lands at the
+/// root rather than nowhere.
 #[gpui::test]
 fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
-    // No row means no heading line to stand on, and the verb still has to
-    // produce the first note rather than fall through to the editor.
+    cx.update(bind_test_keymaps);
     let desk = DeskFixture::new();
-    let workspace = overview_workspace(cx);
+    let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
+    cx.run_until_parked();
 
-    cx.dispatch_action(*workspace, crate::DashboardNewSibling);
+    cx.simulate_keystrokes(*workspace, "space n n");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
     cx.run_until_parked();
 
     workspace
@@ -1287,57 +1294,18 @@ pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace>
     cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx))
 }
 
+/// An overlay chain — transient to minibuffer to a Git approval and back —
+/// leaves the reader in the mode it found them in. Written when the map
+/// gave the reader a second mode to be in at rest; the map is gone, so the
+/// mode under every overlay here is the surface's, and the rule that the
+/// chain does not quietly change it is the same rule.
 #[gpui::test]
-fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) {
+fn modal_overlays_preserve_surface_mode(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = overview_workspace(cx);
 
     workspace
         .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
-            let subject = workspace.subject(window, cx);
-            workspace.open_menu(crate::transient::root_menu(&subject), window, cx);
-        })
-        .expect("open dashboard transient");
-    cx.simulate_keystrokes(*workspace, "p r");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(
-                workspace.is_dashboard_mode(window, cx),
-                "transient-to-minibuffer handoff should remain in dashboard mode"
-            );
-        })
-        .expect("inspect dashboard prompt");
-    cx.dispatch_action(*workspace, crate::MinibufferCancel);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
-            workspace.prompt_open_file(window, cx);
-        })
-        .expect("open dashboard prompt");
-    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
-            let (response, _decision) = tokio::sync::oneshot::channel();
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::GitTransportApproval {
-                    request_id: 1,
-                    prompt: "approve dashboard Git operation".to_owned(),
-                    response,
-                },
-                window,
-                cx,
-            );
-            assert!(workspace.is_dashboard_mode(window, cx));
-        })
-        .expect("open dashboard Git approval");
-    cx.dispatch_action(*workspace, crate::GitApprovalDeny);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
             workspace.select_agent(None, window, cx);
             assert!(!workspace.is_dashboard_mode(window, cx));
             workspace.prompt_open_file(window, cx);
@@ -1841,9 +1809,11 @@ fn one_agents_change_costs_no_display_map_resync(cx: &mut TestAppContext) {
 }
 
 /// A verdict costs the cells it writes. Marking one note done moves that
-/// note's row and no other: the map is not composed, because the rows and
-/// their order did not move, and only the row the verdict named is drawn
-/// again. Before this every desk event rebuilt the whole composition.
+/// note's state where it sits and moves no shape, so the dealer's source
+/// is patched where the verdict landed rather than taken again. Written
+/// against the map's compose-and-redraw counters; the map is gone and the
+/// dealer's source is what stands behind the cards now, but the rule the
+/// test guards — one event, one row's worth of work — is the same one.
 #[gpui::test]
 async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
@@ -1863,11 +1833,11 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
     // What the build costs is not the question; what one verdict costs
     // after it is. Marking a note done writes that note's cells and
     // nothing else, so it must draw that note's row and nothing else.
-    let (composed, redrawn) = workspace
+    let (taken, patched) = workspace
         .update(cx, |workspace, _, _| {
-            workspace.dashboard.map_work_for_test()
+            workspace.dashboard.deal_work_for_test()
         })
-        .expect("read the map's work");
+        .expect("read the dealer's work");
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(workspace.apply_verdict_for_test(
@@ -1881,19 +1851,18 @@ async fn one_verdict_costs_its_own_row(cx: &mut TestAppContext) {
         .expect("mark one note done");
     cx.run_until_parked();
 
-    let (composed_after, redrawn_after) = workspace
+    let (taken_after, patched_after) = workspace
         .update(cx, |workspace, _, _| {
-            workspace.dashboard.map_work_for_test()
+            workspace.dashboard.deal_work_for_test()
         })
-        .expect("read the map's work");
+        .expect("read the dealer's work");
     assert_eq!(
-        composed_after, composed,
-        "a verdict composes nothing: the rows and their order did not move"
+        taken_after, taken,
+        "a verdict takes the source again: the rows and their order did not move"
     );
-    assert_eq!(
-        redrawn_after - redrawn,
-        1,
-        "a verdict draws the row it wrote, and no other"
+    assert!(
+        patched_after > patched,
+        "a verdict patched nothing, so the card it wrote is stale"
     );
     // And it is the verdict the reader sees, not just cheap work.
     workspace
@@ -4825,7 +4794,7 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
                     .iter()
                     .map(|row| row.description.as_str())
                     .collect::<Vec<_>>(),
-                ["Map", "Slack", "Agents", "Status"]
+                ["Slack", "Agents", "Status"]
             );
             assert!(
                 !sheet.has_back,
@@ -4837,7 +4806,7 @@ fn the_phone_sheet_is_the_same_menu_as_the_block(cx: &mut TestAppContext) {
     // Tapping "Status" is the same step `i` would have taken.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.run_menu_at(3, window, cx);
+            workspace.run_menu_at(2, window, cx);
             let sheet = workspace.menu_sheet().expect("the submenu draws");
             assert_eq!(sheet.title, "status");
             assert!(sheet.has_back, "and the sheet says there is a way back");
@@ -6332,241 +6301,6 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
 }
 
 #[gpui::test]
-fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
-    // A note with a child note and a machine agent row: one buffer each,
-    // composed into the one editor the user types in.
-    let mut desk = DeskFixture::new();
-    let parent = desk.note(None, "Parent");
-    let child = desk.note(Some(parent.clone()), "body");
-    let agent_row = desk.agent_row(parent.clone(), agent(31));
-    desk.set(
-        parent.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_772_323_200_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
-    );
-    desk.set(
-        child.clone(),
-        rho_desk::cells::Property::Deadline(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_772_323_200_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
-    );
-
-    cx.update(bind_test_keymaps);
-    let workspace = overview_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .unwrap();
-    assert_eq!(text, "Parent\nbody\n");
-    workspace
-        .update(cx, |workspace, _, cx| {
-            // The dated note and its dated child each carry one hint.
-            assert_eq!(workspace.dashboard_editor().read(cx).eol_hints().len(), 2);
-            assert!(
-                workspace
-                    .tree_buffer_for_test(HostId::default(), agent_row.clone())
-                    .is_some(),
-                "the machine row still gets its own derived buffer"
-            );
-        })
-        .unwrap();
-
-    // `* ` at the start of a line is the one recognition kept: it creates a
-    // note rather than leaving stars in the text.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), child, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "i * space F a s t escape");
-    cx.run_until_parked();
-    let recognized = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .unwrap();
-    assert!(!recognized.contains("* "), "tree text: {recognized:?}");
-    let created = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .into_iter()
-                .into_iter()
-                .find_map(|(node_id, _, text)| {
-                    (matches!(node_id, rho_desk::cells::Id::Note(_)) && text.is_empty())
-                        .then_some(node_id)
-                })
-                .expect("recognition created a note")
-        })
-        .unwrap();
-
-    // Vim search is hosted by the composed editor; its query is never input.
-    let before_search = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.tree_nodes_for_test(HostId::default(), cx)
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "/ P a r enter");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.tree_nodes_for_test(HostId::default(), cx),
-                before_search
-            );
-        })
-        .unwrap();
-
-    // `dd` on a row is one cell write, and `u` puts that cell back.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), created.clone(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape d d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                !workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .any(|(node_id, _, _)| *node_id == created)
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .any(|(node_id, _, _)| *node_id == created),
-                "undo restores the deleted cell"
-            );
-        })
-        .unwrap();
-
-    // alt-enter is the structural `o`: a new note, undone by one `u`.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), parent.clone(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "alt-enter n e w escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .any(
-                        |(id, _, text)| matches!(id, rho_desk::cells::Id::Note(_)) && text == "new"
-                    )
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(
-                !workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .any(
-                        |(id, _, text)| matches!(id, rho_desk::cells::Id::Note(_)) && text == "new"
-                    )
-            );
-        })
-        .unwrap();
-
-    // Deleting a note leaves its machine row alone: the materializer roots
-    // the orphan instead of the client tombstoning what it does not own.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.take_host_messages_for_test(HostId::default());
-            workspace.focus_tree_node_for_test(HostId::default(), parent.clone(), window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape d d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert!(
-                nodes
-                    .iter()
-                    .any(|(node_id, parent_id, _)| *node_id == agent_row && parent_id.is_none()),
-                "post-delete nodes: {nodes:?}"
-            );
-        })
-        .unwrap();
-
-    // A rejected mutation takes its optimistic view back.
-    let rejected = workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default())
-                .expect("delete mutation")
-                .stamp
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationRejected {
-                    stamp: rejected,
-                    reason: "test conflict".into(),
-                },
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert!(
-                nodes.iter().any(|(node_id, _, _)| *node_id == parent),
-                "rejection restores the last merged cells: {nodes:?}"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut TestAppContext) {
     // Two GUIs on one desk: the first deals a verdict, the daemon accepts
     // it, and the second sees it only because the poke made it sync.
@@ -6772,7 +6506,6 @@ fn q_closes_a_standalone_draft_and_goes_back(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["previous"], window, cx);
             workspace.select_agent(None, window, cx);
-            assert!(!workspace.overview_open_for_test());
             assert_eq!(workspace.current_surface_name_for_test(), "draft");
         })
         .unwrap();
@@ -6802,43 +6535,30 @@ fn q_closes_a_standalone_draft_and_goes_back(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// A discarded draft must not stay in surface history: `q` on it takes it
+/// out, and stepping back must not walk into the thing that was thrown
+/// away. Written on a heading draft when `r` on a map row was what opened
+/// one; a draft is now opened from the composer, and the rule is the same.
 #[gpui::test]
-fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
+fn q_discards_a_draft_from_surface_history(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "unstaffed heading");
+    desk.note(None, "unstaffed heading");
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            // Opening the composer from the overview puts the reader on
-            // Draft, matching the state that exposed the human QA failure.
+            workspace.configure_surface_history_for_test(&["previous"], window, cx);
             workspace.select_agent(None, window, cx);
             assert_eq!(workspace.current_surface_name_for_test(), "draft");
         })
         .unwrap();
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // Heading drafts live on the map, which the home key no longer
-            // opens; `r` on an unstaffed heading is what writes one now.
-            workspace.open_overview(window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "r");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.dashboard_has_new_draft_for_test())
-        })
-        .unwrap();
 
     cx.simulate_keystrokes(*workspace, "q");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(workspace.overview_open_for_test());
-            assert!(!workspace.dashboard_has_new_draft_for_test());
+            assert_ne!(workspace.current_surface_name_for_test(), "draft");
             assert!(
                 !workspace
                     .surface_history_for_test()
@@ -6851,34 +6571,49 @@ fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(*workspace, "f24");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.overview_open_for_test(),
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "draft",
                 "history reopened the discarded draft"
             )
         })
         .unwrap();
 }
 
+/// Discarding a draft leaves the history cursor where it was, on the
+/// surface the reader was actually reading.
 #[gpui::test]
-fn discarding_a_heading_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
+fn discarding_a_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let heading = desk.note(None, "unstaffed heading");
+    desk.note(None, "unstaffed heading");
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.configure_surface_history_for_test(&["current"], window, cx);
-            workspace.open_overview(window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+            workspace.select_agent(None, window, cx);
         })
         .unwrap();
     cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "r q f24");
+    cx.simulate_keystrokes(*workspace, "q");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(!workspace.overview_open_for_test());
-            assert_eq!(workspace.current_surface_name_for_test(), "current");
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "current",
+                "discarding the draft left the reader somewhere other than what was under it"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "draft",
+                "forward walked back into the discarded draft"
+            );
         })
         .unwrap();
 }
@@ -6949,7 +6684,6 @@ fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "previous");
-            assert!(!workspace.overview_open_for_test());
         })
         .unwrap();
 }
@@ -6985,7 +6719,7 @@ fn q_on_last_surface_lands_on_home(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn q_on_home_or_the_map_is_a_no_op(cx: &mut TestAppContext) {
+fn q_on_home_is_a_no_op(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     // Home is the floor: there is nothing under it to reveal.
     let workspace = test_workspace(cx);
@@ -6993,20 +6727,6 @@ fn q_on_home_or_the_map_is_a_no_op(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "home");
-        })
-        .unwrap();
-
-    let workspace = overview_workspace(cx);
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_surface_name_for_test()
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "q");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.overview_open_for_test());
-            assert_eq!(workspace.current_surface_name_for_test(), before);
         })
         .unwrap();
 }
@@ -9312,18 +9032,14 @@ fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
 fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let on_the_map = desk.note(None, "map row");
     let note = desk.note(None, "first line");
 
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), on_the_map.clone(), window, cx);
         })
         .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "i t a i l enter escape");
     cx.run_until_parked();
     let body = |workspace: &Workspace, node_id, cx: &gpui::App| {
         workspace
@@ -9333,11 +9049,6 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
             .read(cx)
             .text()
     };
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(body(workspace, &on_the_map, cx), "tail\nmap row");
-        })
-        .unwrap();
 
     workspace
         .update(cx, |workspace, window, cx| {
@@ -9354,15 +9065,16 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// `n n` from Home. A new note is a row on the map, so the map has to come
-/// into view: with Home as the landing surface the row and its insert
+/// `n n` from Home. A note is its own surface, so that surface has to come
+/// into view: with Home as the landing surface the note and its insert
 /// cursor were both behind a surface that never appeared, and the title
-/// the reader typed went nowhere.
+/// the reader typed went nowhere. Where it files is the cursor's business
+/// and `new_note_files_itself_under_the_area_the_cursor_is_on` has it.
 #[gpui::test]
-fn a_new_note_from_home_brings_the_map_into_view(cx: &mut TestAppContext) {
+fn a_new_note_from_home_opens_the_note_itself(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let area = desk.note(None, "the area in view");
+    desk.note(None, "the area in view");
 
     let workspace = test_workspace(cx);
     workspace
@@ -9370,7 +9082,6 @@ fn a_new_note_from_home_brings_the_map_into_view(cx: &mut TestAppContext) {
             story::feed(workspace, HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
             assert_eq!(workspace.current_surface_name_for_test(), "home");
-            assert!(!workspace.overview_open_for_test());
         })
         .unwrap();
     cx.run_until_parked();
@@ -9382,14 +9093,11 @@ fn a_new_note_from_home_brings_the_map_into_view(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
-            assert!(mutation.writes.iter().any(
-                |write| write.property == rho_desk::cells::Property::Parent(Some(area.clone()))
-            ));
-            assert!(
-                workspace.overview_open_for_test(),
-                "the map is what the new row is on, so the map is what the reader sees"
+            take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "note",
+                "the note is its own surface, so the note is what the reader sees"
             );
             assert!(
                 workspace.insert_when_shown_for_test(),
@@ -9508,27 +9216,22 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
         })
         .unwrap();
 
-    // Both places are drawn, each with its own bullet. One buffer in two
-    // excerpts is the thing that used to go wrong here: the prefix is
-    // positioned per excerpt, so the second row is not left bare.
+    // Both places are reachable. The map drew each as its own row; the
+    // finder is what names a thing by where it sits now, and a label is a
+    // second name for the same thing rather than a second thing.
     workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_overview(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let map = workspace
         .update(cx, |workspace, _, cx| {
-            workspace.dashboard_display_text_for_test(cx)
+            let paths = workspace
+                .find_candidates(cx)
+                .into_iter()
+                .flat_map(|candidate| std::iter::once(candidate.path).chain(candidate.labels))
+                .collect::<Vec<_>>();
+            assert!(
+                paths.iter().any(|path| path.starts_with("rho/agent › ")),
+                "the label path is not offered: {paths:?}"
+            );
         })
         .unwrap();
-    // Each place carries its own bullet, and each row starts past the row
-    // it hangs under: the label `agent` under `rho`, and the note under
-    // `agent` past that. A label nests the way a note does.
-    assert_eq!(
-        map,
-        "* Verdict agent\n** Deal QA note\n  ◦ rho\n      ◦ agent\n        * Deal QA note"
-    );
 
     // The same path a second time is the same two labels, not two more, and
     // naming a label the thing already carries takes it off.
@@ -10061,6 +9764,8 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
     let dealt = desk.due_note(None, "Deal QA note");
     // A second card, so Home has a list rather than a single row.
     let queued = desk.due_note(None, "Queued QA note");
+    // A note the dealer holds no card for, to open over Home.
+    let aside = desk.note(None, "An aside");
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -10076,9 +9781,8 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
             );
             workspace.sync_tree_dashboard(HostId::default(), window, cx);
             workspace.pull_card(window, cx);
-            // The cursor is left on the page row while the card is dealt:
-            // the surface in view still decides, in both directions.
-            workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
+            // The page is filed but not opened: the dealt surface is what
+            // the reader is on, and the surface in view still decides.
             assert_eq!(
                 workspace.label_target(cx),
                 Some((HostId::default(), dealt.clone())),
@@ -10088,9 +9792,9 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
         .unwrap();
     cx.run_until_parked();
 
-    // The reader leaves the deal for Home and opens the map over it. Home
-    // keeps a cursor of its own on the queue; the map is the overlay in
-    // front, so the row under its cursor is what the reader is looking at.
+    // The reader leaves the deal for Home and then opens the page. Home
+    // keeps a cursor of its own on the queue, which is the trap: the page
+    // is the surface in front, so the page is what they are looking at.
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.open_home(window, cx);
@@ -10111,8 +9815,11 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 }),
                 "Home ranks fresh, so the card just read is still on top"
             );
-            workspace.open_overview(window, cx);
-            workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
+            // The page's own surface is a live browser view, which this
+            // harness has no window for; the note beside it is a surface it
+            // can show, and "the thing in view is not Home's cursor card"
+            // is the same shape either way.
+            workspace.open_note(HostId::default(), aside.clone(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -10121,12 +9828,12 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
         .update(cx, |workspace, window, cx| {
             assert_eq!(
                 workspace.label_target(cx),
-                Some((HostId::default(), desk_page(origin))),
-                "the row under the cursor is what a verdict is about"
+                Some((HostId::default(), aside.clone())),
+                "the surface in view is what a verdict is about"
             );
             assert!(
                 workspace.open_verdict_transient(window, cx),
-                "the tap opens over a row the dealer has no card for"
+                "the tap opens over a thing the dealer has no card for"
             );
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -10151,16 +9858,13 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 })
                 .expect("the path mints the label it names");
             assert!(
-                mutation
-                    .writes
-                    .iter()
-                    .any(|write| write.id == desk_page(origin)
-                        && write.property
-                            == Property::Labeled {
-                                label: label.clone(),
-                                present: true,
-                            }),
-                "the page the reader is on is what gets labelled"
+                mutation.writes.iter().any(|write| write.id == aside
+                    && write.property
+                        == Property::Labeled {
+                            label: label.clone(),
+                            present: true,
+                        }),
+                "the note the reader is on is what gets labelled"
             );
             assert!(
                 !mutation

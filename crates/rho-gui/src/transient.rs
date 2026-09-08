@@ -60,9 +60,6 @@ pub(crate) enum MenuId {
 pub(crate) enum Command {
     // The root menu.
     Voice,
-    Rail,
-    Map,
-    MapRawSource,
     SwitchBuffer,
     MessageLog,
     SurfaceBack,
@@ -126,7 +123,6 @@ pub(crate) enum Command {
     /// what the item says and not a unit the reader has to combine.
     AgentSnooze(u64),
     // The phone.
-    PhoneOpenDesk,
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
     /// A named hour of the day: `tonight` is this evening while it is still
@@ -239,15 +235,6 @@ pub(crate) fn root_menu(subject: &Subject) -> Menu {
             "a",
             "agent…",
             MenuAction::Open(MenuId::Agent),
-        )
-        .item("r", "rail", MenuAction::Command(Command::Rail))
-        // Home took the front door; the map keeps a key of its own so the
-        // notes store stays one press away from it.
-        .item("o", "map", MenuAction::Command(Command::Map))
-        .item(
-            "e",
-            "map raw source",
-            MenuAction::Command(Command::MapRawSource),
         )
         .item(
             "b",
@@ -493,7 +480,6 @@ pub(crate) fn snooze_menu() -> Menu {
 
 pub(crate) fn phone_root_menu() -> Menu {
     Menu::new("menu")
-        .item("d", "Map", MenuAction::Command(Command::PhoneOpenDesk))
         .item(
             "s",
             "Slack",

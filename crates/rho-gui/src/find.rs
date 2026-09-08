@@ -465,10 +465,7 @@ impl Workspace {
             // note: the staffed-heading shortcut belonged to the desk,
             // where a heading had nowhere else to go.
             FindTarget::Topic { host, node_id } => {
-                if !self.open_note(host, node_id.clone(), window, cx) {
-                    self.dashboard.move_to_tree_node_when_ready(host, node_id);
-                    self.open_overview(window, cx);
-                }
+                self.open_note(host, node_id, window, cx);
             }
             FindTarget::Slack(source) => self.open_slack_source(source, window, cx),
         }

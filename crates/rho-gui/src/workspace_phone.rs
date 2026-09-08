@@ -6,15 +6,14 @@
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, FocusHandle, Focusable as _, MouseButton,
-    MouseDownEvent, MouseUpEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div,
-    ease_out_quint, px,
+    MouseDownEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div, ease_out_quint,
+    px,
 };
 use theme::ActiveTheme as _;
 
 use super::{ContextId, Surface, SurfaceKey, Workspace};
 
 const PHONE_MAX_WIDTH: Pixels = px(600.);
-const TAP_SLOP: Pixels = px(8.);
 const TARGET_HEIGHT: Pixels = px(56.);
 const FLICK_SLOP: f32 = 12.;
 const FLICK_COMMIT_VELOCITY: f32 = 900.;
@@ -74,12 +73,6 @@ impl PhoneScrollEdge {
             )
         )
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PhoneRoot {
-    Feed,
-    Desk,
 }
 
 enum PhoneTransition {
@@ -166,10 +159,8 @@ pub(super) struct PhoneUi {
     snap: Option<PhoneSnap>,
     next_snap_generation: u64,
     transitions: Vec<PhoneTransition>,
-    root: PhoneRoot,
     feed_surface: Option<(ContextId, SurfaceKey)>,
     stack: Vec<(ContextId, SurfaceKey)>,
-    dashboard_press: Option<(Point<Pixels>, Option<crate::dashboard::RowTarget>)>,
     /// A card arrived while the feed sat empty. The feed is the deal, so it
     /// has to be opened again; only a redraw has the window to do it.
     pub(super) feed_retry: bool,
@@ -193,10 +184,8 @@ impl PhoneUi {
             snap: None,
             next_snap_generation: 1,
             transitions: Vec::new(),
-            root: PhoneRoot::Feed,
             feed_surface: None,
             stack: Vec::new(),
-            dashboard_press: None,
             feed_retry: false,
             dashboard_focus: cx.focus_handle(),
         }
@@ -288,7 +277,6 @@ impl Workspace {
         if change.entered {
             self.phone.stack.clear();
             self.phone.transitions.clear();
-            self.phone.root = PhoneRoot::Feed;
             if self.open_card_in_view(cx).is_some() {
                 self.phone
                     .show_feed(self.active_context, self.active_surface().key.clone());
@@ -311,7 +299,6 @@ impl Workspace {
         // session.
         if self.phone.enabled
             && std::mem::take(&mut self.phone.feed_retry)
-            && self.phone.root == PhoneRoot::Feed
             && self.phone.stack.is_empty()
             && self.open_card_in_view(cx).is_none()
         {
@@ -323,9 +310,7 @@ impl Workspace {
             self.phone.snap = None;
             self.update_statuses(cx);
             if self.dashboard.set_phone_browse_mode(false) {
-                cx.defer_in(window, |this, window, cx| {
-                    this.refresh_dashboard(window, cx)
-                });
+                cx.defer_in(window, |this, _window, cx| this.refresh_dashboard(cx));
             }
             self.dashboard
                 .editor()
@@ -338,45 +323,6 @@ impl Workspace {
             });
         }
         change.enabled
-    }
-
-    pub(super) fn phone_dashboard_pointer_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.phone.dashboard_press = (event.button == MouseButton::Left).then(|| {
-            (
-                event.position,
-                self.dashboard
-                    .target_at_window_position(event.position, &self.registry, cx),
-            )
-        });
-        if !self.dashboard.raw_mode() {
-            let focus = self.phone.dashboard_focus.clone();
-            cx.defer_in(window, move |_, window, cx| window.focus(&focus, cx));
-        }
-    }
-
-    pub(super) fn phone_dashboard_pointer_up(
-        &mut self,
-        event: &MouseUpEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((start, target)) = self.phone.dashboard_press.take() else {
-            return;
-        };
-        if event.button != MouseButton::Left
-            || (event.position.x - start.x).abs() > TAP_SLOP
-            || (event.position.y - start.y).abs() > TAP_SLOP
-        {
-            return;
-        }
-        cx.defer_in(window, move |this, window, cx| {
-            this.phone_dashboard_activate_tapped_row(target, window, cx);
-        });
     }
 
     fn phone_surface_pointer_down(
@@ -401,38 +347,6 @@ impl Workspace {
             };
             window.focus(&focus, cx);
         });
-    }
-
-    fn phone_dashboard_activate_tapped_row(
-        &mut self,
-        target: Option<crate::dashboard::RowTarget>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::dashboard::RowTarget;
-        match target {
-            Some(RowTarget::TreeAgent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
-            Some(RowTarget::TreeTopic {
-                host,
-                node_id,
-                first_attention,
-                ..
-            }) => match first_attention.or_else(|| {
-                self.dashboard
-                    .first_tree_agent_for_topic((host, node_id.clone()))
-            }) {
-                Some(agent_id) => self.open_agent(agent_id, window, cx),
-                None => {
-                    self.dashboard.move_to_tree_node_when_ready(host, node_id);
-                    self.dashboard.toggle_subagents(cx);
-                    self.refresh_dashboard(window, cx);
-                }
-            },
-            Some(RowTarget::TreePage { page_id, .. }) => {
-                self.open_browser_page(page_id, window, cx)
-            }
-            _ => {}
-        }
     }
 
     #[cfg(test)]
@@ -536,13 +450,8 @@ impl Workspace {
         }
 
         if self.phone.stack.is_empty() && self.open_card_in_view(cx).is_some() {
-            self.phone.root = PhoneRoot::Feed;
             self.restore_phone_feed(window, cx);
             cx.notify();
-            return;
-        }
-        if self.phone.stack.is_empty() && self.dashboard.raw_mode() {
-            self.phone_set_dashboard_browsing(true, window, cx);
             return;
         }
 
@@ -561,7 +470,6 @@ impl Workspace {
             self.phone.stack.pop();
         };
         let Some((context, key)) = next else {
-            self.phone.root = PhoneRoot::Feed;
             if self.open_card_in_view(cx).is_some() {
                 self.restore_phone_feed(window, cx);
                 cx.notify();
@@ -650,7 +558,6 @@ impl Workspace {
             TouchPhase::Started => {
                 if self.shell_touches.len() == 1
                     && self.phone.snap.is_none()
-                    && self.phone.root == PhoneRoot::Feed
                     && self.phone.stack.is_empty()
                     && !self.phone_current_deal_has_pending_tree_verdict(cx)
                     && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
@@ -756,7 +663,6 @@ impl Workspace {
                 this.phone.snap = None;
                 if let Some(direction) = direction
                     && this.phone.enabled
-                    && this.phone.root == PhoneRoot::Feed
                     && this.phone.stack.is_empty()
                     && this
                         .card_in_view(cx)
@@ -786,7 +692,7 @@ impl Workspace {
                     // one to look at again, so it opens as it was.
                     self.dashboard.clear_skip(&card.identity);
                     self.open_card(*card, window, cx);
-                    self.refresh_dashboard(window, cx);
+                    self.refresh_dashboard(cx);
                 }
                 Some(PhoneTransition::Verdict(sequence))
                     if self.verdict_undo.last().map(|entry| entry.sequence) == Some(sequence) =>
@@ -857,8 +763,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.phone.root == PhoneRoot::Feed
-            && self.phone.stack.is_empty()
+        if self.phone.stack.is_empty()
             && let Some(card) = self.open_card_in_view(cx)
         {
             let colors = cx.theme().colors();
@@ -947,7 +852,7 @@ impl Workspace {
                 card.top(self.phone.drag_offset).into_any_element()
             };
         }
-        if self.phone.root == PhoneRoot::Feed && self.phone.stack.is_empty() {
+        if self.phone.stack.is_empty() {
             let colors = cx.theme().colors();
             return div()
                 .id("phone-feed-empty")
@@ -1014,7 +919,6 @@ impl Workspace {
                 .child(self.render_phone_bar(cx))
                 .into_any_element()
         } else {
-            let browsing = !self.dashboard.raw_mode();
             div()
                 .id("phone-dashboard")
                 .size_full()
@@ -1027,15 +931,6 @@ impl Workspace {
                         .w_full()
                         .overflow_hidden()
                         .track_focus(&self.phone.dashboard_focus)
-                        // The editor consumes bubble-phase pointer events. Capture the
-                        // gesture around it, then inspect its updated cursor.
-                        .when(browsing, |dashboard| {
-                            dashboard
-                                .capture_any_mouse_down(
-                                    cx.listener(Self::phone_dashboard_pointer_down),
-                                )
-                                .capture_any_mouse_up(cx.listener(Self::phone_dashboard_pointer_up))
-                        })
                         .child(self.render_rail(false, text_style, cx)),
                 )
                 .child(self.render_phone_bar(cx))
@@ -1230,11 +1125,7 @@ impl Workspace {
                 .child(div().text_size(px(18.)).child(icon))
                 .child(div().text_size(px(11.)).child(label))
         };
-        let primary = if self.phone.stack.is_empty() && self.phone.root == PhoneRoot::Desk {
-            Some(item("phone-edit", "✎", "edit").on_click(
-                cx.listener(|this, _, window, cx| this.phone_toggle_dashboard_editing(window, cx)),
-            ))
-        } else if self.phone_surface().is_some_and(|surface| {
+        let primary = if self.phone_surface().is_some_and(|surface| {
             matches!(
                 surface.view,
                 super::SurfaceView::Draft { .. }
@@ -1272,22 +1163,12 @@ impl Workspace {
             .into_any_element()
     }
 
-    pub(crate) fn phone_open_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.phone.stack.clear();
-        self.phone.root = PhoneRoot::Desk;
-        self.phone.feed_surface = None;
-        self.phone_set_dashboard_browsing(true, window, cx);
-    }
-
     fn phone_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.is_some() {
             self.minibuffer_confirm(window, cx);
             return;
         }
         if self.phone.stack.is_empty() {
-            if self.dashboard.raw_mode() {
-                self.dashboard_submit(window, cx);
-            }
             return;
         }
         let Some(surface) = self.phone_surface() else {
@@ -1305,42 +1186,6 @@ impl Workspace {
             }
             _ => {}
         }
-    }
-
-    pub(crate) fn phone_toggle_dashboard_editing(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let browsing = self.dashboard.raw_mode();
-        self.phone_set_dashboard_browsing(browsing, window, cx);
-    }
-
-    fn phone_set_dashboard_browsing(
-        &mut self,
-        browsing: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let presentation_changed = self.dashboard.set_phone_browse_mode(browsing);
-        if self.dashboard.raw_mode() == browsing {
-            self.dashboard.toggle_raw_mode(cx);
-            self.refresh_dashboard(window, cx);
-        } else if presentation_changed {
-            cx.defer_in(window, |this, window, cx| {
-                this.refresh_dashboard(window, cx)
-            });
-        }
-        self.dashboard
-            .editor()
-            .update(cx, |editor, _| editor.set_read_only(browsing));
-        let focus = if browsing {
-            self.phone.dashboard_focus.clone()
-        } else {
-            self.dashboard.focus_handle(cx)
-        };
-        window.focus(&focus, cx);
-        cx.notify();
     }
 
     /// The open menu, drawn as a sheet: the same menu the desk draws as a

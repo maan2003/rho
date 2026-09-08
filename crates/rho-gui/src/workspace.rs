@@ -71,23 +71,18 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 use rho_files::{FileView, RemoteProject};
 
 use crate::{
-    AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
-    DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealDone,
+    AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
     DashboardDealExit, DashboardDealFile, DashboardDealMute, DashboardDealNext,
     DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
-    DashboardDealTodo, DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
-    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
-    DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling, DashboardNow,
-    DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote, DashboardRenameTopic,
-    DashboardReply, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
-    DashboardUndo, DashboardYankRow, DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow,
-    GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete,
-    MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus,
-    RailOpen, SearchRepeat, SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll,
-    ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage,
-    SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackReactTo, SlackSearch,
-    SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
-    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DashboardDealTodo, DashboardDeleteRow, DashboardPasteRow, DashboardPasteRowBefore,
+    DashboardYankRow, DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
+    HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat,
+    SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackMarkReadBefore,
+    SlackNextUnread, SlackOpenRow, SlackReactTo, SlackSearch, SlackWatchChannel, SubmitPrompt,
+    SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -368,14 +363,6 @@ fn undo_sequence_insert_position(existing: impl Iterator<Item = u64>, sequence: 
         .count()
 }
 
-/// A structure verb, as the writes that put the desk back. Undo of a
-/// creation is the note's deletion; undo of a deletion or a move is the
-/// cell it replaced.
-struct DeskSemanticUndo {
-    host: HostId,
-    writes: Vec<rho_desk::cells::CellWrite>,
-}
-
 pub struct Workspace {
     pub(crate) hosts: Hosts,
     /// The agents held whole: their events, the transcript folded from
@@ -458,7 +445,6 @@ pub struct Workspace {
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     pub(crate) active_context: ContextId,
-    overview_open: bool,
     last_shift_tap: Option<std::time::Instant>,
     /// When `shift` went down on its own, if it is still down and still a
     /// candidate for a tap. Cleared the moment another key or modifier
@@ -490,12 +476,6 @@ pub struct Workspace {
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
     note_views: HashMap<(HostId, rho_desk::cells::Id), crate::note_view::NoteView>,
-    /// Set by `InputHandled` and consumed by the following buffer edit. The
-    /// editor announces input before mutating its buffer, while heading
-    /// recognition must run immediately after that mutation so subsequent
-    /// typing lands in the newly-created node buffer.
-    pending_heading_recognition: Option<(HostId, rho_desk::cells::Id, usize)>,
-    pending_heading_undo: Option<clock::Lamport>,
     pending_tree_verdicts: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeVerdict>,
     pending_tree_undos: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeUndo>,
     /// Text a paste owes its new notes, held until the daemon accepts the
@@ -507,12 +487,9 @@ pub struct Workspace {
     desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_desk::cells::Id)>,
-    desk_semantic_undo: BTreeMap<clock::Lamport, DeskSemanticUndo>,
     pending_semantic_batches: BTreeMap<(HostId, rho_desk::cells::Stamp), clock::Lamport>,
-    pub(crate) pending_semantic_group: Option<clock::Lamport>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
-    dashboard_preview: Option<AgentId>,
     /// The browser pages the desk refers to, the ones on their way out, and
     /// the one shown in the right-hand preview card: see
     /// [`crate::browser::Pages`].
@@ -587,7 +564,6 @@ pub struct Workspace {
     /// microphone is open: see [`crate::voice::Voice`].
     voice: crate::voice::Voice,
     _event_task: Task<()>,
-    _dashboard_subscription: gpui::Subscription,
     _keystroke_subscription: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
     phone: phone::PhoneUi,
@@ -979,55 +955,6 @@ impl Workspace {
         .detach();
 
         let dashboard = crate::dashboard::Dashboard::new(window, cx);
-        // The preview follows the dashboard cursor: any local selection
-        // change while the dashboard is focused re-aims the surface.
-        let dashboard_subscription = cx.subscribe_in(
-            dashboard.editor(),
-            window,
-            |this, _, event: &editor::EditorEvent, window, cx| match event {
-                editor::EditorEvent::InputHandled { text, .. } if text.as_ref() == " " => {
-                    if let Some((host, node_id, offset)) =
-                        this.dashboard.tree_node_cursor_offset(cx)
-                    {
-                        this.pending_heading_recognition = Some((host, node_id, offset + 1));
-                    }
-                }
-                editor::EditorEvent::BuffersEdited { .. } => {
-                    if let Some((host, node_id, line_end)) = this.pending_heading_recognition.take()
-                    {
-                        // Replacing the editor composition from inside its
-                        // BuffersEdited dispatch can leave the next queued
-                        // keystroke attached to the row we just deleted.
-                        // Reconcile at the end of this GPUI update instead,
-                        // before another platform input event is dispatched.
-                        cx.defer_in(window, move |this, window, cx| {
-                            this.recognize_desk_note_after_edit(
-                                host, node_id, line_end, window, cx,
-                            );
-                        });
-                    }
-                }
-                editor::EditorEvent::SemanticRowAction { buffer_id, action } => {
-                    this.handle_desk_semantic_row_action(*buffer_id, *action, window, cx);
-                }
-                editor::EditorEvent::Edited { .. } => {
-                    if let Some(transaction_id) = this.pending_semantic_group.take() {
-                        this.dashboard.group_until_transaction(transaction_id, cx);
-                    }
-                }
-                editor::EditorEvent::TransactionUndone { transaction_id } => {
-                    this.undo_desk_semantic_action(*transaction_id, window, cx);
-                }
-                editor::EditorEvent::SearchRequested { backwards } => {
-                    this.prompt_dashboard_search(search::Direction::of(*backwards), window, cx);
-                }
-                editor::EditorEvent::SelectionsChanged { local: true } => {
-                    this.refresh_dashboard(window, cx);
-                    this.dashboard_cursor_moved(window, cx);
-                }
-                _ => {}
-            },
-        );
         let keystroke_subscription = cx.observe_keystrokes(|this, event, _window, _cx| {
             if this.desk_semantic_paste_target.is_some()
                 && !event.keystroke.key.eq_ignore_ascii_case("p")
@@ -1097,7 +1024,6 @@ impl Workspace {
             history: None,
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
-            overview_open: false,
             last_shift_tap: None,
             shift_down_at: None,
             shell_touches: HashMap::new(),
@@ -1116,8 +1042,6 @@ impl Workspace {
             mode_indicator,
             desk_cells: DeskCells::new(crate::desk_view::desk_device()),
             note_views: HashMap::new(),
-            pending_heading_recognition: None,
-            pending_heading_undo: None,
             pending_tree_verdicts: BTreeMap::new(),
             pending_desk_texts: BTreeMap::new(),
             pending_tree_undos: BTreeMap::new(),
@@ -1125,10 +1049,7 @@ impl Workspace {
             next_verdict_undo_sequence: 0,
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
-            desk_semantic_undo: BTreeMap::new(),
             pending_semantic_batches: BTreeMap::new(),
-            pending_semantic_group: None,
-            dashboard_preview: None,
             pages: crate::browser::Pages::default(),
             zulip: crate::zulip::Zulip::default(),
             slack: crate::slack::Slack::default(),
@@ -1153,7 +1074,6 @@ impl Workspace {
             git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
-            _dashboard_subscription: dashboard_subscription,
             _keystroke_subscription: keystroke_subscription,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
@@ -1163,13 +1083,12 @@ impl Workspace {
         }
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
-        this.overview_open = false;
         let home = this.make_surface(SurfaceKey::Home, window, cx);
         this.display_surface(home, cx);
         this.refresh_home(cx);
         this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
-        this.refresh_dashboard(window, cx);
+        this.refresh_dashboard(cx);
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack. And when there is no session it says so: rho
@@ -1246,7 +1165,7 @@ impl Workspace {
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         let gone = self.registry.detach_host(host);
         self.selection.forget(|agent_id| gone.contains(&agent_id));
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
         for agent_id in departed {
             // The agent is gone with its daemon, so its transcript is a
             // place that no longer exists: one call, and no context can
@@ -1359,23 +1278,6 @@ impl Workspace {
             context: warm.context,
             surface: surface.clone(),
         };
-        self.overview_open = false;
-        // A dealt note's surface is the dashboard's own editor with the point
-        // moved to the node; nothing else about it is on screen. Stepping to
-        // it out of history has to put the point back the way `open_card`
-        // put it there, or the reader is told the surface changed and shown
-        // the rows they were already reading.
-        if let SurfaceKey::DeskNode { host, node_id } = &surface.key
-            && let SurfaceView::DeskNode(editor) = &surface.view
-            && editor.entity_id() == self.dashboard.editor().entity_id()
-        {
-            self.dashboard
-                .move_to_tree_node_when_ready(*host, node_id.clone());
-            // The pending cursor is consumed by the next composition, and a
-            // step through history is not otherwise one; `open_card` gets its
-            // composition from the deal that follows it.
-            self.refresh_dashboard(window, cx);
-        }
         self.ensure_surface_subscription(&surface.key, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
@@ -1405,23 +1307,9 @@ impl Workspace {
     }
 
     fn close_current_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.is_focused(window, cx)
-            && matches!(
-                self.dashboard.cursor_target(&self.registry, cx),
-                Some(
-                    crate::dashboard::RowTarget::NewDraft
-                        | crate::dashboard::RowTarget::NewTreeDraft(_)
-                )
-            )
-            && self.dashboard.discard_new_draft(cx)
-        {
-            self.forget_discarded_draft(window, cx);
-            self.refresh_dashboard(window, cx);
-            return;
-        }
         // The overview and Home are both floors: there is nothing under
         // them to reveal, so `q` on either stays put.
-        if self.overview_open || self.active_surface().key == SurfaceKey::Home {
+        if self.active_surface().key == SurfaceKey::Home {
             return;
         }
         let key = self.active_surface().key.clone();
@@ -1455,35 +1343,9 @@ impl Workspace {
         });
     }
 
-    fn forget_discarded_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.draft_area = None;
-        let key = SurfaceKey::Draft;
-        rho_journal::record(rho_journal::Event::SurfaceClosed {
-            surface: Self::journal_surface(&key),
-            dealt_untouched: false,
-        });
-        self.forget_surface(&key);
-        // A discarded draft is a place that no longer exists, and the
-        // reader may be standing on it: whatever the overview is doing over
-        // the top, what is under it must be somewhere real.
-        if self.active_surface().key == key {
-            // The reader is looking at the overview, not at what is under
-            // it, so moving the surface underneath must not pull the
-            // overview down with it.
-            let overview = self.overview_open;
-            if !self.show_previous_surface(window, cx) {
-                self.open_home(window, cx);
-                self.active_pane_mut().forget(&key);
-            }
-            self.overview_open = overview;
-        }
-        cx.notify();
-    }
-
-    /// Home is the front door: a cold start, an emptied queue, and the
-    /// overview key all land here.
+    /// Home is the front door: a cold start and an emptied queue both
+    /// land here.
     pub(crate) fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overview_open = false;
         let surface = self.make_surface(SurfaceKey::Home, window, cx);
         self.display_surface(surface, cx);
         self.refresh_home(cx);
@@ -1575,23 +1437,11 @@ impl Workspace {
             return;
         };
         self.open_card(card, window, cx);
-        self.refresh_dashboard(window, cx);
-    }
-
-    pub(crate) fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overview_open = true;
-        self.refresh_dashboard(window, cx);
-        window.focus(&self.dashboard.focus_handle(cx), cx);
-        rho_journal::record(rho_journal::Event::OverviewOpened);
-        cx.notify();
+        self.refresh_dashboard(cx);
     }
 
     fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overview_open {
-            self.overview_open = false;
-            self.focus_active_surface(window, cx);
-            cx.notify();
-        } else if self.active_surface().key == SurfaceKey::Home {
+        if self.active_surface().key == SurfaceKey::Home {
             // Already home: the key shows what the reader was reading, the
             // way closing the overview used to reveal it again. Home was
             // pushed like any other surface, so this is one step back and
@@ -1689,9 +1539,6 @@ impl Workspace {
     }
 
     fn step_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overview_open {
-            return;
-        }
         if !self.show_previous_surface(window, cx) {
             return;
         }
@@ -1712,7 +1559,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.overview_open || self.active_pane().at_newest() {
+        if self.active_pane().at_newest() {
             self.pull_card(window, cx);
             return;
         }
@@ -1942,7 +1789,7 @@ impl Workspace {
             rho_mirror::model::ModelMsg::Loaded { agents, verdicts } => {
                 self.loaded(host, agents, verdicts);
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Whole, cx);
-                self.refresh_dashboard(window, cx);
+                self.refresh_dashboard(cx);
                 self.schedule_desk_sync(host, None, window, cx);
                 cx.notify();
             }
@@ -2121,7 +1968,6 @@ impl Workspace {
                 // just came up is told it whole.
                 self.send_agent_focus_to(host);
                 self.update_statuses(cx);
-                self.dashboard_cursor_moved(window, cx);
                 cx.notify();
             }
             ConnEvent::AuthState(auth) => {
@@ -2372,7 +2218,7 @@ impl Workspace {
         }
         // Every daemon event funnels through here, so this one call is
         // the event-driven replacement for reconciling on render.
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
     }
 
     /// How a daemon names itself in error text: bare when it is the only
@@ -3098,22 +2944,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dashboard.is_focused(window, cx)
-            && let Some(crate::dashboard::RowTarget::TreeTopic { host, node_id, .. }) =
-                self.dashboard.cursor_target(&self.registry, cx)
-        {
-            let state = if hide {
-                rho_desk::cells::State::Muted
-            } else {
-                rho_desk::cells::State::Done
-            };
-            let writes = vec![rho_desk::cells::CellWrite {
-                id: node_id,
-                property: rho_desk::cells::Property::State(state),
-            }];
-            self.apply_desk_writes(host, writes, None, window, cx);
-            return;
-        }
         if !self.require_connected(cx) {
             return;
         }
@@ -3219,7 +3049,7 @@ impl Workspace {
             self.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         };
-        let Some((_host, room_node)) = self.dashboard.tree_room_node(&card) else {
+        let Some((_host, room_node)) = self.dashboard.room_node(&card) else {
             return;
         };
         if !self.submit_tree_verdict(
@@ -3531,8 +3361,6 @@ impl Workspace {
                 };
                 let id = record.id;
                 this.file_page(id, parent, rho_journal::CreateMethod::TabBirth, window, cx);
-                this.preview_browser_page(id, window, cx);
-                this.focus_rail(window, cx);
             });
         })
         .detach();
@@ -3587,7 +3415,7 @@ impl Workspace {
             at_root,
         });
         self.invalidate_dealer_signals(cx);
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
     }
 
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -4022,42 +3850,16 @@ impl Workspace {
     /// with a conversation open is the normal way to work, and taking the
     /// tab's agent there would act on something the user is not looking at.
     ///
-    /// Rows that name nobody — the draft, the rail tail — fall through
-    /// to the open agent, so a chord from the dashboard still lands.
-    pub(crate) fn subject(&self, window: &Window, cx: &mut Context<Self>) -> Subject {
-        use crate::dashboard::RowTarget;
-        let row = self
-            .dashboard
-            .focus_handle(cx)
-            .is_focused(window)
-            .then(|| self.dashboard.cursor_target(&self.registry, cx))
-            .flatten();
-        let subject = match row {
-            Some(RowTarget::TreeAgent { agent_id, .. }) => Some(Subject {
+    /// The map used to answer this from the row under its cursor, and rows
+    /// that named nobody fell through to the open agent. With the map gone
+    /// there is no row, so the fall-through is the whole answer.
+    pub(crate) fn subject(&self, _window: &Window, _cx: &mut Context<Self>) -> Subject {
+        self.selection
+            .selected_agent()
+            .map_or_else(Subject::default, |agent_id| Subject {
                 agent: Some(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
-            }),
-            Some(RowTarget::TreeTopic {
-                host,
-                node_id,
-                first_attention,
-                ..
-            }) => first_attention
-                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
-                .map(|agent_id| Subject {
-                    agent: Some(agent_id),
-                    agents: self.registry.agent_subtree(agent_id),
-                }),
-            _ => None,
-        };
-        subject.unwrap_or_else(|| {
-            self.selection
-                .selected_agent()
-                .map_or_else(Subject::default, |agent_id| Subject {
-                    agent: Some(agent_id),
-                    agents: self.registry.agent_subtree(agent_id),
-                })
-        })
+            })
     }
 
     /// The subject's agent, or a `{verb}: no agent in focus` notice.
@@ -4351,41 +4153,6 @@ impl Workspace {
         self.select_agent_inner(agent_id, true, window, cx);
     }
 
-    /// Shows an agent beside the dashboard cursor without changing the
-    /// focused task or the dashboard's layout.
-    fn preview_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard_preview == Some(agent_id) {
-            return;
-        }
-        self.activate_agent(agent_id, cx);
-        let view = self.materialize_model(&agent_id, window, cx);
-        view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
-        self.dashboard_preview = Some(agent_id);
-        self.pages.clear_preview();
-        self.ensure_duration_timer(cx);
-        cx.notify();
-    }
-
-    fn preview_browser_page(
-        &mut self,
-        id: rho_browser::PageId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.pages.previewing(id) {
-            return;
-        }
-        let Some(model) = rho_browser::open_page(id, cx) else {
-            return;
-        };
-        self.scan_browser_pages_for_gc(cx);
-        self.observe_browser_metadata(&model, window, cx);
-        let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
-        self.dashboard_preview = None;
-        self.pages.preview_page(id, view);
-        cx.notify();
-    }
-
     fn select_agent_inner(
         &mut self,
         agent_id: Option<AgentId>,
@@ -4428,51 +4195,6 @@ impl Workspace {
             self.focus_active_surface(window, cx);
         }
         self.ensure_duration_timer(cx);
-        cx.notify();
-    }
-
-    /// The dashboard cursor moved: preview the row it landed on, and hide
-    /// the preview when the cursor leaves every staffed region. Only
-    /// while the dashboard owns the keyboard — programmatic cursor
-    /// restoration and unfocused syncs never drive the visible surface.
-    fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        if !self.dashboard.focus_handle(cx).is_focused(window) {
-            return;
-        }
-        let target = self.dashboard.cursor_target(&self.registry, cx);
-        if let Some(RowTarget::TreePage { page_id, .. }) = target {
-            self.preview_browser_page(page_id, window, cx);
-            return;
-        }
-        let agent = match target {
-            Some(RowTarget::TreeAgent { agent_id, .. }) => Some(agent_id),
-            Some(RowTarget::TreeTopic {
-                host,
-                node_id,
-                first_attention,
-                ..
-            }) => first_attention
-                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id))),
-            _ => None,
-        };
-        match agent {
-            Some(agent_id) if self.dashboard_preview != Some(agent_id) => {
-                self.preview_agent(agent_id, window, cx)
-            }
-            Some(_) => {}
-            None => self.clear_dashboard_preview(cx),
-        }
-    }
-
-    /// Hides the preview pane: the cursor is on a header, prose, or an
-    /// unstaffed heading, so no agent claims the frame.
-    fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
-        if self.dashboard_preview.is_none() && self.pages.preview().is_none() {
-            return;
-        }
-        self.dashboard_preview = None;
-        self.pages.clear_preview();
         cx.notify();
     }
 
@@ -4774,12 +4496,7 @@ impl Workspace {
     }
 
     pub(crate) fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
-        let method = if self.overview_open {
-            rho_journal::SurfaceShowMethod::Overview
-        } else {
-            rho_journal::SurfaceShowMethod::Open
-        };
-        self.display_surface_with_method(surface, method, cx);
+        self.display_surface_with_method(surface, rho_journal::SurfaceShowMethod::Open, cx);
     }
 
     pub(crate) fn display_surface_with_method(
@@ -4831,7 +4548,6 @@ impl Workspace {
                 history.current().surface.clone()
             }
         };
-        self.overview_open = false;
         if let Some(method) = match method {
             rho_journal::SurfaceShowMethod::Deal => Some(rho_journal::HistoryAppendMethod::Deal),
             rho_journal::SurfaceShowMethod::Overview => {
@@ -5250,39 +4966,8 @@ impl Workspace {
         self.dashboard.editor().clone()
     }
 
-    #[cfg(test)]
-    pub(crate) fn tree_buffer_for_test(
-        &self,
-        host: HostId,
-        node_id: rho_desk::cells::Id,
-    ) -> Option<Entity<language::Buffer>> {
-        self.desk_cells.buffer(host, &node_id).cloned()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tree_nodes_for_test(
-        &self,
-        host: HostId,
-        cx: &App,
-    ) -> Vec<(rho_desk::cells::Id, Option<rho_desk::cells::Id>, String)> {
-        self.desk_cells
-            .nodes(host)
-            .iter()
-            .filter_map(|node| {
-                let text = self.desk_cells.buffer(host, &node.id)?.read(cx).text();
-                Some((node.id.clone(), node.parent.clone(), text))
-            })
-            .collect()
-    }
-
-    /// The map exactly as it is drawn, prefixes included, which is where a
-    /// row's place shows up: two rows of one thing must each carry their
-    /// own bullet.
-    #[cfg(test)]
-    pub(crate) fn dashboard_display_text_for_test(&self, cx: &mut App) -> String {
-        self.dashboard.display_text_for_test(cx)
-    }
-
+    /// What "the cursor is on this node" means without a map: the node's
+    /// own surface is what the reader has open.
     #[cfg(test)]
     pub(crate) fn focus_tree_node_for_test(
         &mut self,
@@ -5291,9 +4976,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dashboard.move_to_tree_node_when_ready(host, node_id);
-        self.refresh_dashboard(window, cx);
-        window.focus(&self.dashboard.focus_handle(cx), cx);
+        self.open_tree_node(host, node_id, window, cx);
+        self.refresh_dashboard(cx);
     }
 
     #[cfg(test)]
@@ -5369,7 +5053,6 @@ impl Workspace {
             }
         }
         if !names.is_empty() {
-            self.overview_open = false;
             self.focus_active_surface(window, cx);
             cx.notify();
         }
@@ -5425,11 +5108,6 @@ impl Workspace {
             .filter(|surface| surface.key == SurfaceKey::Usage)
             .count();
         Some((view.chart(), screens, view.has_block()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn overview_open_for_test(&self) -> bool {
-        self.overview_open
     }
 
     #[cfg(test)]
@@ -5508,7 +5186,7 @@ impl Workspace {
         let draft = self.make_surface(SurfaceKey::Draft, window, cx);
         self.display_surface(draft, cx);
         self.seed_draft(false, window, cx);
-        self.open_overview(window, cx);
+        self.focus_active_surface(window, cx);
     }
 
     #[cfg(test)]
@@ -5568,15 +5246,11 @@ impl Workspace {
         }
         if !delta.shape {
             let nodes = self.desk_cells.nodes(host).to_vec();
-            let threads = self.slack_thread_facts(cx);
-            if self.dashboard.redraw_tree_rows(
-                host,
-                &delta.touched,
-                &nodes,
-                &self.registry,
-                &threads,
-                cx,
-            ) {
+            if self.dashboard.deal_shape_held(host, &nodes)
+                && self
+                    .dashboard
+                    .patch_deal_source(host, &delta.touched, &nodes)
+            {
                 let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
                 // The deal bar reads the hand; the map is not composed.
@@ -5598,7 +5272,7 @@ impl Workspace {
         &mut self,
         host: HostId,
         moved: Option<&BTreeSet<AgentId>>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The desk half of the same accounting: this runs from
@@ -5625,61 +5299,42 @@ impl Workspace {
         // nothing written, so no store event will ever give it the buffer
         // the map draws it from. It gets one here.
         self.desk_cells.reconcile_buffers(host, cx);
-        if let Some((nodes, buffers, titles)) = self.desk_cells.tree_source(host, cx) {
-            let shape_held =
-                self.dashboard
-                    .set_tree_source(host, nodes.clone(), buffers, titles, cx);
-            // The cards this moved, and only those. A `Changed` names its
-            // agents and costs them; a desk that arrived or changed shape
-            // names nothing and is made again.
-            // The dealer's own source, read from the store client rather
-            // than from what the map just composed.
-            //
-            // Made on every sync, not only when the shape changed: a note
-            // whose first line was edited keeps its shape and moves every
-            // breadcrumb beneath it. This is the nodes and the indexes and
-            // no rope, which is what the map's own index cost here before.
-            let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
-            self.dashboard.set_deal_source(host, source);
-            let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
-            let scope = match &moved {
-                Some(agents) => crate::dashboard::DealScope::Agents(agents),
-                None => crate::dashboard::DealScope::Whole,
-            };
-            self.refresh_deal_cards(host, scope, cx);
-            // An agent that is streaming says so constantly, and each time
-            // it names itself and nobody else. If the shape held, the map
-            // the editor has is still the right map: what moved is the
-            // marker in front of those rows, the hint at the end of them,
-            // and the words of a machine row. Drawing those is the desk
-            // delta's path, and a model event has as much right to it —
-            // composing the map again would take every inlay off the tree
-            // and splice them all back for one agent's news, which is what
-            // the user's telemetry caught.
-            if shape_held && let Some(agents) = &moved {
-                let touched = agents
-                    .iter()
-                    .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
-                    .collect::<BTreeSet<_>>();
-                let threads = self.slack_thread_facts(cx);
-                if self.dashboard.redraw_tree_rows(
-                    host,
-                    &touched,
-                    &nodes,
-                    &self.registry,
-                    &threads,
-                    cx,
-                ) {
-                    // The deal bar reads the hand; the map is not composed.
-                    self.dashboard.sync_hand(&self.agent_last_interaction);
-                    self.sync_note_views(host, cx);
-                    cx.notify();
-                    return;
-                }
+        // The desk's nodes are already to hand; asking the dealer whether
+        // they sit where its source has them costs a walk of the ids and no
+        // rope. That question comes first, because its answer decides
+        // whether the source has to be built at all. An agent that is
+        // streaming says so constantly and names only itself: taking the
+        // whole desk again for that is what made every event cost the desk,
+        // which is the fault the user's telemetry caught.
+        let nodes = self.desk_cells.nodes(host).to_vec();
+        let shape_held = self.dashboard.deal_shape_held(host, &nodes);
+        let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
+        if shape_held && let Some(agents) = &moved {
+            let touched = agents
+                .iter()
+                .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
+                .collect::<BTreeSet<_>>();
+            if self.dashboard.patch_deal_source(host, &touched, &nodes) {
+                self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(agents), cx);
+                self.dashboard.sync_hand(&self.agent_last_interaction);
+                self.sync_note_views(host, cx);
+                cx.notify();
+                return;
             }
-            self.refresh_dashboard(window, cx);
-            self.sync_note_views(host, cx);
         }
+        // The shape moved, or nothing was named: the source is taken whole.
+        // A note whose first line was edited keeps its shape and moves every
+        // breadcrumb beneath it, so this reads the titles again; it is the
+        // nodes and the indexes and no rope.
+        let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
+        self.dashboard.set_deal_source(host, source);
+        let scope = match &moved {
+            Some(agents) => crate::dashboard::DealScope::Agents(agents),
+            None => crate::dashboard::DealScope::Whole,
+        };
+        self.refresh_deal_cards(host, scope, cx);
+        self.refresh_dashboard(cx);
+        self.sync_note_views(host, cx);
     }
 
     /// What the desk knows of one agent, or nothing when the agent is not
@@ -6162,104 +5817,17 @@ impl Workspace {
         &mut self,
         host: HostId,
         stamp: rho_desk::cells::Stamp,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         self.pending_desk_texts.remove(&(host, stamp));
         self.pending_tree_verdicts.remove(&(host, stamp));
-        if let Some(transaction_id) = self.pending_semantic_batches.remove(&(host, stamp)) {
-            self.discard_desk_semantic_transaction(transaction_id, cx);
-        }
         if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
             self.restore_verdict_undo(undone.entry);
         }
     }
 
-    /// Records the editor undo entry a structure verb owns, so `u` emits the
-    /// inverse writes rather than replaying text.
-    pub(crate) fn record_desk_semantic_undo(
-        &mut self,
-        host: HostId,
-        stamp: rho_desk::cells::Stamp,
-        writes: Vec<rho_desk::cells::CellWrite>,
-        cx: &mut Context<Self>,
-    ) -> clock::Lamport {
-        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-        self.desk_semantic_undo
-            .insert(transaction_id, DeskSemanticUndo { host, writes });
-        self.pending_semantic_batches
-            .insert((host, stamp), transaction_id);
-        transaction_id
-    }
-
-    /// `* ` typed at the start of a line becomes a note: the line-local
-    /// recognition the design keeps. Nothing else is ever parsed.
-    fn recognize_desk_note_after_edit(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::cells::Id,
-        line_end: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_heading_undo.take();
-        let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
-            return;
-        };
-        let text = buffer.read(cx).text();
-        let cursor = line_end.min(text.len());
-        let line_start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
-        if !text[line_start..].starts_with("* ") || cursor < line_start + 2 {
-            return;
-        }
-        let line_end_offset = text[line_start..]
-            .find('\n')
-            .map_or(text.len(), |index| line_start + index);
-        let body = text[line_start + 2..line_end_offset].to_owned();
-        let Some((created, writes)) = self.desk_cells.new_note_writes(host, &node_id, false) else {
-            return;
-        };
-        // The recognized line leaves the source note; the star is a
-        // keystroke, never stored text.
-        let removed = line_start..if text[line_end_offset..].starts_with('\n') {
-            line_end_offset + 1
-        } else {
-            line_end_offset
-        };
-        buffer.update(cx, |buffer, cx| {
-            buffer.edit([(removed, "")], None, cx);
-        });
-        let undo = self.desk_cells.delete_writes(created.clone());
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-            return;
-        };
-        if !body.is_empty() {
-            self.pending_desk_texts
-                .insert((host, stamp), vec![(created.clone(), body)]);
-        }
-        self.record_desk_semantic_undo(host, stamp, undo, cx);
-        self.dashboard.move_to_tree_node_when_ready(host, created);
-        self.sync_tree_dashboard(host, window, cx);
-    }
-
-    fn discard_desk_semantic_transaction(
-        &mut self,
-        transaction_id: clock::Lamport,
-        cx: &mut Context<Self>,
-    ) {
-        self.desk_semantic_undo.remove(&transaction_id);
-        self.dashboard
-            .forget_external_undo_transaction(transaction_id, cx);
-    }
-
-    pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let threads = self.slack_thread_facts(cx);
-        self.dashboard.sync(
-            &self.registry,
-            &threads,
-            &self.agent_last_interaction,
-            window,
-            cx,
-        );
+    pub(crate) fn refresh_dashboard(&mut self, cx: &mut Context<Self>) {
+        self.dashboard.sync(&self.agent_last_interaction);
         if let Some(unreferenced) = self.pages.reconcile(self.dashboard.page_ids()) {
             for page in unreferenced {
                 self.schedule_browser_page_gc(page, cx);
@@ -7112,9 +6680,6 @@ impl Workspace {
         use crate::transient::Command;
         match command {
             Command::Voice => self.cmd_voice(window, cx),
-            Command::Rail => self.focus_rail(window, cx),
-            Command::Map => self.open_overview(window, cx),
-            Command::MapRawSource => self.cmd_toggle_raw_desk(window, cx),
             Command::SwitchBuffer => self.open_buffer_picker(window, cx),
             Command::MessageLog => self.cmd_messages(window, cx),
             Command::SurfaceBack => self.cmd_surface_back(window, cx),
@@ -7161,7 +6726,6 @@ impl Workspace {
             Command::AgentContinue => self.cmd_continue_turn(window, cx),
             Command::AgentCacheKey => self.cmd_change_prompt_cache_key(window, cx),
             Command::AgentSnooze(ms) => self.cmd_agent_snooze(ms, window, cx),
-            Command::PhoneOpenDesk => self.phone_open_desk(window, cx),
             Command::PhoneSnoozeAhead(unit, count) => {
                 self.phone_verdict_with(
                     rho_journal::PhoneVerdict::Defer,
@@ -7317,11 +6881,6 @@ impl Workspace {
         self.open_prompt("remove project:", complete, on_submit, window, cx);
     }
 
-    /// `space r`: focus jumps directly to the dashboard.
-    pub(crate) fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_overview(window, cx);
-    }
-
     pub(crate) fn cmd_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.step_surface_back(window, cx);
     }
@@ -7330,14 +6889,6 @@ impl Workspace {
     pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_current_surface(window, cx);
         self.pull_card(window, cx);
-    }
-
-    pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.toggle_raw_mode(cx);
-        rho_journal::record(rho_journal::Event::DeskRawModeToggled {
-            enabled: self.dashboard.raw_mode(),
-        });
-        self.refresh_dashboard(window, cx);
     }
 
     /// Opens a card as an ordinary surface: the note, the transcript, the
@@ -7349,14 +6900,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.dashboard
-            .move_to_tree_node_when_ready(card.host, card.topic_node_id.clone());
         let host = card.identity.host;
         let node_id = card.identity.node_id.clone();
         let surface = match self.dashboard.card_target(card.identity.clone()) {
             crate::dashboard::CardTarget::Note | crate::dashboard::CardTarget::Missing => {
-                self.dashboard
-                    .move_to_tree_node_when_ready(host, node_id.clone());
                 Self::wrap_surface(
                     SurfaceKey::DeskNode { host, node_id },
                     SurfaceView::DeskNode(self.dashboard.editor().clone()),
@@ -7378,8 +6925,6 @@ impl Workspace {
                 if self.open_slack_deal(&unit, window, cx) {
                     return true;
                 }
-                self.dashboard
-                    .move_to_tree_node_when_ready(host, node_id.clone());
                 Self::wrap_surface(
                     SurfaceKey::DeskNode { host, node_id },
                     SurfaceView::DeskNode(self.dashboard.editor().clone()),
@@ -7392,14 +6937,10 @@ impl Workspace {
                         let view = cx.new(|cx| rho_browser::PageView::new(model, page, cx));
                         Self::wrap_surface(SurfaceKey::Browser(page), SurfaceView::Browser(view))
                     }
-                    _ => {
-                        self.dashboard
-                            .move_to_tree_node_when_ready(host, node_id.clone());
-                        Self::wrap_surface(
-                            SurfaceKey::DeskNode { host, node_id },
-                            SurfaceView::DeskNode(self.dashboard.editor().clone()),
-                        )
-                    }
+                    _ => Self::wrap_surface(
+                        SurfaceKey::DeskNode { host, node_id },
+                        SurfaceView::DeskNode(self.dashboard.editor().clone()),
+                    ),
                 }
             }
         };
@@ -7450,7 +6991,7 @@ impl Workspace {
             return;
         };
         self.open_card(card, window, cx);
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
     }
 
     /// What `f` files: the card in front of the reader, else the row under
@@ -7463,17 +7004,7 @@ impl Workspace {
         // the row under the cursor when the map is what they are reading.
         // The card in hand is the target only when it is that thing, so
         // filing a page while a Slack card sits in the queue files the page.
-        if !self.overview_open
-            && let Some(node) = self.surface_node()
-        {
-            return Some(node);
-        }
-        // The map is the overlay in front, so its cursor row is what the
-        // reader is on even when Home is the surface underneath with a
-        // cursor of its own on some other card.
-        if self.overview_open
-            && let Some(node) = self.dashboard.tree_node_at_cursor(cx)
-        {
+        if let Some(node) = self.surface_node() {
             return Some(node);
         }
         self.context_area(cx)
@@ -7495,15 +7026,6 @@ impl Workspace {
     /// map's cursor had left behind: they wore its label and its why, and a
     /// verdict pressed over them landed on it.
     fn card_target(&mut self, cx: &mut Context<Self>) -> Option<(HostId, rho_desk::cells::Id)> {
-        // The map is the overlay in front, so its cursor row is what the
-        // reader is on even when Home is the surface underneath with a
-        // cursor of its own on some other card.
-        if self.overview_open {
-            return self
-                .dashboard
-                .tree_node_at_cursor(cx)
-                .or_else(|| self.context_area(cx));
-        }
         // Home is a list of cards, so its cursor names one the same way the
         // map's does.
         if self.home_in_view() {
@@ -7535,7 +7057,7 @@ impl Workspace {
     /// from it opens the top card instead of passing over the row, and the
     /// bar still says "home".
     pub(crate) fn home_in_view(&self) -> bool {
-        !self.overview_open && self.active_surface().key == SurfaceKey::Home
+        self.active_surface().key == SurfaceKey::Home
     }
 
     /// The card a surface in view stands for, which is nothing on Home:
@@ -7579,13 +7101,12 @@ impl Workspace {
                 ..
             }
         );
-        // `u` on the map takes a label back the same way it takes any other
-        // structure verb back: the inverse writes, not replayed text.
-        let undo = self.desk_cells.inverse_writes(host, &writes);
-        let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {
+        if self
+            .apply_desk_writes(host, writes, Some(event), window, cx)
+            .is_none()
+        {
             return;
-        };
-        self.record_desk_semantic_undo(host, stamp, undo, cx);
+        }
         let said = match removed {
             true => format!("label removed: {path}"),
             false => format!("label: {path}"),
@@ -7711,11 +7232,12 @@ impl Workspace {
             id: target,
             property: rho_desk::cells::Property::Parent(Some(parent)),
         }];
-        let undo = self.desk_cells.inverse_writes(host, &writes);
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
             return;
-        };
-        self.record_desk_semantic_undo(host, stamp, undo, cx);
+        }
         self.echo(&format!("file under {heading}"), StyleClass::SystemInfo, cx);
     }
 
@@ -7723,7 +7245,7 @@ impl Workspace {
         // A verdict from Home is a row leaving the list. The reader is
         // looking at the list, so nothing is opened for them.
         if self.home_in_view() {
-            self.refresh_dashboard(window, cx);
+            self.refresh_dashboard(cx);
             return;
         }
         // The card was read as an ordinary surface, so a verdict just closes
@@ -7774,7 +7296,7 @@ impl Workspace {
             cx,
         );
         self.open_card(*card, window, cx);
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
     }
 
     /// Closes a thread card because Slack said the thread is not the user's
@@ -7877,7 +7399,7 @@ impl Workspace {
             StyleClass::SystemInfo,
             cx,
         );
-        self.refresh_dashboard(window, cx);
+        self.refresh_dashboard(cx);
     }
 
     fn next_verdict_undo(&mut self, verb: String, state: VerdictUndoState) -> VerdictUndo {
@@ -8038,31 +7560,6 @@ impl Workspace {
         true
     }
 
-    /// Sibling order is derived from `(CreatedAt, Id)`, so moving a row
-    /// among its siblings has no cell to write in this slice.
-    fn reordering_unavailable(&mut self, cx: &mut Context<Self>) {
-        self.notice_on(
-            None,
-            "reordering rows is not available",
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    /// Writes one fact outside the dealer: no verdict, no undo entry.
-    fn set_node_fact(
-        &mut self,
-        host: HostId,
-        id: rho_desk::cells::Id,
-        property: rho_desk::cells::Property,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let writes = vec![rho_desk::cells::CellWrite { id, property }];
-        self.apply_desk_writes(host, writes, None, window, cx)
-            .is_some()
-    }
-
     /// `n a` with an area chosen: the draft page carries the fields, so
     /// there is no transient in front of it. The area is the agent's
     /// parent and where its workdir is inherited from; the body is focused
@@ -8175,143 +7672,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// What a new agent under an area starts as: the area's inherited
-    /// workdir, a fresh workspace on the auto base, and the default role.
-    /// The fields on the draft page override this; a heading draft has no
-    /// page, so this is all it gets.
-    fn launch_for_area(
-        &self,
-        host: HostId,
-        node_id: rho_desk::cells::Id,
-    ) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
-        let workdir = self
-            .area_workdir(host, node_id)
-            .or_else(|| self.only_workdir())
-            .ok_or_else(|| "new agent: no working directory for this area".to_owned())?;
-        let role = parse_agent_role(rho_agents::create::DEFAULT_ROLE)?;
-        Ok((
-            workdir.host,
-            rho_ui_proto::StartMode::NewOn {
-                repo: workdir.path,
-                revset: rho_agents::create::AUTO_BASE_REVSET.to_owned(),
-            },
-            role,
-        ))
-    }
-
-    /// `enter` on a bound Desk heading opens its agent.
-    fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::TreeAgent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
-            Some(RowTarget::TreePage { page_id, .. }) => {
-                self.open_browser_page(page_id, window, cx)
-            }
-            // `enter` opens what the row is, and a note's surface is the
-            // note. Staffing one is `r`, which writes the draft.
-            Some(RowTarget::TreeTopic {
-                host,
-                node_id,
-                first_attention,
-                ..
-            }) => {
-                if !self.open_note(host, node_id.clone(), window, cx) {
-                    match first_attention.or_else(|| {
-                        self.dashboard
-                            .first_tree_agent_for_topic((host, node_id.clone()))
-                    }) {
-                        Some(agent_id) => self.open_agent(agent_id, window, cx),
-                        None => {
-                            self.dashboard
-                                .open_new_tree_draft((host, node_id), window, cx);
-                            self.dashboard_focus_draft(window, cx);
-                        }
-                    }
-                }
-            }
-            Some(RowTarget::NewTreeDraft((topic_host, node_id))) => {
-                if !self.require_connected(cx) {
-                    return;
-                }
-                let Some(body) = self.dashboard.take_new_draft(cx) else {
-                    return;
-                };
-                let (host, start, role) = match self.launch_for_area(topic_host, node_id.clone()) {
-                    Ok(launch) => launch,
-                    Err(message) => {
-                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                };
-                self.pending_agent_filing = Some((host, node_id));
-                self.send_to_host(
-                    host,
-                    ClientMessage::NewAgent {
-                        role,
-                        start,
-                        content: Some(vec![ContentPart::Text { text: body }]),
-                    },
-                );
-                self.refresh_dashboard(window, cx);
-            }
-            _ => {}
-        }
-    }
-
-    /// Insert-mode enter: send when the cursor is in a draft, and drop
-    /// back to normal mode on the row the send leaves behind. In document
-    /// text it is a newline — dispatched explicitly, because propagating
-    /// would fall through to the transcript prompt's `RhoGui > Editor`
-    /// SubmitPrompt binding, which swallows the key.
-    fn dashboard_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(
-            self.dashboard.cursor_target(&self.registry, cx),
-            Some(
-                crate::dashboard::RowTarget::NewDraft
-                    | crate::dashboard::RowTarget::NewTreeDraft(_)
-            )
-        ) {
-            self.dashboard_open(window, cx);
-            if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
-                window.dispatch_action(action, cx);
-            }
-        } else {
-            // Not propagate: the fall-through lands on the transcript
-            // prompt's SubmitPrompt binding, which eats the key and leaves
-            // the note without its newline.
-            window.dispatch_action(Box::new(editor::actions::Newline), cx);
-        }
-    }
-
-    fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
-                self.open_agent(agent_id, window, cx)
-            }
-            Some(crate::dashboard::RowTarget::TreeTopic {
-                host,
-                node_id,
-                first_attention,
-                ..
-            }) => match first_attention.or_else(|| {
-                self.dashboard
-                    .first_tree_agent_for_topic((host, node_id.clone()))
-            }) {
-                Some(agent_id) => self.open_agent(agent_id, window, cx),
-                None => {
-                    self.dashboard
-                        .open_new_tree_draft((host, node_id), window, cx);
-                    self.dashboard_focus_draft(window, cx);
-                }
-            },
-            _ => cx.propagate(),
-        }
-    }
-
-    pub(crate) fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.enter_insert_mode(window, cx);
-    }
-
     /// Vim's insert, for a surface that was opened to be written in. It is
     /// dispatched to whatever the window has focused, so a caller that just
     /// changed surfaces has to wait for the frame that focus lands in.
@@ -8377,98 +7737,6 @@ impl Workspace {
         self.insert_when_shown
     }
 
-    /// A freshly opened draft row only exists on screen after a sync:
-    /// splice it in now so the pending cursor lands on it, then enter
-    /// insert there — never on the read-only row the cursor came from.
-    pub(crate) fn dashboard_focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.refresh_dashboard(window, cx);
-        self.dashboard_enter_insert(window, cx);
-    }
-
-    /// Vim-style `o`/`O` on a heading line: insert a sibling node below or
-    /// above. Anywhere else the action propagates so vim's own open-line
-    /// binding runs.
-    /// `above` makes no difference: sibling order is `(CreatedAt, NodeId)`
-    /// and `CreatedAt` cannot be rewritten, so a new row lands after its
-    /// siblings either way. The semantic `O` says so in the echo area.
-    fn dashboard_insert_heading(
-        &mut self,
-        _above: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  _window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let title = input.trim();
-                if !title.is_empty()
-                    && let Some((host, relative)) = workspace.dashboard.tree_node_at_cursor(cx)
-                {
-                    workspace.append_tree_heading(host, relative, false, title, _window, cx);
-                }
-            },
-        );
-        self.open_prompt(
-            "new topic:",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
-            window,
-            cx,
-        );
-    }
-
-    /// Single-letter Desk verbs only apply on a heading line of the focused
-    /// Desk; otherwise the caller propagates the key back to vim.
-    fn dashboard_verb_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
-        self.dashboard.is_focused(window, cx) && self.dashboard.cursor_on_heading_line(cx)
-    }
-
-    /// The new-heading verbs also apply when there is nothing to stand on:
-    /// a desk with no rows has no heading line, and without this the very
-    /// first note could never be written from the keyboard.
-    fn dashboard_new_heading_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
-        self.dashboard.is_focused(window, cx)
-            && (self.dashboard.cursor_on_heading_line(cx) || self.dashboard.tree_is_empty())
-    }
-
-    fn dashboard_new_heading(&mut self, child: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // An empty desk has no row to hang the new one off, so the first
-        // note is a root: the key still works on a desk with nothing in it.
-        // A cursor left in a removed excerpt still names its old node, and
-        // the verb must not be swallowed: an unknown row falls back to a root.
-        let (host, relative) = match self.dashboard.tree_node_at_cursor(cx) {
-            Some((host, node_id)) => (
-                host,
-                self.desk_cells.node(host, &node_id).map(|node| node.id),
-            ),
-            None => match self.hosts.primary() {
-                Some(host) if self.desk_cells.is_synced(host) => (host, None),
-                _ => return,
-            },
-        };
-        let created = match relative {
-            Some(relative) => self.desk_cells.new_note_writes(host, &relative, child),
-            None => self.desk_cells.create_note_writes(host, None),
-        };
-        let Some((created, writes)) = created else {
-            return;
-        };
-        let undo = self.desk_cells.delete_writes(created.clone());
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-            return;
-        };
-        self.dashboard.move_to_tree_node_when_ready(host, created);
-        self.sync_tree_dashboard(host, window, cx);
-        let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
-        self.pending_semantic_group = Some(transaction_id);
-        // The structural shortcut is the equivalent of Vim's `o`: the
-        // new row is ready for text immediately, rather than consuming
-        // the first title characters as normal-mode commands.
-        self.dashboard_enter_insert(window, cx);
-    }
-
     fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
@@ -8479,13 +7747,10 @@ impl Workspace {
         let Some(capture) = self.desk_semantic_clipboard.clone() else {
             return;
         };
-        let Some((root, writes, texts)) = self.desk_cells.paste_writes(host, &node_id, &capture)
+        let Some((_root, writes, texts)) = self.desk_cells.paste_writes(host, &node_id, &capture)
         else {
             return;
         };
-        let undo = self.desk_cells.delete_writes(root.clone());
-        self.dashboard
-            .move_to_tree_node_when_ready(host, root.clone());
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
@@ -8493,224 +7758,9 @@ impl Workspace {
             self.pending_desk_texts.insert((host, stamp), texts);
         }
         cx.on_next_frame(window, move |this, window, cx| {
-            this.dashboard.move_to_tree_node_when_ready(host, root);
             this.sync_tree_dashboard(host, window, cx);
         });
         cx.notify();
-        self.record_desk_semantic_undo(host, stamp, undo, cx);
-    }
-
-    fn handle_desk_semantic_row_action(
-        &mut self,
-        buffer_id: text::BufferId,
-        action: editor::SemanticRowAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((host, node_id)) = self.dashboard.tree_node_for_buffer(buffer_id, cx) else {
-            return;
-        };
-        match action {
-            editor::SemanticRowAction::Yank => {
-                self.desk_semantic_clipboard = self.desk_cells.capture(host, &node_id, cx);
-            }
-            editor::SemanticRowAction::Delete => {
-                let Some(capture) = self.desk_cells.capture(host, &node_id, cx) else {
-                    return;
-                };
-                let writes = self.desk_cells.delete_writes(node_id.clone());
-                let undo = self.desk_cells.inverse_writes(host, &writes);
-                self.desk_semantic_clipboard = Some(capture);
-                let focus = self.desk_cells.row_after_delete(host, &node_id);
-                self.desk_semantic_paste_target = focus.clone().map(|focus| (host, focus));
-                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-                    return;
-                };
-                if let Some(focus) = focus {
-                    // Vim finishes its linewise delete after emitting the
-                    // semantic action and can overwrite a synchronous cursor
-                    // move with an anchor into the removed excerpt. Re-aim at
-                    // the surviving sibling after that dispatch completes.
-                    cx.on_next_frame(window, move |this, window, cx| {
-                        this.dashboard.move_to_tree_node_when_ready(host, focus);
-                        this.sync_tree_dashboard(host, window, cx);
-                        if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
-                            window.dispatch_action(action, cx);
-                        }
-                    });
-                    cx.notify();
-                }
-                self.record_desk_semantic_undo(host, stamp, undo, cx);
-            }
-            editor::SemanticRowAction::Paste { .. } => {
-                self.desk_semantic_paste_target = None;
-                self.paste_desk_semantic_subtree(host, node_id, window, cx);
-            }
-            editor::SemanticRowAction::Open { above } => {
-                // Sibling order is `(CreatedAt, NodeId)` and `CreatedAt`
-                // cannot be rewritten, so `O` opens after the row like `o`.
-                if above {
-                    self.echo(
-                        "open above: new rows land after their siblings",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
-                let Some((created, writes)) =
-                    self.desk_cells.new_note_writes(host, &node_id, false)
-                else {
-                    return;
-                };
-                let undo = self.desk_cells.delete_writes(created.clone());
-                self.dashboard.move_to_tree_node_when_ready(host, created);
-                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-                    return;
-                };
-                let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
-                self.pending_semantic_group = Some(transaction_id);
-                self.dashboard_enter_insert(window, cx);
-            }
-            editor::SemanticRowAction::Indent { outdent } => {
-                let Some(writes) = self
-                    .desk_cells
-                    .structure_move_writes(host, &node_id, !outdent)
-                else {
-                    return;
-                };
-                let undo = self.desk_cells.inverse_writes(host, &writes);
-                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-                    return;
-                };
-                self.record_desk_semantic_undo(host, stamp, undo, cx);
-            }
-        }
-    }
-
-    fn undo_desk_semantic_action(
-        &mut self,
-        transaction_id: clock::Lamport,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(undo) = self.desk_semantic_undo.remove(&transaction_id) else {
-            return;
-        };
-        self.apply_desk_writes(undo.host, undo.writes, None, window, cx);
-    }
-
-    fn append_tree_heading(
-        &mut self,
-        host: HostId,
-        relative: rho_desk::cells::Id,
-        child: bool,
-        title: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.append_tree_heading_at(host, relative, child, title, window, cx)
-            .is_some()
-    }
-
-    fn append_tree_heading_at(
-        &mut self,
-        host: HostId,
-        relative: rho_desk::cells::Id,
-        child: bool,
-        title: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<rho_desk::cells::Id> {
-        let (created, writes) = self.desk_cells.new_note_writes(host, &relative, child)?;
-        self.dashboard
-            .move_to_tree_node_when_ready(host, created.clone());
-        self.apply_desk_writes(host, writes, None, window, cx)?;
-        self.sync_tree_dashboard(host, window, cx);
-        self.dashboard
-            .rename_cursor_topic(title, cx)
-            .then_some(created)
-    }
-
-    fn dashboard_delete_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
-            return;
-        };
-        let empty = self
-            .desk_cells
-            .buffer(host, &node_id)
-            .is_some_and(|buffer| buffer.read(cx).is_empty());
-        if !empty {
-            self.notice_on(
-                None,
-                "delete: heading is not empty",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        let focus = self.desk_cells.row_above(host, &node_id);
-        let writes = self.desk_cells.delete_writes(node_id);
-        let undo = self.desk_cells.inverse_writes(host, &writes);
-        if let Some(focus) = focus {
-            self.dashboard.move_to_tree_node_when_ready(host, focus);
-        }
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-            return;
-        };
-        self.record_desk_semantic_undo(host, stamp, undo, cx);
-    }
-
-    fn dashboard_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(action) = cx.build_action("vim::Undo", None) {
-            window.dispatch_action(action, cx);
-        }
-    }
-
-    fn dashboard_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.dashboard.next_now(&self.registry, window, cx) else {
-            self.notice_on(None, "NOW is clear", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.preview_agent(agent_id, window, cx);
-        window.focus(&self.dashboard.focus_handle(cx), cx);
-    }
-
-    fn dashboard_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.back(&self.registry, window, cx) {
-            window.focus(&self.dashboard.focus_handle(cx), cx);
-        }
-    }
-
-    fn prompt_dashboard_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, cx: &gpui::App| {
-            workspace
-                .dashboard
-                .heading_candidates(&workspace.registry, input.trim(), cx)
-                .into_iter()
-                .map(|(value, description)| crate::commands::Candidate { value, description })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let found = workspace.dashboard.jump_to_heading(
-                    input.trim(),
-                    &workspace.registry,
-                    window,
-                    cx,
-                );
-                rho_journal::record(rho_journal::Event::Find {
-                    query: input.trim().to_owned(),
-                    target: "desk_heading".to_owned(),
-                    found,
-                });
-                if found {
-                    window.focus(&workspace.dashboard.focus_handle(cx), cx);
-                }
-            },
-        );
-        self.open_prompt("Note:", complete, on_submit, window, cx);
     }
 
     /// The transcript model and editor of the surface the reader is on.
@@ -8925,44 +7975,6 @@ impl Workspace {
         self.run_transcript_search(agent_id, query, window, cx);
     }
 
-    /// `/` on the dashboard, which searches its own buffer with the same
-    /// query register as everything else.
-    fn prompt_dashboard_search(
-        &mut self,
-        direction: search::Direction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.prompt_for_query(direction, window, cx, |workspace, query, window, cx| {
-            let editor = workspace.dashboard.editor().clone();
-            if !workspace.search_editor(&editor, query, window, cx) {
-                workspace.notice_on(None, "search: no match", StyleClass::SystemInfo, cx);
-            }
-        });
-    }
-
-    fn prompt_dashboard_rename_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             _window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                if !input.trim().is_empty()
-                    && workspace.dashboard.rename_cursor_topic(input.trim(), cx)
-                {
-                    workspace.refresh_dashboard(_window, cx);
-                }
-            },
-        );
-        self.open_prompt(
-            "rename topic:",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
-            window,
-            cx,
-        );
-    }
-
     /// The home-mode dashboard beside the active context's preview.
     fn render_rail(
         &mut self,
@@ -9003,40 +8015,6 @@ impl Workspace {
             .overflow_hidden()
             .child(self.dashboard.editor().clone());
         container.child(dashboard).into_any_element()
-    }
-
-    /// The selected agent's preview editor.
-    fn selected_preview_editor(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<editor::Editor>> {
-        let agent_id = self.dashboard_preview?;
-        let model = self.models.get(&agent_id)?.clone();
-        Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
-    }
-
-    fn selected_preview(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        if let Some(preview) = self.pages.preview() {
-            return Some(
-                div()
-                    .size_full()
-                    .overflow_hidden()
-                    .child(preview.view.clone())
-                    .into_any_element(),
-            );
-        }
-        self.selected_preview_editor(window, cx).map(|editor| {
-            div()
-                .size_full()
-                .overflow_hidden()
-                .child(editor)
-                .into_any_element()
-        })
     }
 
     fn render_deal_why(
@@ -9348,8 +8326,8 @@ impl Workspace {
         // An agent surface's state comes from its head, never from the card
         // that dealt it: the card says why the dealer raised the agent, and
         // a running agent has no card at all, which left the line blank.
-        let agent_in_view = match (self.overview_open, &self.active_surface().key) {
-            (false, SurfaceKey::Transcript(agent_id)) => Some(*agent_id),
+        let agent_in_view = match &self.active_surface().key {
+            SurfaceKey::Transcript(agent_id) => Some(*agent_id),
             _ => None,
         };
         if let Some(card) = self.open_card_in_view(cx)
@@ -9358,20 +8336,7 @@ impl Workspace {
         {
             return self.render_deal_why(&card, text_style, window, cx);
         }
-        let path = if self.overview_open {
-            let path = self
-                .dashboard
-                .cursor_breadcrumb(cx)
-                .unwrap_or_else(|| "map".to_owned());
-            if matches!(
-                self.dashboard.cursor_target(&self.registry, cx),
-                Some(crate::dashboard::RowTarget::NewTreeDraft(_))
-            ) {
-                format!("{path} / new agent")
-            } else {
-                path
-            }
-        } else {
+        let path = {
             match &self.active_surface().key {
                 SurfaceKey::Transcript(agent_id) => {
                     let leaf = self.registry.agent_display_label(*agent_id);
@@ -9423,99 +8388,34 @@ impl Workspace {
         )
     }
 
-    fn render_workspace(
-        &mut self,
-        window: &mut Window,
-        text_style: &gpui::TextStyle,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        // Home mode: the dashboard owns the keyboard, so it owns the frame;
-        // the surface area is its preview. With nothing selected there is
-        // nothing to preview — the dashboard takes the whole frame.
-        // Modal overlays borrow keyboard focus; the frame stays in the mode
-        // recorded beneath the overlay for its whole replacement chain.
-        let home = self.overview_open;
+    fn render_workspace(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         {
-            let focused_surface = if home {
-                crate::telemetry::SurfaceKind::Dashboard
-            } else {
-                self.active_surface().view.telemetry_kind()
-            };
-            let visible_surfaces = focused_surface.bit();
-            crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
+            let focused_surface = self.active_surface().view.telemetry_kind();
+            crate::telemetry::record_surfaces(focused_surface, focused_surface.bit());
         }
-        self.sync_diff_visibility(!home, cx);
-        let web_preview_visible = self.pages.preview().is_some();
-        let show_surface = !home || self.dashboard_preview.is_some() || web_preview_visible;
-        let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
-        // Same hairline the rail uses against the preview.
-        let separator_color = cx.theme().colors().border_variant.opacity(0.6);
-        let mut preview_text_style = text_style.clone();
-        preview_text_style.font_size =
-            (text_style.font_size.to_pixels(window.rem_size()) * 0.85).into();
-        preview_text_style.line_height =
-            (text_style.line_height_in_pixels(window.rem_size()) * 0.85).into();
-        let preview = home.then(|| self.selected_preview(window, cx)).flatten();
-        let surface = show_surface.then(|| {
-            let element = div().flex_1().min_w_0().min_h_0();
-            // Home mode uses a narrow preview card with the original top
-            // inset, anchored to the bottom-right of the surface area rather
-            // than competing with the dashboard for an equal split.
-            // The sheet shows the agent's *document* editor: the same
-            // transcript buffers composed without the prompt, ending where
-            // the words end. Its bottom bar carries the context the prompt
-            // row shows in work mode.
-            if home {
-                element.flex().flex_col().child(
-                    div()
-                        .w_full()
-                        .h(gpui::relative(0.98))
-                        .ml_auto()
-                        .mt_auto()
-                        .border_1()
-                        .border_color(separator_color)
-                        .rounded_t_md()
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_1()
-                                .min_w_0()
-                                .min_h_0()
-                                .overflow_hidden()
-                                .children(preview),
-                        ),
-                )
-            } else {
-                element
-                    .h_full()
-                    .relative()
-                    .overflow_hidden()
-                    .child(self.render_surface(self.active_surface()))
-            }
-        });
+        self.sync_diff_visibility(true, cx);
         div()
             .flex()
             .flex_row()
             .w_full()
             .flex_grow(1.0)
             .min_h_0()
-            .children(rail)
-            .children(surface)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .h_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child(self.render_surface(self.active_surface())),
+            )
             .into_any_element()
     }
 
-    fn dashboard_mode(&self, window: &Window, cx: &App) -> bool {
+    fn dashboard_mode(&self, _window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
-        let browser_preview_focused = self
-            .pages
-            .preview()
-            .is_some_and(|preview| preview.view.read(cx).focus_handle(cx).is_focused(window));
-        self.overview_open
-            || self.overlay_focus.target() == Some(&dashboard)
-            || browser_preview_focused
+        self.overlay_focus.target() == Some(&dashboard)
     }
 
     /// Hidden surfaces stay alive as editor buffers, but they must not turn
@@ -9818,7 +8718,9 @@ impl Render for Workspace {
                 this.home_open_row(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
-                this.focus_rail(window, cx);
+                // The rail was the map's; leaving the browser lands on
+                // Home, which is the front door either way.
+                this.open_home(window, cx);
             }))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
@@ -9919,64 +8821,10 @@ impl Render for Workspace {
                 this.select_agent(None, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
-                if this.dashboard.is_focused(window, cx)
-                    && !this.dashboard.cursor_on_heading_line(cx)
-                {
-                    cx.propagate();
-                    return;
-                }
                 this.cmd_agent_done(false, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentHide, window, cx| {
-                if this.dashboard.is_focused(window, cx)
-                    && !this.dashboard.cursor_on_heading_line(cx)
-                {
-                    cx.propagate();
-                    return;
-                }
                 this.cmd_agent_done(true, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
-                this.dashboard_reply(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardSubmit, window, cx| {
-                this.dashboard_submit(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardCancelDraft, window, cx| {
-                if matches!(
-                    this.dashboard.cursor_target(&this.registry, cx),
-                    Some(
-                        crate::dashboard::RowTarget::NewDraft
-                            | crate::dashboard::RowTarget::NewTreeDraft(_)
-                    )
-                ) && this.dashboard.discard_new_draft(cx)
-                {
-                    this.forget_discarded_draft(window, cx);
-                    this.refresh_dashboard(window, cx);
-                    if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
-                        window.dispatch_action(action, cx);
-                    }
-                } else {
-                    cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
-                this.dashboard_insert_heading(false, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardHeadingAbove, window, cx| {
-                this.dashboard_insert_heading(true, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardNow, window, cx| {
-                this.dashboard_now(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardBack, window, cx| {
-                this.dashboard_back(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardJump, window, cx| {
-                this.prompt_dashboard_jump(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardRenameTopic, window, cx| {
-                this.prompt_dashboard_rename_topic(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);
@@ -10071,6 +8919,18 @@ impl Render for Workspace {
                             window.focus(&view.read(cx).editor().focus_handle(cx), cx);
                         }
                     }
+                    // A note card opens the note. It used to open the map
+                    // and put it in edit mode, because the note had no
+                    // surface of its own to open; it has one now, and it is
+                    // the same one find opens.
+                    _ if matches!(card.kind, crate::dashboard::DealCardKind::Desk) => {
+                        this.open_note(
+                            card.identity.host,
+                            card.identity.node_id.clone(),
+                            window,
+                            cx,
+                        );
+                    }
                     _ if card.agent_id.is_some() => {
                         let agent_id = card.agent_id.unwrap();
                         this.open_agent(agent_id, window, cx);
@@ -10082,129 +8942,8 @@ impl Render for Workspace {
                             model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
                         }
                     }
-                    _ if this.phone.enabled
-                        && matches!(card.kind, crate::dashboard::DealCardKind::Desk) =>
-                    {
-                        this.phone_open_desk(window, cx);
-                        this.phone_toggle_dashboard_editing(window, cx);
-                    }
                     _ => {}
                 }
-            }))
-            .on_action(
-                cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {
-                    if !this.dashboard.is_focused(window, cx)
-                        || !this.dashboard.toggle_agent_tree(cx)
-                    {
-                        cx.propagate();
-                        return;
-                    }
-                    this.refresh_dashboard(window, cx);
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
-                    if !this.dashboard.is_focused(window, cx)
-                        || !this.dashboard.toggle_subagents(cx)
-                    {
-                        cx.propagate();
-                        return;
-                    }
-                    this.refresh_dashboard(window, cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &DashboardCycleGlobal, window, cx| {
-                if !this.dashboard.is_focused(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard.cycle_global_folds(cx);
-                this.refresh_dashboard(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
-                if !this.dashboard.is_focused(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                let archived =
-                    this.dashboard
-                        .tree_node_at_cursor(cx)
-                        .is_some_and(|(host, node_id)| {
-                            this.set_node_fact(
-                                host,
-                                node_id,
-                                rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
-                                window,
-                                cx,
-                            )
-                        });
-                if !archived {
-                    this.notice_on(
-                        None,
-                        "archive: heading unavailable",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                } else {
-                    this.notice_on(None, "archived", StyleClass::SystemInfo, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDemote, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard.dispatch_semantic_row_action(
-                    editor::SemanticRowAction::Indent { outdent: false },
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &DashboardPromote, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard.dispatch_semantic_row_action(
-                    editor::SemanticRowAction::Indent { outdent: true },
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &DashboardNewSibling, window, cx| {
-                if !this.dashboard_new_heading_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard_new_heading(false, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardNewChild, window, cx| {
-                if !this.dashboard_new_heading_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard_new_heading(true, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardMoveSubtreeUp, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.reordering_unavailable(cx);
-            }))
-            .on_action(
-                cx.listener(|this, _: &DashboardMoveSubtreeDown, window, cx| {
-                    if !this.dashboard_verb_applies(window, cx) {
-                        cx.propagate();
-                        return;
-                    }
-                    this.reordering_unavailable(cx);
-                }),
-            )
-            .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.dashboard_delete_empty(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDeleteRow, _, cx| {
                 if !this
@@ -10248,9 +8987,6 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .on_action(cx.listener(|this, _: &DashboardUndo, window, cx| {
-                this.dashboard_undo(window, cx);
-            }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(
                     None,
@@ -10277,9 +9013,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DraftFieldClear, window, cx| {
                 this.clear_draft_field(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
-                this.focus_rail(window, cx);
-            }))
             .on_action(cx.listener(|this, _: &crate::NoteOpenRow, window, cx| {
                 if !this.note_open_row(window, cx) {
                     cx.propagate();
@@ -10287,12 +9020,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &crate::NotesForThis, window, cx| {
                 this.open_notes_for_surface(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
-                this.dashboard_open(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardGoto, window, cx| {
-                this.dashboard_open(window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 let subject = this.subject(window, cx);
@@ -10339,7 +9066,7 @@ impl Render for Workspace {
                     .child(if phone {
                         self.render_phone_body(&text_style, window, cx)
                     } else {
-                        self.render_workspace(window, &text_style, cx)
+                        self.render_workspace(cx)
                     }),
             )
             .children(if phone {

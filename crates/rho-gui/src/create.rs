@@ -74,9 +74,6 @@ impl Workspace {
                 crate::home::HomeTarget::None => {}
             }
         }
-        if let Some(node) = self.dashboard.tree_node_at_cursor(cx) {
-            return Some(node);
-        }
         self.surface_node()
     }
 
@@ -236,26 +233,24 @@ impl Workspace {
         else {
             return;
         };
-        let undo = self.desk_cells.delete_writes(created.clone());
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
             return;
-        };
+        }
         rho_journal::record(rho_journal::Event::Created {
             node_id: created.clone().into(),
             kind: rho_journal::CreatedKind::Note,
             method: rho_journal::CreateMethod::New,
             at_root: area.is_none(),
         });
-        self.dashboard.move_to_tree_node_when_ready(host, created);
         self.sync_tree_dashboard(host, window, cx);
-        let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
-        self.pending_semantic_group = Some(transaction_id);
-        // A new note is a row on the map, so the map is where the reader
-        // has to be to type it. From Home — the front door, and where `n`
-        // is usually pressed — the row and the insert cursor were both
-        // behind a surface that never came into view, so the title went
-        // into nothing and the note read as "nothing happened".
-        self.open_overview(window, cx);
+        // A note is its own surface now, so the note itself is where the
+        // reader has to be to type it. Opening it is what makes the title
+        // land somewhere; without this the characters went into whatever
+        // was in view and the note read as "nothing happened".
+        self.open_note(host, created.clone(), window, cx);
         // The note is ready for its first line immediately, rather than
         // reading the title's characters as normal-mode commands.
         self.enter_insert_when_shown(window, cx);

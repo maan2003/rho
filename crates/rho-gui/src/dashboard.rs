@@ -12,29 +12,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use editor::scroll::Autoscroll;
-use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
+use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
-use language::{Buffer, Capability, InlayId, Point};
-use multi_buffer::composition::{Composition, CompositionSpec, RowSpec};
-use multi_buffer::{MultiBuffer, MultiBufferRow};
-use rho_agents::{AgentMap, Attention as UiAttention, HostId};
+use gpui::{App, Context, Entity, Focusable as _, Window};
+use language::{Buffer, Capability};
+use multi_buffer::MultiBuffer;
+use rho_agents::{AgentMap, HostId};
 pub use rho_desk::cells::SlackUnit;
 use rho_ui_proto::AgentId;
-use text::{Bias, BufferId, ToOffset as _};
-use theme::ActiveTheme as _;
 
 use crate::workspace::Workspace;
-
-/// Highlight-key space for dashboard classes, clear of the transcript's
-/// semantic and syntax key ranges.
-const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
-
-const TREE_INLAY_ID_BASE: usize = 2_000_000;
-/// Indent inlays for the second and later lines of a note body. Far enough
-/// past the row prefixes that a long note cannot collide with them.
-const CONTINUATION_INLAY_ID_BASE: usize = 3_000_000;
 
 type DraftTopic = Option<(HostId, rho_desk::cells::Id)>;
 type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
@@ -127,88 +114,6 @@ pub enum CardTarget {
     Thread(SlackUnit),
     /// The node is gone, or lacks the fields its kind needs.
     Missing,
-}
-
-/// The marker and name in front of an agent's row, keeping the indent the
-/// row was drawn with: only the agent's own part of the prefix moves.
-fn agent_prefix(drawn: &str, agent_id: AgentId, registry: &AgentMap) -> String {
-    let indent = drawn
-        .find('•')
-        .map(|at| drawn[..at].to_owned())
-        .unwrap_or_default();
-    format!(
-        "{indent}• {} {} ",
-        match registry.attention(agent_id) {
-            UiAttention::Quiet => "○",
-            UiAttention::Working => "·",
-            UiAttention::Pending => "●",
-            UiAttention::NeedsInput => "!",
-        },
-        registry.agent_human_name(agent_id)
-    )
-}
-
-/// What is hinted after a row: what the user said about it and where it
-/// stands. A verdict is exactly a change to this, which is why it is a
-/// function of the row rather than something the drawing keeps.
-fn row_hint(node: &crate::desk_view::DeskNode) -> Option<gpui::SharedString> {
-    let mut hints = Vec::new();
-    match node.state {
-        rho_desk::cells::State::Done => hints.push("done".to_owned()),
-        rho_desk::cells::State::Muted => hints.push("muted".to_owned()),
-        rho_desk::cells::State::Open => {}
-    }
-    if let Some(at) = node.defer_until {
-        hints.push(format!("defer {} · {}d", desk_date(at), node.pace_days));
-    }
-    if let Some(at) = node.deadline {
-        hints.push(format!("due {} · {}d", desk_date(at), node.pace_days));
-    }
-    if node.page().is_some() {
-        hints.push("page".to_owned());
-    }
-    if let Some(path) = node.path() {
-        hints.push(path.to_string());
-    }
-    (!hints.is_empty()).then(|| hints.join(" · ").into())
-}
-
-/// The hint as the editor paints it.
-fn eol_hint(text: gpui::SharedString) -> editor::EolHintRenderer {
-    std::sync::Arc::new(move |_, cx| {
-        use gpui::Styled as _;
-        use settings::Settings as _;
-        use theme::ActiveTheme as _;
-        let settings = theme_settings::ThemeSettings::get_global(cx);
-        gpui::div()
-            .font(settings.buffer_font.clone())
-            .text_size(settings.buffer_font_size(cx))
-            .line_height(gpui::relative(settings.line_height()))
-            .text_color(cx.theme().colors().text_muted)
-            .child(text.clone())
-            .into_any_element()
-    })
-}
-
-/// One row of the map as it was drawn: where it sits in the composition,
-/// what is written in front of it and what is hinted after it. Keeping
-/// this is what lets a verdict cost its own row.
-struct TreeRowDraw {
-    /// Where the row starts and ends in the map, as anchors that survive
-    /// an edit inside the row.
-    start: editor::Anchor,
-    end: editor::Anchor,
-    /// The heading prefix as an inlay, and the padding inlays under it.
-    prefix: String,
-    inlays: Vec<InlayId>,
-    /// The base the row's inlay ids were minted from, so a redraw can mint
-    /// the same ones again.
-    at: usize,
-    /// The end-of-line hint, when the row has one.
-    hint: Option<gpui::SharedString>,
-    /// A closed ancestor hides the row, and a hidden row is drawn with
-    /// neither prefix nor hint.
-    hidden_by_fold: bool,
 }
 
 /// Every card is a thing on the desk, on the host that holds it.
@@ -473,14 +378,6 @@ pub enum RowTarget {
     NewTreeDraft((HostId, rho_desk::cells::Id)),
 }
 
-/// Where the cursor is: on a generated row, or at an offset inside a
-/// host's document.
-#[derive(Clone, Debug, PartialEq)]
-enum CursorPlace {
-    Row(LineKey),
-    Tree(HostId, rho_desk::cells::Id, usize),
-}
-
 /// One generated segment: a slice of a host document, or a generated
 /// line (row or draft slot). Equality against the previous pass lets a
 /// sync bail out before touching the editor at all.
@@ -489,13 +386,11 @@ enum CursorPlace {
 /// of the title of the heading whose cut opens the slice (0 for the
 /// slice that starts the document). The composition keys the excerpt on
 pub struct Dashboard {
-    multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     /// One buffer per generated line key: read-only listing lines and
     /// writable reply drafts alike.
     buffers: HashMap<LineKey, Entity<Buffer>>,
     /// Non-owning references to the workspace-owned Desk source buffers.
-    tree_hosts: BTreeMap<HostId, TreeHostSource>,
     /// What the dealer reads: one host's nodes as the store client holds
     /// them, with no buffers and no editor behind them.
     ///
@@ -506,18 +401,12 @@ pub struct Dashboard {
     deal_hosts: BTreeMap<HostId, crate::candidates::HostNodes>,
     /// Reconciles the multibuffer to the generated spec by element
     /// identity, so unchanged excerpts — and cursors in them — survive.
-    composition: Composition,
     /// Stable composition keys per line, allocated once and never reused.
-    element_keys: HashMap<LineKey, u64>,
     /// One key per row, and a row is a thing in one of its places: a
     /// labelled thing has a row in its own place and one under each label.
-    tree_element_keys: HashMap<(HostId, rho_desk::cells::Id, Option<rho_desk::cells::Id>), u64>,
-    tree_heading_agents: HashMap<(HostId, rho_desk::cells::Id), Vec<AgentId>>,
-    tree_heading_pages: HashMap<(HostId, rho_desk::cells::Id), Vec<rho_browser::PageId>>,
-    next_element_key: u64,
+
     /// Generated rows in display order, from the last sync.
     /// What each generated key means, for cursor lookup.
-    targets: HashMap<LineKey, RowTarget>,
     /// Every bound browser page, including additional bindings on a heading
     /// whose preview can display only one page.
     referenced_pages: HashSet<rho_browser::PageId>,
@@ -543,7 +432,6 @@ pub struct Dashboard {
     /// User-opened folds must survive every later document sync.
     /// Next S-TAB target in org's OVERVIEW → CONTENTS → SHOW ALL cycle.
     /// Shows only literal editable Desk source, with no generated UI.
-    raw_mode: bool,
     /// Phone-only composed Desk presentation: bound-agent chips collapse
     /// into colored heading bullets while desktop chrome stays unchanged.
     phone_browse_mode: bool,
@@ -558,113 +446,14 @@ pub struct Dashboard {
     pending_cursor: Option<LineKey>,
     /// Move the cursor to this document offset on the next sync.
     /// Reply placeholder inlays currently spliced in.
-    tree_inlay_ids: Vec<InlayId>,
     /// What each row of the map is drawn as, in the order the composition
     /// put them. A delta that keeps the shape redraws the rows it names
     /// out of this and leaves the rest of the map alone; without it the
     /// only way to move one row's hint was to draw every row again.
-    tree_draw: Vec<TreeRowDraw>,
-    tree_draw_at: HashMap<(HostId, rho_desk::cells::Id), Vec<usize>>,
-    /// How many times the map has been composed, and how many rows have
-    /// been drawn again in place. The rule this slice is about is a
-    /// difference between these two, so a test can read it.
     #[cfg(test)]
-    composed: usize,
+    deal_taken: usize,
     #[cfg(test)]
-    redrawn: usize,
-    /// The title last written into each machine row's buffer, against the
-    /// buffer it went into. A sync used to read every one of those ropes
-    /// back to find out it had not changed; on a desk of thousands of rows
-    /// that read, and the editor events the rewrites raised, were most of
-    /// what a sync cost.
-    derived_titles: HashMap<(HostId, rho_desk::cells::Id), (gpui::EntityId, String)>,
-    tree_collapsed: HashSet<(HostId, rho_desk::cells::Id)>,
-    pending_tree_cursor: Option<(HostId, rho_desk::cells::Id, usize)>,
-    /// The previous pass's inputs and output, so a sync whose world is
-    /// unchanged returns without touching the editor.
-    /// Buffers already registered as headerless with the editor. A
-    /// boundary onto a headerless buffer draws nothing, so this is what
-    /// keeps the interleaved excerpts seamless.
-    headers_disabled: std::collections::HashSet<BufferId>,
-}
-
-struct TreeHostSource {
-    nodes: Vec<crate::desk_view::DeskNode>,
-    buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
-    /// Every note's title, kept by the desk so that naming a row never
-    /// reads a rope. Rows that are not notes have their title derived.
-    titles: std::rc::Rc<HashMap<rho_desk::cells::Id, String>>,
-    /// The map's edges, made once when the source is set. Walking every
-    /// node to find one node's children was the whole cost of dealing a
-    /// desk: quadratic in a map that only grows.
-    index: TreeIndex,
-}
-
-/// The lookups the map needs, built in one pass over the nodes.
-#[derive(Default)]
-struct TreeIndex {
-    by_id: HashMap<rho_desk::cells::Id, usize>,
-    children: HashMap<rho_desk::cells::Id, Vec<usize>>,
-    by_agent: HashMap<AgentId, usize>,
-}
-
-impl TreeIndex {
-    fn build(nodes: &[crate::desk_view::DeskNode]) -> Self {
-        let mut index = TreeIndex {
-            by_id: HashMap::with_capacity(nodes.len()),
-            children: HashMap::new(),
-            by_agent: HashMap::new(),
-        };
-        for (at, node) in nodes.iter().enumerate() {
-            index.by_id.insert(node.id.clone(), at);
-            if let Some(parent) = &node.parent {
-                index.children.entry(parent.clone()).or_default().push(at);
-            }
-            if let Some(agent) = node.agent() {
-                index.by_agent.insert(agent, at);
-            }
-        }
-        index
-    }
-}
-
-impl TreeHostSource {
-    fn node(&self, id: &rho_desk::cells::Id) -> Option<&crate::desk_view::DeskNode> {
-        self.index.by_id.get(id).map(|at| &self.nodes[*at])
-    }
-
-    /// What a row is called: a note's own first line, or the title the map
-    /// derives for everything else.
-    fn title(&self, id: &rho_desk::cells::Id) -> Option<&str> {
-        self.titles.get(id).map(String::as_str)
-    }
-
-    /// Every row's title, including the derived ones the map wrote into
-    /// read-only buffers. This reads those buffers, so it belongs to the
-    /// pickers a keystroke opens and not to anything a sync runs.
-    fn all_titles(&self, cx: &App) -> HashMap<rho_desk::cells::Id, String> {
-        let mut titles = (*self.titles).clone();
-        for (id, buffer) in &self.buffers {
-            if !titles.contains_key(id) {
-                titles.insert(id.clone(), note_title(&buffer.read(cx).text()).to_owned());
-            }
-        }
-        titles
-    }
-}
-
-fn nearest_tree_heading(
-    source: &TreeHostSource,
-    mut node_id: Option<rho_desk::cells::Id>,
-) -> Option<rho_desk::cells::Id> {
-    while let Some(id) = node_id {
-        let node = source.nodes.iter().find(|node| node.id == id)?;
-        if node.is_note() {
-            return Some(id);
-        }
-        node_id = node.parent.clone();
-    }
-    None
+    deal_patched: usize,
 }
 
 impl Dashboard {
@@ -704,15 +493,6 @@ impl Dashboard {
     ) -> bool {
         self.editor.update(cx, |editor, cx| {
             editor.dispatch_semantic_row_action(action, cx)
-        })
-    }
-
-    pub fn tree_heading_named(&self, title: &str) -> Option<(HostId, rho_desk::cells::Id)> {
-        self.tree_hosts.iter().find_map(|(host, source)| {
-            source.nodes.iter().find_map(|node| {
-                (node.is_note() && source.title(&node.id) == Some(title.trim()))
-                    .then_some((*host, node.id.clone()))
-            })
         })
     }
 
@@ -1143,45 +923,46 @@ impl Dashboard {
         })
     }
 
-    pub fn cursor_room(&self, cx: &mut Context<Workspace>) -> Option<DeskRoom> {
-        let (host, node_id) = self.cursor_topic(cx)?;
-        self.room_for_node(host, node_id)
+    /// Where an agent or a page is filed, as the path of headings above it.
+    ///
+    /// The map kept a heading-to-agents index as it composed, and these read
+    /// it back; nothing composes now, so the row is found in the dealer's
+    /// own source instead. Same answer, one source.
+    fn filed_node(
+        &self,
+        find: impl Fn(&crate::candidates::HostNodes) -> Option<rho_desk::cells::Id>,
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
+        self.deal_hosts
+            .iter()
+            .find_map(|(host, source)| find(source).map(|node_id| (*host, node_id)))
     }
 
-    pub fn cursor_breadcrumb(&self, cx: &mut Context<Workspace>) -> Option<String> {
-        let (host, node_id) = self.cursor_topic(cx)?;
-        self.breadcrumb_for_node(host, node_id)
+    fn agent_node_id(&self, agent_id: AgentId) -> Option<(HostId, rho_desk::cells::Id)> {
+        self.filed_node(|source| source.agent_node(agent_id).map(|node| node.id.clone()))
+    }
+
+    fn page_node_id(&self, page_id: rho_browser::PageId) -> Option<(HostId, rho_desk::cells::Id)> {
+        let page = rho_desk::PageId(*page_id.0.as_bytes());
+        self.filed_node(|source| source.page_node(page).map(|node| node.id.clone()))
     }
 
     pub fn breadcrumb_for_agent(&self, agent_id: AgentId, _cx: &App) -> Option<String> {
-        let (host, node_id) = self
-            .tree_heading_agents
-            .iter()
-            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
+        let (host, node_id) = self.agent_node_id(agent_id)?;
         self.breadcrumb_for_node(host, node_id)
     }
 
     pub fn breadcrumb_for_page(&self, page_id: rho_browser::PageId, _cx: &App) -> Option<String> {
-        let (host, node_id) = self
-            .tree_heading_pages
-            .iter()
-            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
+        let (host, node_id) = self.page_node_id(page_id)?;
         self.breadcrumb_for_node(host, node_id)
     }
 
     pub fn room_for_agent(&self, agent_id: AgentId, _cx: &App) -> Option<DeskRoom> {
-        let (host, node_id) = self
-            .tree_heading_agents
-            .iter()
-            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
+        let (host, node_id) = self.agent_node_id(agent_id)?;
         self.room_for_node(host, node_id)
     }
 
     pub fn room_for_page(&self, page_id: rho_browser::PageId, _cx: &App) -> Option<DeskRoom> {
-        let (host, node_id) = self
-            .tree_heading_pages
-            .iter()
-            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
+        let (host, node_id) = self.page_node_id(page_id)?;
         self.room_for_node(host, node_id)
     }
 
@@ -1212,61 +993,22 @@ impl Dashboard {
             editor
         });
         Self {
-            multi_buffer,
             editor,
             buffers: HashMap::new(),
-            tree_hosts: BTreeMap::new(),
             deal_hosts: BTreeMap::new(),
-            composition: Composition::default(),
-            element_keys: HashMap::new(),
-            tree_element_keys: HashMap::new(),
-            tree_heading_agents: HashMap::new(),
-            tree_heading_pages: HashMap::new(),
-            next_element_key: 0,
-            targets: HashMap::new(),
             referenced_pages: HashSet::new(),
             new_draft: None,
             tree_new_draft_parent: None,
-            raw_mode: false,
             phone_browse_mode: false,
             skipped: HashMap::new(),
             queue_depth: DealQueueDepth::default(),
             dealer: DealerSet::default(),
             pending_cursor: None,
-            tree_inlay_ids: Vec::new(),
-            tree_draw: Vec::new(),
-            tree_draw_at: HashMap::new(),
             #[cfg(test)]
-            composed: 0,
+            deal_taken: 0,
             #[cfg(test)]
-            redrawn: 0,
-            derived_titles: HashMap::new(),
-            tree_collapsed: HashSet::new(),
-            pending_tree_cursor: None,
-            headers_disabled: std::collections::HashSet::new(),
+            deal_patched: 0,
         }
-    }
-
-    /// Registers every current buffer (rows and Desk documents) as
-    /// headerless with the editor, so excerpt boundaries draw no divider.
-    fn ensure_headerless(&mut self, cx: &mut Context<Workspace>) {
-        let new_ids = self
-            .buffers
-            .values()
-            .chain(
-                self.tree_hosts
-                    .values()
-                    .flat_map(|host| host.buffers.values()),
-            )
-            .map(|buffer| buffer.read(cx).remote_id())
-            .filter(|id| !self.headers_disabled.contains(id))
-            .collect::<Vec<_>>();
-        // One call, not one per buffer: each of these resyncs the display
-        // map, so a build of n rows cost n block-map syncs of n rows.
-        self.editor.update(cx, |editor, cx| {
-            editor.disable_headers_for_buffers(new_ids.iter().copied(), cx);
-        });
-        self.headers_disabled.extend(new_ids);
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
@@ -1275,10 +1017,6 @@ impl Dashboard {
 
     pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
         self.editor.read(cx).focus_handle(cx)
-    }
-
-    pub fn raw_mode(&self) -> bool {
-        self.raw_mode
     }
 
     pub fn set_phone_browse_mode(&mut self, enabled: bool) -> bool {
@@ -1297,69 +1035,94 @@ impl Dashboard {
         self.focus_handle(cx).is_focused(window)
     }
 
-    /// Answers whether the map's *shape* survived: the same rows, in the
-    /// same order, hanging under the same parents, each drawn from the same
-    /// buffer. A shape that held is the caller's licence to patch the rows
-    /// an event named instead of composing the map again — the excerpts,
-    /// their order and their folds are all still what the editor has, and
-    /// only what is written on a row can have moved.
-    ///
-    /// The comparison walks the rows, which is a cost the caller has
-    /// already paid: the sources hand over a fresh `nodes` every time. It
-    /// compares ids, parents and buffer entities, and touches no editor.
-    pub fn set_tree_source(
-        &mut self,
-        host: HostId,
-        nodes: Vec<crate::desk_view::DeskNode>,
-        buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
-        titles: std::rc::Rc<HashMap<rho_desk::cells::Id, String>>,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let shape_held = self.tree_hosts.get(&host).is_some_and(|source| {
-            source.nodes.len() == nodes.len()
-                && source.buffers.len() == buffers.len()
-                && source
-                    .nodes
-                    .iter()
-                    .zip(&nodes)
-                    .all(|(held, fresh)| held.id == fresh.id && held.under == fresh.under)
-                && buffers.iter().all(|(id, buffer)| {
-                    source.buffers.get(id).map(Entity::entity_id) == Some(buffer.entity_id())
-                })
-        });
-        if self.pending_tree_cursor.is_none()
-            && let Some((cursor_host, node_id, offset)) = self.tree_node_cursor_offset(cx)
-            && cursor_host == host
-            && self
-                .tree_hosts
-                .get(&host)
-                .and_then(|source| source.buffers.get(&node_id))
-                != buffers.get(&node_id)
-            && buffers.contains_key(&node_id)
-        {
-            self.pending_tree_cursor = Some((host, node_id, offset));
-        }
-        let index = TreeIndex::build(&nodes);
-        self.tree_hosts.insert(
-            host,
-            TreeHostSource {
-                nodes,
-                buffers,
-                titles,
-                index,
-            },
-        );
-        shape_held
-    }
-
     /// The nodes the dealer deals from, read out of the store client.
     ///
     /// Held rather than rebuilt per card: making a hand walks a host's
     /// nodes once, and the incremental paths — one row's cards, one
     /// agent's card — are lookups against these indexes. Rebuilding the
     /// source for each of those would make every event cost the desk.
+    /// Every id at or under a node, taken from the dealer's source. The
+    /// map used to be asked this; the answer never needed a drawn row.
+    pub fn subtree_ids(&self, host: HostId, id: &rho_desk::cells::Id) -> Vec<rho_desk::cells::Id> {
+        let Some(source) = self.deal_hosts.get(&host) else {
+            return Vec::new();
+        };
+        let mut ids = vec![id.clone()];
+        let mut cursor = 0;
+        while cursor < ids.len() {
+            let at = ids[cursor].clone();
+            cursor += 1;
+            ids.extend(source.children(&at).map(|node| node.id.clone()));
+        }
+        ids
+    }
+
+    /// The first agent filed under a heading, which is what a card on that
+    /// heading stands for. Answered from the dealer's source, which indexes
+    /// the agents under each heading as it is built.
+    pub fn first_agent_for_topic(&self, topic: (HostId, rho_desk::cells::Id)) -> Option<AgentId> {
+        self.deal_hosts
+            .get(&topic.0)
+            .and_then(|source| source.agents_under(&topic.1).first())
+            .copied()
+    }
+
+    /// The note a card's room is named after: the highest note above it
+    /// that still hangs under notes. From the dealer's source.
+    pub fn room_node(&self, card: &DealCard) -> Option<(HostId, rho_desk::cells::Id)> {
+        let source = self.deal_hosts.get(&card.host)?;
+        let mut node_id = card.topic_node_id.clone();
+        loop {
+            let node = source.node(&node_id)?;
+            let Some(ref parent) = node.parent else {
+                return Some((card.host, node_id));
+            };
+            let parent_node = source.node(parent)?;
+            if !parent_node.is_note() {
+                return Some((card.host, node_id));
+            }
+            node_id = parent.clone();
+        }
+    }
+
     pub(crate) fn set_deal_source(&mut self, host: HostId, source: crate::candidates::HostNodes) {
+        #[cfg(test)]
+        {
+            self.deal_taken += 1;
+        }
         self.deal_hosts.insert(host, source);
+    }
+
+    /// Whether the desk's nodes sit where the dealer's source has them.
+    /// Asked before the source is built, because the answer decides whether
+    /// building it is needed at all: a held shape means the delta is
+    /// patched where it lands and the desk is not read again.
+    pub(crate) fn deal_shape_held(
+        &self,
+        host: HostId,
+        nodes: &[crate::desk_view::DeskNode],
+    ) -> bool {
+        self.deal_hosts
+            .get(&host)
+            .is_some_and(|held| held.same_shape_as(nodes))
+    }
+
+    /// The rows a delta named, copied into the dealer's source. Answers
+    /// false when a named row is not where it was, which is the caller's
+    /// cue to take the whole source again.
+    pub(crate) fn patch_deal_source(
+        &mut self,
+        host: HostId,
+        touched: &BTreeSet<rho_desk::cells::Id>,
+        nodes: &[crate::desk_view::DeskNode],
+    ) -> bool {
+        #[cfg(test)]
+        {
+            self.deal_patched += 1;
+        }
+        self.deal_hosts
+            .get_mut(&host)
+            .is_some_and(|source| source.patch(touched, nodes))
     }
 
     /// What a card's node is, which decides the surface it opens.
@@ -1471,82 +1234,18 @@ impl Dashboard {
         })
     }
 
-    pub fn tree_node_at_cursor(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
-        self.tree_node_cursor_offset(cx)
-            .map(|(host, node_id, _)| (host, node_id))
-    }
-
-    pub fn tree_node_for_buffer(
-        &self,
-        buffer_id: BufferId,
-        cx: &App,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
-        self.tree_hosts.iter().find_map(|(host, source)| {
-            source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some((*host, node_id.clone()))
-            })
-        })
-    }
-
-    pub fn first_tree_agent_for_topic(
-        &self,
-        topic: (HostId, rho_desk::cells::Id),
-    ) -> Option<AgentId> {
-        self.tree_heading_agents
-            .get(&topic)
-            .and_then(|agents| agents.first())
-            .copied()
-    }
-
-    pub fn tree_node_cursor_offset(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::cells::Id, usize)> {
-        let (buffer_id, offset) = self.editor.update(cx, |editor, cx| {
-            let head = editor.selections.newest_anchor().head();
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            snapshot
-                .anchor_to_buffer_anchor(head)
-                .map(|(anchor, buffer)| (buffer.remote_id(), anchor.to_offset(buffer)))
-        })?;
-        self.tree_hosts.iter().find_map(|(host, source)| {
-            source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some((
-                    *host,
-                    node_id.clone(),
-                    offset,
-                ))
-            })
-        })
-    }
-
-    pub fn move_to_tree_node_when_ready(&mut self, host: HostId, node_id: rho_desk::cells::Id) {
-        self.pending_tree_cursor = Some((host, node_id, 0));
-    }
-
-    pub fn move_to_tree_position_when_ready(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::cells::Id,
-        offset: usize,
-    ) {
-        self.pending_tree_cursor = Some((host, node_id, offset));
-    }
-
     /// How many cards have been made in this dashboard's life.
     #[cfg(test)]
     pub(crate) fn cards_made_for_test(&self) -> usize {
         self.dealer.made
     }
 
-    /// How many times the whole map has been composed, and how many rows
-    /// have been drawn again where they sit.
+    /// What the dealer's source cost: times it was taken whole, and times
+    /// a delta was patched into it. One agent's news must patch and never
+    /// take, or every event costs the desk.
     #[cfg(test)]
-    pub(crate) fn map_work_for_test(&self) -> (usize, usize) {
-        (self.composed, self.redrawn)
+    pub(crate) fn deal_work_for_test(&self) -> (usize, usize) {
+        (self.deal_taken, self.deal_patched)
     }
 
     #[cfg(test)]
@@ -1613,173 +1312,6 @@ impl Dashboard {
                 }
             }
         }
-    }
-
-    /// The rows a delta named, drawn again where they sit. Nothing is
-    /// composed: the excerpts, the folds and the highlights are the same
-    /// rows in the same order, so what one verdict moves is the hint at
-    /// the end of its row, the marker in front of it, and the title of a
-    /// machine row. Answers false when a row the delta names was never
-    /// drawn, which is the caller's cue that the shape moved after all.
-    pub fn redraw_tree_rows(
-        &mut self,
-        host: HostId,
-        touched: &BTreeSet<rho_desk::cells::Id>,
-        nodes: &[crate::desk_view::DeskNode],
-        registry: &AgentMap,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        // The dealer reads its own source now, not the map's, so the rows
-        // a delta names have to reach both. A verdict moves a card's state
-        // and this is the only path it travels between syncs; without this
-        // the dealer answers from the desk as it stood at the last sync,
-        // which is what made a muted thread's card stay open.
-        if !self
-            .deal_hosts
-            .get_mut(&host)
-            .is_some_and(|source| source.patch(touched, nodes))
-        {
-            return false;
-        }
-        let Some(source) = self.tree_hosts.get_mut(&host) else {
-            return false;
-        };
-        // The map the dashboard holds is the desk's, one step behind: the
-        // rows the delta named are copied across, and nothing else is read.
-        for id in touched {
-            let Some(at) = source.index.by_id.get(id).copied() else {
-                return false;
-            };
-            let Some(fresh) = nodes.get(at) else {
-                return false;
-            };
-            if fresh.id != *id {
-                return false;
-            }
-            source.nodes[at] = fresh.clone();
-        }
-        let mut remove = Vec::new();
-        let mut insert = Vec::new();
-        let mut hints_moved = false;
-        let mut titles = Vec::new();
-        for id in touched {
-            let Some(draws) = self.tree_draw_at.get(&(host, id.clone())) else {
-                return false;
-            };
-            for at in draws.clone() {
-                #[cfg(test)]
-                {
-                    self.redrawn += 1;
-                }
-                let Some(node) = self
-                    .tree_hosts
-                    .get(&host)
-                    .and_then(|source| source.node(id))
-                    .cloned()
-                else {
-                    return false;
-                };
-                let draw = &self.tree_draw[at];
-                if draw.hidden_by_fold {
-                    continue;
-                }
-                let hint = row_hint(&node);
-                if hint != draw.hint {
-                    hints_moved = true;
-                    self.tree_draw[at].hint = hint;
-                }
-                // A machine row's words are derived, so a verdict that
-                // moves them moves the row's own text.
-                if !is_note(&node)
-                    && let Some(buffer) = self
-                        .tree_hosts
-                        .get(&host)
-                        .and_then(|source| source.buffers.get(id))
-                        .cloned()
-                {
-                    let title = derived_title(&node, registry, threads);
-                    let key = (host, id.clone());
-                    if self.derived_titles.get(&key) != Some(&(buffer.entity_id(), title.clone())) {
-                        self.derived_titles
-                            .insert(key, (buffer.entity_id(), title.clone()));
-                        titles.push((buffer, title));
-                    }
-                }
-                // The marker in front of an agent row is its attention and
-                // its name, and both can move without the map moving.
-                let draw = &self.tree_draw[at];
-                if let Some(agent_id) = node.agent() {
-                    let prefix = agent_prefix(&draw.prefix, agent_id, registry);
-                    if prefix != draw.prefix {
-                        remove.extend(draw.inlays.iter().copied());
-                        let padding = " ".repeat(prefix.chars().count());
-                        let mut ids = Vec::with_capacity(draw.inlays.len());
-                        let head = Inlay::custom(
-                            TREE_INLAY_ID_BASE + draw.at * 2,
-                            draw.start,
-                            prefix.clone(),
-                        );
-                        ids.push(head.id);
-                        insert.push(head);
-                        for (line, _) in draw.inlays.iter().skip(1).enumerate() {
-                            let inlay = Inlay::custom(
-                                CONTINUATION_INLAY_ID_BASE + draw.at * 256 + line,
-                                draw.start,
-                                padding.clone(),
-                            );
-                            ids.push(inlay.id);
-                            insert.push(inlay);
-                        }
-                        self.tree_draw[at].prefix = prefix;
-                        self.tree_draw[at].inlays = ids;
-                    }
-                }
-            }
-        }
-        for (buffer, title) in titles {
-            crate::desk_view::write_derived_title(&buffer, &title, cx);
-        }
-        if !remove.is_empty() || !insert.is_empty() {
-            self.tree_inlay_ids.retain(|id| !remove.contains(id));
-            self.tree_inlay_ids
-                .extend(insert.iter().map(|inlay| inlay.id));
-            self.editor
-                .update(cx, |editor, cx| editor.splice_inlays(&remove, insert, cx));
-        }
-        if hints_moved {
-            // The editor takes its hints as a set, so the ones that did not
-            // move are handed back as they were. Nothing is measured or
-            // anchored again: this is the kept drawing, read out.
-            let hints = self
-                .tree_draw
-                .iter()
-                .filter_map(|draw| {
-                    let text = draw.hint.clone()?;
-                    Some((draw.end, eol_hint(text)))
-                })
-                .collect::<Vec<_>>();
-            self.editor
-                .update(cx, |editor, cx| editor.set_eol_hints(hints, cx));
-        }
-        true
-    }
-
-    /// A row and everything drawn under it. A note's words are the head of
-    /// every breadcrumb below it, so an edit to them moves the cards of its
-    /// subtree and of nothing outside it.
-    pub fn subtree_ids(&self, host: HostId, id: &rho_desk::cells::Id) -> Vec<rho_desk::cells::Id> {
-        let Some(source) = self.deal_hosts.get(&host) else {
-            return Vec::new();
-        };
-        let mut ids = vec![id.clone()];
-        let mut cursor = 0;
-        while cursor < ids.len() {
-            let at = ids[cursor].clone();
-            cursor += 1;
-            ids.extend(source.children(&at).map(|node| node.id.clone()));
-        }
-        ids
     }
 
     /// The cards of one row, made again. What it costs is the row and the
@@ -2103,24 +1635,6 @@ impl Dashboard {
         self.skipped.contains_key(identity)
     }
 
-    /// The room a card belongs to: the note it hangs under, walked up to
-    /// the outermost note, which is what `shift-s` snoozes.
-    pub fn tree_room_node(&self, card: &DealCard) -> Option<(HostId, rho_desk::cells::Id)> {
-        let source = self.deal_hosts.get(&card.host)?;
-        let mut node_id = card.topic_node_id.clone();
-        loop {
-            let node = source.node(&node_id)?;
-            let Some(ref parent) = node.parent else {
-                return Some((card.host, node_id));
-            };
-            let parent_node = source.node(parent)?;
-            if !parent_node.is_note() {
-                return Some((card.host, node_id));
-            }
-            node_id = parent.clone();
-        }
-    }
-
     /// Opens (or returns to) the inline new-agent draft. Like a reply
     /// draft it parks when left and survives refreshes.
     pub fn open_new_draft(
@@ -2131,9 +1645,9 @@ impl Dashboard {
     ) {
         if self.new_draft.is_none() {
             let buffer = cx.new(|cx| Buffer::local("", cx));
-            let subscription = cx.subscribe_in(&buffer, window, |this, _, event, window, cx| {
+            let subscription = cx.subscribe_in(&buffer, window, |this, _, event, _window, cx| {
                 if matches!(event, language::BufferEvent::Edited { .. }) {
-                    this.refresh_dashboard(window, cx);
+                    this.refresh_dashboard(cx);
                 }
             });
             self.buffers
@@ -2147,16 +1661,6 @@ impl Dashboard {
             .unwrap_or(topic);
         self.pending_cursor = Some(LineKey::NewDraft(topic));
         cx.notify();
-    }
-
-    pub fn open_new_tree_draft(
-        &mut self,
-        topic: (HostId, rho_desk::cells::Id),
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        self.tree_new_draft_parent = Some(topic.clone());
-        self.open_new_draft(Some(topic), window, cx);
     }
 
     /// Takes the new-agent draft's text and closes it. `None` when empty.
@@ -2183,451 +1687,12 @@ impl Dashboard {
         self.new_draft.as_ref().and_then(|draft| draft.0.clone())
     }
 
-    /// Renders the authoritative tree as one native editor composition. Each
-    /// row is the node's own CRDT buffer; stars and typed machine/meta fields
-    /// are display-only inlays, so structural state never leaks into text.
-    fn sync_tree(
-        &mut self,
-        registry: &AgentMap,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let mut timing =
-            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::SyncTree);
-        self.tree_heading_agents.clear();
-        self.tree_heading_pages.clear();
-        self.referenced_pages.clear();
-        for (host, source) in &self.tree_hosts {
-            for node in &source.nodes {
-                let Some(parent) = node.parent.clone() else {
-                    continue;
-                };
-                if let Some(agent_id) = node.agent() {
-                    self.tree_heading_agents
-                        .entry((*host, parent.clone()))
-                        .or_default()
-                        .push(agent_id);
-                }
-                if let Some(page_id) = node_page(node) {
-                    self.tree_heading_pages
-                        .entry((*host, parent))
-                        .or_default()
-                        .push(page_id);
-                    self.referenced_pages.insert(page_id);
-                }
-            }
-        }
-        // Machine rows carry no stored text: their titles are derived from
-        // live metadata every reconcile. Only the rows whose title actually
-        // moved are written; the rest are left alone, buffer and all.
-        let mut written = HashMap::with_capacity(self.derived_titles.len());
-        let mut writes = Vec::new();
-        for (host, source) in &self.tree_hosts {
-            for node in &source.nodes {
-                let Some(buffer) = source.buffers.get(&node.id) else {
-                    continue;
-                };
-                if is_note(node) {
-                    continue;
-                }
-                let title = derived_title(node, registry, threads);
-                let key = (*host, node.id.clone());
-                let held = self.derived_titles.get(&key);
-                if held != Some(&(buffer.entity_id(), title.clone())) {
-                    writes.push((buffer.clone(), title.clone()));
-                }
-                written.insert(key, (buffer.entity_id(), title));
-            }
-        }
-        self.derived_titles = written;
-        for (buffer, title) in writes {
-            crate::desk_view::write_derived_title(&buffer, &title, cx);
-        }
-        let cursor_anchor = self.editor.update(cx, |editor, cx| {
-            let head = editor.selections.newest_anchor().head();
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            snapshot
-                .anchor_to_buffer_anchor(head)
-                .map(|(anchor, buffer)| buffer.anchor_after(anchor.to_offset(buffer)))
-        });
-        // Decorations are anchored in the current composition. Remove them
-        // before replacing row buffers; asking the display map to translate
-        // old inlay/fold edits through a replacement can underflow, and the
-        // anchors cannot refer to the new buffer entities anyway.
-        let old = std::mem::take(&mut self.tree_inlay_ids);
-        self.editor
-            .update(cx, |editor, cx| editor.splice_inlays(&old, Vec::new(), cx));
-        self.apply_tree_folds(&[], &[], cx);
-        let raw_mode = self.raw_mode;
-        let rows = self
-            .tree_hosts
-            .iter()
-            .flat_map(|(host, source)| {
-                source.nodes.iter().filter_map(move |node| {
-                    if raw_mode && !is_note(node) {
-                        return None;
-                    }
-                    Some((*host, node.clone(), source.buffers.get(&node.id)?.clone()))
-                })
-            })
-            .collect::<Vec<_>>();
-        let semantic_rows = rows
-            .iter()
-            .filter(|(_, node, _)| node.is_note())
-            .map(|(_, _, buffer)| buffer.read(cx).remote_id())
-            .collect();
-        self.editor.update(cx, |editor, _| {
-            editor.set_semantic_row_buffers(semantic_rows)
-        });
-        let mut spec = CompositionSpec::default();
-        for (host, node, buffer) in &rows {
-            let key = (*host, node.id.clone(), node.under.clone());
-            let id = *self.tree_element_keys.entry(key).or_insert_with(|| {
-                self.next_element_key += 1;
-                self.next_element_key
-            });
-            spec.tail.push(RowSpec {
-                id,
-                buffer: buffer.clone(),
-            });
-            if self.tree_new_draft_parent == Some((*host, node.id.clone()))
-                && let Some((_, draft, _)) = &self.new_draft
-            {
-                let key = LineKey::NewDraft(Some((*host, node.id.clone())));
-                let id = *self.element_keys.entry(key.clone()).or_insert_with(|| {
-                    self.next_element_key += 1;
-                    self.next_element_key
-                });
-                self.buffers.insert(key.clone(), draft.clone());
-                self.targets.insert(
-                    key.clone(),
-                    RowTarget::NewTreeDraft((*host, node.id.clone())),
-                );
-                spec.tail.push(RowSpec {
-                    id,
-                    buffer: draft.clone(),
-                });
-            }
-        }
-        if self.tree_new_draft_parent.is_none()
-            && let Some((_, draft, _)) = &self.new_draft
-        {
-            let key = LineKey::NewDraft(None);
-            let id = *self.element_keys.entry(key.clone()).or_insert_with(|| {
-                self.next_element_key += 1;
-                self.next_element_key
-            });
-            self.buffers.insert(key, draft.clone());
-            self.targets
-                .insert(LineKey::NewDraft(None), RowTarget::NewDraft);
-            spec.tail.push(RowSpec {
-                id,
-                buffer: draft.clone(),
-            });
-        }
-        let changed = self.composition.sync(&self.multi_buffer, &spec, cx);
-        if changed
-            && self.pending_tree_cursor.is_none()
-            && let Some(anchor) = cursor_anchor
-        {
-            self.select_buffer_anchor(anchor, None, window, cx);
-        }
-        if let Some((host, ref node_id, offset)) = self.pending_tree_cursor {
-            if let Some(buffer) = self
-                .tree_hosts
-                .get(&host)
-                .and_then(|source| source.buffers.get(node_id))
-            {
-                let buffer = buffer.read(cx);
-                let anchor = buffer.anchor_after(offset.min(buffer.len()));
-                self.select_buffer_anchor(anchor, None, window, cx);
-            }
-            self.pending_tree_cursor = None;
-        }
-        if self.pending_cursor.as_ref().is_some_and(|key| {
-            self.buffers.get(key).is_some_and(|candidate| {
-                self.new_draft
-                    .as_ref()
-                    .is_some_and(|(_, buffer, _)| candidate == buffer)
-            })
-        }) && let Some((_, buffer, _)) = &self.new_draft
-        {
-            let buffer = buffer.read(cx);
-            self.select_buffer_anchor(buffer.anchor_after(buffer.len()), None, window, cx);
-            self.pending_cursor = None;
-        }
-        self.ensure_headerless(cx);
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        if self.raw_mode {
-            self.editor.update(cx, |editor, cx| {
-                for class in DashClass::ALL {
-                    editor.highlight_text(class.key(), Vec::new(), class.style(cx), cx);
-                }
-            });
-            self.apply_tree_folds(&[], &[], cx);
-            return;
-        }
-        let mut inlays = Vec::new();
-        #[cfg(test)]
-        {
-            self.composed += 1;
-        }
-        // What this composition was over. A `sync_tree` that composes eight
-        // rows and one that composes eight thousand are the same stage name
-        // and not the same event, and until now the report could not tell
-        // them apart.
-        timing.input(rows.len(), 0, rows.len() as u64);
-        self.tree_draw.clear();
-        self.tree_draw_at.clear();
-        let mut eol_hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
-        let mut highlights = DashClass::ALL
-            .into_iter()
-            .map(|class| (class, Vec::new()))
-            .collect::<Vec<_>>();
-        // Depth belongs to the row, not to the thing the row is of: a
-        // labelled thing is drawn where it is filed and again under its
-        // label, and the two places sit at different depths. The rows come
-        // in the order the tree walks them, so the row a row hangs under is
-        // the nearest one above it with that id, which is a stack rather
-        // than a lookup.
-        let mut row_depths: Vec<RowDepth> = Vec::with_capacity(rows.len());
-        let mut open: Vec<(HostId, rho_desk::cells::Id, RowDepth)> = Vec::new();
-        for (host, node, _) in &rows {
-            match &node.under {
-                None => open.clear(),
-                Some(parent) => {
-                    while open
-                        .last()
-                        .is_some_and(|(open_host, id, _)| open_host != host || id != parent)
-                    {
-                        open.pop();
-                    }
-                }
-            }
-            let above = open.last().map(|(_, _, depth)| *depth).unwrap_or_default();
-            let depth = RowDepth {
-                tree: above.tree + usize::from(node.under.is_some()),
-                note: above.note + usize::from(node.is_note()),
-                card: above.card + usize::from(!node.is_note()),
-            };
-            row_depths.push(depth);
-            open.push((*host, node.id.clone(), depth));
-        }
-        // Where each row starts and ends in the map, found once. A thing
-        // drawn in two places is one buffer in two excerpts, and asking the
-        // buffer for its anchor lands in whichever excerpt came first, so
-        // the second row would take the first one's prefix and highlight.
-        // The excerpt boundaries name each excerpt's own rows, and the
-        // composition names the path a row was put at, which pairs them.
-        let mut rows_by_path: HashMap<multi_buffer::PathKey, (MultiBufferRow, MultiBufferRow)> =
-            HashMap::new();
-        for boundary in snapshot.excerpt_boundaries_in_range(multi_buffer::MultiBufferOffset(0)..) {
-            if let multi_buffer::Anchor::Excerpt(excerpt) = boundary.next.start_anchor {
-                rows_by_path
-                    .entry(snapshot.path_for_anchor(excerpt).clone())
-                    .or_insert((boundary.row, boundary.next.end_row));
-            }
-        }
-        for (index, (host, node, _)) in rows.iter().enumerate() {
-            // The visible heading prefix belongs to this row. Right-biased
-            // at the row's first column, because a left-biased anchor sits
-            // at the end of the row above instead, which made commands
-            // issued on `*` edit that previous row (notably `dd`, `O`, `R`,
-            // and subtree toggles).
-            let key = (*host, node.id.clone(), node.under.clone());
-            let Some((start_row, end_row)) = self
-                .tree_element_keys
-                .get(&key)
-                .and_then(|id| self.composition.path_for_row(*id))
-                .and_then(|path| rows_by_path.get(&path).copied())
-            else {
-                continue;
-            };
-            let start = snapshot.anchor_after(Point::new(start_row.0, 0));
-            let end = snapshot.anchor_before(Point::new(end_row.0, snapshot.line_len(end_row)));
-            let hidden_by_fold = self.tree_hosts.get(host).is_some_and(|source| {
-                let mut parent = node.under.clone();
-                while let Some(parent_id) = parent {
-                    if self.tree_collapsed.contains(&(*host, parent_id.clone())) {
-                        return true;
-                    }
-                    parent = source
-                        .nodes
-                        .iter()
-                        .find(|candidate| candidate.id == parent_id)
-                        .and_then(|candidate| candidate.under.clone());
-                }
-                false
-            });
-            // A card hangs under the card above it, so its marker starts
-            // past that one's. Its own depth counts itself, which is the
-            // indent a root card has: none.
-            let indent = "    ".repeat(row_depths[index].card.saturating_sub(1));
-            let prefix = match &node.id {
-                rho_desk::cells::Id::Note(_) => {
-                    // A note under a card is indented past the card's marker
-                    // and words. At the left edge its `*` read as the next
-                    // root rather than as something belonging to the card.
-                    format!(
-                        "{}{} ",
-                        "    ".repeat(row_depths[index].card),
-                        "*".repeat(row_depths[index].note.max(1))
-                    )
-                }
-                rho_desk::cells::Id::Agent(_) => {
-                    let label = node
-                        .agent()
-                        .map(|agent_id| {
-                            format!(
-                                "{} {} ",
-                                match registry.attention(agent_id) {
-                                    UiAttention::Quiet => "○",
-                                    UiAttention::Working => "·",
-                                    UiAttention::Pending => "●",
-                                    UiAttention::NeedsInput => "!",
-                                },
-                                registry.agent_human_name(agent_id)
-                            )
-                        })
-                        .unwrap_or_default();
-                    format!("{indent}  • {label}")
-                }
-                _ => format!("{indent}  ◦ "),
-            };
-            let class = match &node.id {
-                rho_desk::cells::Id::Note(_) => Some(DashClass::for_depth(row_depths[index].note)),
-                _ => Some(DashClass::Muted),
-            };
-            if let Some(class) = class
-                && let Some((_, ranges)) = highlights.iter_mut().find(|(key, _)| *key == class)
-            {
-                ranges.push(start..end);
-            }
-            let mut row_inlays = Vec::new();
-            if !hidden_by_fold && !prefix.is_empty() {
-                // A body runs to as many lines as it wants, and only its
-                // first carries the bullet. The rest are padded to the same
-                // column so the note reads as one block under it.
-                let padding = " ".repeat(prefix.chars().count());
-                let inlay = Inlay::custom(TREE_INLAY_ID_BASE + index * 2, start, prefix.clone());
-                self.tree_inlay_ids.push(inlay.id);
-                row_inlays.push(inlay.id);
-                inlays.push(inlay);
-                for (line, row) in (start_row.0 + 1..=end_row.0).enumerate() {
-                    let anchor = snapshot.anchor_after(Point::new(row, 0));
-                    let inlay = Inlay::custom(
-                        CONTINUATION_INLAY_ID_BASE + index * 256 + line,
-                        anchor,
-                        padding.clone(),
-                    );
-                    self.tree_inlay_ids.push(inlay.id);
-                    row_inlays.push(inlay.id);
-                    inlays.push(inlay);
-                }
-            }
-            let hint = (!hidden_by_fold).then(|| row_hint(node)).flatten();
-            if let Some(text) = &hint {
-                eol_hints.push((end, eol_hint(text.clone())));
-            }
-            self.tree_draw_at
-                .entry((*host, node.id.clone()))
-                .or_default()
-                .push(self.tree_draw.len());
-            self.tree_draw.push(TreeRowDraw {
-                start,
-                end,
-                prefix,
-                inlays: row_inlays,
-                at: index,
-                hint,
-                hidden_by_fold,
-            });
-        }
-        self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&[], inlays, cx);
-            editor.set_eol_hints(eol_hints, cx);
-            for (class, ranges) in highlights {
-                editor.highlight_text(class.key(), ranges, class.style(cx), cx);
-            }
-        });
-        timing.spliced(self.tree_inlay_ids.len() as u64, 0..rows.len() as u64, 0);
-        self.apply_tree_folds(rows.as_slice(), &row_depths, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn display_text_for_test(&self, cx: &mut App) -> String {
-        self.editor.update(cx, |editor, cx| editor.display_text(cx))
-    }
-
-    fn apply_tree_folds(
-        &self,
-        rows: &[(HostId, crate::desk_view::DeskNode, Entity<Buffer>)],
-        depths: &[RowDepth],
-        cx: &mut Context<Workspace>,
-    ) {
-        struct TreeSubtreeFold;
-        let type_id = std::any::TypeId::of::<TreeSubtreeFold>();
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let mut creases = Vec::new();
-        for (index, (host, node, _)) in rows.iter().enumerate() {
-            if !self.tree_collapsed.contains(&(*host, node.id.clone())) {
-                continue;
-            }
-            let depth = depths[index].tree;
-            let end_index = rows[index + 1..]
-                .iter()
-                .enumerate()
-                .position(|(offset, (candidate_host, _, _))| {
-                    *candidate_host != *host || depths[index + 1 + offset].tree <= depth
-                })
-                .map_or(rows.len(), |offset| index + 1 + offset);
-            if end_index == index + 1 {
-                continue;
-            }
-            let first = &rows[index + 1].2;
-            let last = &rows[end_index - 1].2;
-            let start_snapshot = first.read(cx).snapshot();
-            let end_snapshot = last.read(cx).snapshot();
-            let (Some(start), Some(end)) = (
-                snapshot.anchor_in_excerpt(start_snapshot.anchor_before(0)),
-                snapshot.anchor_in_excerpt(end_snapshot.anchor_before(end_snapshot.len())),
-            ) else {
-                continue;
-            };
-            creases.push(editor::display_map::Crease::simple(
-                start..end,
-                editor::FoldPlaceholder {
-                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
-                    constrain_width: false,
-                    merge_adjacent: false,
-                    type_tag: Some(type_id),
-                    collapsed_text: Some(" …".into()),
-                    caret_rest: editor::display_map::CaretRest::Boundary,
-                },
-            ));
-        }
-        self.editor.update(cx, |editor, cx| {
-            editor.display_map.update(cx, |display_map, cx| {
-                display_map.replace_folds_with_type(type_id, creases, cx);
-            });
-        });
-    }
-
     /// Regenerates the listing: the host documents are sliced at bound
     /// headings, generated rows and drafts are interleaved between the
     /// slices, and highlights and lamps reapplied. The cursor follows
     /// its buffer through the rearrangement.
-    pub fn sync(
-        &mut self,
-        registry: &AgentMap,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        agent_interactions: &HashMap<AgentId, i64>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
+    pub fn sync(&mut self, agent_interactions: &HashMap<AgentId, i64>) {
         self.sync_hand(agent_interactions);
-        self.sync_tree(registry, threads, window, cx);
     }
 
     /// What the hand says, without touching the map. A delta that only
@@ -2642,223 +1707,6 @@ impl Dashboard {
         };
     }
 
-    fn select_buffer_anchor(
-        &self,
-        anchor: text::Anchor,
-        autoscroll: Option<Autoscroll>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let Some(anchor) = snapshot.anchor_in_excerpt(anchor) else {
-            return;
-        };
-        self.editor.update(cx, |editor, cx| {
-            let effects = autoscroll.map_or_else(Default::default, SelectionEffects::scroll);
-            editor.change_selections(effects, window, cx, |selections| {
-                selections.select_anchor_ranges([anchor..anchor]);
-            });
-        });
-    }
-
-    /// Where the cursor is: a generated row, or an offset in a document.
-    fn cursor_place(&self, cx: &mut Context<Workspace>) -> Option<CursorPlace> {
-        let (anchor, buffer_id, offset) = self.editor.update(cx, |editor, cx| {
-            let anchor = editor.selections.newest_anchor().head();
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            snapshot
-                .anchor_to_buffer_anchor(anchor)
-                .map(|(text_anchor, buffer)| {
-                    (anchor, buffer.remote_id(), text_anchor.to_offset(buffer))
-                })
-        })?;
-        self.place_for_anchor(anchor, buffer_id, offset, cx)
-    }
-
-    fn place_for_anchor(
-        &self,
-        _anchor: multi_buffer::Anchor,
-        buffer_id: BufferId,
-        offset: usize,
-        cx: &App,
-    ) -> Option<CursorPlace> {
-        for (host, source) in &self.tree_hosts {
-            if let Some(node_id) = source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some(node_id.clone())
-            }) {
-                return Some(CursorPlace::Tree(*host, node_id, offset));
-            }
-        }
-        self.buffers
-            .iter()
-            .find(|(_, buffer)| buffer.read(cx).remote_id() == buffer_id)
-            .map(|(key, _)| CursorPlace::Row(key.clone()))
-    }
-
-    /// The row at a window-space position, resolved from the editor's painted
-    /// layout without focusing it or moving its selection.
-    pub fn target_at_window_position(
-        &self,
-        position: gpui::Point<gpui::Pixels>,
-        registry: &AgentMap,
-        cx: &mut Context<Workspace>,
-    ) -> Option<RowTarget> {
-        let place = self
-            .editor
-            .read(cx)
-            .buffer_location_for_window_position(position, Bias::Left)?;
-        let place = self.place_for_anchor(place.0, place.1, place.2, cx)?;
-        self.target_for_place(place, registry, cx)
-    }
-
-    /// The row under the cursor.
-    pub fn cursor_target(
-        &self,
-        registry: &AgentMap,
-        cx: &mut Context<Workspace>,
-    ) -> Option<RowTarget> {
-        let place = self.cursor_place(cx)?;
-        self.target_for_place(place, registry, cx)
-    }
-
-    fn target_for_place(
-        &self,
-        place: CursorPlace,
-        registry: &AgentMap,
-        _cx: &App,
-    ) -> Option<RowTarget> {
-        match place {
-            CursorPlace::Row(key) => self.targets.get(&key).cloned(),
-            CursorPlace::Tree(host, node_id, _) => {
-                let source = self.tree_hosts.get(&host)?;
-                let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.is_note() {
-                    Some(node.id.clone())
-                } else {
-                    nearest_tree_heading(source, node.parent.clone())
-                };
-                match &node.id {
-                    rho_desk::cells::Id::Agent(_) => match node.agent() {
-                        Some(agent_id) => Some(RowTarget::TreeAgent {
-                            host,
-                            node_id,
-                            topic_node_id: topic?,
-                            agent_id,
-                        }),
-                        None => Some(RowTarget::None),
-                    },
-                    rho_desk::cells::Id::Page(_) => match node_page(node) {
-                        Some(page_id) => Some(RowTarget::TreePage {
-                            host,
-                            node_id,
-                            topic_node_id: topic?,
-                            page_id,
-                        }),
-                        None => Some(RowTarget::None),
-                    },
-                    _ => {
-                        let topic = topic?;
-                        let first_attention = self
-                            .tree_heading_agents
-                            .get(&(host, topic.clone()))
-                            .into_iter()
-                            .flatten()
-                            .copied()
-                            .find(|agent_id| registry.attention(*agent_id) >= UiAttention::Pending);
-                        Some(RowTarget::TreeTopic {
-                            host,
-                            node_id: topic,
-                            first_attention,
-                            on_heading_line: node.is_note(),
-                        })
-                    }
-                }
-            }
-        }
-    }
-
-    /// The heading that owns the cursor position: the containing heading
-    /// for document positions, the bound heading for agent rows.
-    pub fn cursor_topic(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::cells::Id)> {
-        match self.cursor_place(cx)? {
-            CursorPlace::Tree(host, node_id, _) => {
-                let source = self.tree_hosts.get(&host)?;
-                let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.is_note() {
-                    node.id.clone()
-                } else {
-                    nearest_tree_heading(source, node.parent.clone())?
-                };
-                Some((host, topic))
-            }
-            CursorPlace::Row(LineKey::NewDraft(topic)) => topic,
-        }
-    }
-
-    /// Capture metadata for the heading under the cursor. The room is the
-    /// top-level ancestor, not the leaf task, so capture never asks the user
-    /// to classify a thought while still preserving the surrounding scene.
-    pub fn capture_position(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::cells::Id, String)> {
-        let (host, node_id) = self.cursor_topic(cx)?;
-        let room = self.room_for_node(host, node_id.clone())?;
-        Some((host, node_id, room.name))
-    }
-
-    /// Whether the cursor is somewhere dashboard verbs apply: a heading
-    /// line of the document or a generated agent row.
-    /// No rows at all, on any host: the desk the user is looking at is
-    /// blank rather than merely scrolled away from its rows.
-    pub fn tree_is_empty(&self) -> bool {
-        self.tree_hosts
-            .values()
-            .all(|source| source.nodes.is_empty())
-    }
-
-    pub fn cursor_on_heading_line(&self, cx: &mut Context<Workspace>) -> bool {
-        self.tree_node_at_cursor(cx).is_some_and(|(host, node_id)| {
-            self.tree_hosts.get(&host).is_some_and(|source| {
-                source
-                    .nodes
-                    .iter()
-                    .any(|node| node.id == node_id && node.is_note())
-            })
-        })
-    }
-
-    /// Org-style visibility cycling on the heading under the cursor.
-    pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let Some((host, node_id)) = self.tree_node_at_cursor(cx) else {
-            return false;
-        };
-        let is_heading = self.tree_hosts.get(&host).is_some_and(|source| {
-            source
-                .nodes
-                .iter()
-                .any(|node| node.id == node_id && node.is_note())
-        });
-        if !is_heading {
-            return false;
-        }
-        if !self.tree_collapsed.insert((host, node_id.clone())) {
-            self.tree_collapsed.remove(&(host, node_id));
-        }
-        cx.notify();
-        true
-    }
-
-    /// Switches between the composed Desk and its literal editable
-    /// source. The mode is display-only; no source or fold state is changed.
-    pub fn toggle_raw_mode(&mut self, cx: &mut Context<Workspace>) {
-        self.raw_mode = !self.raw_mode;
-        cx.notify();
-    }
-
     pub fn hint(&self, _cx: &mut Context<Workspace>) -> String {
         format!(
             "{} dealt · {} waiting",
@@ -2869,88 +1717,6 @@ impl Dashboard {
 
 /// Gutter highlight marker type for reply drafts.
 pub struct ReplyGutter;
-
-/// Dashboard text classes: lamps and muted chrome. The cursor itself is
-/// the selection indicator — rows carry no selected styling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DashClass {
-    Muted,
-    Heading,
-    Heading2,
-    Heading3,
-    Heading4,
-    TodoHeading,
-    StaffedHeading,
-    Working,
-    Pending,
-    NeedsInput,
-}
-
-impl DashClass {
-    const ALL: [DashClass; 10] = [
-        DashClass::Muted,
-        DashClass::Heading,
-        DashClass::Heading2,
-        DashClass::Heading3,
-        DashClass::Heading4,
-        DashClass::TodoHeading,
-        DashClass::StaffedHeading,
-        DashClass::Working,
-        DashClass::Pending,
-        DashClass::NeedsInput,
-    ];
-
-    /// Org-style per-level heading colors, cycling every four levels.
-    fn for_depth(depth: usize) -> DashClass {
-        match depth.saturating_sub(1) % 4 {
-            0 => DashClass::Heading,
-            1 => DashClass::Heading2,
-            2 => DashClass::Heading3,
-            _ => DashClass::Heading4,
-        }
-    }
-
-    fn key(self) -> HighlightKey {
-        let slot = match self {
-            DashClass::Muted => 0,
-            DashClass::Heading => 1,
-            DashClass::Heading2 => 2,
-            DashClass::Heading3 => 3,
-            DashClass::Heading4 => 4,
-            DashClass::TodoHeading => 5,
-            DashClass::StaffedHeading => 6,
-            DashClass::Working => 7,
-            DashClass::Pending => 8,
-            DashClass::NeedsInput => 9,
-        };
-        HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
-    }
-
-    /// Color does all the talking: nothing on the dashboard is bold.
-    /// Headings deliberately avoid `text_accent`, which is the typed
-    /// user-message color everywhere else in rho.
-    fn style(self, cx: &App) -> HighlightStyle {
-        let colors = cx.theme().colors();
-        let color = match self {
-            DashClass::Muted => colors.text_muted,
-            // Bright at the top: prominence tracks how shallow the
-            // heading sits, so top-level topics pop and deep ones recede.
-            DashClass::Heading => colors.terminal_ansi_bright_magenta,
-            DashClass::Heading2 => colors.terminal_ansi_bright_green,
-            DashClass::Heading3 => colors.terminal_ansi_magenta,
-            DashClass::Heading4 => colors.terminal_ansi_green,
-            DashClass::TodoHeading => colors.terminal_ansi_red,
-            DashClass::StaffedHeading => colors.terminal_ansi_cyan,
-            DashClass::Working => colors.terminal_ansi_cyan,
-            DashClass::Pending => colors.terminal_ansi_yellow,
-            DashClass::NeedsInput => colors.terminal_ansi_red,
-        };
-        HighlightStyle {
-            color: Some(color.into()),
-            ..HighlightStyle::default()
-        }
-    }
-}
 
 /// One generated dashboard line: identity, text, semantic spans, and
 /// the object addressed by dashboard verbs.
@@ -3229,18 +1995,6 @@ fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
         .map(|page| rho_browser::PageId(uuid::Uuid::from_bytes(page.0)))
 }
 
-/// A note's workdir is a `File` filed under it, so callers look one level
-/// down; an agent's own workdir comes from the registry instead.
-pub(crate) fn node_file_path(
-    nodes: &[crate::desk_view::DeskNode],
-    id: &rho_desk::cells::Id,
-) -> Option<camino::Utf8PathBuf> {
-    nodes
-        .iter()
-        .filter(|node| node.parent.as_ref() == Some(id))
-        .find_map(|node| node.path().map(ToOwned::to_owned))
-}
-
 /// What a row that is not a note says. Agent rows carry their name in the
 /// row prefix already, so their buffer stays empty rather than repeating it.
 fn derived_title(
@@ -3311,27 +2065,6 @@ fn area_kind(id: &rho_desk::cells::Id) -> &'static str {
 /// a card, or a picker row.
 pub(crate) fn note_title(text: &str) -> &str {
     text.lines().next().unwrap_or("").trim()
-}
-
-/// A note is the user's to write in; every other kind is the machine's row.
-fn is_note(node: &crate::desk_view::DeskNode) -> bool {
-    node.is_note()
-}
-
-fn tree_breadcrumb(id: &rho_desk::cells::Id, source: &TreeHostSource) -> String {
-    let mut path = Vec::new();
-    let mut cursor = Some(id.clone());
-    while let Some(id) = cursor {
-        let Some(node) = source.node(&id) else {
-            break;
-        };
-        if node.is_note() {
-            path.push(source.title(&id).unwrap_or(""));
-        }
-        cursor = node.parent.clone();
-    }
-    path.reverse();
-    path.join(" › ")
 }
 
 #[derive(Clone, Debug)]
@@ -3412,29 +2145,6 @@ impl RankedDealCard {
 }
 
 impl Dashboard {
-    pub fn heading_destination_candidates(
-        &self,
-        _cx: &App,
-    ) -> Vec<(String, String, HostId, rho_desk::cells::Id)> {
-        self.tree_hosts
-            .iter()
-            .flat_map(|(host, source)| {
-                source.nodes.iter().filter_map(move |node| {
-                    if !node.is_note() {
-                        return None;
-                    }
-                    let title = source.title(&node.id)?.to_owned();
-                    Some((
-                        title.clone(),
-                        self.breadcrumb_for_node_for_source(node.id.clone(), source)?,
-                        *host,
-                        node.id.clone(),
-                    ))
-                })
-            })
-            .collect()
-    }
-
     /// Every node a new thing can be filed under, as its full path. Any
     /// kind is an area: a note under a Slack thread is notes for that
     /// thread, an agent under a page is the engineer on it. A row with
@@ -3443,24 +2153,19 @@ impl Dashboard {
         &self,
         registry: &AgentMap,
         threads: &HashMap<SlackUnit, SlackFacts>,
-        cx: &App,
+        _cx: &App,
     ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
         let mut areas = Vec::new();
-        for (host, source) in &self.tree_hosts {
-            let titles = source.all_titles(cx);
-            for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(&node.id, source);
+        for (host, source) in &self.deal_hosts {
+            for node in source.nodes() {
+                let breadcrumb = source.breadcrumb(&node.id);
                 // A note's breadcrumb already ends with the note itself;
                 // every other kind hangs its title under its parent's.
-                let path = if is_note(node) {
+                let path = if node.is_note() {
                     breadcrumb
                 } else {
-                    let title = titles
-                        .get(&node.id)
-                        .and_then(|text| text.lines().next())
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
-                        .map(str::to_owned)
+                    let title = source
+                        .shown_title(&node.id)
                         .or_else(|| {
                             node.agent()
                                 .map(|agent_id| registry.agent_human_name(agent_id))
@@ -3479,180 +2184,6 @@ impl Dashboard {
             }
         }
         areas
-    }
-
-    pub fn heading_candidates(
-        &self,
-        _registry: &AgentMap,
-        needle: &str,
-        _cx: &App,
-    ) -> Vec<(String, String)> {
-        let needle = needle.to_lowercase();
-        self.tree_hosts
-            .values()
-            .flat_map(|source| {
-                source
-                    .nodes
-                    .iter()
-                    .filter(|node| node.is_note())
-                    .filter_map(|node| {
-                        let title = source.title(&node.id)?.to_owned();
-                        title.to_lowercase().contains(&needle).then(|| {
-                            (
-                                title.clone(),
-                                self.breadcrumb_for_node_for_source(node.id.clone(), source)
-                                    .unwrap_or(title),
-                            )
-                        })
-                    })
-            })
-            .collect()
-    }
-
-    fn breadcrumb_for_node_for_source(
-        &self,
-        node_id: rho_desk::cells::Id,
-        source: &TreeHostSource,
-    ) -> Option<String> {
-        Some(tree_breadcrumb(&node_id, source))
-    }
-
-    pub fn jump_to_heading(
-        &mut self,
-        query: &str,
-        _registry: &AgentMap,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some((host, node_id)) = self.tree_heading_named(query) else {
-            return false;
-        };
-        self.move_to_tree_node_when_ready(host, node_id);
-        true
-    }
-
-    pub fn rename_cursor_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {
-        let Some((host, node_id)) = self.tree_node_at_cursor(cx) else {
-            return false;
-        };
-        let Some(buffer) = self
-            .tree_hosts
-            .get(&host)
-            .and_then(|source| source.buffers.get(&node_id))
-            .cloned()
-        else {
-            return false;
-        };
-        let len = buffer.read(cx).len();
-        buffer.update(cx, |buffer, cx| buffer.edit([(0..len, title)], None, cx));
-        true
-    }
-
-    pub fn staffing_target_for(
-        &self,
-        topic: (HostId, rho_desk::cells::Id),
-        cx: &App,
-    ) -> Result<(HostId, rho_desk::cells::Id, String, Option<String>), &'static str> {
-        let (host, node_id) = topic;
-        let source = self.tree_hosts.get(&host).ok_or("Desk host unavailable")?;
-        let node = source
-            .nodes
-            .iter()
-            .find(|node| node.id == node_id)
-            .ok_or("Desk node unavailable")?;
-        let text = source
-            .buffers
-            .get(&node_id)
-            .ok_or("Desk text unavailable")?
-            .read(cx)
-            .text();
-        let project = node_file_path(&source.nodes, &node.id).map(|path| path.to_string());
-        Ok((host, node_id, text, project))
-    }
-
-    pub fn next_now(
-        &mut self,
-        registry: &AgentMap,
-        _window: &mut Window,
-        _cx: &mut Context<Workspace>,
-    ) -> Option<AgentId> {
-        let ((host, node_id), agent_id) =
-            self.tree_heading_agents
-                .iter()
-                .find_map(|(topic, agents)| {
-                    agents
-                        .iter()
-                        .copied()
-                        .find(|id| registry.attention(*id) >= UiAttention::Pending)
-                        .map(|agent| (topic.clone(), agent))
-                })?;
-        self.move_to_tree_node_when_ready(host, node_id);
-        Some(agent_id)
-    }
-
-    pub fn back(
-        &mut self,
-        _registry: &AgentMap,
-        _window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some((host, node_id)) = self.tree_node_at_cursor(cx) else {
-            return false;
-        };
-        let Some(parent) = self
-            .tree_hosts
-            .get(&host)
-            .and_then(|source| source.nodes.iter().find(|node| node.id == node_id))
-            .and_then(|node| node.parent.clone())
-        else {
-            return false;
-        };
-        self.move_to_tree_node_when_ready(host, parent);
-        true
-    }
-
-    pub fn cycle_global_folds(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let headings = self
-            .tree_hosts
-            .iter()
-            .flat_map(|(host, source)| {
-                source
-                    .nodes
-                    .iter()
-                    .filter(|node| node.is_note())
-                    .map(move |node| (*host, node.id.clone()))
-            })
-            .collect::<HashSet<_>>();
-        if headings.is_empty() {
-            return false;
-        }
-        if self.tree_collapsed == headings {
-            self.tree_collapsed.clear();
-        } else {
-            self.tree_collapsed = headings;
-        }
-        cx.notify();
-        true
-    }
-
-    pub fn toggle_agent_tree(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let Some(key) = self.tree_node_at_cursor(cx) else {
-            return false;
-        };
-        let has_children = self.tree_hosts.get(&key.0).is_some_and(|source| {
-            source
-                .nodes
-                .iter()
-                .any(|node| node.parent == Some(key.1.clone()))
-        });
-        if !has_children {
-            return false;
-        }
-        if !self.tree_collapsed.insert(key.clone()) {
-            self.tree_collapsed.remove(&key);
-        }
-        cx.notify();
-        true
     }
 }
 
@@ -3802,32 +2333,4 @@ mod tests {
             "an agent spoken to 10 minutes ago ({just_spoken_to}) still comes first"
         );
     }
-}
-
-/// A mark's date as the reader sees it in an end-of-line hint.
-/// A mark's date, with its clock time when it has one: a snooze of an hour
-/// comes back this afternoon, and a bare date would not say when.
-fn desk_date(at: rho_desk::cells::Timestamp) -> String {
-    let format = match at.precision {
-        rho_desk::cells::TimestampPrecision::Day => "%Y-%m-%d",
-        _ => "%Y-%m-%d %H:%M",
-    };
-    desk_time(at).map_or_else(
-        || "unknown".to_owned(),
-        |time| time.format(format).to_string(),
-    )
-}
-
-/// How far in one row is drawn, in the three counts the map indents by.
-/// It is per row rather than per thing, because a labelled thing is drawn
-/// in more than one place and the places are at different depths.
-#[derive(Clone, Copy, Default)]
-struct RowDepth {
-    /// Rows above it in the tree, whatever they are: what a fold spans.
-    tree: usize,
-    /// Notes above it, which is how many `*` its bullet carries.
-    note: usize,
-    /// Cards above it: a card's marker is two columns in, so anything
-    /// below it starts past those columns.
-    card: usize,
 }
