@@ -2058,7 +2058,15 @@ impl DisplaySnapshot {
     }
 
     /// The multiple of the editor's font size this row renders at.
+    ///
+    /// Which row of the buffer a display row came from is a walk down every
+    /// map, and the caller asks for one per visible row per frame. A surface
+    /// that scales no row -- every surface but the agent transcript -- has
+    /// the same answer for all of them, so it does not take the walk.
     pub fn row_scale(&self, row: DisplayRow) -> f32 {
+        if self.row_scales.is_empty() {
+            return 1.0;
+        }
         let point = self.display_point_to_point(DisplayPoint::new(row, 0), Bias::Left);
         self.row_scales
             .scale_for_buffer_row(self.buffer_snapshot(), point.row)

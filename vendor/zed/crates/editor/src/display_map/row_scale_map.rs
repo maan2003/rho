@@ -74,6 +74,12 @@ impl RowScaleSnapshot {
         Self { ranges: tree }
     }
 
+    /// Whether any row is scaled at all. A surface that scales nothing can
+    /// answer for a row without resolving which row it is.
+    pub(super) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
     pub(super) fn scale_for_buffer_row(&self, snapshot: &MultiBufferSnapshot, row: u32) -> f32 {
         if self.ranges.is_empty() {
             return 1.0;
