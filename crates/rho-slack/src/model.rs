@@ -767,6 +767,9 @@ impl Model {
             .collect()
     }
 
+    /// How many conversations the workspace holds, whatever a query
+    /// reaches. What the list's narrowing line counts against, so the
+    /// reader can see how much is being kept off the screen.
     pub fn conversation_count(&self) -> usize {
         self.order.len()
     }

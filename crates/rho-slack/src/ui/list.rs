@@ -423,13 +423,26 @@ impl ListView {
     }
 
     /// The lines above the listing: why the session cannot be trusted to be
-    /// current, when there is a reason.
+    /// current, and what the listing is narrowed to.
+    ///
+    /// The narrowing is a state of the model that nothing clears but another
+    /// search, so without a line for it a reader who searched an hour ago
+    /// sees a short list and no reason for it.
     fn banner_spans(&self, cx: &Context<Self>) -> Vec<Vec<Span>> {
-        self.session
-            .read(cx)
-            .health_reason()
-            .map(|reason| vec![vec![Span::styled(reason.to_owned(), Class::Error)]])
-            .unwrap_or_default()
+        let session = self.session.read(cx);
+        let mut lines = Vec::new();
+        if let Some(reason) = session.health_reason() {
+            lines.push(vec![Span::styled(reason.to_owned(), Class::Error)]);
+        }
+        let query = session.query();
+        if !query.is_empty() {
+            lines.push(narrowed_line(
+                &query,
+                session.rows().len(),
+                session.conversation_count(),
+            ));
+        }
+        lines
     }
 
     /// Rewrites the banner lines that say something different now.
@@ -574,6 +587,16 @@ fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelI
 /// places that draw a row ask the same thing.
 fn now_seconds() -> i64 {
     chrono::Local::now().timestamp()
+}
+
+/// The line that says the listing is narrowed, and by how much. The count is
+/// against the whole workspace, which is what says how much a query is
+/// keeping off the screen rather than only that something is.
+fn narrowed_line(query: &str, shown: usize, whole: usize) -> Vec<Span> {
+    vec![Span::styled(
+        format!("matching \"{query}\" · {shown} of {whole}"),
+        Class::Muted,
+    )]
 }
 
 /// Which banner lines have to be written again: the ones whose words differ

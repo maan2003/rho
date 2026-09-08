@@ -497,6 +497,24 @@ async fn typing_narrows_the_list_per_keystroke_and_escape_puts_it_back(cx: &mut 
         "every row left answers what was typed: {after_three:?}"
     );
 
+    // A narrowing the reader cannot see is a list with rows missing and no
+    // reason for it: the narrowing outlives the prompt, and nothing else on
+    // screen says so.
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("draw a frame");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace.slack_banner_for_test(cx))
+            .unwrap(),
+        vec![format!(
+            "matching \"ops\" · {} of {}",
+            after_three.len(),
+            whole.len()
+        )],
+        "the list says what it is narrowed to, and how much it is keeping off the screen"
+    );
+
     // Escape is the reader changing their mind: the list goes back to what
     // it was showing before the prompt opened.
     cx.simulate_keystrokes(*workspace, "escape");
@@ -507,6 +525,16 @@ async fn typing_narrows_the_list_per_keystroke_and_escape_puts_it_back(cx: &mut 
             .unwrap(),
         whole,
         "escape puts back what the reader was looking at"
+    );
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("draw a frame");
+    cx.run_until_parked();
+    assert!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace.slack_banner_for_test(cx))
+            .unwrap()
+            .is_empty(),
+        "and with nothing narrowed there is nothing to say"
     );
 }
 

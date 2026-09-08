@@ -1046,6 +1046,11 @@ impl Session {
         self.model.query()
     }
 
+    /// How many conversations there are, before a query narrows them.
+    pub fn conversation_count(&self) -> usize {
+        self.model.conversation_count()
+    }
+
     /// Whether a query stands, so a drawer with nothing to draw can say
     /// that nothing matches rather than talk about the socket.
     pub fn is_narrowed(&self) -> bool {

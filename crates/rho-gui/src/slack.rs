@@ -256,6 +256,16 @@ impl Workspace {
         Some(session)
     }
 
+    /// The chrome above the Slack listing, for a test that asserts what the
+    /// reader is told about the state the list is in.
+    #[cfg(test)]
+    pub(crate) fn slack_banner_for_test(&self, cx: &gpui::App) -> Vec<String> {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
+            return Vec::new();
+        };
+        view.read(cx).drawn_banner_for_test()
+    }
+
     /// The conversation names the Slack list is drawing, for a test that
     /// asserts what the reader is looking at rather than what the model
     /// holds.
