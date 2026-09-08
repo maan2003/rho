@@ -1,5 +1,6 @@
 //! The Rho GPUI client views and native application integration.
 
+pub(crate) mod browser;
 pub(crate) mod candidates;
 mod capture_carryover;
 pub(crate) mod chime;

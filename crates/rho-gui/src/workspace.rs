@@ -521,13 +521,10 @@ pub struct Workspace {
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
-    /// Client-local web page shown in the same right-hand preview card.
-    dashboard_web_preview: Option<(rho_browser::PageId, Entity<rho_browser::PageView>)>,
-    /// Browser resources referenced by the last reconciled Desk documents.
-    browser_pages: HashSet<rho_browser::PageId>,
-    browser_metadata_subscription: Option<gpui::Subscription>,
-    /// Unreferenced browser pages waiting out the Desk edit grace period.
-    browser_page_gc: HashMap<rho_browser::PageId, Task<()>>,
+    /// The browser pages the desk refers to, the ones on their way out, and
+    /// the one shown in the right-hand preview card: see
+    /// [`crate::browser::Pages`].
+    pages: crate::browser::Pages,
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
     zulip: Option<Entity<rho_zulip::session::Session>>,
@@ -1144,10 +1141,7 @@ impl Workspace {
             pending_semantic_batches: BTreeMap::new(),
             pending_semantic_group: None,
             dashboard_preview: None,
-            dashboard_web_preview: None,
-            browser_pages: HashSet::new(),
-            browser_metadata_subscription: None,
-            browser_page_gc: HashMap::new(),
+            pages: crate::browser::Pages::default(),
             zulip: None,
             slack: None,
             slack_degraded: None,
@@ -3538,13 +3532,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.browser_metadata_subscription.is_none() {
+        if !self.pages.observed() {
             // A tab the reader opened from a page is a row on the map, so
             // the browser moving is the same kind of news as the Slack
             // mirror moving: the join has to be rebuilt, not just redrawn.
             // The model polls the metadata revision, so a burst of
             // ctrl-clicks arrives as one event and costs one reconcile.
-            self.browser_metadata_subscription = Some(cx.subscribe_in(
+            self.pages.observe(cx.subscribe_in(
                 model,
                 window,
                 |workspace, _, _: &rho_browser::PageMetadataChanged, window, cx| {
@@ -4412,9 +4406,7 @@ impl Workspace {
         let view = self.materialize_model(&agent_id, window, cx);
         view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         self.dashboard_preview = Some(agent_id);
-        {
-            self.dashboard_web_preview = None;
-        }
+        self.pages.clear_preview();
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -4425,11 +4417,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .dashboard_web_preview
-            .as_ref()
-            .is_some_and(|(current, _)| *current == id)
-        {
+        if self.pages.previewing(id) {
             return;
         }
         let Some(model) = rho_browser::open_page(id, cx) else {
@@ -4439,7 +4427,7 @@ impl Workspace {
         self.observe_browser_metadata(&model, window, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
-        self.dashboard_web_preview = Some((id, view));
+        self.pages.preview_page(id, view);
         cx.notify();
     }
 
@@ -4525,14 +4513,11 @@ impl Workspace {
     /// Hides the preview pane: the cursor is on a header, prose, or an
     /// unstaffed heading, so no agent claims the frame.
     fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
-        let web_preview_empty = self.dashboard_web_preview.is_none();
-        if self.dashboard_preview.is_none() && web_preview_empty {
+        if self.dashboard_preview.is_none() && self.pages.preview().is_none() {
             return;
         }
         self.dashboard_preview = None;
-        {
-            self.dashboard_web_preview = None;
-        }
+        self.pages.clear_preview();
         cx.notify();
     }
 
@@ -6320,23 +6305,11 @@ impl Workspace {
             window,
             cx,
         );
-        {
-            let pages = self.dashboard.page_ids();
-            if pages != self.browser_pages {
-                for page in &pages {
-                    self.browser_page_gc.remove(page);
-                }
-                let removed = self
-                    .browser_pages
-                    .difference(&pages)
-                    .copied()
-                    .collect::<Vec<_>>();
-                self.browser_pages = pages;
-                for page in removed {
-                    self.schedule_browser_page_gc(page, cx);
-                }
-                self.scan_browser_pages_for_gc(cx);
+        if let Some(unreferenced) = self.pages.reconcile(self.dashboard.page_ids()) {
+            for page in unreferenced {
+                self.schedule_browser_page_gc(page, cx);
             }
+            self.scan_browser_pages_for_gc(cx);
         }
         self.invalidate_dealer_signals(cx);
     }
@@ -6351,7 +6324,7 @@ impl Workspace {
                 Ok(pages) => {
                     for page in pages {
                         if this.browser_page_retained(page.id) {
-                            this.browser_page_gc.remove(&page.id);
+                            this.pages.not_closing(page.id);
                         } else {
                             this.schedule_browser_page_gc(page.id, cx);
                         }
@@ -6364,14 +6337,15 @@ impl Workspace {
     }
 
     fn schedule_browser_page_gc(&mut self, page: rho_browser::PageId, cx: &mut Context<Self>) {
-        const GRACE: Duration = Duration::from_secs(10 * 60);
-        if self.browser_page_gc.contains_key(&page) || self.browser_page_retained(page) {
+        if self.pages.is_closing(page) || self.browser_page_retained(page) {
             return;
         }
         let gc = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(GRACE).await;
+            cx.background_executor()
+                .timer(crate::browser::GRACE)
+                .await;
             let _ = this.update(cx, |this, cx| {
-                this.browser_page_gc.remove(&page);
+                this.pages.not_closing(page);
                 if this.browser_page_retained(page) {
                     return;
                 }
@@ -6381,7 +6355,7 @@ impl Workspace {
                 }
             });
         });
-        self.browser_page_gc.insert(page, gc);
+        self.pages.closing(page, gc);
     }
 
     fn browser_page_retained(&self, page: rho_browser::PageId) -> bool {
@@ -9103,12 +9077,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        if let Some((_, view)) = &self.dashboard_web_preview {
+        if let Some(preview) = self.pages.preview() {
             return Some(
                 div()
                     .size_full()
                     .overflow_hidden()
-                    .child(view.clone())
+                    .child(preview.view.clone())
                     .into_any_element(),
             );
         }
@@ -9527,7 +9501,7 @@ impl Workspace {
             crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
         }
         self.sync_diff_visibility(!home, cx);
-        let web_preview_visible = self.dashboard_web_preview.is_some();
+        let web_preview_visible = self.pages.preview().is_some();
         let show_surface = !home || self.dashboard_preview.is_some() || web_preview_visible;
         let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
         // Same hairline the rail uses against the preview.
@@ -9592,9 +9566,9 @@ impl Workspace {
     fn dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
         let browser_preview_focused = self
-            .dashboard_web_preview
-            .as_ref()
-            .is_some_and(|(_, view)| view.read(cx).focus_handle(cx).is_focused(window));
+            .pages
+            .preview()
+            .is_some_and(|preview| preview.view.read(cx).focus_handle(cx).is_focused(window));
         self.overview_open
             || self.overlay_return_focus.as_ref() == Some(&dashboard)
             || browser_preview_focused
