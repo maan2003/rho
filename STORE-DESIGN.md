@@ -353,54 +353,26 @@ user typed, and the page exists when the browser opens it.
 
 ## Migration
 
-### Second conversion: recover the outline as labels
+### Second conversion: the outline recovered as labels (historical)
 
-No copy of the Org text survived the 3 Sep cutover, so this conversion reads
-the outline back from the current Desk store: a heading is now a note, an Org
-agent tag is now an agent parented under that note, an archive mark is now a
-`:archived:` stamp-note child, a bookmark heading owns page children, and
-`:project:` is represented by a file child plus a label's `Project`. These
-stored facts and bodies are the only source.
+No copy of the Org text survived the 3 Sep cutover, so this conversion read
+the outline back out of the Desk store itself: a heading was a note with at
+least two non-stamp children, an Org agent tag was an agent parented under
+that note, an archive mark was a `:archived:` stamp-note child, a bookmark
+heading owned page children, and `:project:` was a file child plus a label's
+`Project`. One shot at daemon start behind a durable marker, and then the
+code goes (the standing rule).
 
-The one-shot daemon-start conversion, behind a durable marker, interprets that
-shape in this order:
-
-1. Drop each `:archived: <date>` stamp note and set its containing note Done.
-2. Drop each `Archive`/`archive` folder, set every descendant Done, and delete
-   the `archive` label and all of its memberships.
-3. Outside an archive folder, a note with at least two non-stamp children is a
-   heading: mint or reuse an equal-name label, stripping a trailing colon,
-   and parent that label to the nearest enclosing heading-label. Drop the
-   heading note itself unless it has a real body; preserve a real heading
-   body as a note labeled with that label. Inside an
-   archive folder a heading flattens instead: its children take the nearest
-   outside label and remain Done. Equal names always reuse one label, whose
-   parent comes from the outermost equal-name heading; children below another
-   occurrence carry that label plus their enclosing heading's label.
-4. Drop every old `File { host, path }` project marker, wherever it sits. If
-   the equal-name label lacks `Project`, copy the host and path there first.
-5. An item note whose only children are one or more agents, and whose body is
-   empty or equals its title, is an agent entry. Drop the note; give every
-   child agent the note's labels, its Done state, and `Name(title)` when that
-   differs from the registry's human name at conversion time, or when the
-   registry has no name. This specific rule wins over the broad heading rule
-   when every non-stamp child is an agent.
-6. Keep every other note, label it with the nearest heading-label, and add
-   `About(agent)` for either legacy note-to-agent shape. Afterward drop any note
-   with neither body text nor a title: `About` on nothing is nothing.
-7. Drop bookmark headings and their page children; the browser is the source.
-8. Drop every remaining non-label `Parent`, including spawn chains and links
-   from agents or pages to notes. Preserve `AgentHandledThrough` and `State`,
-   but drop every agent `DeferUntil`: "lets just remove snooze for them, I
-   will resnooze them if needed".
-9. Drop every zero `CreatedAt` and every body whose note does not exist.
-
-The code is deleted after the user has run it. Proof uses DeskSync to save a
-read-only version-zero snapshot outside the repository, renders that snapshot
-with the parked reader's `--org` output before and after applying the
-conversion as a pure function, and then deletes the snapshot. Before daemon
-code is written, the snapshot's counts and any unexpected shapes are reported
-for review. This process never copies or directly opens `rho.redb`.
+What it left behind: headings became labels, parented to the nearest
+enclosing heading-label and reused by equal name; agent entries gave their
+labels, their Done state and their title-as-`Name` to the agents beneath
+them; archives became Done; every remaining non-label `Parent` was dropped,
+so nothing but a label places anything. The user ran it on 8 Sep and the
+code was deleted the same day (this commit). On a converted clone of their
+state it minted 30 named labels, and of 647 agent items 112 carry one; the
+labels are their own vocabulary — nixos, rho, fedimint, jj, niri, work,
+"Desk rework". The daemon's report of that run went nowhere, because the
+daemon installs no tracing subscriber, which is a separate fault.
 
 ### First conversion from the native tree (historical)
 

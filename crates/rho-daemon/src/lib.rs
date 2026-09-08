@@ -27,7 +27,6 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast
 
 pub mod debug;
 mod desk_cells;
-mod desk_outline_migration;
 mod detail;
 mod realtime;
 mod secret_store;
