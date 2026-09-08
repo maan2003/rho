@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use gpui::{App, Global};
 use language::{Buffer, Language, LanguageConfig, LanguageMatcher, LanguageQueries};
@@ -55,7 +56,11 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
     // Transcript composition activates this after excerpts and editor
     // attachments are in place. Keeping assignment separate from activation
     // avoids exposing a half-composed buffer to syntax consumers.
-    buffer.set_sync_parse_timeout(None);
+    //
+    // A chunk parses inside the frame that edits it, up to the timeout: the
+    // concealed text and the text on screen are then the same text, and a
+    // streamed edit never flashes the markup it is about to conceal.
+    buffer.set_sync_parse_timeout(Some(Duration::from_millis(1)));
     buffer.set_language_deferred(Some(block.clone()), cx);
 }
 
