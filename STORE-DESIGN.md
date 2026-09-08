@@ -59,7 +59,10 @@ Two shapes of property, decided per variant:
   `DeferUntil(Timestamp)`,
   `Deadline(Timestamp)`, `PaceDays(u32)`, `SlackHandledThrough(Ts)` and
   `AgentHandledThrough(AgentEventPos)` (the verdict cursors, one per
-  source, at that source's own position), `Deleted(bool)`,
+  source, at that source's own position; nothing writes
+  `SlackHandledThrough` since 8 Sep, and nothing reads it after the one
+  seed that moved it into the Slack mirror -- the cells stay where they
+  are and nothing deletes them), `Deleted(bool)`,
   `CreatedAt(Timestamp)`. `CreatedAt` is never zero; when creation time is
   unknown there is no cell.
 - Many per subject, one boolean LWW cell per payload: the store key is the
@@ -143,7 +146,8 @@ nothing in storage.
   fact, or open by source facts, or a label-ancestor of one that is. So
   not every Slack channel, not every finished agent, not every tab.
 - Home (`HOME-DESIGN.md`): dealable if open by source facts (an agent
-  waiting, a Slack unit with `newest_from_other > handled_through`) or by
+  waiting, a Slack unit rho-slack says has attention, which is that
+  crate's own join of its cursor and Slack's read mark) or by
   user facts (`defer_until` reached, with `pace_days`), filtered by
   `state`; curves per id kind as today.
 - Notes for this: notes whose `About` names this id.
@@ -199,9 +203,12 @@ never sees the id.
 ### Verdicts write facts
 
 Anything backed by a source is closed by a cursor at that source's own
-position, never by a state: `d` on a Slack unit writes
-`SlackHandledThrough(newest)`, `d` on an agent writes
-`AgentHandledThrough(the position of its latest event)`. The card is
+position, never by a state: `d` on an agent writes
+`AgentHandledThrough(the position of its latest event)`. A Slack unit is
+the same rule in a different file (8 Sep): its cursor is rho's own half of
+a join with Slack's read mark, both halves live in the Slack mirror, and
+`d` on a unit writes no cell at all. `SLACK-DESIGN.md`, "How a Slack unit
+sits in rho". The card is
 open again the moment the source has an event that wants the user past
 the cursor (a reply from them, an agent turn ending on a question or a
 tag), with a fresh wait; the user's own message to either never reopens

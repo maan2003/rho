@@ -216,6 +216,11 @@ struct VerdictUndo {
     sequence: u64,
     verb: String,
     state: VerdictUndoState,
+    /// rho's own Slack cursors this verdict moved, and where each stood.
+    /// Empty for everything that is not a Slack unit. Undo puts them back;
+    /// what the outbox already pushed to Slack stays pushed, because Slack
+    /// has no way back from a read marker.
+    slack_cursors: Vec<(rho_slack::model::Unit, rho_slack::session::HandledBefore)>,
 }
 
 /// The menu on screen while it is open. Nothing here says where it is
@@ -337,6 +342,13 @@ fn snooze_said(
 
 #[derive(Clone)]
 enum VerdictUndoState {
+    /// A verdict that wrote nothing: done on a Slack unit is rho's own
+    /// cursor moving, which is in `slack_cursors` and is the whole of it.
+    SlackCursor {
+        /// Boxed for the same reason as below.
+        card: Box<crate::dashboard::DealCard>,
+        verdict: crate::dashboard::DealerVerdict,
+    },
     /// The applied verdict this undo appends `Undone { of }` against.
     DeskVerdict {
         /// Boxed: the card dwarfs everything else an undo entry holds.
@@ -1893,6 +1905,11 @@ impl Workspace {
                 }
                 self.sync_tree_delta(host, &delta, window, cx);
                 self.carry_over_captures(host, window, cx);
+                // Both halves are here only when the cells are: the seed of
+                // rho's Slack cursors from the store's old ones runs at the
+                // first sync that has a session, once ever, and is a marker
+                // read afterwards.
+                self.seed_slack_cursors(cx);
             }
             ConnEvent::DeskCellsAvailable { frontier } => {
                 if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
@@ -5915,29 +5932,42 @@ impl Workspace {
             });
         }
         if let Some(verdict) = self.pending_tree_verdicts.remove(&(host, stamp)) {
-            let submitted_card_is_current = self
-                .open_card_in_view(cx)
-                .is_some_and(|card| card.identity == verdict.event.card);
-            let undo_sequence = verdict.undo.sequence;
-            self.restore_verdict_undo(verdict.undo);
-            if verdict.phone_verdict.is_some() && submitted_card_is_current {
-                self.phone_completed_verdict(undo_sequence);
-            }
-            self.dashboard.record_dealer_event(verdict.event);
-            if let Some(phone_verdict) = verdict.phone_verdict {
-                self.record_phone_verdict(phone_verdict, cx);
-            }
-            if submitted_card_is_current {
-                if verdict.phone_verdict.is_some() {
-                    self.restore_phone_feed(window, cx);
-                }
-                self.finish_deal_verdict(window, cx);
-            }
-            self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
+            self.complete_tree_verdict(verdict, window, cx);
         }
         if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
             self.complete_verdict_undo(undone.entry, window, cx);
         }
+    }
+
+    /// The verdict is made: the undo is armed, the dealer is told, and the
+    /// card leaves. Reached from the daemon's acceptance for every verdict
+    /// that writes a cell, and straight away for the one that does not --
+    /// done on a Slack unit, which is rho's own cursor and nothing else.
+    fn complete_tree_verdict(
+        &mut self,
+        verdict: PendingTreeVerdict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let submitted_card_is_current = self
+            .open_card_in_view(cx)
+            .is_some_and(|card| card.identity == verdict.event.card);
+        let undo_sequence = verdict.undo.sequence;
+        self.restore_verdict_undo(verdict.undo);
+        if verdict.phone_verdict.is_some() && submitted_card_is_current {
+            self.phone_completed_verdict(undo_sequence);
+        }
+        self.dashboard.record_dealer_event(verdict.event);
+        if let Some(phone_verdict) = verdict.phone_verdict {
+            self.record_phone_verdict(phone_verdict, cx);
+        }
+        if submitted_card_is_current {
+            if verdict.phone_verdict.is_some() {
+                self.restore_phone_feed(window, cx);
+            }
+            self.finish_deal_verdict(window, cx);
+        }
+        self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
     }
 
     /// The daemon refused it. `DeskCells` has already restored the last
@@ -7342,8 +7372,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let VerdictUndo { verb, state, .. } = entry;
-        let VerdictUndoState::DeskVerdict { card, verdict, .. } = state else {
+        let VerdictUndo {
+            verb,
+            state,
+            slack_cursors,
+            ..
+        } = entry;
+        // Before anything the user sees: the card comes back because the
+        // cursor went back, and that is what makes it come back.
+        self.restore_slack_cursors(&slack_cursors, cx);
+        let (VerdictUndoState::DeskVerdict { card, verdict, .. }
+        | VerdictUndoState::SlackCursor { card, verdict }) = state
+        else {
             return;
         };
         // A discarded thread was ignored in Slack, so taking the verdict
@@ -7401,20 +7441,26 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> usize {
         let mut applied = Vec::new();
+        let mut cursors = Vec::new();
         for (node, cursor) in nodes {
-            // Each unit gets its own log entry, so `shift-u` puts the whole
+            // A Slack unit is done at the cutoff and no further: the cursor
+            // lands on the newest message at or before the age the user
+            // named, and anything newer is still theirs.
+            if let rho_desk::cells::Id::Slack(unit) = &node {
+                cursors.extend(self.advance_slack_cursor(
+                    &unit.clone(),
+                    Some(rho_slack::types::Ts(cursor.0)),
+                    cx,
+                ));
+                continue;
+            }
+            // Each note gets its own log entry, so `shift-u` puts the whole
             // batch back and the daemon checks each cursor against the one
             // that was there.
-            let writes = match &node {
-                rho_desk::cells::Id::Slack(unit) => {
-                    self.desk_cells.slack_done_writes(host, unit, cursor)
-                }
-                _ => {
-                    self.desk_cells
-                        .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
-                }
-            };
-            let Some((writes, event)) = writes else {
+            let Some((writes, event)) =
+                self.desk_cells
+                    .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
+            else {
                 continue;
             };
             let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {
@@ -7422,15 +7468,16 @@ impl Workspace {
             };
             applied.push((node, stamp));
         }
-        let count = applied.len();
+        let count = applied.len() + cursors.len();
         if count > 0 {
-            let undo = self.next_verdict_undo(
+            let mut undo = self.next_verdict_undo(
                 verb,
                 VerdictUndoState::MarkedReadBefore {
                     host,
                     nodes: applied,
                 },
             );
+            undo.slack_cursors = cursors;
             self.restore_verdict_undo(undo);
         }
         count
@@ -7444,7 +7491,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut undone = 0;
+        let mut undone = entry.slack_cursors.len();
+        self.restore_slack_cursors(&entry.slack_cursors.clone(), cx);
         for (node, at) in nodes {
             let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
             else {
@@ -7481,6 +7529,7 @@ impl Workspace {
             sequence,
             verb,
             state,
+            slack_cursors: Vec::new(),
         }
     }
 
@@ -7504,6 +7553,11 @@ impl Workspace {
             return;
         };
         match entry.state.clone() {
+            // Nothing was written, so there is nothing to ask the daemon
+            // for: the cursor goes back and the card is dealt again.
+            VerdictUndoState::SlackCursor { .. } => {
+                self.complete_verdict_undo(entry, window, cx);
+            }
             VerdictUndoState::MarkedReadBefore { host, nodes } => {
                 self.undo_marked_read_before(entry, host, nodes, window, cx);
             }
@@ -7576,10 +7630,6 @@ impl Workspace {
         {
             self.slack_silence_unit(&unit, cx);
         }
-        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
-        else {
-            return false;
-        };
         // A verdict names the card it took, not the place the card was
         // filed. The breadcrumb is the path above an agent's card, so `done`
         // over an agent under a label said the label's name and never the
@@ -7590,6 +7640,53 @@ impl Workspace {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| card.breadcrumb.clone());
         let echo = format!("{verb}: {subject}");
+        // Every verdict that says "this is dealt with" moves rho's own
+        // cursor in the unit: done, the mute that is done and quiet, and
+        // the todo that is done here and owed in a note. A snooze and a
+        // filing do not, because neither says anything has been read.
+        let moves_cursor = matches!(
+            dealt,
+            crate::desk_view::DeskVerdict::Done
+                | crate::desk_view::DeskVerdict::Mute
+                | crate::desk_view::DeskVerdict::Todo { .. }
+        );
+        let slack_cursors = match (&node_id, moves_cursor) {
+            (rho_desk::cells::Id::Slack(unit), true) => self
+                .advance_slack_cursor(&unit.clone(), None, cx)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Done on a Slack unit writes no cell: the cursor above is the
+        // whole verdict, so there is no mutation to wait on and the card
+        // leaves now rather than a round trip later.
+        if matches!(dealt, crate::desk_view::DeskVerdict::Done)
+            && matches!(node_id, rho_desk::cells::Id::Slack(_))
+        {
+            let mut undo = self.next_verdict_undo(
+                verb,
+                VerdictUndoState::SlackCursor {
+                    card: Box::new(card.clone()),
+                    verdict,
+                },
+            );
+            undo.slack_cursors = slack_cursors;
+            let pending = PendingTreeVerdict {
+                event,
+                echo,
+                undo,
+                phone_verdict,
+            };
+            self.complete_tree_verdict(pending, window, cx);
+            return true;
+        }
+        // The cursor moved above, so a verdict that cannot be written puts
+        // it back: half a verdict is not one.
+        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
+        else {
+            self.restore_slack_cursors(&slack_cursors, cx);
+            return false;
+        };
         // A todo hangs a note under the card. Empty, it comes back in a week
         // reading only `defer …`, so it is given the card's own words.
         let todo_note = match &applied.1 {
@@ -7601,13 +7698,14 @@ impl Workspace {
         };
         let Some(stamp) = self.apply_desk_writes(card.host, writes, Some(applied), window, cx)
         else {
+            self.restore_slack_cursors(&slack_cursors, cx);
             return false;
         };
         if let Some(note) = todo_note {
             self.pending_desk_texts
                 .insert((card.host, stamp), vec![(note, card.breadcrumb.clone())]);
         }
-        let undo = self.next_verdict_undo(
+        let mut undo = self.next_verdict_undo(
             verb,
             VerdictUndoState::DeskVerdict {
                 card: Box::new(card.clone()),
@@ -7617,6 +7715,7 @@ impl Workspace {
                 at: stamp,
             },
         );
+        undo.slack_cursors = slack_cursors;
         self.pending_tree_verdicts.insert(
             (card.host, stamp),
             PendingTreeVerdict {

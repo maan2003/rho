@@ -149,6 +149,21 @@ user's own reply advances the cursor, wherever they wrote it. rho never
 writes Slack's read mark on leaving a conversation -- that write goes.
 This replaces `handled_through` as a store cell in the section above.
 
+Landed 8 Sep. Where the local cursor lives: the Slack mirror
+(`slack.redb`), beside Slack's own mark, ruled by en1p -- local, the
+crate's own, and the one file that already holds the other half. The
+outbox is a second cursor per unit in the same file, "how far Slack has
+been told": a unit whose cursor is past it is a push that has not
+happened, retried at the next start, so a workspace that was offline
+still pushes when it comes back. The store's old `SlackHandledThrough`
+cells are seeded into it once, at the first start that has both, marked
+in the mirror and never read again; nothing deletes them and the seed
+pushes nothing to Slack. Undo puts both halves back: rho's cursor, and
+Slack's mark pushed back to where it stood, because rho is what moved it
+-- a mark moving backwards is what "mark unread" is, and this is the only
+place rho asks for one. A done no longer crosses machines through the
+store; what crosses is Slack's mark, which is what the outbox is for.
+
 **Mute is Slack's.** A muted channel or direct message is muted in Slack,
 and a thread the user is done with is unfollowed in Slack. There is no rho
 mute cell for a unit, and following is Slack's too. A unit muted in Slack

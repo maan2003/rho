@@ -1174,17 +1174,9 @@ mod tests {
         });
         let note = Id::Note(Uuid::random());
         let wake = at(9);
+        // No cursor among them: where the reader is done in a Slack unit
+        // is the Slack mirror's, so what a todo writes here is the note.
         let changes = vec![
-            FactChange {
-                id: unit.clone(),
-                key: PropertyKey::SlackHandledThrough,
-                before: Some(Property::SlackHandledThrough(rho_desk::cells::SlackTs(
-                    String::new(),
-                ))),
-                after: Some(Property::SlackHandledThrough(rho_desk::cells::SlackTs(
-                    "2.0".into(),
-                ))),
-            },
             FactChange {
                 id: note.clone(),
                 key: PropertyKey::Deleted,
@@ -1210,10 +1202,6 @@ mod tests {
         };
         let writes = |parent: Option<Id>| {
             let mut writes = vec![
-                CellWrite {
-                    id: unit.clone(),
-                    property: Property::SlackHandledThrough(rho_desk::cells::SlackTs("2.0".into())),
-                },
                 CellWrite {
                     id: note.clone(),
                     property: Property::Deleted(false),
@@ -1280,12 +1268,10 @@ mod tests {
         )
         .unwrap();
         // The unit is closed by its cursor, never by a state: a history page
-        // replaying an older message cannot make it open again.
+        // replaying an older message cannot make it open again. The cursor
+        // is the Slack mirror's, so the store holds none of it.
         assert_eq!(store.facts(&unit).state, State::Open);
-        assert_eq!(
-            store.facts(&unit).slack_handled_through,
-            Some(rho_desk::cells::SlackTs("2.0".into()))
-        );
+        assert_eq!(store.facts(&unit).slack_handled_through, None);
         assert_eq!(store.facts(&note).parent, Some(unit));
     }
 

@@ -459,6 +459,68 @@ impl Mirror {
         );
     }
 
+    /// How far the reader has said they are done in this unit, in rho's own
+    /// words. The other half of the same question is Slack's read mark, and
+    /// what has been dealt with is the later of the two; this is the half
+    /// that is rho's to keep, so it lives here beside the other rather than
+    /// in the store. `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
+    pub fn handled(&self, scope: &Scope) -> Option<Ts> {
+        match self.cursor(&format!("{}handled", scope.prefix())) {
+            Some(StoredCursor::Stamp(ts)) => Some(Ts(ts)),
+            _ => None,
+        }
+    }
+
+    pub fn set_handled(&self, scope: &Scope, ts: &Ts) {
+        self.put_cursor(
+            &format!("{}handled", scope.prefix()),
+            StoredCursor::Stamp(ts.0.clone()),
+        );
+    }
+
+    /// Puts the cursor back where an undone verdict found it. `None` is a
+    /// unit that had none, which is not the same as one at the oldest
+    /// message: the row goes, so the join is back to Slack's mark alone.
+    pub fn clear_handled(&self, scope: &Scope) {
+        self.drop_cursor(&format!("{}handled", scope.prefix()));
+    }
+
+    /// How far Slack itself has been told, of what rho's cursor says. The
+    /// outbox is the difference: a unit whose handled cursor is past this
+    /// is one Slack has not heard about yet, and the push is retried at the
+    /// next start whatever happened to the last one.
+    pub fn pushed(&self, scope: &Scope) -> Option<Ts> {
+        match self.cursor(&format!("{}pushed", scope.prefix())) {
+            Some(StoredCursor::Stamp(ts)) => Some(Ts(ts)),
+            _ => None,
+        }
+    }
+
+    pub fn set_pushed(&self, scope: &Scope, ts: &Ts) {
+        self.put_cursor(
+            &format!("{}pushed", scope.prefix()),
+            StoredCursor::Stamp(ts.0.clone()),
+        );
+    }
+
+    /// Whether the local cursors have been seeded from the store's old
+    /// `handled_through` cells. Once, at the first start that has both, and
+    /// never again: the cells stay where they are and nothing reads them
+    /// after this says yes.
+    pub fn handled_seeded(&self, workspace: &str) -> bool {
+        matches!(
+            self.cursor(&format!("{workspace}{SEPARATOR}handled-seeded")),
+            Some(StoredCursor::Flag(true))
+        )
+    }
+
+    pub fn set_handled_seeded(&self, workspace: &str) {
+        self.put_cursor(
+            &format!("{workspace}{SEPARATOR}handled-seeded"),
+            StoredCursor::Flag(true),
+        );
+    }
+
     pub fn last_read(&self, scope: &Scope) -> Option<Ts> {
         match self.cursor(&format!("{}read", scope.prefix())) {
             Some(StoredCursor::Stamp(ts)) => Some(Ts(ts)),
@@ -666,6 +728,15 @@ impl Mirror {
         let txn = self.db.read();
         let table = txn.open_table(CURSORS);
         table.get(key).map(|value| value.value().into_owned())
+    }
+
+    fn drop_cursor(&self, key: &str) {
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(CURSORS);
+            table.remove(key);
+        }
+        txn.commit();
     }
 
     fn put_cursor(&self, key: &str, cursor: StoredCursor) {

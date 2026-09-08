@@ -523,9 +523,11 @@ wrong at the design, not at the polish.
   a thread view that reads well, compose and reply, reactions, mark read
   that sticks, search, and its own screens and keys. Tested against the
   fake Slack server (`fake.rs`) and against a copy of the user's real
-  mirror. Read state: Slack's own cursor is the truth for reading and is
-  written back when the user reads here; Rho's `SlackHandledThrough`
-  stays the dealing cursor only. Owner: eng-bgkw.
+  mirror. Read state: Slack's own cursor is one half of what has been dealt
+  with and rho's own local cursor is the other, and what has been dealt
+  with is the later of the two (8 Sep). Both live in the Slack mirror;
+  reading here writes neither, and `d` writes rho's half at once and
+  pushes Slack's through an outbox. Owner: eng-bgkw.
   Ruling, 6 Sep: the Slack screens stay editor based. The conversation,
   the thread, the list and compose are drawn with the editor primitives
   the rest of Rho draws with (buffers, inlays, the composition), never a

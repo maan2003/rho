@@ -520,25 +520,34 @@ pub fn verdict_changes(
     // Slack sends afterwards, the only question the card asks is "is there
     // something from them past the cursor", and a history page cannot make
     // that true again.
+    //
+    // That cursor is not a cell any more (8 Sep). Where the reader is done
+    // in a unit is rho's own half of a join with Slack's read mark, and
+    // both halves live in the Slack mirror; the store keeps what the mirror
+    // cannot say, which is a mute and a snooze. `SLACK-DESIGN.md`, "How a
+    // Slack unit sits in rho".
     if let Id::Slack(_) = id {
-        // Only a verdict that moves the cursor needs one. Filing says where
-        // a unit lives and says nothing about what is read, so demanding a
-        // cursor here refused every `f` on a Slack card.
+        // Only a verdict that writes a timestamp needs one. Filing says
+        // where a unit lives and says nothing about what is read, so
+        // demanding a cursor here refused every `f` on a Slack card.
         let cursor = || {
             slack
                 .clone()
                 .ok_or_else(|| "a verdict on a Slack unit needs its newest message".to_owned())
         };
-        let handled = || Ok::<_, String>(change(Property::SlackHandledThrough(cursor()?.newest)));
         return match verdict {
-            Verdict::Done => Ok(vec![handled()?]),
-            // Mute is done plus a state, because done alone is only "up to
-            // here" and the next message would be past it. The state is what
-            // keeps the unit quiet however much arrives; opening it clears
-            // the state, and the silence rho asks Slack for (a thread
+            // Nothing in the store: done on a Slack unit is the mirror's
+            // cursor moving, and moving it is the caller's. An empty change
+            // list would be a verdict the daemon has nothing to check, so
+            // this says so rather than writing a cell nobody reads.
+            Verdict::Done => Err("a Slack unit's done is rho's cursor, not a cell".to_owned()),
+            // A mute is the one verdict a cursor cannot express: the user
+            // said "not this unit", not "not up to here", so nothing
+            // arriving past the cursor reopens it. Opening it clears the
+            // state, and the silence rho asks Slack for (a thread
             // unfollowed, a conversation marked read) is the caller's to
             // send, so following the thread again still brings the card back.
-            Verdict::Mute => Ok(vec![handled()?, change(Property::State(State::Muted))]),
+            Verdict::Mute => one(Property::State(State::Muted)),
             // The cursor stays where it is, so the messages the user has
             // not handled are still theirs when the snooze ends. Where the
             // unit stood is recorded with it: a snooze is not a cursor and
@@ -561,7 +570,6 @@ pub fn verdict_changes(
                     after: Some(after),
                 };
                 Ok(vec![
-                    handled()?,
                     fresh(Property::Deleted(true), Property::Deleted(false)),
                     fresh(
                         Property::DeferUntil(None),
@@ -1580,7 +1588,10 @@ mod tests {
 
     /// A Slack unit is closed by moving a cursor, not by a state, so that
     /// whatever Slack replays afterwards, the only question is whether
-    /// there is something from them past the cursor.
+    /// there is something from them past the cursor -- and that cursor is
+    /// the Slack mirror's, beside Slack's own read mark, so a done writes
+    /// nothing here at all. What is left for the store is what the mirror
+    /// cannot say: a mute, and where a snooze found the unit.
     #[test]
     fn a_verdict_on_a_slack_unit_writes_a_cursor_rather_than_a_state() {
         let store = Store::new(device(1));
@@ -1603,34 +1614,32 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(
-            changes(Verdict::Done),
-            vec![FactChange {
-                id: unit.clone(),
-                key: PropertyKey::SlackHandledThrough,
-                before: Some(Property::SlackHandledThrough(SlackTs(String::new()))),
-                after: Some(Property::SlackHandledThrough(newest.clone())),
-            }]
+        // Done is refused rather than written: there is no cell for it, and
+        // a verdict the daemon has nothing to check is not a verdict.
+        assert!(
+            verdict_changes(
+                &unit,
+                &Verdict::Done,
+                &|key| store.property(&unit, key).cloned(),
+                None,
+                Some(SlackVerdict {
+                    newest: newest.clone(),
+                }),
+                None,
+            )
+            .is_err()
         );
-        // Mute is done plus the state that keeps the unit quiet past the
-        // cursor, and the unfollow in Slack the caller sends; nothing here
-        // says the card can never come back, because opening it must.
+        // A mute is the state that keeps the unit quiet past the cursor,
+        // plus the unfollow in Slack the caller sends; nothing here says the
+        // card can never come back, because opening it must.
         assert_eq!(
             changes(Verdict::Mute),
-            vec![
-                FactChange {
-                    id: unit.clone(),
-                    key: PropertyKey::SlackHandledThrough,
-                    before: Some(Property::SlackHandledThrough(SlackTs(String::new()))),
-                    after: Some(Property::SlackHandledThrough(newest.clone())),
-                },
-                FactChange {
-                    id: unit.clone(),
-                    key: PropertyKey::State,
-                    before: Some(Property::State(State::Open)),
-                    after: Some(Property::State(State::Muted)),
-                },
-            ]
+            vec![FactChange {
+                id: unit.clone(),
+                key: PropertyKey::State,
+                before: Some(Property::State(State::Open)),
+                after: Some(Property::State(State::Muted)),
+            }]
         );
         // A snooze leaves the cursor alone, so the messages the user has not
         // handled are still theirs when it ends, and records where the unit
@@ -1647,10 +1656,20 @@ mod tests {
                 .iter()
                 .any(|change| change.key == PropertyKey::SlackHandledThrough)
         );
-        // A verdict on a unit whose newest message nobody supplied is a
-        // verdict that would write an empty cursor, so it is refused.
+        // A snooze on a unit whose newest message nobody supplied is one
+        // that would record an empty position, so it is refused.
         assert!(
-            verdict_changes(&unit, &Verdict::Done, &|_| None, None, None, None).is_err(),
+            verdict_changes(
+                &unit,
+                &Verdict::Defer {
+                    until: timestamp(10)
+                },
+                &|_| None,
+                None,
+                None,
+                None
+            )
+            .is_err(),
             "a cursor cannot be invented"
         );
     }

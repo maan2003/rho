@@ -6,7 +6,7 @@
 //! and no storage: it emits [`SessionEvent`], and the host decides what a
 //! raised thread means for its inbox, its journal, and its lamp.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -365,6 +365,13 @@ pub struct Session {
     /// the first one; a later one is a reconnect, and what happened during
     /// the outage has to be asked for.
     connected_once: bool,
+    /// The read marks Slack has not been told about yet, unit by unit.
+    /// Filled whenever rho's own cursor moves and drained as soon as there
+    /// is a client; what a run fails to push is still on disk, as a handled
+    /// cursor past the pushed one, so the next start pushes it. Nothing
+    /// here changes what rho shows -- the local cursor has already said it,
+    /// and this is only the same thing said to Slack.
+    outbox: BTreeMap<Unit, Ts>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -401,6 +408,7 @@ impl Session {
             paths,
             focused: None,
             connected_once: false,
+            outbox: BTreeMap::new(),
             _tasks: Vec::new(),
         }
     }
@@ -421,6 +429,7 @@ impl Session {
             paths,
             focused: None,
             connected_once: false,
+            outbox: BTreeMap::new(),
             _tasks: Vec::new(),
         };
         session.seed_from_mirror();
@@ -509,6 +518,9 @@ impl Session {
             true => restore_units(&mut self.model, &mirror),
             false => self.rebuild_units_from_mirror(),
         }
+        // After the units, because the cursor is kept per unit: a row whose
+        // unit is not here yet has nothing to be a cursor on.
+        self.outbox = seed_handled_cursors(&mut self.model, &mirror);
     }
 
     /// Works the units out from the mirror's own history and writes them
@@ -1054,11 +1066,150 @@ impl Session {
     }
 
     fn announce(&mut self, changes: Vec<Change>, cx: &mut Context<Self>) {
+        // Before the early return: the reader's own message moves the
+        // cursor and may be the only thing that happened.
+        self.write_handled();
         if changes.is_empty() {
             return;
         }
         self.write_units(&changes);
         cx.emit(SessionEvent::Changed(changes));
+    }
+
+    /// Says the reader is done in this unit up to here, and remembers it.
+    ///
+    /// rho's own half of the cursor moves at once and on this machine, so
+    /// the card closes whether or not Slack ever hears about it. Telling
+    /// Slack is the caller's, through the outbox: an unconfirmed push is
+    /// stale, not a fault, because the other half of the join already says
+    /// the right thing here.
+    pub fn mark_handled(&mut self, unit: &Unit, ts: &Ts, cx: &mut Context<Self>) -> bool {
+        if !self.model.mark_handled(unit, ts) {
+            return false;
+        }
+        self.write_handled();
+        self.outbox.insert(unit.clone(), ts.clone());
+        self.drain_outbox(cx);
+        cx.notify();
+        true
+    }
+
+    /// A cursor the store already held, put where cursors live now. Not
+    /// pushed: it is a record of verdicts made before rho ever pushed a
+    /// read mark, and a start is not the moment to mark a hundred
+    /// conversations read in Slack.
+    pub fn seed_handled(&mut self, unit: &Unit, ts: &Ts) {
+        if !self.model.mark_handled(unit, ts) {
+            return;
+        }
+        self.write_handled();
+        let workspace = self.model.workspace().0.clone();
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_pushed(&scope_of(&workspace, unit), ts);
+        }
+    }
+
+    /// Whether the local cursors have been seeded from the store's old
+    /// cells. The seed itself is the caller's: the store is not this
+    /// crate's to read.
+    pub fn handled_seeded(&self) -> bool {
+        self.mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.handled_seeded(&self.model.workspace().0))
+    }
+
+    pub fn set_handled_seeded(&self) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.set_handled_seeded(&self.model.workspace().0);
+        }
+    }
+
+    /// Writes down the cursor moves the model has made since this last ran.
+    /// Costs the moves, which is one row for a keypress and one for the
+    /// reader's own message.
+    fn write_handled(&mut self) {
+        let edits = self.model.take_handled_edits();
+        let Some(mirror) = self.mirror.as_ref() else {
+            return;
+        };
+        let workspace = self.model.workspace().0.clone();
+        for (unit, ts) in edits {
+            let scope = scope_of(&workspace, &unit);
+            match &ts {
+                Some(ts) => mirror.set_handled(&scope, ts),
+                None => mirror.clear_handled(&scope),
+            }
+        }
+    }
+
+    /// Takes the verdict's word back, both halves of it: rho's own cursor
+    /// goes where it stood, and Slack's mark is pushed back to where it
+    /// stood, because rho is what moved it. A mark moving backwards is a
+    /// thing Slack does -- it is what "mark unread" is -- and this is the
+    /// only place rho asks for one.
+    ///
+    /// A unit that had no mark at all cannot be un-marked: there is no
+    /// message to name it by. The card still comes back here, on rho's own
+    /// half, which is what the reader pressed undo about.
+    pub fn undo_handled(&mut self, unit: &Unit, before: &HandledBefore, cx: &mut Context<Self>) {
+        self.outbox.remove(unit);
+        self.model.undo_handled(unit, before.handled.clone());
+        self.model.undo_read(unit, before.read.clone());
+        self.write_handled();
+        if let Some(read) = before.read.clone() {
+            self.outbox.insert(unit.clone(), read);
+            self.drain_outbox(cx);
+        }
+        cx.notify();
+    }
+
+    /// Where both halves of a unit's cursor stand, for an undo to put back.
+    pub fn handled_before(&self, unit: &Unit) -> HandledBefore {
+        HandledBefore {
+            handled: self.model.handled_through(unit).cloned(),
+            read: self.model.read_through(unit).cloned(),
+        }
+    }
+
+    /// Tells Slack what rho's cursor already says, for every unit waiting.
+    /// One request each, and only for units whose cursor moved, so this
+    /// costs the moves rather than the mirror. A failure leaves the unit in
+    /// the outbox: nothing local depends on the answer.
+    fn drain_outbox(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let workspace = self.model.workspace().0.clone();
+        for (unit, ts) in std::mem::take(&mut self.outbox) {
+            let client = client.clone();
+            let mirror = self.mirror.clone();
+            let scope = scope_of(&workspace, &unit);
+            let (channel, thread, at) = (unit.channel.clone(), unit.thread.clone(), ts.clone());
+            let task = gpui_tokio::Tokio::spawn(cx, async move {
+                match &thread {
+                    Some(root) => client.mark_thread_read(&channel, root, &at).await,
+                    None => client.mark_read(&channel, &at).await,
+                }
+            });
+            self._tasks.push(cx.spawn(async move |this, cx| {
+                let failed = match task.await {
+                    Ok(Err(error)) => Some(format!("{error:#}")),
+                    Err(error) => Some(format!("{error}")),
+                    Ok(Ok(())) => None,
+                };
+                let _ = this.update(cx, |this, _| match failed {
+                    Some(reason) => {
+                        tracing::warn!(error = %reason, "slack read mark not pushed");
+                        this.outbox.entry(unit).or_insert(ts);
+                    }
+                    None => {
+                        if let Some(mirror) = mirror {
+                            mirror.set_pushed(&scope, &ts);
+                        }
+                    }
+                });
+            }));
+        }
     }
 
     /// Puts the units a change moved on disk, and only those.
@@ -2519,6 +2670,45 @@ const LANDING_WINDOW: usize = 200;
 /// window keeps the cost of a start flat in a workspace with a long
 /// history.
 const STARTUP_WINDOW: usize = 200;
+/// Where a unit's cursor stood before a verdict moved it: rho's own half
+/// and Slack's, because a verdict moves both and an undo puts both back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandledBefore {
+    pub handled: Option<Ts>,
+    pub read: Option<Ts>,
+}
+
+/// The mirror's key for a unit: a conversation, or the thread inside it.
+fn scope_of(workspace: &str, unit: &Unit) -> Scope {
+    match &unit.thread {
+        Some(thread) => Scope::thread(workspace, &unit.channel, thread),
+        None => Scope::conversation(workspace, &unit.channel),
+    }
+}
+
+/// rho's own half of the cursor, as the last run left it. Costs the units
+/// rho tracks, which is what a start reads anyway.
+pub fn seed_handled_cursors(model: &mut Model, mirror: &Mirror) -> BTreeMap<Unit, Ts> {
+    let workspace = model.workspace().0.clone();
+    let mut outbox = BTreeMap::new();
+    for unit in model.tracked() {
+        let scope = scope_of(&workspace, &unit);
+        let Some(ts) = mirror.handled(&scope) else {
+            continue;
+        };
+        // A cursor past what Slack was told is a push that did not happen:
+        // the run before this one was offline, or the call failed. It is
+        // the same push now as it was then, so it goes back in the outbox.
+        if mirror
+            .pushed(&scope)
+            .is_none_or(|pushed| ts.is_newer_than(&pushed))
+        {
+            outbox.insert(unit.clone(), ts.clone());
+        }
+        model.restore_handled(&unit, ts);
+    }
+    outbox
+}
 
 /// Where the reader had read to in each conversation, before Slack has said
 /// anything.

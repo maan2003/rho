@@ -2039,3 +2039,269 @@ async fn opening_a_conversation_marks_nothing_read(cx: &mut TestAppContext) {
     );
     assert_eq!(fake.last_read("C1"), None, "and the server's cursor stands");
 }
+
+/// Brings a session up against the fake and returns it with the workspace,
+/// once the reader's own id is known: the units are about who wrote what,
+/// so a card raised before that is a card about a stranger.
+async fn workspace_with_slack(
+    cx: &mut TestAppContext,
+    workspace: gpui::WindowHandle<crate::workspace::Workspace>,
+    fake: &rho_slack::fake::Fake,
+    state: &tempfile::TempDir,
+) -> gpui::WindowHandle<crate::workspace::Workspace> {
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack(window, cx);
+        })
+        .unwrap();
+    // The listing crosses a real socket. Nothing can be pushed at a
+    // conversation the session has not heard of yet.
+    for _ in 0..300 {
+        cx.run_until_parked();
+        let rows = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if !rows.is_empty() {
+            return workspace;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    panic!("the fake's conversations never reached the workspace");
+}
+
+/// Waits until every named unit is asking, or says which one never did.
+async fn wait_for_reasons(
+    cx: &mut TestAppContext,
+    workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
+    wanted: &[rho_desk::cells::SlackUnit],
+) {
+    for _ in 0..300 {
+        cx.run_until_parked();
+        let facts = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_thread_facts(cx))
+            .unwrap();
+        if wanted
+            .iter()
+            .all(|unit| facts.get(unit).is_some_and(|facts| facts.reason.is_some()))
+        {
+            return;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    panic!("the fake's units never asked for the reader");
+}
+
+fn slack_unit(channel: &str, thread: Option<&str>) -> rho_desk::cells::SlackUnit {
+    rho_desk::cells::SlackUnit {
+        workspace: "acme".to_owned(),
+        channel: channel.to_owned(),
+        thread: thread.map(str::to_owned),
+    }
+}
+
+fn reason_of(
+    workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
+    cx: &mut TestAppContext,
+    unit: &rho_desk::cells::SlackUnit,
+) -> Option<rho_slack::model::Attention> {
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .slack_thread_facts(cx)
+                .get(unit)
+                .and_then(|facts| facts.reason)
+        })
+        .unwrap()
+}
+
+/// `d` on a Slack card: rho's own cursor moves here and now, and the
+/// outbox tells Slack the same thing. Done is the later of the two, so
+/// either half closing the unit closes it, and the local half is what makes
+/// the keystroke instant and true with the workspace offline.
+///
+/// The undo puts rho's half back and the card returns. What the outbox has
+/// already pushed stays pushed: Slack has no way back from a read marker,
+/// so this is the same bargain a mute has always made.
+#[gpui::test]
+async fn a_done_moves_rhos_cursor_and_the_outbox_tells_slack(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::model::Attention;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000100.000000", "user": "UA", "text": "are you around?"}),
+    );
+    let unit = slack_unit("D1", None);
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        Some(Attention::DirectMessage)
+    );
+
+    let moved = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.advance_slack_cursor(&unit, None, cx)
+        })
+        .unwrap()
+        .expect("the unit is one the session knows, so its cursor moves");
+    assert_eq!(
+        moved.1,
+        Default::default(),
+        "nothing was handled in it before"
+    );
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        None,
+        "the card is gone the moment the cursor moved, with nothing sent"
+    );
+
+    // And the outbox says the same thing to Slack, which is what closes it
+    // on the reader's phone.
+    let mut pushed = None;
+    for _ in 0..300 {
+        cx.run_until_parked();
+        pushed = fake.last_read("D1");
+        if pushed.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        pushed.as_deref(),
+        Some("1800000100.000000"),
+        "the outbox pushed the read mark rho's cursor said"
+    );
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.restore_slack_cursors(std::slice::from_ref(&moved), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        Some(Attention::DirectMessage),
+        "the undo takes rho's half back, so the card is the reader's again"
+    );
+}
+
+/// `mark read before` closes a backlog in one keystroke, so it comes back
+/// in one: `shift-u` puts every cursor it moved back, not the last of them.
+/// The cursor each unit lands on is the caller's rather than the unit's
+/// newest, which is what "before an age" means: a conversation with
+/// something newer than the cutoff keeps its card.
+#[gpui::test]
+async fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let me = fake.self_id().to_owned();
+
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000100.000000", "user": "UA", "text": "are you around?"}),
+    );
+    // The direct message has a second line, after the cutoff the reader
+    // will name; the mention has nothing after it.
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000300.000000", "user": "UA", "text": "still there?"}),
+    );
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "C1", "ts": "1800000200.000000", "user": "UA", "text": format!("<@{me}> can you look?")}),
+    );
+    let direct = slack_unit("D1", None);
+    let mention = slack_unit("C1", None);
+    wait_for_reasons(cx, &workspace, &[direct.clone(), mention.clone()]).await;
+
+    let closed = workspace
+        .update(cx, |workspace, window, cx| {
+            let cursor = |ts: &str| rho_desk::cells::SlackTs(ts.to_owned());
+            workspace.mark_cards_done(
+                rho_agents::HostId::default(),
+                vec![
+                    (
+                        rho_desk::cells::Id::Slack(direct.clone()),
+                        cursor("1800000100.000000"),
+                    ),
+                    (
+                        rho_desk::cells::Id::Slack(mention.clone()),
+                        cursor("1800000200.000000"),
+                    ),
+                ],
+                "mark read before".to_owned(),
+                window,
+                cx,
+            )
+        })
+        .unwrap();
+    assert_eq!(closed, 2, "both cursors moved");
+    cx.run_until_parked();
+    assert_eq!(
+        reason_of(&workspace, cx, &mention),
+        None,
+        "the mention was marked at its newest, so it is dealt with"
+    );
+    assert!(
+        reason_of(&workspace, cx, &direct).is_some(),
+        "what arrived after the cutoff is still the reader's"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .verdict_undo_count_for_test())
+            .unwrap(),
+        1,
+        "one keystroke leaves one thing to undo"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.undo_verdict(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        reason_of(&workspace, cx, &mention).is_some(),
+        "the undo puts the whole batch back"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .verdict_undo_count_for_test())
+            .unwrap(),
+        0
+    );
+}

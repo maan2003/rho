@@ -576,7 +576,10 @@ done right after the transcript primitive (2.4) and before 2.10:
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
 - [x] 2.20 Mute on a Slack unit is a cursor plus `State(Muted)` plus the
-      source's own silence. Landed 4 Sep (b8os): `Verdict::Mute` writes both
+      source's own silence. Superseded in part 8 Sep: the cursor is rho's
+      own half in the Slack mirror, not a store cell, so a mute writes
+      `State(Muted)` here and moves the cursor there. Everything else in
+      this item stands. Landed 4 Sep (b8os): `Verdict::Mute` writes both
       facts, the derived card reads a stored `Muted` before it compares the
       cursor, opening the unit (from a card or from the list) clears the
       state and leaves the cursor, and `x` on a conversation unit marks it
@@ -615,7 +618,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       screens s218-*): `Unit{channel, thread}` and monotonic `UnitFacts`
       replace the per-message thread key; the card line is rendered from
       the mirror at display time; `d`, `t` write `SlackHandledThrough :=
-      newest`; snooze records `SlackSnoozedAt(newest)` beside
+      newest` (superseded 8 Sep: that cursor is rho's own half of a join
+      with Slack's read mark and lives in the Slack mirror; the cells are
+      seeded from once and then never read, and nothing deletes them); snooze records `SlackSnoozedAt(newest)` beside
       `DeferUntil` and is voided when `newest_from_other` passes it, the
       cursor untouched; `Name` beats the derived title on any id but a
       note; the dealer deals DMs and mentioned channels, not only threads;

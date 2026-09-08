@@ -10,7 +10,7 @@ use rho_desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, NextUnread, Unit};
-use rho_slack::session::{Session, SessionEvent, Source};
+use rho_slack::session::{HandledBefore, Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::{Attaching, EditStart};
 use rho_window::style::StyleClass;
@@ -403,6 +403,9 @@ impl Workspace {
                 }),
             );
         self.slack.start(session);
+        // The session is the other half of the seed. Whichever half arrives
+        // second runs it; the marker in the mirror is what makes it once.
+        self.seed_slack_cursors(cx);
     }
 
     /// The host services the Slack surfaces borrow, the same two the Zulip
@@ -413,6 +416,77 @@ impl Workspace {
             configure_markdown: rho_window::markdown::configure_buffer,
             gutter_colour: rho_window::style::user_prompt_gutter_color,
         }
+    }
+
+    /// Moves rho's own half of a unit's cursor and says where it stood, so
+    /// an undo can put it back. `at` is where to put it, defaulting to the
+    /// unit's newest message: `mark read before` names a cutoff, and every
+    /// other verdict means all of it.
+    ///
+    /// The move is local and immediate. Telling Slack is the session's
+    /// outbox, which is why nothing here waits for anything.
+    pub(crate) fn advance_slack_cursor(
+        &mut self,
+        unit: &SlackUnit,
+        at: Option<Ts>,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<(Unit, HandledBefore)> {
+        let session = self.slack.session()?;
+        let unit = model_unit(unit);
+        session.update(cx, |session, cx| {
+            let at = at.or_else(|| {
+                session
+                    .model()
+                    .unit(&unit)
+                    .map(|facts| facts.newest.clone())
+            })?;
+            let before = session.handled_before(&unit);
+            session.mark_handled(&unit, &at, cx);
+            Some((unit.clone(), before))
+        })
+    }
+
+    /// `shift-u`: the cursors a verdict moved, back where it found them.
+    pub(crate) fn restore_slack_cursors(
+        &mut self,
+        cursors: &[(Unit, HandledBefore)],
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack.session() else {
+            return;
+        };
+        session.update(cx, |session, cx| {
+            for (unit, before) in cursors {
+                session.undo_handled(unit, before, cx);
+            }
+        });
+    }
+
+    /// The one-time seed: what the store's `handled_through` cells said
+    /// becomes rho's local cursor, once, at the first start that has both
+    /// the session and the cells. The cells are not read again and nothing
+    /// deletes them -- they are the record of verdicts made before the
+    /// cursor lived in the mirror.
+    ///
+    /// One pass over the store's facts, once per workspace ever, so the
+    /// per-event cost rule is untouched.
+    pub(crate) fn seed_slack_cursors(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(session) = self.slack.session() else {
+            return;
+        };
+        if session.read(cx).handled_seeded() {
+            return;
+        }
+        let Some(host) = self.hosts.primary() else {
+            return;
+        };
+        let cells = self.desk_cells.slack_handled_cells(host);
+        session.update(cx, |session, _| {
+            for (unit, ts) in cells {
+                session.seed_handled(&model_unit(&unit), &Ts(ts.0));
+            }
+            session.set_handled_seeded();
+        });
     }
 
     /// Opens the conversation a Slack card is about and puts the reader on
@@ -432,12 +506,11 @@ impl Workspace {
         let Some(session) = self.slack_session(window, cx) else {
             return false;
         };
-        let cursor = self
-            .desk_cells
-            .facts_of_slack_unit(self.hosts.primary(), unit)
-            .and_then(|facts| facts.slack_handled_through)
-            .map(|ts| Ts(ts.0));
         let unit_of = model_unit(unit);
+        // rho's half of the cursor. Slack's mark is the other half and the
+        // conversation view lands on it in its own right, so the oldest
+        // message this reader has not dealt with is what is asked for here.
+        let cursor = session.read(cx).model().handled_through(&unit_of).cloned();
         let land = session
             .read(cx)
             .oldest_from_other_after(&unit_of, cursor.as_ref());

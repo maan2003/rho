@@ -460,10 +460,11 @@ two rows change, or the row stays with no echo line saying why.
 
 ### C3. A Slack thread marked read that comes back
 
-*Why it is tricky.* There are two cursors: Slack's own, which is the truth for
-reading, and Rho's `SlackHandledThrough`, which is the dealing cursor only. A
-thread marked read here must write back to Slack's cursor, and a thread the
-dealer has handled must not re-deal on the next poll.
+*Why it is tricky.* There are two cursors, both in the Slack mirror: Slack's
+own read mark, and rho's local cursor that `d` moves. What has been dealt with
+is the later of the two, so a thread the dealer has handled must not re-deal on
+the next poll, and one read on the phone must not either. Reading here writes
+neither.
 
 *Run.* Open an unread thread in the rig's Slack, read to the end, leave it.
 Note the conversation. `rho-qa rig down desk` and `rig up desk`. Look at Home

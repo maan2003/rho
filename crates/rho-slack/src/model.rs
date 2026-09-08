@@ -362,6 +362,15 @@ pub struct Model {
     /// channel read that nobody has looked at.
     conversation_read: BTreeMap<ChannelId, Ts>,
     thread_read: BTreeMap<ThreadKey, Ts>,
+    /// How far the reader has said they are done in each unit, in rho's own
+    /// words. Slack's read mark says the same thing in Slack's, and what
+    /// has been dealt with is the later of the two: reading on the phone
+    /// counts, and so does pressing `d` here with the phone switched off.
+    /// `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
+    handled: BTreeMap<Unit, Ts>,
+    /// The cursor moves this run that are not on disk yet. The session
+    /// drains it and writes the rows; the model touches no file.
+    handled_edits: Vec<(Unit, Option<Ts>)>,
     /// Every word start in every conversation's name, paired with the
     /// conversation it belongs to. This is what a reader typing narrows
     /// against: the set is ordered by the word, so a query is a range scan
@@ -485,6 +494,8 @@ impl Model {
             muted: BTreeSet::new(),
             conversation_read: BTreeMap::new(),
             thread_read: BTreeMap::new(),
+            handled: BTreeMap::new(),
+            handled_edits: Vec::new(),
             words: BTreeSet::new(),
             worded: BTreeMap::new(),
             query: Vec::new(),
@@ -1708,6 +1719,100 @@ impl Model {
         self.followed.contains(key)
     }
 
+    /// Says the reader is done in this unit up to here: `d`, their own
+    /// reply, or the seed off the store's old cells. Monotonic, because a
+    /// cursor that can go backwards is not a cursor -- an older message
+    /// arriving late says nothing about what has been dealt with.
+    ///
+    /// Nothing is sent to Slack from here. The push of Slack's own mark is
+    /// the caller's, through an outbox, so a workspace that is offline
+    /// still reads right on this machine.
+    pub fn mark_handled(&mut self, unit: &Unit, ts: &Ts) -> bool {
+        if self
+            .handled
+            .get(unit)
+            .is_some_and(|handled| !ts.is_newer_than(handled))
+        {
+            return false;
+        }
+        self.handled.insert(unit.clone(), ts.clone());
+        self.handled_edits.push((unit.clone(), Some(ts.clone())));
+        self.refresh_attention(unit);
+        true
+    }
+
+    /// How far the reader is done in this unit by rho's own cursor alone.
+    /// The answer the reader sees is the join of this and Slack's mark, and
+    /// [`Model::attention`] is where they are joined.
+    pub fn handled_through(&self, unit: &Unit) -> Option<&Ts> {
+        self.handled.get(unit)
+    }
+
+    /// Where Slack's own mark stands for this unit: the other half of the
+    /// join, in Slack's words. Taken before a verdict moves anything, so an
+    /// undo can put both halves back.
+    pub fn read_through(&self, unit: &Unit) -> Option<&Ts> {
+        match &unit.thread {
+            Some(root) => self.thread_read.get(&self.key(&unit.channel, root)),
+            None => self.conversation_read.get(&unit.channel),
+        }
+    }
+
+    /// Slack's mark, back where it stood before rho pushed it. The one
+    /// place a read mark moves backwards, and only ever by exactly as much
+    /// as this rho moved it: a verdict pushed the mark, the undo takes the
+    /// verdict back, and Slack is told the same thing. Whatever Slack says
+    /// afterwards is the truth again, monotonic from here.
+    pub fn undo_read(&mut self, unit: &Unit, before: Option<Ts>) {
+        match &unit.thread {
+            Some(root) => {
+                let key = self.key(&unit.channel, root);
+                match before {
+                    Some(ts) => self.thread_read.insert(key, ts),
+                    None => self.thread_read.remove(&key),
+                };
+                self.refresh_attention(unit);
+            }
+            None => {
+                match before {
+                    Some(ts) => self.conversation_read.insert(unit.channel.clone(), ts),
+                    None => self.conversation_read.remove(&unit.channel),
+                };
+                self.refresh_badge(&unit.channel);
+                self.refresh_channel(&unit.channel);
+                self.reindex(&unit.channel);
+            }
+        }
+    }
+
+    /// Puts the cursor back where a verdict found it, which is the only
+    /// way it ever goes backwards: undo is the reader saying the move did
+    /// not happen, so what was above the old cursor is theirs again.
+    /// `None` is a unit that had no cursor at all, which is not the same as
+    /// one at its oldest message, so the row goes rather than moving.
+    pub fn undo_handled(&mut self, unit: &Unit, before: Option<Ts>) {
+        match before {
+            Some(ts) => self.handled.insert(unit.clone(), ts),
+            None => self.handled.remove(unit),
+        };
+        self.handled_edits
+            .push((unit.clone(), self.handled.get(unit).cloned()));
+        self.refresh_attention(unit);
+    }
+
+    /// The cursor moves the session has not written down yet. `None` is a
+    /// cursor undone back to nothing.
+    pub fn take_handled_edits(&mut self) -> Vec<(Unit, Option<Ts>)> {
+        std::mem::take(&mut self.handled_edits)
+    }
+
+    /// The cursor as the last run left it, put back without being written
+    /// out again.
+    pub fn restore_handled(&mut self, unit: &Unit, ts: Ts) {
+        self.handled.insert(unit.clone(), ts);
+        self.refresh_attention(unit);
+    }
+
     /// Marks a conversation read locally. Called when rho reads one, when
     /// Slack says another client did, and when the mirror hands back what
     /// the last run knew. Reading is not a verdict: this moves the cursor
@@ -2096,6 +2201,12 @@ impl Model {
             true => existing.and_then(|facts| facts.newest_from_other.clone()),
             false => Some(ts.clone()),
         };
+        // The reader's own message is them saying they are done here,
+        // wherever they wrote it: the phone, another client, or rho.
+        if from_you {
+            self.handled.insert(unit.clone(), ts.clone());
+            self.handled_edits.push((unit.clone(), Some(ts.clone())));
+        }
         self.units.insert(
             unit.clone(),
             UnitFacts {
@@ -2174,6 +2285,16 @@ impl Model {
         // Nothing from anyone else since the reader last looked: whoever
         // else has written, they have read it.
         let newest = facts.newest_from_other.as_ref()?;
+        // rho's own half of the cursor. Slack's mark is asked below, in the
+        // words Slack keeps it in; what has been dealt with is the later of
+        // the two, so either one being past the newest message closes it.
+        if self
+            .handled
+            .get(unit)
+            .is_some_and(|handled| !newest.is_newer_than(handled))
+        {
+            return None;
+        }
         match &unit.thread {
             Some(root) => {
                 let key = self.key(&unit.channel, root);
@@ -2555,6 +2676,50 @@ mod tests {
             model.cards(0).first().and_then(|card| card.attention),
             Some(Attention::Mentioned)
         );
+    }
+
+    /// The whole point of the unit: a unit the reader has dealt with stays
+    /// dealt with whatever Slack sends next. A history page, a reconnect, a
+    /// feed poll and a restart all replay messages that were already there,
+    /// and the only question is whether there is something from someone
+    /// else past the cursor.
+    ///
+    /// The cursor here is rho's own half, moved by `d` with nothing sent to
+    /// Slack. Slack's half does the same job from the other side, which is
+    /// `a_mention_read_in_another_client_stops_asking`.
+    #[test]
+    fn a_unit_the_reader_marked_done_stays_closed_until_someone_writes_past_it() {
+        let mut model = model();
+        let design = ChannelId("C1".into());
+        let unit = Unit::conversation(&design);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
+
+        assert!(model.mark_handled(&unit, &Ts("100".into())));
+        assert_eq!(model.attention(&unit), None, "`d` closes it here and now");
+        assert_eq!(model.handled_through(&unit), Some(&Ts("100".into())));
+
+        // A history page under the cursor, and the same message again from
+        // the feed. Neither is news, and neither moves the cursor back.
+        model.note_message(&message("C1", "50", "U1", "earlier still"), 0);
+        model.note_message(&message("C1", "100", "U1", "hey <@ME> look"), 0);
+        assert_eq!(model.attention(&unit), None);
+        assert!(!model.mark_handled(&unit, &Ts("50".into())));
+        assert_eq!(model.handled_through(&unit), Some(&Ts("100".into())));
+
+        // Somebody writing past it is news, and only that.
+        model.note_message(&message("C1", "200", "U1", "<@ME> still?"), 0);
+        assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
+
+        // And the undo puts the cursor back where the verdict found it, so
+        // what was theirs before is theirs again.
+        assert!(model.mark_handled(&unit, &Ts("200".into())));
+        assert_eq!(model.attention(&unit), None);
+        model.undo_handled(&unit, Some(Ts("100".into())));
+        assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
+        model.undo_handled(&unit, None);
+        assert_eq!(model.handled_through(&unit), None);
+        assert_eq!(model.attention(&unit), Some(Attention::Mentioned));
     }
 
     /// A followed thread answers to its own cursor. Reading the channel

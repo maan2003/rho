@@ -452,30 +452,19 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
         return None;
     };
     let source = sources.unit(unit)?;
-    let past = |cursor: Option<&SlackTs>| match (source.newest_from_other.as_ref(), cursor) {
-        (Some(newest), Some(cursor)) => newest.is_after(cursor),
-        (Some(_), None) => true,
-        (None, _) => false,
-    };
     Some(SlackCard {
         // A mute is the one verdict the cursor cannot express: the user said
         // "not this unit", not "not up to here", so nothing arriving past the
         // cursor reopens it. Opening the unit is what clears the state.
-        state: match (
-            facts.state,
-            source.reason,
-            past(facts.slack_handled_through.as_ref()),
-        ) {
-            (State::Muted, _, _) => State::Muted,
-            // Slack is not badging this unit, so nothing here is owed: read
-            // on the phone, or ordinary traffic in a channel nobody opted
-            // into. The desk's cursor has nothing to say about a question
-            // that is no longer being asked.
-            (_, None, _) => State::Done,
-            (_, Some(_), past) => match past {
-                true => State::Open,
-                false => State::Done,
-            },
+        state: match (facts.state, source.reason) {
+            (State::Muted, _) => State::Muted,
+            // The crate's answer is the whole of it (8 Sep): the reason it
+            // sends is already the join of rho's own cursor and Slack's read
+            // mark, so a second comparison here could only disagree with it.
+            // No reason is nothing owed -- read on the phone, dealt with by
+            // `d`, or ordinary traffic in a channel that has gone quiet.
+            (_, None) => State::Done,
+            (_, Some(_)) => State::Open,
         },
     })
 }
@@ -2099,6 +2088,23 @@ impl DeskCells {
         Some(self.hosts.get(&host?)?.view.facts(&Id::Slack(unit.clone())))
     }
 
+    /// Every Slack unit the store holds an old cursor for. Read once ever,
+    /// by the seed that moves those cursors into the Slack mirror; nothing
+    /// reads the cells afterwards and nothing deletes them.
+    pub fn slack_handled_cells(&self, host: HostId) -> Vec<(SlackUnit, SlackTs)> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        desk.view
+            .all_facts()
+            .into_iter()
+            .filter_map(|(id, facts)| match id {
+                Id::Slack(unit) => Some((unit, facts.slack_handled_through?)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// What the mirror says a Slack unit's newest message is, for a verdict
     /// about to write a cursor. `None` for everything that is not a Slack
     /// unit, and for a unit no source knows about, which is a verdict on a
@@ -2150,25 +2156,6 @@ impl DeskCells {
         let slack = self.slack_verdict(host, id);
         let agent = self.agent_verdict(host, id);
         self.verdict_writes_with_cursor(host, id, verdict, slack, agent)
-    }
-
-    /// Done on a Slack unit at a cursor the caller names instead of the
-    /// mirror's newest. `mark read before` needs this: what it handles is
-    /// everything up to an age, so the cursor lands on the newest message at
-    /// or before that age and anything newer stays the user's.
-    pub fn slack_done_writes(
-        &mut self,
-        host: HostId,
-        unit: &rho_desk::cells::SlackUnit,
-        newest: rho_desk::cells::SlackTs,
-    ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
-        self.verdict_writes_with_cursor(
-            host,
-            &Id::Slack(unit.clone()),
-            DeskVerdict::Done,
-            Some(rho_desk::cells::SlackVerdict { newest }),
-            None,
-        )
     }
 
     fn verdict_writes_with_cursor(

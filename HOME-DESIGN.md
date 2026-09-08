@@ -178,10 +178,11 @@ under the cursor is the card in view for every verdict, with Home
 refreshed in place rather than closed, while a pull from Home opens the
 top card without passing over the row.
 
-Mark-read-before an age (`space shift-s m`) also writes
-`SlackHandledThrough` at the cutoff for every unit it covers, one
-verdict each, undone as one (the user: no Slack read cursor in dealing,
-"handle mark read on our side"). Landed 4 Sep (d84ab832).
+Mark-read-before an age (`space shift-s m`) also moves every unit's
+cursor to the cutoff, one verdict each, undone as one (the user: no Slack
+read cursor in dealing, "handle mark read on our side"). Landed 4 Sep
+(d84ab832); since 8 Sep the cursor it moves is rho's own half in the Slack
+mirror rather than a store cell, and the outbox tells Slack the same.
 
 **Why:** the user's words: "each pull with space-j should give the most
 important thing based on rules", "no extra in-deal-mode state, no deal
