@@ -224,6 +224,10 @@ impl HostNodes {
         let mut path = Vec::new();
         let mut cursor = Some(id.clone());
         while let Some(id) = cursor {
+            // The walk to the root is the half of a candidate's cost that
+            // is not the scoring, and it is the half that grows when the
+            // tree gets deeper rather than wider.
+            crate::find::charge_walk(1);
             let Some(node) = self.node(&id) else { break };
             if node.is_note() {
                 path.push(self.title(&id).unwrap_or(""));
@@ -274,6 +278,7 @@ pub(crate) fn find_candidates(
     for host in desk.hosts() {
         let source = HostNodes::of(desk, host, cx);
         for node in &source.nodes {
+            crate::find::charge_walk(1);
             if let Some(agent_id) = node.agent() {
                 filed.insert(agent_id);
             }

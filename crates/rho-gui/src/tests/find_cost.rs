@@ -91,18 +91,16 @@ fn a_keystroke_costs_no_more_per_candidate_as_the_desk_grows(cx: &mut gpui::Test
     let small = measure(cx, 8, 80, "agent 77");
     let large = measure(cx, 32, 288, "agent 277");
 
-    println!(
-        "find: {} candidates, {:.2} ms per keystroke, {:.1} us per candidate",
-        small.candidates,
-        small.per_keystroke.as_secs_f64() * 1000.,
-        small.per_candidate_us()
-    );
-    println!(
-        "find: {} candidates, {:.2} ms per keystroke, {:.1} us per candidate",
-        large.candidates,
-        large.per_keystroke.as_secs_f64() * 1000.,
-        large.per_candidate_us()
-    );
+    for cost in [&small, &large] {
+        println!(
+            "find: {} candidates, per candidate {:.1} steps walking and \
+             {:.1} scoring ({:.2} ms per keystroke)",
+            cost.candidates,
+            cost.per_candidate(cost.walked),
+            cost.per_candidate(cost.scored),
+            cost.per_keystroke.as_secs_f64() * 1000.,
+        );
+    }
 
     assert!(
         large.candidates > small.candidates * 3,
@@ -111,29 +109,66 @@ fn a_keystroke_costs_no_more_per_candidate_as_the_desk_grows(cx: &mut gpui::Test
         large.candidates,
         small.candidates
     );
+    // Counted, not timed. This was a ratio of two wall clocks measured
+    // minutes apart, and it failed for eng-b8os with three other rho-gui
+    // suites on the same box while passing alone and in a full run at load
+    // 18 — a guard that refuses a good landing on a busy day teaches
+    // people to re-run the gate, which is worse than having no guard. A
+    // step is a node or an ancestor visited while the set is built, or a
+    // cell of the alignment visited while it is scored: the work the
+    // machine did, which a loaded machine does not change.
+    //
+    // The two halves are asserted apart. A scan introduced into the build
+    // is a third of a sum the scoring dominates, and passes a ratio it
+    // should fail; separated, it is the whole of its own number. Checked
+    // that way — a per-node scan put into the walk fails the walk's
+    // assertion and nothing else.
+    //
     // Linear would be equal; a little worse than linear is expected, since
-    // a breadcrumb is a walk to the root and the tree is deeper. Quadratic
-    // would be eight times over this span and is the answer that would say
+    // a breadcrumb is a walk to the root and the tree is deeper, and a
+    // longer path is more cells. Quadratic is the answer that would say
     // the candidate set has to be kept rather than rebuilt.
     assert!(
-        large.per_candidate_us() < small.per_candidate_us() * 3.,
-        "the cost per candidate must not run away as the desk grows: \
-         {:.1} us at {} candidates against {:.1} us at {}",
-        large.per_candidate_us(),
-        large.candidates,
-        small.per_candidate_us(),
-        small.candidates
+        small.walked > 0 && small.scored > 0 && large.walked > 0 && large.scored > 0,
+        "the finder neither walked nor scored at one of the two sizes, so \
+         this measured nothing"
     );
+    for (half, small, large) in [
+        (
+            "walking to build them",
+            small.per_candidate(small.walked),
+            large.per_candidate(large.walked),
+        ),
+        (
+            "scoring them",
+            small.per_candidate(small.scored),
+            large.per_candidate(large.scored),
+        ),
+    ] {
+        assert!(
+            large < small * 2.,
+            "the work per candidate {half} must not run away as the desk \
+             grows: {large:.1} steps per candidate on the large desk \
+             against {small:.1} on the small"
+        );
+    }
 }
 
 struct Cost {
     candidates: usize,
+    /// Nodes and ancestors visited building the set, for one keystroke.
+    walked: u64,
+    /// Cells of the alignment visited scoring it, for one keystroke.
+    scored: u64,
+    /// Kept for the printed line only. A number worth reading beside the
+    /// steps and not worth asserting on a host other people are building
+    /// on.
     per_keystroke: std::time::Duration,
 }
 
 impl Cost {
-    fn per_candidate_us(&self) -> f64 {
-        self.per_keystroke.as_secs_f64() * 1_000_000. / self.candidates as f64
+    fn per_candidate(&self, steps: u64) -> f64 {
+        steps as f64 / self.candidates as f64
     }
 }
 
@@ -155,6 +190,7 @@ fn measure(cx: &mut gpui::TestAppContext, topics: u64, agents: u64, query: &str)
          {query:?} over {candidates} candidates it returned {found:#?}"
     );
 
+    crate::find::take_find_steps();
     let started = std::time::Instant::now();
     for end in 1..=query.len() {
         workspace
@@ -163,9 +199,14 @@ fn measure(cx: &mut gpui::TestAppContext, topics: u64, agents: u64, query: &str)
             })
             .expect("type a character into the finder");
     }
+    let per_keystroke = started.elapsed() / query.len() as u32;
+    let (walked, scored) = crate::find::take_find_steps();
+    let keystrokes = query.len() as u64;
     Cost {
         candidates,
-        per_keystroke: started.elapsed() / query.len() as u32,
+        walked: walked / keystrokes,
+        scored: scored / keystrokes,
+        per_keystroke,
     }
 }
 
@@ -209,11 +250,13 @@ fn the_open_frame_and_the_keystroke_frame_at_the_scale_the_user_runs_at(
     );
 
     // The keystroke: the ranking, over a set already in hand.
+    crate::find::take_find_steps();
     let started = std::time::Instant::now();
     for end in 1..=query.len() {
         crate::workspace::Workspace::find_rows_in_for_test(&snapshot, &query[..end]);
     }
     let keystroke = started.elapsed();
+    let (keystroke_walked, keystroke_scored) = crate::find::take_find_steps();
 
     // The same keystrokes down the path this cut replaced: the candidate
     // set taken again, and its names built again, for every character.
@@ -228,31 +271,40 @@ fn the_open_frame_and_the_keystroke_frame_at_the_scale_the_user_runs_at(
             .expect("type a character down the old path");
     }
     let rebuilt = started.elapsed();
+    let (rebuilt_walked, _) = crate::find::take_find_steps();
 
+    // The shape, not the milliseconds, and now not a clock at all.
+    // Ranking is O(candidates) and no implementation makes it less, so a
+    // keystroke is not cheap and is not meant to be; what the cut removed
+    // is the taking of the set and the building of its names, once per
+    // character. That is a thing the keystroke either does or does not do,
+    // so it is asserted as a count of zero rather than as one duration
+    // being four-fifths of another — the same reason the guard above was
+    // taken off the clock.
+    //
+    // Emptiness alone would pass if the finder had stopped working, so the
+    // old path's own walk is asserted beside it: the number that has to be
+    // zero and the number that has to not be, in one place.
     println!(
         "find at scale: {} candidates ({desk} desk + {rooms} slack); \
-         open {:.2} ms, keystroke {:.2} ms, keystroke down the old path \
-         {:.2} ms",
+         open {:.2} ms, keystroke {:.2} ms over {keystroke_scored} scoring \
+         steps, keystroke down the old path {:.2} ms over {rebuilt_walked} \
+         walking steps",
         desk + rooms,
         open.as_secs_f64() * 1000.,
         keystroke.as_secs_f64() * 1000. / query.len() as f64,
         rebuilt.as_secs_f64() * 1000. / query.len() as f64,
     );
-
-    // The shape, not the milliseconds. Ranking is O(candidates) and no
-    // implementation makes it less, so a keystroke is not cheap and is not
-    // meant to be; what the cut removes is the taking of the set and the
-    // building of its names, once per character. So the comparison that
-    // says the rebuild is gone is against the old path, not against the
-    // open. The open is the smaller of the two here — building 445
-    // candidates costs less than scoring them — which is why comparing a
-    // keystroke to the open proved nothing in either direction.
-    let per_keystroke = keystroke / query.len() as u32;
-    let per_rebuild = rebuilt / query.len() as u32;
     assert!(
-        per_keystroke * 5 < per_rebuild * 4,
-        "a keystroke must not be paying for the candidate set: {per_rebuild:?} \
-         down the old path against {per_keystroke:?} ranking a set in hand"
+        rebuilt_walked > 0 && keystroke_scored > 0,
+        "the old path did not build the set ({rebuilt_walked} steps) or the \
+         keystroke did not score it ({keystroke_scored}), so the comparison \
+         has no subject"
+    );
+    assert_eq!(
+        keystroke_walked, 0,
+        "a keystroke must not be paying for the candidate set: it walked \
+         {keystroke_walked} nodes to the old path's {rebuilt_walked}"
     );
 }
 

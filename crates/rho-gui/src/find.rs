@@ -122,6 +122,56 @@ fn bonus_at(chars: &[char], index: usize) -> i32 {
     0
 }
 
+// How much work one keystroke in the finder actually did.
+//
+// A keystroke has two halves and both can grow with the desk, so both are
+// counted, separately, because they grow for different reasons and a sum
+// hides the smaller one: building a candidate — the node itself and each
+// ancestor its breadcrumb walks to the root — and scoring one, where a
+// step is a visit to a cell of the alignment. Summed, a scan introduced
+// into the build is a third of a total the scoring dominates and passes a
+// ratio that should have caught it; that is not a hypothetical, it is what
+// this counter did before it was split.
+//
+// This is the machine's own work: a busy machine does not change it.
+//
+// Thread-local because the suite runs tests concurrently in one process: a
+// shared counter reads as one test's work plus its neighbours', which is a
+// number that cannot be wrong in any way you can see.
+#[cfg(test)]
+thread_local! {
+    static WALK_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SCORE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One node visited, or one ancestor of it, while the candidate set is
+/// built.
+#[cfg(test)]
+pub(crate) fn charge_walk(steps: usize) {
+    WALK_STEPS.with(|counted| counted.set(counted.get() + steps as u64));
+}
+
+#[cfg(not(test))]
+pub(crate) fn charge_walk(_steps: usize) {}
+
+#[cfg(test)]
+fn charge_score(steps: usize) {
+    SCORE_STEPS.with(|counted| counted.set(counted.get() + steps as u64));
+}
+
+#[cfg(not(test))]
+fn charge_score(_steps: usize) {}
+
+/// What the finder has done since this was last asked: the candidate set
+/// walked, and the matcher run.
+#[cfg(test)]
+pub(crate) fn take_find_steps() -> (u64, u64) {
+    (
+        WALK_STEPS.with(|counted| counted.replace(0)),
+        SCORE_STEPS.with(|counted| counted.replace(0)),
+    )
+}
+
 /// Scores `query` against `path`, or `None` when the query is not a
 /// subsequence of it. An empty query matches everything at zero.
 pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
@@ -146,6 +196,9 @@ pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
     let mut previous: Option<Vec<Option<i32>>> = None;
     for (position, needle) in query.iter().enumerate() {
         let mut row = vec![None; chars.len()];
+        // One row is one pass over the path, whether or not any character
+        // of it matches.
+        charge_score(chars.len());
         for index in 0..chars.len() {
             if folded[index] != *needle {
                 continue;
@@ -158,19 +211,25 @@ pub(crate) fn score(path: &str, query: &str) -> Option<i32> {
             let here = MATCH + bonuses[index] * multiplier;
             row[index] = match &previous {
                 None => Some(here),
-                Some(previous) => previous[..index]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(earlier, score)| {
-                        let score = (*score)?;
-                        let gap = (index - earlier - 1) as i32;
-                        Some(if gap == 0 {
-                            score + here + BONUS_CONSECUTIVE
-                        } else {
-                            score + here + GAP_START + GAP_EXTENSION * (gap - 1)
+                // A match after the first looks back over every earlier
+                // alignment: the part that is not linear in the path, and
+                // the part a cheaper scorer would remove.
+                Some(previous) => {
+                    charge_score(index);
+                    previous[..index]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(earlier, score)| {
+                            let score = (*score)?;
+                            let gap = (index - earlier - 1) as i32;
+                            Some(if gap == 0 {
+                                score + here + BONUS_CONSECUTIVE
+                            } else {
+                                score + here + GAP_START + GAP_EXTENSION * (gap - 1)
+                            })
                         })
-                    })
-                    .max(),
+                        .max()
+                }
             };
         }
         if row.iter().all(Option::is_none) {
