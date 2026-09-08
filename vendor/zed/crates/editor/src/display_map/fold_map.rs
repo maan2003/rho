@@ -1180,26 +1180,16 @@ impl FoldMap {
                         ));
                         break;
                     }
-                    // The new tree ends inside an old transform. It cannot
-                    // be appended whole and it cannot be split - a fold
-                    // transform has no meaningful half - so step over it and
-                    // go round again with the edit widened to its end.
-                    // Whatever of it the new tree does not already describe
-                    // is emitted from the new snapshot, by the folds above
-                    // if a fold still covers it and as text below if none
-                    // does. The cursor only ever moves forward, so this
-                    // ends.
-                    cursor.next();
-                    let absorbed = absorb_edits_behind_the_cursor(
-                        &mut edit,
-                        &mut cursor,
-                        &mut inlay_edits_iter,
-                        true,
-                    );
-                    delta += absorbed;
-                    edit.new.end = InlayOffset(MultiBufferOffset(
-                        ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
-                    ));
+                    // An emitted fold always reaches an anchored fold end.
+                    // If the fold was retained, that anchor is also the end
+                    // of its old transform, so `covered` is a boundary. If it
+                    // is new, the old tree is plain there. An old fold that
+                    // encloses a shorter new fold was already taken whole by
+                    // the initial seek, so the shorter fold cannot overshoot
+                    // the widened edit. Those are all possible old-tree
+                    // shapes; landing inside an old fold would mean the two
+                    // trees disagree about a retained fold's end.
+                    unreachable!("emitted fold end landed inside an old fold transform");
                 }
 
                 let sum = new_transforms.summary();
