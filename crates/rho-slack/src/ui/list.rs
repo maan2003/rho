@@ -20,7 +20,7 @@ use theme::ActiveTheme as _;
 use crate::model::ConversationRow;
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
-use crate::ui::{Class, Hooks, Span, apply_highlights, clock_time, lay_out};
+use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
 
 pub struct ListView {
     session: Entity<Session>,
@@ -378,7 +378,7 @@ impl ListView {
                     true => self.muted += 1,
                     false => self.unmuted += 1,
                 }
-                let line = render_row(&row);
+                let line = render_row(&row, now_seconds());
                 let (text, styles) = lay_out(&line);
                 self.insert_line(
                     at,
@@ -496,6 +496,10 @@ impl ListView {
 /// this: the model answers a query from its own index, so nothing here
 /// looks at every conversation to decide what to draw.
 fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
+    // Read once for the whole listing rather than once a row: every row is
+    // asking the same question, and the answer moving between two of them
+    // would put two days on one frame.
+    let now = now_seconds();
     let matching = rows.iter().collect::<Vec<_>>();
     let mut lines = Vec::with_capacity(matching.len());
     let mut targets = Vec::with_capacity(matching.len());
@@ -508,10 +512,16 @@ fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelI
             lines.push(break_line());
             targets.push(None);
         }
-        lines.push(render_row(row));
+        lines.push(render_row(row, now));
         targets.push(Some(row.id.clone()));
     }
     (lines, targets)
+}
+
+/// The wall clock, read at the top of a draw. Its own function so the two
+/// places that draw a row ask the same thing.
+fn now_seconds() -> i64 {
+    chrono::Local::now().timestamp()
 }
 
 /// The break between the two sections. Its own function because an
@@ -522,7 +532,7 @@ fn break_line() -> Vec<Span> {
 
 /// One conversation's line. Factored out of the listing so that redrawing
 /// one row and redrawing all of them cannot drift apart.
-fn render_row(row: &ConversationRow) -> Vec<Span> {
+fn render_row(row: &ConversationRow, now: i64) -> Vec<Span> {
     let mut spans = vec![Span::styled(row.label.clone(), Class::Conversation)];
     let mut waiting = Vec::new();
     if row.mention_count > 0 {
@@ -558,7 +568,7 @@ fn render_row(row: &ConversationRow) -> Vec<Span> {
     if let Some(latest) = &row.latest {
         spans.push(Span::plain("  "));
         spans.push(Span::styled(
-            clock_time(latest.epoch_seconds() as i64),
+            when_label(latest.epoch_seconds() as i64, now),
             Class::Time,
         ));
     }
@@ -728,12 +738,13 @@ mod tests {
     fn a_row_carries_its_counts_and_the_time_it_last_spoke() {
         let mut design = row("#design", true, 2);
         design.unread_count = 5;
-        // A fixed instant so the clock column is the same wherever this
-        // runs: the offset is the machine's, the format is what is asserted.
+        // A fixed instant, long enough ago to be a date rather than a
+        // clock: what is asserted here is the row's layout, and where the
+        // day boundaries fall is `when_label`'s own test.
         design.latest = Some(Ts("1755780420.000100".into()));
         let expected = format!(
             "#design  @2 · 5 new  {}",
-            crate::ui::clock_time(1_755_780_420)
+            crate::ui::when_label(1_755_780_420, now_seconds())
         );
         let (lines, _) = render_rows(&[design]);
         assert_eq!(text(&lines[0]), expected);

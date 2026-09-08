@@ -295,6 +295,36 @@ pub fn day_label(timestamp: i64) -> String {
     }
 }
 
+/// When something was last said, as short as it can be while still saying
+/// which day: the clock for today, the weekday for the last week, the date
+/// beyond that, and the year when the year is not this one.
+///
+/// The list's column was `clock_time`, which reads as today whatever day it
+/// is: a channel that last spoke on Friday afternoon showed `17:32` on
+/// Monday morning, beside one that spoke ten minutes ago. The words are
+/// `day_label`'s, and the day boundary is `crosses_day`'s -- local calendar
+/// days, not a count of seconds -- so the list and the transcript cannot
+/// disagree about where a day starts.
+///
+/// `now` is a parameter so the boundaries are a test rather than a wait.
+pub fn when_label(timestamp: i64, now: i64) -> String {
+    use chrono::{Datelike as _, Local, TimeZone as _};
+    let (Some(then), Some(now)) = (
+        Local.timestamp_opt(timestamp, 0).single(),
+        Local.timestamp_opt(now, 0).single(),
+    ) else {
+        return "--:--".to_owned();
+    };
+    match (now.date_naive() - then.date_naive()).num_days() {
+        // A message dated ahead of the clock is a clock disagreeing, not a
+        // day to name, so it reads as the time like any other of today's.
+        ..=0 => then.format("%H:%M").to_string(),
+        1..=6 => then.format("%a").to_string(),
+        _ if then.year() == now.year() => then.format("%-d %b").to_string(),
+        _ => then.format("%-d %b %Y").to_string(),
+    }
+}
+
 /// Whether two timestamps fall on different local days, so the transcript
 /// can break between them.
 pub fn crosses_day(earlier: i64, later: i64) -> bool {
@@ -311,6 +341,52 @@ pub fn crosses_day(earlier: i64, later: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The list's time column has to say which day, because the reader
+    /// scans it to decide what to open. It said a clock and nothing else,
+    /// so a channel that last spoke on Friday afternoon read `17:32` on
+    /// Monday morning beside one that spoke ten minutes ago.
+    #[test]
+    fn a_time_says_which_day_once_the_day_is_not_this_one() {
+        use chrono::{Local, TimeZone as _};
+
+        // Midday, so that subtracting whole days cannot land on the day
+        // before or after wherever this runs.
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 8, 12, 0, 0)
+            .earliest()
+            .expect("a midday that exists in this timezone");
+        let days_back = |days: i64| (now - chrono::Duration::days(days)).timestamp();
+        let label = |days: i64| when_label(days_back(days), now.timestamp());
+
+        assert_eq!(label(0), "12:00", "today is the clock, as it always was");
+        assert_eq!(label(1), "Mon", "yesterday is named, not timed");
+        assert_eq!(label(6), "Wed", "and so is the far end of the week");
+        assert_eq!(
+            label(7),
+            "1 Sep",
+            "a week back is a date: two Tuesdays would read alike"
+        );
+        assert_eq!(
+            label(365),
+            "8 Sep 2025",
+            "and last year says the year, or it reads as this one"
+        );
+    }
+
+    /// A message dated ahead of the clock is a clock disagreeing, not a day
+    /// to name.
+    #[test]
+    fn a_time_in_the_future_reads_as_a_time() {
+        use chrono::{Local, TimeZone as _};
+
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 8, 12, 0, 0)
+            .earliest()
+            .expect("a midday that exists in this timezone");
+        let ahead = (now + chrono::Duration::hours(26)).timestamp();
+        assert_eq!(when_label(ahead, now.timestamp()), "14:00");
+    }
 
     #[test]
     fn lay_out_records_only_classed_runs() {
