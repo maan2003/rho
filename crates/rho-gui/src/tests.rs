@@ -2536,7 +2536,7 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         cx,
         agent(1),
         state(
-            vec![user("**user markup stays visible**")],
+            vec![user("**user markup renders**")],
             vec![assistant(
                 "## Heading\n\n**bold** and `code`.\n",
                 Some(UiMessagePhase::FinalAnswer),
@@ -2550,7 +2550,12 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         text.contains("Heading\n\nbold and code.\n"),
         "markup should not reach the screen: {text:?}"
     );
-    assert!(text.contains("**user markup stays visible**"));
+    // The user's own markup renders like anyone else's: they are writing
+    // markdown too, and a turn is one buffer end to end.
+    assert!(
+        text.contains("user markup renders") && !text.contains("**user markup renders**"),
+        "the user's markup was left on screen: {text:?}"
+    );
     let buffer = buffer_text(&workspace, cx);
     assert!(
         buffer.contains("## Heading\n\n**bold** and `code`.\n"),

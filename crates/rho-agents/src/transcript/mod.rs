@@ -1497,12 +1497,6 @@ impl TranscriptModel {
                     .map(|(_, range)| range.clone())
                     .collect();
                 editor.update(cx, |editor, cx| {
-                    // The user's own words are quoted back exactly as they
-                    // were typed. They share a buffer with the model's
-                    // markdown so a turn is one buffer, so the parser sees
-                    // their asterisks and backticks as markup; concealing
-                    // there would hide what they wrote.
-                    editor.set_concealment_exclusions(user_ranges.clone(), cx);
                     editor.highlight_gutter::<UserMessageGutter>(
                         user_ranges,
                         rho_window::style::user_prompt_gutter_color,
