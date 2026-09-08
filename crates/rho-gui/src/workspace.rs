@@ -9193,27 +9193,6 @@ pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
     minutes.checked_mul(60 * 1000)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn labels_agent_role() {
-        assert_eq!(agent_role_label(AgentRole::default()), "eng");
-    }
-
-    #[test]
-    fn rejected_undos_return_to_their_original_lifo_positions() {
-        let mut sequences = vec![0, 3];
-        for rejected in [2, 1] {
-            let index = undo_sequence_insert_position(sequences.iter().copied(), rejected);
-            sequences.insert(index, rejected);
-        }
-        assert_eq!(sequences, vec![0, 1, 2, 3]);
-        assert_eq!(sequences.pop(), Some(3));
-    }
-}
-
 /// Times one step of a desk sync under its own name.
 ///
 /// `sync_tree_rows` is timed whole, which says the desk's map costs
@@ -9235,4 +9214,25 @@ fn timed_desk_step<T>(label: &'static str, work_units: u64, step: impl FnOnce() 
         work_units,
     });
     held
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_agent_role() {
+        assert_eq!(agent_role_label(AgentRole::default()), "eng");
+    }
+
+    #[test]
+    fn rejected_undos_return_to_their_original_lifo_positions() {
+        let mut sequences = vec![0, 3];
+        for rejected in [2, 1] {
+            let index = undo_sequence_insert_position(sequences.iter().copied(), rejected);
+            sequences.insert(index, rejected);
+        }
+        assert_eq!(sequences, vec![0, 1, 2, 3]);
+        assert_eq!(sequences.pop(), Some(3));
+    }
 }
