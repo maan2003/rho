@@ -2274,12 +2274,10 @@ mod tests {
                 let start_row = rng.random_range(0..=end_row);
                 end_row += 1;
 
-                let mut expected_text = self.text_chunks(WrapRow(start_row)).collect::<String>();
-                if expected_text.ends_with('\n') {
-                    expected_text.push('\n');
-                }
-                let mut expected_text = expected_text
-                    .lines()
+                let mut expected_text = self
+                    .text_chunks(WrapRow(start_row))
+                    .collect::<String>()
+                    .split('\n')
                     .take((end_row - start_row) as usize)
                     .collect::<Vec<_>>()
                     .join("\n");
