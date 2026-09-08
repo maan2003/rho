@@ -765,6 +765,27 @@ pub struct Store {
     version: Version,
 }
 
+/// What a merge displaced, so a merge that fails can put it back. Held for
+/// the length of one merge and no longer, and sized by what the merge
+/// wrote rather than by what the store holds.
+struct Undo {
+    clock: u64,
+    version: Version,
+    cells: Vec<((Id, PropertyKey), Option<Cell>)>,
+    verdicts: Vec<(Id, Stamp)>,
+}
+
+impl Undo {
+    fn none(store: &Store) -> Self {
+        Self {
+            clock: store.clock,
+            version: store.version.clone(),
+            cells: Vec::new(),
+            verdicts: Vec::new(),
+        }
+    }
+}
+
 impl Store {
     pub fn new(device: DeviceId) -> Self {
         Self {
@@ -829,7 +850,9 @@ impl Store {
                 version: self.clock,
             },
         )?;
-        self.merge_cell(cell.clone())?;
+        // One cell, and every way merge_cell can refuse it refuses before
+        // it writes, so there is nothing to put back.
+        self.merge_cell(cell.clone(), &mut Undo::none(self))?;
         Ok(cell)
     }
 
@@ -874,16 +897,45 @@ impl Store {
         Ok(stamp)
     }
 
+    /// A snapshot merged in, all of it or none of it.
+    ///
+    /// A merge that fails validation part-way must leave the store exactly
+    /// as it was: half a mutation is a store nobody wrote. This used to be
+    /// bought by copying the whole store, applying to the copy and swapping
+    /// it in, which made every write cost every row the store held — at a
+    /// thousand rows that was half a millisecond for one verdict, and the
+    /// user's desk only grows. It is bought here by writing in place and
+    /// keeping what was displaced, which is bounded by the snapshot rather
+    /// than by the store.
     pub fn merge(&mut self, snapshot: Snapshot) -> Result<(), String> {
-        let mut staged = self.clone();
-        staged.merge_inner(snapshot)?;
-        *self = staged;
-        Ok(())
+        let mut undo = Undo {
+            clock: self.clock,
+            version: self.version.clone(),
+            cells: Vec::new(),
+            verdicts: Vec::new(),
+        };
+        let merged = self.merge_inner(snapshot, &mut undo);
+        if merged.is_err() {
+            // Newest first: a key written twice in one snapshot is put back
+            // to what it was before the first of them.
+            for (key, displaced) in undo.cells.into_iter().rev() {
+                match displaced {
+                    Some(cell) => self.cells.insert(key, cell),
+                    None => self.cells.remove(&key),
+                };
+            }
+            for key in undo.verdicts {
+                self.verdicts.remove(&key);
+            }
+            self.clock = undo.clock;
+            self.version = undo.version;
+        }
+        merged
     }
 
-    fn merge_inner(&mut self, snapshot: Snapshot) -> Result<(), String> {
+    fn merge_inner(&mut self, snapshot: Snapshot, undo: &mut Undo) -> Result<(), String> {
         for cell in snapshot.cells {
-            self.merge_cell(cell)?;
+            self.merge_cell(cell, undo)?;
         }
         for (id, stamp, event) in snapshot.verdicts {
             if matches!(&event, VerdictEvent::Applied { at, .. } if *at != stamp) {
@@ -895,7 +947,8 @@ impl Store {
                     return Err("conflicting Desk verdict event at the same stamp".into());
                 }
             } else {
-                self.verdicts.insert(key, event);
+                self.verdicts.insert(key.clone(), event);
+                undo.verdicts.push(key);
             }
             self.observe(stamp);
         }
@@ -935,7 +988,7 @@ impl Store {
         self.since(&Version::new())
     }
 
-    fn merge_cell(&mut self, cell: Cell) -> Result<(), String> {
+    fn merge_cell(&mut self, cell: Cell, undo: &mut Undo) -> Result<(), String> {
         if !cell.property.is_valid() {
             return Err("Desk property payload is not one the store takes".into());
         }
@@ -952,7 +1005,8 @@ impl Store {
         let replace = self.cells.get(&key).is_none_or(|old| wins(&cell, old));
         self.observe(cell.stamp);
         if replace {
-            self.cells.insert(key, cell);
+            let displaced = self.cells.insert(key.clone(), cell);
+            undo.cells.push((key, displaced));
         }
         Ok(())
     }
@@ -1075,6 +1129,83 @@ mod tests {
             device: device(byte),
             version,
         }
+    }
+
+    /// A merge that fails part-way leaves the store exactly as it was.
+    ///
+    /// This is the whole of what the old whole-store copy bought: half a
+    /// mutation is a store nobody wrote, and the daemon refuses a mutation
+    /// after some of its cells have already been taken. The copy is gone
+    /// and what was displaced is put back instead, so the guarantee is
+    /// checked here rather than assumed from the shape of the code: the
+    /// snapshot, the version and the next stamp all have to come back the
+    /// same.
+    #[test]
+    fn a_merge_that_fails_leaves_the_store_as_it_was() {
+        let mut store = Store::new(device(1));
+        store
+            .write(note(1), Property::Parent(None))
+            .expect("the first cell");
+        let held = store
+            .write(note(1), Property::Name("as it was".to_owned()))
+            .expect("the second cell");
+        let before = store.snapshot();
+        let before_version = store.version().clone();
+
+        // Good cells first, then one the store must refuse: the same stamp
+        // as a cell it already holds, saying something else. Everything
+        // before it has already been written by the time it is reached.
+        let refused = Snapshot {
+            cells: vec![
+                Cell::new(note(2), Property::Parent(Some(note(1))), stamp(9, 4))
+                    .expect("a cell the store takes"),
+                Cell::new(note(3), Property::Name("also new".to_owned()), stamp(9, 5))
+                    .expect("a cell the store takes"),
+                Cell::new(
+                    note(1),
+                    Property::Name("something else".to_owned()),
+                    held.stamp,
+                )
+                .expect("a cell the store takes"),
+            ],
+            verdicts: vec![(
+                note(2),
+                stamp(9, 6),
+                VerdictEvent::Applied {
+                    verdict: Verdict::Done,
+                    at: stamp(9, 6),
+                    changes: Vec::new(),
+                },
+            )],
+            version: Version::from([(device(9), 6)]),
+        };
+        let error = store.merge(refused).expect_err("the store must refuse it");
+        assert!(
+            error.contains("conflicting"),
+            "refused for the wrong reason: {error}"
+        );
+
+        assert_eq!(
+            store.snapshot(),
+            before,
+            "a refused merge left some of itself behind"
+        );
+        assert_eq!(
+            store.version(),
+            &before_version,
+            "a refused merge moved the store's version"
+        );
+        let next = store
+            .write(note(4), Property::Parent(None))
+            .expect("the store still writes");
+        assert_eq!(
+            next.stamp,
+            Stamp {
+                device: device(1),
+                version: held.stamp.version + 1,
+            },
+            "a refused merge moved the clock, so the next write is stamped past it"
+        );
     }
 
     fn snapshot(cells: Vec<Cell>) -> Snapshot {
