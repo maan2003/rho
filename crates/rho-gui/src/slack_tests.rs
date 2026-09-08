@@ -1907,3 +1907,80 @@ async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppConte
         );
     }
 }
+
+/// Opening a conversation tells Slack nothing about what has been read.
+///
+/// Reading is not a verdict: what has been dealt with is the later of rho's
+/// own cursor and Slack's read mark, and only the reader saying done moves
+/// rho's. A mark written on open would make walking into a channel to see
+/// what is in it a done, on every client the reader owns.
+///
+/// Against the fake, with the server as the only authority: the assertion
+/// is that no `conversations.mark` reached it, not that no code path was
+/// taken.
+#[gpui::test]
+async fn opening_a_conversation_marks_nothing_read(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "UD", "text": "shipping it"}),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            source,
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The history crosses a real socket, so wait for the message rather
+    // than for the executor to go quiet.
+    let mut arrived = false;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let drawn = window
+            .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
+            .unwrap();
+        arrived = drawn.iter().any(|line| line.contains("shipping it"));
+        if arrived {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    // Or the test proves nothing: a conversation that never loaded would
+    // not have marked anything read either.
+    assert!(arrived, "the history reached the surface");
+    // A mark in flight would have been sent by now: the history it would
+    // have followed is already on screen.
+    cx.run_until_parked();
+    assert_eq!(
+        fake.calls("conversations.mark"),
+        0,
+        "opening a conversation is not a done"
+    );
+    assert_eq!(fake.last_read("C1"), None, "and the server's cursor stands");
+}

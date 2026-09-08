@@ -933,7 +933,7 @@ impl Session {
         let Some(since) = loaded.messages.last().map(|last| last.ts.clone()) else {
             return;
         };
-        self.fetch(source, None, false, Some(since), cx);
+        self.fetch(source, None, Some(since), cx);
     }
 
     /// Names for the authors the roster has no name for.
@@ -1251,7 +1251,7 @@ impl Session {
                 ..Loaded::default()
             },
         );
-        self.fetch(source.clone(), None, true, since, cx);
+        self.fetch(source.clone(), None, since, cx);
     }
 
     /// Brings the chunk holding `ts` into an open conversation. A deal is
@@ -1480,7 +1480,7 @@ impl Session {
             return;
         };
         match request {
-            Older::Cursor(cursor) => self.fetch(source.clone(), Some(cursor), false, None, cx),
+            Older::Cursor(cursor) => self.fetch(source.clone(), Some(cursor), None, cx),
             Older::Before(latest) => self.fill_gap(source.clone(), latest, cx),
         }
     }
@@ -1610,7 +1610,7 @@ impl Session {
             return;
         }
         self.loaded.insert(source.clone(), Loaded::default());
-        self.fetch(source, None, false, None, cx);
+        self.fetch(source, None, None, cx);
     }
 
     /// Says a request is in flight for this conversation. Only ever called
@@ -1625,7 +1625,6 @@ impl Session {
         &mut self,
         source: Source,
         cursor: Option<String>,
-        mark_read: bool,
         since: Option<Ts>,
         cx: &mut Context<Self>,
     ) {
@@ -1721,9 +1720,6 @@ impl Session {
                     }
                 }
                 session.announce(changes, cx);
-                if mark_read {
-                    session.mark_read(&source, cx);
-                }
                 cx.notify();
             });
         }));
@@ -1945,47 +1941,6 @@ impl Session {
                 mirror.set_last_read(&self.scope(&Source::Thread(key.clone())), ts);
             }
         }
-    }
-
-    /// Tells Slack the conversation has been read, so rho does not leave the
-    /// phone showing a badge for something the user has already seen.
-    ///
-    /// A thread is marked as a thread. Slack keeps a cursor inside each
-    /// followed thread and one on the conversation around it, and a reply's
-    /// timestamp is a real timestamp in its channel — so telling Slack the
-    /// channel was read at one would mark every message older than that
-    /// reply read in a channel the reader never opened.
-    pub fn mark_read(&mut self, source: &Source, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let Some(latest) = self
-            .loaded
-            .get(source)
-            .and_then(|loaded| loaded.messages.last())
-            .map(|message| message.ts.clone())
-        else {
-            return;
-        };
-        self.note_read(source, &latest);
-        cx.notify();
-        let source = source.clone();
-        let task = gpui_tokio::Tokio::spawn(cx, async move {
-            match &source {
-                Source::Conversation(channel) => client.mark_read(channel, &latest).await,
-                Source::Thread(key) => {
-                    client
-                        .mark_thread_read(&key.channel, &key.thread_ts, &latest)
-                        .await
-                }
-            }
-        });
-        self._tasks.push(cx.spawn(async move |this, cx| {
-            if let Ok(Err(error)) = task.await {
-                tracing::warn!(error = %error, "slack mark-read failed");
-            }
-            let _ = this.update(cx, |_, cx| cx.notify());
-        }));
     }
 
     /// The conversation half of a mute: a thread is unfollowed, and a
