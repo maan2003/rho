@@ -997,6 +997,56 @@ async fn undoing_a_discard_follows_the_thread_again() {
     assert_eq!(owed(&model, 0).len(), 1);
 }
 
+/// What a thread on screen asks for after an outage. It holds everything up
+/// to a reply it already has, so it asks for what is newer than that one —
+/// not for the thread again, which is what a poll a minute would otherwise
+/// cost for as long as the reader sits in it.
+#[tokio::test]
+async fn a_thread_asks_only_for_the_replies_it_does_not_have() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({"ts": "500.0", "user": "U1", "text": "can you look at this?"}),
+    );
+    fake.add_message(
+        "C1",
+        json!({"ts": "501.0", "thread_ts": "500.0", "user": "ME", "text": "looking"}),
+    );
+    fake.add_message(
+        "C1",
+        json!({"ts": "502.0", "thread_ts": "500.0", "user": "U1", "text": "while you slept"}),
+    );
+    let client = client(&fake);
+
+    let page = client
+        .conversations_replies_since(
+            &ChannelId("C1".into()),
+            &Ts("500.0".into()),
+            &Ts("501.0".into()),
+        )
+        .await
+        .unwrap();
+
+    // The root and the one reply that is new. Slack hands the thread's own
+    // message back whatever the bound, which is why it is here and why the
+    // loaded run deduplicates on the timestamp rather than trusting the page.
+    let texts = page
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(texts, vec!["can you look at this?", "while you slept"]);
+
+    // And the unbounded call still answers with the whole thread, which is
+    // what opening one asks for.
+    let whole = client
+        .conversations_replies(&ChannelId("C1".into()), &Ts("500.0".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(whole.messages.len(), 3);
+}
+
 #[tokio::test]
 async fn editing_a_sent_message_updates_slack_and_comes_back_on_the_socket() {
     let fake = Fake::start().await.unwrap();

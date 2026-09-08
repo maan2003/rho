@@ -1450,6 +1450,13 @@ fn handle(
         "conversations.replies" => {
             let channel = field("channel");
             let root = field("ts");
+            // `oldest` bounds the replies and never the root: Slack hands
+            // the thread's own message back whatever the bound, which is
+            // what lets a caller show the thread from one call.
+            let floor = match field("oldest") {
+                bound if bound.is_empty() => None,
+                bound => bound.parse::<f64>().ok(),
+            };
             let messages = state
                 .history
                 .get(&channel)
@@ -1458,6 +1465,16 @@ fn handle(
                 .into_iter()
                 .filter(|message| {
                     message["ts"] == json!(root) || message["thread_ts"] == json!(root)
+                })
+                .filter(|message| {
+                    let Some(floor) = floor else {
+                        return true;
+                    };
+                    message["ts"] == json!(root)
+                        || message["ts"]
+                            .as_str()
+                            .and_then(|ts| ts.parse::<f64>().ok())
+                            .is_some_and(|ts| ts > floor)
                 })
                 .collect::<Vec<_>>();
             json!({"ok": true, "messages": messages, "has_more": false})

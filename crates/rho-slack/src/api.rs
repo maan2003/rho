@@ -313,6 +313,32 @@ impl Client {
         Ok(parse_message_page(&body, channel))
     }
 
+    /// The tail of a thread: only replies newer than `oldest`. The bounded
+    /// twin of `conversations_replies`, and what a thread on screen asks for
+    /// to fill what an outage swallowed, so the whole thread is not fetched
+    /// a poll at a time.
+    ///
+    /// Slack answers a replies call with the thread's root message whatever
+    /// the bound, so one row comes back that the caller already holds. The
+    /// loaded run deduplicates on the timestamp, so it costs a row on the
+    /// wire and nothing on screen.
+    pub async fn conversations_replies_since(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        oldest: &Ts,
+    ) -> anyhow::Result<MessagePage> {
+        let fields = vec![
+            ("channel", channel.0.clone()),
+            ("ts", thread_ts.0.clone()),
+            ("limit", PAGE.to_string()),
+            ("oldest", oldest.0.clone()),
+            ("inclusive", "false".to_owned()),
+        ];
+        let body = self.post_form("conversations.replies", &fields).await?;
+        Ok(parse_message_page(&body, channel))
+    }
+
     /// A channel or DM's recent messages. Slack returns newest first here,
     /// unlike replies, so the page is reversed before it is handed on.
     pub async fn conversations_history(

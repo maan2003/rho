@@ -861,12 +861,17 @@ impl Session {
         }
     }
 
-    /// Asks the conversation on screen for anything newer than its last
-    /// message. The socket is the fast path, not the reliable one: a socket
-    /// that dies without saying so delivers nothing, and this is what makes
-    /// that case a minute of lag instead of silence.
+    /// Asks whatever is on screen for anything newer than its last message.
+    /// The socket is the fast path, not the reliable one: a socket that dies
+    /// without saying so delivers nothing, and this is what makes that case
+    /// a minute of lag instead of silence.
+    ///
+    /// A thread is on screen the same way a conversation is, and an outage
+    /// swallows its replies the same way. Both ask a bounded question — what
+    /// is newer than the last message held — so the request costs what is
+    /// new, not the whole of what is there.
     fn resync_tail(&mut self, cx: &mut Context<Self>) {
-        let Some(source @ Source::Conversation(_)) = self.focused.clone() else {
+        let Some(source) = self.focused.clone() else {
             return;
         };
         let Some(loaded) = self.loaded.get(&source) else {
@@ -1426,11 +1431,18 @@ impl Session {
                             .await
                     }
                 },
-                Source::Thread(key) => {
-                    client
-                        .conversations_replies(&key.channel, &key.thread_ts, cursor.as_deref())
-                        .await
-                }
+                Source::Thread(key) => match &since {
+                    Some(since) => {
+                        client
+                            .conversations_replies_since(&key.channel, &key.thread_ts, since)
+                            .await
+                    }
+                    None => {
+                        client
+                            .conversations_replies(&key.channel, &key.thread_ts, cursor.as_deref())
+                            .await
+                    }
+                },
             }
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
@@ -1458,8 +1470,9 @@ impl Session {
                                 // A catch-up page runs forward from what the
                                 // mirror held. More behind it means the run
                                 // still stops short of the live end. A
-                                // thread comes whole or not at all, so there
-                                // is nothing to say about it.
+                                // thread is never behind the live end: it is
+                                // read from its root, and a bounded ask
+                                // reaches the last reply or there was none.
                                 loaded.behind_live =
                                     page.has_more && matches!(source, Source::Conversation(_));
                             }
