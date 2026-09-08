@@ -95,6 +95,11 @@ pub struct ConversationView {
     /// file the message is waiting on. Nothing in the update log speaks for
     /// a download, so the surface remembers this itself.
     awaiting_images: Vec<(Ts, String)>,
+    /// Messages drawn while the roster had no name for their author, so the
+    /// row says "someone". The name arriving is not a change to the message
+    /// and is not in the update log either, so the surface remembers which
+    /// rows are waiting on one and redraws exactly those.
+    awaiting_names: Vec<Ts>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -430,6 +435,7 @@ impl ConversationView {
             held_compose: None,
             attached: None,
             awaiting_images: Vec::new(),
+            awaiting_names: Vec::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -475,6 +481,19 @@ impl ConversationView {
         self.transcript
             .line_meta(row, cx)
             .and_then(|meta| meta.file.clone())
+    }
+
+    /// The transcript as the reader reads it, one string per line. A test
+    /// that cannot read the rows cannot say what is on screen.
+    pub fn drawn_lines_for_test(&self, cx: &App) -> Vec<String> {
+        self.transcript
+            .buffer()
+            .read(cx)
+            .snapshot()
+            .text()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
@@ -1190,6 +1209,7 @@ impl ConversationView {
         self.place_dealt(window, cx);
         self.place_unread(window, cx);
         self.settle_images(cx);
+        self.settle_names(cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         self.refresh_chip(cx);
@@ -1215,6 +1235,45 @@ impl ConversationView {
         self.awaiting_images
             .retain(|(_, id)| !session.cached_file(id).is_some_and(|path| path.exists()));
         cx.notify();
+    }
+
+    /// Redraws the rows whose author had no name when they were drawn and
+    /// has one now. Nothing else moves: a name is not a change to the
+    /// message, so the run, the anchors, the cursor and the scroll are all
+    /// where the reader left them.
+    ///
+    /// Cost: the rows that carried "someone", which is none at all once
+    /// every author on screen has a name.
+    fn settle_names(&mut self, cx: &mut Context<Self>) {
+        if self.awaiting_names.is_empty() {
+            return;
+        }
+        let messages = self.shown_messages(cx);
+        let named = self
+            .awaiting_names
+            .iter()
+            .filter_map(|ts| messages.iter().find(|message| &message.ts == ts))
+            .filter(|message| !self.unnamed_author(message, cx))
+            .cloned()
+            .collect::<Vec<_>>();
+        for message in named {
+            // `item_for` takes the row off the waiting list itself, the same
+            // as it does for a picture that has landed.
+            let key = Row::Message(message.ts.clone());
+            let item = self.item_for(&message, cx);
+            self.editing = true;
+            self.transcript.replace(&key, item, cx);
+            self.editing = false;
+        }
+    }
+
+    /// Whether this row would draw as "someone" — the author is a person
+    /// rho has no name for, rather than a bot, which carries its own.
+    fn unnamed_author(&self, message: &Message, cx: &App) -> bool {
+        let Some(id) = message.user.as_ref() else {
+            return false;
+        };
+        message.bot_name.is_none() && !self.session.read(cx).model().knows_user(id)
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -1515,6 +1574,10 @@ impl ConversationView {
         }
         self.awaiting_images
             .retain(|(waiting, _)| waiting != &message.ts);
+        self.awaiting_names.retain(|waiting| waiting != &message.ts);
+        if self.unnamed_author(message, cx) {
+            self.awaiting_names.push(message.ts.clone());
+        }
         for (order, (line, file)) in images.into_iter().enumerate() {
             let ready = self.session.update(cx, |session, cx| {
                 // The thumbnail is asked for alongside the picture: it is

@@ -884,3 +884,88 @@ async fn a_narrowing_that_takes_the_point_s_row_away_puts_it_on_the_first_match(
         "so the point is on the first match, which is what the reader typed for"
     );
 }
+
+/// A name that arrives after the row is drawn reaches the row.
+///
+/// Someone who joined after rho asked for the roster has no name when their
+/// message lands, so the row draws as `someone`. rho asks Slack who they
+/// are and the model learns it — and before this the row went on saying
+/// `someone` anyway, because a name is not a change to the message and
+/// nothing in the update log speaks for one. The reader had to leave the
+/// conversation and come back to see who had been talking to them.
+#[gpui::test]
+async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "UA", "text": "morning"}),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The roster has landed: `ada` is named, which is how the test knows
+    // the next person is one rho was never told about.
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let drawn = window
+            .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
+            .unwrap();
+        if drawn.iter().any(|line| line.starts_with("ada:")) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    fake.add_user("UZ", "zed");
+    fake.live_message("C1", "UZ", "hello, just joined");
+
+    let mut drawn = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        drawn = window
+            .update(cx, |view, _, cx| view.drawn_lines_for_test(cx))
+            .unwrap();
+        if drawn.iter().any(|line| line.starts_with("zed:")) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        drawn.iter().any(|line| line.starts_with("zed:")),
+        "the row the newcomer's message drew says who they are: {drawn:?}"
+    );
+    assert!(
+        !drawn.iter().any(|line| line.starts_with("someone:")),
+        "and no row is left saying someone: {drawn:?}"
+    );
+}
