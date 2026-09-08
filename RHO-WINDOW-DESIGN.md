@@ -331,6 +331,20 @@ nothing needs the mouse, no modal appears. Plus the cost rule, per event
 O(touched) + O(log n) and per frame O(drawn), measured on the snapshot and
 written into the landing note.
 
+Read that way, the two largest numbers the gate prints on the elided run are
+one event and not two. The largest count on a step's line, `multibuffer:216`
+against 77 for the identical 64-byte chunk later on, and the largest draw in
+the whole gate, 3537 us against about 2000 us for the steps after it, both
+fall on the step after the window is composed: fifty-eight of the window's
+buffers report a parse landing in a single sync, every excerpt is re-created
+against its new snapshot, and the frame that follows carries 2767 primitives
+across 161 owners where a settled one carries 1075 across 148. It is the
+compose settling, once, and not a walk - the same chunk's own syncs cost a
+dozen or two items each, at 59 excerpts and at 119 alike. What this asks of
+a reading of the gate is that the biggest number on a line be attributed
+before it is cut at: a count that follows neither the rows touched nor the
+document is usually work arriving, not work repeated.
+
 ## The prompt, and what it can do per keystroke
 
 The minibuffer is a completing read: a prompt, an input line, and candidate
