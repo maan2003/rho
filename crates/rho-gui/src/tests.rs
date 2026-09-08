@@ -11532,3 +11532,69 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
         })
         .unwrap();
 }
+
+/// The client's copy of the desk is a desk like any other. Cells that
+/// come off its own disk go through the same door the daemon's answer
+/// does, so a verdict the user gave in a previous session is in hand
+/// before a word is exchanged with the daemon — which is the whole reason
+/// the copy exists, and the state the two cold-open guards were written
+/// against.
+#[gpui::test]
+fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut TestAppContext) {
+    let put_away = agent(41);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, put_away);
+    desk.set(
+        rho_desk::cells::Id::Agent(put_away),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 4_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+    // What the replica would have handed back: the cells of a previous
+    // session, with no daemon behind them.
+    let held = match desk.synced() {
+        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a DeskSynced"),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(put_away)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(put_away, UnixMs(1)),
+                window,
+                cx,
+            );
+            // No `DeskSynced` from a daemon: this is the copy being opened.
+            workspace.desk_arrived(HostId::default(), 42, held.0, held.1, window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let dealt = workspace
+                .hand(cx)
+                .cards
+                .iter()
+                .filter_map(|card| card.agent_id)
+                .collect::<Vec<_>>();
+            assert!(
+                !dealt.contains(&put_away),
+                "the snooze was read off the copy, so the card does not go out: {dealt:?}"
+            );
+        })
+        .unwrap();
+}

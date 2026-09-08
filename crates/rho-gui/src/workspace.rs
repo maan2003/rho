@@ -1595,6 +1595,61 @@ impl Workspace {
     /// whole desk: a `Loaded`, a host reset, or a desk delta, where what is
     /// on the desk at all can be different. Scopes merge, and a whole one
     /// swallows the rest.
+    /// Cells that have arrived, from either place they can come from: the
+    /// daemon's answer to a handshake, or the client's own copy of what a
+    /// previous session was told. The two are the same event as far as
+    /// every reader is concerned, which is the whole point of the copy —
+    /// there is no moment when the client has no desk and every reader
+    /// has to remember to ask.
+    pub(crate) fn desk_arrived(
+        &mut self,
+        host: HostId,
+        node_namespace: u16,
+        delta: rho_desk::cells::Snapshot,
+        bodies: Vec<rho_desk::cells::BodySnapshot>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (again, delta) = self
+            .desk_cells
+            .synced(host, node_namespace, delta, bodies, cx);
+        if let Some(again) = again {
+            self.send_to_host(host, again);
+        }
+        self.sync_tree_delta(host, &delta, window, cx);
+        self.carry_over_captures(host, window, cx);
+        // Both halves are here only when the cells are: the seed of rho's
+        // Slack cursors from the store's old ones runs at the first sync
+        // that has a session, once ever, and is a marker read afterwards.
+        self.seed_slack_cursors(cx);
+    }
+
+    /// The desk this client last held for the host, off its own disk,
+    /// before a word has been exchanged with the daemon. A host the copy
+    /// has never held is left alone: that is the one case where the
+    /// client really has not read a store, and the readers that ask
+    /// `is_synced` are right to wait.
+    fn open_desk_from_replica(
+        &mut self,
+        host: HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.desk_cells.is_synced(host) {
+            return;
+        }
+        let name = self.hosts.host_label(host);
+        if name.is_empty() {
+            return;
+        }
+        self.desk_cells.host_named(host, name.clone());
+        let held = rho_mirror::desk::load(&name);
+        if !held.known {
+            return;
+        }
+        self.desk_arrived(host, held.namespace, held.snapshot, held.bodies, window, cx);
+    }
+
     fn schedule_desk_sync(
         &mut self,
         host: HostId,
@@ -1896,21 +1951,7 @@ impl Workspace {
                 node_namespace,
                 delta,
                 bodies,
-            } => {
-                let (again, delta) =
-                    self.desk_cells
-                        .synced(host, node_namespace, delta, bodies, cx);
-                if let Some(again) = again {
-                    self.send_to_host(host, again);
-                }
-                self.sync_tree_delta(host, &delta, window, cx);
-                self.carry_over_captures(host, window, cx);
-                // Both halves are here only when the cells are: the seed of
-                // rho's Slack cursors from the store's old ones runs at the
-                // first sync that has a session, once ever, and is a marker
-                // read afterwards.
-                self.seed_slack_cursors(cx);
-            }
+            } => self.desk_arrived(host, node_namespace, delta, bodies, window, cx),
             ConnEvent::DeskCellsAvailable { frontier } => {
                 if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
                     self.send_to_host(host, sync);
@@ -2131,6 +2172,11 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                // The copy comes first, so what the client already read is
+                // on screen before the daemon has said anything, and so
+                // that the handshake below asks from the version it holds
+                // rather than from nothing.
+                self.open_desk_from_replica(host, window, cx);
                 // The Desk handshake belongs to the connection, not to the
                 // window: a reconnect asks only for what it is missing.
                 let sync = self.desk_cells.sync(host);

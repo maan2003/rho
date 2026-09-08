@@ -362,6 +362,7 @@ fn run() -> Result<()> {
                 // file redb finds unclean, and the next start rebuilds its
                 // allocator from every page to be sure of it.
                 rho_mirror::mirror::close();
+                rho_mirror::desk::close();
                 std::future::ready(())
             })
             .detach();

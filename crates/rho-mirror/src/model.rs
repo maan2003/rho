@@ -424,6 +424,9 @@ async fn run(
     // existed. Until it is open the GUI is simply a session with no copy,
     // which is what the mirror has always promised to be.
     crate::mirror::open_stated();
+    // The desk's copy opens beside the agents', on the same thread and for
+    // the same reason: it is a file, and no frame waits on a file.
+    crate::desk::open_stated();
     let mut model = Model::new();
     while let Some(item) = incoming.next().await {
         let out = match item {

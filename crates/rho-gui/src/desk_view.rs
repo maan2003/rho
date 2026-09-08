@@ -570,6 +570,11 @@ pub struct DeskCells {
     device: DeviceId,
     next_buffer_id: u64,
     hosts: BTreeMap<HostId, HostDeskCells>,
+    /// The name each host answers to, which is what the replica on disk
+    /// is keyed by. A host id is handed out in attach order and means
+    /// nothing across a restart; the name is the same one the agent
+    /// mirror keys its cursor by.
+    names: BTreeMap<HostId, String>,
 }
 
 impl DeskCells {
@@ -578,7 +583,16 @@ impl DeskCells {
             device,
             next_buffer_id: 1,
             hosts: BTreeMap::new(),
+            names: BTreeMap::new(),
         }
+    }
+
+    /// What the replica writes this host under. Said by the workspace,
+    /// which is the only thing that knows a host by more than its id;
+    /// until it is said nothing is written, and the session is one with
+    /// no copy, which is what the replica has always promised to be.
+    pub fn host_named(&mut self, host: HostId, name: String) {
+        self.names.insert(host, name);
     }
 
     pub fn device(&self) -> DeviceId {
@@ -613,6 +627,11 @@ impl DeskCells {
         cx: &mut Context<Workspace>,
     ) -> (Option<ClientMessage>, DeskDelta) {
         let frontier = delta.version.clone();
+        // The copy's own share of the delta, taken before the merges
+        // consume it. `delta.version` is the daemon's frontier, which is
+        // what `confirmed` holds once the merge lands, so what is written
+        // down and what the next `DeskSync` asks from are one number.
+        let held = delta.clone();
         let mut delta_ids = DeskDelta::default();
         for cell in &delta.cells {
             delta_ids.write(&cell.id, &cell.property);
@@ -666,8 +685,15 @@ impl DeskCells {
         // and the ones it did not are still in the view where they were
         // put. Only a rejection takes a write back out of the middle,
         // and that is the one path that replays.
+        // Written down before anything is drawn from it, and only once
+        // the merge has taken it: a copy of cells the store itself
+        // refused would be a desk this client could never bring into
+        // line.
         self.apply_to_map(host, &delta_ids);
-        self.merge_bodies(host, bodies, cx);
+        self.merge_bodies(host, &bodies, cx);
+        if let Some(name) = self.names.get(&host) {
+            rho_mirror::desk::write_delta(name, namespace, held, bodies);
+        }
         self.give_buffers(host, &delta_ids, cx);
         let again = match self.hosts.get_mut(&host).and_then(|desk| desk.poked.take()) {
             // The answer already carries everything the poke announced.
@@ -769,12 +795,7 @@ impl DeskCells {
     /// Merges the handshake's body histories. A snapshot never replaces a
     /// newer operation that arrived on its own: the two are queued
     /// independently, so the merge is by operation, not by replacement.
-    fn merge_bodies(
-        &mut self,
-        host: HostId,
-        bodies: Vec<BodySnapshot>,
-        cx: &mut Context<Workspace>,
-    ) {
+    fn merge_bodies(&mut self, host: HostId, bodies: &[BodySnapshot], cx: &mut Context<Workspace>) {
         for body in bodies {
             let operations = body
                 .operations
@@ -794,7 +815,7 @@ impl DeskCells {
                 None => {
                     let buffer = self.new_note_buffer(host, body.id.clone(), operations, cx);
                     if let Some(desk) = self.hosts.get_mut(&host) {
-                        desk.buffers.insert(body.id, buffer);
+                        desk.buffers.insert(body.id.clone(), buffer);
                     }
                 }
             }
