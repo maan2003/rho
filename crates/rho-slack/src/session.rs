@@ -1656,8 +1656,13 @@ impl Session {
             };
             if let Err(error) = opened {
                 tracing::warn!(error = %error, "slack file open failed");
-                let _ = this.update(cx, |session, cx| {
-                    session.signal(Some(Signal::Degraded(format!("slack: {error:#}"))), cx);
+                let _ = this.update(cx, |_, cx| {
+                    // Not a health signal. A file rho could not open says
+                    // nothing about whether the session is keeping up, and
+                    // `Health` is the only thing that may say it is not: it
+                    // owns the reason that `feed_ok` clears, so a degraded
+                    // state raised from outside it is one nothing can lift.
+                    cx.emit(SessionEvent::Notice(format!("slack: {error:#}")));
                 });
             }
         }));

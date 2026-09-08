@@ -206,6 +206,24 @@ mod tests {
         assert_eq!(health.feed_ok(), Some(Signal::Recovered));
     }
 
+    /// Why a degraded state may only come from here. `feed_ok` lifts one by
+    /// taking the reason this holds; a `Signal::Degraded` raised anywhere
+    /// else leaves that reason unset, so there is nothing to take and no
+    /// recovery is ever announced. The lamp it lit stays lit. `open_file`
+    /// used to raise one when a file would not open, which is how a 404 on
+    /// an image became a session that had lost touch for the rest of the run.
+    #[test]
+    fn a_healthy_session_announces_no_recovery_because_it_never_degraded() {
+        let mut health = Health::default();
+        health.connected(0);
+        assert!(!health.is_degraded());
+        assert_eq!(
+            health.feed_ok(),
+            None,
+            "nothing to recover from, so nothing that could lift one raised elsewhere"
+        );
+    }
+
     #[test]
     fn a_poll_that_lands_while_the_socket_is_down_does_not_clear_the_lamp() {
         let mut health = Health::default();
