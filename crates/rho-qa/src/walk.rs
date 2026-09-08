@@ -65,10 +65,20 @@ const HISTORY_PAGING_DRIVE: &[WalkEvent] = &[
 /// itself. What it is here to read is the `fold:` count, which is elision's
 /// line in a step's walk: the paging run's document is concealed markup
 /// only, and markup's number is not elision's.
+///
+/// A streamed chunk stands at each end of that climb, and it is the same
+/// event both times, so a reader of the gate can compare a step against
+/// itself rather than against a different kind of step. Everything the
+/// climb changes is between them: the first runs on the composed screen and
+/// the second on a document twice as long. A keystroke cannot take that
+/// place - an insert scrolls the cursor into view, and the oracle is right
+/// to refuse a second one after a jump - but a chunk arriving in the turn
+/// does not move the viewport, and it is the event a reader watching a
+/// turn actually gets.
 const ELIDED_HISTORY_DRIVE: &[WalkEvent] = &[
     WalkEvent::ComposerKey { character: 'a' },
     WalkEvent::Idle,
-    WalkEvent::ScrollToTop,
+    WalkEvent::AgentChunk { bytes: 64 },
     WalkEvent::Idle,
     WalkEvent::ScrollToTop,
     WalkEvent::Idle,
@@ -77,6 +87,10 @@ const ELIDED_HISTORY_DRIVE: &[WalkEvent] = &[
     WalkEvent::ScrollToTop,
     WalkEvent::Idle,
     WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::ScrollToTop,
+    WalkEvent::Idle,
+    WalkEvent::AgentChunk { bytes: 64 },
     WalkEvent::Idle,
 ];
 
