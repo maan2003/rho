@@ -156,6 +156,18 @@ impl ListView {
             .collect()
     }
 
+    /// The lines above the listing as the reader reads them. Its own
+    /// accessor because `drawn_conversations_for_test` is about rows, and
+    /// chrome is not a row.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn drawn_banner_for_test(&self) -> Vec<String> {
+        self.drawn
+            .iter()
+            .take(self.banner)
+            .map(|line| line.text.clone())
+            .collect()
+    }
+
     #[cfg(any(test, feature = "fake"))]
     pub fn place_cursor_for_test(
         &mut self,
@@ -221,11 +233,7 @@ impl ListView {
     /// listing no longer have a line in common to build from.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.id_at(self.cursor_row(cx));
-        let banner = self
-            .session
-            .read(cx)
-            .health_reason()
-            .map(|reason| vec![Span::styled(reason.to_owned(), Class::Error)]);
+        let banner = self.banner_spans(cx);
         let listing = self.session.read(cx).has_rows();
         let edits = match listing {
             true => self
@@ -237,10 +245,12 @@ impl ListView {
                 None
             }
         };
-        let incremental =
-            listing && !self.drawn.is_empty() && banner.is_some() == (self.banner == 1);
+        let incremental = listing && !self.drawn.is_empty() && banner.len() == self.banner;
         match (incremental, edits) {
-            (true, Some(edits)) => self.apply_edits(edits, cx),
+            (true, Some(edits)) => {
+                self.redraw_banner(banner, cx);
+                self.apply_edits(edits, cx);
+            }
             _ => self.rebuild(banner, cx),
         }
         // The point follows the conversation, not the line number: rows
@@ -255,7 +265,7 @@ impl ListView {
 
     /// Writes the whole listing. The first draw, and the fallback whenever
     /// an edit cannot be placed against what the buffer holds.
-    fn rebuild(&mut self, banner: Option<Vec<Span>>, cx: &mut Context<Self>) {
+    fn rebuild(&mut self, banner: Vec<Vec<Span>>, cx: &mut Context<Self>) {
         let session = self.session.read(cx);
         // Whatever the mirror holds is shown whatever the socket is doing:
         // a restart reads its conversations before Slack answers, and an
@@ -291,8 +301,8 @@ impl ListView {
         let muted = known.iter().filter(|row| row.muted).count();
         let listed = !known.is_empty();
 
-        self.drawn = Vec::with_capacity(lines.len() + 1);
-        self.banner = usize::from(banner.is_some());
+        self.drawn = Vec::with_capacity(lines.len() + banner.len());
+        self.banner = banner.len();
         // The counters only mean anything when the buffer holds the whole
         // listing; a narrowed or status-line buffer has no places to
         // compute, and the next draw rebuilds anyway.
@@ -362,7 +372,7 @@ impl ListView {
             let muted_after = self.muted - usize::from(left_muted)
                 + usize::from(edit.row.as_ref().is_some_and(|row| row.muted));
             if (self.muted > 0) != (muted_after > 0) {
-                self.rebuild(self.banner_span(cx), cx);
+                self.rebuild(self.banner_spans(cx), cx);
                 return;
             }
             if let Some(line) = leaving {
@@ -412,11 +422,53 @@ impl ListView {
         }
     }
 
-    fn banner_span(&self, cx: &Context<Self>) -> Option<Vec<Span>> {
+    /// The lines above the listing: why the session cannot be trusted to be
+    /// current, when there is a reason.
+    fn banner_spans(&self, cx: &Context<Self>) -> Vec<Vec<Span>> {
         self.session
             .read(cx)
             .health_reason()
-            .map(|reason| vec![Span::styled(reason.to_owned(), Class::Error)])
+            .map(|reason| vec![vec![Span::styled(reason.to_owned(), Class::Error)]])
+            .unwrap_or_default()
+    }
+
+    /// Rewrites the banner lines that say something different now.
+    ///
+    /// The chrome was drawn by `rebuild` alone, and a redraw takes the
+    /// incremental path whenever the number of banner lines is unchanged.
+    /// So a reason replaced by another reason -- the count the same, the
+    /// words not -- stayed on screen saying what was true before, which is
+    /// the chrome telling the reader something untrue about whether the
+    /// session is keeping up.
+    fn redraw_banner(&mut self, banner: Vec<Vec<Span>>, cx: &mut Context<Self>) {
+        let drawn = self
+            .drawn
+            .iter()
+            .take(self.banner)
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        let laid = banner
+            .into_iter()
+            .map(|line| lay_out(&line))
+            .collect::<Vec<_>>();
+        let words = laid
+            .iter()
+            .map(|(text, _)| text.clone())
+            .collect::<Vec<_>>();
+        for at in stale_banner(&drawn, &words) {
+            let (text, styles) = laid[at].clone();
+            self.remove_line(at, cx);
+            self.insert_line(
+                at,
+                DrawnLine {
+                    id: None,
+                    muted: false,
+                    text,
+                    styles,
+                },
+                cx,
+            );
+        }
     }
 
     fn remove_line(&mut self, at: usize, cx: &mut Context<Self>) {
@@ -522,6 +574,23 @@ fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelI
 /// places that draw a row ask the same thing.
 fn now_seconds() -> i64 {
     chrono::Local::now().timestamp()
+}
+
+/// Which banner lines have to be written again: the ones whose words differ
+/// from what the buffer already holds.
+///
+/// Its own function because the case that was wrong is invisible from
+/// either side alone -- the count is right, so the incremental path is
+/// taken, and the words are not, so the reader is told something that was
+/// true a draw ago. Called only when the two are the same length, which is
+/// what makes each index a line already in the buffer.
+fn stale_banner(drawn: &[String], banner: &[String]) -> Vec<usize> {
+    banner
+        .iter()
+        .enumerate()
+        .filter(|(at, line)| drawn.get(*at) != Some(*line))
+        .map(|(at, _)| at)
+        .collect()
 }
 
 /// The break between the two sections. Its own function because an
@@ -728,6 +797,31 @@ mod tests {
         check(&mut model, &mut lines, "and one in the last unmuted row");
         model.mark_read(&ChannelId("C2".into()), &Ts("100.000000".into()));
         check(&mut model, &mut lines, "and a row loses its badge in place");
+    }
+
+    /// The chrome is drawn by a full rebuild alone, and a redraw takes the
+    /// incremental path whenever the number of banner lines is unchanged.
+    /// One health reason replaced by another is exactly that case: the
+    /// count is right and the words are not, and the old reason stood on
+    /// screen telling the reader the session had a problem it no longer
+    /// had.
+    #[test]
+    fn a_banner_line_whose_words_changed_is_written_again() {
+        let lost = "slack: connection lost".to_owned();
+        let refused = "slack: connecting to Slack: 401".to_owned();
+        assert_eq!(
+            stale_banner(std::slice::from_ref(&lost), std::slice::from_ref(&refused)),
+            vec![0],
+            "one reason replaced by another, with the count unchanged"
+        );
+        assert!(
+            stale_banner(std::slice::from_ref(&lost), std::slice::from_ref(&lost)).is_empty(),
+            "and the ordinary draw, where the chrome has not moved, writes nothing"
+        );
+        assert!(
+            stale_banner(&[], &[]).is_empty(),
+            "nor does a listing with no chrome at all"
+        );
     }
 
     fn text(line: &[Span]) -> String {
