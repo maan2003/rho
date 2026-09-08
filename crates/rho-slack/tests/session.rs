@@ -283,3 +283,59 @@ async fn a_message_from_someone_the_roster_never_had_is_asked_about_once(cx: &mu
         "asked once for the person, not once for each of their messages"
     );
 }
+
+/// A search hit, or any other place named from outside, can be in a part of
+/// a conversation rho has never paged. Opening there used to leave the reader
+/// at the newest messages with nothing saying so; now the window comes down
+/// the same road a ping's does.
+#[gpui::test]
+async fn a_place_the_mirror_has_never_held_is_fetched_and_landed_on(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.fake.add_channel("C2", "ops");
+    // Far more than one page, so the message asked for is nowhere near the
+    // newest ones that opening loads by itself.
+    for n in 0..120 {
+        rig.fake.add_message(
+            "C2",
+            serde_json::json!({"ts": format!("{}.0", 1000 + n), "user": "UA", "text": format!("line {n}")}),
+        );
+    }
+    let ops = Source::Conversation(ChannelId("C2".into()));
+    let deep = Ts("1005.0".into());
+
+    rig.session
+        .update(cx, |session, cx| session.open_at(&ops, &deep, cx));
+
+    let mut landed = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        landed = rig.session.read_with(cx, |session, _| {
+            session
+                .loaded(&ops)
+                .map(|loaded| {
+                    loaded
+                        .messages
+                        .iter()
+                        .map(|message| message.ts.0.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        if landed.contains(&deep.0) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    assert!(
+        landed.contains(&deep.0),
+        "the message asked for has to be in front of the reader: {landed:?}"
+    );
+    assert!(
+        landed.contains(&"1004.0".to_owned()) && landed.contains(&"1006.0".to_owned()),
+        "and it arrives with the conversation around it, not on its own: {landed:?}"
+    );
+}

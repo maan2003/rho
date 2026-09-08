@@ -1175,19 +1175,29 @@ impl Session {
     /// papered over.
     pub fn open_at(&mut self, source: &Source, ts: &Ts, cx: &mut Context<Self>) {
         self.open(source, cx);
+        if self.land_on(source, ts, cx) {
+            return;
+        }
+        self.fetch_window_around(source, ts, cx);
+    }
+
+    /// Puts the chunk holding `ts` in front of the reader, and says whether
+    /// it could. False means the mirror holds nothing there — the message
+    /// is real, rho has simply never paged that part of the conversation.
+    fn land_on(&mut self, source: &Source, ts: &Ts, cx: &mut Context<Self>) -> bool {
         let scope = self.scope(source);
         let Some(mirror) = self.mirror.clone() else {
-            return;
+            return false;
         };
         let Some(loaded) = self.loaded.get_mut(source) else {
-            return;
+            return false;
         };
         if loaded.messages.iter().any(|held| &held.ts == ts) {
-            return;
+            return true;
         }
         let chunk = mirror.chunk_containing(&scope, ts, MIRROR_PAGE);
         let Some(newest) = chunk.last().map(|message| message.ts.clone()) else {
-            return;
+            return false;
         };
         for message in chunk {
             loaded.insert(message);
@@ -1200,6 +1210,54 @@ impl Session {
         loaded.reached_oldest =
             mirror.gap_at_or_below(&scope, ts).is_none() && mirror.history_begins(&scope);
         cx.notify();
+        true
+    }
+
+    /// Fetches the conversation around a message rho holds nothing near, and
+    /// lands on it when the window arrives.
+    ///
+    /// The same two bounded calls `prefetch_ping` makes, and for the same
+    /// reason: something outside the mirror — a card, or a search hit the
+    /// reader chose — names a place, and the reader is owed the place rather
+    /// than the newest messages in the conversation, which is where opening
+    /// would otherwise leave them with no sign that it did.
+    fn fetch_window_around(&mut self, source: &Source, ts: &Ts, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        // A thread is fetched whole by the thread load, so a thread source
+        // never needs a window cut out of the middle of it.
+        let Source::Conversation(channel) = source.clone() else {
+            return;
+        };
+        let scope = self.scope(source);
+        let source = source.clone();
+        let ts = ts.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let channel = channel.clone();
+            let ts = ts.clone();
+            async move {
+                client
+                    .conversations_history_around(&channel, &ts, PING_WINDOW)
+                    .await
+            }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let Ok(Ok(messages)) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                session.mirror_page(&source, &messages, false, false);
+                session.learn_names(&messages, cx);
+                if let Some(mirror) = session.mirror.as_ref() {
+                    // The window is an island: what sits under it is
+                    // unknown, and saying so is what stops the surface
+                    // showing it as continuous history.
+                    mirror_island(mirror, &scope, &messages);
+                }
+                session.land_on(&source, &ts, cx);
+            });
+        }));
     }
 
     /// Fills a hole from below: one page forward from the message it sits
