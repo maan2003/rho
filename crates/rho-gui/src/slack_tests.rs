@@ -1621,6 +1621,7 @@ async fn the_edge_of_a_narrowing_says_what_waits_outside_it(cx: &mut TestAppCont
 #[gpui::test]
 #[ignore = "measures a per-event cost, so it needs a quiet machine"]
 async fn one_arriving_message_costs_what_it_touches(cx: &mut TestAppContext) {
+    crate::tests::measure_the_pipeline_and_not_the_validation();
     let small = arrival_cost(cx, 0).await;
     let big = arrival_cost(cx, 300).await;
     eprintln!("one arriving message, small listing: {small:?}");

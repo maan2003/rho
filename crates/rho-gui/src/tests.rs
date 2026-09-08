@@ -2371,9 +2371,19 @@ fn streaming_text_appends_through_item_diffs(cx: &mut TestAppContext) {
 /// PERF_BLOCKS=400 cargo test --release -p rho-gui --bin rho-gui \
 ///     bench_markdown_transcript -- --ignored --nocapture
 /// ```
+/// What a bench measures is the pipeline, not the validation the test
+/// build wraps it in: `rows_within_their_document` walks the document on
+/// every wrap sync, and with it on one flushed replacement read 5.64s at
+/// five thousand items where the same edit costs 33.4ms. A correctness
+/// suite keeps it.
+pub(crate) fn measure_the_pipeline_and_not_the_validation() {
+    editor::display_map::set_wrap_rows_check_enabled(false);
+}
+
 #[gpui::test]
 #[ignore = "benchmark"]
 fn bench_markdown_transcript(cx: &mut TestAppContext) {
+    measure_the_pipeline_and_not_the_validation();
     let blocks_count: usize = std::env::var("PERF_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2436,6 +2446,7 @@ fn bench_markdown_transcript(cx: &mut TestAppContext) {
 #[gpui::test]
 #[ignore = "benchmark"]
 fn bench_rho_gui_flows(cx: &mut TestAppContext) {
+    measure_the_pipeline_and_not_the_validation();
     let blocks_count: usize = std::env::var("PERF_BLOCKS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3184,6 +3195,7 @@ fn assert_incremental_wrap(
 #[gpui::test]
 #[ignore = "manual streaming benchmark"]
 fn benchmark_streaming_suffix_wrap_pipeline(cx: &mut TestAppContext) {
+    measure_the_pipeline_and_not_the_validation();
     const APPENDS: usize = 50;
     let workspace = test_workspace(cx);
     let mut streamed = "one long streamed markdown paragraph ".repeat(2_000);

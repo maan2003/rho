@@ -423,6 +423,14 @@ fn a_marked_item_takes_the_gutter_and_gives_it_back(cx: &mut TestAppContext) {
     assert_eq!(marked(cx), 1, "what left is unmarked");
 }
 
+/// What a bench measures is the pipeline, not the validation the test
+/// build wraps it in: `rows_within_their_document` walks the document on
+/// every wrap sync, and with it on this bench read 5.64s at five thousand
+/// items where the same edit costs 33.4ms. A correctness suite keeps it.
+fn measure_the_pipeline_and_not_the_validation() {
+    editor::display_map::set_wrap_rows_check_enabled(false);
+}
+
 /// One item replaced costs what it touches, whatever else is on screen.
 ///
 /// The rule the surfaces hold to is per event O(rows the event touches) +
@@ -448,6 +456,7 @@ fn a_marked_item_takes_the_gutter_and_gives_it_back(cx: &mut TestAppContext) {
 #[gpui::test]
 #[ignore = "measures a per-event cost, so it needs a quiet machine"]
 fn one_replacement_costs_what_it_touches(cx: &mut TestAppContext) {
+    measure_the_pipeline_and_not_the_validation();
     init_editor(cx);
     let small = replacement_cost(cx, 100);
     let big = replacement_cost(cx, 5000);
