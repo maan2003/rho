@@ -1297,14 +1297,15 @@ fn binaries(which: Binaries, gui: bool) -> Result<Build> {
         label: label.to_owned(),
         fallback,
     };
-    let mut wanted = vec![bin.daemon(), bin.fake_model(), bin.fake_slack()];
-    if gui {
-        // Only a run that starts the GUI needs the GUI, the driver and the
-        // browser the client launches.
-        wanted.extend([bin.rho(), bin.gui(), bin.fake_browser()]);
-    }
+    // The same list the build builds from, so a binary that is wanted here
+    // is one `rho-qa build` makes. Only a run that starts the GUI needs the
+    // GUI, the driver and the browser the client launches.
     let mut missing = Vec::new();
-    for path in wanted {
+    for binary in crate::build::RIG_BINARIES {
+        if binary.gui_only && !gui {
+            continue;
+        }
+        let path = bin.find(binary.file);
         if !path.exists() {
             missing.push(path.display().to_string());
         }
