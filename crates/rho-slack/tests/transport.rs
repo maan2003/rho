@@ -1758,3 +1758,92 @@ async fn the_readers_reaction_comes_off_without_taking_anyone_elses() {
         "one reader taking theirs off is not the reaction going away"
     );
 }
+
+/// A hit has to be somewhere the reader can be taken. The assertion is not
+/// that the search answered, but that what it answered with opens: for every
+/// hit, the window around its timestamp in its own channel holds it.
+#[tokio::test]
+async fn a_search_hit_is_a_place_the_client_can_open() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "100.0", "user": "UD", "text": "the staging rollback is done"}),
+    );
+    fake.add_message(
+        "C1",
+        json!({"type": "message", "ts": "101.0", "user": "UD", "text": "lunch"}),
+    );
+    fake.add_message(
+        "C2",
+        json!({"type": "message", "ts": "102.0", "user": "UD", "text": "who owns staging"}),
+    );
+    let client = client(&fake);
+
+    let found = client.search_messages("staging", 1).await.unwrap();
+
+    assert_eq!(
+        found
+            .hits
+            .iter()
+            .map(|hit| (
+                hit.channel.0.as_str(),
+                hit.channel_label.as_str(),
+                hit.message.text.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("C2", "random", "who owns staging"),
+            ("C1", "design", "the staging rollback is done"),
+        ],
+        "newest first, each hit naming the conversation it is in"
+    );
+    assert_eq!((found.page, found.pages, found.total), (1, 1, 2));
+
+    for hit in &found.hits {
+        let window = client
+            .conversations_history_around(&hit.channel, &hit.message.ts, 5)
+            .await
+            .unwrap();
+        assert!(
+            window.iter().any(|message| message.ts == hit.message.ts),
+            "a hit the client cannot open is not a place: {hit:?}"
+        );
+    }
+}
+
+/// Slack pages a search by numbered pages, not by cursor, and a reader who
+/// asks for more must not be shown the first page again.
+#[tokio::test]
+async fn a_second_page_of_hits_is_the_next_ones_and_not_the_same_ones() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    for n in 0..45 {
+        fake.add_message(
+            "C1",
+            json!({
+                "type": "message",
+                "ts": format!("{}.0", 100 + n),
+                "user": "UD",
+                "text": format!("staging note {n}"),
+            }),
+        );
+    }
+    let client = client(&fake);
+
+    let first = client.search_messages("staging", 1).await.unwrap();
+    let second = client.search_messages("staging", 2).await.unwrap();
+
+    assert_eq!((first.page, first.pages, first.total), (1, 2, 45));
+    assert_eq!(first.hits.len(), 40, "one page is bounded");
+    assert_eq!((second.page, second.pages, second.total), (2, 2, 45));
+    assert_eq!(second.hits.len(), 5, "and the last page is the remainder");
+    let seen = first
+        .hits
+        .iter()
+        .chain(second.hits.iter())
+        .map(|hit| hit.message.ts.0.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(seen.len(), 45, "no message is on both pages");
+}

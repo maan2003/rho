@@ -1005,6 +1005,26 @@ fn png_size(bytes: &[u8]) -> (u32, u32) {
 
 /// When a feed item happened, from wherever its own shape keeps it: a
 /// mention carries the message, a thread bundle carries its latest reply.
+/// The words a fake search matches on: whitespace-separated and lowered.
+/// Slack parses `from:` and `in:` and its own operators, and this does not
+/// pretend to -- a fake that guessed at that grammar would be asserting
+/// against rho's guess rather than against Slack.
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+}
+
+/// When a match happened, for ordering. A message with no readable `ts`
+/// sorts oldest rather than being dropped.
+fn search_ts(message: &Value) -> f64 {
+    message["ts"]
+        .as_str()
+        .and_then(|ts| ts.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 fn feed_ts(item: &Value) -> f64 {
     let entry = &item["item"];
     entry["message"]["ts"]
@@ -1374,6 +1394,54 @@ fn handle(
                 "items": page,
                 "response_metadata": {
                     "next_cursor": if has_more { end.to_string() } else { String::new() },
+                },
+            })
+        }
+        "search.messages" => {
+            // Every conversation at once, which is what makes a search
+            // different from history: the hit names its own channel because
+            // the request did not.
+            let terms = search_terms(&field("query"));
+            let mut matches = Vec::new();
+            for (channel, messages) in &state.history {
+                let name = state
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation["id"] == json!(channel))
+                    .and_then(|conversation| conversation["name"].as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                for message in messages {
+                    let text = message["text"].as_str().unwrap_or_default().to_lowercase();
+                    if terms.iter().all(|term| text.contains(term)) {
+                        let mut hit = message.clone();
+                        hit["channel"] = json!({"id": channel, "name": name});
+                        matches.push(hit);
+                    }
+                }
+            }
+            // Newest first, which is the order rho asks for and the order a
+            // list of places is read in.
+            matches.sort_by(|left, right| search_ts(right).total_cmp(&search_ts(left)));
+            let total = matches.len();
+            let count = field("count").parse::<usize>().unwrap_or(20).max(1);
+            let page = field("page").parse::<usize>().unwrap_or(1).max(1);
+            let pages = total.div_ceil(count).max(1);
+            let start = (page - 1) * count;
+            let end = (start + count).min(total);
+            let shown = matches.get(start..end).unwrap_or_default().to_vec();
+            json!({
+                "ok": true,
+                "query": field("query"),
+                "messages": {
+                    "total": total,
+                    "matches": shown,
+                    "paging": {
+                        "count": count,
+                        "total": total,
+                        "page": page,
+                        "pages": pages,
+                    },
                 },
             })
         }

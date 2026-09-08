@@ -20,6 +20,12 @@ const DEFAULT_BASE: &str = "https://slack.com/api";
 /// one request, shallow enough that the first screen paints quickly.
 pub const PAGE: usize = 50;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many search hits one page asks for. A screenful and a little, the
+/// same reasoning as the finder's offered names: enough that the answer is
+/// usually whole, small enough that a query the reader is about to refine
+/// costs one bounded request.
+const SEARCH_PAGE: usize = 40;
 /// Slack refuses a websocket handshake that arrives without a user agent,
 /// and an `xoxc` session belongs to the desktop client, so rho presents
 /// itself as one. The same string goes on every HTTP call, so what Slack
@@ -101,6 +107,36 @@ pub struct MessagePage {
     /// forward has no cursor of its own — the next one starts at its newest
     /// message — so this is what says the run has not caught up yet.
     pub has_more: bool,
+}
+
+/// One message a search reached.
+///
+/// A hit is a place: the conversation it is in and the message itself,
+/// which is what `open_at` needs to put the reader on it. It is not a unit
+/// and never becomes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub channel: ChannelId,
+    /// The conversation's name as the search answered it. Slack names the
+    /// channel inside every match, so a result row can be drawn without
+    /// asking the roster about a conversation the reader has never opened.
+    pub channel_label: String,
+    pub message: Message,
+}
+
+/// One page of `search.messages`.
+///
+/// Slack pages this one by numbered pages rather than by cursor, so this
+/// carries the numbers it answers with instead of a cursor: a reader asking
+/// for more asks for the next page, and the count is what the surface says
+/// it is showing part of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    /// One-based, as Slack counts.
+    pub page: u32,
+    pub pages: u32,
+    pub total: u32,
 }
 
 /// One thread Slack follows for the user, from `subscriptions.thread.getView`.
@@ -295,6 +331,47 @@ impl Client {
 
     /// A thread, oldest first. The parent is the first message, exactly as
     /// the surface wants to render it.
+    /// Messages matching a query, newest first, one page at a time.
+    ///
+    /// The query goes to Slack exactly as the reader typed it: Slack parses
+    /// its own modifiers, so `from:@dana staging` works without rho knowing
+    /// what `from:` means, for the same reason blocks are rendered rather
+    /// than reinterpreted.
+    ///
+    /// Sorted by time rather than by Slack's relevance score, because the
+    /// results are a list of places and "when" is the thing a reader orders
+    /// places by. A score would also make the same query answer differently
+    /// on two days for reasons rho cannot show them.
+    pub async fn search_messages(&self, query: &str, page: u32) -> anyhow::Result<SearchPage> {
+        let body = self
+            .post_form(
+                "search.messages",
+                &[
+                    ("query", query.to_owned()),
+                    ("count", SEARCH_PAGE.to_string()),
+                    ("page", page.max(1).to_string()),
+                    ("sort", "timestamp".to_owned()),
+                    ("sort_dir", "desc".to_owned()),
+                ],
+            )
+            .await?;
+        let messages = &body["messages"];
+        let hits = messages["matches"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(parse_search_hit)
+            .collect();
+        let paging = &messages["paging"];
+        Ok(SearchPage {
+            hits,
+            page: number(&paging["page"]).unwrap_or(1),
+            pages: number(&paging["pages"]).unwrap_or(1),
+            total: number(&paging["total"]).unwrap_or_default(),
+        })
+    }
+
     pub async fn conversations_replies(
         &self,
         channel: &ChannelId,
@@ -843,6 +920,28 @@ fn parse_message_page(body: &Value, channel: &ChannelId) -> MessagePage {
         older_cursor,
         has_more,
     }
+}
+
+/// Parses one search match. The match is a message payload with the channel
+/// named inside it rather than assumed from the request, because one search
+/// crosses every conversation the reader can see.
+fn parse_search_hit(value: &Value) -> Option<SearchHit> {
+    let channel = ChannelId(string(&value["channel"]["id"])?);
+    let message = parse_message(value, &channel)?;
+    Some(SearchHit {
+        channel_label: string(&value["channel"]["name"]).unwrap_or_default(),
+        channel,
+        message,
+    })
+}
+
+/// A number Slack sent, whether it sent it as a number or as a string. The
+/// paging block has been both.
+fn number(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .and_then(|number| u32::try_from(number).ok())
 }
 
 /// Parses one message payload. The same shape arrives over the websocket, so
