@@ -888,7 +888,16 @@ impl BlockMap {
         }
         start.column = 0;
         let start_row = wrap_snapshot.make_wrap_point(start, Bias::Left).row();
-        let end_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row() + WrapRow(1);
+        // To the end of the wrapped line, not to the end of the row the
+        // elision happens to stop on. An edit widened to an elision is
+        // rebuilt whole, and a block anchored inside the last line of it
+        // sits on whichever row the wrap put it on - past the widened end
+        // if the end is in the middle of a line, which leaves the rebuilt
+        // transforms a row longer than the text they describe.
+        let end_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row();
+        let end_row = wrap_snapshot
+            .next_row_boundary(WrapPoint::new(end_row, 0))
+            .unwrap_or(wrap_snapshot.max_point().row() + WrapRow(1));
         Some(start_row..end_row)
     }
 
