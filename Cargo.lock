@@ -14389,6 +14389,7 @@ name = "rho-transcript"
 version = "0.1.0"
 dependencies = [
  "assets",
+ "collections",
  "editor",
  "gpui",
  "language",

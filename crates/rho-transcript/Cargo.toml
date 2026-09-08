@@ -12,6 +12,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+collections = { path = "../../vendor/zed/crates/collections" }
 editor = { path = "../../vendor/zed/crates/editor", default-features = false }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false }
 language = { path = "../../vendor/zed/crates/language" }

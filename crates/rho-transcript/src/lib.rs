@@ -155,10 +155,13 @@ struct Record<K, C, M> {
 /// One editor showing this transcript. Blocks live in the editor's own id
 /// space and anchors resolve through its multibuffer, so both are per
 /// attachment.
-struct Attachment {
+struct Attachment<K> {
     editor: WeakEntity<Editor>,
     multi_buffer: Entity<MultiBuffer>,
-    blocks: Vec<(usize, CustomBlockId)>,
+    /// The blocks each item owns here, by key rather than by position: an
+    /// item that did not move keeps its blocks through any edit above it,
+    /// and only an item that came or went is reconciled.
+    blocks: HashMap<K, Vec<CustomBlockId>>,
 }
 
 /// The ranges each class paints in one bucket.
@@ -173,7 +176,7 @@ pub struct Transcript<K, C, M, G = NoGutter> {
     buffer: Entity<Buffer>,
     items: Vec<Record<K, C, M>>,
     index: HashMap<K, usize>,
-    attachments: Vec<Attachment>,
+    attachments: Vec<Attachment<K>>,
     /// Classes each bucket currently paints, so a bucket that loses a class
     /// clears it instead of leaving stale ranges behind.
     painted: HashMap<u32, HashSet<C>>,
@@ -250,6 +253,18 @@ where
     /// back from the end rather than over everything drawn.
     pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> {
         self.items.iter().map(|item| &item.key)
+    }
+
+    /// The blocks an item owns in the first attached editor. A block that
+    /// survives an edit elsewhere keeps its id, which is the whole of what
+    /// makes an edit cost what it touched.
+    #[cfg(test)]
+    pub fn block_ids(&self, key: &K) -> Vec<CustomBlockId> {
+        self.attachments
+            .first()
+            .and_then(|attachment| attachment.blocks.get(key))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Buckets whose highlights the last operation re-sent.
@@ -501,7 +516,8 @@ where
         touched.sort_unstable();
         self.last_painted = touched.clone();
         self.paint(&touched, cx);
-        self.place_blocks(cx);
+        let gone = gone.into_iter().map(|item| item.key).collect::<Vec<_>>();
+        self.place_blocks(&gone, at..at + inserted, cx);
     }
 
     /// Bucket numbers for a run. Appending extends the last bucket while it
@@ -699,48 +715,55 @@ where
         });
     }
 
-    /// Blocks are reconciled per attachment against the items that own them.
-    /// Only items whose specs changed lose and regain their block ids.
-    fn place_blocks(&mut self, cx: &mut App) {
-        let wanted = self
-            .items
-            .iter()
-            .enumerate()
-            .flat_map(|(index, item)| item.blocks.iter().map(move |block| (index, block)))
-            .collect::<Vec<_>>();
+    /// Reconciles the blocks of the items that came and went, and only
+    /// those. A block sits on an anchor, so an item that did not move keeps
+    /// its blocks through an edit anywhere else in the buffer: taking them
+    /// all away and putting them all back was the whole transcript's worth
+    /// of work for one arriving message.
+    fn place_blocks(&mut self, gone: &[K], inserted: Range<usize>, cx: &mut App) {
         let snapshot = self.buffer.read(cx).snapshot();
-        let placements = wanted
-            .iter()
-            .map(|(index, block)| {
-                let row = self.items[*index].range.start.to_point(&snapshot).row + block.line;
-                let point = Point::new(row.min(snapshot.max_point().row), 0);
-                (*index, (*block).clone(), snapshot.anchor_after(point))
-            })
-            .collect::<Vec<_>>();
+        let mut placements = Vec::new();
+        for item in self.items.get(inserted).into_iter().flatten() {
+            let start = item.range.start.to_point(&snapshot).row;
+            for block in &item.blocks {
+                let point = Point::new((start + block.line).min(snapshot.max_point().row), 0);
+                placements.push((
+                    item.key.clone(),
+                    block.clone(),
+                    snapshot.anchor_after(point),
+                ));
+            }
+        }
         drop(snapshot);
+        // An item that arrives under a key that is already here -- a
+        // replacement -- takes the place of what was there, so its old
+        // blocks go with the ones that left.
+        let replaced = placements
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<HashSet<_>>();
 
         let mut attachments = std::mem::take(&mut self.attachments);
         attachments.retain_mut(|attachment| {
             let Some(editor) = attachment.editor.upgrade() else {
                 return false;
             };
-            let previous = std::mem::take(&mut attachment.blocks);
-            if !previous.is_empty() {
-                editor.update(cx, |editor, cx| {
-                    editor.remove_blocks(
-                        previous.into_iter().map(|(_, id)| id).collect(),
-                        None,
-                        cx,
-                    );
-                });
+            let stale = gone
+                .iter()
+                .chain(&replaced)
+                .filter_map(|key| attachment.blocks.remove(key))
+                .flatten()
+                .collect::<collections::HashSet<_>>();
+            if !stale.is_empty() {
+                editor.update(cx, |editor, cx| editor.remove_blocks(stale, None, cx));
             }
             let snapshot = attachment.multi_buffer.read(cx).snapshot(cx);
             let mut owners = Vec::new();
             let properties = placements
                 .iter()
-                .filter_map(|(index, block, anchor)| {
+                .filter_map(|(key, block, anchor)| {
                     let anchor = snapshot.anchor_in_excerpt(*anchor)?;
-                    owners.push(*index);
+                    owners.push(key.clone());
                     Some(BlockProperties {
                         placement: BlockPlacement::Below(anchor),
                         height: Some(block.height),
@@ -753,7 +776,9 @@ where
             if !properties.is_empty() {
                 let ids =
                     editor.update(cx, |editor, cx| editor.insert_blocks(properties, None, cx));
-                attachment.blocks = owners.into_iter().zip(ids).collect();
+                for (key, id) in owners.into_iter().zip(ids) {
+                    attachment.blocks.entry(key).or_default().push(id);
+                }
             }
             true
         });
@@ -767,7 +792,7 @@ where
         self.attachments.push(Attachment {
             editor: editor.downgrade(),
             multi_buffer,
-            blocks: Vec::new(),
+            blocks: HashMap::new(),
         });
         let buckets = self
             .items
@@ -779,7 +804,7 @@ where
         self.painted.clear();
         self.paint(&buckets, cx);
         self.mark_gutter(Vec::new(), 0..self.items.len(), cx);
-        self.place_blocks(cx);
+        self.place_blocks(&[], 0..self.items.len(), cx);
     }
 }
 

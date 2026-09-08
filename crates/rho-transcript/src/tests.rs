@@ -1,5 +1,5 @@
 use editor::{Editor, EditorMode, HighlightKey, SizingBehavior};
-use gpui::{App, AppContext as _, Entity, HighlightStyle, TestAppContext};
+use gpui::{App, AppContext as _, Entity, HighlightStyle, IntoElement as _, TestAppContext};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use text::{ToOffset as _, ToPoint as _};
@@ -468,11 +468,17 @@ const SIZE_FACTOR: u32 = 4;
 
 /// How long one item's replacement takes, averaged over enough of them that
 /// a single scheduling hiccup does not carry the number.
+///
+/// No item carries a block. What a block costs to place is the editor's
+/// block map, not this crate's bookkeeping, and it is large enough to bury
+/// the thing being measured here: see the note on the block map in the
+/// window's design.
 fn replacement_cost(cx: &mut TestAppContext, items: usize) -> std::time::Duration {
     let (buffer, editor) = on_screen(cx);
     let mut sheet = Sheet::new(buffer.clone());
+    let shown = |index: usize, text: &str| item(&format!("m{index}"), text);
     let run = (0..items)
-        .map(|index| item(&format!("m{index}"), &format!("message {index}\n")))
+        .map(|index| shown(index, &format!("message {index}\n")))
         .collect::<Vec<_>>();
     cx.update(|cx| {
         sheet.insert_before(None, run, cx);
@@ -490,7 +496,7 @@ fn replacement_cost(cx: &mut TestAppContext, items: usize) -> std::time::Duratio
             let key = format!("m{index}");
             sheet.replace(
                 &key,
-                item(&key, &format!("message {index} ({round})\n")),
+                shown(index, &format!("message {index} ({round})\n")),
                 cx,
             );
         }
@@ -531,4 +537,45 @@ fn on_screen(cx: &mut TestAppContext) -> (Entity<Buffer>, Entity<Editor>) {
     });
     let editor = window.root(cx).expect("the editor is the window's root");
     (transcript, editor)
+}
+
+/// A block under an item outlives every edit that is not its own.
+///
+/// Blocks sit on anchors, so the buffer moving under one is not a reason to
+/// take it away and put it back: a picture that is torn down and rebuilt on
+/// every arriving message flickers, and pays for the whole transcript to do
+/// it.
+#[gpui::test]
+fn a_block_survives_an_edit_that_is_not_its_own(cx: &mut TestAppContext) {
+    init_editor(cx);
+    let (buffer, editor) = on_screen(cx);
+    let mut sheet = Sheet::new(buffer.clone());
+    let with_picture = item("a", "alice hello\n").with_blocks(vec![crate::BlockSpec {
+        line: 0,
+        height: 4,
+        render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+        priority: 0,
+    }]);
+    cx.update(|cx| {
+        sheet.insert_before(None, vec![with_picture, item("b", "bob hello\n")], cx);
+        sheet.attach(&editor, cx);
+    });
+    let placed = sheet.block_ids(&"a".to_owned());
+    assert_eq!(placed.len(), 1, "the picture is under its own item");
+
+    cx.update(|cx| {
+        sheet.replace(&"b".to_owned(), item("b", "bob hello again\n"), cx);
+        sheet.insert_before(None, vec![item("c", "carol hello\n")], cx);
+    });
+    assert_eq!(
+        sheet.block_ids(&"a".to_owned()),
+        placed,
+        "someone else's message is not a reason to redraw a picture"
+    );
+
+    cx.update(|cx| sheet.remove(&"a".to_owned(), cx));
+    assert!(
+        sheet.block_ids(&"a".to_owned()).is_empty(),
+        "the picture goes with the message it was under"
+    );
 }
