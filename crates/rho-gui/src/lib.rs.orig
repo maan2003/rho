@@ -31,7 +31,7 @@ pub mod workspace;
 pub(crate) mod zulip;
 
 use gpui::{App, KeyBinding, actions};
-use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
+use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup};
 pub use rho_files::FileSave;
 pub use rho_shell_view::{ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit};
 use rho_terminal::{
@@ -111,7 +111,6 @@ actions!(
         DealOpen,
         DealCloseAndNext,
         OverviewToggle,
-        VerdictMenu,
         SurfaceClose,
         ZulipNextUnread,
         ZulipLoadOlder,
@@ -215,12 +214,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         // `Editor` (JoinLines, git::Diff), and gpui prefers the deeper match,
         // so a root-level `RhoGui` binding would lose while typing.
         KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
-        // `tab` is the verdicts over a card and the fields on the draft: one
-        // action, and the handler asks the draft first.
         KeyBinding::new(
             "tab",
-            VerdictMenu,
-            Some("RhoGui > Editor && !showing_completions"),
+            RoleCycle,
+            Some("RhoGui > Editor && !showing_completions && !VimDeal"),
         ),
         KeyBinding::new(
             "shift-tab",
@@ -623,8 +620,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([KeyBinding::new("g g", TranscriptTop, Some(context))]);
     }
     // Vim is vim on every surface: a card is read, searched and yanked like
-    // any buffer, and the verdicts live in the transient `tab` opens.
-    // `shift-u` stays a key of its own because undoing a verdict is
+    // any buffer, and the verdicts live in the transient one tap of `shift`
+    // opens. `shift-u` stays a key of its own because undoing a verdict is
     // the same verb whether or not the card is still on screen.
     for context in [
         "RhoGui > Editor",

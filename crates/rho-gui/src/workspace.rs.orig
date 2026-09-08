@@ -82,8 +82,7 @@ use crate::{
     SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackFindMessage,
     SlackMarkReadBefore, SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch,
     SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
-    UndoVerdict, UploadGuiTelemetry, VerdictMenu, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow,
+    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -448,6 +447,11 @@ pub struct Workspace {
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     pub(crate) active_context: ContextId,
+    last_shift_tap: Option<std::time::Instant>,
+    /// When `shift` went down on its own, if it is still down and still a
+    /// candidate for a tap. Cleared the moment another key or modifier
+    /// joins it, which is what makes holding it for a chord silent.
+    shift_down_at: Option<std::time::Instant>,
     shell_touches: HashMap<TouchId, ShellTouchContact>,
     shell_touch_was_multi: bool,
     shell_touch_committed: bool,
@@ -950,8 +954,23 @@ impl Workspace {
                 control = event.keystroke.modifiers.control,
                 alt = event.keystroke.modifiers.alt,
                 platform = event.keystroke.modifiers.platform,
+                shift_down = this.shift_down_at.is_some(),
                 "keystroke"
             );
+            // A key arriving while `shift` is down means it was being held
+            // for that key, so it was never a tap. `shift`'s own keystroke
+            // is not such a key and never decides anything: a platform may
+            // deliver it before it updates the modifier state, and deciding
+            // here opened the menu on every press. Only modifiers-changed
+            // decides a tap.
+            let bare_shift = event.keystroke.key == "shift"
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform;
+            if !bare_shift {
+                this.shift_down_at = None;
+                this.last_shift_tap = None;
+            }
         });
         let mut last_window_active = None;
         let window_activation_subscription =
@@ -988,6 +1007,8 @@ impl Workspace {
             history: None,
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
+            last_shift_tap: None,
+            shift_down_at: None,
             shell_touches: HashMap::new(),
             shell_touch_was_multi: false,
             shell_touch_committed: false,
@@ -3956,17 +3977,14 @@ impl Workspace {
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
-    /// the body. On agent views it does nothing, and says so, so that the
-    /// key can be the verdicts there.
-    fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    /// the body. On agent views it does nothing.
+    fn cycle_draft_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
         {
             self.draft_model
                 .update(cx, |view, cx| view.toggle_field(&editor, window, cx));
-            return true;
         }
-        false
     }
 
     /// Shift-Tab in the draft walks the rows the other way round, the way
@@ -6498,28 +6516,76 @@ impl Workspace {
     /// How long `shift` may be held and still count as a tap. Longer than
     /// this and the reader is holding it for something, even if the
     /// something never arrived.
-    /// `tab`, wherever it lands. On the draft it walks the fields. With the
-    /// verdicts open it is Home, which the menu's own `tab` row says. With
-    /// another menu or a prompt holding the keyboard it is theirs. Over a
-    /// card it opens the verdicts; over a surface that is no card it goes
-    /// Home, and from Home it is the way back.
-    fn verdict_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.cycle_draft_field(window, cx) {
+    const SHIFT_TAP_HOLD: Duration = Duration::from_millis(300);
+
+    /// The `shift` tap, decided on release. Opening the menu on the press
+    /// put it under the reader's uppercase letter, which then landed in it;
+    /// a tap is `shift` down and up with nothing in between.
+    fn shift_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.modifiers;
+        tracing::debug!(
+            shift = modifiers.shift,
+            control = modifiers.control,
+            alt = modifiers.alt,
+            platform = modifiers.platform,
+            held_ms = self.shift_down_at.map(|down| down.elapsed().as_millis()),
+            "modifiers changed"
+        );
+        if modifiers.shift {
+            // Down. Only `shift` on its own can still become a tap: with
+            // another modifier already held this is a chord being built.
+            self.shift_down_at = (!modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+                && !modifiers.function)
+                .then(std::time::Instant::now);
             return;
         }
+        let Some(down) = self.shift_down_at.take() else {
+            return;
+        };
+        if down.elapsed() > Self::SHIFT_TAP_HOLD {
+            return;
+        }
+        self.shift_tapped(window, cx);
+    }
+
+    fn shift_tapped(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        // The second tap is Home, whether it comes quickly on a surface that
+        // is not a card or as the `shift` row of the verdict transient the
+        // first tap opened. There is no timer on the second one: the menu is
+        // on screen saying so.
         if self.verdict_transient_open() {
+            self.last_shift_tap = None;
             self.close_menu(window, cx);
             self.toggle_overview(window, cx);
         } else if self.has_modal_overlay() {
-        } else if !self.open_verdict_transient(window, cx) {
+            // A menu or a prompt is already holding the keyboard: shift
+            // belongs to whatever the reader is typing there.
+            self.last_shift_tap = None;
+        } else if self
+            .last_shift_tap
+            .is_some_and(|last| now.duration_since(last) <= Self::SHIFT_TAP_HOLD)
+        {
+            self.last_shift_tap = None;
             self.toggle_overview(window, cx);
+        } else {
+            self.last_shift_tap = Some(now);
+            self.open_verdict_transient(window, cx);
         }
     }
 
-    /// `tab`: the verdicts, over whatever card is in view. The card is the
-    /// surface the reader is on (or the row under the cursor on Home), so a
-    /// verdict follows the eye rather than a mode. Returns whether there
-    /// was a card to open it over; with none, the key goes Home instead.
+    /// One tap of `shift`: the verdicts, over whatever card is in view. The
+    /// card is the surface the reader is on (or the row under the cursor on
+    /// Home), so a verdict follows the eye rather than a mode. Returns
+    /// whether there was a card to open it over; with none, the tap is left
+    /// to the double tap that reaches Home.
     pub(crate) fn open_verdict_transient(
         &mut self,
         window: &mut Window,
@@ -6820,7 +6886,6 @@ impl Workspace {
             Command::NewTerminal => self.cmd_term(true, window, cx),
             Command::UndoVerdict => window.dispatch_action(Box::new(crate::UndoVerdict), cx),
             Command::Quit => cx.quit(),
-            Command::Home => self.toggle_overview(window, cx),
             Command::SlackReact(name) => self.slack_react(&name, window, cx),
             Command::SlackReactByName => self.prompt_slack_react(window, cx),
             Command::SlackConversations => self.open_slack(window, cx),
@@ -8817,9 +8882,7 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .capture_touch(cx.listener(Self::shell_touch))
-            .on_action(cx.listener(|this, _: &VerdictMenu, window, cx| {
-                this.verdict_key(window, cx);
-            }))
+            .on_modifiers_changed(cx.listener(Self::shift_modifiers_changed))
             .on_scroll_wheel(cx.listener(Self::journal_scroll))
             .on_linux_pointer_axis(cx.listener(Self::journal_linux_scroll))
             .on_action(cx.listener(Self::submit_prompt))

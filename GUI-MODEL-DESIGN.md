@@ -56,7 +56,7 @@ needs.
    set for dealing. Every one of them updated per change.
 3. **Screens**, each holding the rows it draws: map, Home, Find,
    transcript, draft. A change updates the rows it touches. **Window**
-   state (focus, which screen is up, key context, echo, shift tap,
+   state (focus, which screen is up, key context, echo, `tab`'s menu,
    transients) is not about agents and holds none.
 
 Flow is one direction: model → state → screens. Commands go back the same

@@ -927,7 +927,7 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
 
 /// Deal mode took `d`, `x`, `s`, `t` and `f` from every card, so a card
 /// could not be read like the buffer it is. The verdicts moved into the
-/// transient `tab` opens, and the letters belong to vim again on
+/// transient a tap of `shift` opens, and the letters belong to vim again on
 /// every surface. `shift-u` is the exception: undoing a verdict is the same
 /// verb wherever the card is.
 #[gpui::test]
@@ -1202,10 +1202,82 @@ fn overview_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     workspace
 }
 
-/// `tab`, as a keystroke: the verdicts over a card, Home over none, and
-/// Home again from the verdict menu's own row.
-fn press_tab(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
-    cx.simulate_keystrokes(**workspace, "tab");
+/// The `shift` tap as the platform delivers it: the modifier down, then up,
+/// with nothing in between. The tap fires on the release, so a test that
+/// only sent the keystroke would be testing a press that no longer opens
+/// anything.
+fn tap_shift(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    hold_shift(workspace, true, cx);
+    hold_shift(workspace, false, cx);
+}
+
+/// The `shift` key arriving as a keystroke of its own while it is held. Some
+/// platforms report the modifier this way, and it is what the old press-time
+/// tap fired on.
+fn press_held_shift_key(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    key: "shift".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// The `shift` keystroke as a platform delivers it when the modifier state
+/// has not caught up yet: the key is shift and the modifiers read clear.
+fn press_shift_key_with_modifiers_clear(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+) {
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers::default(),
+                    key: "shift".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// One half of the tap: `shift` going down, or coming back up.
+fn hold_shift(workspace: &WindowHandle<Workspace>, down: bool, cx: &mut TestAppContext) {
+    let modifiers = gpui::Modifiers {
+        shift: down,
+        ..Default::default()
+    };
+    // Outside an entity update: the listener is the workspace's own, and it
+    // cannot borrow itself twice.
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
+                modifiers,
+                capslock: Default::default(),
+            }),
+            cx,
+        );
+    })
+    .unwrap();
     cx.run_until_parked();
 }
 
@@ -4255,12 +4327,69 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
         .unwrap();
 }
 
-/// `tab` is the verdicts, over the card in view, and the letters they used
-/// to steal stay vim's. This is the whole of the change: the key opens a
-/// menu that says what the keys are, and `d` in it writes exactly what deal
-/// mode's `d` wrote.
+/// `shift` held for an uppercase letter is a modifier, not a tap. Opening
+/// the menu on the press put it under the letter the reader was in the
+/// middle of typing, which then landed in the menu instead of the buffer.
 #[gpui::test]
-fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
+fn shift_held_for_a_letter_never_opens_the_verdicts(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Down, the letter, up: what typing `G` looks like from here. The
+    // platform sends the modifier as a keystroke of its own as well, with
+    // shift already held, which is what the old press-time tap fired on.
+    hold_shift(&workspace, true, cx);
+    press_held_shift_key(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the press alone opens nothing: it may still be a chord"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift-g");
+    hold_shift(&workspace, false, cx);
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "a held shift is a modifier, so the release opens nothing"
+            );
+        })
+        .unwrap();
+
+    // And the tap that follows still works: the cancelled hold left nothing
+    // behind that swallows the next one.
+    tap_shift(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "the next bare tap still opens the verdicts"
+            );
+        })
+        .unwrap();
+}
+
+/// One tap of `shift` is the verdicts, over the card in view, and the
+/// letters they used to steal stay vim's. This is the whole of the change:
+/// the tap opens a menu that says what the keys are, and `d` in it writes
+/// exactly what deal mode's `d` wrote.
+#[gpui::test]
+fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let dealt = desk.due_note(None, "Card in view");
 
@@ -4275,13 +4404,13 @@ fn tab_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
             assert!(
                 workspace.verdict_transient_open(),
-                "tab over a card opens the verdicts"
+                "a tap of shift over a card opens the verdicts"
             );
         })
         .unwrap();
@@ -4362,6 +4491,50 @@ fn an_unfiled_agent_that_wants_the_user_is_still_dealt(cx: &mut TestAppContext) 
         .unwrap();
 }
 
+/// A `shift` keystroke that reports shift already up is not a tap. On a
+/// platform that delivers the keystroke before it updates the modifier
+/// state, every press looks like that, and treating it as a completed tap
+/// opened the verdicts on every press of shift. Only modifiers-changed
+/// decides.
+#[gpui::test]
+fn a_bare_shift_keystroke_opens_nothing(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    press_shift_key_with_modifiers_clear(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the keystroke alone is not a tap"
+            );
+        })
+        .unwrap();
+
+    // The real press and release that follows it still taps.
+    tap_shift(&workspace, cx);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "down and up with nothing between is the tap"
+            );
+        })
+        .unwrap();
+}
+
 /// Snooze end to end through the transient, every unit the fingers know.
 /// It was an operator in deal mode, `ss` for a day and `45sm` for
 /// forty-five minutes; the count now goes inside the menu, where the units
@@ -4396,7 +4569,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         cx.run_until_parked();
 
         let (expected, said) = snooze_target(unit, count as i64, chrono::Local::now());
-        press_tab(&workspace, cx);
+        tap_shift(&workspace, cx);
         cx.simulate_keystrokes(*workspace, keys);
         cx.run_until_parked();
         workspace
@@ -4463,7 +4636,7 @@ fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppC
         })
         .unwrap();
 
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     let after = workspace
         .update(cx, |workspace, _, cx| {
@@ -4500,8 +4673,8 @@ fn the_verdicts_open_under_the_point_and_leave_it_where_it_was(cx: &mut TestAppC
         .unwrap();
 }
 
-/// The root menu takes the keyboard, so `tab` no longer reaches Home
-/// while it is open: with a menu up, the key belongs to the menu. Three steps
+/// The root menu takes the keyboard, so `shift` no longer reaches Home
+/// while it is open: with a menu up, a tap belongs to the menu. Three steps
 /// down and three escapes back, with the point where it started — the whole
 /// way back, not one step of it. The buffer is not touched on the way: the
 /// menu is drawn at the bottom of the window, over the surface, so no row is
@@ -4562,7 +4735,7 @@ fn the_root_menu_opens_at_the_bottom_and_escape_retraces_it(cx: &mut TestAppCont
             );
             assert!(
                 !workspace.verdict_transient_open(),
-                "the root menu is not the verdicts, so tab is not Home"
+                "the root menu is not the verdicts, so shift is not Home"
             );
             assert_eq!(point(workspace, cx), before, "the point did not move");
         })
@@ -4736,7 +4909,7 @@ fn escape_in_a_submenu_returns_to_the_menu_it_came_from(cx: &mut TestAppContext)
         .unwrap();
     cx.run_until_parked();
 
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     cx.simulate_keystrokes(*workspace, "s");
     cx.run_until_parked();
@@ -4763,11 +4936,12 @@ fn escape_in_a_submenu_returns_to_the_menu_it_came_from(cx: &mut TestAppContext)
         .unwrap();
 }
 
-/// A second `tab` is Home: the first put the verdicts on screen and the
-/// menu's own `tab` row says the next one leaves. The second press reaches
-/// the menu, not the editor, so it is the menu's row that answers it.
+/// The second tap of `shift` is Home: the first tap put the verdicts on
+/// screen and the menu's own `shift` row says the next one leaves. There
+/// is no timer on it, unlike the old double tap, because the menu is on
+/// screen saying what it does.
 #[gpui::test]
-fn a_second_tab_leaves_the_card_for_home(cx: &mut TestAppContext) {
+fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     desk.due_note(None, "Card in view");
 
@@ -4781,7 +4955,7 @@ fn a_second_tab_leaves_the_card_for_home(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -4790,13 +4964,13 @@ fn a_second_tab_leaves_the_card_for_home(cx: &mut TestAppContext) {
         })
         .unwrap();
 
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
             assert!(
                 !workspace.verdict_transient_open(),
-                "the second tab closes the verdicts"
+                "the second tap closes the verdicts"
             );
             assert_eq!(
                 workspace.current_surface_name_for_test(),
@@ -5030,11 +5204,8 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         .unwrap();
 }
 
-/// Over a surface that is no card, `tab` has no verdicts to open, so it
-/// goes Home in one press; from Home it is the way back.
 #[gpui::test]
-fn tab_over_no_card_opens_home(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
+fn double_shift_opens_home(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -5042,14 +5213,16 @@ fn tab_over_no_card_opens_home(cx: &mut TestAppContext) {
             assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
+    tap_shift(&workspace, cx);
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
     // Pressing it again is the way back to what the reader was reading.
-    press_tab(&workspace, cx);
+    tap_shift(&workspace, cx);
+    tap_shift(&workspace, cx);
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "current");
@@ -7966,8 +8139,8 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
 /// agent the user has not filed has no row on the desk, so the lookup that
 /// answers "which node is this agent" found nothing and the row fell
 /// through to the surface — and Home is a list that stands for no node, so
-/// the row named nothing: `tab` opened nothing and said nothing.
-/// Filing an agent is one of the things that key is for, so the row that
+/// the row named nothing: one tap of shift opened nothing and said nothing.
+/// Filing an agent is one of the things that tap is for, so the row that
 /// most needs the menu was the one that could not open it.
 /// The draft's start field stops offering an agent the user muted, and the
 /// handle still reaches it. A mute is about what rho draws, not about
@@ -8289,7 +8462,7 @@ fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppCon
             );
             assert!(
                 workspace.open_verdict_transient(window, cx),
-                "tab opens the verdicts over it"
+                "one tap of shift opens the verdicts over it"
             );
         })
         .unwrap();

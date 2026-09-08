@@ -75,8 +75,6 @@ pub(crate) enum Command {
     NewTerminal,
     UndoVerdict,
     Quit,
-    /// Home, from the verdict menu's own `tab` row.
-    Home,
     // Slack.
     /// Put this emoji on the message under the point, or take the
     /// reader's own off if it is already there. Slack's shortcode without
@@ -156,11 +154,11 @@ pub(crate) enum VerdictAction {
 /// application's own values in it.
 pub(crate) type Menu = rho_window::transient::Transient<MenuAction>;
 
-/// `tab` — the verdicts, on the card under the point. Deal mode used to
-/// take `d`, `x`, `s`, `t` and `f` from every dealt surface, so a card could
-/// not be read, searched or yanked like the buffer it is; the keys live here
-/// instead and vim keeps its own everywhere. `tab` again is Home. It was a
-/// tap of `shift` until the user found the modifier distracting.
+/// One tap of `shift` — the verdicts, on the card under the point. Deal mode
+/// used to take `d`, `x`, `s`, `t` and `f` from every dealt surface, so a card
+/// could not be read, searched or yanked like the buffer it is; the keys live
+/// here instead and vim keeps its own everywhere. `shift` again is Home, which
+/// is what the old double tap did.
 pub(crate) fn verdict_menu() -> Menu {
     Menu::new("verdict")
         .item("d", "done", MenuAction::Verdict(VerdictAction::Done))
@@ -183,7 +181,6 @@ pub(crate) fn verdict_menu() -> Menu {
             "open the top card",
             MenuAction::Verdict(VerdictAction::Pull),
         )
-        .item("tab", "home", MenuAction::Command(Command::Home))
         .counted()
 }
 
