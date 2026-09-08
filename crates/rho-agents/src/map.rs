@@ -753,6 +753,21 @@ impl AgentMap {
             .filter(|n| !n.trim().is_empty())
             .map_or_else(|| id.clone(), |n| format!("{n} ({id})"))
     }
+    /// Where the user filed the agent, after its name. The labels are the
+    /// ones this map already holds for it — the desk's filing, fed in by
+    /// `set_agent_filings` — so a name costs a lookup and a join, and a
+    /// frame that draws k agents pays for k of them and nothing else.
+    ///
+    /// An agent filed nowhere reads exactly as it did before: a name with
+    /// no labels has nothing to say about placement.
+    pub fn agent_name_with_labels(&self, agent_id: AgentId, name: String) -> String {
+        match self.agent_summary(agent_id) {
+            Some(agent) if !agent.labels.is_empty() => {
+                format!("{name} · {}", agent.labels.join(" › "))
+            }
+            _ => name,
+        }
+    }
     /// What the user last said to the agent, for finding it by the words
     /// they remember rather than by a name they never gave it.
     pub fn agent_last_user_message(&self, agent_id: AgentId) -> Option<&str> {

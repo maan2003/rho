@@ -1363,7 +1363,9 @@ impl Workspace {
         // because a card and the surface it opens are the same agent and
         // were reading as two.
         let mut rows = crate::home::split_hand(&hand.cards, |card| {
-            crate::home::card_title(card, |agent_id| registry.agent_display_label(agent_id))
+            crate::home::card_title(card, |agent_id| {
+                registry.agent_name_with_labels(agent_id, registry.agent_display_label(agent_id))
+            })
         });
         let now_ms = now.timestamp_millis();
         // An agent created by an agent belongs to its creator and is not
@@ -1386,7 +1388,13 @@ impl Workspace {
                 let facts = self.registry.agent_facts(agent_id);
                 crate::home::RunningRow {
                     agent_id,
-                    name: self.registry.agent_display_label(agent_id),
+                    // The name, then where the user filed it: two agents
+                    // doing the same thing in different places read as two
+                    // rows rather than as one name said twice.
+                    name: self.registry.agent_name_with_labels(
+                        agent_id,
+                        self.registry.agent_display_label(agent_id),
+                    ),
                     // Where it is filed, not the whole path: the row is
                     // about the agent, and the leaf is what names the work.
                     topic: self
@@ -4193,7 +4201,9 @@ impl Workspace {
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::Usage => "usage".to_owned(),
             SurfaceKey::DeskNode { .. } => "note".to_owned(),
-            SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
+            SurfaceKey::Transcript(agent_id) => self
+                .registry
+                .agent_name_with_labels(*agent_id, self.registry.agent_display_label(*agent_id)),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_display_label(*agent_id))

@@ -7608,6 +7608,26 @@ impl DeskFixture {
         id
     }
 
+    /// A label the user made, and the act of putting one on a row. A label
+    /// is placement: the row keeps whatever parent it already had.
+    fn label(&mut self, name: &str) -> rho_desk::cells::Id {
+        self.next_node += 1;
+        let id = rho_desk::cells::Id::Label(rho_desk::cells::Uuid([self.next_node as u8; 16]));
+        self.file(id.clone(), None);
+        self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
+        id
+    }
+
+    fn labelled(&mut self, id: rho_desk::cells::Id, label: rho_desk::cells::Id) {
+        self.set(
+            id,
+            rho_desk::cells::Property::Labeled {
+                label,
+                present: true,
+            },
+        );
+    }
+
     /// An agent the user filed under a note.
     fn agent_row(&mut self, parent: rho_desk::cells::Id, agent_id: AgentId) -> rho_desk::cells::Id {
         let id = rho_desk::cells::Id::Agent(agent_id);
@@ -7984,6 +8004,55 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
             );
         })
         .unwrap();
+}
+
+/// Where the user filed an agent is half of which agent it is: two of them
+/// on the same kind of work read as one name said twice until the row says
+/// where each one lives. The labels are the ones the registry already holds
+/// for the agent, so the row costs a lookup and a join.
+#[gpui::test]
+fn a_labelled_agents_home_row_reads_its_labels(cx: &mut TestAppContext) {
+    let running = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "phone feed");
+    let row = desk.agent_row(heading, running);
+    let rho = desk.label("rho");
+    let cargo = desk.label("cargo");
+    desk.labelled(row.clone(), rho);
+    desk.labelled(row, cargo);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        activity: Some("wiring the flick recogniser".to_owned()),
+                        turn_running: true,
+                        ..ui_head(running)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let tag = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.registry.agent_id_label(running)
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains(&format!("{tag} · rho › cargo")),
+        "the running row names the agent and then where it is filed, got {text:?}"
+    );
 }
 
 #[gpui::test]
