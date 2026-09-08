@@ -58,6 +58,9 @@ pub struct ConversationView {
     /// cursor and the view on their own, and none of that is the reader
     /// asking for anything.
     editing: bool,
+    /// Set by a rebuild: every row went, so the scroll the reader had is
+    /// meaningless and the point the refresh puts back is centred.
+    centre_on_the_point: bool,
     /// How long the last redraw took. The per-event path is one of the few
     /// where a number is the requirement, so the surface times itself and a
     /// test reads it, rather than a test timing the socket and the executor
@@ -449,6 +452,7 @@ impl ConversationView {
             editor,
             revision: 0,
             editing: false,
+            centre_on_the_point: false,
             #[cfg(any(test, feature = "fake"))]
             last_refresh: std::time::Duration::ZERO,
             fill: Fill::default(),
@@ -687,7 +691,8 @@ impl ConversationView {
     }
 
     /// Puts the point on a named message, the way a reader does by
-    /// scrolling to it. For the test that pins where the point ends up when
+    /// scrolling to it. Used by the rebuild to put the reader back where
+    /// they were, and by the test that pins where the point ends up when
     /// the message under it changes: a test that cannot place the point
     /// cannot say what happens to it.
     pub fn place_cursor_on_for_test(
@@ -696,6 +701,10 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.place_cursor_on(ts, window, cx)
+    }
+
+    fn place_cursor_on(&mut self, ts: &Ts, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(start) = self
             .transcript
             .range_of(&Row::Message(ts.clone()))
@@ -738,13 +747,21 @@ impl ConversationView {
 
     /// The message the cursor is on, if the transcript has one there.
     fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
-        let row = self.cursor_row(cx) as u32;
-        let Row::Message(ts) = self.transcript.key_at_row(row, cx)?.clone() else {
-            return None;
-        };
+        let ts = self.cursor_message_ts(cx)?;
         self.shown_messages(cx)
             .into_iter()
             .find(|message| message.ts == ts)
+    }
+
+    /// Which message the point is on, without reading the message itself:
+    /// the transcript's own search, so a refresh can ask it twice without
+    /// paying for a pass over what is shown.
+    fn cursor_message_ts(&self, cx: &mut Context<Self>) -> Option<Ts> {
+        let row = self.cursor_row(cx) as u32;
+        match self.transcript.key_at_row(row, cx) {
+            Some(Row::Message(ts)) => Some(ts.clone()),
+            _ => None,
+        }
     }
 
     /// The emoji a reaction menu should offer over the message under the
@@ -1307,6 +1324,14 @@ impl ConversationView {
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(test, feature = "fake"))]
         let started = std::time::Instant::now();
+        // The point is the reader's, and no redraw is allowed to move it.
+        // An anchor keeps it through an edit that leaves the message alone,
+        // but not through one that rewrites the row it sits on or inserts a
+        // day rule in front of it: there the anchor is left on the row that
+        // slid under it, which for a day rule is a row that is not a
+        // message at all. Asked as a key, which is the transcript's own
+        // search rather than a pass over what is shown.
+        let was_on = self.cursor_message_ts(cx);
         let Some((revision, updates)) = self
             .session
             .read(cx)
@@ -1331,6 +1356,19 @@ impl ConversationView {
             }
         }
         self.revision = revision;
+        // Back on the message it was on, if the redraw moved it off. The
+        // reader chose that message; everything below is the surface's own
+        // placing, and each of those is asked for.
+        if let Some(ts) = was_on
+            && self.cursor_message_ts(cx) != Some(ts.clone())
+            && self.place_cursor_on(&ts, window, cx)
+            && std::mem::take(&mut self.centre_on_the_point)
+        {
+            self.editor.update(cx, |editor, cx| {
+                editor.request_autoscroll(Autoscroll::center(), cx);
+            });
+        }
+        self.centre_on_the_point = false;
         // A deal may open on a message the tail does not hold yet: the page
         // that brings it in is where the cursor goes.
         self.refresh_unread(cx);
@@ -1441,6 +1479,10 @@ impl ConversationView {
         }
         self.transcript.insert_before(None, items, cx);
         self.editing = false;
+        // The rows the scroll was measured against are gone with them, so
+        // the point the refresh puts back is centred rather than left
+        // wherever the new text happens to put it.
+        self.centre_on_the_point = true;
     }
 
     /// Carries out the plan: each operation is one transcript edit.
