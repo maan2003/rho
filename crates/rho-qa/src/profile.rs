@@ -760,7 +760,7 @@ mod tests {
         let line = summary.render();
         assert!(
             line.ends_with(
-                "; longest prepaint pass prepaint/lines 9 spans 37 ms total, p50 4.12                  p99 4.41 ms at 50 rows"
+                "; longest prepaint pass prepaint/lines 9 spans 37 ms total, p50 4.12 p99 4.41 ms at 50 rows"
             ),
             "the pass clause is not on the line as written: {line}"
         );
