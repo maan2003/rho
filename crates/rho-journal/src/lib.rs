@@ -480,6 +480,16 @@ pub struct DealerPolicySnapshot {
     pub blocked_reply_slope_per_day: f64,
     pub fyi_reply_pace_days: f64,
     pub thread_reply_head_start: f64,
+    /// Where a channel's own unread traffic starts, and what being
+    /// answered by somebody else takes off it. Added after the first
+    /// journals were written, so a session recorded before the channel
+    /// curve existed decodes with both at zero, which is what it had.
+    #[senax(default)]
+    #[serde(default)]
+    pub channel_traffic_head_start: f64,
+    #[senax(default)]
+    #[serde(default)]
+    pub channel_answered_drop: f64,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,
@@ -1061,6 +1071,53 @@ mod tests {
         assert!(error.to_string().contains("exit the GUI"));
     }
 
+    /// A journal written before the channel curve existed still decodes.
+    /// The fields are new, so the run that wrote those bytes had no
+    /// channel curve, and zero is exactly what it had.
+    #[test]
+    fn a_policy_written_before_the_channel_curve_still_decodes() {
+        use bytes::BytesMut;
+        use senax_encoder::{Decoder as _, Encoder as _};
+
+        /// The struct as it stood before the two channel fields, so this
+        /// is the shape of the bytes already on disk and not a mock of it.
+        #[derive(senax_encoder::Encode)]
+        struct WithoutTheChannelCurve {
+            queue_floor: f64,
+            blocked_reply_head_start: f64,
+            blocked_reply_slope_per_day: f64,
+            fyi_reply_pace_days: f64,
+            thread_reply_head_start: f64,
+            skip_cooldown_minutes: i64,
+            lamp_threshold: f64,
+            chime_threshold: f64,
+            agent_recency_bonus: f64,
+            agent_recency_window_ms: i64,
+        }
+
+        let mut buffer = BytesMut::new();
+        WithoutTheChannelCurve {
+            queue_floor: -1.0,
+            blocked_reply_head_start: 1.0,
+            blocked_reply_slope_per_day: 12.0,
+            fyi_reply_pace_days: 3.0,
+            thread_reply_head_start: 1.1,
+            skip_cooldown_minutes: 15,
+            lamp_threshold: 2.0,
+            chime_threshold: 3.0,
+            agent_recency_bonus: 4.0,
+            agent_recency_window_ms: 3_600_000,
+        }
+        .encode(&mut buffer)
+        .unwrap();
+
+        let mut bytes = buffer.freeze();
+        let policy = DealerPolicySnapshot::decode(&mut bytes).unwrap();
+        assert_eq!(policy.thread_reply_head_start, 1.1);
+        assert_eq!(policy.channel_traffic_head_start, 0.0);
+        assert_eq!(policy.channel_answered_drop, 0.0);
+    }
+
     #[test]
     fn session_started_round_trips_build_and_policy_context() {
         let event = Event::SessionStarted {
@@ -1074,6 +1131,8 @@ mod tests {
                 blocked_reply_slope_per_day: 3.0,
                 fyi_reply_pace_days: 4.0,
                 thread_reply_head_start: 5.0,
+                channel_traffic_head_start: 11.0,
+                channel_answered_drop: 12.0,
                 skip_cooldown_minutes: 6,
                 lamp_threshold: 7.0,
                 chime_threshold: 8.0,

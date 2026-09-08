@@ -76,6 +76,8 @@ pub(crate) fn dealer_policy_snapshot() -> rho_journal::DealerPolicySnapshot {
         blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
         fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
         thread_reply_head_start: THREAD_REPLY_HEAD_START,
+        channel_traffic_head_start: CHANNEL_TRAFFIC_HEAD_START,
+        channel_answered_drop: CHANNEL_ANSWERED_DROP,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,
