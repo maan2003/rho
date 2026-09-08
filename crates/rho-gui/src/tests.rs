@@ -32,6 +32,7 @@ mod history;
 mod inlay_cost;
 mod minibuffer;
 mod record_anchors;
+mod running_turn_elapsed;
 mod scene_walk;
 mod story;
 mod tool_output_not_drawn;

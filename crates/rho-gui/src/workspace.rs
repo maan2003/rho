@@ -1394,10 +1394,7 @@ impl Workspace {
                         .breadcrumb_for_agent(agent_id, cx)
                         .and_then(|path| path.rsplit(" › ").next().map(str::to_owned))
                         .unwrap_or_default(),
-                    elapsed: crate::home::elapsed_label(
-                        facts.last_user_message_at.0 as i64,
-                        now_ms,
-                    ),
+                    elapsed: crate::home::running_elapsed_label(&facts, now_ms),
                     last_line: self
                         .registry
                         .agent_activity(agent_id)

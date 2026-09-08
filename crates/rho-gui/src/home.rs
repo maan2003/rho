@@ -120,6 +120,17 @@ pub(crate) fn elapsed_label(since_ms: i64, now_ms: i64) -> String {
     age_label(((now_ms - since_ms).max(0)) as f64 / 86_400_000.0)
 }
 
+/// How long the running turn has run, for the row that says it is running.
+/// Empty when the head says a turn runs without saying since when, which
+/// is every turn that started before the client was listening: a row with
+/// no start has no duration to print, and printing one from a missing
+/// start is how a turn came to have been running since the epoch.
+pub(crate) fn running_elapsed_label(facts: &rho_agents::AgentFacts, now_ms: i64) -> String {
+    facts.turn_started_at.map_or_else(String::new, |started| {
+        elapsed_label(started.0 as i64, now_ms)
+    })
+}
+
 /// What a Home row offers when the cursor is on it. Home closes nothing
 /// and opens nothing of its own: a row is a card, and a card is dealt.
 #[derive(Clone, Debug, PartialEq, Eq)]
