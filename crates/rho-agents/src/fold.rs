@@ -434,11 +434,10 @@ impl TranscriptFold {
         })
     }
 
-    /// Each result lands on the call it answers.
-    ///
-    /// `pos` is where the raw log holds the outputs: the call keeps it so a
-    /// chunk that draws the call can ask for its body without searching.
-    fn finish_calls(&mut self, pos: AgentPos, results: &[ToolOutcome]) {
+    /// Each result lands on the call it answers: its status and its two
+    /// timestamps. Where the log holds the output is not kept, because
+    /// nothing in the transcript draws it.
+    fn finish_calls(&mut self, results: &[ToolOutcome]) {
         for result in results {
             let called = self
                 .blocks
@@ -457,7 +456,6 @@ impl TranscriptFold {
                 };
                 tool.started_at = Some(result.started_at);
                 tool.finished_at = Some(result.finished_at);
-                tool.result_at = Some(pos);
             }
         }
     }
@@ -517,9 +515,9 @@ impl TranscriptFold {
                         },
                     );
                 }
-                self.finish_calls(pos, results);
+                self.finish_calls(results);
             }
-            MirrorEvent::Results { results, .. } => self.finish_calls(pos, results),
+            MirrorEvent::Results { results, .. } => self.finish_calls(results),
             MirrorEvent::Replied {
                 text,
                 calls,
@@ -560,7 +558,6 @@ impl TranscriptFold {
                             finished_at: None,
                             metadata: None,
                             // Set when the event carrying its result closes it.
-                            result_at: None,
                         }),
                     );
                 }

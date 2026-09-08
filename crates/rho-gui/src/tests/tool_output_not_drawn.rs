@@ -21,11 +21,10 @@ use super::{
     user,
 };
 
-/// A call that has finished, with its output left in the log at `pos`.
-fn finished_call(id: &str, pos: u64) -> UiBlock {
-    let mut called = tool(id, UiToolStatus::Success, Some(1_000), Some(1_200));
-    called.result_at = Some(AgentPos(pos));
-    UiBlock::Tool(called)
+/// A call that has finished. Its output is in the daemon's log; nothing in
+/// the transcript records where, because nothing goes looking.
+fn finished_call(id: &str) -> UiBlock {
+    UiBlock::Tool(tool(id, UiToolStatus::Success, Some(1_000), Some(1_200)))
 }
 
 /// A call shows what was run and nothing under it, whether its output is
@@ -34,8 +33,7 @@ fn finished_call(id: &str, pos: u64) -> UiBlock {
 fn a_call_shows_what_was_run_and_never_what_it_said(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
-    let mut running = tool("call-one", UiToolStatus::Running, Some(1_000), None);
-    running.result_at = None;
+    let running = tool("call-one", UiToolStatus::Running, Some(1_000), None);
     feed_frame(
         &workspace,
         cx,
@@ -45,7 +43,7 @@ fn a_call_shows_what_was_run_and_never_what_it_said(cx: &mut TestAppContext) {
             vec![
                 user("look"),
                 UiBlock::Tool(running),
-                finished_call("call-two", 7),
+                finished_call("call-two"),
             ],
         ),
     );
@@ -62,16 +60,16 @@ fn a_call_shows_what_was_run_and_never_what_it_said(cx: &mut TestAppContext) {
     );
 }
 
-/// Composing calls whose results are in the log asks for nothing. This is
-/// the half a reader cannot see: the transcript used to send one request
-/// per composed chunk naming every position its calls came from, and a
-/// reader scrolling history paid a round trip a chunk.
+/// Composing finished calls asks for nothing. This is the half a reader
+/// cannot see: the transcript used to send one request per composed chunk
+/// naming every position its calls came from, and a reader scrolling
+/// history paid a round trip a chunk.
 #[gpui::test]
-fn composing_calls_with_results_in_the_log_asks_for_nothing(cx: &mut TestAppContext) {
+fn composing_finished_calls_asks_for_nothing(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
     let calls = (0..8)
-        .map(|index| finished_call(&format!("call-{index}"), 10 + index))
+        .map(|index| finished_call(&format!("call-{index}")))
         .collect::<Vec<_>>();
     let mut blocks = vec![user("look")];
     blocks.extend(calls);
@@ -104,7 +102,7 @@ fn an_answer_nobody_asked_for_draws_nothing(cx: &mut TestAppContext) {
         &workspace,
         cx,
         agent_id,
-        state(Vec::new(), vec![user("look"), finished_call("call-one", 7)]),
+        state(Vec::new(), vec![user("look"), finished_call("call-one")]),
     );
 
     workspace

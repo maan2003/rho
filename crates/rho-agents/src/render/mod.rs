@@ -647,7 +647,6 @@ mod tests {
             started_at: None,
             finished_at: None,
             metadata: None,
-            result_at: None,
         }
     }
 

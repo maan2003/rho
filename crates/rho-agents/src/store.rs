@@ -230,7 +230,6 @@ pub fn block(item: &Item) -> UiBlock {
             finished_at: None,
             metadata: None,
             // Set when the event carrying its result closes it.
-            result_at: None,
         }),
     }
 }
