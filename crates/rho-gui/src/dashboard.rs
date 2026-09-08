@@ -1960,12 +1960,6 @@ fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
         .map(|page| rho_browser::PageId(uuid::Uuid::from_bytes(page.0)))
 }
 
-/// What a row that is not a note says. Agent rows carry their name in the
-
-/// What an area row calls itself in the picker.
-/// Every label as the path a person would type, `rho/agent`. The label
-/// axis only: a label filed under something that is not a label is named
-
 /// A note's title is the first line of its body. The rest of the body is
 /// the note itself: it belongs on the note's own surface, never in a path,
 /// a card, or a picker row.
