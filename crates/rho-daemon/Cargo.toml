@@ -52,6 +52,10 @@ senax-encoder.workspace = true
 text.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "fmt",
+] }
 url.workspace = true
 uuid.workspace = true
 
