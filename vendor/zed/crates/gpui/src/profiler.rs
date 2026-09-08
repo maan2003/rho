@@ -1205,12 +1205,19 @@ impl Drop for EditorTimingGuard {
     }
 }
 
-/// Who was on the main thread when no frame was being drawn.
+/// Who was on the main thread, under a name.
 ///
-/// The frame ring accounts for time inside `Window::draw` and nothing else,
-/// so main-thread work between frames is invisible in it — and that work is
-/// exactly what makes the *next* frame late. A record names its owner rather
-/// than leaving it to be guessed from a stack.
+/// The frame ring accounts for `Window::draw` as three numbers — prepaint,
+/// paint, present — and nothing else, so neither the work between frames nor
+/// the parts of a long prepaint has anywhere to be seen. Both are why a frame
+/// is late and neither is visible in a frame number, so a record names its
+/// owner rather than leaving it to be guessed from a stack.
+///
+/// Most records are of work outside a frame, which is where this started and
+/// what the named kinds below describe. A caller may also name a span inside
+/// one — the passes of a prepaint, say — under [`Self::Other`]; such a span is
+/// a share of a frame's own time and a reader that adds it to the
+/// between-frame total counts the same milliseconds twice.
 #[derive(Debug, Copy, Clone)]
 #[expect(missing_docs)]
 pub enum MainThreadWorkKind {
@@ -1259,9 +1266,14 @@ static MAIN_THREAD_WORK: spin::Mutex<MainThreadWorkLog> = spin::Mutex::new(MainT
     total_pushed: 0,
 });
 
-/// Records a span of main-thread work that happened outside a frame.
+/// Records a named span of main-thread work.
+///
+/// Usually work outside a frame; a caller that names a span inside one owns
+/// saying so in the label, since nothing here can tell the two apart.
 ///
 /// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+/// The ring is shared and bounded, so a caller that records per frame rather
+/// than per event is the one that decides how far back the log reaches.
 pub fn record_main_thread_work(work: MainThreadWork) {
     if !frame_trace_enabled() {
         return;

@@ -92,7 +92,7 @@ use std::{
     ops::{Deref, Range},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
@@ -8352,6 +8352,93 @@ impl Drop for EditorPrepaintGuard {
     }
 }
 
+/// What each pass of [`EditorElement::prepaint`] cost, timed on the stack and
+/// pushed to the profiler only for a frame whose prepaint already went long.
+///
+/// The frame log times prepaint whole, so a prepaint of 4.2 ms against a
+/// median of 1.4 says a frame missed and names nothing. Timing the passes is
+/// cheap — one clock read each — but recording them is not: a rig run draws
+/// about sixteen hundred frames, and a dozen records apiece would push the
+/// between-frame log out of the ring the two share. The question is only ever
+/// asked about a frame that went long, so the marks are taken always and
+/// recorded almost never.
+///
+/// A mark closes the segment *ending* with the pass it names rather than
+/// timing that call alone, so the segments sum to the whole prepaint exactly
+/// and no time hides between two passes. `prepaint/rest` is everything after
+/// the last mark: the popovers, the gutter menu, the toggles and the minimap.
+///
+/// A prepaint that returns early to re-wrap re-enters this function, and the
+/// abandoned attempt records nothing: the marks are dropped with it and the
+/// call that follows times itself from its own start. Such a frame therefore
+/// under-reports, by the work it did before deciding to start again.
+///
+/// The labels are `prepaint/<pass>`, the same shape a desk sync's passes use,
+/// with the difference that these are *inside* a frame and that one is not —
+/// a reader that adds them to the between-frame total is counting the draw
+/// twice.
+struct PrepaintPasses {
+    started: Instant,
+    last: Instant,
+    marks: [(&'static str, Duration); Self::MAX],
+    count: usize,
+}
+
+impl PrepaintPasses {
+    /// Marks a prepaint can hold. One more than it has passes, so a pass
+    /// added without a slot added is a dropped mark and not a panic.
+    const MAX: usize = 12;
+
+    /// The prepaint worth naming. The bound the user set is 4 ms on the whole
+    /// draw, of which prepaint is one part beside paint and the present, so
+    /// the interesting prepaints start below it; the shape seen on a rig is
+    /// 3.8 to 4.4 ms against a median of 1.4.
+    const LONG: Duration = Duration::from_millis(3);
+
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            marks: [("", Duration::ZERO); Self::MAX],
+            count: 0,
+        }
+    }
+
+    fn mark(&mut self, pass: &'static str) {
+        let now = Instant::now();
+        if self.count < Self::MAX {
+            self.marks[self.count] = (pass, now.saturating_duration_since(self.last));
+            self.count += 1;
+        }
+        self.last = now;
+    }
+
+    /// Closes the last segment and records the lot, if the prepaint went long.
+    ///
+    /// `rows` is the visible range, so a segment's cost per row means what a
+    /// frame's does; a pass that is flat in the rows drawn and long anyway is
+    /// the answer this exists to give.
+    fn finish(mut self, rows: u64) {
+        self.mark("prepaint/rest");
+        let ended = self.last;
+        if ended.saturating_duration_since(self.started) < Self::LONG {
+            return;
+        }
+        let mut start = self.started;
+        for (pass, took) in &self.marks[..self.count] {
+            let end = start + *took;
+            gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+                owner: gpui::profiler::MainThreadWorkKind::Other(pass),
+                start,
+                end,
+                work_units: rows,
+            });
+            start = end;
+        }
+    }
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = EditorRequestLayoutState;
     type PrepaintState = EditorLayout;
@@ -8468,9 +8555,11 @@ impl Element for EditorElement {
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    let mut passes = PrepaintPasses::new();
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
                         (editor.snapshot(window, cx), editor.read_only(cx))
                     });
+                    passes.mark("prepaint/snapshot");
                     let style = &self.style;
 
                     let rem_size = window.rem_size();
@@ -8988,6 +9077,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/line_numbers");
 
                     let mut expand_toggles =
                         window.with_element_namespace("expand_toggles", |window| {
@@ -9035,6 +9125,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/diff_hunks");
 
                     #[cfg(feature = "native")]
                     Self::layout_word_diff_highlights(
@@ -9214,6 +9305,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/indent_guides");
                     let indent_guides_for_spacers = indent_guides.clone();
 
                     let blocks = (!is_minimap)
@@ -9536,6 +9628,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    passes.mark("prepaint/blocks");
                     let line_elements = self.prepaint_lines(
                         start_row,
                         &mut line_layouts,
@@ -9546,6 +9639,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/lines");
 
                     window.with_element_namespace("blocks", |window| {
                         self.layout_blocks(
@@ -9596,6 +9690,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/cursors");
                     let navigation_overlay_paint_commands = self.layout_navigation_overlays(
                         &snapshot,
                         start_row..end_row,
@@ -9620,6 +9715,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/scrollbars");
 
                     let gutter_settings = EditorSettings::get_global(cx).gutter;
 
@@ -10013,6 +10109,7 @@ impl Element for EditorElement {
                         cursors: selections.len() as u64,
                     });
 
+                    passes.finish(end_row.0.saturating_sub(start_row.0).into());
                     EditorLayout {
                         mode,
                         defer_paint_until_rewrapped,
