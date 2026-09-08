@@ -84,3 +84,54 @@ fn composing_history_parses_what_it_draws(cx: &mut TestAppContext) {
         "a chunk composed for the page after this one is not parsed for this one"
     );
 }
+
+/// A row near the top of the opening tail: two hundred rows are composed
+/// when a transcript opens and the reader is at the bottom of them, so
+/// this one is a screen and a half above anything drawn.
+const TOP_OF_THE_OPENING_TAIL: u32 = 5;
+
+/// Opening parses the screen the reader opens on, and not the two hundred
+/// rows composed behind it.
+///
+/// The open is the one place the editor cannot parse what it draws for
+/// itself: it has not laid out yet, so it can see nothing and parses
+/// nothing. The transcript warms a window's rows from the tail instead of
+/// every buffer it composed.
+#[gpui::test]
+fn opening_parses_the_screen_it_opens_on(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history());
+    let editor = active_editor(&workspace, cx);
+
+    let (tail_has_language, tail_unparsed, top_has_language, top_unparsed) = workspace
+        .update(cx, |_, _, cx| {
+            let multi_buffer = editor.read(cx).buffer().clone();
+            let last_row = multi_buffer.read(cx).snapshot(cx).max_point().row;
+            let mut answer = Vec::new();
+            for row in [last_row.saturating_sub(2), TOP_OF_THE_OPENING_TAIL] {
+                let point = multi_buffer::MultiBufferPoint::new(row, 0);
+                let (buffer, _) = multi_buffer
+                    .read(cx)
+                    .point_to_buffer_offset(point, cx)
+                    .expect("a composed row");
+                answer.push(buffer.read(cx).language().is_some());
+                answer.push(buffer.update(cx, |buffer, cx| buffer.ensure_syntax_parsed(cx)));
+            }
+            (answer[0], answer[1], answer[2], answer[3])
+        })
+        .expect("read the two ends of the opening tail");
+
+    assert!(
+        tail_has_language && top_has_language,
+        "both rows have to hold syntax, or the questions are vacuous"
+    );
+    assert!(
+        !tail_unparsed,
+        "the transcript opens on its tail and the tail is parsed for it"
+    );
+    assert!(
+        top_unparsed,
+        "the rows composed behind the screen are parsed when the reader \
+         reaches them, not to open"
+    );
+}

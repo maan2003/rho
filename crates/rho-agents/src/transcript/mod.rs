@@ -41,8 +41,6 @@ use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 pub use elisions::HistoryFold;
 use elisions::{ElisionState, ElisionSync};
-use futures::FutureExt as _;
-use futures::future::LocalBoxFuture;
 use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};
 use language::{Buffer, Point};
@@ -299,7 +297,7 @@ impl TranscriptModel {
         text_buffers: Vec<(Reservation<Buffer>, TextBuffer)>,
         now_ms: u64,
         cx: &mut Context<V>,
-    ) -> Vec<LocalBoxFuture<'static, ()>> {
+    ) {
         debug_assert!(self.records.is_empty());
         debug_assert!(self.buffers.is_empty());
         debug_assert_eq!(prepared.chunks.len(), text_buffers.len());
@@ -311,11 +309,7 @@ impl TranscriptModel {
         self.uncomposed = prepared.first_block;
         self.agent_labels = prepared.agent_labels;
         let mut installed = Vec::with_capacity(prepared.chunks.len());
-        // Register newest buffers first; syntax activation below follows the
-        // same order so the visible tail leads the historical parser backlog.
-        for (chunk, (reservation, text_buffer)) in
-            prepared.chunks.into_iter().zip(text_buffers).rev()
-        {
+        for (chunk, (reservation, text_buffer)) in prepared.chunks.into_iter().zip(text_buffers) {
             let buffer = cx.insert_entity(reservation, |cx| {
                 let mut buffer = Buffer::build(text_buffer, None, language::Capability::Read);
                 if chunk.markdown {
@@ -327,7 +321,7 @@ impl TranscriptModel {
         }
 
         let mut gutters_changed = false;
-        for (chunk, buffer) in installed.into_iter().rev() {
+        for (chunk, buffer) in installed {
             {
                 let snapshot = buffer.read(cx);
                 let spans = chunk.spans;
@@ -371,30 +365,38 @@ impl TranscriptModel {
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
         self.apply_to_attachments(now_ms, &history, &live, gutters_changed, cx);
-        let parsing = Self::warm_syntax(
-            self.buffers.iter().rev().map(|turn| turn.buffer.clone()),
-            cx,
-        );
+        self.warm_first_screen(cx);
         cx.notify();
-        parsing
     }
 
-    fn warm_syntax<V: 'static>(
-        buffers: impl IntoIterator<Item = Entity<Buffer>>,
-        cx: &mut Context<V>,
-    ) -> Vec<LocalBoxFuture<'static, ()>> {
-        let mut parsing = Vec::new();
-        for buffer in buffers {
-            let has_language = buffer.read(cx).language().is_some();
-            if !has_language {
-                continue;
+    /// Parses the syntax of the buffers the window is about to draw.
+    ///
+    /// Everywhere else the editor does this for itself, on an excerpt
+    /// change, a display-map change or a scroll — but it parses what it
+    /// can see, and at open it has not laid out yet and can see nothing.
+    /// So the first screen is warmed here, and only the first screen: a
+    /// window's rows counted back from the tail, which is where a
+    /// transcript opens. What is above them is parsed when the reader
+    /// scrolls to it, by the element that draws it.
+    fn warm_first_screen<V: 'static>(&mut self, cx: &mut Context<V>) {
+        let mut rows = 0;
+        let mut screen = Vec::new();
+        for turn in self.buffers.iter().rev() {
+            if rows >= WINDOW_ROWS {
+                break;
             }
+            // Counted whether or not it has a language: a buffer with no
+            // syntax still takes up the screen the bound is written in.
+            rows += turn.buffer.read(cx).max_point().row as usize + 1;
+            if turn.buffer.read(cx).language().is_some() {
+                screen.push(turn.buffer.clone());
+            }
+        }
+        for buffer in screen {
             buffer.update(cx, |buffer, cx| {
                 buffer.ensure_syntax_parsed(cx);
             });
-            parsing.push(buffer.read(cx).parsing_idle().boxed_local());
         }
-        parsing
     }
 
     /// Attaches an editor showing this transcript (over whatever
@@ -1533,6 +1535,11 @@ impl TranscriptModel {
 /// fill a window twice over, so opening and the first page of scrolling
 /// draw without composing anything more.
 pub const OPENING_ROWS: usize = 200;
+
+/// A window's rows, which is what the opening tail is two of by the line
+/// above. What the open parses, since at open there is no laid-out editor
+/// to say which rows those are.
+const WINDOW_ROWS: usize = OPENING_ROWS / 2;
 
 /// Which end of the gap a composition step closes.
 ///

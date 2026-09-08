@@ -18,7 +18,6 @@ use editor::scroll::AutoscrollStrategy;
 use editor::{
     Editor, EditorMode, EditorRightPrompt, HighlightKey, Inlay, SelectionEffects, SizingBehavior,
 };
-use futures::future::join_all;
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
@@ -251,13 +250,15 @@ impl AgentModel {
                 })
                 .await;
             let text_buffers = reservations.into_iter().zip(text_buffers).collect();
-            let Ok(parsing) = this.update(cx, |this, cx| {
-                this.transcript
-                    .install_initial(prepared, text_buffers, now_ms, cx)
-            }) else {
+            if this
+                .update(cx, |this, cx| {
+                    this.transcript
+                        .install_initial(prepared, text_buffers, now_ms, cx);
+                })
+                .is_err()
+            {
                 return;
-            };
-            join_all(parsing).await;
+            }
             if this
                 .update(cx, |this, _| {
                     this.initial_load_ready = true;
