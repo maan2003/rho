@@ -1411,17 +1411,14 @@ impl ConversationView {
 
     /// Carries out the plan: each operation is one transcript edit.
     fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
-        let messages = self.shown_messages(cx);
         // Only what lands at the live end counts: a page of history
-        // arriving above is not something the reader is missing.
-        let tail = self
-            .transcript
-            .keys()
-            .filter_map(|key| match key {
-                Row::Message(ts) => Some(ts.clone()),
-                _ => None,
-            })
-            .last();
+        // arriving above is not something the reader is missing. Read from
+        // the end, because the newest message is at the end: the chip is
+        // the only row that can sit under it.
+        let tail = self.transcript.keys().rev().find_map(|key| match key {
+            Row::Message(ts) => Some(ts.clone()),
+            _ => None,
+        });
         self.unseen += updates
             .iter()
             .filter(|update| match update {
@@ -1429,7 +1426,39 @@ impl ConversationView {
                 _ => false,
             })
             .count();
-        let ops = plan(&updates, &messages, &self.transcript);
+        // The plan is made against the run on screen without copying it:
+        // an arriving message costs the message, and a transcript of a
+        // thousand lines is not a thousand clones per frame of traffic.
+        let in_thread = matches!(self.source, Source::Thread(_));
+        let (ops, messages) = {
+            let session = self.session.read(cx);
+            let shown = session
+                .loaded(&self.source)
+                .map(|loaded| {
+                    loaded
+                        .messages
+                        .iter()
+                        .filter(|message| in_thread || message.is_top_level())
+                        .collect::<Vec<&Message>>()
+                })
+                .unwrap_or_default();
+            let ops = plan(&updates, &shown, &self.transcript);
+            // The messages the plan actually names, and no others. Found by
+            // binary search, because the run is ordered by `ts`.
+            let messages = ops
+                .iter()
+                .flat_map(|op| match op {
+                    Op::Insert { keys, .. } => keys.as_slice(),
+                    Op::Replace(key) => std::slice::from_ref(key),
+                    Op::Remove(_) => &[],
+                })
+                .filter_map(|key| match key {
+                    Row::Message(ts) => at_ts(&shown, ts).cloned(),
+                    _ => None,
+                })
+                .collect::<Vec<Message>>();
+            (ops, messages)
+        };
         // The first message of a page arriving above everything on screen:
         // where the cursor goes if it was resting on the gap line.
         let first_loaded = ops
@@ -1914,7 +1943,7 @@ fn point_after_removal(on_it: bool, after: Option<Row>, before: Option<Row>) -> 
 /// Turns the session's changes into transcript operations. Arriving messages
 /// are gathered into runs, so a page of history is one edit at the top
 /// rather than fifty, and a day rule rides with the message it heads.
-fn plan(updates: &[Update], shown: &[Message], placed: &impl Placed) -> Vec<Op> {
+fn plan(updates: &[Update], shown: &[&Message], placed: &impl Placed) -> Vec<Op> {
     let mut ops = Vec::new();
     let mut added: HashSet<Row> = HashSet::new();
     let mut gone: HashSet<Row> = HashSet::new();
@@ -1988,7 +2017,7 @@ fn plan(updates: &[Update], shown: &[Message], placed: &impl Placed) -> Vec<Op> 
 
 fn plan_inserts(
     mut arrived: Vec<Ts>,
-    shown: &[Message],
+    shown: &[&Message],
     arriving: &HashSet<Ts>,
     placed: &impl Placed,
     added: &mut HashSet<Row>,
@@ -2010,11 +2039,11 @@ fn plan_inserts(
     for ts in arrived {
         // A reply in a channel is not shown there at all; it changed the
         // parent's count line instead, which arrives as its own update.
-        let Some(message) = shown.iter().find(|message| message.ts == ts) else {
+        let Some(place) = position_of(shown, &ts) else {
             continue;
         };
-        let at = message.ts.epoch_seconds() as i64;
-        let next = anchor_after(shown, &ts, arriving, |key| held(key, added));
+        let at = shown[place].ts.epoch_seconds() as i64;
+        let next = anchor_after(shown, place, arriving, |key| held(key, added));
         if !keys.is_empty() && next != before {
             close_run(
                 std::mem::take(&mut keys),
@@ -2041,7 +2070,9 @@ fn plan_inserts(
             };
             previous_day = match covered {
                 true => Some(at),
-                false => day_before(before.as_ref(), shown, arriving, |key| held(key, added)),
+                false => day_before(before.as_ref(), shown, place, arriving, |key| {
+                    held(key, added)
+                }),
             };
         }
         // A day rule heads the first message of its day.
@@ -2091,38 +2122,59 @@ fn close_run(
 /// The item an arriving message goes in front of: the next message already
 /// on screen. `None` means the end.
 fn anchor_after(
-    shown: &[Message],
-    ts: &Ts,
+    shown: &[&Message],
+    place: usize,
     arriving: &HashSet<Ts>,
     held: impl Fn(&Row) -> bool,
 ) -> Option<Row> {
     shown
+        .get(place + 1..)?
         .iter()
-        .skip_while(|message| message.ts.epoch_seconds() <= ts.epoch_seconds())
         .find(|message| !arriving.contains(&message.ts))
         .map(|message| Row::Message(message.ts.clone()))
         .filter(|row| held(row))
+}
+
+/// Where a timestamp sits in the run on screen, or `None` if it is not
+/// shown there — a reply in a channel is the case.
+///
+/// A binary search, because the run is held in `ts` order and an arriving
+/// message must cost the message rather than the run it lands at the end
+/// of. Walking would be the whole transcript for every message the socket
+/// brings, which is what a live conversation does all day.
+fn position_of(shown: &[&Message], ts: &Ts) -> Option<usize> {
+    let at = shown
+        .binary_search_by(|message| message.ts.epoch_seconds().total_cmp(&ts.epoch_seconds()))
+        .ok()?;
+    (shown[at].ts == *ts).then_some(at)
+}
+
+/// The message at a timestamp, by the same search.
+fn at_ts<'a>(shown: &[&'a Message], ts: &Ts) -> Option<&'a Message> {
+    position_of(shown, ts).map(|at| shown[at])
 }
 
 /// The day of the message the run will follow, which decides whether it
 /// needs a day rule of its own.
 fn day_before(
     anchor: Option<&Row>,
-    shown: &[Message],
+    shown: &[&Message],
+    place: usize,
     arriving: &HashSet<Ts>,
     held: impl Fn(&Row) -> bool,
 ) -> Option<i64> {
-    let before = match anchor {
-        Some(Row::Message(ts)) => shown
-            .iter()
-            .rev()
-            .filter(|message| message.ts.epoch_seconds() < ts.epoch_seconds())
-            .find(|message| !arriving.contains(&message.ts)),
-        _ => shown
-            .iter()
-            .rev()
-            .find(|message| !arriving.contains(&message.ts)),
-    }?;
+    // From the anchor's own place backwards, not from the end: the run is
+    // ordered, so the message this one follows is the nearest one under it
+    // that is not arriving with it.
+    let below = match anchor {
+        Some(Row::Message(ts)) => position_of(shown, ts).unwrap_or(place),
+        _ => shown.len(),
+    };
+    let before = shown
+        .get(..below)?
+        .iter()
+        .rev()
+        .find(|message| !arriving.contains(&message.ts))?;
     held(&Row::Message(before.ts.clone())).then(|| before.ts.epoch_seconds() as i64)
 }
 
@@ -2977,12 +3029,21 @@ mod tests {
             .collect()
     }
 
+    /// The run on screen as `plan` takes it: borrowed, never copied.
+    fn borrowed(shown: &[Message]) -> Vec<&Message> {
+        shown.iter().collect()
+    }
+
     #[test]
     fn a_page_landing_over_a_day_rule_still_reaches_the_top() {
         let older = message("1.0", None, "older");
         let shown = [older.clone(), message("2.0", None, "newest")];
         let held = held(&shown[1..]);
-        let ops = plan(&[Update::Inserted(older.ts.clone())], &shown, &held);
+        let ops = plan(
+            &[Update::Inserted(older.ts.clone())],
+            &borrowed(&shown),
+            &held,
+        );
         assert!(
             ops.iter().any(|op| reaches_the_top(op, &held)),
             "a day rule above the first message is chrome, not content: {ops:?}"
@@ -3127,7 +3188,11 @@ mod tests {
         let arrived = message("1700000060.0", None, "and another");
         let shown = [message("1700000000.0", None, "hello"), arrived.clone()];
 
-        let ops = plan(&[Update::Inserted(arrived.ts.clone())], &shown, &held);
+        let ops = plan(
+            &[Update::Inserted(arrived.ts.clone())],
+            &borrowed(&shown),
+            &held,
+        );
 
         assert_eq!(
             ops,
@@ -3149,7 +3214,7 @@ mod tests {
 
         let ops = plan(
             &[Update::Replaced(Ts("1700000060.0".into()))],
-            &shown,
+            &borrowed(&shown),
             &held,
         );
 
@@ -3175,7 +3240,7 @@ mod tests {
                 .iter()
                 .map(|message| Update::Inserted(message.ts.clone()))
                 .collect::<Vec<_>>(),
-            &shown,
+            &borrowed(&shown),
             &held,
         );
 
@@ -3212,7 +3277,7 @@ mod tests {
                 .iter()
                 .map(|message| Update::Inserted(message.ts.clone()))
                 .collect::<Vec<_>>(),
-            &shown,
+            &borrowed(&shown),
             &held,
         );
 
