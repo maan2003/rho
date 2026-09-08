@@ -9,8 +9,8 @@
 //! at that moment in whatever shape it judges best.
 //! `DECISION-pull-based-sources`.
 //!
-//! The core says exactly one thing to a running tool — [`ToolSession::cancel`],
-//! meaning *wind down*. Everything else flows the other way.
+//! The core can cancel work and close turn-local patience eligibility. Output
+//! and model-authored patience requests flow from the tool to the core.
 
 use std::sync::Arc;
 
@@ -88,6 +88,19 @@ pub trait ToolSession: Send {
     /// governs what is collected — every call is asked for its one result, and
     /// every answered call is asked for updates, whatever this says.
     fn haste(&self) -> ToolHaste;
+
+    /// Turn-local idle request: (session sequence, seconds).
+    fn take_patience(&mut self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// A new model request closes this cell’s ability to set patience.
+    fn close_patience(&mut self) {}
+
+    /// Successful quiet completion of a cell that only set patience.
+    fn control_only_completion(&self) -> bool {
+        false
+    }
 
     /// Whether the core can forget this call: nothing left to say, ever.
     ///

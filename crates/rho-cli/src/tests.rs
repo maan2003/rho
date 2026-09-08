@@ -136,3 +136,32 @@ fn record_visualization_parses() {
         super::Command::RecordVisualization(_)
     ));
 }
+
+#[test]
+fn evaluation_defaults_to_astra_and_requires_a_prompt() {
+    assert!(Args::try_parse(["eval".to_owned()].into_iter()).is_err());
+    let args = Args::try_parse(
+        [
+            "eval",
+            "smoke test",
+            "--expect",
+            "PASS",
+            "--require-tool",
+            "exec",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(
+        matches!(args.command, Command::Eval(eval::EvalArgs {role, expect, require_tool,..}) if role == "eng-high" && expect == ["PASS"] && require_tool == ["exec"])
+    );
+    assert!(
+        Args::try_parse(
+            ["eval", "task", "--timeout", "0"]
+                .into_iter()
+                .map(str::to_owned)
+        )
+        .is_err()
+    );
+}

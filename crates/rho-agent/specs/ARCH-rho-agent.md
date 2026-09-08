@@ -13,7 +13,7 @@ channel, state out as a published `AgentState`.
 Everything that produces transcript blocks is a **source**: the user queue, the
 mail queue, and one entry per called tool. A source accumulates on its own and
 reports plain facts — when something arrived, whether a call has been answered,
-whether a tool has ended. It names no durations and starts no requests
+whether a tool has ended. It chooses no durations and starts no requests
 ([DECISION-pull-based-sources](DECISION-pull-based-sources.md)).
 
 Being a source is a role, not a module. The two queues are plain vectors on the
@@ -50,10 +50,13 @@ knows about another, or about the clock.
 Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A
 registry type would have been that map with pass-through methods, so there is
-not one. `wait` is the one tool the core supplies itself: its argument is the
+not one. In direct-tool and JavaScript code modes, `wait` is the one tool the core supplies itself: its argument is the
 interval `boundary` reads and nothing else, so no session is spawned for it and
-the core writes its reply at the next drain. The core says exactly one thing to a running tool — `cancel`, meaning
-wind down — and still collects its parting output, so a tool has the last word
+the core writes its reply at the next drain. Python cells can instead relay a
+model-authored `set_patience` interval, eligible only until the next request.
+The core closes that eligibility when starting a request and can tell a running
+tool to `cancel`, meaning wind down. It still collects parting output, so a tool
+has the last word
 ([DECISION-model-sets-the-pace](DECISION-model-sets-the-pace.md)).
 
 A session hands its output over in two shapes, and the split is in the trait
@@ -83,7 +86,9 @@ Instructions are deliberately not among the stored fields
   ack fires only after that command's own handling.
 - The drain, the append and the send are one persisted event, so no crash can
   leave a queue drained into a transcript that never went out.
-- No source names a duration. Every duration in the crate is in `boundary`.
+- No source chooses a duration. Sources may relay the model’s turn-local
+  patience; every scheduling rule remains in `boundary`. A quiet successful
+  setter-only completion does not defeat the interval it just conveyed.
 - Nothing outside the core decides *when*; the core never decides *what* a
   source has to say.
 - A drain's block order is the provider's, not the clock's, as constrained by

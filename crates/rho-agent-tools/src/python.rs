@@ -1,0 +1,832 @@
+//! Python notebook adapter. Rho owns subprocesses, retained output, and source
+//! policy.
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType, UnixMs};
+use rho_python::{Event, Input, Sender, Session};
+use rho_tool_shell::{BoundedOutput, ProcessEvent, ShellTools, decode_output_lossy};
+use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
+
+use crate::{
+    Finished, FutureTool, SourceWaker, Tool, ToolHaste, ToolSession, output, stands_on_its_own,
+};
+
+const LOG_LIMIT: usize = 8 * 1024 * 1024;
+const JOB_LIMIT: usize = 64;
+
+pub struct PythonTool {
+    session: Session,
+    shared: Arc<Shared>,
+    next_cell: AtomicU64,
+    spec: ToolSpec,
+    driver: tokio::task::JoinHandle<()>,
+}
+struct Shared {
+    shell: ShellTools,
+    others: HashMap<String, Arc<dyn FutureTool>>,
+    cells: Mutex<HashMap<u64, Arc<Mutex<Cell>>>>,
+    jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
+    sequence: AtomicU64,
+    images: Mutex<BTreeMap<u64, rho_core::ImageContent>>,
+}
+struct Cell {
+    waker: SourceWaker,
+    output: BoundedOutput,
+    since: Option<UnixMs>,
+    important: Option<UnixMs>,
+    finished: Option<UnixMs>,
+    error: bool,
+    delivered: bool,
+    meaningful: bool,
+    patience: Option<(u64, u64)>,
+    patience_open: bool,
+    patience_set: bool,
+    jobs: Vec<Arc<Job>>,
+    pending: usize,
+    cancelled: tokio::sync::watch::Sender<bool>,
+    last_completion: UnixMs,
+    images: Vec<rho_core::ImageContent>,
+}
+impl Cell {
+    fn say(&mut self, text: &str, important: bool) {
+        self.write(text, important);
+        self.output.push(b"\n");
+    }
+    fn write(&mut self, text: &str, important: bool) {
+        self.output.push(text.as_bytes());
+        self.meaningful = true;
+        self.since.get_or_insert_with(UnixMs::now);
+        if important {
+            self.important.get_or_insert_with(UnixMs::now);
+        }
+        self.waker.wake();
+    }
+    fn closed(&self) -> bool {
+        self.finished.is_some()
+            && self.pending == 0
+            && self
+                .jobs
+                .iter()
+                .all(|j| j.state.lock().unwrap().finished.is_some())
+    }
+}
+struct Job {
+    id: u64,
+    state: Mutex<JobState>,
+    stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    cancel: Notify,
+    budget: usize,
+    ready: tokio::sync::watch::Sender<bool>,
+}
+struct JobState {
+    file: std::fs::File,
+    len: usize,
+    dropped: usize,
+    cursor: usize,
+    unsent: BoundedOutput,
+    since: Option<UnixMs>,
+    important: Option<UnixMs>,
+    finished: Option<(UnixMs, Value)>,
+    delivered: bool,
+}
+impl PythonTool {
+    pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
+        let mut description = String::from(
+            r#"Run raw Python in the persistent notebook.
+
+Work registers immediately; output arrives automatically. Put independent calls in the same cell to run them concurrently; await only when later Python statements depend on completion.
+- command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are optional. Awaiting it returns completion metadata (id, exit_code), not stdout.
+- write_stdin(handle, chars='', max_tokens=2000) registers an input write and retained-output read. It waits for stdin readiness, not subsequent output; an empty page is valid. Await only if Python needs the returned page or write completion. display(handle) also reads a page.
+- tools.NAME(**kwargs) registers an internal tool call. Custom tools take a single string. Await only for Python dependencies; text results are strings, JSON results are parsed values. Tool schemas follow the examples.
+
+Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner. image((await tools.view_image(path=...))["content"][0]) displays a returned image reference.
+
+Examples
+
+Run independent inspections concurrently in one exec—no gather, await, or result-printing:
+```python
+command("git diff --stat")
+command("rg -n 'TODO' src")
+```
+
+Internal tools register the same way:
+```python
+tools.apply_patch("""*** Begin Patch
+*** Update File: config.toml
+@@
+-retries = 2
++retries = 3
+*** End Patch""")
+```
+
+Search the web without awaiting or reprinting the result:
+```python
+tools.web__run(search_query=[{"q": "Python asyncio TaskGroup documentation"}])
+```
+Use the returned references in a later cell for tools.web__run(open=[...]).
+
+When an edit is already prepared in `patch`, await only the dependencies:
+```python
+await tools.apply_patch(patch)
+check = await command("cargo check")
+if check["exit_code"] == 0:
+    command("cargo test")
+```
+
+Use Python directly to manipulate file data:
+```python
+config = Path("config.toml")
+config.write_text(config.read_text().replace("retries = 2", "retries = 3"))
+```
+
+Send stdin without blocking the notebook:
+```python
+job = command("python3 -c 'print(input())'", max_tokens=100)
+write_stdin(job, "hello\n")
+```
+After automatic completion, a later cell can expand retained output:
+```python
+write_stdin(job, max_tokens=6000)
+```
+
+A live monitoring cell:
+```python
+progress = {"checks": 0}
+while not Path("results.json").exists():
+    progress["checks"] += 1
+    await asyncio.sleep(5)
+notify("Results are ready")
+```
+Inspect its globals in a later cell without stopping it:
+```python
+text(progress)
+```
+The default check-in interval is 120 seconds. Omit set_patience unless you want
+a significantly shorter or longer interval. For a significantly longer interval, set it alongside the work:
+```python
+command("git diff --check")
+command("cargo test")
+set_patience(seconds=300)
+```
+Then end the model turn. No separate exec is needed; this does not sleep or block Python.
+If the cell also awaits a dependency, set patience before that await; a suspended cell
+may resume after its originating model turn has ended.
+
+Details and limits
+- Explicit output reads have a separate cursor starting at byte 0, so they can repeat automatic previews. Wait for command completion only if Python needs a complete final read.
+- Budgets are capped at 10000 tokens. Each command retains its first 8 MiB with explicit overflow counts. Up to 64 handles are retained; oldest completed, delivered handles may be evicted. Up to 32 image references are retained.
+- set_patience accepts 1..3600 seconds and overrides only this turn's default 120-second interval. Meaningful events wake earlier; old cells cannot change a newer turn's patience.
+- Python is in-process, not a sandbox. Cwd is private to the notebook; other process-global APIs retain normal semantics. Native extension packages are unsupported.
+
+Available tools:
+"#,
+        );
+        for spec in shell
+            .specs()
+            .into_iter()
+            .filter(|s| s.name.as_str() != "exec_command" && s.name.as_str() != "write_stdin")
+            .chain(others.iter().map(|t| t.spec()))
+        {
+            description.push_str(&format!(
+                "tools.{}: {}\nArguments: {}\n",
+                spec.name.as_str(),
+                spec.description,
+                spec.input_schema
+            ));
+        }
+        let shared = Arc::new(Shared {
+            shell,
+            others: others
+                .into_iter()
+                .map(|t| (t.spec().name.as_str().to_owned(), t))
+                .collect(),
+            cells: Mutex::new(HashMap::new()),
+            jobs: Mutex::new(BTreeMap::new()),
+            sequence: AtomicU64::new(1),
+            images: Mutex::new(BTreeMap::new()),
+        });
+        let shell = shared.shell.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (session, mut events) = Session::new(move || {
+            // Session runs setup only on its dedicated CLONE_FS-unshared thread.
+            unsafe { runtime.block_on(shell.enter_interpreter_thread()) }
+                .map_err(|error| error.to_string())
+        })?;
+        let weak = Arc::downgrade(&shared);
+        let sender = session.sender();
+        let driver = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                let Some(shared) = weak.upgrade() else { break };
+                match event {
+                    Event::Call {
+                        cell,
+                        request,
+                        name,
+                        arguments,
+                    } => {
+                        let link = shared
+                            .cells
+                            .lock()
+                            .unwrap()
+                            .get(&cell)
+                            .cloned()
+                            .filter(|link| !*link.lock().unwrap().cancelled.borrow());
+                        if let Some(link) = link {
+                            register_call(&shared, &sender, request, name, arguments, link);
+                        } else {
+                            let sender = sender.clone();
+                            tokio::spawn(async move {
+                                resolve(
+                                    &sender,
+                                    request,
+                                    Err("Originating cell no longer exists".into()),
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                    Event::Text {
+                        cell,
+                        text,
+                        important,
+                        ..
+                    } => {
+                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
+                            link.lock().unwrap().write(&text, important);
+                        }
+                    }
+                    Event::Patience { cell, seconds } => {
+                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
+                            let mut link = link.lock().unwrap();
+                            if link.patience_open
+                                && !*link.cancelled.borrow()
+                                && (1..=3600).contains(&seconds)
+                            {
+                                link.patience = Some((
+                                    shared.sequence.fetch_add(1, Ordering::Relaxed),
+                                    seconds,
+                                ));
+                                link.patience_set = true;
+                                link.waker.wake();
+                            } else {
+                                link.say(
+                                    "set_patience ignored: its originating model turn has ended",
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                    Event::Finished { cell, error } => {
+                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
+                            let mut link = link.lock().unwrap();
+                            if let Some(error) = error {
+                                link.error = true;
+                                link.say(&error, true);
+                            }
+                            link.finished = Some(UnixMs::now());
+                            link.waker.wake();
+                        }
+                    }
+                    Event::Stopped { error } => {
+                        for link in shared.cells.lock().unwrap().values() {
+                            let mut link = link.lock().unwrap();
+                            link.error = true;
+                            link.say(error.as_deref().unwrap_or("Python runtime stopped"), true);
+                            link.finished = Some(UnixMs::now());
+                            link.cancelled.send_replace(true);
+                            for job in &link.jobs {
+                                job.cancel.notify_one();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            session,
+            shared,
+            next_cell: AtomicU64::new(1),
+            spec: ToolSpec {
+                name: ToolName::try_from("exec").unwrap(),
+                tool_type: ToolType::Custom,
+                description,
+                input_schema: Value::Null,
+                format: Some(rho_core::ToolFormat::Text),
+            },
+            driver,
+        })
+    }
+}
+impl Drop for PythonTool {
+    fn drop(&mut self) {
+        self.driver.abort();
+        for cell in self.shared.cells.lock().unwrap().values() {
+            let mut cell = cell.lock().unwrap();
+            cell.cancelled.send_replace(true);
+            cell.finished = Some(UnixMs::now());
+            cell.say("Python notebook closed", true);
+        }
+        for job in self.shared.jobs.lock().unwrap().values() {
+            job.cancel.notify_one();
+        }
+    }
+}
+impl Tool for PythonTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession> {
+        let cell = self.next_cell.fetch_add(1, Ordering::Relaxed);
+        let link = Arc::new(Mutex::new(Cell {
+            waker,
+            output: BoundedOutput::for_tokens(Some(10000)),
+            since: None,
+            important: None,
+            finished: None,
+            error: false,
+            delivered: false,
+            meaningful: false,
+            patience: None,
+            patience_open: true,
+            patience_set: false,
+            jobs: Vec::new(),
+            pending: 0,
+            cancelled: tokio::sync::watch::channel(false).0,
+            last_completion: UnixMs::now(),
+            images: Vec::new(),
+        }));
+        self.shared
+            .cells
+            .lock()
+            .unwrap()
+            .insert(cell, Arc::clone(&link));
+        if let Err(error) = self.session.sender().send(Input::Execute {
+            cell,
+            source: call.arguments,
+        }) {
+            self.shared.cells.lock().unwrap().remove(&cell);
+            return Box::new(Finished::error(error));
+        }
+        Box::new(PythonCell {
+            cell,
+            link,
+            shared: Arc::clone(&self.shared),
+            sender: self.session.sender(),
+        })
+    }
+}
+async fn resolve(sender: &Sender, request: u64, result: Result<Value, String>) {
+    let (value, error) = match result {
+        Ok(value) => (value, None),
+        Err(error) => (Value::Null, Some(error)),
+    };
+    if let Err(error) = sender
+        .send_async(Input::Resolve {
+            request,
+            value,
+            error,
+        })
+        .await
+    {
+        // A large result must fail its await rather than strand the cell.
+        let _ = sender
+            .send_async(Input::Resolve {
+                request,
+                value: Value::Null,
+                error: Some(error),
+            })
+            .await;
+    }
+}
+// Every Python host call registers ownership before the driver accepts the next
+// event. Awaiting its future is optional and never controls the Rust lifetime.
+fn register_call(
+    shared: &Arc<Shared>,
+    sender: &Sender,
+    request: u64,
+    name: String,
+    args: Value,
+    link: Arc<Mutex<Cell>>,
+) {
+    // Publish command handles synchronously: write_stdin in the same cell can
+    // refer to a command whose process has not started yet.
+    let job = if name == "command" {
+        (|| -> Result<Arc<Job>, String> {
+            let mut jobs = shared.jobs.lock().unwrap();
+            if jobs.len() >= JOB_LIMIT {
+                let old = jobs
+                    .iter()
+                    .find(|(_, j)| j.state.lock().unwrap().delivered)
+                    .map(|(id, _)| *id);
+                if let Some(id) = old {
+                    jobs.remove(&id);
+                } else {
+                    return Err("64 command handles are still active or awaiting delivery".into());
+                }
+            }
+            let budget = args["max_tokens"].as_u64().unwrap_or(2000).clamp(1, 10000) as usize;
+            let job = Arc::new(Job {
+                id: request,
+                state: Mutex::new(JobState {
+                    file: tempfile::tempfile().map_err(|e| e.to_string())?,
+                    len: 0,
+                    dropped: 0,
+                    cursor: 0,
+                    unsent: BoundedOutput::for_tokens(Some(budget)),
+                    since: None,
+                    important: None,
+                    finished: None,
+                    delivered: false,
+                }),
+                stdin: tokio::sync::Mutex::new(None),
+                cancel: Notify::new(),
+                budget,
+                ready: tokio::sync::watch::channel(false).0,
+            });
+            jobs.insert(request, Arc::clone(&job));
+            Ok(job)
+        })()
+        .map(Some)
+    } else {
+        Ok(None)
+    };
+    {
+        let mut cell = link.lock().unwrap();
+        cell.pending += 1;
+        cell.meaningful = true;
+        if let Ok(Some(job)) = &job {
+            cell.jobs.push(Arc::clone(job));
+        }
+    }
+    let shared = Arc::clone(shared);
+    let sender = sender.clone();
+    tokio::spawn(async move {
+        let mut cancelled = link.lock().unwrap().cancelled.subscribe();
+        let work = async {
+            match &job {
+                Ok(Some(job)) => run_command(&shared.shell, job, &args, &link).await,
+                Ok(None) => host_call(&shared, &name, args, &link).await,
+                Err(error) => Err(error.clone()),
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Tool call cancelled".into()),
+            result = work => result,
+        };
+        if let Ok(Some(job)) = &job {
+            *job.stdin.lock().await = None;
+            job.ready.send_replace(true);
+            let summary = match &result {
+                Ok(value) => value.clone(),
+                Err(error) => json!({"id":request,"error":error}),
+            };
+            job.state.lock().unwrap().finished = Some((UnixMs::now(), summary));
+        } else if let Err(error) = &result {
+            link.lock().unwrap().say(error, true);
+        }
+        {
+            let mut cell = link.lock().unwrap();
+            cell.pending -= 1;
+            cell.last_completion = UnixMs::now();
+            cell.waker.wake();
+        }
+        resolve(&sender, request, result).await;
+    });
+}
+
+async fn run_command(
+    shell: &ShellTools,
+    job: &Job,
+    args: &Value,
+    link: &Arc<Mutex<Cell>>,
+) -> Result<Value, String> {
+    let work = async {
+        let cmd = args["cmd"].as_str().ok_or("command requires cmd")?;
+        let mut process = shell
+            .spawn(cmd, args["workdir"].as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+        *job.stdin.lock().await = process.take_stdin();
+        job.ready.send_replace(true);
+        let mut exit_code = None;
+        loop {
+            let event = process.next().await;
+            match event {
+                ProcessEvent::Output(chunk) => {
+                    let mut state = job.state.lock().unwrap();
+                    let keep = chunk.len().min(LOG_LIMIT - state.len);
+                    let end = state.len as u64;
+                    state
+                        .file
+                        .seek(SeekFrom::Start(end))
+                        .map_err(|e| e.to_string())?;
+                    state
+                        .file
+                        .write_all(&chunk[..keep])
+                        .map_err(|e| e.to_string())?;
+                    state.len += keep;
+                    state.dropped = state.dropped.saturating_add(chunk.len() - keep);
+                    state.unsent.push(&chunk);
+                    state.since.get_or_insert_with(UnixMs::now);
+                    if stands_on_its_own(&String::from_utf8_lossy(&chunk)) {
+                        state.important.get_or_insert_with(UnixMs::now);
+                    }
+                }
+                ProcessEvent::Exited(status) => exit_code = status.code(),
+                ProcessEvent::Failed(error) => return Err(error),
+                ProcessEvent::Closed => break,
+            }
+            link.lock().unwrap().waker.wake();
+        }
+        Ok(json!({"id": job.id, "exit_code": exit_code}))
+    };
+    tokio::select! {
+        biased;
+        _ = job.cancel.notified() => Err("Command cancelled".into()),
+        result = work => result,
+    }
+}
+async fn host_call(
+    shared: &Shared,
+    name: &str,
+    args: Value,
+    link: &Arc<Mutex<Cell>>,
+) -> Result<Value, String> {
+    if name == "image" {
+        let id = args["id"].as_u64().ok_or("Expected an image reference")?;
+        let image = shared
+            .images
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or("Image expired or unknown")?;
+        let mut cell = link.lock().unwrap();
+        if cell.images.len() >= 20 {
+            return Err("Cell image limit reached".into());
+        }
+        cell.images.push(image);
+        cell.say("Image displayed", false);
+        return Ok(Value::Null);
+    }
+    if matches!(name, "write_stdin" | "display" | "cancel_command") {
+        let id = args["id"].as_u64().ok_or("Expected command handle")?;
+        let job = shared
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or("Command handle expired or unknown")?;
+        if name == "cancel_command" {
+            job.cancel.notify_one();
+            return Ok(Value::Null);
+        }
+        if name == "write_stdin" {
+            let chars = args["chars"].as_str().ok_or("chars must be a string")?;
+            if !chars.is_empty() {
+                job.ready
+                    .subscribe()
+                    .wait_for(|ready| *ready)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut stdin = job.stdin.lock().await;
+                let stdin = stdin.as_mut().ok_or("Command stdin not ready or closed")?;
+                stdin
+                    .write_all(chars.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                stdin.flush().await.map_err(|e| e.to_string())?;
+            }
+        }
+        let mut state = job.state.lock().unwrap();
+        let start = state.cursor;
+        let size = (state.len - start)
+            .min(args["max_tokens"].as_u64().unwrap_or(2000).clamp(1, 10000) as usize * 4);
+        let mut bytes = vec![0; size];
+        state
+            .file
+            .seek(SeekFrom::Start(start as u64))
+            .map_err(|e| e.to_string())?;
+        state
+            .file
+            .read_exact(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        // Do not split a UTF-8 character merely because a page hit its budget.
+        // Non-UTF-8 process output still follows the shell's lossy-text contract.
+        if size < state.len - start
+            && let Err(error) = std::str::from_utf8(&bytes)
+            && error.error_len().is_none()
+        {
+            bytes.truncate(error.valid_up_to());
+        }
+        state.cursor += bytes.len();
+        let result = json!({"id":id,"output":String::from_utf8_lossy(&bytes),"offset":start,"next_offset":state.cursor,"retained_bytes":state.len,"dropped_bytes":state.dropped,"finished":state.finished.as_ref().map(|(_,v)|v)});
+        drop(state);
+        link.lock().unwrap().say(&result.to_string(), false);
+        return Ok(result);
+    }
+    let other = shared.others.get(name);
+    let spec = other
+        .map(|t| t.spec())
+        .or_else(|| {
+            shared.shell.specs().into_iter().find(|s| {
+                s.name.as_str() == name && name != "exec_command" && name != "write_stdin"
+            })
+        })
+        .ok_or_else(|| format!("Unknown tool: {name}"))?;
+    let call = ToolCall {
+        id: format!("python-{name}")
+            .try_into()
+            .map_err(|_| "Invalid tool ID")?,
+        name: spec.name,
+        tool_type: spec.tool_type,
+        arguments: if spec.tool_type == ToolType::Custom {
+            args.as_str()
+                .ok_or("Custom tool takes a string")?
+                .to_owned()
+        } else {
+            args.to_string()
+        },
+    };
+    let result = match other {
+        Some(tool) => tool.call(call).await,
+        None => shared.shell.call(call).await,
+    };
+    if result.status != ToolOutputStatus::Success {
+        return Err((*result.output).clone());
+    }
+    let mut content = Vec::new();
+    if !result.images.is_empty() {
+        let mut images = shared.images.lock().unwrap();
+        for image in result.images.iter() {
+            while images.len() >= 32 {
+                images.pop_first();
+            }
+            let id = shared.sequence.fetch_add(1, Ordering::Relaxed);
+            images.insert(id, image.clone());
+            content.push(json!({"id":id}));
+        }
+    }
+    if !result.output.is_empty() {
+        link.lock().unwrap().say(&result.output, false);
+    }
+    if !content.is_empty() {
+        Ok(json!({"output":*result.output,"content":content}))
+    } else {
+        Ok(serde_json::from_str(&result.output)
+            .unwrap_or_else(|_| Value::String((*result.output).clone())))
+    }
+}
+struct PythonCell {
+    cell: u64,
+    link: Arc<Mutex<Cell>>,
+    shared: Arc<Shared>,
+    sender: Sender,
+}
+impl PythonCell {
+    fn render(&mut self, first: bool) -> Option<ToolOutput> {
+        let mut cell = self.link.lock().unwrap();
+        let mut chunks = Vec::new();
+        if !cell.output.is_empty() {
+            chunks.push(decode_output_lossy(
+                std::mem::replace(&mut cell.output, BoundedOutput::for_tokens(Some(10000)))
+                    .into_bytes(),
+            ));
+        }
+        cell.since = None;
+        cell.important = None;
+        cell.jobs.retain(|job| {
+            let mut state = job.state.lock().unwrap();
+            if !state.unsent.is_empty() { chunks.push(format!("Command {} output:\n{}", job.id, decode_output_lossy(std::mem::replace(&mut state.unsent, BoundedOutput::for_tokens(Some(job.budget))).into_bytes()))); }
+            state.since = None;
+            state.important = None;
+            if let Some((_, summary)) = state.finished.clone() {
+                chunks.push(format!("Command completed: {summary}. Retained {} bytes; dropped {} bytes beyond retention limit.", state.len, state.dropped));
+                state.delivered = true;
+                false
+            } else { true }
+        });
+        if cell.closed() && !cell.delivered {
+            chunks.push(
+                if cell.error {
+                    "Python cell failed."
+                } else {
+                    "Python cell completed."
+                }
+                .into(),
+            );
+            cell.delivered = true;
+        } else if first {
+            chunks.push(format!(
+                "Python cell {} is live; output arrives automatically on this call.",
+                self.cell
+            ));
+        }
+        if chunks.is_empty() {
+            return None;
+        }
+        let mut result = output(
+            chunks.join("\n"),
+            if *cell.cancelled.borrow() {
+                ToolOutputStatus::Cancelled
+            } else if cell.error {
+                ToolOutputStatus::Error
+            } else {
+                ToolOutputStatus::Success
+            },
+        );
+        result.images = Arc::new(std::mem::take(&mut cell.images));
+        Some(result)
+    }
+}
+impl ToolSession for PythonCell {
+    fn haste(&self) -> ToolHaste {
+        let cell = self.link.lock().unwrap();
+        if cell.closed() {
+            let at = cell
+                .jobs
+                .iter()
+                .filter_map(|job| {
+                    job.state
+                        .lock()
+                        .unwrap()
+                        .finished
+                        .as_ref()
+                        .map(|(at, _)| *at)
+                })
+                .chain([cell.finished.unwrap(), cell.last_completion])
+                .max()
+                .unwrap();
+            return ToolHaste::Ended { at };
+        }
+        let mut soon = cell.important;
+        let mut since = cell.since;
+        for job in &cell.jobs {
+            let state = job.state.lock().unwrap();
+            for at in state
+                .important
+                .into_iter()
+                .chain(state.finished.as_ref().map(|(at, _)| *at))
+            {
+                soon = Some(soon.map_or(at, |old| old.min(at)));
+            }
+            if let Some(at) = state.since {
+                since = Some(since.map_or(at, |old| old.min(at)));
+            }
+        }
+        if let Some(since) = soon {
+            ToolHaste::Soon { since }
+        } else if let Some(since) = since {
+            ToolHaste::Eventually { since }
+        } else {
+            ToolHaste::None
+        }
+    }
+    fn done(&self) -> bool {
+        self.link.lock().unwrap().delivered
+    }
+    fn first_output(&mut self) -> ToolOutput {
+        self.render(true).unwrap()
+    }
+    fn more_output(&mut self) -> Option<ToolOutput> {
+        self.render(false)
+    }
+    fn cancel(&mut self) {
+        self.sender.cancel(self.cell);
+        self.link.lock().unwrap().cancelled.send_replace(true);
+        for job in &self.link.lock().unwrap().jobs {
+            job.cancel.notify_one();
+        }
+    }
+    fn take_patience(&mut self) -> Option<(u64, u64)> {
+        self.link.lock().unwrap().patience.take()
+    }
+    fn close_patience(&mut self) {
+        let mut cell = self.link.lock().unwrap();
+        cell.patience_open = false;
+        cell.patience = None;
+    }
+    fn control_only_completion(&self) -> bool {
+        let cell = self.link.lock().unwrap();
+        cell.patience_set
+            && !cell.meaningful
+            && cell.jobs.is_empty()
+            && !cell.error
+            && !*cell.cancelled.borrow()
+    }
+}
+impl Drop for PythonCell {
+    fn drop(&mut self) {
+        if !self.done() {
+            self.cancel();
+        }
+        self.shared.cells.lock().unwrap().remove(&self.cell);
+    }
+}

@@ -1,0 +1,1 @@
+Fix the retry over-counting bug in job_report.summarize_jobs according to the README. Add regression tests and run the tests.

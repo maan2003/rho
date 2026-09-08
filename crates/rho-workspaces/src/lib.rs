@@ -1171,11 +1171,38 @@ impl View {
         Ok(())
     }
 
+    /// Enter this view on a dedicated, long-lived interpreter thread.
+    /// This installs path mapping, not a Python sandbox.
+    ///
+    /// # Safety
+    /// The caller must have unshared CLONE_FS and must never return this thread
+    /// to a reusable thread pool. Cwd, namespace and capabilities change here.
+    /// This future must be polled on that same dedicated thread throughout.
+    pub async unsafe fn enter_interpreter_thread(&self) -> anyhow::Result<()> {
+        let entries = self.entries();
+        let cwd = entries[0].repo();
+        if !entries.iter().any(|entry| entry.needs_mount()) {
+            std::env::set_current_dir(cwd)?;
+            return Ok(());
+        }
+        let mut guard = self.ns.lock().await;
+        let fd = ensure_ns(&mut guard, entries).await;
+        let cwd = CString::new(cwd.as_str())?;
+        // ensure_ns may lazily start Tokio blocking threads from this thread,
+        // sharing its fs_struct again. setns requires it to be private now.
+        unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::FS) }?;
+        enter_workspace_ns(std::os::fd::AsRawFd::as_raw_fd(fd), &cwd)?;
+        Ok(())
+    }
+
     /// Maps a path in the agent-visible view (origin paths) to the host path
     /// where the bytes actually live (managed checkouts), for in-process file
-    /// operations that do not enter the namespace. Paths outside every entry
-    /// are returned unchanged.
+    /// operations that do not enter the namespace. Relative paths start at
+    /// the primary checkout; absolute paths outside every entry are unchanged.
     pub fn resolve_host_path(&self, path: &Path) -> PathBuf {
+        if path.is_relative() {
+            return self.entries[0].checkout().as_std_path().join(path);
+        }
         for entry in self.entries() {
             if let Ok(rel) = path.strip_prefix(entry.repo().as_std_path()) {
                 return entry.checkout().as_std_path().join(rel);
@@ -1580,6 +1607,20 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         symlink(outside.path(), root.path().join("escape")).unwrap();
         assert!(open_beneath(root.path(), std::path::Path::new("escape")).is_err());
+    }
+
+    #[tokio::test]
+    async fn relative_host_paths_use_the_primary_checkout_not_process_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(
+            Repo::open_plain_with_path_overrides(temp.path(), Default::default()).unwrap(),
+        );
+        let view = super::View::new(vec![repo.user_checkout().await.unwrap()]).unwrap();
+        assert_eq!(
+            view.resolve_host_path_checked(std::path::Path::new("fixture.json"))
+                .unwrap(),
+            temp.path().join("fixture.json")
+        );
     }
 
     #[tokio::test]

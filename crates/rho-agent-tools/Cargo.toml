@@ -11,6 +11,8 @@ anyhow.workspace = true
 futures.workspace = true
 rho-code-mode.workspace = true
 rho-core.workspace = true
+rho-python.workspace = true
+tempfile.workspace = true
 rho-tool-shell.workspace = true
 rho-web-search.workspace = true
 serde.workspace = true
@@ -19,3 +21,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 rho-workspaces.workspace = true
+
+[[test]]
+name = "python_workspace"
+harness = false

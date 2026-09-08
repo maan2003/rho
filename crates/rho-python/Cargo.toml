@@ -1,0 +1,19 @@
+[package]
+name = "rho-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustpython-vm = { git = "https://github.com/RustPython/RustPython", rev = "c6c1b1ce6c39894b351b3ca9f68cdd3a8aacd4d6", default-features = false, features = ["compiler", "freeze-stdlib", "gc", "host_env"] }
+rustpython-stdlib = { git = "https://github.com/RustPython/RustPython", rev = "c6c1b1ce6c39894b351b3ca9f68cdd3a8aacd4d6", default-features = false, features = ["compiler", "host_env"] }
+rustpython-pylib = { git = "https://github.com/RustPython/RustPython", rev = "c6c1b1ce6c39894b351b3ca9f68cdd3a8aacd4d6", features = ["freeze-stdlib"] }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

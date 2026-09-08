@@ -695,51 +695,76 @@ is truncated before the closing fence. Discovery follows symlinks with cycle
 detection for roots/directories/files. Skill files are prompt input only; they
 do not restrict filesystem access or grant tools.
 
-## Code mode (`rho-code-mode`)
+## Python code mode (`rho-python`, `rho-agent-tools`)
 
-- `rho-code-mode` runs model-authored JavaScript in an in-process V8 isolate
-  (deno_core), one isolate per session on a dedicated thread. Scripts have full
-  access to the host through the nested tool dispatcher — the same access the
-  model already has through shell tools. Code mode is not a sandbox and adds no
-  new privilege beyond the existing tool surface.
-- Code mode is used by GPT-5.6-backed roles except `eng-mini`, which uses the
-  direct tool surface, and is fixed at agent creation; the daemon rejects
-  changing the role on a running agent. When on,
-  the model-facing tools are only
-  `exec`/`wait`, and
-  shell plus multi-agent tools are dispatched from scripts on the agent's
-  normal runtime through the same code paths as direct tool calls.
-- Nested command calls return structured JSON values to JavaScript (including
-  process session ids), while direct command calls render the equivalent
-  Codex-style status headers as text. Other nested tools return JSON strings;
-  tool errors reject the JavaScript promise rather than becoming values.
-- `spawn_engineer` is installed in the nested runtime registry and listed by
-  `ALL_TOOLS`, but its full declaration and delegation guidance live in the
-  dynamically discovered `delegate-engineering` skill instead of every code
-  mode prompt. Runtime authorization and spawn validation are unchanged.
-- Trust boundaries: script source is model-controlled input; nested tool calls
-  leave the isolate through the `ToolDispatcher`, which forwards to the agent's
-  normal tool path with its existing controls. The JS environment strips
-  `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`, and exposes no
-  I/O ops other than nested tool calls, `text`/`notify` output, and timers.
-- `notify(...)` becomes a `ToolUpdate` attributed to the cell's originating
-  `exec` call: it rides the agent's persisted input queue and enters model
-  context at the next request boundary of the active turn. With no active
-  turn the update is dropped, and leftover updates alone never start a turn,
-  so script output cannot wake an idle agent.
-- Resource bounds: exec/wait yield back to the model after a deadline (default
-  10 s) while the script keeps running as a tracked cell; result text is
-  middle-truncated to a token budget (default 10k tokens); a 100 ms heartbeat
-  on the runtime thread detects synchronous busy loops.
-- Cancellation: terminating a cell escalates from cancelling its pending tool
-  ops (rejecting the promises it awaits), to `TerminateExecution` on the
-  isolate if the heartbeat is stale (the isolate and other cells survive), to
-  marking the cell an inert zombie whose ops are refused and output discarded.
-  Dropping the session cancels all cells and shuts down the runtime thread.
-- Tests: `crates/rho-code-mode/tests/session.rs` covers REPL state
-  persistence, concurrent cells, yield/wait, terminate of both parked and
-  busy-looping cells (with session survival), tool-failure propagation, and
-  output truncation.
+`eng-high` and `advisor-high` select Python by default. Other code-mode roles retain the
+JavaScript runtime; roles with code mode disabled retain direct tools.
+
+- Model-authored Python runs in-process on a dedicated RustPython thread, with
+  persistent globals and cooperative top-level-await cells. The crate boundary
+  carries serialized messages, not interpreter objects, so a future worker can
+  replace the thread without moving tool or scheduling policy.
+- Ordinary RustPython host access is enabled: `pathlib`, `open`, `os`, and
+  other supported standard-library modules work directly. `pathlib` and `Path`
+  are prebound; imports remain ordinary Python imports. The dedicated VM thread
+  unshares its filesystem state before entering the agent's View mount namespace
+  and setting its initial cwd. Python `chdir` therefore affects that notebook,
+  not the daemon or sibling notebooks; it remains shared between its live cells.
+- Python is explicitly **not a sandbox**. Workspace mount mapping provides path
+  correctness, not capability isolation. Unlike managed shell commands, native
+  Python file operations are not Landlock-restricted. Process-global environment
+  mutations, signals, descriptor operations, and process exit retain their normal
+  in-process behavior and can affect the daemon. Python code must be trusted to
+  the same extent as daemon code. Automatic Python signal-handler installation
+  is disabled so imports do not replace the host's Ctrl-C handler; explicit
+  Python signal changes still retain their normal semantics.
+  A worker process is required before promising fault or resource isolation.
+  Commands should use `command()` when Rust-managed
+  lifetime and automatic output are wanted; ordinary Python subprocesses do not
+  acquire that managed lifecycle automatically.
+- Standard asyncio owns Python task scheduling, timers, and I/O. Rust messages
+  wake its selector through an eventfd; cell context follows tasks and callbacks.
+  Asyncio networking and subprocesses have ordinary unsandboxed Python access,
+  not the managed lifecycle of `command()`. Native extension wheels are unsupported.
+  Python can exhaust memory, disable tracing, catch cancellation, or block in
+  native computation. Cancellation of Python is best-effort; Rust command and
+  nested-tool cancellation do not depend on Python cooperation.
+- Commands, stdin writes, and nested tools share eager Rust-owned registration;
+  awaiting a Python result is not what starts or owns the work. Their source remains
+  attached to the actual provider `exec` call until evaluation and attached work
+  finish and final output is drained. Internal jobs never invent provider calls.
+  Output previews are token-budgeted; explicit reads use an independent cursor
+  over a private temporary file, including after command completion. Each job
+  retains its first 8 MiB with explicit overflow counts. At most 64 job records
+  are retained, evicting oldest completed, delivered records; temporary files
+  disappear with their records. Up to 32 image references are retained.
+- Runtime messages are capped at 1 MiB, input and event queues at 256 entries,
+  live cells at 128, and pending host requests and registered tasks at 1,024 each.
+  Reliable asynchronous completion delivery applies backpressure without blocking
+  event draining. These bounds do not cap arbitrary Python allocations.
+- `notify` marks meaningful output; `text` and captured stdout/stderr mark
+  ordinary progress. Standard streams expose no daemon file descriptors. Both
+  become output on the originating call at the core's next request boundary;
+  neither starts inference directly. `set_patience` conveys a model-authored
+  one-turn interval, not a Python sleep or a tool-selected timeout. The next
+  request closes old cells' setter eligibility. A quiet successful setter-only
+  completion is not news that immediately defeats its own interval; failures,
+  command completion, and meaningful output retain normal wake/batching rules.
+- Notebook state and live jobs are ephemeral and do not survive restart. The
+  existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
+  the JavaScript runtime for all other code-mode roles.
+
+## Headless evaluations (`rho eval`)
+
+The CLI runs the production agent loop with the selected native engineer role
+(default `eng-high` / GPT-6 Astra), configured provider credentials, and isolated
+temporary agent state. It neither connects to nor replaces the running daemon.
+The default workdir is temporary; `--workdir` deliberately grants ordinary live
+workspace tool authority and does not roll back writes. Evaluations make real
+provider requests. JSONL output contains assistant/tool transcripts and usage,
+not provider reasoning or image bytes; it remains potentially sensitive.
+Timeout/interruption cancels the agent. Expected final substrings and required
+observed tool calls are CLI evaluation criteria, not a security boundary.
 
 ## Visualization artifacts
 

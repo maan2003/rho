@@ -32,6 +32,7 @@ members = [
   "crates/rho-mirror",
   "crates/rho-openai-realtime",
   "crates/rho-pr-monitor",
+  "crates/rho-python",
   "crates/rho-profiling",
   "crates/rho-qa",
   "crates/rho-rpc",
@@ -139,6 +140,7 @@ rho-journal = { path = "crates/rho-journal" }
 rho-mirror = { path = "crates/rho-mirror" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
+rho-python = { path = "crates/rho-python" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-hosts = { path = "crates/rho-hosts" }
 rho-window = { path = "crates/rho-window" }
@@ -226,4 +228,6 @@ noq-proto = { path = "vendor/noq/noq-proto" }
 # Local redb fork: compaction keeps relocating pages past one it cannot
 # move lower, instead of stopping at the first such page.
 redb = { path = "vendor/redb" }
+# Upstream fix for integer comparison ambiguity exposed by RustPython/malachite.
+redb-derive = { git = "https://github.com/cberner/redb", rev = "32f8a1368f766fee33042a7f88abe3173d529ffe" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }

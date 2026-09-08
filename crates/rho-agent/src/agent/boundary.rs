@@ -44,6 +44,9 @@ pub(crate) enum SourceKind {
     Tool {
         answer: ToolCallAnswer,
         haste: ToolHaste,
+        /// Quiet successful setter completion is not news that defeats its own
+        /// interval.
+        control_only_completion: bool,
     },
 }
 
@@ -112,8 +115,8 @@ pub(crate) enum ModelAsked {
     Calls,
     /// An interval the model named for itself. Honoured with nothing running,
     /// because a model with nothing to do asking to be woken later is the whole
-    /// point of it. Named through `wait`, the one tool the core answers
-    /// itself.
+    /// point of it. Named through the direct `wait` tool or relayed by a
+    /// Python cell’s turn-local `set_patience` control.
     Wait(Duration),
 }
 
@@ -238,7 +241,7 @@ pub(crate) fn boundary(
                 Some(until) if until > now => Due::Until(until),
                 _ => Due::Nothing,
             },
-            SourceKind::Tool { answer, haste } => match (answer, haste) {
+            SourceKind::Tool { answer, haste, .. } => match (answer, haste) {
                 // An ended call has nothing left to wait for, nor has one that
                 // says what it holds stands on its own — which is it saying not
                 // to wait for the rest of the call. Nor has one that has
@@ -284,6 +287,11 @@ pub(crate) fn boundary(
             // Both date from the moment they happened, so a tool that ends
             // after an hour of output gets its siblings' full attention rather
             // than looking an hour overdue.
+            SourceKind::Tool {
+                haste: ToolHaste::Ended { .. },
+                control_only_completion: true,
+                ..
+            } => None,
             SourceKind::Tool { haste, .. } => match haste {
                 ToolHaste::None => None,
                 // Mid-thought, so nobody asked for it and it is nobody's reason

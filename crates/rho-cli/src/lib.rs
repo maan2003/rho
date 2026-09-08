@@ -15,6 +15,7 @@ use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
 use rho_ui_proto::{ClientMessage, ServerMessage};
 
+mod eval;
 mod land;
 mod mcp_agent_tools;
 mod pr;
@@ -25,11 +26,21 @@ mod wayland;
 mod tests;
 
 pub fn main() -> Result<()> {
-    // Dying quietly on a closed pipe is the correct
-    // CLI behavior; Rust's default ignore turns it into a print panic.
-    // SAFETY: top of main, single-threaded, resetting to default handling.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args = Args::parse_or_exit(std::env::args().skip(1));
+    // Ordinary utilities die quietly on a closed pipe. Evaluations own live
+    // agent work: BrokenPipe must unwind through cancellation, not kill us
+    // before subprocess destructors run.
+    // SAFETY: top of main, single-threaded, before any runtime exists.
+    unsafe {
+        libc::signal(
+            libc::SIGPIPE,
+            if matches!(&args.command, Command::Eval(_)) {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            },
+        );
+    }
     if let Command::Land(land) = &args.command
         && let Some(socket_path) = &land.socket_path
     {
@@ -55,6 +66,10 @@ pub fn main() -> Result<()> {
         drop(runtime);
         return profiler.finish(result);
     }
+    if matches!(&args.command, Command::Eval(_)) {
+        // SAFETY: before creating the shared runtime or any other thread.
+        unsafe { rho_daemon::init_daemon_namespace() }.context("set up evaluation namespace")?;
+    }
     if let Command::Wayland(args) = args.command {
         return wayland::run(args);
     }
@@ -77,6 +92,7 @@ async fn run(command: Command) -> Result<()> {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
+        Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
@@ -182,6 +198,9 @@ enum Command {
     ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    /// Run a headless agent evaluation; JSONL output, temporary state, real
+    /// provider.
+    Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -208,6 +227,9 @@ enum CliCommand {
     ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    /// Run a headless agent evaluation; JSONL output, temporary state, real
+    /// provider.
+    Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -398,6 +420,7 @@ impl Args {
             CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
             CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
+            CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Land(args) => Command::Land(args),
             CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),

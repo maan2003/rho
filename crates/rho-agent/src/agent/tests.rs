@@ -92,6 +92,7 @@ fn tool(haste: ToolHaste) -> SourceKind {
     SourceKind::Tool {
         answer: ToolCallAnswer::Owed,
         haste,
+        control_only_completion: false,
     }
 }
 
@@ -101,6 +102,7 @@ fn answered(call: SourceKind) -> SourceKind {
         SourceKind::Tool { haste, .. } => SourceKind::Tool {
             answer: ToolCallAnswer::Sent,
             haste,
+            control_only_completion: false,
         },
         SourceKind::User { .. } | SourceKind::Mail { .. } => panic!("only a call has an answer"),
     }
@@ -982,4 +984,100 @@ fn a_finished_call_answers_at_once_however_much_is_running_behind_it() {
         schedule.boundary(UnixMs(5_000 + millis(MAIL_BURST))),
         Boundary::Now
     );
+}
+
+#[test]
+fn patience_setter_completion_does_not_defeat_its_interval() {
+    let control = SourceKind::Tool {
+        answer: ToolCallAnswer::Owed,
+        haste: ToolHaste::Ended { at: UnixMs(1) },
+        control_only_completion: true,
+    };
+    let scenario = ask(vec![control.clone()]).waiting(300);
+    assert_eq!(scenario.recheck(UnixMs(1)), Some(UnixMs(300_000)));
+    assert_eq!(scenario.boundary(UnixMs(300_000)), Boundary::Now);
+    let meaningful = tool(ToolHaste::Soon { since: UnixMs(5) });
+    assert_eq!(
+        ask(vec![control, meaningful])
+            .waiting(300)
+            .boundary(UnixMs(5)),
+        Boundary::Now
+    );
+    assert_eq!(
+        ask(vec![tool(ToolHaste::Ended { at: UnixMs(5) })])
+            .waiting(300)
+            .boundary(UnixMs(5)),
+        Boundary::Now
+    );
+}
+
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+async fn python_surface_has_exec_only_and_direct_surface_keeps_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Arc::new(
+        rho_workspaces::Repo::open_plain_with_path_overrides(temp.path(), Default::default())
+            .unwrap(),
+    );
+    let view = rho_workspaces::View::new(vec![repo.user_checkout().await.unwrap()]).unwrap();
+    for role in [
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        },
+        AgentRole::Advisor {
+            intelligence: crate::db::AdvisorIntelligence::High,
+        },
+    ] {
+        let python = render_agent_surface(view.clone(), role).unwrap();
+        assert_eq!(
+            python
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec"]
+        );
+        assert!(python.system_prompt.contains("## Python Code Mode"));
+        assert!(!python.system_prompt.contains("## JavaScript Code Mode"));
+    }
+    for role in [
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Medium,
+        },
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        },
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Low,
+        },
+        AgentRole::Advisor {
+            intelligence: crate::db::AdvisorIntelligence::Medium,
+        },
+        AgentRole::Advisor {
+            intelligence: crate::db::AdvisorIntelligence::Cheap,
+        },
+    ] {
+        let javascript = render_agent_surface(view.clone(), role).unwrap();
+        assert!(javascript.system_prompt.contains("## JavaScript Code Mode"));
+        assert!(!javascript.system_prompt.contains("## Python Code Mode"));
+        assert!(!javascript.system_prompt.contains("set_patience"));
+        assert_eq!(
+            javascript
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exec", "wait"]
+        );
+    }
+    let direct = render_agent_surface(
+        view,
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Mini,
+        },
+    )
+    .unwrap();
+    assert!(direct.tools.iter().any(|t| t.name.as_str() == "wait"));
+    assert!(!direct.system_prompt.contains("## Python Code Mode"));
+    assert!(!direct.system_prompt.contains("## JavaScript Code Mode"));
 }

@@ -165,6 +165,7 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
+    code_mode: Option<rho_agent_tools::CodeMode>,
     view: Arc<View>,
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
     instructions: Arc<str>,
@@ -767,6 +768,14 @@ impl Agent {
             // One question per event. Either it says to wait and hands over the
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
+            let patience = self
+                .tools
+                .values_mut()
+                .filter_map(|tool| tool.session.take_patience())
+                .max_by_key(|(sequence, _)| *sequence);
+            if let (Some((_, seconds)), Some(turn)) = (patience, self.turn.as_mut()) {
+                turn.asked = ModelAsked::Wait(Duration::from_secs(seconds));
+            }
             let now = UnixMs::now();
             let deadline = match boundary(&self.sources(), self.turn.as_ref(), &self.phase, now) {
                 Boundary::No { recheck } => recheck,
@@ -838,6 +847,7 @@ impl Agent {
         sources.extend(self.tools.values().map(|tool| SourceKind::Tool {
             answer: tool.answer,
             haste: tool.session.haste(),
+            control_only_completion: tool.session.control_only_completion(),
         }));
         sources
     }
@@ -1222,6 +1232,9 @@ impl Agent {
     // -- acting on it -------------------------------------------------------
 
     async fn start_request(&mut self, now: UnixMs) {
+        for tool in self.tools.values_mut() {
+            tool.session.close_patience();
+        }
         // Tools and instructions come from the workdirs, which are only
         // opened now: a load never fails on them, a turn may.
         let surface = match self.surface.get().await {
@@ -1241,7 +1254,9 @@ impl Agent {
             .tools
             .values()
             .map(|tool| tool.spec())
-            .chain(std::iter::once(wait_tool_spec()))
+            .chain(
+                (surface.code_mode != Some(rho_agent_tools::CodeMode::Python)).then(wait_tool_spec),
+            )
             .collect::<Arc<[ToolSpec]>>();
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
@@ -1852,11 +1867,25 @@ fn surface(
         // A rendering has no provider behind it; the spec is what it is for.
         None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
     });
-    let code_mode = cfg!(feature = "code-mode") && profile.code_mode;
+    let code_mode = (cfg!(feature = "code-mode") && profile.code_mode).then_some(
+        if matches!(
+            role,
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High
+            } | AgentRole::Advisor {
+                intelligence: crate::db::AdvisorIntelligence::High
+            }
+        ) {
+            rho_agent_tools::CodeMode::Python
+        } else {
+            rho_agent_tools::CodeMode::JavaScript
+        },
+    );
     let tools = rho_agent_tools::tools(shell, others, code_mode)
         .map_err(|error| anyhow::anyhow!("code mode failed to start: {error}"))?;
     let instructions = system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), code_mode, role);
     Ok(Surface {
+        code_mode,
         view,
         tools: tools
             .into_iter()
@@ -1899,7 +1928,9 @@ pub fn render_agent_surface(
             .tools
             .values()
             .map(|tool| tool.spec())
-            .chain(std::iter::once(wait_tool_spec()))
+            .chain(
+                (surface.code_mode != Some(rho_agent_tools::CodeMode::Python)).then(wait_tool_spec),
+            )
             .collect(),
     })
 }

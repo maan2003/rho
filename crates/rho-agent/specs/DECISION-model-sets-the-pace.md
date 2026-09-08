@@ -11,7 +11,9 @@ itself are that it ended, or that what it currently holds stands on its own.
 
 A look-in lasts exactly one turn: the model is shown what its calls have once,
 and to be shown again it has to ask, by calling something or by naming an
-interval.
+interval. A quiet successful call whose only effect is to name that interval
+must not wake the model merely to acknowledge the setter. Old suspended calls
+cannot change the pace of a newer turn.
 
 ## Rationale
 

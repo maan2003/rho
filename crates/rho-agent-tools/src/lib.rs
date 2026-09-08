@@ -7,6 +7,7 @@
 //! costs the same one, and the model names any pace it wants with `wait`.
 
 mod code_mode;
+mod python;
 mod shell;
 #[cfg(test)]
 mod tests;
@@ -17,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 pub use code_mode::CodeModeTool;
 use futures::future::BoxFuture;
+pub use python::PythonTool;
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs};
 use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;
@@ -53,19 +55,26 @@ impl Tool for Direct {
     }
 }
 
-/// One agent's model-facing surface.
-///
+/// Runtime for an agent's code-mode surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeMode {
+    JavaScript,
+    Python,
+}
+
 /// With `code_mode`, that is a single `exec` whose scripts reach the shell
 /// and `others` as nested tools. Without it, every tool is called directly.
-/// Must be called on a tokio runtime: code mode starts a V8 thread and blocks
-/// briefly while it comes up.
+/// Must be called on a tokio runtime. Python mode starts an interpreter thread
+/// and blocks briefly while it comes up.
 pub fn tools(
     shell: ShellTools,
     others: Vec<Arc<dyn FutureTool>>,
-    code_mode: bool,
+    code_mode: Option<CodeMode>,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
-    if code_mode {
-        return Ok(vec![Arc::new(CodeModeTool::new(shell, others)?)]);
+    match code_mode {
+        Some(CodeMode::Python) => return Ok(vec![Arc::new(PythonTool::new(shell, others)?)]),
+        Some(CodeMode::JavaScript) => return Ok(vec![Arc::new(CodeModeTool::new(shell, others)?)]),
+        None => {}
     }
     let mut tools = ShellTool::all(shell);
     tools.extend(

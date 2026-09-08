@@ -536,6 +536,23 @@ impl ShellTools {
         }
     }
 
+    /// Initialize ordinary Python filesystem operations in this tool's workdir.
+    ///
+    /// # Safety
+    /// Must run on a dedicated interpreter thread with CLONE_FS unshared.
+    /// Poll this future on that same thread throughout.
+    pub async unsafe fn enter_interpreter_thread(&self) -> Result<()> {
+        match &self.exec {
+            ExecContext::Directory {
+                working_directory, ..
+            } => {
+                std::env::set_current_dir(working_directory)?;
+                Ok(())
+            }
+            ExecContext::View(view) => unsafe { view.enter_interpreter_thread().await },
+        }
+    }
+
     /// Start `cmd` the way `exec_command` would, and hand the running process
     /// over instead of collecting its output.
     pub async fn spawn(&self, cmd: &str, workdir: Option<&str>) -> Result<SpawnedProcess> {

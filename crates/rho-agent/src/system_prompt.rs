@@ -5,11 +5,11 @@ use crate::multi_agent_tools::MultiAgentTools;
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
 /// the section explaining them. `code_mode` is set when the agent's tool
-/// surface is the code-mode `exec`/`wait` pair.
+/// surface uses the selected code-mode runtime.
 pub fn prompt(
     view: &rho_workspaces::View,
     multi_agent: Option<&MultiAgentTools>,
-    code_mode: bool,
+    code_mode: Option<rho_agent_tools::CodeMode>,
     role: AgentRole,
 ) -> Arc<str> {
     let entries = view.entries();
@@ -54,8 +54,8 @@ pub fn prompt(
 {identity}
 
 Complete your independent analysis and return it to your parent through your \
-final response. You may use `message_agent` to request context from any known \
-agent and `wait` when blocked on a reply.
+final response. Use the available messaging tool to request context from a known \
+agent and the idle mechanism described above when blocked on a reply.
 "
             );
         }
@@ -67,6 +67,11 @@ agent and `wait` when blocked on a reply.
                 "You were spawned by another Engineer. Own the bounded assignment in the \
                  parent message; your final response is mailed to that Engineer."
             }
+        };
+        let message_tool = if code_mode.is_some() {
+            "tools.message_agent"
+        } else {
+            "message_agent"
         };
         format!(
             "## Team Context
@@ -83,14 +88,23 @@ Payload:
 <payload text>
 ```
 
-Use `message_agent` for bidirectional communication with any known agent. Mail \
+Use `{message_tool}` for bidirectional communication with any known agent. Mail \
 does not interrupt an in-flight request, but it can start or continue your next \
 request.
 
 "
         )
     });
-    let code_mode = if code_mode { CODE_MODE_PROMPT } else { "" };
+    let tool_results = if code_mode == Some(rho_agent_tools::CodeMode::Python) {
+        PYTHON_RESULTS_PROMPT
+    } else {
+        TOOL_RESULTS_PROMPT
+    };
+    let code_mode = match code_mode {
+        Some(rho_agent_tools::CodeMode::Python) => CODE_MODE_PROMPT,
+        Some(rho_agent_tools::CodeMode::JavaScript) => JAVASCRIPT_CODE_MODE_PROMPT,
+        None => "",
+    };
     let role_prompt = match role {
         AgentRole::Engineer { .. } | AgentRole::Advisor { .. } => "",
     };
@@ -101,7 +115,7 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     let workspace = render_workspace_prompt(&workdirs);
-    format!("{base_prompt}{agents_md}{skills}{code_mode}{TOOL_RESULTS_PROMPT}{team_context}{role_prompt}{workspace}{environment}")
+    format!("{base_prompt}{agents_md}{skills}{code_mode}{tool_results}{team_context}{role_prompt}{workspace}{environment}")
         .into()
 }
 
@@ -228,11 +242,11 @@ Use each tool call to answer a specific uncertainty: where the change belongs, w
 
 Optimize for a fast, useful answer. Start from the highest-signal evidence, avoid serial exploration, and stop investigating once you have enough confidence to answer the task.
 
-Batch independent local reads and searches through Code Mode instead of chasing wide questions serially. Read the decisive evidence — the diff, the core function, the contract — yourself. Use `message_agent` only when another agent has context you cannot obtain from the workspace, and treat its report as a lead rather than a conclusion: spot-check decisive evidence before building a finding on it.
+Batch independent local reads and searches through Code Mode instead of chasing wide questions serially. Read the decisive evidence — the diff, the core function, the contract — yourself. Use the available messaging tool only when another agent has context you cannot obtain from the workspace, and treat its report as a lead rather than a conclusion: spot-check decisive evidence before building a finding on it.
 
 - If the task asks about current changes, uncommitted changes, the latest change, or a review of this branch, inspect the diff first with `git diff` or the narrowest relevant `git diff -- <path>` command. Do not read whole files first when the diff is the requested object.
 - If the task asks about the last commit or recent history, start with `git show --stat` / `git show` or a narrow `git log` before reading files.
-- Batch independent local inspection commands in one `exec_command` call when possible, for example `git diff --stat && git diff -- src/foo.ts && rg "pattern" src`. Prefer one well-scoped batched call over several sequential calls.
+- Batch independent local inspections using the available shell interface. Prefer one well-scoped batch over several sequential calls.
 - Use `rg`, `git diff`, `git grep`, `git log`, and targeted `sed`/`head`/`cat` reads before broad file reads. Search for the exact symbols, paths, errors, and behaviors named in the task.
 - Read only the slices of files needed to understand the diff, call chain, or contract. Expand outward only when a concrete uncertainty remains.
 - Do not rerun tests, builds, or checks the requesting Engineer already reports as completed. Run a focused check or scratch experiment only when it resolves a material uncertainty the existing evidence cannot answer; avoid broad or long-running verification.
@@ -291,12 +305,12 @@ Do not repeat verification already performed by the requesting Engineer. Use its
 
 Use provided context first; reach for tools only when they materially improve accuracy or are required to answer. When you investigate, parallelize independent reads and searches through Code Mode rather than issuing them serially.
 
-- Use `exec_command` for focused local inspection, code search, version-control history, and the occasional justified experiment. Prefer `rg` for searching and targeted `sed`/`head`/`cat` reads over broad file reads.
+- Use the available shell interface for focused local inspection, code search, version-control history, and the occasional justified experiment. Prefer `rg` for searching and targeted `sed`/`head`/`cat` reads over broad file reads.
 - For current-change reviews, inspect the repository's current diff first and read surrounding files only when the diff leaves a specific uncertainty. Follow repository guidance about whether to use jj, Git, or another VCS.
 - For recent-history questions, start with the narrowest relevant log or show command before reading whole files.
-- Use `web__run` only when local information is insufficient or a current authoritative external reference is necessary.
+- Use web search only when local information is insufficient or a current authoritative external reference is necessary.
 - Construct paths from the working directory or workspace root shown in the environment section. Never invent placeholder roots such as `/workspace`, `/repo`, or `/project`; inspect the environment when a path is unknown.
-- Use `message_agent` to request genuinely missing context from a known agent and `wait` when blocked on its reply. Do not use messaging as a substitute for evidence available in the workspace.
+- Use the available messaging tool to request genuinely missing context from a known agent and the idle mechanism described above when blocked on its reply. Do not use messaging as a substitute for evidence available in the workspace.
 
 ## Response format
 
@@ -329,13 +343,39 @@ not implement changes.
 
 ";
 
-const CODE_MODE_PROMPT: &str = "## Code Mode
+const JAVASCRIPT_CODE_MODE_PROMPT: &str = "## JavaScript Code Mode
 
-Your tool surface is code mode: the `exec` tool runs JavaScript, and every \
-other capability is an async function under `tools.*` inside your scripts \
-(see the `exec` tool description for signatures). Top-level variables persist \
-across `exec` calls. A cell that is still running when you are next called \
-keeps running; what it prints later reaches you on the same call.
+`exec` runs JavaScript in a persistent REPL with top-level await. Call tools through
+`tools.NAME(...)`; use `text(value)` to display results and `image(item)` for images.
+Batch independent calls with `Promise.all`. See exec for the runtime API and schemas.
+Use the separate `wait` tool when there is nothing else to do.
+
+";
+
+const CODE_MODE_PROMPT: &str = "## Python Code Mode
+
+`exec` runs a persistent Python notebook with top-level await. Globals are shared;
+live cells interleave at await. `command`, `write_stdin`, and `tools.NAME` register
+Rust-owned work immediately. Output and completion arrive automatically: no await
+or print is needed to see them. Put independent calls in one exec cell to run them
+concurrently. Await only for dependencies within Python. Internal tools live under
+`tools` (for example `tools.web__run`), not as global functions.
+
+Use shell commands to inspect files and Python when you need to manipulate their
+data. See exec for examples and API details.
+
+";
+
+const PYTHON_RESULTS_PROMPT: &str = "## How tool results arrive
+
+Live work continues between model turns; output arrives on its original call without
+polling. The default check-in interval after a tool-calling turn is 120 seconds.
+Only use `set_patience(seconds=...)` when you want a significantly shorter or longer interval.
+Include it in the same cell as the work, before any await; no separate call is needed.
+It overrides this turn's interval, not future turns, and does not sleep Python. Meaningful output,
+completion, user messages, or mail wake you sooner under normal batching. The setter's
+own quiet successful completion does not wake you. Old cells cannot change newer
+turns' patience. Use asyncio.sleep only inside Python monitoring logic.
 
 ";
 

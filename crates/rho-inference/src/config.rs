@@ -41,8 +41,9 @@ impl InferenceModel {
 pub struct InferenceProfile {
     pub effort: ReasoningEffort,
     pub fast_mode: bool,
-    /// Code-mode-only tool surface: the model gets `exec`/`wait` and reaches
-    /// all other tools through JavaScript.
+    /// Code-mode tool surface. eng-high and advisor-high use Python; other
+    /// enabled roles use JavaScript. The model reaches nested tools through
+    /// `exec`.
     pub code_mode: bool,
 }
 

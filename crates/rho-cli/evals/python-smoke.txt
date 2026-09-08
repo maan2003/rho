@@ -1,0 +1,3 @@
+Smoke-test this Python notebook: shared state across calls while a monitoring loop is live, concurrent commands with persistent handles, stdin, retrieving truncated output after command completion, and async/file/JSON operations.
+
+Use small harmless commands and temporary files. Verify results rather than assuming success. Briefly report any failures. Finish with PYTHON_SMOKE_PASS if all checks pass, otherwise PYTHON_SMOKE_FAIL.
