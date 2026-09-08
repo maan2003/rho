@@ -771,3 +771,116 @@ async fn a_refused_rewrite_and_a_failed_upload_answer_with_a_refusal(cx: &mut Te
         "an upload that failed is not a file that was sent"
     );
 }
+
+/// A narrowing that takes the point's row away puts the point on the first
+/// match.
+///
+/// The list holds the rule that the point follows the conversation and never
+/// the line number — an arriving message must not move the selection under a
+/// keypress. `refresh` kept it by finding the held conversation again after
+/// the draw, but only if it was still on screen. When a query filtered it
+/// out, nothing placed the point at all: it fell to wherever the editor
+/// clamped it, which was the blank line under the listing, and `enter`
+/// answered nothing at all. Measured before the fix: six rows narrowed to
+/// two, the point on row three, and `cursor_source` answering None.
+#[gpui::test]
+async fn a_narrowing_that_takes_the_point_s_row_away_puts_it_on_the_first_match(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack(window, cx);
+        })
+        .unwrap();
+
+    let mut whole = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+            .expect("draw a frame");
+        cx.run_until_parked();
+        whole = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if whole.len() > 4 {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        whole.len() > 4,
+        "the fake's conversations reached the list: {whole:?}"
+    );
+
+    // A row the query will not reach, and not the first one, so the point
+    // has somewhere to fall from.
+    let held = whole
+        .iter()
+        .enumerate()
+        .find(|(at, label)| *at > 0 && !label.to_lowercase().contains("ops"))
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("a row outside the query, below the top: {whole:?}"));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.slack_place_cursor_for_test(held, window, cx);
+        })
+        .unwrap();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_cursor_conversation_for_test(cx))
+            .unwrap()
+            .as_deref(),
+        Some(whole[held].as_str()),
+        "the point starts on the row it was put on"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.slack_narrow_for_test("ops", window, cx);
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("draw a frame");
+    cx.run_until_parked();
+
+    let narrowed = workspace
+        .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+        .unwrap();
+    assert!(
+        !narrowed.contains(&whole[held]),
+        "the query took the point's row away: {narrowed:?}"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_cursor_conversation_for_test(cx))
+            .unwrap()
+            .as_deref(),
+        narrowed.first().map(String::as_str),
+        "so the point is on the first match, which is what the reader typed for"
+    );
+}

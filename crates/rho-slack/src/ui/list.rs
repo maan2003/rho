@@ -200,6 +200,12 @@ impl ListView {
             .position(|line| line.id.as_ref() == Some(channel))
     }
 
+    /// The first line that opens a conversation, past whatever chrome is
+    /// above the listing.
+    fn first_row(&self) -> Option<usize> {
+        self.drawn.iter().position(|line| line.id.is_some())
+    }
+
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
         self.editor.update(cx, |editor, cx| {
             editor
@@ -254,9 +260,18 @@ impl ListView {
             _ => self.rebuild(banner, cx),
         }
         // The point follows the conversation, not the line number: rows
-        // moving above the reader must not move the reader.
+        // moving above the reader must not move the reader. When the
+        // conversation it was on is not on screen at all -- a query
+        // narrowed it away -- it goes to the first row, which is the match
+        // the reader typed for. Something has to decide: left alone the
+        // point falls to wherever the editor clamps it, which today is the
+        // blank line under the listing, so `enter` answers nothing.
+        //
+        // Only when it was on a conversation. A point the reader put on the
+        // break, or below the rows, is theirs; moving it because a message
+        // arrived is the very thing this rule exists to prevent.
         if let Some(held) = held
-            && let Some(row) = self.line_of_id(&held)
+            && let Some(row) = self.line_of_id(&held).or_else(|| self.first_row())
         {
             self.place_cursor(row, window, cx);
         }

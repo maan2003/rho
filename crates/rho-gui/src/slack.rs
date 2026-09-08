@@ -266,6 +266,37 @@ impl Workspace {
         view.read(cx).drawn_banner_for_test()
     }
 
+    /// Puts the point on a row of the Slack list, for a test that then
+    /// moves the rows under it.
+    #[cfg(test)]
+    pub(crate) fn slack_place_cursor_for_test(
+        &mut self,
+        row: usize,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
+            return;
+        };
+        view.clone()
+            .update(cx, |view, cx| view.place_cursor_for_test(row, window, cx));
+    }
+
+    /// The conversation the point is on in the Slack list, named the way
+    /// the rows are, for a test that asserts what `enter` would open.
+    #[cfg(test)]
+    pub(crate) fn slack_cursor_conversation_for_test(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<String> {
+        let SurfaceView::SlackList(view) = &self.active_surface().view else {
+            return None;
+        };
+        let source = view.clone().update(cx, |view, cx| view.cursor_source(cx))?;
+        let session = self.slack.session()?;
+        Some(session.read(cx).model().label(source.channel()))
+    }
+
     /// The conversation names the Slack list is drawing, for a test that
     /// asserts what the reader is looking at rather than what the model
     /// holds.
@@ -1217,6 +1248,17 @@ impl Workspace {
     /// Narrows the Slack list to a query. The one place the narrowing
     /// happens, so a keystroke, a submit and escape putting the old query
     /// back are the same code and cannot drift apart.
+    /// The narrowing, for a test that drives it without the prompt.
+    #[cfg(test)]
+    pub(crate) fn slack_narrow_for_test(
+        &mut self,
+        query: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.slack_narrow(query, window, cx);
+    }
+
     fn slack_narrow(
         &mut self,
         query: &str,
