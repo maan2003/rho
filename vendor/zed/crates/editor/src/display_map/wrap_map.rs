@@ -16,6 +16,7 @@ use std::{
     mem,
     ops::Range,
     sync::LazyLock,
+    sync::atomic::{self, AtomicBool},
     time::{Duration, Instant},
 };
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
@@ -67,13 +68,31 @@ const WRAP_BATCH_BUDGET: Duration = Duration::from_millis(2);
 /// now shows the old width for one frame instead of running long.
 const WRAP_FOREGROUND_BUDGET: Duration = Duration::from_millis(3);
 
+/// Whether a batch is bounded by the clock, or by the row interval alone.
+///
+/// A harness that hashes a scene has to own every bound on the work behind
+/// it: with the clock in, how many rows a batch finishes depends on how
+/// busy the machine is, so the same seed composes differently on a loaded
+/// box and the scene it hashes is not the scene it hashed before. Zed's
+/// tests do not hash a scene across runs, so the clock costs them nothing.
+static WRAP_BATCH_CLOCK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Bounds a wrap batch by the row interval alone, for a harness whose
+/// scenes must be the same on every run. Off the harness this stays on:
+/// a row that wraps into twenty lines costs twenty times one that fits,
+/// and only the clock knows that.
+pub fn set_wrap_batch_clock_enabled(enabled: bool) {
+    WRAP_BATCH_CLOCK_ENABLED.store(enabled, atomic::Ordering::Relaxed);
+}
+
 /// When the current batch started, or `None` where there is no clock to ask.
 ///
 /// `Instant::now` has no answer on wasm, where this runs on the browser's
 /// main thread; there the row interval stands in for the budget, which is
 /// what the whole map did before.
 fn wrap_batch_started() -> Option<Instant> {
-    cfg!(not(target_family = "wasm")).then(Instant::now)
+    (cfg!(not(target_family = "wasm")) && WRAP_BATCH_CLOCK_ENABLED.load(atomic::Ordering::Relaxed))
+        .then(Instant::now)
 }
 
 impl_for_row_types! {
