@@ -431,12 +431,11 @@ impl DeskNode {
 }
 
 /// What the join of a Slack unit's cursor and its mirror facts says: the
-/// card's state, and whether a message arriving during a snooze has voided
-/// it.
+/// card's state, and nothing else. A snooze is not a cursor, so nothing
+/// arriving during one has anything to say about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SlackCard {
     state: State,
-    voided: bool,
 }
 
 /// A Slack unit's card, derived and never stored. It is open exactly while
@@ -478,10 +477,6 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
                 false => State::Done,
             },
         },
-        // The snooze recorded where the unit stood; anything from someone
-        // else past that arrived while it was snoozed, and that is what
-        // brings the card straight back.
-        voided: facts.defer_until.is_some() && past(facts.slack_snoozed_at.as_ref()),
     })
 }
 
@@ -1010,10 +1005,7 @@ impl DeskCells {
                 (_, Some(card)) => card.state,
                 _ => fact.state,
             },
-            defer_until: match slack {
-                Some(card) if card.voided => None,
-                _ => fact.defer_until,
-            },
+            defer_until: fact.defer_until,
             deadline: fact.deadline,
             pace_days: fact.pace_days,
             labels: fact.labels.clone(),
@@ -1098,10 +1090,7 @@ impl DeskCells {
                         (_, Some(card)) => card.state,
                         _ => fact.state,
                     },
-                    defer_until: match slack {
-                        Some(card) if card.voided => None,
-                        _ => fact.defer_until,
-                    },
+                    defer_until: fact.defer_until,
                     deadline: fact.deadline,
                     pace_days: fact.pace_days,
                     labels: fact.labels.clone(),
@@ -1185,7 +1174,7 @@ impl DeskCells {
                 Some((
                     agent,
                     rho_agents::AgentFiling {
-                        hidden: facts.state == State::Muted,
+                        muted: facts.state == State::Muted,
                         labels,
                         name: facts.name,
                     },
@@ -1220,7 +1209,7 @@ impl DeskCells {
                 Some((
                     *agent,
                     rho_agents::AgentFiling {
-                        hidden: facts.state == State::Muted,
+                        muted: facts.state == State::Muted,
                         labels,
                         name: facts.name,
                     },

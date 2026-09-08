@@ -379,7 +379,7 @@ pub(crate) fn find_candidates(
     // An agent created by an agent belongs to its creator and is not found.
     for agent_id in registry.known_agents().copied() {
         if filed.contains(&agent_id)
-            || registry.agent_hidden(agent_id)
+            || registry.agent_muted(agent_id)
             || !registry.created_by_user(agent_id)
         {
             continue;

@@ -1188,8 +1188,21 @@ impl Dashboard {
             .is_some_and(|node| node.state == rho_desk::cells::State::Open)
     }
 
-    /// When a card is put down until, as the view derives it: a snooze a
-    /// newer message has voided reads as no snooze at all.
+    /// Whether the user has put this agent away: muted, or snoozed to a
+    /// time still ahead. Neither is a cursor, so nothing the agent does
+    /// takes either back — this is the one question every list that draws
+    /// agents asks, and it is the same one the dealer asks per card.
+    pub(crate) fn agent_put_down(
+        &self,
+        agent_id: AgentId,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> bool {
+        self.deal_hosts
+            .values()
+            .any(|source| agent_node_closed(source, agent_id, now))
+    }
+
+    /// When a card is put down until.
     pub fn node_defer_until(&self, card: DealCardId) -> Option<rho_desk::cells::Timestamp> {
         self.deal_hosts
             .get(&card.host)

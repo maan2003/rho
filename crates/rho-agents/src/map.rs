@@ -20,7 +20,7 @@
 //! Per read, the reads the screens actually make:
 //!
 //! - a row's own facts (`agent_facts`, `attention`, `agent_display_label`,
-//!   `agent_human_name`, `agent_hidden`, …) — one lookup each, so a frame costs
+//!   `agent_human_name`, `agent_muted`, …) — one lookup each, so a frame costs
 //!   the rows it draws.
 //! - `agent_children` — the children, no search; `agent_subtree` — the subtree
 //!   it returns, plus sorting it.
@@ -47,7 +47,6 @@ use rho_ui_proto::mirror::LogEntry;
 use crate::fold::{AgentIdentity, Attention, Digest, MirroredAgent, Verdict, Wants, attention};
 use crate::now_ms;
 
-pub const HIDE_LABEL: &str = "hide";
 const LABEL_HEADROOM: u64 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,11 +63,13 @@ struct HostSnapshot {
 }
 
 /// The user's own filing of an agent, which lives on the desk and never on
-/// the wire: whether they put it away, the labels they placed it under, and
+/// the wire: whether they muted it, the labels they placed it under, and
 /// the name they gave it after it was running.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentFiling {
-    pub hidden: bool,
+    /// The user's mute, which is the desk saying the agent's node is
+    /// muted. There is no second way to put an agent away.
+    pub muted: bool,
     pub labels: Vec<String>,
     /// `Property::Name` on the agent's own cell. `None` is an agent the
     /// user has not named, which reads as whatever the runtime titled it.
@@ -109,7 +110,7 @@ pub struct AgentMap {
     activities: BTreeMap<AgentId, String>,
     /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
-    /// The user's filing, from the store: hidden agents, their labels,
+    /// The user's filing, from the store: muted agents, their labels,
     /// and what the user called them.
     filing: BTreeMap<AgentId, AgentFiling>,
     /// Where each agent is currently filed in the `children` and
@@ -289,7 +290,7 @@ impl AgentMap {
         changed
     }
 
-    /// The user's filing of the agents named, from the store: hidden, and
+    /// The user's filing of the agents named, from the store: muted, and
     /// the labels they put on them. Nothing on the wire carries either.
     ///
     /// The desk files them all at once, so they are taken all at once: one
@@ -301,8 +302,7 @@ impl AgentMap {
         filings: impl IntoIterator<Item = (AgentId, AgentFiling)>,
     ) -> bool {
         let mut moved = Vec::new();
-        for (agent_id, mut filing) in filings {
-            filing.hidden |= filing.labels.iter().any(|label| label == HIDE_LABEL);
+        for (agent_id, filing) in filings {
             if self.filing.get(&agent_id) == Some(&filing) {
                 continue;
             }
@@ -470,8 +470,7 @@ impl AgentMap {
             return;
         };
         let entry = (key, agent_id);
-        let hidden = self.agent_hidden(agent_id);
-        if hidden {
+        if self.agent_muted(agent_id) {
             self.visible.remove(&entry);
         } else {
             self.visible.insert(entry);
@@ -558,13 +557,9 @@ impl AgentMap {
         self.last_active
             .insert(agent_id, rho_core::UnixMs(now_ms()));
     }
-    pub fn agent_folded(&self, agent_id: AgentId) -> bool {
-        self.agent_hidden(agent_id)
-    }
-
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
         // Hidden agents are excluded from the result but still walked,
-        // so descendants behind a hidden intermediate are found.
+        // so descendants behind a muted intermediate are found.
         let mut seen = BTreeSet::from([agent_id]);
         let mut queue = vec![agent_id];
         let mut descendants = Vec::new();
@@ -572,7 +567,7 @@ impl AgentMap {
             for child in self.children.get(&cursor).map_or(&[][..], Vec::as_slice) {
                 if seen.insert(*child) {
                     queue.push(*child);
-                    if !self.agent_hidden(*child) {
+                    if !self.agent_muted(*child) {
                         descendants.push(*child);
                     }
                 }
@@ -586,7 +581,7 @@ impl AgentMap {
     }
 
     /// Direct children in stable summary order. Unlike `agent_subtree`, this
-    /// preserves the runtime hierarchy and includes hidden agents so a full
+    /// preserves the runtime hierarchy and includes muted agents so a full
     /// tree never silently rewrites its ancestry.
     pub fn agent_children(&self, agent_id: AgentId) -> &[AgentId] {
         self.children.get(&agent_id).map_or(&[][..], Vec::as_slice)
@@ -665,10 +660,13 @@ impl AgentMap {
     pub fn created_by_user(&self, agent_id: AgentId) -> bool {
         self.agent_parent(agent_id).is_none()
     }
-    pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
+    /// The user muted this agent: they said "not this one", and nothing
+    /// the agent does takes that back. Every list that draws agents asks
+    /// this and leaves it out.
+    pub fn agent_muted(&self, agent_id: AgentId) -> bool {
         self.filing
             .get(&agent_id)
-            .is_some_and(|filing| filing.hidden)
+            .is_some_and(|filing| filing.muted)
     }
     pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
         self.agent_labels(agent_id)
@@ -1131,7 +1129,7 @@ mod tests {
         assert!(map.set_agent_filings([(
             agent(2),
             AgentFiling {
-                hidden: true,
+                muted: true,
                 ..AgentFiling::default()
             },
         )]));

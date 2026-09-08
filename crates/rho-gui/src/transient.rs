@@ -111,7 +111,6 @@ pub(crate) enum Command {
     Version,
     // The agent under the point.
     AgentDone,
-    AgentHide,
     AgentCancel,
     AgentRole,
     AgentName,
@@ -428,7 +427,6 @@ pub(crate) fn status_menu() -> Menu {
 pub(crate) fn agent_menu() -> Menu {
     Menu::new("agent")
         .item("d", "done", MenuAction::Command(Command::AgentDone))
-        .item("shift-d", "hide", MenuAction::Command(Command::AgentHide))
         .item("s", "snooze…", MenuAction::Open(MenuId::Snooze))
         .item(
             "c",

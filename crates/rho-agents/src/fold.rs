@@ -54,11 +54,15 @@ pub struct AttentionFacts {
 /// reads the answer through the registry.
 pub fn attention(facts: AttentionFacts, verdict: Verdict) -> Attention {
     let past = |pos: AgentPos| pos >= verdict.handled_through;
-    // A running turn is the agent's court, whatever the user has said.
-    if facts.turn_running {
-        Attention::Working
-    } else if verdict.muted {
+    // A mute is not a cursor: the user said "not this agent", so nothing
+    // the agent does takes it back — not a turn starting, not a turn
+    // ending with a question. Working used to be read first, on the
+    // reasoning that a running turn is the agent's court; that is true of
+    // how loudly an agent may ask and not of whether it may ask at all.
+    if verdict.muted {
         Attention::Quiet
+    } else if facts.turn_running {
+        Attention::Working
     } else if facts.errored.is_some_and(past) {
         Attention::NeedsInput
     } else if facts.wants_at.is_some_and(past) {
@@ -1155,6 +1159,35 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    /// A mute is not a cursor: an agent the user muted stays quiet whatever
+    /// it does next. A turn starting used to be read first — a running turn
+    /// is the agent's court — which made the mute last exactly until the
+    /// agent moved.
+    #[test]
+    fn a_muted_agent_stays_quiet_through_a_turn() {
+        let muted = Verdict {
+            handled_through: AgentPos(0),
+            muted: true,
+        };
+        let running = AttentionFacts {
+            turn_running: true,
+            errored: None,
+            wants_at: None,
+        };
+        assert_eq!(attention(running, muted), Attention::Quiet);
+        assert_eq!(
+            attention(running, Verdict::default()),
+            Attention::Working,
+            "and an agent nobody muted still says it is working"
+        );
+        let asking = AttentionFacts {
+            turn_running: false,
+            errored: None,
+            wants_at: Some(AgentPos(1)),
+        };
+        assert_eq!(attention(asking, muted), Attention::Quiet);
     }
 
     /// A rewind hides what it undid and keeps what came before it.

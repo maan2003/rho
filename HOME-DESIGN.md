@@ -206,6 +206,47 @@ a snoozed todo comes back from zero rather than halfway up its old curve.
 The pair is one shape in `rho-desk`, which the writer builds and the daemon
 checks, so an entry naming only the wake time is refused.
 
+## Done is a cursor; mute and snooze are not
+
+Decided with the user on 8 Sep. The three verdicts differ in what a later
+message may do to them:
+
+- **Done** says "up to here". It is a cursor, so anything past it is news
+  and brings the card back. That is what makes `d` safe to press on a
+  thread that is still alive.
+- **Mute** says "not this thing". Nothing arriving takes it back: not a
+  Slack reply, not an agent starting a turn, not an agent's turn ending
+  with a question. Opening the thing is what clears a mute, because that
+  is the user looking at it again.
+- **Snooze** says "not until then". Nothing arriving shortens it either;
+  the wake time is the only thing that ends it. The cursor is left alone,
+  so the messages the user never handled are still theirs when it wakes.
+
+The rule is applied per source and in one place per surface. A Slack unit's
+card reads its state before anything else; an agent's attention answers
+Quiet for a muted agent whatever its turn is doing; and Home's running list
+asks the same question the dealer asks per card — has the user put this
+agent away, by a mute or by a snooze still ahead — instead of listing every
+agent with a turn in flight.
+
+**Why:** the user's words. A snooze that the next reply voids means "not
+until Monday" reads as "until somebody writes", and a mute that a running
+turn overrules means the thing you put away comes back by moving. Only
+`done` is about a position in a stream; the other two are about the thing.
+
+## There is one mute, and `hide` is gone
+
+Decided with the user on 8 Sep. `shift-d` "hide" wrote the same
+`DeskVerdict::Mute` as `x`, so rho had two names, two keys and two words in
+the log for one verdict — and the second name spread: an agent was "hidden"
+in `rho-agents` and muted everywhere else, which is how lists came to filter
+one and not the other. The hide entry, `Command::AgentHide` and the hide
+half of the agent-done key are gone; `x` on the card is the mute, and the
+filing rho reads is `agent_muted`. A muted agent is left out of every list
+that draws agents — Home's running list, the finder, and the draft's start
+field — while its handle still resolves and its row is still on the map,
+which is where the mute is taken back.
+
 ## Deliberately deferred
 
 - Editing anything from Home.

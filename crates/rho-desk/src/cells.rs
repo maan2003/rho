@@ -539,10 +539,11 @@ pub fn verdict_changes(
             // unfollowed, a conversation marked read) is the caller's to
             // send, so following the thread again still brings the card back.
             Verdict::Mute => Ok(vec![handled()?, change(Property::State(State::Muted))]),
-            // The cursor stays where it is, so the messages the user has not
-            // handled are still theirs when the snooze ends. What is
-            // recorded is where the unit stood, which is what makes a reply
-            // arriving during the snooze void it.
+            // The cursor stays where it is, so the messages the user has
+            // not handled are still theirs when the snooze ends. Where the
+            // unit stood is recorded with it: a snooze is not a cursor and
+            // nothing arriving during one takes it back, so this is a note
+            // of what the user was looking away from, not a trigger.
             Verdict::Defer { until } => Ok(vec![
                 change(Property::DeferUntil(Some(*until))),
                 change(Property::PaceDays(0)),
@@ -1502,7 +1503,7 @@ mod tests {
         );
         // A snooze leaves the cursor alone, so the messages the user has not
         // handled are still theirs when it ends, and records where the unit
-        // stood so a reply arriving during the snooze voids it.
+        // stood when the user looked away.
         let snoozed = changes(Verdict::Defer {
             until: timestamp(10),
         });

@@ -8141,6 +8141,263 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
 /// the row named nothing: one tap of shift opened nothing and said nothing.
 /// Filing an agent is one of the things that tap is for, so the row that
 /// most needs the menu was the one that could not open it.
+/// The draft's start field stops offering an agent the user muted, and the
+/// handle still reaches it. A mute is about what rho draws, not about
+/// taking the agent away: without the second half of that, muting would be
+/// a one-way door with no way back except remembering the handle.
+#[gpui::test]
+fn a_muted_agent_is_not_offered_as_a_start_target(cx: &mut TestAppContext) {
+    let hidden = agent(43);
+    let seen = agent(44);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    let hidden_node = desk.agent_row(topic.clone(), hidden);
+    desk.agent_row(topic, seen);
+    desk.set(
+        hidden_node,
+        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(hidden), ui_head(seen)], 40),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let hidden_handle = workspace.registry.agent_id_label(hidden);
+            let offered = workspace
+                .live_agent_targets()
+                .into_iter()
+                .map(|candidate| candidate.value)
+                .collect::<Vec<_>>();
+            assert!(
+                offered.contains(&workspace.registry.agent_id_label(seen)),
+                "the agent that was not muted is still offered: {offered:?}"
+            );
+            assert!(
+                !offered.contains(&hidden_handle),
+                "the muted agent is offered as a target: {offered:?}"
+            );
+            assert_eq!(
+                workspace.registry.agent_by_label(&hidden_handle),
+                Some(hidden),
+                "and the handle still reaches it, so a mute is not a one-way door"
+            );
+        })
+        .unwrap();
+}
+
+/// The other half of the same rule: an agent the user muted, whose turn
+/// ended asking for them, is not a card either. The mute and the asking
+/// arrive from different places and only the card says which won.
+#[gpui::test]
+fn a_muted_agent_asking_for_the_user_is_not_a_card(cx: &mut TestAppContext) {
+    let hidden = agent(41);
+    let seen = agent(42);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    let hidden_node = desk.agent_row(topic.clone(), hidden);
+    desk.agent_row(topic, seen);
+    desk.set(
+        hidden_node,
+        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(hidden), ui_head(seen)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(hidden, UnixMs(1)),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(seen, UnixMs(1)),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .dashboard
+                    .agent_card_id(seen)
+                    .is_some_and(|card| workspace.dashboard.node_is_open(card)),
+                "the agent that was not muted is asking and has its card"
+            );
+            assert!(
+                !workspace
+                    .dashboard
+                    .agent_card_id(hidden)
+                    .is_some_and(|card| workspace.dashboard.node_is_open(card)),
+                "the muted agent is carded despite the mute"
+            );
+        })
+        .unwrap();
+}
+
+/// The same rule for the other verdict that is not a cursor: an agent
+/// snoozed until a time still ahead is off Home even when it starts a turn
+/// and says something. Snoozing a working agent left it on Home, so
+/// "not until tomorrow" lasted until the agent's next move.
+#[gpui::test]
+fn a_snoozed_agent_is_off_home_when_its_turn_runs(cx: &mut TestAppContext) {
+    let snoozed = agent(51);
+    let seen = agent(52);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    let snoozed_node = desk.agent_row(topic.clone(), snoozed);
+    desk.agent_row(topic, seen);
+    desk.set(
+        snoozed_node,
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 4_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![
+                        story::UiAgentHead {
+                            activity: Some("wiring the flick recogniser".to_owned()),
+                            turn_running: true,
+                            ..ui_head(snoozed)
+                        },
+                        story::UiAgentHead {
+                            activity: Some("reading the mirror".to_owned()),
+                            turn_running: true,
+                            ..ui_head(seen)
+                        },
+                    ],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            let home = workspace.home_view().expect("home is in view");
+            home.update(cx, |home, cx| {
+                let editor = home.editor().clone();
+                editor.read(cx).buffer().read(cx).snapshot(cx).text()
+            })
+        })
+        .unwrap();
+    assert!(
+        text.contains("reading the mirror"),
+        "the agent nobody snoozed is still running on Home: {text}"
+    );
+    assert!(
+        !text.contains("wiring the flick recogniser"),
+        "the snoozed agent is drawn on Home while it runs: {text}"
+    );
+}
+
+/// An agent the user muted is not on Home while it runs. A mute is not a
+/// cursor: it is the user saying "not this agent", and a running turn
+/// decides how loudly an agent may ask, not whether it may ask at all.
+/// Home's running list asked neither, so muting a working agent did
+/// nothing a reader could see until the turn ended.
+#[gpui::test]
+fn a_muted_agent_is_off_home_even_while_its_turn_runs(cx: &mut TestAppContext) {
+    let hidden = agent(31);
+    let seen = agent(32);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    let hidden_node = desk.agent_row(topic.clone(), hidden);
+    desk.agent_row(topic, seen);
+    // Muting an agent is a state on its node; that is the whole of it.
+    desk.set(
+        hidden_node,
+        rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![
+                        story::UiAgentHead {
+                            activity: Some("wiring the flick recogniser".to_owned()),
+                            turn_running: true,
+                            ..ui_head(hidden)
+                        },
+                        story::UiAgentHead {
+                            activity: Some("reading the mirror".to_owned()),
+                            turn_running: true,
+                            ..ui_head(seen)
+                        },
+                    ],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            let home = workspace.home_view().expect("home is in view");
+            home.update(cx, |home, cx| {
+                let editor = home.editor().clone();
+                editor.read(cx).buffer().read(cx).snapshot(cx).text()
+            })
+        })
+        .unwrap();
+    assert!(
+        text.contains("reading the mirror"),
+        "the agent the user did not mute is still running on Home: {text}"
+    );
+    assert!(
+        !text.contains("wiring the flick recogniser"),
+        "the muted agent is drawn on Home while it runs: {text}"
+    );
+}
+
 #[gpui::test]
 fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppContext) {
     let running = agent(31);
@@ -8841,10 +9098,12 @@ fn a_done_slack_unit_is_not_reopened_by_anything_slack_replays(cx: &mut TestAppC
 }
 
 /// A snooze leaves the cursor alone, so the messages the user has not
-/// handled are still theirs when it ends. What voids it is somebody writing
-/// during the snooze: the card comes straight back.
+/// handled are still theirs when it ends — and it is not a cursor either:
+/// a message arriving during the snooze does not bring the card back. A
+/// snooze used to be voided by the next reply, which made "not until
+/// Monday" mean "until somebody writes".
 #[gpui::test]
-fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
+fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let node = desk.thread_row(None, "C1", "500.0");
     let unit = rho_desk::cells::SlackUnit {
@@ -8894,7 +9153,7 @@ fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppConte
             assert_eq!(
                 facts.slack_snoozed_at,
                 Some(rho_desk::cells::SlackTs("600.0".to_owned())),
-                "and where the unit stood is what tells a new reply from an old one"
+                "and where the unit stood when they looked away is recorded with it"
             );
             assert!(
                 workspace.dashboard.node_defer_until(card.clone()).is_some(),
@@ -8903,8 +9162,12 @@ fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppConte
 
             workspace.set_slack_sources_for_test(HostId::default(), source("700.0"), window, cx);
             assert!(
-                workspace.dashboard.node_defer_until(card).is_none(),
-                "somebody writing during the snooze voids it"
+                workspace.dashboard.node_defer_until(card.clone()).is_some(),
+                "somebody writing during the snooze does not end it"
+            );
+            assert!(
+                workspace.dashboard.node_is_open(card),
+                "the unit is still open — the snooze is when it is asked about, not whether"
             );
         })
         .unwrap();

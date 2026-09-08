@@ -71,7 +71,7 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 use rho_files::{FileView, RemoteProject};
 
 use crate::{
-    AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
+    AgentDone, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
     DashboardDealExit, DashboardDealFile, DashboardDealMute, DashboardDealNext,
     DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
     DashboardDealTodo, DashboardDeleteRow, DashboardPasteRow, DashboardPasteRowBefore,
@@ -1380,12 +1380,19 @@ impl Workspace {
         let now_ms = now.timestamp_millis();
         // An agent created by an agent belongs to its creator and is not
         // the reader's to watch; only the ones the reader made are listed.
+        // Nor one the user put away. A running turn decides how loudly an
+        // agent may ask; a mute and a snooze decide whether it may ask at
+        // all, and neither is a cursor, so a turn starting does not take
+        // either back. This list read neither, which is why muting or
+        // snoozing a working agent did nothing a reader could see until
+        // the turn ended.
         let mut running = self
             .registry
             .known_agents()
             .copied()
             .filter(|agent_id| {
                 self.registry.created_by_user(*agent_id)
+                    && !self.dashboard.agent_put_down(*agent_id, now)
                     && self.registry.agent_facts(*agent_id).turn_running
             })
             .collect::<Vec<_>>();
@@ -2992,31 +2999,22 @@ impl Workspace {
         self.echo(&said, StyleClass::SystemInfo, cx);
     }
 
-    pub(crate) fn cmd_agent_done(
-        &mut self,
-        hide: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// `ctrl-shift-d`, and `d` in the agent menu: done on the agent under
+    /// the point. Done is a cursor — up to here — and the only verdict
+    /// this key writes. Putting an agent away for good is the mute `x`
+    /// writes on its card, which is one verdict in one place.
+    pub(crate) fn cmd_agent_done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
-        let verdict = if hide {
-            crate::desk_view::DeskVerdict::Mute
-        } else {
-            crate::desk_view::DeskVerdict::Done
-        };
         let targets = self.subject(window, cx).agents;
-        let hid_open_agent = self
-            .selection
-            .selected_agent()
-            .is_some_and(|agent_id| targets.contains(&agent_id));
-        let sent = self.deal_agents(targets, "done", verdict, window, cx);
-        // Hiding the open agent closes its tab, or it would stay
-        // rail-visible through the selection exemption.
-        if hide && sent && hid_open_agent {
-            self.select_agent(None, window, cx);
-        }
+        self.deal_agents(
+            targets,
+            "done",
+            crate::desk_view::DeskVerdict::Done,
+            window,
+            cx,
+        );
     }
 
     /// The snooze operator: `s` and a unit, with vim's count in front, so
@@ -5458,7 +5456,7 @@ impl Workspace {
             rho_desk::cells::StoryPos(pos.0)
         }
 
-        if self.registry.host_of_agent(agent) != Some(host) || self.registry.agent_hidden(agent) {
+        if self.registry.host_of_agent(agent) != Some(host) || self.registry.agent_muted(agent) {
             return None;
         }
         let digest = self.registry.agent_digest(agent);
@@ -6909,8 +6907,7 @@ impl Workspace {
             Command::Usage(chart, days) => self.open_usage_chart(chart, days, window, cx),
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
             Command::Version => self.cmd_version(cx),
-            Command::AgentDone => self.cmd_agent_done(false, window, cx),
-            Command::AgentHide => self.cmd_agent_done(true, window, cx),
+            Command::AgentDone => self.cmd_agent_done(window, cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
             Command::AgentName => self.prompt_name_agent(window, cx),
@@ -8752,9 +8749,17 @@ impl Workspace {
         }
     }
 
+    /// The agents the draft's start field offers. An agent the user hid is
+    /// not offered — the finder leaves it out for the same reason — but it
+    /// is not made unreachable: its handle still resolves, and its row on
+    /// the map is where the user takes the hiding back.
     pub fn live_agent_targets(&self) -> Vec<crate::commands::Candidate> {
         let mut candidates = Vec::new();
-        for agent_id in self.registry.known_agents() {
+        for agent_id in self
+            .registry
+            .known_agents()
+            .filter(|agent_id| !self.registry.agent_muted(**agent_id))
+        {
             let id_label = self.registry.agent_id_label(*agent_id);
             let display_name = self
                 .registry
@@ -9018,10 +9023,7 @@ impl Render for Workspace {
                 this.select_agent(None, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
-                this.cmd_agent_done(false, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &AgentHide, window, cx| {
-                this.cmd_agent_done(true, window, cx);
+                this.cmd_agent_done(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);
