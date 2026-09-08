@@ -1466,13 +1466,21 @@ impl Model {
     /// unread ones is one key pressed repeatedly; `None` when there is
     /// nothing left, which is what sends the reader back to the list.
     ///
-    /// The whole order, never the narrowed rows. A query is what the reader
-    /// is looking at; this is a question about what the workspace holds,
-    /// and a query left standing from an hour ago must not answer it. It
-    /// reads the same set `mark_plan` does, so the two cannot disagree
-    /// about how much is waiting.
+    /// The list the reader is looking at, which is the narrowed one while a
+    /// query stands. A key that moves them through the list has to move
+    /// them through *this* list: taking them to a conversation the rows
+    /// cannot show, under a banner still describing the rows, is the list
+    /// and the key disagreeing about where the reader is. The narrowing
+    /// lasts as long as they are in it and no longer -- it is a motion, not
+    /// a setting -- so there is no hour-old query left to answer this
+    /// wrongly.
+    ///
+    /// This is why it no longer reads the same set `mark_plan` does. That
+    /// one is a question about the workspace, and stays one; this is a
+    /// question about the list on screen. Two questions, two answers, and
+    /// the difference is deliberate.
     pub fn next_unread(&self, from: Option<&ChannelId>) -> Option<ChannelId> {
-        let rows = self.order.values().collect::<Vec<_>>();
+        let rows = self.walked();
         let unread = |row: &&ConversationRow| !row.muted && (row.unread || row.mention_count > 0);
         let at = from
             .and_then(|from| rows.iter().position(|row| &row.id == from))
@@ -1482,6 +1490,20 @@ impl Model {
             .chain(rows.iter().take(at))
             .find(|row| unread(row) && Some(&row.id) != from)
             .map(|row| row.id.clone())
+    }
+
+    /// The rows a key walks: the narrowed ones while a query stands, the
+    /// whole list otherwise. Costs the matches rather than the workspace
+    /// when narrowed, since the narrowed set is already held in list order.
+    fn walked(&self) -> Vec<&ConversationRow> {
+        match self.query.is_empty() {
+            true => self.order.values().collect(),
+            false => self
+                .narrowed
+                .iter()
+                .filter_map(|(key, _)| self.order.get(key))
+                .collect(),
+        }
     }
 
     /// What `mark read before` would touch, as a plan the caller can count
@@ -3439,13 +3461,26 @@ mod tests {
         assert_eq!(model.next_unread(Some(&ChannelId("D1".into()))), None);
     }
 
-    /// A query is what the reader is looking at, not what the workspace
-    /// holds. Before this, `next_unread` walked the narrowed rows: a search
-    /// left standing from an hour ago answered "nothing unread" while a DM
-    /// outside it waited, and the key that exists to find unread messages
-    /// was the one thing that could not see them.
+    /// `shift-n` walks the list the reader is looking at, which is the
+    /// narrowed one while a query stands.
+    ///
+    /// This has been decided both ways and the history is worth keeping.
+    /// It first walked the narrowed rows; that was changed because a query
+    /// left standing answered "nothing unread" while a DM outside it
+    /// waited, and the key that exists to find unread messages was the one
+    /// thing that could not see them. What settles it is the rule that a
+    /// narrowing is a motion and not a setting: it lasts while the reader
+    /// is in it and does not survive a restart, so there is no hour-old
+    /// query to be trapped by, and a key that moved them somewhere the
+    /// rows cannot show -- under a banner still describing the rows --
+    /// would leave the list and the key disagreeing about where they are.
+    ///
+    /// What remains true from the other direction is asserted below: the
+    /// backlog is still counted over the whole workspace, so nothing
+    /// waiting is ever hidden from the reader, only from this one key
+    /// while they are narrowed.
     #[test]
-    fn a_query_standing_does_not_hide_an_unread_from_the_key_that_looks_for_one() {
+    fn the_next_unread_key_stays_inside_the_list_the_reader_is_looking_at() {
         let mut model = model();
         let count = |channel: &str| ConversationCount {
             channel: ChannelId(channel.into()),
@@ -3455,26 +3490,49 @@ mod tests {
             latest: Some(Ts("100".into())),
             last_read: None,
         };
-        // Unread in the DM, which is the one the query will not reach.
-        model.set_counts([count("D1")]);
+        // Unread in the DM, which is the one the query will not reach, and
+        // in the channel it will.
+        model.set_counts([count("D1"), count("C1")]);
         model.narrow("design");
         assert_eq!(
-            model.conversation_rows().len(),
-            1,
+            model
+                .conversation_rows()
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec![ChannelId("C1".into())],
             "the list is narrowed to #design, which is what the reader sees"
         );
         assert_eq!(
             model.next_unread(None),
-            Some(ChannelId("D1".into())),
-            "and the unread outside the query is still where the key goes"
+            Some(ChannelId("C1".into())),
+            "the key goes to the unread one on screen, not the one off it"
         );
-        // The same set `mark read before` reads, so the two cannot come to
-        // disagree about how much is waiting.
+
+        // Nothing unread left inside the narrowing: the key stops rather
+        // than jumping to a conversation the rows cannot show.
+        model.set_counts([
+            count("D1"),
+            ConversationCount {
+                has_unreads: false,
+                ..count("C1")
+            },
+        ]);
+        assert_eq!(
+            model.next_unread(None),
+            None,
+            "and it stops at the edge of the list rather than leaving it"
+        );
         assert_eq!(
             model.mark_plan(f64::MAX).conversations.len(),
             1,
-            "and the backlog says the same one is waiting"
+            "the backlog is still the workspace's, so nothing is hidden \
+             from the reader -- only from this key while they are narrowed"
         );
+
+        // Out of the narrowing, the key sees the whole list again.
+        model.narrow("");
+        assert_eq!(model.next_unread(None), Some(ChannelId("D1".into())));
     }
 
     #[test]

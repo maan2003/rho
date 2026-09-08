@@ -1395,3 +1395,62 @@ async fn a_search_that_fails_says_so_where_the_results_would_be(cx: &mut TestApp
         "one line, in the reader's words: {lines:?}"
     );
 }
+
+/// `shift-n` moves the reader through the list they are looking at.
+///
+/// Narrowed to `ops`, with something unread both inside the narrowing and
+/// outside it, the key goes to the one on screen. A key that took them to
+/// a conversation the rows cannot show, under a banner still counting the
+/// rows, would leave the list and the key disagreeing about where they are.
+#[gpui::test]
+async fn the_next_unread_key_stays_inside_the_narrowed_list(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+
+    // Unread inside the narrowing, and unread outside it -- the outside
+    // one newer, so it is what the whole-list walk would reach first. A
+    // test where both walks agree would pass either way and say nothing.
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C3",
+        "ts": "9000.0",
+        "user": "UD",
+        "text": "about ops",
+    }));
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C1",
+        "ts": "9001.0",
+        "user": "UD",
+        "text": "and about the design",
+    }));
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.slack_narrow_for_test("ops", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let shown = workspace
+        .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+        .unwrap();
+    assert!(
+        shown.iter().all(|label| label.contains("ops")),
+        "the reader is looking at the ops conversations: {shown:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "shift-n");
+    cx.run_until_parked();
+    let opened = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.slack_open_label_for_test(cx)
+        })
+        .unwrap();
+
+    assert_eq!(
+        opened.as_deref(),
+        Some("#dev-ops"),
+        "the key went to the unread conversation the list was showing, \
+         and not to the one it was not: {shown:?}"
+    );
+}

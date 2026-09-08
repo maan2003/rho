@@ -314,6 +314,17 @@ impl Workspace {
         view.read(cx).drawn_conversations_for_test(cx)
     }
 
+    /// The conversation on screen, named the way the list names it, for a
+    /// test that asserts where a key took the reader.
+    #[cfg(test)]
+    pub(crate) fn slack_open_label_for_test(&self, cx: &gpui::App) -> Option<String> {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return None;
+        };
+        let source = view.read(cx).source().clone();
+        Some(self.slack.session()?.read(cx).label(&source))
+    }
+
     /// The lines of the search results as the reader reads them, for a
     /// test that asserts what is on screen rather than what came back.
     #[cfg(test)]
