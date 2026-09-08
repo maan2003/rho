@@ -175,10 +175,6 @@ impl ElisionSync {
         }
 
         let snapshot = multi_buffer.read(cx).snapshot(cx);
-        let unfold = stale
-            .iter()
-            .filter_map(|(spec, _)| excerpt_range(&snapshot, &spec.range))
-            .collect::<Vec<_>>();
         let uncrease = stale.iter().map(|(_, id)| *id).collect::<Vec<_>>();
         // Only the specs whose anchors resolve in this snapshot become
         // folds, and a spec in the middle of the run can fail to resolve —
@@ -213,9 +209,23 @@ impl ElisionSync {
             .unzip();
 
         let fresh_ids = editor.update(cx, |editor, cx| {
-            if !uncrease.is_empty() {
-                editor.remove_creases(uncrease, cx);
-            }
+            // What the editor was folding, taken from the editor, not from
+            // the specs. A spec's anchors can stop resolving while its fold
+            // is still there — an excerpt that covers only the tail of its
+            // buffer answers nothing for a range above it — and a range
+            // that resolves to nothing unfolds nothing, so unfolding by
+            // spec left a fold no later reconcile could reach: the reader
+            // saw a turn elided that the model had stopped eliding, and
+            // nothing would open it again.
+            let unfold = if uncrease.is_empty() {
+                Vec::new()
+            } else {
+                editor
+                    .remove_creases(uncrease, cx)
+                    .into_iter()
+                    .map(|(_, range)| range)
+                    .collect::<Vec<_>>()
+            };
             let ids = editor.insert_creases(fold.clone(), cx);
             editor.display_map.update(cx, |display_map, cx| {
                 if !unfold.is_empty() {
