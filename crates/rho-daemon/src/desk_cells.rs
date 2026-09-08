@@ -109,6 +109,33 @@ impl DeskCellStore {
         Ok(Self { db })
     }
 
+    /// The store's answer to a client's handshake, with the name of the
+    /// store that answered. `held` is the store the client counted `known`
+    /// in: when it is another store's name, the numbers in `known` were
+    /// counted somewhere else and mean nothing here, so the answer is the
+    /// whole store rather than a difference from a number that was never
+    /// ours. Identity and delta are read under one transaction, so the name
+    /// the client writes down is the name the cells were counted in.
+    pub(crate) fn sync_for(
+        &self,
+        held: Option<DeviceId>,
+        known: &Version,
+    ) -> Result<(DeviceId, Snapshot), String> {
+        let read = self.db.read();
+        let meta = read
+            .open_table(META)
+            .get(&())
+            .ok_or("Desk cells V2 metadata is missing")?
+            .value()
+            .into_owned();
+        let store = Store::from_snapshot(meta.daemon_device, read_snapshot(&read)?)?;
+        let delta = match held {
+            Some(held) if held != meta.daemon_device => store.since(&Version::new()),
+            _ => store.since(known),
+        };
+        Ok((meta.daemon_device, delta))
+    }
+
     pub(crate) fn sync_since(&self, known: &Version) -> Result<Snapshot, String> {
         let read = self.db.read();
         let meta = read
@@ -965,6 +992,43 @@ mod tests {
             .max()
             .unwrap_or(0)
             + 1
+    }
+
+    /// A client that comes back holding a replica of some other store is
+    /// not behind this one: its version counts writes that never happened
+    /// here. So the answer ignores the number it asked from and is the
+    /// whole store, and it carries this store's name so the client knows
+    /// to throw away what it kept.
+    #[tokio::test]
+    async fn a_version_counted_in_another_store_is_answered_with_the_whole_of_this_one() {
+        let store = fixture_store().await;
+        let device = DeviceId([9; 16]);
+        let id = seed_note(&store, device).await;
+        let (identity, whole) = store.sync_for(None, &Version::new()).unwrap();
+        assert!(
+            whole.cells.iter().any(|cell| cell.id == id),
+            "the note is in the store"
+        );
+
+        // Caught up in this store: the difference is empty.
+        let (again, nothing) = store.sync_for(Some(identity), &whole.version).unwrap();
+        assert_eq!(again, identity, "the store's name does not change");
+        assert!(
+            nothing.cells.is_empty(),
+            "a client of this store that is level asks for nothing"
+        );
+
+        // The same version, held in another store's name. The numbers say
+        // caught up and are worth nothing, so the whole store comes back.
+        let (told, all) = store
+            .sync_for(Some(DeviceId([3; 16])), &whole.version)
+            .unwrap();
+        assert_eq!(told, identity, "the answer names the store that answered");
+        assert!(
+            all.cells.iter().any(|cell| cell.id == id),
+            "a replica counted elsewhere is sent the whole store, not a difference"
+        );
+        assert_eq!(all.cells.len(), whole.cells.len());
     }
 
     /// The parent conversion runs on the store it is opened on, and the

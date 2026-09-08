@@ -2114,7 +2114,11 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::Pong);
             Ok(Refresh::None)
         }
-        ClientMessage::DeskSync { device, known } => {
+        ClientMessage::DeskSync {
+            device,
+            known,
+            store,
+        } => {
             if desk_session
                 .as_ref()
                 .is_some_and(|session| session.device != device)
@@ -2126,9 +2130,14 @@ async fn handle_message(
                 .node_namespace(device)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            let delta = services
+            // The client says which store it counted `known` in. If that
+            // is not this store, the answer is the whole of this one: the
+            // client's numbers were counted elsewhere, and a difference
+            // taken from them would leave it holding a desk made of two
+            // stores at once.
+            let (store, delta) = services
                 .desk_cells
-                .sync_since(&known)
+                .sync_for(store, &known)
                 .map_err(anyhow::Error::msg)?;
             let binding = match desk_session.take() {
                 // This connection already holds the device: syncing again is
@@ -2170,6 +2179,7 @@ async fn handle_message(
                 binding,
             });
             let _ = outgoing_tx.send(ServerMessage::DeskSynced {
+                store,
                 node_namespace,
                 delta,
                 bodies: services.desk_cells.bodies(),
@@ -4274,6 +4284,7 @@ mod tests {
         let sync = |device| ClientMessage::DeskSync {
             device,
             known: Version::default(),
+            store: None,
         };
         desk_message(&services, &older_tx, 1, &mut older, sync(device))
             .await

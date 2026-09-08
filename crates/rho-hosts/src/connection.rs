@@ -71,6 +71,7 @@ impl EventSink {
 
 pub enum ConnEvent {
     DeskSynced {
+        store: rho_desk::cells::DeviceId,
         node_namespace: u16,
         delta: rho_desk::cells::Snapshot,
         bodies: Vec<rho_desk::cells::BodySnapshot>,
@@ -1222,10 +1223,12 @@ async fn run(
         };
         let event = match message {
             ServerMessage::DeskSynced {
+                store,
                 node_namespace,
                 delta,
                 bodies,
             } => Some(ConnEvent::DeskSynced {
+                store,
                 node_namespace,
                 delta,
                 bodies,

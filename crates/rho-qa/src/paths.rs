@@ -55,6 +55,9 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
     "rho.redb",
     // The GUI's own files.
     "agent-mirror.redb",
+    // The client's copy of the desk cells. A client opens holding it, so a
+    // rig that starts without it is a colder open than the user's own.
+    "desk-mirror.redb",
     "action-journal.redb",
     "inbox.redb",
     "desk-device",
@@ -86,8 +89,10 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
 ///   directory. A client never has it.
 /// - `gui-telemetry`, `qlog`, `debug`: what a run wrote, not what it needs.
 pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
-    // What the screens read: the agent mirror and the inbox behind Home.
+    // What the screens read: the agent mirror, the desk the client already
+    // holds, and the inbox behind Home.
     "agent-mirror.redb",
+    "desk-mirror.redb",
     "inbox.redb",
     // What a verdict wrote, so undo means something after a restart.
     "action-journal.redb",

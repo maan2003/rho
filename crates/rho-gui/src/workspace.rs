@@ -68,6 +68,18 @@ pub(crate) struct WarmSurface {
 }
 
 type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
+
+/// A desk's cells as they arrived, whichever of the two places they came
+/// from. Held together rather than passed apart because they are one
+/// statement: these cells, counted in this store, under this replica id.
+pub(crate) struct DeskArrival {
+    /// The store the cells were counted in. Cells under a name the client
+    /// was not holding are a different desk, not this one running behind.
+    pub(crate) store: rho_desk::cells::DeviceId,
+    pub(crate) node_namespace: u16,
+    pub(crate) delta: rho_desk::cells::Snapshot,
+    pub(crate) bodies: Vec<rho_desk::cells::BodySnapshot>,
+}
 use rho_files::{FileView, RemoteProject};
 
 use crate::{
@@ -1604,15 +1616,18 @@ impl Workspace {
     pub(crate) fn desk_arrived(
         &mut self,
         host: HostId,
-        node_namespace: u16,
-        delta: rho_desk::cells::Snapshot,
-        bodies: Vec<rho_desk::cells::BodySnapshot>,
+        cells: DeskArrival,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (again, delta) = self
-            .desk_cells
-            .synced(host, node_namespace, delta, bodies, cx);
+        let (again, delta) = self.desk_cells.synced(
+            host,
+            cells.store,
+            cells.node_namespace,
+            cells.delta,
+            cells.bodies,
+            cx,
+        );
         if let Some(again) = again {
             self.send_to_host(host, again);
         }
@@ -1647,7 +1662,17 @@ impl Workspace {
         if !held.known {
             return;
         }
-        self.desk_arrived(host, held.namespace, held.snapshot, held.bodies, window, cx);
+        self.desk_arrived(
+            host,
+            DeskArrival {
+                store: held.store,
+                node_namespace: held.namespace,
+                delta: held.snapshot,
+                bodies: held.bodies,
+            },
+            window,
+            cx,
+        );
     }
 
     fn schedule_desk_sync(
@@ -1948,10 +1973,21 @@ impl Workspace {
     ) {
         match event {
             ConnEvent::DeskSynced {
+                store,
                 node_namespace,
                 delta,
                 bodies,
-            } => self.desk_arrived(host, node_namespace, delta, bodies, window, cx),
+            } => self.desk_arrived(
+                host,
+                DeskArrival {
+                    store,
+                    node_namespace,
+                    delta,
+                    bodies,
+                },
+                window,
+                cx,
+            ),
             ConnEvent::DeskCellsAvailable { frontier } => {
                 if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
                     self.send_to_host(host, sync);

@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_ui_proto::desk_tree::cells::{
-    BodySnapshot, Cell, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
+    BodySnapshot, Cell, DeviceId, Id, PropertyKey, Snapshot, Stamp, VerdictEvent, Version,
 };
 
 pub const FILE_NAME: &str = "desk-mirror.redb";
@@ -63,6 +63,12 @@ const DESK_BODIES: TableDefinition<Sen<BodyKey>, Sen<BodySnapshot>> =
 #[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
 struct StoredDeskHost {
     version: Version,
+    /// The store the version was counted in, said by the daemon. A version
+    /// is a count of writes per device inside one store, so the same
+    /// numbers read against another store name writes that never happened.
+    /// Held so the next handshake can say whose numbers these are, and so
+    /// a daemon that does not know the name can say to throw them away.
+    store: DeviceId,
     /// The text replica id the daemon gave this device. It is the
     /// device's, not the connection's, so it is the same number after a
     /// restart — and it has to be held, because the client edits a note
@@ -102,6 +108,7 @@ pub struct HeldDesk {
     /// has asked. Only the second means "do not draw yet".
     pub known: bool,
     pub namespace: u16,
+    pub store: DeviceId,
     pub snapshot: Snapshot,
     pub bodies: Vec<BodySnapshot>,
 }
@@ -109,6 +116,7 @@ pub struct HeldDesk {
 enum Write {
     Delta {
         host: String,
+        store: DeviceId,
         namespace: u16,
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
@@ -185,6 +193,7 @@ impl DeskMirror {
         HeldDesk {
             known: true,
             namespace: stored.namespace,
+            store: stored.store,
             snapshot: Snapshot {
                 cells,
                 verdicts,
@@ -201,12 +210,14 @@ impl DeskMirror {
     pub fn write_delta(
         &self,
         host: &str,
+        store: DeviceId,
         namespace: u16,
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
     ) {
         self.send(Write::Delta {
             host: host.to_owned(),
+            store,
             namespace,
             delta,
             bodies,
@@ -287,6 +298,7 @@ fn apply(
     match write {
         Write::Delta {
             host,
+            store,
             namespace,
             delta,
             bodies,
@@ -327,6 +339,7 @@ fn apply(
                 &host.as_str(),
                 SenValue::borrowed(&StoredDeskHost {
                     version: delta.version,
+                    store,
                     namespace,
                 }),
             );
@@ -442,9 +455,15 @@ pub fn load(host: &str) -> HeldDesk {
         .unwrap_or_default()
 }
 
-pub fn write_delta(host: &str, namespace: u16, delta: Snapshot, bodies: Vec<BodySnapshot>) {
+pub fn write_delta(
+    host: &str,
+    store: DeviceId,
+    namespace: u16,
+    delta: Snapshot,
+    bodies: Vec<BodySnapshot>,
+) {
     if let Some(mirror) = global().as_ref() {
-        mirror.write_delta(host, namespace, delta, bodies);
+        mirror.write_delta(host, store, namespace, delta, bodies);
     }
 }
 
@@ -456,9 +475,12 @@ pub fn reset_host(host: &str) {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::desk_tree::cells::{DeviceId, Property, Store, Uuid};
+    use rho_ui_proto::desk_tree::cells::{Property, Store, Uuid};
 
     use super::*;
+
+    /// The store the daemon in these tests answers as.
+    const DAEMON: DeviceId = DeviceId([5; 16]);
 
     fn note(seed: u8) -> Id {
         Id::Note(Uuid([seed; 16]))
@@ -479,7 +501,7 @@ mod tests {
         store.write(id.clone(), Property::PaceDays(3)).unwrap();
         let snapshot = store.snapshot();
 
-        mirror.write_delta("desk", 42, snapshot.clone(), Vec::new());
+        mirror.write_delta("desk", DAEMON, 42, snapshot.clone(), Vec::new());
         mirror.flush();
 
         let held = mirror.load("desk");
@@ -491,6 +513,10 @@ mod tests {
         assert_eq!(
             held.snapshot.version, snapshot.version,
             "the version is what the next DeskSync asks from"
+        );
+        assert_eq!(
+            held.store, DAEMON,
+            "the store the version was counted in is held with it, since the number means nothing without it"
         );
         let read = Store::from_snapshot(DeviceId([7; 16]), held.snapshot).unwrap();
         let facts = read.facts(&id);
@@ -509,6 +535,7 @@ mod tests {
 
         mirror.write_delta(
             "desk",
+            DAEMON,
             42,
             Store::new(DeviceId([7; 16])).snapshot(),
             Vec::new(),
@@ -533,13 +560,13 @@ mod tests {
             .write(first.clone(), Property::Name("rho".into()))
             .unwrap();
         let held_through = store.version().clone();
-        mirror.write_delta("desk", 42, store.snapshot(), Vec::new());
+        mirror.write_delta("desk", DAEMON, 42, store.snapshot(), Vec::new());
 
         let second = note(2);
         store
             .write(second.clone(), Property::Name("slack".into()))
             .unwrap();
-        mirror.write_delta("desk", 42, store.since(&held_through), Vec::new());
+        mirror.write_delta("desk", DAEMON, 42, store.since(&held_through), Vec::new());
         mirror.flush();
 
         let held = mirror.load("desk");
@@ -557,7 +584,7 @@ mod tests {
         let mirror = DeskMirror::open(dir.path()).unwrap();
         let mut store = Store::new(DeviceId([7; 16]));
         store.write(note(1), Property::Name("rho".into())).unwrap();
-        mirror.write_delta("desk", 42, store.snapshot(), Vec::new());
+        mirror.write_delta("desk", DAEMON, 42, store.snapshot(), Vec::new());
         mirror.flush();
         assert!(mirror.load("desk").known);
 

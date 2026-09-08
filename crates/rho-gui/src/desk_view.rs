@@ -40,6 +40,12 @@ struct HostDeskCells {
     sources: Sources,
     /// The text replica namespace the daemon assigned this connection.
     namespace: u16,
+    /// The store these cells were counted in, said by the daemon and kept
+    /// so the next handshake can name it. A version means nothing outside
+    /// the store that counted it, so cells that arrive under another name
+    /// are not news about this desk; they are a different desk, and what
+    /// this one holds is thrown away rather than merged.
+    store: DeviceId,
     /// A `DeskSync` is in flight; the daemon answers exactly one.
     syncing: bool,
     /// The newest frontier poked while a sync was in flight. A poke that
@@ -602,16 +608,17 @@ impl DeskCells {
     /// The handshake, sent on connect and after every poke. `known` is what
     /// this GUI already holds, so the daemon answers with the difference.
     pub fn sync(&mut self, host: HostId) -> ClientMessage {
-        let known = match self.hosts.get_mut(&host) {
+        let (known, store) = match self.hosts.get_mut(&host) {
             Some(desk) => {
                 desk.syncing = true;
-                desk.confirmed.version().clone()
+                (desk.confirmed.version().clone(), Some(desk.store))
             }
-            None => Version::new(),
+            None => (Version::new(), None),
         };
         ClientMessage::DeskSync {
             device: self.device,
             known,
+            store,
         }
     }
 
@@ -621,6 +628,7 @@ impl DeskCells {
     pub fn synced(
         &mut self,
         host: HostId,
+        store: DeviceId,
         namespace: u16,
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
@@ -641,6 +649,24 @@ impl DeskCells {
             // it is drawn.
             delta_ids.touched.insert(id.clone());
         }
+        // Cells counted in another store are not this desk running behind:
+        // they are a different desk. What this client holds was counted
+        // somewhere else, so it goes whole — the stores, the writes still
+        // in flight, the map and the copy on disk — and what arrives is
+        // taken as a first sync. The delta that comes with a name the
+        // client did not have is the whole store, not a difference; that
+        // is what the daemon answers a name it does not know.
+        if self
+            .hosts
+            .get(&host)
+            .is_some_and(|held| held.store != store)
+        {
+            self.hosts.remove(&host);
+            if let Some(name) = self.names.get(&host) {
+                rho_mirror::desk::reset_host(name);
+            }
+            tracing::info!("Desk replica was counted in another store and was dropped");
+        }
         let existing = self.hosts.contains_key(&host);
         if !existing {
             self.hosts.insert(
@@ -657,6 +683,7 @@ impl DeskCells {
                     _subscriptions: Vec::new(),
                     sources: Sources::default(),
                     namespace,
+                    store,
                     syncing: false,
                     poked: None,
                 },
@@ -670,6 +697,7 @@ impl DeskCells {
                 return (None, DeskDelta::quiet());
             };
             desk.namespace = namespace;
+            desk.store = store;
             desk.syncing = false;
             if let Err(error) = desk.confirmed.merge(delta.clone()) {
                 tracing::error!(%error, "Desk cell delta did not merge");
@@ -692,7 +720,7 @@ impl DeskCells {
         self.apply_to_map(host, &delta_ids);
         self.merge_bodies(host, &bodies, cx);
         if let Some(name) = self.names.get(&host) {
-            rho_mirror::desk::write_delta(name, namespace, held, bodies);
+            rho_mirror::desk::write_delta(name, store, namespace, held, bodies);
         }
         self.give_buffers(host, &delta_ids, cx);
         let again = match self.hosts.get_mut(&host).and_then(|desk| desk.poked.take()) {

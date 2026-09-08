@@ -7628,6 +7628,10 @@ impl DeskFixture {
     /// The text replica namespace the daemon gives this connection.
     const NAMESPACE: u16 = 42;
     const DAEMON_NAMESPACE: u16 = 1;
+    /// The store the fixture's daemon answers as. Cells are only news
+    /// about a desk when they are counted in the store the client holds,
+    /// so every sync says which one that is.
+    pub(super) const STORE: rho_desk::cells::DeviceId = rho_desk::cells::DeviceId([5; 16]);
 
     pub(super) fn new() -> Self {
         let device = rho_desk::cells::DeviceId([9; 16]);
@@ -7794,6 +7798,7 @@ impl DeskFixture {
 
     pub(super) fn synced(&self) -> ConnEvent {
         ConnEvent::DeskSynced {
+            store: Self::STORE,
             node_namespace: Self::NAMESPACE,
             delta: self.store.snapshot(),
             bodies: self.bodies.clone(),
@@ -11335,6 +11340,114 @@ fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppCont
         .unwrap();
 }
 
+/// A version counts writes per device inside one store. Carried to
+/// another store the same numbers name writes that never happened, so a
+/// replica that turns out to have been counted somewhere else is not a
+/// desk running behind: it is a different desk. What the client holds
+/// goes whole and the cells that come under the new name stand alone —
+/// otherwise the user would be reading one desk made of two stores, with
+/// verdicts in it that nothing on this side can ever take back.
+#[gpui::test]
+fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppContext) {
+    let put_away = agent(41);
+    let held_store = rho_desk::cells::DeviceId([9; 16]);
+
+    // What the copy handed back: a snoozed agent, counted in a store that
+    // is no longer the one answering.
+    let mut old = DeskFixture::new();
+    let heading = old.note(None, "rho");
+    old.agent_row(heading, put_away);
+    old.set(
+        rho_desk::cells::Id::Agent(put_away),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 4_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+    let held = match old.synced() {
+        ConnEvent::DeskSynced { delta, bodies, .. } => (delta, bodies),
+        _ => unreachable!("the fixture's sync is a DeskSynced"),
+    };
+
+    // The store now answering has the same agent filed, and says nothing
+    // about a snooze: the user never gave that verdict here.
+    let mut now = DeskFixture::new();
+    let elsewhere = now.note(None, "rho");
+    now.agent_row(elsewhere, put_away);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(put_away)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(put_away, UnixMs(1)),
+                window,
+                cx,
+            );
+            workspace.desk_arrived(
+                HostId::default(),
+                crate::workspace::DeskArrival {
+                    store: held_store,
+                    node_namespace: 42,
+                    delta: held.0,
+                    bodies: held.1,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let dealt = workspace
+                .hand(cx)
+                .cards
+                .iter()
+                .filter_map(|card| card.agent_id)
+                .collect::<Vec<_>>();
+            assert!(
+                !dealt.contains(&put_away),
+                "the copy's snooze holds while the copy is what the client has: {dealt:?}"
+            );
+        })
+        .unwrap();
+
+    // The daemon answers under a name the client has never counted in.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), now.synced(), window, cx);
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let dealt = workspace
+                .hand(cx)
+                .cards
+                .iter()
+                .filter_map(|card| card.agent_id)
+                .collect::<Vec<_>>();
+            assert!(
+                dealt.contains(&put_away),
+                "the snooze was counted in a store that is not this one, so it went with the rest of that desk: {dealt:?}"
+            );
+        })
+        .unwrap();
+}
+
 /// The client's copy of the desk is a desk like any other. Cells that
 /// come off its own disk go through the same door the daemon's answer
 /// does, so a verdict the user gave in a previous session is in hand
@@ -11379,7 +11492,17 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
                 cx,
             );
             // No `DeskSynced` from a daemon: this is the copy being opened.
-            workspace.desk_arrived(HostId::default(), 42, held.0, held.1, window, cx);
+            workspace.desk_arrived(
+                HostId::default(),
+                crate::workspace::DeskArrival {
+                    store: DeskFixture::STORE,
+                    node_namespace: 42,
+                    delta: held.0,
+                    bodies: held.1,
+                },
+                window,
+                cx,
+            );
         })
         .unwrap();
     next_frame(cx, workspace);

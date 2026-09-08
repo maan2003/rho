@@ -130,6 +130,14 @@ pub enum ClientMessage {
     DeskSync {
         device: desk_tree::cells::DeviceId,
         known: desk_tree::cells::Version,
+        /// Which store the client counted `known` in, when it holds a
+        /// replica at all. A version is a count of writes per device inside
+        /// one store; carried to another store the same numbers name writes
+        /// that never happened. So a client that comes back holding one
+        /// says whose numbers these are, and a daemon that does not
+        /// recognise the name answers with the whole store rather than a
+        /// difference from a number that was never its own.
+        store: Option<desk_tree::cells::DeviceId>,
     },
     DeskMutationApply {
         mutation: desk_tree::cells::CellMutation,
@@ -564,6 +572,11 @@ pub struct LandLeaseHolder {
 pub enum ServerMessage {
     Pong,
     DeskSynced {
+        /// The store this delta was counted in, so a client holding a
+        /// replica can tell whether what it kept is behind this store or
+        /// about a different one. When it does not match what the client
+        /// holds, `delta` is the whole store, not a difference.
+        store: desk_tree::cells::DeviceId,
         node_namespace: u16,
         delta: desk_tree::cells::Snapshot,
         bodies: Vec<desk_tree::cells::BodySnapshot>,
@@ -1183,6 +1196,7 @@ mod tests {
             ClientMessage::DeskSync {
                 device,
                 known: Version::from([(device, 11)]),
+                store: Some(device),
             },
             ClientMessage::DeskMutationApply { mutation },
             ClientMessage::DeskTextApply {
@@ -1197,6 +1211,7 @@ mod tests {
             assert_eq!(decoded, message);
         }
         let message = ServerMessage::DeskSynced {
+            store: device,
             node_namespace: 4,
             delta: desk_tree::cells::Snapshot::default(),
             bodies: Vec::new(),

@@ -235,10 +235,17 @@ Without it a client that has a version from one store and connects to
 another — a restored backup, a different machine behind the same
 name — sends a `known` the new store has never issued and is answered with
 the cells it has not got, and the client goes on holding rows the daemon
-does not have and calling them the user's desk. So `DeskSynced` gains the
-store's identity, and a client whose replica names a different one drops
-the replica and syncs from nothing. This is the reason the daemon commit is
-the sensitive one.
+does not have and calling them the user's desk. So both halves of the
+handshake name the store. `DeskSync` carries `store: Option<DeviceId>`,
+which is whose numbers `known` counts and is `None` when the client holds
+no replica; `DeskSynced` carries the store that answered. A daemon given a
+name that is not its own ignores `known` and sends the whole store, because
+a difference taken from a number counted elsewhere is not a difference at
+all. A client answered under a name it was not holding drops what it
+held — the stores, the writes in flight, the map, the copy on disk — and
+takes the answer as a first sync. One round trip, and at no point is the
+user reading one desk made of two stores. This is the reason the daemon
+commit is the sensitive one.
 
 **What the replica is not.** It holds `confirmed` — what the daemon has
 acknowledged — and never `view`. A client that dies with mutations in
@@ -258,7 +265,7 @@ per-body versions, and it comes after.
 **Order.** Client first, daemon second. The client's half — persist,
 open from the replica, send the version it holds — is correct against
 today's daemon, which already answers `since`. The daemon's half is the
-store identity on `DeskSynced` and the reset it forces.
+store identity on both messages and the drop it forces.
 
 ## Deferred on purpose
 
