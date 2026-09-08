@@ -1103,3 +1103,130 @@ async fn a_message_changing_under_the_point_leaves_it_somewhere_the_reader_chose
         "an edit leaves the point on the message it was on"
     );
 }
+
+/// A rewrite whose message someone else deletes closes, and the words are
+/// kept.
+///
+/// Slack will not update a message that is not there. Before this the
+/// rewrite stayed open over a message that had gone from the screen: enter
+/// sent `chat.update`, Slack refused it, and the refusal put the reader
+/// back into the same rewrite with the same words and no line saying why.
+/// Pressing enter again did the same thing. The only way out was escape,
+/// and nothing said so.
+#[gpui::test]
+async fn a_rewrite_whose_message_is_deleted_closes_and_keeps_the_words(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use rho_slack::ui::conversation::EditStart;
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "ME", "text": "on it"}),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials.clone(), fake.api_base()).unwrap(),
+    );
+    // A second client, for asking Slack what it holds at the end -- which is
+    // what everyone else in the channel reads.
+    let asking = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    let mut started = EditStart::Nothing;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        started = window
+            .update(cx, |view, window, cx| view.edit_last_own(window, cx))
+            .unwrap();
+        if matches!(started, EditStart::Started(_)) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        matches!(started, EditStart::Started(_)),
+        "the reader's own message is on screen and the rewrite is open"
+    );
+    window
+        .update(cx, |view, _, cx| {
+            view.set_compose_for_test("on it, by tuesday".to_owned(), cx)
+        })
+        .unwrap();
+
+    // Someone else deletes it, from the Slack app or another client.
+    fake.live_delete("C1", "100.0");
+    let mut open = true;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        open = window
+            .update(cx, |view, _, _| view.editing_message().is_some())
+            .unwrap();
+        if !open {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        !open,
+        "the rewrite is closed, rather than open on a message that is gone"
+    );
+    assert_eq!(
+        window
+            .update(cx, |view, _, cx| view.compose_text_for_test(cx))
+            .unwrap(),
+        "on it, by tuesday",
+        "and the words the reader typed are in the composer, to send if they \
+         still want them"
+    );
+
+    // Enter now sends them, rather than refusing an update of a message
+    // that is not there and putting the reader back where they started.
+    drop(window.update(cx, |view, _, cx| view.submit(cx)).unwrap());
+    cx.run_until_parked();
+    let held = cx
+        .update(|cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                asking
+                    .conversations_history(&ChannelId("C1".into()), None)
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["on it, by tuesday"],
+        "the words reached Slack as a new message"
+    );
+}

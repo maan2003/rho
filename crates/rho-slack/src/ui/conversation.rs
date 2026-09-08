@@ -114,6 +114,10 @@ pub enum Event {
     /// A dropped path the surface would not take, because an edit is open.
     /// The host says why, the same as it does for the other two ways in.
     AttachRefused,
+    /// The message a rewrite was open on was deleted by someone else. The
+    /// rewrite has closed and the words are back in the composer; the host
+    /// says so, because this crate has no notice line of its own.
+    RewriteLost,
 }
 
 /// What a press of enter turned out to be, once Slack had answered.
@@ -593,6 +597,38 @@ impl ConversationView {
         watch(cx, told)
     }
 
+    /// Whether one of these updates deletes the message a rewrite is open
+    /// on. Costs the updates, which is what just arrived.
+    fn rewrite_was_deleted(&self, updates: &[Update]) -> bool {
+        let Some(editing) = self.editing_message.as_ref() else {
+            return false;
+        };
+        updates
+            .iter()
+            .any(|update| matches!(update, Update::Removed(ts) if ts == editing))
+    }
+
+    /// Closes a rewrite whose message someone else has deleted.
+    ///
+    /// It cannot land: `chat.update` on a message that is not there is
+    /// refused, and the refusal puts the reader back into the same rewrite
+    /// with the same words -- pressing enter again refuses again, and
+    /// nothing on screen says why. The rewrite closes here instead, and the
+    /// words stay in the composer over whatever was held aside for it, the
+    /// same as any other refusal: text that was typed is never dropped on
+    /// the floor. From the composer they can be sent as a new message,
+    /// which is the only thing Slack will now accept.
+    fn lose_the_rewrite(&mut self, cx: &mut Context<Self>) {
+        if self.editing_message.take().is_none() {
+            return;
+        }
+        let held = self.held_compose.take().unwrap_or_default();
+        let rewrite = self.input.read(cx).text();
+        self.set_compose(restored_compose(rewrite, &held), cx);
+        cx.emit(Event::RewriteLost);
+        cx.notify();
+    }
+
     /// Puts a refused message back where it was typed. Whatever the reader
     /// has written since goes under it rather than over it: text that was
     /// typed is never dropped on the floor, and which of the two they want
@@ -662,6 +698,17 @@ impl ConversationView {
     /// reaction or `enter` is about.
     pub fn cursor_message_for_test(&self, cx: &mut Context<Self>) -> Option<Message> {
         self.cursor_message(cx)
+    }
+
+    /// The composer's text, for a test that asserts what the reader is
+    /// left holding.
+    pub fn compose_text_for_test(&self, cx: &App) -> String {
+        self.input.read(cx).text()
+    }
+
+    /// Puts words in the composer, the way typing does.
+    pub fn set_compose_for_test(&mut self, text: String, cx: &mut Context<Self>) {
+        self.set_compose(text, cx);
     }
 
     /// The message the cursor is on, if the transcript has one there.
@@ -1239,7 +1286,16 @@ impl ConversationView {
             // A surface that has fallen too far behind (or has never been
             // filled) renders the run it can see in one insert.
             None => self.rebuild(cx),
-            Some(updates) => self.apply_updates(updates, window, cx),
+            Some(updates) => {
+                // Asked of the log rather than of the transcript: the log
+                // says the message was deleted, where an absent row could
+                // also be a run that has not been drawn yet.
+                let lost = self.rewrite_was_deleted(&updates);
+                self.apply_updates(updates, window, cx);
+                if lost {
+                    self.lose_the_rewrite(cx);
+                }
+            }
         }
         self.revision = revision;
         // A deal may open on a message the tail does not hold yet: the page

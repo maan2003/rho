@@ -21,6 +21,12 @@ use rho_window::style::StyleClass;
 const NOT_WHILE_EDITING: &str =
     "slack: a rewrite cannot carry a picture; finish or leave the edit first";
 
+/// The message a rewrite was open on has been deleted from somewhere else.
+/// Slack will not update a message that is not there, so the rewrite is
+/// closed rather than left to be refused on every enter, and the words are
+/// in the composer to send as a new message if the reader still wants them.
+const REWRITE_LOST: &str = "slack: that message was deleted; your rewrite is in the composer";
+
 use crate::dashboard::SlackFacts;
 use crate::minibuffer::Candidate;
 use crate::pane::SurfaceKey;
@@ -412,6 +418,9 @@ impl Workspace {
                         }
                         rho_slack::ui::conversation::Event::AttachRefused => {
                             workspace.echo(NOT_WHILE_EDITING, StyleClass::SystemInfo, cx);
+                        }
+                        rho_slack::ui::conversation::Event::RewriteLost => {
+                            workspace.echo(REWRITE_LOST, StyleClass::SystemInfo, cx);
                         }
                         rho_slack::ui::conversation::Event::AttachFailed(said) => {
                             workspace.echo(
