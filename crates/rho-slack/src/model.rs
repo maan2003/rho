@@ -317,6 +317,16 @@ pub enum NextUnread {
     Nothing,
 }
 
+/// Why a narrowed list is empty, for the one line that says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Empty {
+    /// The query has not reached a conversation since it was typed.
+    Never,
+    /// It reached conversations, and they have been renamed, archived or
+    /// left since.
+    Gone,
+}
+
 pub struct Model {
     workspace: WorkspaceName,
     self_id: UserId,
@@ -369,6 +379,12 @@ pub struct Model {
     /// than a tree: it is rebuilt whole on a keystroke and walked whole to
     /// draw, and neither wants a tree's per-node cost.
     narrowed: Vec<(RowKey, ChannelId)>,
+    /// Whether the standing query has ever had a conversation on screen.
+    /// A query that empties because the mirror moved and one that never
+    /// answered are the same empty list, and this is the only thing that
+    /// tells them apart; cleared by the reader typing, and by nothing
+    /// else.
+    reached_once: bool,
     /// The conversation list, in the order it is read, and the key each
     /// conversation currently sits at.
     ///
@@ -473,6 +489,7 @@ impl Model {
             worded: BTreeMap::new(),
             query: Vec::new(),
             narrowed: Vec::new(),
+            reached_once: false,
             order: BTreeMap::new(),
             placed: BTreeMap::new(),
             edits: Vec::new(),
@@ -924,6 +941,7 @@ impl Model {
                 .binary_search_by(|(held, _)| held.cmp(&key))
                 .unwrap_or_else(|at| at);
             self.narrowed.insert(at, (key, channel.clone()));
+            self.reached_once = true;
         }
         // Traffic in a conversation the query does not reach changes no
         // line on screen, so there is nothing to tell the drawer and
@@ -1105,7 +1123,26 @@ impl Model {
             // what changed, walked over the two ordered sets at once.
             (true, false) => self.note_narrow_edits(&was, &now),
         }
+        self.reached_once = !now.is_empty();
         self.narrowed = now;
+    }
+
+    /// Why the narrowed list has nothing on it, or `None` when it has rows
+    /// or no query stands at all.
+    ///
+    /// The two are not the same fact and must not read the same: a word
+    /// nothing answers is the reader's last keystroke, and a list that
+    /// emptied under them is Slack's doing. Only the second has to name
+    /// the way out, because only in the second did the reader do nothing
+    /// to get there.
+    pub fn empty_narrowing(&self) -> Option<Empty> {
+        if self.query.is_empty() || !self.narrowed.is_empty() {
+            return None;
+        }
+        match self.reached_once {
+            true => Some(Empty::Gone),
+            false => Some(Empty::Never),
+        }
     }
 
     /// The conversations the standing query reaches, or none at all when
@@ -2764,6 +2801,61 @@ mod tests {
             vec!["#random".to_owned()],
             "and the narrowed list is what it was"
         );
+    }
+
+    /// An empty narrowing has two causes and the list must not read the
+    /// same for both: a word nothing ever answered is the reader's own
+    /// keystroke, and a list that emptied under them afterwards is Slack's
+    /// doing. Only what the model remembers of the query's own history can
+    /// tell them apart, and the reader typing is the only thing that
+    /// forgets it.
+    #[test]
+    fn an_empty_narrowing_says_which_of_the_two_emptied_it() {
+        let mut model = model();
+        assert_eq!(model.empty_narrowing(), None, "no query stands");
+
+        model.narrow("design");
+        assert_eq!(
+            model.empty_narrowing(),
+            None,
+            "a query with rows under it is not empty"
+        );
+
+        // The channel is renamed out from under the query.
+        model.add_conversations([Conversation {
+            id: ChannelId("C1".into()),
+            kind: ConversationKind::Channel,
+            name: "product".to_owned(),
+            user: None,
+            members: Vec::new(),
+        }]);
+        assert!(model.conversation_rows().is_empty(), "nothing left to draw");
+        assert_eq!(
+            model.empty_narrowing(),
+            Some(Empty::Gone),
+            "the reader did nothing to empty this and is owed the way out"
+        );
+
+        // A conversation answering the standing query arrives: the list is
+        // a list again, and the reason it was empty is not raised.
+        model.add_conversations([Conversation {
+            id: ChannelId("C7".into()),
+            kind: ConversationKind::Channel,
+            name: "design-review".to_owned(),
+            user: None,
+            members: Vec::new(),
+        }]);
+        assert_eq!(model.empty_narrowing(), None, "rows again");
+
+        model.narrow("zzz");
+        assert_eq!(
+            model.empty_narrowing(),
+            Some(Empty::Never),
+            "a fresh query that reaches nothing is the reader's own keystroke"
+        );
+
+        model.narrow("");
+        assert_eq!(model.empty_narrowing(), None, "widening ends the question");
     }
 
     /// Widening by deleting a letter puts rows back, and the model says

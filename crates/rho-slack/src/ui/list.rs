@@ -17,7 +17,7 @@ use language::{Buffer, Capability, Point};
 use text::Anchor;
 use theme::ActiveTheme as _;
 
-use crate::model::ConversationRow;
+use crate::model::{ConversationRow, Empty};
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
 use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
@@ -287,31 +287,34 @@ impl ListView {
         // offline workspace stays readable. The status line is for when
         // there is genuinely nothing to show yet.
         let known = session.rows();
-        let narrowed = session.is_narrowed();
-        let (lines, rows) = match session.status() {
-            _ if !known.is_empty() => render_rows(&known),
-            // A query that reaches nothing says so, rather than falling
-            // through to a status line about the socket, which is not what
-            // the reader just did.
-            _ if narrowed => (
-                vec![vec![Span::styled("nothing matches", Class::Muted)]],
+        let narrowed = session.empty_narrowing();
+        // A query that reaches nothing says so, rather than falling through
+        // to a status line about the socket, which is not what the reader
+        // just did. Which of the two ways it emptied decides the line: only
+        // the one the reader did not do is told the way out.
+        let (lines, rows) = match (known.is_empty(), narrowed) {
+            (true, Some(why)) => (
+                vec![vec![Span::styled(empty_line(why), Class::Muted)]],
                 vec![None],
             ),
-            Status::Failed(reason) => (
-                vec![vec![
-                    Span::styled("slack unavailable: ", Class::Error),
-                    Span::styled(reason.clone(), Class::Muted),
-                ]],
-                vec![None],
-            ),
-            Status::Connecting => (
-                vec![vec![Span::styled("connecting to slack…", Class::Muted)]],
-                vec![None],
-            ),
-            Status::Connected => (
-                vec![vec![Span::styled("no conversations", Class::Muted)]],
-                vec![None],
-            ),
+            _ => match session.status() {
+                _ if !known.is_empty() => render_rows(&known),
+                Status::Failed(reason) => (
+                    vec![vec![
+                        Span::styled("slack unavailable: ", Class::Error),
+                        Span::styled(reason.clone(), Class::Muted),
+                    ]],
+                    vec![None],
+                ),
+                Status::Connecting => (
+                    vec![vec![Span::styled("connecting to slack…", Class::Muted)]],
+                    vec![None],
+                ),
+                Status::Connected => (
+                    vec![vec![Span::styled("no conversations", Class::Muted)]],
+                    vec![None],
+                ),
+            },
         };
         let muted = known.iter().filter(|row| row.muted).count();
         let listed = !known.is_empty();
@@ -604,6 +607,19 @@ fn now_seconds() -> i64 {
     chrono::Local::now().timestamp()
 }
 
+/// The one line under a banner whose narrowing reaches nothing.
+///
+/// A word nothing answers is the reader's own last keystroke and needs no
+/// explaining. A list that emptied under them is not: they are told what
+/// happened, and told the way out, because `s` with an empty query is the
+/// only way back to the whole list and nothing else on screen says so.
+fn empty_line(why: Empty) -> &'static str {
+    match why {
+        Empty::Never => "nothing matches",
+        Empty::Gone => "what matched has gone; s with an empty query shows every conversation",
+    }
+}
+
 /// The line that says the listing is narrowed, and by how much. The count is
 /// against the whole workspace, which is what says how much a query is
 /// keeping off the screen rather than only that something is.
@@ -708,6 +724,24 @@ mod tests {
             watched: false,
             latest: None,
         }
+    }
+
+    /// The two empty-state lines, as the reader reads them. The first is
+    /// about the word they just typed and says nothing else, because they
+    /// know what they did. The second is about something Slack did, and
+    /// names the way back to the whole list, which is otherwise written
+    /// nowhere on screen.
+    #[test]
+    fn an_empty_narrowing_reads_as_the_thing_that_emptied_it() {
+        assert_eq!(empty_line(Empty::Never), "nothing matches");
+        assert_eq!(
+            empty_line(Empty::Gone),
+            "what matched has gone; s with an empty query shows every conversation"
+        );
+        assert!(
+            !empty_line(Empty::Gone).contains("filter"),
+            "the way out is the key the reader presses, not a word for it"
+        );
     }
 
     /// The buffer the incremental path builds must be the buffer a full

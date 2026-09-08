@@ -1133,6 +1133,12 @@ impl Session {
         self.model.is_narrowed()
     }
 
+    /// Why the narrowed list is empty, when it is, so the drawer can say
+    /// which of the two happened.
+    pub fn empty_narrowing(&self) -> Option<crate::model::Empty> {
+        self.model.empty_narrowing()
+    }
+
     /// What the conversation list has done since the drawer last asked.
     /// `None` when the drawer has to write the listing again.
     pub fn take_row_edits(&mut self) -> Option<Vec<crate::model::RowEdit>> {
