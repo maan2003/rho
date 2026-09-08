@@ -4,7 +4,7 @@ use super::{
     ElisionPolicy, Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
 use language::InlayId;
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
@@ -723,7 +723,7 @@ impl FoldMap {
     fn sync(
         &mut self,
         inlay_snapshot: InlaySnapshot,
-        inlay_edits: Vec<InlayEdit>,
+        mut inlay_edits: Vec<InlayEdit>,
     ) -> Vec<FoldEdit> {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::FoldMapSync);
@@ -772,6 +772,72 @@ impl FoldMap {
             // two sides are only comparable through the buffer, so both
             // snapshots have to be in hand to convert either way.
             let old_inlay_snapshot = self.snapshot.inlay_snapshot.clone();
+
+            // Removing an excerpt invalidates anchors into it. Such folds no
+            // longer have a stable ordering in the new buffer, so discard
+            // them before using the fold tree with the new snapshot.
+            let mut invalid_folds_by_start =
+                HashMap::<MultiBufferOffset, HashSet<FoldId>>::default();
+            let mut invalid_fold_edits = Vec::new();
+            for edit in &inlay_edits {
+                let old_range = old_inlay_snapshot.to_buffer_offset(edit.old.start)
+                    ..old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                let mut folds =
+                    intersecting_folds(&old_inlay_snapshot, &self.snapshot.folds, old_range, true);
+                while let Some(fold) = folds.item() {
+                    if !fold.range.start.is_valid(&inlay_snapshot.buffer)
+                        || !fold.range.end.is_valid(&inlay_snapshot.buffer)
+                    {
+                        let newly_invalid = invalid_folds_by_start
+                            .entry(fold.range.start.to_offset(&old_inlay_snapshot.buffer))
+                            .or_default()
+                            .insert(fold.id);
+                        if newly_invalid {
+                            let old_start = fold.range.start.to_offset(&old_inlay_snapshot.buffer);
+                            let old_end = fold.range.end.to_offset(&old_inlay_snapshot.buffer);
+                            let new_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
+                            let new_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
+                            invalid_fold_edits.push(InlayEdit {
+                                old: old_inlay_snapshot.to_inlay_offset(old_start)
+                                    ..old_inlay_snapshot.to_inlay_offset(old_end),
+                                new: inlay_snapshot.to_inlay_offset(new_start.min(new_end))
+                                    ..inlay_snapshot.to_inlay_offset(new_start.max(new_end)),
+                            });
+                        }
+                        self.snapshot.fold_metadata_by_id.remove(&fold.id);
+                    }
+                    folds.next();
+                }
+            }
+            if !invalid_folds_by_start.is_empty() {
+                let mut invalid_folds_by_start =
+                    invalid_folds_by_start.into_iter().collect::<Vec<_>>();
+                invalid_folds_by_start.sort_unstable_by_key(|(start, _)| *start);
+                self.snapshot.folds = {
+                    let mut cursor = self
+                        .snapshot
+                        .folds
+                        .cursor::<FoldRange>(&old_inlay_snapshot.buffer);
+                    let mut folds = SumTree::new(&inlay_snapshot.buffer);
+                    for (start, invalid_ids) in invalid_folds_by_start {
+                        let target =
+                            FoldRange(old_inlay_snapshot.buffer.anchor_before(start)..Anchor::Max);
+                        folds.append(cursor.slice(&target, Bias::Left), &inlay_snapshot.buffer);
+                        while let Some(fold) = cursor.item()
+                            && fold.range.start.to_offset(&old_inlay_snapshot.buffer) == start
+                        {
+                            if !invalid_ids.contains(&fold.id) {
+                                folds.push(fold.clone(), &inlay_snapshot.buffer);
+                            }
+                            cursor.next();
+                        }
+                    }
+                    folds.append(cursor.suffix(), &inlay_snapshot.buffer);
+                    folds
+                };
+                inlay_edits.extend(invalid_fold_edits);
+                inlay_edits = consolidate_inlay_edits(inlay_edits);
+            }
 
             // A retained fold can straddle the start of a later edit in the
             // batch. Widen that edit before either cursor starts walking, so
@@ -2788,6 +2854,7 @@ mod tests {
     use crate::{MultiBuffer, ToPoint, display_map::inlay_map::InlayMap};
     use Bias::{Left, Right};
     use collections::HashSet;
+    use multi_buffer::PathKey;
     use rand::prelude::*;
     use settings::SettingsStore;
     use std::{env, mem};
@@ -3003,6 +3070,68 @@ mod tests {
             inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
         let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
         assert_eq!(snapshot.text(), "parent⋯");
+    }
+
+    #[gpui::test]
+    fn test_removing_excerpt_discards_its_folds(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_multi(
+            [
+                ("remove\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+                ("keep\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+            ],
+            cx,
+        );
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![
+            (Point::new(0, 0)..Point::new(2, 4), FoldPlaceholder::test()),
+            (Point::new(0, 0)..Point::new(2, 4), FoldPlaceholder::test()),
+            (Point::new(0, 0)..Point::new(0, 2), FoldPlaceholder::test()),
+        ]);
+        assert_eq!(snapshot.fold_count(), 3);
+
+        // Give one of the two equal-start folds a stable start anchor. Its
+        // sibling keeps its anchor into the excerpt that will be removed.
+        let old_buffer = snapshot.inlay_snapshot.buffer.clone();
+        let mut folds = map.snapshot.folds.items(&old_buffer);
+        let kept_fold = folds
+            .iter_mut()
+            .find(|fold| fold.range.end.to_point(&old_buffer) == Point::new(2, 4))
+            .unwrap();
+        kept_fold.range.start = Anchor::Min;
+        let kept_fold_id = kept_fold.id;
+        map.snapshot.fold_metadata_by_id.insert_or_replace(
+            kept_fold.id,
+            FoldMetadata {
+                range: kept_fold.range.clone(),
+                width: None,
+            },
+        );
+        folds.sort_unstable_by(|a, b| a.range.cmp(&b.range, &old_buffer));
+        map.snapshot.folds = SumTree::from_iter(folds, &old_buffer);
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.remove_excerpts(PathKey::sorted(0), cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.fold_count(), 1);
+        assert_eq!(
+            snapshot
+                .folds
+                .items(&snapshot.inlay_snapshot.buffer)
+                .into_iter()
+                .map(|fold| fold.id)
+                .collect::<Vec<_>>(),
+            [kept_fold_id]
+        );
     }
 
     #[gpui::test]
