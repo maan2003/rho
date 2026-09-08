@@ -1410,12 +1410,21 @@ fn place(id: &Id, facts: &Facts, sources: &Sources) -> Option<Id> {
 /// Parents before children, siblings oldest first, and a parent chain that
 /// never reaches the root shown at the root.
 fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
+    // The parent each node is placed by, which is the one it keeps. A cell
+    // can name a parent that is not here, or one whose own chain comes back
+    // around, and a walk up such a chain never ends: everything downstream —
+    // a breadcrumb, a heading's context, the walk from an agent to the note
+    // above it — reads this field and walks it without a guard. So the
+    // resolution happens once, here, where the rule already lives, and what
+    // leaves this function is a forest.
+    let mut placed: BTreeMap<Id, Option<Id>> = BTreeMap::new();
     let mut children: BTreeMap<Option<Id>, Vec<&DeskNode>> = BTreeMap::new();
     for node in nodes.values() {
         let parent = node
             .parent
             .clone()
             .filter(|parent| nodes.contains_key(parent) && reaches_root(&nodes, node));
+        placed.insert(node.id.clone(), parent.clone());
         children.entry(parent).or_default().push(node);
     }
     // The second axis. A label lists what carries it, under the label's own
@@ -1468,6 +1477,7 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
         }
         ordered.push(DeskNode {
             under,
+            parent: placed.get(&node.id).cloned().unwrap_or_default(),
             ..node.clone()
         });
         if let Some(row) = members.get(&node.id) {

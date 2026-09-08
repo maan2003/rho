@@ -1803,6 +1803,56 @@ async fn a_burst_of_quiet_cells_costs_its_own_rows(cx: &mut TestAppContext) {
     );
 }
 
+/// A note that is its own parent does not hang the desk.
+///
+/// The store can be told anything: a Parent cell naming the row it sits on
+/// is one write, and two devices filing each other's notes under one
+/// another is two. Every walk up the tree — a breadcrumb, a heading's
+/// context, an agent finding the note above it — follows the parent field
+/// without a guard, so a chain that comes back around is not a wrong answer
+/// but no answer at all: the frame never ends. The store client resolves it
+/// where the tree is built, so what the desk hands on is a forest and the
+/// row is drawn at the top, which is where a thing with nowhere above it
+/// belongs. If this ever fails it fails by hanging, which is the fault
+/// itself.
+#[gpui::test]
+async fn a_note_that_is_its_own_parent_is_drawn_at_the_root(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let looped = desk.note(None, "the loop");
+    let under = desk.note(Some(looped.clone()), "beneath it");
+    // The cell the daemon could hand over: the row filed under itself.
+    desk.set(
+        looped.clone(),
+        rho_desk::cells::Property::Parent(Some(looped.clone())),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .expect("build the desk");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let nodes = workspace.desk_cells.nodes(HostId::default()).to_vec();
+            let loop_node = nodes
+                .iter()
+                .find(|node| node.id == looped)
+                .expect("the self-filed row is on the desk");
+            assert_eq!(
+                loop_node.parent, None,
+                "a parent that comes back to the row is no parent at all"
+            );
+            assert!(
+                nodes.iter().any(|node| node.id == under),
+                "what was filed under it is still on the desk"
+            );
+        })
+        .expect("read the desk");
+}
+
 /// A shape that moved is the one case that composes the map. Filing a
 /// note writes its parent, which is where the row sits, so the dealer
 /// cannot patch it where it was: the source is taken again. This is the
@@ -7574,7 +7624,7 @@ impl DeskFixture {
 
     fn note(&mut self, parent: Option<rho_desk::cells::Id>, text: &str) -> rho_desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([self.next_node as u8; 16]));
+        let id = rho_desk::cells::Id::Note(Self::uuid(self.next_node));
         self.file(id.clone(), parent);
         if !text.is_empty() {
             let mut buffer = text::Buffer::new(
@@ -7665,7 +7715,7 @@ impl DeskFixture {
     /// one exists.
     fn project(&mut self, name: &str, path: &str) -> rho_desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Label(rho_desk::cells::Uuid([self.next_node as u8; 16]));
+        let id = rho_desk::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
         self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
         self.set(
@@ -7682,7 +7732,7 @@ impl DeskFixture {
     /// is placement: the row keeps whatever parent it already had.
     fn label(&mut self, name: &str) -> rho_desk::cells::Id {
         self.next_node += 1;
-        let id = rho_desk::cells::Id::Label(rho_desk::cells::Uuid([self.next_node as u8; 16]));
+        let id = rho_desk::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
         self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
         id
@@ -7725,6 +7775,19 @@ impl DeskFixture {
         };
         self.set(id.clone(), rho_desk::cells::Property::Parent(parent));
         self.set(id, rho_desk::cells::Property::CreatedAt(created_at));
+    }
+
+    /// A distinct id for every row, however many there are.
+    ///
+    /// This used to be one byte repeated, which was fine until a desk with
+    /// more rows than a byte counts: the counter wrapped, a note was handed
+    /// the root's id, and filing it under the root made the root its own
+    /// parent. Every walk up the tree then ran forever, which read as the
+    /// desk hanging above a certain size rather than as an id collision.
+    fn uuid(counter: u64) -> rho_desk::cells::Uuid {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&counter.to_be_bytes());
+        rho_desk::cells::Uuid(bytes)
     }
 
     fn set(&mut self, id: rho_desk::cells::Id, property: rho_desk::cells::Property) {
@@ -7770,7 +7833,7 @@ fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
 
     let card = |node: u64| crate::dashboard::DealCardId {
         host: HostId::default(),
-        node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([(node) as u8; 16])),
+        node_id: rho_desk::cells::Id::Note(DeskFixture::uuid(node)),
     };
     let rows = crate::home::HomeRows {
         next: vec![crate::home::HomeRow {
