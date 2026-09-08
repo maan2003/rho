@@ -495,7 +495,7 @@ impl Session {
         let Some(mirror) = self.mirror.clone() else {
             return;
         };
-        derive_units(&mut self.model, &mirror, now_ms());
+        derive_units(&mut self.model, &mirror);
     }
 
     /// Users, conversations, and unread counts: everything the list surface
@@ -2408,7 +2408,11 @@ pub fn restore_units(model: &mut Model, mirror: &Mirror) {
 /// instead, one row per unit. The one time a start may reach this is a
 /// mirror written before the units table existed, which pays it once and
 /// then records that it has. Calling it at boot would put the cost back.
-pub fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
+/// A replayed message is evidence about when it was said, not about now.
+/// `note_message` takes the time a unit was first seen, and the mirror is
+/// handing over history: the time to hand it is the message's own, or every
+/// card derived here reads as having waited no time at all.
+pub fn derive_units(model: &mut Model, mirror: &Mirror) {
     let workspace = model.workspace().0.clone();
     let mut scopes = mirror
         .conversations(&workspace)
@@ -2423,7 +2427,8 @@ pub fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
     );
     for scope in scopes {
         for message in mirror.newest_chunk(&scope, STARTUP_WINDOW) {
-            model.note_message(&message, now_ms);
+            let said_at = message.ts.millis();
+            model.note_message(&message, said_at);
         }
     }
 }
@@ -2700,7 +2705,7 @@ mod tests {
             .unwrap()],
         );
 
-        derive_units(&mut model, &mirror, 0);
+        derive_units(&mut model, &mirror);
         assert_eq!(
             model.tracked(),
             vec![
@@ -2722,10 +2727,63 @@ mod tests {
         // A second pass is what the roster's followed list triggers, and it
         // is a no-op on everything already derived.
         let before = model.card(&Unit::conversation(&ChannelId("C1".into())), 0);
-        derive_units(&mut model, &mirror, 60_000);
+        derive_units(&mut model, &mirror);
         assert_eq!(
             model.card(&Unit::conversation(&ChannelId("C1".into())), 0),
             before
+        );
+    }
+
+    /// A card derived from the mirror has waited since the message was said,
+    /// not since rho worked out that it had one. Derive is not a once-ever
+    /// pass: it runs again on every connect, once the followed list is in,
+    /// and again when the reader opts a channel into being handed over — so
+    /// a card that took its wait from the derive would read zero days on a
+    /// mention that has been sitting there since Friday.
+    #[test]
+    fn a_card_derived_from_the_mirror_waits_from_the_message_and_not_the_derive() {
+        const DAY: i64 = 86_400_000;
+        let (_dir, mirror, mut model) = seeded();
+        // The scopes derive walks are the mirror's own conversation list.
+        mirror.put_conversations(
+            "T1",
+            &[crate::types::Conversation {
+                id: ChannelId("C1".into()),
+                kind: crate::types::ConversationKind::Channel,
+                name: "design".into(),
+                user: None,
+                members: Vec::new(),
+            }],
+        );
+        let now = 100 * DAY;
+        let said_at = now - 3 * DAY;
+        mirror.insert_messages(
+            &Scope::conversation("T1", &ChannelId("C1".into())),
+            &[mentioning(
+                &format!("{}.0", said_at / 1000),
+                "U1",
+                "<@ME> can you look?",
+            )],
+        );
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+
+        derive_units(&mut model, &mirror);
+        let card = model.card(&unit, now).unwrap();
+        assert!(
+            (card.wait_days - 3.0).abs() < 0.01,
+            "three days, not {}",
+            card.wait_days
+        );
+
+        // The second connect derives again over the same history. It must
+        // not restart the clock either: `record` keeps the first_seen it
+        // already has, and the first one it had is now the right one.
+        derive_units(&mut model, &mirror);
+        let card = model.card(&unit, now).unwrap();
+        assert!(
+            (card.wait_days - 3.0).abs() < 0.01,
+            "still three days on the second connect, not {}",
+            card.wait_days
         );
     }
 

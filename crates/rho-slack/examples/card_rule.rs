@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     // that were already worked out once.
     let derived_at = Instant::now();
     let mut old = model(&mirror, &name);
-    derive_units(&mut old, &mirror, now_ms());
+    derive_units(&mut old, &mirror);
     let derived = derived_at.elapsed();
     let messages: usize = mirror
         .conversations(&workspace)
