@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use redb::TableDefinition;
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
 use rho_desk::cells::{
     BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
@@ -19,6 +20,9 @@ const BODIES: TableDefinition<Sen<Id>, Sen<BodySnapshot>> =
 const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
 const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
+/// The marker of the one-shot below, so it runs on a store once.
+const PARENTS_CONVERTED: TableDefinition<(), bool> =
+    TableDefinition::new("rho_desk_parent_labels_v1");
 
 /// The same two tables, read without trusting every row to decode. A newer
 /// build on another device can write a property or a verdict this one has
@@ -70,6 +74,36 @@ impl DeskCellStore {
     pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
         initialize(&mut write)?;
+        // A thing is placed by the labels it carries. The parents already
+        // in the store are the same statement in the old shape, so they are
+        // read once, written as labels, and cleared.
+        if write.open_table(PARENTS_CONVERTED).get(&()).is_none() {
+            let read = db.read();
+            let agent_titles = if read.has_table("agent_log") {
+                read.list_agents()
+                    .into_iter()
+                    .map(|(id, head)| (id, head.title().map(str::to_owned)))
+                    .collect()
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            drop(read);
+            let mut meta = load_meta_from_write(&mut write)?;
+            let snapshot = read_snapshot_from_write(&mut write)?;
+            let bodies = write
+                .open_table(BODIES_READ)
+                .iter()
+                .map(|(_, body)| body.value().ok_or("Desk body was written by a newer build"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+            let report = crate::desk_parent_labels::convert(&mut store, &bodies, &agent_titles)?;
+            let snapshot = store.snapshot();
+            persist_snapshot(&mut write, &snapshot, bodies)?;
+            meta.frontier = snapshot.version;
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            write.open_table(PARENTS_CONVERTED).insert(&(), &true);
+            tracing::info!("{}", report.line());
+        }
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -671,6 +705,7 @@ pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     write.open_table(CELLS);
     write.open_table(VERDICTS);
     write.open_table(BODIES);
+    write.open_table(PARENTS_CONVERTED);
     write.open_table(META).insert(&(), SenValue::owned(meta));
     Ok(())
 }
@@ -930,6 +965,75 @@ mod tests {
             .max()
             .unwrap_or(0)
             + 1
+    }
+
+    /// The parent conversion runs on the store it is opened on, and the
+    /// marker means it runs once: a parent written after it has run is the
+    /// user's own and stays until rho itself takes it off.
+    #[tokio::test]
+    async fn parent_conversion_and_marker_commit_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("rho.redb"));
+        let area = Id::Note(Uuid::random());
+        let thing = Id::Note(Uuid::random());
+        {
+            let mut write = db.write().await;
+            initialize(&mut write).unwrap();
+            let mut meta = load_meta_from_write(&mut write).unwrap();
+            let mut cells = Store::new(meta.daemon_device);
+            cells
+                .write(area.clone(), Property::Name("rho".into()))
+                .unwrap();
+            cells
+                .write(thing.clone(), Property::Parent(Some(area.clone())))
+                .unwrap();
+            persist_snapshot(&mut write, &cells.snapshot(), Vec::new()).unwrap();
+            meta.frontier = cells.version().clone();
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            write.commit();
+        }
+
+        let first = DeskCellStore::new(db.clone()).await.unwrap();
+        let snapshot = first.sync_since(&Version::new()).unwrap();
+        let converted = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
+        assert_eq!(converted.facts(&thing).parent, None);
+        let labels = converted
+            .facts(&thing)
+            .labels
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 1, "the parent is now the label it stood for");
+        assert_eq!(converted.facts(&labels[0]).name.as_deref(), Some("rho"));
+        assert_eq!(
+            db.read()
+                .open_table(PARENTS_CONVERTED)
+                .get(&())
+                .map(|value| value.value()),
+            Some(true)
+        );
+
+        // A parent written after the conversion is not converted again.
+        let device = DeviceId([7; 16]);
+        let after = Id::Note(Uuid::random());
+        let version = next_version(&first);
+        first
+            .apply_mutation(
+                device,
+                CellMutation {
+                    stamp: Stamp { device, version },
+                    writes: vec![CellWrite {
+                        id: after.clone(),
+                        property: Property::Parent(Some(area.clone())),
+                    }],
+                    verdict: None,
+                },
+            )
+            .await
+            .unwrap();
+        let second = DeskCellStore::new(db.clone()).await.unwrap();
+        let snapshot = second.sync_since(&Version::new()).unwrap();
+        let reopened = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
+        assert_eq!(reopened.facts(&after).parent, Some(area));
     }
 
     /// Writes one note at the root the way a client does. A note is

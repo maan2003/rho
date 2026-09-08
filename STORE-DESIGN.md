@@ -353,6 +353,32 @@ user typed, and the page exists when the browser opens it.
 
 ## Migration
 
+### Third conversion: the parents become labels
+
+A thing is placed by the labels it carries and carries no parent
+(`DESK-DESIGN.md`). Rho stopped writing parents on the filing paths on
+8 Sep; this reads the parents already in the store and says the same thing
+as a label. One shot at daemon start behind the durable marker
+`rho_desk_parent_labels_v1`, and then the code goes (the standing rule).
+
+For every non-label carrying a `Parent`: the label that parent stands for is
+minted or reused, named by the parent's `Name`, else the first line of its
+body, else the agent log's title; that label is nested under the label the
+parent's own parent stands for, so `rho/agent` is a path; the thing is given
+`Labeled`, any label the new one is nested under comes off, and the `Parent`
+is written `None`. A label's own `Parent` is left alone — that is what nests
+labels. A parent nobody named cannot become a label, so that thing keeps its
+parent rather than losing the only thing that says where it is. Label ids are
+a hash of name-under-parent, so two runs of one store agree cell for cell.
+
+Proved before landing on a copy of `user-2026-09-06`, which predates the
+outline conversion and so still carries parents: 917 subjects, 18 labels,
+341 parents, 7 things carrying a label and 7 label cells before; the run
+reported 341 things carrying a parent, 134 labels minted and 3 reused, 340
+things labelled, 0 shallower labels dropped, 340 parents cleared and 1 left
+for want of a name; and the store read after it says 1051 subjects, 1 parent,
+342 things carrying a label, 347 label cells, marker set.
+
 ### Second conversion: the outline recovered as labels (historical)
 
 No copy of the Org text survived the 3 Sep cutover, so this conversion read
