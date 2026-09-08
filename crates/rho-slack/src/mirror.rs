@@ -179,6 +179,53 @@ impl Mirror {
         txn.commit();
     }
 
+    /// Puts one arriving message into every scope it belongs to, in one
+    /// transaction.
+    ///
+    /// A top-level message belongs in two: the channel, and the thread its
+    /// own timestamp roots, so that a reader who opens a thread on it sees
+    /// the message they opened even before Slack answers. Written scope by
+    /// scope that is two durable commits for one message, and a durable
+    /// commit is the floor of what an arriving message costs -- 88 µs
+    /// against a microsecond of model work -- so the second one is half the
+    /// bill of every message rho receives, for no fact the first does not
+    /// already carry.
+    ///
+    /// The island rule is the same as a single write's and is applied in
+    /// the same transaction: a scope the mirror holds nothing for has no
+    /// telling what sits under this message, so it gets a gap of its own
+    /// until a page fills it. Which scopes those are is read before the
+    /// write, or the message would find itself.
+    pub fn insert_live(&self, scopes: &[&Scope], message: &Message) {
+        let islands = scopes
+            .iter()
+            .filter(|scope| self.newest_chunk(scope, 1).is_empty() && !self.history_begins(scope))
+            .map(|scope| scope.key(&message.ts))
+            .collect::<Vec<_>>();
+        let mut txn = self.write();
+        {
+            let mut table = txn.open_table(MESSAGES);
+            for scope in scopes {
+                table.insert(
+                    scope.key(&message.ts).as_str(),
+                    SenValue::owned(StoredMessage::from(message)),
+                );
+            }
+        }
+        if !islands.is_empty() {
+            let mut table = txn.open_table(GAPS);
+            for key in &islands {
+                table.insert(
+                    key.as_str(),
+                    SenValue::owned(StoredGap {
+                        page_before: message.ts.0.clone(),
+                    }),
+                );
+            }
+        }
+        txn.commit();
+    }
+
     /// A `message_deleted` frame: the message is gone, and the mirror must
     /// forget it rather than keep a copy the user cannot see anywhere else.
     pub fn remove_message(&self, scope: &Scope, ts: &Ts) {

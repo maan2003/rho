@@ -163,6 +163,50 @@ fn a_tail_that_does_not_reach_the_cache_leaves_a_gap() {
     assert_eq!(mirror.newest_chunk(&scope, 50).len(), 4);
 }
 
+/// A message said to the room reaches both the places it belongs, and costs
+/// one commit to do it.
+///
+/// A durable commit is the floor of what an arriving message costs -- 88 µs
+/// against a microsecond of model work -- and a top-level message used to
+/// pay two, one for the channel and one for the thread its own timestamp
+/// roots. The thread copy is what a reader who opens a thread on a message
+/// with no replies sees before Slack answers, so it stays; what goes is the
+/// second commit.
+#[test]
+fn a_message_said_to_the_room_reaches_its_thread_and_its_channel_at_once() {
+    let (_dir, mirror) = mirror();
+    let channel = scope();
+    let said = message("100.000000", "anyone about?");
+    let thread = Scope::thread("acme", &ChannelId::from("C1"), &said.ts);
+
+    mirror.insert_live(&[&thread, &channel], &said);
+
+    assert_eq!(
+        mirror
+            .newest_chunk(&channel, 50)
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anyone about?"],
+        "the room has it"
+    );
+    assert_eq!(
+        mirror
+            .newest_chunk(&thread, 50)
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anyone about?"],
+        "and a thread opened on a message nobody has replied to still shows          the message it was opened on"
+    );
+    // Both scopes were empty, so both are islands: nothing is known under
+    // either until a page says otherwise, and that has to be true of the
+    // scope that shared the transaction as much as of the one that started
+    // it.
+    assert!(mirror.gap_below(&channel, None).is_some());
+    assert!(mirror.gap_below(&thread, None).is_some());
+}
+
 /// `has_more: false` is the beginning of history, and that is a fact worth
 /// keeping: `shift-p` at the top is then an echo rather than a request.
 #[test]

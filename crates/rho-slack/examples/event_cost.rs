@@ -103,6 +103,17 @@ fn main() -> anyhow::Result<()> {
     }
     let wrote = wrote_at.elapsed() / runs;
 
+    // The whole arrival as `route` runs it now: the thread scope this
+    // message roots and the channel, in one transaction. The scope is built
+    // inside the loop because a live one is built per message.
+    let live_at = Instant::now();
+    for step in 0..runs as usize {
+        let said = arriving(step);
+        let thread = Scope::thread(WORKSPACE, &channel, &said.ts);
+        mirror.insert_live(&[&thread, &conversation], &said);
+    }
+    let live = live_at.elapsed() / runs;
+
     // What the model does with the same message: the row put back in its
     // place in the list, and the card rule.
     let counts_at = Instant::now();
@@ -121,10 +132,14 @@ fn main() -> anyhow::Result<()> {
 
     println!("one arriving message, top level, into a conversation of {each}");
     println!("  mirror, newest_chunk(1) {looked:?}   (×2: the thread scope and the channel)");
-    println!("  mirror, insert + commit {wrote:?}   (×2)");
+    println!("  mirror, insert + commit {wrote:?}   (one scope, one commit)");
+    println!("  mirror, one arrival     {live:?}   (both scopes, one commit)");
     println!("  model, note_counts      {counts:?}");
     println!("  model, note_message     {noted:?}");
-    println!("  mirror total            {:?}", (looked + wrote) * 2);
+    println!(
+        "  mirror, two commits     {:?}   (what an arrival cost before)",
+        (looked + wrote) * 2
+    );
     println!("  model total             {:?}", counts + noted);
     Ok(())
 }

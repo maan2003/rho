@@ -785,11 +785,15 @@ impl Session {
         if let Some(mirror) = self.mirror.as_ref() {
             let workspace = self.model.workspace().0.clone();
             let thread = Scope::thread(&workspace, &message.channel, &message.thread_root());
-            mirror_live(mirror, &thread, message);
+            let conversation = Scope::conversation(&workspace, &message.channel);
+            // One transaction for both places the message belongs. A commit
+            // is the floor of what an arriving message costs, and a message
+            // said to the room used to pay two of them.
+            let mut scopes = vec![&thread];
             if message.is_top_level() {
-                let conversation = Scope::conversation(&workspace, &message.channel);
-                mirror_live(mirror, &conversation, message);
+                scopes.push(&conversation);
             }
+            mirror.insert_live(&scopes, message);
         }
         let conversation = Source::Conversation(message.channel.clone());
         let thread = Source::Thread(ThreadKey {
@@ -2535,18 +2539,6 @@ fn refused_search(said: &str) -> bool {
     said.contains("missing_scope") || said.contains("not_allowed_token_type")
 }
 
-/// Puts a message the socket brought into the mirror. A message landing in
-/// a scope the mirror holds nothing for is an island: there is no telling
-/// what sits under it, so it gets a gap of its own and the reader is told
-/// as much until a page fills it.
-fn mirror_live(mirror: &Mirror, scope: &Scope, message: &Message) {
-    let empty = mirror.newest_chunk(scope, 1).is_empty();
-    mirror.insert_messages(scope, std::slice::from_ref(message));
-    if empty && !mirror.history_begins(scope) {
-        mirror.put_gap(scope, &message.ts, &message.ts);
-    }
-}
-
 /// Records what a ping's window does not know. The window is an island:
 /// it was fetched around one message, so nothing is known below its oldest,
 /// and without the record the surface would take those twenty messages for
@@ -3169,12 +3161,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
         let scope = Scope::conversation("T1", &ChannelId("C1".into()));
-        mirror_live(&mirror, &scope, &message("2.0", "live"));
+        mirror.insert_live(&[&scope], &message("2.0", "live"));
         assert!(
             mirror.gap_below(&scope, None).is_some(),
             "nothing is known under a message the socket dropped in"
         );
-        mirror_live(&mirror, &scope, &message("3.0", "and another"));
+        mirror.insert_live(&[&scope], &message("3.0", "and another"));
         assert_eq!(
             mirror
                 .gap_below(&scope, None)
