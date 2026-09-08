@@ -2197,6 +2197,11 @@ impl Session {
         if text.trim().is_empty() {
             return Task::ready(Err(anyhow::anyhow!("an empty rewrite is not a delete")));
         }
+        // The same rule as `send`, and for the same reason: `<@U1>` is the
+        // only form that makes the mention count for Ada. A rewrite is how a
+        // reader adds the name they forgot, so a rewrite that skipped this
+        // was the one way to type `@ada` in rho and have nobody told.
+        let text = self.model.encode(&text);
         let channel = source.channel().clone();
         let source = source.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
