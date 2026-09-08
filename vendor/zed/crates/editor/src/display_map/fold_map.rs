@@ -3357,6 +3357,7 @@ mod tests {
 
         let (mut initial_snapshot, _) = map.read(inlay_snapshot, vec![]);
         let mut snapshot_edits = Vec::new();
+        let mut expected_folds = ExpectedFolds::default();
 
         let mut next_inlay_id = 0;
         for _ in 0..operations {
@@ -3365,7 +3366,9 @@ mod tests {
             let mut inlay_edits = Vec::new();
             match rng.random_range(0..=100) {
                 0..=39 => {
-                    snapshot_edits.extend(map.randomly_mutate(&mut rng));
+                    let mutation = map.random_mutation(&mut rng);
+                    expected_folds.apply(&mutation, &map.snapshot.inlay_snapshot.buffer);
+                    snapshot_edits.extend(map.apply_random_mutation(mutation));
                 }
                 40..=59 => {
                     let (_, edits) = inlay_map.randomly_mutate(&mut next_inlay_id, &mut rng);
@@ -3392,8 +3395,12 @@ mod tests {
             let (snapshot, edits) = map.read(inlay_snapshot.clone(), inlay_edits);
             snapshot_edits.push((snapshot.clone(), edits));
 
+            expected_folds.retain_resolvable(&inlay_snapshot.buffer);
+            let merged_folds = expected_folds.merged(&inlay_snapshot.buffer);
+            assert_eq!(map.merged_folds(), merged_folds);
+
             let mut expected_text: String = inlay_snapshot.text().to_string();
-            for fold_range in map.merged_folds().into_iter().rev() {
+            for fold_range in merged_folds.iter().rev() {
                 let fold_inlay_start = inlay_snapshot.to_inlay_offset(fold_range.start);
                 let fold_inlay_end = inlay_snapshot.to_inlay_offset(fold_range.end);
                 expected_text.replace_range(fold_inlay_start.0.0..fold_inlay_end.0.0, "⋯");
@@ -3408,7 +3415,7 @@ mod tests {
 
             let mut prev_row = 0;
             let mut expected_buffer_rows = Vec::new();
-            for fold_range in map.merged_folds() {
+            for fold_range in merged_folds {
                 let fold_start = inlay_snapshot
                     .to_point(inlay_snapshot.to_inlay_offset(fold_range.start))
                     .row();
@@ -3754,6 +3761,75 @@ mod tests {
         cx.set_global(store);
     }
 
+    #[derive(Default)]
+    struct ExpectedFolds(Vec<Range<Anchor>>);
+
+    impl ExpectedFolds {
+        fn apply(&mut self, mutation: &RandomFoldMutation, buffer: &MultiBufferSnapshot) {
+            match mutation {
+                RandomFoldMutation::Fold(ranges) => {
+                    self.0.extend(ranges.iter().filter_map(|range| {
+                        (!range.is_empty()).then(|| {
+                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end)
+                        })
+                    }));
+                }
+                RandomFoldMutation::Unfold { ranges, inclusive } => {
+                    self.0.retain(|fold| {
+                        !ranges.iter().any(|range| {
+                            let start = buffer.anchor_before(range.start);
+                            let end = buffer.anchor_after(range.end);
+                            let start_cmp = start.cmp(&fold.end, buffer);
+                            let end_cmp = end.cmp(&fold.start, buffer);
+                            if *inclusive {
+                                start_cmp <= Ordering::Equal && end_cmp >= Ordering::Equal
+                            } else {
+                                start_cmp == Ordering::Less && end_cmp == Ordering::Greater
+                            }
+                        })
+                    });
+                }
+            }
+        }
+
+        fn retain_resolvable(&mut self, buffer: &MultiBufferSnapshot) {
+            self.0
+                .retain(|fold| buffer.can_resolve(&fold.start) && buffer.can_resolve(&fold.end));
+        }
+
+        fn merged(&self, buffer: &MultiBufferSnapshot) -> Vec<Range<MultiBufferOffset>> {
+            let mut folds = self
+                .0
+                .iter()
+                .map(|fold| fold.start.to_offset(buffer)..fold.end.to_offset(buffer))
+                .collect::<Vec<_>>();
+            folds.sort_unstable_by_key(|fold| (fold.start, cmp::Reverse(fold.end)));
+
+            let mut merged = Vec::<Range<MultiBufferOffset>>::new();
+            for fold in folds {
+                if fold.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = merged.last_mut()
+                    && previous.end >= fold.start
+                {
+                    previous.end = previous.end.max(fold.end);
+                } else {
+                    merged.push(fold);
+                }
+            }
+            merged
+        }
+    }
+
+    enum RandomFoldMutation {
+        Fold(Vec<Range<MultiBufferOffset>>),
+        Unfold {
+            ranges: Vec<Range<MultiBufferOffset>>,
+            inclusive: bool,
+        },
+    }
+
     impl FoldMap {
         fn merged_folds(&self) -> Vec<Range<MultiBufferOffset>> {
             let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
@@ -3789,45 +3865,62 @@ mod tests {
             &mut self,
             rng: &mut impl Rng,
         ) -> Vec<(FoldSnapshot, Vec<FoldEdit>)> {
+            let mutation = self.random_mutation(rng);
+            self.apply_random_mutation(mutation)
+        }
+
+        fn random_mutation(&self, rng: &mut impl Rng) -> RandomFoldMutation {
+            let buffer = &self.snapshot.inlay_snapshot.buffer;
+            if rng.random_range(0..=100) <= 39 && !self.snapshot.folds.is_empty() {
+                let mut ranges = Vec::new();
+                for _ in 0..rng.random_range(1..=3) {
+                    let end = buffer
+                        .clip_offset(rng.random_range(MultiBufferOffset(0)..=buffer.len()), Right);
+                    let start =
+                        buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
+                    ranges.push(start..end);
+                }
+                RandomFoldMutation::Unfold {
+                    ranges,
+                    inclusive: rng.random(),
+                }
+            } else {
+                let mut ranges = Vec::new();
+                for _ in 0..rng.random_range(1..=2) {
+                    let end = buffer
+                        .clip_offset(rng.random_range(MultiBufferOffset(0)..=buffer.len()), Right);
+                    let start =
+                        buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
+                    ranges.push(start..end);
+                }
+                RandomFoldMutation::Fold(ranges)
+            }
+        }
+
+        fn apply_random_mutation(
+            &mut self,
+            mutation: RandomFoldMutation,
+        ) -> Vec<(FoldSnapshot, Vec<FoldEdit>)> {
             let mut snapshot_edits = Vec::new();
-            match rng.random_range(0..=100) {
-                0..=39 if !self.snapshot.folds.is_empty() => {
+            match mutation {
+                RandomFoldMutation::Unfold { ranges, inclusive } => {
                     let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
-                    let buffer = &inlay_snapshot.buffer;
-                    let mut to_unfold = Vec::new();
-                    for _ in 0..rng.random_range(1..=3) {
-                        let end = buffer.clip_offset(
-                            rng.random_range(MultiBufferOffset(0)..=buffer.len()),
-                            Right,
-                        );
-                        let start =
-                            buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
-                        to_unfold.push(start..end);
-                    }
-                    let inclusive = rng.random();
-                    log::info!("unfolding {:?} (inclusive: {})", to_unfold, inclusive);
+                    log::info!("unfolding {:?} (inclusive: {})", ranges, inclusive);
                     let (mut writer, snapshot, edits) = self.write(inlay_snapshot, vec![]);
                     snapshot_edits.push((snapshot, edits));
-                    let (snapshot, edits) = writer.unfold_intersecting(to_unfold, inclusive);
+                    let (snapshot, edits) = writer.unfold_intersecting(ranges, inclusive);
                     snapshot_edits.push((snapshot, edits));
                 }
-                _ => {
+                RandomFoldMutation::Fold(ranges) => {
                     let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
-                    let buffer = &inlay_snapshot.buffer;
-                    let mut to_fold = Vec::new();
-                    for _ in 0..rng.random_range(1..=2) {
-                        let end = buffer.clip_offset(
-                            rng.random_range(MultiBufferOffset(0)..=buffer.len()),
-                            Right,
-                        );
-                        let start =
-                            buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
-                        to_fold.push((start..end, FoldPlaceholder::test()));
-                    }
-                    log::info!("folding {:?}", to_fold);
+                    log::info!("folding {:?}", ranges);
                     let (mut writer, snapshot, edits) = self.write(inlay_snapshot, vec![]);
                     snapshot_edits.push((snapshot, edits));
-                    let (snapshot, edits) = writer.fold(to_fold);
+                    let (snapshot, edits) = writer.fold(
+                        ranges
+                            .into_iter()
+                            .map(|range| (range, FoldPlaceholder::test())),
+                    );
                     snapshot_edits.push((snapshot, edits));
                 }
             }
