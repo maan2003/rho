@@ -401,6 +401,79 @@ nothing to say, or the user starts checking the other app again.
 Typed events: connected, disconnected, item ingested, replied, each with
 the thread identity. No strings where an enum will do.
 
+### Searching what people said
+
+The finder narrows the conversation *list* by name; nothing finds a
+message. "What did dana say about the staging rollback" is a daily
+question, and today it is answered by opening the other app, which is the
+one thing this design exists to stop.
+
+**A hit is a place, not a thing.** A hit is a workspace, a channel, an
+optional thread and a timestamp -- exactly the argument `Session::open_at`
+already takes. It is not a unit, not a card, never filed and never in the
+store: the rule that a message timestamp is a fact about a unit and not an
+identity holds here too. A result list is a way of getting somewhere, and
+it is thrown away once the reader has arrived.
+
+**A hit opens where a ping opens.** Landing the reader on a message rho
+may hold nothing around is solved already: `prefetch_ping` fetches a
+bounded window either side of the pinging message, `mirror_island` records
+that the window is an island with unknown history under it, and `open_at`
+opens the chunk that contains it. A search hit is a ping the reader raised
+themselves and takes the same road: the conversation surface, the chunk
+around the message, the point on its row, the row marked so the reader can
+see which one matched. One thing has to change -- `open_at` returns
+silently today when the mirror holds nothing at that timestamp, and a hit
+from the server is precisely that case, so it gains the window fetch the
+ping path already has.
+
+Results are their own surface, the same shape as the conversation list: a
+read-only buffer, one row per hit, the point on the first one, `enter`
+opens it, `escape` comes back to the results. A row is the author's name,
+the conversation's name, the day, and the line that matched -- no ids, no
+timestamps, nothing that says "you".
+
+**Hits come from Slack, not from the mirror.** `search.messages` on the
+same session, paged, which `slack-search.el` has used for a decade. The
+mirror is not searched and not indexed, and the measurements are why.
+Measured on a synthetic mirror of 250,000 messages over 200 conversations,
+twelve words each, release build, file warm:
+
+- The mirror is 128 MiB. One pass over it, decoding every message and
+  matching, is 290 ms. Per keystroke that is a pass over the mirror, which
+  the cost rule forbids outright.
+- A word index in memory, the shape the name index uses, is 3.0M postings:
+  279 MiB of resident memory, 4.6 s to build at startup. It costs more RAM
+  than the whole mirror costs disk.
+- A word index on disk costs 257 MiB beside the 128 MiB of messages, and
+  twelve inserts per message on the socket path (mean 323 us per message,
+  worst 579 us). Lookup is honest for a whole word (43 us) and for a long
+  prefix (143 us for 1,505 postings), but a two-letter prefix reaches
+  1.5M postings in 167 ms -- so even with the index, per keystroke is a
+  pass over the index.
+- And the mirror holds only what rho has paged in. A search of it answers
+  "what have I already read", which is not the question asked.
+
+**What it costs per keystroke: nothing.** This search is submit-then-ask,
+not narrow-as-you-type. The finder narrows on every keystroke because it
+is answered from an index of a few thousand short names held in memory;
+neither half of that is true of messages. The message prompt offers no
+candidates while typing, reads nothing, and asks nothing until `enter`. A
+query still in flight when a second is submitted is dropped, so the
+results shown are the last query's and never an older one arriving late. A
+query that fails says so on one line and leaves the results that were
+there.
+
+The query goes to Slack as the reader typed it. `from:@dana staging` works
+without rho knowing what `from:` means, because Slack parses its own
+modifiers -- the same reason blocks are rendered rather than reinterpreted.
+
+**Why:** the workspace's history is Slack's, not rho's, and a client that
+answers "find it" from its own partial copy answers a different question
+than the reader asked. Indexing that partial copy would cost more than the
+copy, on both the memory the client holds and the write path every
+incoming message crosses, to answer worse.
+
 ## The fake is a server, not a test double
 
 `rho-fake-slack` is its own crate, a library and a binary. The fake lived
@@ -470,8 +543,10 @@ same typed actions the in-process handle takes.
 - Automatic token and cookie extraction from the embedded browser.
 - Dialogs and modals rendered as forms in the editor.
 - Presence and typing indicators.
-- Workspace-wide search. Narrowing the conversation list by name is built;
-  searching what people said is not.
+- Searching what people said, which is designed above and not yet built.
+  Narrowing the conversation list by name is built.
+- Searching the mirror while offline, and search modifiers rho understands
+  itself rather than passing through.
 - Scopes and per-heading keyword filters.
 
 Reactions, emoji, file upload, message editing and deletion have all been
