@@ -85,6 +85,25 @@ pub fn set_wrap_batch_clock_enabled(enabled: bool) {
     WRAP_BATCH_CLOCK_ENABLED.store(enabled, atomic::Ordering::Relaxed);
 }
 
+/// Whether a sync validates that every row of the snapshot it hands out
+/// lies within its document.
+///
+/// The check walks every display row, so it costs the document on every
+/// sync, and under `wrap-test-support` that cost is in every number a test
+/// build produces: one flushed replacement at five thousand items measured
+/// 5.64s with it and 33.4ms without, and its shape went from 74x the
+/// hundred-item cost to 1.4x. A bench turns it off before it measures; a
+/// correctness suite leaves it on, which is where it earns its keep.
+#[cfg(feature = "wrap-test-support")]
+static WRAP_ROWS_CHECK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Stops a sync validating its rows, for a bench measuring what a sync
+/// costs. On by default wherever the feature is on.
+#[cfg(feature = "wrap-test-support")]
+pub fn set_wrap_rows_check_enabled(enabled: bool) {
+    WRAP_ROWS_CHECK_ENABLED.store(enabled, atomic::Ordering::Relaxed);
+}
+
 /// When the current batch started, or `None` where there is no clock to ask.
 ///
 /// `Instant::now` has no answer on wasm, where this runs on the browser's
@@ -358,7 +377,9 @@ impl WrapMap {
                     .max()
                     .unwrap_or(0),
             });
-            if let Err(violation) = self.snapshot.rows_within_their_document() {
+            if WRAP_ROWS_CHECK_ENABLED.load(atomic::Ordering::Relaxed)
+                && let Err(violation) = self.snapshot.rows_within_their_document()
+            {
                 self.sync_violations.push(violation);
             }
         }

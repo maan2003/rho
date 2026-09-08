@@ -106,6 +106,8 @@ pub use wrap_map::WrapSyncRecord;
 #[cfg(feature = "wrap-test-support")]
 pub use wrap_map::WrapSyncTrace;
 pub use wrap_map::set_wrap_batch_clock_enabled;
+#[cfg(feature = "wrap-test-support")]
+pub use wrap_map::set_wrap_rows_check_enabled;
 pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
