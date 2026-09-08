@@ -1364,6 +1364,78 @@ impl Model {
         out
     }
 
+    /// The inverse of [`Model::encode`]: a wire string as the reader would
+    /// have typed it, for a composer that is about to send it back.
+    ///
+    /// An escape is rewritten only when `encode` would turn the result into
+    /// a mention of the same person or channel. Everything else stays
+    /// exactly as the wire wrote it — a link, a subteam, an id the roster
+    /// does not know. The rendered form is not typeable: `@Ada Lovelace`
+    /// would go back out as prose, because `encode` stops a handle at the
+    /// space and finds nobody, and `docs` would go out with the address
+    /// gone. A rewrite of a message is not a chance to lose the link in it,
+    /// so the reader edits a link in its wire form and keeps it.
+    ///
+    /// Cost: one roster lookup per escape in the one message, which is what
+    /// `encode` already pays to send it. This is opening an edit, not a
+    /// frame and not an event.
+    pub fn decode(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('<') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            // An unclosed `<` is the reader's own character, not an escape.
+            let Some(end) = after.find('>') else {
+                out.push_str(&rest[start..]);
+                return out;
+            };
+            let escape = &after[..end];
+            match self.typed_form(escape) {
+                Some(typed) => out.push_str(&typed),
+                None => {
+                    out.push('<');
+                    out.push_str(escape);
+                    out.push('>');
+                }
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// What the reader would have typed for one escape, or `None` when
+    /// nothing they could type comes back as it.
+    ///
+    /// The test is not that the bytes match — Slack writes `<#C1>` and
+    /// `<#C1|whatever-it-was-called-then>` for the same channel — but that
+    /// `encode` names the same one coming back. Two people can carry the
+    /// same handle, and a rewrite must not quietly change who it tells.
+    fn typed_form(&self, escape: &str) -> Option<String> {
+        let target = escape.split('|').next().unwrap_or(escape);
+        let (sigil, id) = target.split_at_checked(1)?;
+        match sigil {
+            "@" => {
+                let handle = self.users.get(&UserId(id.to_owned()))?.handle.clone();
+                (self.wire_form('@', &handle)? == format!("<@{id}>")).then(|| format!("@{handle}"))
+            }
+            "#" => {
+                let name = self
+                    .conversations
+                    .get(&ChannelId(id.to_owned()))?
+                    .name
+                    .clone();
+                (self.wire_form('#', &name)? == format!("<#{id}|{name}>"))
+                    .then(|| format!("#{name}"))
+            }
+            // The broadcasts name nobody in particular, so there is nothing
+            // to resolve and nothing to get wrong.
+            "!" if BROADCASTS.contains(&id) => Some(format!("@{id}")),
+            _ => None,
+        }
+    }
+
     fn wire_form(&self, sigil: char, name: &str) -> Option<String> {
         match sigil {
             // The broadcasts are not users and are in no member list, so the
@@ -3447,5 +3519,59 @@ mod tests {
         // word is the whole of it.
         assert_eq!(model.encode("over@here.example"), "over@here.example");
         assert_eq!(model.encode("@herero"), "@herero");
+    }
+
+    /// Opening an edit puts what was sent in the composer, and what was sent
+    /// is the wire form. Without this the reader rewrites `<@U1> can you
+    /// look?` — and if they retyped it as the name they see drawn, `@Ada
+    /// Lovelace`, `encode` would stop at the space, find nobody, and send it
+    /// as prose.
+    #[test]
+    fn opening_an_edit_gives_back_the_words_that_were_typed() {
+        let model = model();
+        assert_eq!(
+            model.decode("<@U1> see <#C1|design> and <!here>"),
+            "@ada see #design and @here"
+        );
+        // Slack writes a channel both ways for the same channel, and both
+        // come back as the name it has now.
+        assert_eq!(model.decode("<#C1>"), "#design");
+        assert_eq!(model.decode("<#C1|what-it-was-called-then>"), "#design");
+    }
+
+    /// An escape with no typed form is left exactly as the wire wrote it. A
+    /// rewrite is not a chance to lose the link in a message: rendering
+    /// `<https://x.example|docs>` down to `docs` would send it back with the
+    /// address gone, and there is no typed form that puts one back.
+    #[test]
+    fn an_escape_the_reader_could_not_have_typed_survives_the_rewrite() {
+        let model = model();
+        for wire in [
+            "<https://x.example|docs>",
+            "<https://x.example>",
+            "<!subteam^S1|@team>",
+            "<@U404>",
+            "<#C404>",
+            "<>",
+            "a < b and c > d",
+            "unclosed <@U1 stays",
+        ] {
+            assert_eq!(model.decode(wire), wire, "left as the wire wrote it");
+            assert_eq!(
+                model.encode(wire),
+                wire,
+                "and encode does not touch it either, so the rewrite is lossless"
+            );
+        }
+    }
+
+    /// The round trip, both ways, on the forms each side produces.
+    #[test]
+    fn what_the_reader_types_and_what_goes_on_the_wire_are_inverses() {
+        let model = model();
+        let typed = "morning @ada, see #design, @here, @channel";
+        assert_eq!(model.decode(&model.encode(typed)), typed);
+        let wire = "<@U1> <#C1|design> <!here> <!channel> <https://x.example|docs>";
+        assert_eq!(model.encode(&model.decode(wire)), wire);
     }
 }

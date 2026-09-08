@@ -649,9 +649,13 @@ impl ConversationView {
             self.held_compose = Some(self.input.read(cx).text());
         }
         let previous = self.editing_message.replace(message.ts.clone());
-        // The composer holds what was sent, not what was drawn: an edit
-        // starts from the reader's own words.
-        self.set_compose(message.text.clone(), cx);
+        // The composer holds what was sent, not what was drawn, and what was
+        // sent is the wire form: an edit starting from `<@U1>` does not start
+        // from the reader's own words. `decode` gives those back, and leaves
+        // alone every escape that has no typed form rather than render it
+        // into one that could not be sent again.
+        let typed = self.session.read(cx).model().decode(&message.text);
+        self.set_compose(typed, cx);
         if let Some(previous) = previous.filter(|previous| previous != &message.ts) {
             self.retint(&previous, cx);
         }
