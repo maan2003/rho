@@ -512,6 +512,26 @@ impl WriteTxn {
         }
     }
 
+    /// Opens a table, or `None` if the file records it under other
+    /// key/value types. redb writes the Rust path of a value type into
+    /// the table, so a type that moves between crates makes every
+    /// database written before the move unopenable; a caller that can
+    /// rebuild the table would rather be told than panicked at.
+    pub fn try_open_table<K, V>(
+        &mut self,
+        definition: TableDefinition<K, V>,
+    ) -> Option<WriteTable<'_, K, V>>
+    where
+        K: redb::Key + 'static,
+        V: redb::Value + 'static,
+    {
+        match self.inner.open_table(definition) {
+            Ok(inner) => Some(WriteTable { inner }),
+            Err(redb::TableError::TableTypeMismatch { .. }) => None,
+            Err(error) => panic!("open rho-db write table: {error:?}"),
+        }
+    }
+
     /// Deletes a table by name (no type check), returning whether it
     /// existed. For migrations that change a table's key/value types.
     pub fn delete_table(&mut self, name: &str) -> bool {

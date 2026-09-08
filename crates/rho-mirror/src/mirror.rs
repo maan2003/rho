@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-use redb::TableDefinition;
+use redb::{TableDefinition, TableHandle};
 use rho_agents::{AgentIdentity, DIGEST_VERSION, Digest, Verdict};
 use rho_db::{RecordedTypeName, RhoDb, Sen, SenAs, SenValue};
 use rho_ui_proto::AgentId;
@@ -159,6 +159,35 @@ enum Write {
     Flush(mpsc::SyncSender<()>),
 }
 
+/// Opens a mirror table, dropping it first if the file records it under
+/// other key/value types.
+///
+/// redb writes the Rust path of a value type into the table it types, so
+/// a struct that moves between crates makes every database written
+/// before the move refuse to open — the fault this crate already carries
+/// a pin for. A pin fixes one direction only: `StoredHost` and
+/// `AgentSnapshot` were written under `rho_gui::mirror` before 09-07 and
+/// under `rho_mirror::mirror` after it, and both are on disk in the
+/// wild, so no single name opens both. Every row in these four tables is
+/// a copy of something the daemon still has, and the crate's own rule is
+/// that anything doubted is thrown away and asked for again, so the
+/// answer here is to drop and re-copy rather than to name.
+///
+/// `VERDICTS` is not passed through this: a verdict is the user's own
+/// word about an agent and the daemon has no copy of it, so that one
+/// stays pinned by name and is never dropped.
+fn open_or_rebuild<K, V>(write: &mut rho_db::WriteTxn, definition: TableDefinition<K, V>)
+where
+    K: redb::Key + 'static,
+    V: redb::Value + 'static,
+{
+    let ours = write.try_open_table(definition).is_some();
+    if !ours {
+        write.delete_table(definition.name());
+        write.open_table(definition);
+    }
+}
+
 pub struct Mirror {
     db: RhoDb,
     /// Taken on drop: closing the channel is what tells the writer thread
@@ -174,10 +203,10 @@ impl Mirror {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
-            write.open_table(HOSTS);
-            write.open_table(AGENT_HOSTS);
-            write.open_table(EVENTS);
-            write.open_table(DIGESTS);
+            open_or_rebuild(&mut write, HOSTS);
+            open_or_rebuild(&mut write, AGENT_HOSTS);
+            open_or_rebuild(&mut write, EVENTS);
+            open_or_rebuild(&mut write, DIGESTS);
             write.open_table(VERDICTS);
             for table in RETIRED_TABLES {
                 write.delete_table(table);
@@ -732,5 +761,83 @@ mod tests {
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].0, kept);
         assert!(mirror.read_events(gone).is_empty());
+    }
+
+    /// A mirror written before `StoredHost` and `AgentSnapshot` left
+    /// rho-gui opens, and the rows the daemon can send again are the
+    /// only ones thrown away.
+    ///
+    /// The old names are spelled out rather than referenced so that
+    /// renaming anything in the code cannot rename what this checks
+    /// against. A verdict written under its pin stands beside the
+    /// emptiness: without it this test would pass on a mirror that
+    /// dropped every table it has.
+    #[test]
+    fn a_mirror_written_before_its_types_moved_crates_still_opens() {
+        #[derive(Debug)]
+        struct HostAsWrittenInRhoGui;
+
+        impl RecordedTypeName for HostAsWrittenInRhoGui {
+            const NAME: &'static str = "rho-db::Sen<rho_gui::mirror::StoredHost>";
+        }
+
+        #[derive(Debug)]
+        struct SnapshotAsWrittenInRhoGui;
+
+        impl RecordedTypeName for SnapshotAsWrittenInRhoGui {
+            const NAME: &'static str = "rho-db::Sen<rho_gui::mirror::AgentSnapshot>";
+        }
+
+        const OLD_HOSTS: TableDefinition<&str, SenAs<StoredHost, HostAsWrittenInRhoGui>> =
+            TableDefinition::new("gui_mirror_host_v2");
+        const OLD_DIGESTS: TableDefinition<
+            AgentId,
+            SenAs<AgentSnapshot, SnapshotAsWrittenInRhoGui>,
+        > = TableDefinition::new("gui_agent_digest_v1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(path(dir.path()));
+        let verdict = Verdict {
+            handled_through: AgentPos(7),
+            muted: true,
+        };
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            let host = StoredHost {
+                machine_seed: 3,
+                seq: Seq(11),
+            };
+            write
+                .open_table(OLD_HOSTS)
+                .insert("desk", SenValue::borrowed(&host));
+            write
+                .open_table(VERDICTS)
+                .insert(agent_id(1), SenValue::borrowed(&verdict));
+            // Opened so the file records its old type too; a digest
+            // without a host is not loaded, so the row itself would not
+            // be seen either way.
+            write.open_table(OLD_DIGESTS);
+            write.commit();
+        });
+        drop(db);
+
+        // The panic this reproduces was inside `open`, before anything a
+        // caller could catch, so the assertion is that it returns at all.
+        let mirror = Mirror::open(dir.path()).expect("open a mirror an older build wrote");
+        let loaded = mirror.load();
+        assert!(
+            loaded.hosts.is_empty(),
+            "the cursor was kept though its table was rebuilt, so the \
+             client would ask only for what came after rows it no longer \
+             has: {:?}",
+            loaded.hosts
+        );
+        let kept = mirror.db.read().open_table(VERDICTS);
+        assert_eq!(
+            kept.get(&agent_id(1)).map(|held| held.value().into_owned()),
+            Some(verdict),
+            "the user's verdict went with the tables the daemon can \
+             replace; nothing else holds it"
+        );
     }
 }
