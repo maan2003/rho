@@ -588,6 +588,7 @@ fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
         WrapMapUpdate => "wrap_map_update",
         SyncTree => "sync_tree",
         SpliceInlays => "splice_inlays",
+        MultiBufferBufferScan => "multi_buffer_buffer_scan",
     }
 }
 

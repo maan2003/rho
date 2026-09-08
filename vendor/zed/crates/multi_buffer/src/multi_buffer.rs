@@ -2781,6 +2781,15 @@ impl MultiBuffer {
         let mut paths_to_edit = Vec::new();
         let mut non_text_state_updated = false;
         let mut edited = false;
+        // The pass over the buffers marked changed is its own stage, because
+        // it is its own unit: a buffer whose parse has just landed reports a
+        // change without having been edited, and the work it asks for is one
+        // re-snapshot of that buffer, not a walk of anything. Counting it
+        // beside the cursor's leaf items made a screenful of parses read as
+        // the largest number on a step.
+        let mut scan = gpui::profiler::EditorTimingGuard::new(
+            gpui::profiler::EditorTimingKind::MultiBufferBufferScan,
+        );
         let mut scanned_items = 0_u64;
         for buffer_id in changed {
             let Some(buffer_state) = buffers.get(buffer_id) else {
@@ -2838,6 +2847,8 @@ impl MultiBuffer {
                 );
             }
         }
+        scan.walked_items(scanned_items);
+        drop(scan);
         if edited {
             *edit_count += 1;
         }
@@ -2911,7 +2922,7 @@ impl MultiBuffer {
         }
         new_excerpts.append(cursor.suffix(), ());
 
-        let mut walked_items = cursor.walked_items().saturating_add(scanned_items);
+        let mut walked_items = cursor.walked_items();
         drop(cursor);
         *excerpts = new_excerpts;
 

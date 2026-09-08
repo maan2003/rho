@@ -104,6 +104,22 @@ const ELIDED_HISTORY_DRIVE: &[WalkEvent] = &[
 const LARGE_TRANSCRIPT_TURNS: usize = 400;
 
 /// One step's walk written as `stage:count`, or `-` where it walked nothing.
+///
+/// Every number on the line counts the same unit: leaf items a stage's
+/// cursors crossed. `multibuffer:`, `fold:`, `tab:`, `wrap:`, `block:` and
+/// `inlay:` are each that map's cursors, so they can be read against one
+/// another and against `touched_rows` — the cost rule says a step pays for
+/// the rows it touches and a logarithm, and these are what it is paid in.
+///
+/// `buffers:` is the exception and is named apart for it. It is the
+/// multibuffer's pass over the buffers marked changed, one item per buffer
+/// and one per path it carries, and it rises when many buffers report a
+/// change in the same sync — a screenful of parses landing together, each
+/// asking for one re-snapshot of its own buffer — not when the document
+/// grows. It was inside `multibuffer:` until the elided run made it read as
+/// the largest cost on a step: 216 at 233 rows against 77 at 469, where the
+/// cursors' own share was 59 and 10 and the rest was fifty-nine parses
+/// coming home at once.
 fn stage_walks(walks: &[(&'static str, u64)]) -> String {
     if walks.is_empty() {
         return "-".to_owned();

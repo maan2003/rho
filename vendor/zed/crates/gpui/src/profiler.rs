@@ -989,6 +989,13 @@ pub enum EditorTimingKind {
     SyncTree = 9,
     /// Inlays going into or out of the display map.
     SpliceInlays = 10,
+    /// The multibuffer's pass over the buffers marked changed, counted apart
+    /// from `MultiBufferSync` because it is a different unit: one item per
+    /// changed buffer and one per path it carries, where the sync's own
+    /// number is SumTree leaf items crossed. It rises when many buffers
+    /// report a change at once - a screenful of parses finishing together -
+    /// and not with the size of the document.
+    MultiBufferBufferScan = 11,
 }
 
 const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
