@@ -15,13 +15,32 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, mpsc};
 
 use redb::{TableDefinition, TableHandle as _};
-use rho_db::{RhoDb, Sen, SenValue};
+use rho_db::{RhoDb, SenAs, SenValue};
 use serde::{Deserialize, Serialize};
 
 pub const FILE_NAME: &str = "action-journal.redb";
 const LOCK_FILE_NAME: &str = "action-journal.lock";
 
-const EVENTS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new("gui_action_journal_v3");
+/// The name this table was written under, from before `Entry` moved out
+/// of `rho-gui` and into this crate. redb records the Rust path of a value
+/// type and refuses a database whose table says another one, so moving the
+/// type took every existing journal with it: the GUI panicked on
+/// `TableTypeMismatch` at startup, before the window, on any state
+/// directory that had ever recorded an action. What is on disk is
+/// unchanged; only the path in the type's name moved.
+///
+/// Found on a rig cloned from the user's own snapshot, which is what a rig
+/// on real state is for: the crate's own tests build their journals fresh
+/// and every one of them passed.
+#[derive(Debug)]
+struct EntryName;
+
+impl rho_db::RecordedTypeName for EntryName {
+    const NAME: &'static str = "rho-db::Sen<rho_gui::journal::Entry>";
+}
+
+const EVENTS: TableDefinition<u64, SenAs<Entry, EntryName>> =
+    TableDefinition::new("gui_action_journal_v3");
 /// The same table read as bytes. A row an older build wrote can name a
 /// variant this one no longer has (the discard verdict became mute), and
 /// the history of everything else is worth more than that one row, so the
@@ -55,9 +74,9 @@ impl redb::Value for StoredEntry {
     }
 
     /// redb records the name a table was created with, so this has to
-    /// answer to `Sen<Entry>`'s.
+    /// answer to the name [`EVENTS`] answers to.
     fn type_name() -> redb::TypeName {
-        <Sen<Entry> as redb::Value>::type_name()
+        <SenAs<Entry, EntryName> as redb::Value>::type_name()
     }
 }
 
@@ -900,6 +919,59 @@ fn dump_db(db: &RhoDb, kind: Option<&str>, mut output: impl std::io::Write) -> a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A journal written before `Entry` moved into this crate still
+    /// opens.
+    ///
+    /// The crate's other tests build their journals fresh, so they write
+    /// the name this build uses and read it back: every one of them passed
+    /// while the GUI panicked at startup on the user's own state. This one
+    /// writes the old name first, which is the only way to fail the way a
+    /// reader fails.
+    #[test]
+    fn a_journal_written_before_the_entry_moved_crates_still_opens() {
+        /// What `std::any::type_name` gave while `Entry` was
+        /// `rho_gui::journal::Entry`. Spelled out rather than referenced,
+        /// so that renaming the pin in the code does not rename the thing
+        /// this test is checking against.
+        #[derive(Debug)]
+        struct AsWrittenInRhoGui;
+
+        impl rho_db::RecordedTypeName for AsWrittenInRhoGui {
+            const NAME: &'static str = "rho-db::Sen<rho_gui::journal::Entry>";
+        }
+
+        const OLD: TableDefinition<u64, SenAs<Entry, AsWrittenInRhoGui>> =
+            TableDefinition::new("gui_action_journal_v3");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(&dir.path().join(FILE_NAME));
+        futures::executor::block_on(async {
+            let mut write = db.write().await;
+            let entry = Entry {
+                timestamp: "2026-09-06T19:20:32Z".to_owned(),
+                event: Event::UserResumed,
+            };
+            write.open_table(OLD).insert(&1, SenValue::borrowed(&entry));
+            write.commit();
+        });
+        drop(db);
+
+        // The panic this reproduces was inside `open`, before anything a
+        // caller could catch, so the assertion is that it returns at all.
+        let journal = Journal::open(dir.path()).expect("open a journal an older build wrote");
+        journal.record(Event::UserResumed);
+        journal.flush().unwrap();
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let dumped = String::from_utf8(output).unwrap();
+        assert_eq!(
+            dumped.lines().count(),
+            2,
+            "the row the older build wrote is still there and the new one \
+             went in beside it: {dumped}"
+        );
+    }
 
     /// A row from a build whose vocabulary has moved on, the discard
     /// verdict being the first, is one row lost and not a lost journal.
