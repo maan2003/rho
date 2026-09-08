@@ -970,6 +970,51 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
     );
 }
 
+/// Runs until the view says the thing the test is waiting for.
+///
+/// The wait ends on the session saying something changed -- the event the
+/// test is about -- from a stream made before the state is read, so a
+/// change landing between the read and the wait is buffered rather than
+/// missed. The small timer it races decides nothing: it is what lets the
+/// test executor's own clock move, so work scheduled behind a timer runs.
+/// Nothing here counts tries.
+///
+/// The one real duration is a backstop. A test that gives up after so many
+/// milliseconds fails on a loaded machine and proves nothing on a quiet
+/// one, so this one gives up only after longer than any machine takes, and
+/// says what it was waiting for when it does.
+async fn until<R>(
+    session: &gpui::Entity<rho_slack::session::Session>,
+    window: gpui::WindowHandle<rho_slack::ui::ConversationView>,
+    cx: &mut TestAppContext,
+    waiting_for: &str,
+    mut ready: impl FnMut(
+        &mut rho_slack::ui::ConversationView,
+        &mut gpui::Window,
+        &mut gpui::Context<rho_slack::ui::ConversationView>,
+    ) -> Option<R>,
+) -> R {
+    use futures::StreamExt as _;
+
+    let mut changed = cx.notifications(session);
+    let since = std::time::Instant::now();
+    loop {
+        cx.run_until_parked();
+        if let Some(found) = window
+            .update(cx, |view, window, cx| ready(view, window, cx))
+            .expect("the conversation's window is open")
+        {
+            return found;
+        }
+        if since.elapsed() > std::time::Duration::from_secs(60) {
+            panic!("waited for {waiting_for} and it never came");
+        }
+        let changed = std::pin::pin!(changed.next());
+        let clock = std::pin::pin!(cx.executor().timer(std::time::Duration::from_millis(10)));
+        futures::future::select(changed, clock).await;
+    }
+}
+
 /// The point in a transcript is an anchor, so a message changing under it
 /// does the right thing without anyone deciding.
 ///
@@ -1029,58 +1074,78 @@ async fn a_message_changing_under_the_point_leaves_it_somewhere_the_reader_chose
         )
     });
 
-    // The reader puts the point on the middle message, the way they would
-    // by scrolling to it.
-    let point_on = async |ts: &str, cx: &mut TestAppContext| {
+    // Everything this test is about reaches the session first and the view
+    // refreshes off it, so the session saying something changed is the
+    // event each wait below ends on.
+    let session = window
+        .update(cx, |view, _, _| view.session().clone())
+        .expect("the conversation's window is open");
+
+    // The history has to be in before the point goes on it. A point put on
+    // a transcript that is still filling sits in text the fill replaces,
+    // and comes back at the top: that is the load moving it, which is not
+    // what this test is about, and waiting on a count of milliseconds for
+    // the load instead is what made it fail on a loaded machine.
+    let source = Source::Conversation(ChannelId("C1".into()));
+    until(
+        &session,
+        window,
+        cx,
+        "the conversation to finish loading",
+        |view, _, cx| {
+            let loaded = view.session().read(cx).loaded(&source)?;
+            (!loaded.loading && loaded.messages.len() == 3).then_some(())
+        },
+    )
+    .await;
+
+    // Then the reader puts the point on the middle message, the way they
+    // would by scrolling to it. Placed is not on: the point is not on the
+    // message until the view says that is the message under it.
+    let point_on = async |ts: &str, text: &str, cx: &mut TestAppContext| {
         let ts = Ts(ts.to_owned());
-        for _ in 0..200 {
-            cx.run_until_parked();
-            let placed = window
-                .update(cx, |view, window, cx| {
-                    view.place_cursor_on_for_test(&ts, window, cx)
-                })
-                .unwrap();
-            if placed {
-                return;
-            }
-            cx.executor()
-                .timer(std::time::Duration::from_millis(10))
-                .await;
-        }
-        panic!("{ts:?} never reached the transcript");
+        until(
+            &session,
+            window,
+            cx,
+            &format!("the point to come to rest on {text:?}"),
+            |view, window, cx| {
+                view.place_cursor_on_for_test(&ts, window, cx);
+                view.cursor_message_for_test(cx)
+                    .map(|message| message.text)
+                    .filter(|under| under == text)
+            },
+        )
+        .await;
     };
-    let under = async |until: &str, cx: &mut TestAppContext| {
-        let mut under = None;
-        for _ in 0..200 {
-            cx.run_until_parked();
-            under = window
-                .update(cx, |view, _, cx| {
-                    view.cursor_message_for_test(cx).map(|message| message.text)
-                })
-                .unwrap();
-            if under.as_deref() == Some(until) {
-                break;
-            }
-            cx.executor()
-                .timer(std::time::Duration::from_millis(10))
-                .await;
-        }
-        under
+    let under = async |text: &str, cx: &mut TestAppContext| {
+        until(
+            &session,
+            window,
+            cx,
+            &format!("{text:?} to come under the point"),
+            |view, _, cx| {
+                view.cursor_message_for_test(cx)
+                    .map(|message| message.text)
+                    .filter(|under| under == text)
+            },
+        )
+        .await
     };
 
     // One: the message under the point is deleted from somewhere else. The
     // point is on the one that followed it, which is where the reader was
     // reading towards.
-    point_on("200.0", cx).await;
+    point_on("200.0", "middle", cx).await;
     assert_eq!(
-        under("middle", cx).await.as_deref(),
-        Some("middle"),
+        under("middle", cx).await,
+        "middle",
         "which is what the reader's next keypress is about"
     );
     fake.live_delete("C1", "200.0");
     assert_eq!(
-        under("last", cx).await.as_deref(),
-        Some("last"),
+        under("last", cx).await,
+        "last",
         "the point is on the message that followed, not on the day rule \
          that now sits where it was"
     );
@@ -1089,8 +1154,8 @@ async fn a_message_changing_under_the_point_leaves_it_somewhere_the_reader_chose
     // it. There is nothing after it, so the point is on the one before.
     fake.live_delete("C1", "1780000000.0");
     assert_eq!(
-        under("first", cx).await.as_deref(),
-        Some("first"),
+        under("first", cx).await,
+        "first",
         "with nothing after it, the point is on the message before"
     );
 
@@ -1098,8 +1163,8 @@ async fn a_message_changing_under_the_point_leaves_it_somewhere_the_reader_chose
     // message, so the point does not go anywhere.
     fake.live_edit("C1", "100.0", "first, rewritten");
     assert_eq!(
-        under("first, rewritten", cx).await.as_deref(),
-        Some("first, rewritten"),
+        under("first, rewritten", cx).await,
+        "first, rewritten",
         "an edit leaves the point on the message it was on"
     );
 }
