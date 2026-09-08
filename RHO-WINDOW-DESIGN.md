@@ -129,7 +129,7 @@ the honest shape afterwards — a menu should not know how another menu is
 presented.
 
 And back has to be a stack, not a parent. The verdicts were one deep, so a
-single parent was enough; `space a s` is three, and an escape that goes out
+single parent was enough; `space s u` is three, and an escape that goes out
 from the third step rather than back to the second is the thing the design
 says never happens. What is kept is what escape retraces, so the whole way
 back is there, not one step of it.

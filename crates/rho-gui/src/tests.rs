@@ -11374,3 +11374,72 @@ fn going_to_the_top_lays_out_the_top_and_not_the_transcript(cx: &mut TestAppCont
         "the top of the history is in the buffer"
     );
 }
+
+/// The verdicts open over a running agent on Home, so they have to land on
+/// it. An agent nobody has filed has no row on the desk, and a verdict that
+/// wanted a row opened its menu over the agent and then refused: `tab s s`
+/// said "snooze: nothing under the deal". The verdicts are the one door to
+/// a verdict now, so a door that opens and refuses is the whole of it.
+#[gpui::test]
+fn a_verdict_lands_on_a_running_agent_nobody_filed(cx: &mut TestAppContext) {
+    let loose = agent(31);
+    // Nothing is filed: the desk has never heard of this agent, which is
+    // every agent the user started and did not put anywhere.
+    let desk = DeskFixture::new();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        turn_running: true,
+                        ..ui_head(loose)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let home = workspace.home_view().expect("Home is the surface");
+            assert_eq!(
+                home.update(cx, |home, cx| home.cursor_target(cx)),
+                crate::home::HomeTarget::Agent(loose),
+                "the only row Home has is the running agent"
+            );
+            assert!(
+                workspace.open_verdict_transient(window, cx),
+                "the verdicts open over the row"
+            );
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, None, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .dashboard
+                    .agent_put_down(loose, chrono::Local::now().fixed_offset()),
+                "and what they opened them for is what happens: the agent is \
+                 put down until tomorrow"
+            );
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        !text.contains("running"),
+        "the row it was on is gone with it, got {text:?}"
+    );
+}

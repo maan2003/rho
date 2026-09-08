@@ -1019,7 +1019,7 @@ wrong at the design, not at the polish.
   "hosts", the workspace decides where hosts is drawn, and the four menus
   still reached by name (`input`, `agent`, `new`, `status`) open in the strip
   from the same arm until their batch. And back is a stack rather than a
-  parent: the verdicts were one deep so one parent sufficed, but `space a s`
+  parent: the verdicts were one deep so one parent sufficed, but `space s u`
   is three, and an escape that leaves from the third step instead of
   returning to the second is exactly what the design says never happens.
   Also removed, because the primitive does it: `Transient::item_when`,

@@ -47,8 +47,6 @@ pub(crate) enum MenuId {
     Agent,
     New,
     Status,
-    /// `space a s`: how long, in the sizes a keyboard picks.
-    Snooze,
     /// `space s u`: which usage chart to look at.
     UsageRoot,
 }
@@ -121,9 +119,6 @@ pub(crate) enum Command {
     AgentRewindMany,
     AgentContinue,
     AgentCacheKey,
-    /// `space a s`: a fixed distance ahead, in milliseconds because that is
-    /// what the item says and not a unit the reader has to combine.
-    AgentSnooze(u64),
     // The phone.
     /// A distance ahead, the sizes a thumb picks.
     PhoneSnoozeAhead(crate::workspace::SnoozeUnit, usize),
@@ -430,7 +425,6 @@ pub(crate) fn status_menu() -> Menu {
 pub(crate) fn agent_menu() -> Menu {
     Menu::new("agent")
         .item("d", "done", MenuAction::Command(Command::AgentDone))
-        .item("s", "snooze…", MenuAction::Open(MenuId::Snooze))
         .item(
             "c",
             "cancel turn",
@@ -458,26 +452,6 @@ pub(crate) fn agent_menu() -> Menu {
             "shift-k",
             "new prompt cache key",
             MenuAction::Command(Command::AgentCacheKey),
-        )
-}
-
-pub(crate) fn snooze_menu() -> Menu {
-    const MINUTE_MS: u64 = 60 * 1000;
-    Menu::new("snooze")
-        .item(
-            "3",
-            "30 minutes",
-            MenuAction::Command(Command::AgentSnooze(30 * MINUTE_MS)),
-        )
-        .item(
-            "h",
-            "2 hours",
-            MenuAction::Command(Command::AgentSnooze(2 * 60 * MINUTE_MS)),
-        )
-        .item(
-            "d",
-            "1 day",
-            MenuAction::Command(Command::AgentSnooze(24 * 60 * MINUTE_MS)),
         )
 }
 

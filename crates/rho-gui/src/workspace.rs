@@ -229,7 +229,7 @@ struct MenuBuffer {
     carried_count: Option<u32>,
     /// The menus this one is standing on, oldest first. Escape pops one
     /// rather than going out: back returns, here as everywhere, and it
-    /// returns all the way down `space a s` and not one step of it.
+    /// returns all the way down `space s u` and not one step of it.
     under: Vec<crate::transient::Menu>,
     /// Whether this is the verdict menu (or a menu opened from it), which
     /// is what makes the next `shift` Home rather than another open.
@@ -3149,29 +3149,6 @@ impl Workspace {
                 cx,
             );
         }
-    }
-
-    pub(crate) fn cmd_agent_snooze(
-        &mut self,
-        duration_ms: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.require_connected(cx) {
-            return;
-        }
-        let until = rho_desk::cells::Timestamp {
-            unix_ms: now_ms().saturating_add(duration_ms) as i64,
-            precision: rho_desk::cells::TimestampPrecision::Minute,
-        };
-        let targets = self.subject(window, cx).agents;
-        self.deal_agents(
-            targets,
-            "snooze",
-            crate::desk_view::DeskVerdict::Defer { until },
-            window,
-            cx,
-        );
     }
 
     pub(crate) fn cmd_project_add(
@@ -6769,7 +6746,6 @@ impl Workspace {
             MenuId::Agent => crate::transient::agent_menu(),
             MenuId::New => crate::transient::new_menu(),
             MenuId::Status => crate::transient::status_menu(),
-            MenuId::Snooze => crate::transient::snooze_menu(),
             MenuId::UsageRoot => crate::transient::usage_root_menu(),
         };
         self.show_menu(menu, count, Back::Over, false);
@@ -6857,7 +6833,6 @@ impl Workspace {
             Command::AgentRewindMany => self.prompt_rewind(window, cx),
             Command::AgentContinue => self.cmd_continue_turn(window, cx),
             Command::AgentCacheKey => self.cmd_change_prompt_cache_key(window, cx),
-            Command::AgentSnooze(ms) => self.cmd_agent_snooze(ms, window, cx),
             Command::PhoneSnoozeAhead(unit, count) => {
                 self.phone_verdict_with(
                     rho_journal::PhoneVerdict::Defer,

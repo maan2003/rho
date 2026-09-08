@@ -869,8 +869,21 @@ impl Dashboard {
         _cx: &App,
     ) -> Option<DealCard> {
         let source = self.deal_hosts.get(&host)?;
-        let node = source.node(&node_id)?;
-        let kind = match (node.slack().is_some(), node_agent(node)) {
+        let node = source.node(&node_id);
+        // An agent nobody has filed and that is not asking for the user has
+        // no row on the desk, and a verdict over it is still about the
+        // agent: `Id::Agent` names it whether or not anything was ever said
+        // about it, which is what the transcript's own snooze writes.
+        // Wanting a row here is what let Home open the verdicts over a
+        // running agent and then refuse them.
+        let agent_id = match node {
+            Some(node) => node_agent(node),
+            None => match &node_id {
+                rho_desk::cells::Id::Agent(agent_id) => Some(*agent_id),
+                _ => return None,
+            },
+        };
+        let kind = match (node.is_some_and(|node| node.slack().is_some()), agent_id) {
             (true, _) => DealCardKind::Thread,
             (false, Some(_)) => DealCardKind::Agent,
             (false, None) => DealCardKind::Desk,
@@ -880,7 +893,7 @@ impl Dashboard {
             priority: 0.,
             host,
             topic_node_id: node_id.clone(),
-            agent_id: node_agent(node),
+            agent_id,
             agent_tag: None,
             breadcrumb: self.breadcrumb_for_node(host, node_id.clone())?,
             room: self
