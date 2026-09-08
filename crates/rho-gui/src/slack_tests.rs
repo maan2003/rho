@@ -1741,3 +1741,155 @@ async fn arrival_cost(cx: &mut TestAppContext, channels: usize) -> ArrivalCost {
     cost.frame = frame_at.elapsed();
     cost
 }
+
+/// A message that asks for the reader becomes a card, by every route that
+/// makes one: named in a channel, a direct message, a reply in a followed
+/// thread, and traffic in a channel the reader opted into.
+///
+/// Written for a report of no Slack cards after three changes to the
+/// arrival path. It runs the whole way — socket frame, model, the facts
+/// the desk is built from, and the ranking — because every earlier test
+/// stopped at arrival, and arrival was never the part in doubt.
+#[gpui::test]
+async fn a_message_that_asks_for_the_reader_becomes_a_card(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::model::Attention;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    let me = fake.self_id().to_owned();
+    // The followed thread has to have a root in the channel before a reply
+    // can hang off it, and Slack's follow list is what makes it the
+    // reader's.
+    fake.add_message(
+        "C3",
+        serde_json::json!({
+            "type": "message",
+            "ts": "1700000100.000000",
+            "user": "UA",
+            "text": "the deploy is stuck",
+        }),
+    );
+    fake.follow_thread("C3", "1700000100.000000");
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let session = workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session.clone(), window, cx);
+            workspace.open_slack(window, cx);
+            session
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let rows = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if !rows.is_empty() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    // The opt-in is rho's own fact and nothing arrives to make it.
+    workspace
+        .update(cx, |_, _, cx| {
+            session.update(cx, |session, cx| {
+                session.set_watching(&rho_slack::types::ChannelId("C4".into()), true, cx)
+            })
+        })
+        .unwrap();
+
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C1",
+        "ts": "1800000100.000000",
+        "user": "UA",
+        "text": format!("<@{me}> can you look at this?"),
+    }));
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "D1",
+        "ts": "1800000200.000000",
+        "user": "UA",
+        "text": "are you around?",
+    }));
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C3",
+        "ts": "1800000300.000000",
+        "thread_ts": "1700000100.000000",
+        "user": "UD",
+        "text": "still stuck",
+    }));
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C4",
+        "ts": "1800000400.000000",
+        "user": "UD",
+        "text": "disk is filling up",
+    }));
+
+    let mut facts = std::collections::HashMap::new();
+    for _ in 0..100 {
+        cx.run_until_parked();
+        facts = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_thread_facts(cx))
+            .unwrap();
+        if facts
+            .values()
+            .filter(|facts| facts.reason.is_some())
+            .count()
+            >= 4
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    let asking = facts
+        .values()
+        .filter_map(|facts| {
+            facts
+                .reason
+                .map(|reason| (facts.conversation.clone(), reason))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        asking.get("#design"),
+        Some(&Attention::Mentioned),
+        "a message naming the reader in a channel asks; asking was {asking:?}"
+    );
+    assert_eq!(asking.get("@ada"), Some(&Attention::DirectMessage));
+    assert_eq!(asking.get("#dev-ops"), Some(&Attention::FollowedThread));
+    assert_eq!(asking.get("#ops-alerts"), Some(&Attention::WatchedChannel));
+
+    // And every one of them ranks above the floor the dealer drops cards at.
+    let now = chrono::Local::now().fixed_offset();
+    for (unit, facts) in &facts {
+        if facts.reason.is_none() {
+            continue;
+        }
+        let (label, priority) = crate::dashboard::thread_card_facts(facts, now);
+        assert!(
+            priority > crate::dashboard::DEAL_QUEUE_FLOOR,
+            "{unit:?} says {label:?} at {priority}, which the dealer drops"
+        );
+    }
+}

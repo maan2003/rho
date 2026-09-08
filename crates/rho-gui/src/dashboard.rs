@@ -28,7 +28,7 @@ type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
 
 // Dealer curve tuning. These are deliberately all in one place: rho has one
 // user, so policy changes are edits, not a configuration system.
-const DEAL_QUEUE_FLOOR: f64 = -1.0;
+pub(crate) const DEAL_QUEUE_FLOOR: f64 = -1.0;
 /// How long a skipped card stays out of the next pull. Nothing else times
 /// out: the card is still open the whole time and Home still shows it.
 const SKIP_COOLDOWN: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
@@ -2064,7 +2064,7 @@ impl RankedDealCard {
 /// The reason is made here rather than carried, out of the fact and the
 /// conversation's name as it reads now: a card that says `mentioned in
 /// #design` is a card the reader can answer without opening it.
-fn thread_card_facts(
+pub(crate) fn thread_card_facts(
     thread: &SlackFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> (String, f64) {

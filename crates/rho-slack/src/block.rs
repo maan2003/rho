@@ -12,6 +12,7 @@
 
 use serde_json::Value;
 
+use crate::markdown::{escape, remark};
 use crate::types::{Attachment, ChannelId, FileSummary, UserId};
 
 /// Whatever the model knows about names right now. Rendering is a pure
@@ -36,6 +37,18 @@ impl Names for NoNames {
     }
 }
 
+/// Which set of emphasis markers the rendering carries.
+///
+/// Slack's own `mrkdwn` is what the composer accepts back, so a line yanked
+/// out of a thread pastes into a reply; markdown is what a document made of
+/// these blocks is written in, and it is what the transcript's parse reads.
+/// One renderer answers both, so ids, links and lists are resolved once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flavour {
+    Mrkdwn,
+    Markdown,
+}
+
 /// Renders a whole message body: its blocks (or its plain `text` when it has
 /// none), then attachment and file titles.
 pub fn render_message(
@@ -45,7 +58,8 @@ pub fn render_message(
     files: &[FileSummary],
     names: &dyn Names,
 ) -> String {
-    let (mut rendered, chrome) = render_parts(blocks, text, attachments, files, names);
+    let (mut rendered, chrome) =
+        render_parts_as(Flavour::Mrkdwn, blocks, text, attachments, files, names);
     for line in chrome {
         push_line(&mut rendered, &line);
     }
@@ -62,12 +76,24 @@ pub fn render_parts(
     files: &[FileSummary],
     names: &dyn Names,
 ) -> (String, Vec<String>) {
+    render_parts_as(Flavour::Mrkdwn, blocks, text, attachments, files, names)
+}
+
+/// The same, in the flavour asked for.
+pub fn render_parts_as(
+    flavour: Flavour,
+    blocks: &[Value],
+    text: &str,
+    attachments: &[Attachment],
+    files: &[FileSummary],
+    names: &dyn Names,
+) -> (String, Vec<String>) {
     let said = if blocks.is_empty() {
-        render_mrkdwn(text, names)
+        render_mrkdwn_as(flavour, text, names)
     } else {
         let parts = blocks
             .iter()
-            .map(|block| render_block(block, names))
+            .map(|block| render_block_as(flavour, block, names))
             .filter(|part| !part.trim().is_empty())
             .collect::<Vec<_>>();
         parts.join("\n")
@@ -331,20 +357,25 @@ fn push_line(target: &mut String, line: &str) {
 }
 
 pub fn render_block(block: &Value, names: &dyn Names) -> String {
+    render_block_as(Flavour::Mrkdwn, block, names)
+}
+
+/// The same, in the flavour asked for.
+pub fn render_block_as(flavour: Flavour, block: &Value, names: &dyn Names) -> String {
     match string(block, "type") {
         "rich_text" => array(block, "elements")
             .iter()
-            .map(|element| render_rich_text_element(element, names))
+            .map(|element| render_rich_text_element(flavour, element, names))
             .collect::<String>(),
         "section" => {
             let mut parts = Vec::new();
-            let text = render_text_object(block.get("text"), names);
+            let text = render_text_object(flavour, block.get("text"), names);
             if !text.is_empty() {
                 parts.push(text);
             }
             let fields = array(block, "fields")
                 .iter()
-                .map(|field| render_text_object(Some(field), names))
+                .map(|field| render_text_object(flavour, Some(field), names))
                 .filter(|field| !field.is_empty())
                 .collect::<Vec<_>>();
             if !fields.is_empty() {
@@ -353,7 +384,7 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
             parts.join("\n")
         }
         "header" => {
-            let text = render_text_object(block.get("text"), names);
+            let text = render_text_object(flavour, block.get("text"), names);
             match text.is_empty() {
                 true => String::new(),
                 false => format!("# {text}"),
@@ -361,7 +392,7 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
         }
         "divider" => "———".to_owned(),
         "image" => {
-            let title = render_text_object(block.get("title"), names);
+            let title = render_text_object(flavour, block.get("title"), names);
             let alt = string(block, "alt_text");
             match (title.is_empty(), alt.is_empty()) {
                 (false, _) => format!("[image: {title}]"),
@@ -379,7 +410,7 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
                         false => format!("[image: {alt}]"),
                     }
                 }
-                _ => render_text_object(Some(element), names),
+                _ => render_text_object(flavour, Some(element), names),
             })
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
@@ -390,7 +421,7 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
         "actions" => array(block, "elements")
             .iter()
             .map(|element| {
-                let label = render_text_object(element.get("text"), names);
+                let label = render_text_object(flavour, element.get("text"), names);
                 match label.is_empty() {
                     true => String::new(),
                     false => format!("[{label}]"),
@@ -406,12 +437,15 @@ pub fn render_block(block: &Value, names: &dyn Names) -> String {
     }
 }
 
-fn render_rich_text_element(element: &Value, names: &dyn Names) -> String {
+fn render_rich_text_element(flavour: Flavour, element: &Value, names: &dyn Names) -> String {
     match string(element, "type") {
-        "rich_text_section" => inline(element, names),
-        "rich_text_preformatted" => format!("```\n{}\n```\n", inline(element, names).trim_end()),
+        "rich_text_section" => inline(flavour, element, names),
+        "rich_text_preformatted" => format!(
+            "```\n{}\n```\n",
+            inline(Flavour::Mrkdwn, element, names).trim_end()
+        ),
         "rich_text_quote" => {
-            let text = inline(element, names);
+            let text = inline(flavour, element, names);
             let quoted = text
                 .trim_end_matches('\n')
                 .split('\n')
@@ -431,26 +465,32 @@ fn render_rich_text_element(element: &Value, names: &dyn Names) -> String {
                         true => format!("{}.", index + 1),
                         false => "-".to_owned(),
                     };
-                    let text = render_rich_text_element(item, names);
+                    let text = render_rich_text_element(flavour, item, names);
                     format!("{indent}{bullet} {}", text.trim_end())
                 })
                 .collect::<Vec<_>>();
             format!("{}\n", items.join("\n"))
         }
-        _ => inline(element, names),
+        _ => inline(flavour, element, names),
     }
 }
 
-fn inline(element: &Value, names: &dyn Names) -> String {
+fn inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String {
     array(element, "elements")
         .iter()
-        .map(|element| render_inline(element, names))
+        .map(|element| render_inline(flavour, element, names))
         .collect()
 }
 
-fn render_inline(element: &Value, names: &dyn Names) -> String {
+fn render_inline(flavour: Flavour, element: &Value, names: &dyn Names) -> String {
     let text = match string(element, "type") {
-        "text" => string(element, "text").to_owned(),
+        // What the sender typed, kept as they typed it: in markdown the
+        // characters that would otherwise open emphasis or a link are
+        // escaped, because here they are text and not formatting.
+        "text" => match flavour {
+            Flavour::Mrkdwn => string(element, "text").to_owned(),
+            Flavour::Markdown => escape(string(element, "text")),
+        },
         "user" => {
             let id = UserId(string(element, "user_id").to_owned());
             format!(
@@ -479,9 +519,15 @@ fn render_inline(element: &Value, names: &dyn Names) -> String {
         // which is what `enter` opens.
         "link" => {
             let url = string(element, "url");
-            match string(element, "text") {
-                "" => url.to_owned(),
-                text => text.to_owned(),
+            let label = string(element, "text");
+            match (flavour, label) {
+                (Flavour::Mrkdwn, "") => url.to_owned(),
+                (Flavour::Mrkdwn, label) => label.to_owned(),
+                // The address travels in the text now: a document of
+                // markdown carries its own links, and the line no longer
+                // has to be asked what it points at.
+                (Flavour::Markdown, "") => format!("<{url}>"),
+                (Flavour::Markdown, label) => format!("[{}]({url})", escape(label)),
             }
         }
         // A date element always ships the text Slack itself would show.
@@ -512,12 +558,12 @@ fn render_inline(element: &Value, names: &dyn Names) -> String {
         }
         _ => String::new(),
     };
-    apply_style(element.get("style"), &text)
+    apply_style(flavour, element.get("style"), &text)
 }
 
 /// Slack's own emphasis markers, which is also what the composer accepts, so
 /// yanking a line out of a thread and pasting it into a reply round-trips.
-fn apply_style(style: Option<&Value>, text: &str) -> String {
+fn apply_style(flavour: Flavour, style: Option<&Value>, text: &str) -> String {
     let Some(style) = style else {
         return text.to_owned();
     };
@@ -525,26 +571,30 @@ fn apply_style(style: Option<&Value>, text: &str) -> String {
     if text.is_empty() {
         return text.to_owned();
     }
+    let (bold, italic, struck) = match flavour {
+        Flavour::Mrkdwn => ("*", "_", "~"),
+        Flavour::Markdown => ("**", "*", "~~"),
+    };
     if flag("code") {
         return format!("`{text}`");
     }
     if flag("bold") {
-        return format!("*{text}*");
+        return format!("{bold}{text}{bold}");
     }
     if flag("italic") {
-        return format!("_{text}_");
+        return format!("{italic}{text}{italic}");
     }
     if flag("strike") {
-        return format!("~{text}~");
+        return format!("{struck}{text}{struck}");
     }
     text.to_owned()
 }
 
-fn render_text_object(object: Option<&Value>, names: &dyn Names) -> String {
+fn render_text_object(flavour: Flavour, object: Option<&Value>, names: &dyn Names) -> String {
     let Some(object) = object else {
         return String::new();
     };
-    render_mrkdwn(string(object, "text"), names)
+    render_mrkdwn_as(flavour, string(object, "text"), names)
 }
 
 /// Resolves the escapes Slack's older `mrkdwn` strings carry: `<@U…>`,
@@ -552,24 +602,40 @@ fn render_text_object(object: Option<&Value>, names: &dyn Names) -> String {
 /// A message with blocks never needs this, but plain-text messages, older
 /// posts, and attachment bodies all do.
 pub fn render_mrkdwn(text: &str, names: &dyn Names) -> String {
+    render_mrkdwn_as(Flavour::Mrkdwn, text, names)
+}
+
+/// The same, in the flavour asked for. In markdown the emphasis Slack's
+/// plain bodies carry as characters is rewritten with markdown's own
+/// markers, since here it is formatting and not punctuation; what is not a
+/// marker is escaped, so a name with an underscore in it stays a name.
+pub fn render_mrkdwn_as(flavour: Flavour, text: &str, names: &dyn Names) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
+        out.push_str(&plain(flavour, &rest[..start]));
         let after = &rest[start + 1..];
         let Some(end) = after.find('>') else {
-            out.push_str(&rest[start..]);
+            out.push_str(&plain(flavour, &rest[start..]));
             rest = "";
             break;
         };
-        out.push_str(&render_escape(&after[..end], names));
+        out.push_str(&render_escape(flavour, &after[..end], names));
         rest = &after[end + 1..];
     }
-    out.push_str(rest);
+    out.push_str(&plain(flavour, rest));
     unescape_entities(&out)
 }
 
-fn render_escape(body: &str, names: &dyn Names) -> String {
+/// A run of a plain body between escapes, in the flavour asked for.
+fn plain(flavour: Flavour, text: &str) -> String {
+    match flavour {
+        Flavour::Mrkdwn => text.to_owned(),
+        Flavour::Markdown => remark(text),
+    }
+}
+
+fn render_escape(flavour: Flavour, body: &str, names: &dyn Names) -> String {
     let (target, label) = match body.split_once('|') {
         Some((target, label)) => (target, Some(label)),
         None => (body, None),
@@ -596,9 +662,11 @@ fn render_escape(body: &str, names: &dyn Names) -> String {
             Some(label) => label.to_owned(),
             None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
         },
-        _ => match label {
-            Some(label) => label.to_owned(),
-            None => target.to_owned(),
+        _ => match (flavour, label) {
+            (Flavour::Mrkdwn, Some(label)) => label.to_owned(),
+            (Flavour::Mrkdwn, None) => target.to_owned(),
+            (Flavour::Markdown, Some(label)) => format!("[{}]({target})", escape(label)),
+            (Flavour::Markdown, None) => format!("<{target}>"),
         },
     }
 }
