@@ -1003,12 +1003,41 @@ const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTim
 struct EditorTimings {
     timings: VecDeque<EditorTiming>,
     total_pushed: u64,
+    /// Threads that have claimed the trace, or empty for "every thread".
+    /// A claim is how a measurement says which work is its own: the ring
+    /// is one buffer for the process and a bounded one, so a thread
+    /// working beside a measurement does not only add records to it, it
+    /// can push the measurement's own records out before they are read.
+    claimed: Vec<u64>,
 }
 
 static EDITOR_TIMINGS: spin::Mutex<EditorTimings> = spin::Mutex::new(EditorTimings {
     timings: VecDeque::new(),
     total_pushed: 0,
+    claimed: Vec::new(),
 });
+
+/// A thread's claim on the editor trace, released when it is dropped.
+pub struct EditorTraceClaim(u64);
+
+impl Drop for EditorTraceClaim {
+    fn drop(&mut self) {
+        let mut timings = EDITOR_TIMINGS.lock();
+        if let Some(at) = timings.claimed.iter().position(|tid| *tid == self.0) {
+            timings.claimed.remove(at);
+        }
+    }
+}
+
+/// Records only this thread's editor work for as long as the claim is
+/// held - and any other thread's that has claimed it too. Unclaimed, the
+/// ring records every thread, which is what the running application wants
+/// and what a measurement standing next to other work does not.
+pub fn claim_editor_trace_for_this_thread() -> EditorTraceClaim {
+    let tid = editor_profile_tid();
+    EDITOR_TIMINGS.lock().claimed.push(tid);
+    EditorTraceClaim(tid)
+}
 
 static EDITOR_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static EDITOR_TRACE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -1039,6 +1068,9 @@ fn record_editor_timing(timing: EditorTiming, generation: u64) {
         return;
     }
     if generation != EDITOR_TRACE_GENERATION.load(Ordering::Relaxed) {
+        return;
+    }
+    if !timings.claimed.is_empty() && !timings.claimed.contains(&timing.tid) {
         return;
     }
     if timings.timings.len() >= MAX_EDITOR_TIMINGS {
