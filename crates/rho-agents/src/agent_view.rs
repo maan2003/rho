@@ -422,6 +422,13 @@ impl AgentModel {
             return;
         }
         self.composing = true;
+        // The first chunk is composed in the frame that asked for it. A
+        // jump that draws what was composed before it and replaces it on
+        // the next frame is a flicker, and one chunk is bounded work. The
+        // rest of history still catches up off the frame loop.
+        if !self.compose_step(window, cx) {
+            return;
+        }
         self.history_task = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 let Ok(more) = this.update_in(cx, |this, window, cx| this.compose_step(window, cx))

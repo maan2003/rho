@@ -585,11 +585,7 @@ fn run_events_with_detached_host(
             ));
         }
         let frame = &produced[0];
-        // Paging history in is composed on the frame after the jump, by
-        // design: HISTORY_PAGING_DRIVE is written as a jump and then the
-        // idle that composes the next forty-row chunk. So a jump is the
-        // one event whose frame is allowed not to be its last.
-        if !matches!(event, WalkEvent::ScrollToTop) && !produced[1].changes.is_empty() {
+        if !produced[1].changes.is_empty() {
             return Err((
                 "the frame an event produced is not the frame it settled to",
                 step,
