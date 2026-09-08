@@ -14,6 +14,12 @@
 //! seek fix in 93af55e4 made each splice cheaper; it did not make the map
 //! stop splicing itself whole, which is this test's subject.
 //!
+//! The desk's own map had the same fault one layer down: the sources are
+//! the join every row is drawn through, and a new set of them built the
+//! map again from every fact, so one agent's title cost a walk of the
+//! whole desk. What the sources moved now decides what the event costs,
+//! and the walk is the cold build.
+//!
 //! The assertions are shapes, not milliseconds. A composition either
 //! happens or it does not, and the rows drawn again are counted, so this
 //! says the same thing on any machine.
@@ -77,12 +83,19 @@ fn desk_of_agents(
 ///
 /// Returns what the event cost: how many times the dealer's source was
 /// taken whole and how many times it was patched, how many source entries
-/// the walk looked at, and how long the whole event took.
+/// the cold build and then the event looked at, and how long the event
+/// took.
 fn cost_of_one_agent_s_news(
     cx: &mut gpui::TestAppContext,
     count: u64,
-) -> (usize, usize, usize, std::time::Duration) {
+) -> (usize, usize, usize, usize, std::time::Duration) {
+    crate::desk_view::take_source_scans();
     let (workspace, agents) = desk_of_agents(cx, count);
+    // The build is the walk, and the walk is where a lookup that scans
+    // costs the nodes times the sources. Read before the event's own count
+    // is started, so the two questions stay separate: this one is the
+    // index, the one below is that the walk did not run at all.
+    let built = crate::desk_view::take_source_scans();
     let (taken, patched) = workspace
         .update(cx, |workspace, _, _| {
             workspace.dashboard.deal_work_for_test()
@@ -125,7 +138,13 @@ fn cost_of_one_agent_s_news(
             workspace.dashboard.deal_work_for_test()
         })
         .expect("read the dealer's work");
-    (taken_after - taken, patched_after - patched, scans, took)
+    (
+        taken_after - taken,
+        patched_after - patched,
+        built,
+        scans,
+        took,
+    )
 }
 
 /// What one agent's news must cost, whatever the map's size.
@@ -135,10 +154,10 @@ fn cost_of_one_agent_s_news(
 /// satisfy every other assertion here trivially, which is the way a test
 /// like this is usually wrong.
 fn assert_one_agent_s_news_is_cheap(cx: &mut gpui::TestAppContext, count: u64) {
-    let (taken, patched, scans, took) = cost_of_one_agent_s_news(cx, count);
+    let (taken, patched, built, scans, took) = cost_of_one_agent_s_news(cx, count);
     eprintln!(
-        "{count} agents: taken {taken}, patched {patched}, {scans} source \
-         entries, {took:?} per event"
+        "{count} agents: taken {taken}, patched {patched}, {built} entries \
+         to build, {scans} per event, {took:?} per event"
     );
     assert!(
         patched >= 32,
@@ -158,17 +177,35 @@ fn assert_one_agent_s_news_is_cheap(cx: &mut gpui::TestAppContext, count: u64) {
          names one agent and must cost that agent and no more"
     );
     // The walk asks the sources for one agent, unit or page per node it
-    // builds. Asking by scanning made a walk cost the nodes times the
-    // sources, which at 128 agents was 16,384 entries for one agent's
-    // news. An index makes each ask one entry, so the count is the nodes
-    // and not their square. Counted rather than timed on purpose: at these
-    // sizes the difference is microseconds and a clock would not see it,
-    // which is exactly why it could come back unnoticed.
-    assert!(scans > 0, "the walk did not run, so this measured nothing");
+    // builds, so a lookup that scans makes a walk cost the nodes times the
+    // sources: at 128 agents that was 16,384 entries where an index is
+    // 128. Counted rather than timed on purpose — at these sizes the
+    // difference is microseconds and a clock would not see it, which is
+    // exactly why it could come back unnoticed.
     assert!(
-        scans <= count as usize * 2,
+        built > 0,
+        "the desk was never built, so this measured nothing"
+    );
+    assert!(
+        built <= count as usize * 8,
+        "building a desk of {count} agents looked at {built} source entries; \
+         a lookup that scans is back"
+    );
+    // The event's own count is the second rule and the harder one: one
+    // agent's news names one agent, so it asks the sources about that
+    // agent and stops. A number that follows {count} here means the map
+    // was built again for news that moved one row, whatever the index
+    // costs per node.
+    assert!(
+        scans > 0,
+        "one agent's news asked the sources nothing, so its row was not \
+         made again and this measured nothing"
+    );
+    assert!(
+        scans <= 8,
         "one agent's news looked at {scans} source entries on a desk of \
-         {count} agents; a lookup that scans is back"
+         {count} agents; it names one agent, so the desk is being walked \
+         for it"
     );
 }
 

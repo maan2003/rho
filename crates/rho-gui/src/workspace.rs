@@ -3914,7 +3914,8 @@ impl Workspace {
             };
             self.apply_desk_writes(host, writes, Some(verdict_entry), window, cx);
         }
-        self.refresh_desk_sources(host, None, cx);
+        let change = self.refresh_desk_sources(host, None, cx);
+        self.desk_cells.apply_source_change(host, change);
         self.invalidate_dealer_signals(cx);
         cx.notify();
         true
@@ -5290,10 +5291,11 @@ impl Workspace {
                 work_units,
             });
         }));
-        self.refresh_desk_sources(host, moved, cx);
-        // The sources decide who is on the desk at all, so the map is
-        // built again here and the delta paths patch what it left.
-        self.desk_cells.rebuild_map(host);
+        // The sources decide who is on the desk at all, so what they moved
+        // decides what this costs: an agent that named only itself patches
+        // its own row, and only a change of shape walks the desk.
+        let change = self.refresh_desk_sources(host, moved, cx);
+        self.desk_cells.apply_source_change(host, change);
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
@@ -5306,21 +5308,34 @@ impl Workspace {
         // streaming says so constantly and names only itself: taking the
         // whole desk again for that is what made every event cost the desk,
         // which is the fault the user's telemetry caught.
-        let nodes = self.desk_cells.nodes(host).to_vec();
-        let shape_held = self.dashboard.deal_shape_held(host, &nodes);
+        //
+        // The desk owns the nodes and the dealer owns its source, so the
+        // two are borrowed apart rather than the nodes copied: a copy is
+        // every row's name and labels cloned for an event that reads them
+        // and puts them down again.
         let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
-        if shape_held && let Some(agents) = &moved {
-            let touched = agents
-                .iter()
-                .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
-                .collect::<BTreeSet<_>>();
-            if self.dashboard.patch_deal_source(host, &touched, &nodes) {
-                self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(agents), cx);
-                self.dashboard.sync_hand(&self.agent_last_interaction);
-                self.sync_note_views(host, cx);
-                cx.notify();
-                return;
-            }
+        let patched = {
+            let Self {
+                desk_cells,
+                dashboard,
+                ..
+            } = self;
+            let nodes = desk_cells.nodes(host);
+            dashboard.deal_shape_held(host, nodes)
+                && moved.as_ref().is_some_and(|agents| {
+                    let touched = agents
+                        .iter()
+                        .map(|agent_id| rho_desk::cells::Id::Agent(*agent_id))
+                        .collect::<BTreeSet<_>>();
+                    dashboard.patch_deal_source(host, &touched, nodes)
+                })
+        };
+        if patched && let Some(agents) = &moved {
+            self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(agents), cx);
+            self.dashboard.sync_hand(&self.agent_last_interaction);
+            self.sync_note_views(host, cx);
+            cx.notify();
+            return;
         }
         // The shape moved, or nothing was named: the source is taken whole.
         // A note whose first line was edited keeps its shape and moves every
@@ -5377,7 +5392,7 @@ impl Workspace {
         host: HostId,
         moved: Option<&BTreeSet<AgentId>>,
         cx: &Context<Self>,
-    ) {
+    ) -> crate::desk_view::SourceChange {
         // A filing that moved changes who is on the desk at all, so the
         // whole set is built again; otherwise only the agents named are.
         let filed = self
@@ -5453,7 +5468,7 @@ impl Workspace {
             slack,
             pages,
         );
-        self.desk_cells.set_sources(host, sources);
+        let change = self.desk_cells.set_sources(host, sources);
         // The user's verdicts are the one thing attention needs that no
         // row carries; the registry derives it from them and the digest,
         // and the mirror keeps them so a restart ranks the same way.
@@ -5462,6 +5477,7 @@ impl Workspace {
                 rho_mirror::mirror::write_verdict(agent_id, verdict);
             }
         }
+        change
     }
 
     /// A transcript handed in whole, for a test that drives the view
@@ -5513,7 +5529,8 @@ impl Workspace {
             .cloned()
             .unwrap_or_default()
             .with_slack(slack);
-        self.desk_cells.set_sources(host, sources);
+        let change = self.desk_cells.set_sources(host, sources);
+        self.desk_cells.apply_source_change(host, change);
         self.sync_tree_dashboard(host, window, cx);
     }
 

@@ -257,6 +257,75 @@ impl Sources {
     }
 }
 
+/// What replacing the sources did to the map.
+///
+/// The sources are the join every row is drawn through, so a new set of
+/// them can move the map as surely as a cell can. An agent that is
+/// streaming replaces its own entry many times a second and moves nothing
+/// else, and that is the case this exists to keep cheap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceChange {
+    /// The same sources, said again. Nothing to do.
+    Quiet,
+    /// The same things are on the desk and these rows read differently:
+    /// each is made again where it sits.
+    Rows(BTreeSet<Id>),
+    /// Who is on the desk at all, or where something hangs, is not what it
+    /// was: the map is built again.
+    Shape,
+}
+
+/// What one set of sources says about the last, row by row.
+///
+/// Shape is the conservative answer and every uncertainty takes it: a list
+/// of a different length, entries in a different order, a page list that
+/// differs at all. Being wrong towards `Shape` costs a walk; being wrong
+/// towards `Rows` draws the map wrong, which is not the same kind of
+/// mistake.
+fn source_change(held: &Sources, fresh: &Sources) -> SourceChange {
+    // The host seed is every unfiled agent's place, and a page's origin
+    // chain is the one thing about a tab that decides where it hangs.
+    if held.host != fresh.host || held.pages != fresh.pages {
+        return SourceChange::Shape;
+    }
+    if held.agents.len() != fresh.agents.len() || held.slack.len() != fresh.slack.len() {
+        return SourceChange::Shape;
+    }
+    let mut rows = BTreeSet::new();
+    for (was, now) in held.agents.iter().zip(&fresh.agents) {
+        if was == now {
+            continue;
+        }
+        // Who spawned the agent is where it hangs, and whether the story
+        // is asking for the user is whether the agent is on the map at
+        // all when nothing has been said about it. The rest — the story
+        // cursor, a turn running, the want itself — is the card's reading
+        // of a row that stays where it is.
+        if was.agent != now.agent
+            || was.spawned_by != now.spawned_by
+            || was.wants_user() != now.wants_user()
+        {
+            return SourceChange::Shape;
+        }
+        rows.insert(Id::Agent(now.agent));
+    }
+    for (was, now) in held.slack.iter().zip(&fresh.slack) {
+        if was == now {
+            continue;
+        }
+        // Every unit the mirror holds is on the desk, so the units are the
+        // shape and their timestamps are the card.
+        if was.unit != now.unit {
+            return SourceChange::Shape;
+        }
+        rows.insert(Id::Slack(now.unit.clone()));
+    }
+    match rows.is_empty() {
+        true => SourceChange::Quiet,
+        false => SourceChange::Rows(rows),
+    }
+}
+
 /// A thing as a view shows it: the user's facts, placed by the rules in
 /// `STORE-DESIGN.md`. Nothing here is stored; changing a rule changes the
 /// view and moves no cell.
@@ -649,15 +718,39 @@ impl DeskCells {
     /// What the sources say, for the join every view reads through. The
     /// workspace recomputes this from the registry and the Slack mirror;
     /// none of it is ever written to the store.
-    pub fn set_sources(&mut self, host: HostId, sources: Sources) -> bool {
+    pub fn set_sources(&mut self, host: HostId, sources: Sources) -> SourceChange {
         let Some(desk) = self.hosts.get_mut(&host) else {
-            return false;
+            return SourceChange::Quiet;
         };
-        if desk.sources == sources {
-            return false;
-        }
+        let change = source_change(&desk.sources, &sources);
         desk.sources = sources;
-        true
+        change
+    }
+
+    /// Brings the map up to what the sources now say. Rows the sources
+    /// moved are made again where they sit, which costs those rows; only a
+    /// change of who is on the desk at all, or a map never built, walks
+    /// everything.
+    pub fn apply_source_change(&mut self, host: HostId, change: SourceChange) {
+        match change {
+            SourceChange::Shape => self.rebuild_map(host),
+            SourceChange::Rows(touched) => self.apply_to_map(
+                host,
+                &DeskDelta {
+                    touched,
+                    shape: false,
+                },
+            ),
+            SourceChange::Quiet => {
+                if self
+                    .hosts
+                    .get(&host)
+                    .is_some_and(|desk| desk.nodes.is_empty())
+                {
+                    self.rebuild_map(host);
+                }
+            }
+        }
     }
 
     pub fn sources(&self, host: HostId) -> Option<&Sources> {
