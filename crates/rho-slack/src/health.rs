@@ -36,10 +36,6 @@ pub struct Health {
     feed_failures: u32,
     connect_failures: u32,
     reason: Option<String>,
-    /// Set when a socket comes back while degraded: the lamp stays lit until
-    /// the catch-up poll that follows has landed, because until then rho
-    /// still does not know what it missed.
-    awaiting_catch_up: bool,
 }
 
 impl Health {
@@ -55,9 +51,10 @@ impl Health {
         self.connected = true;
         self.connect_failures = 0;
         self.disconnected_since_ms = None;
-        if self.is_degraded() {
-            self.awaiting_catch_up = true;
-        }
+        // A socket coming back is not the end of an outage. What rho missed
+        // is still missing until a poll fills it, and `feed_ok` is the only
+        // thing that clears `reason`, so the lamp stays lit until then
+        // without this having to say so.
         None
     }
 
@@ -110,10 +107,12 @@ impl Health {
 
     /// A poll landed. This is the only thing that clears a degraded session:
     /// the feed is what fills the gap, so until one succeeds the catch-up has
-    /// not happened.
+    /// not happened. That is also what keeps the lamp lit across a socket
+    /// that comes back while degraded -- the reconnect does not clear
+    /// `reason`, only this does, because until a poll lands rho still does
+    /// not know what it missed.
     pub fn feed_ok(&mut self) -> Option<Signal> {
         self.feed_failures = 0;
-        self.awaiting_catch_up = false;
         match (self.connected, self.reason.take()) {
             (true, Some(_)) => Some(Signal::Recovered),
             // Still no socket: the poll proves the network, not the session.
