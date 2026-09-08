@@ -30,6 +30,12 @@ use serde::{Deserialize, Serialize};
 /// on every surface, in the profiling profile.
 const DRAW_BUDGET_MS: f64 = 4.0;
 
+/// The label a span inside a frame carries. The editor's prepaint records its
+/// passes under `prepaint/<pass>` when one of them goes long, and those are
+/// part of a draw the frame log has already counted whole — so they are read
+/// out of the between-frame work rather than beside it.
+const IN_FRAME: &str = "prepaint/";
+
 /// The summary of one session's profile, printed on `rig down` and kept in
 /// the rig's session entry so a landing note can quote it verbatim.
 #[derive(Serialize, Deserialize)]
@@ -50,6 +56,12 @@ pub struct Summary {
     /// first. A frame number cannot see any of this, and it is what makes
     /// the next frame late.
     pub work: Vec<Work>,
+    /// Named spans from *inside* a frame, costliest first — the passes of a
+    /// prepaint that went long. They are a share of a draw the frame log has
+    /// already counted, so they are kept apart from `work`: adding the two
+    /// would count the same milliseconds twice.
+    #[serde(default)]
+    pub in_frame: Vec<Work>,
     pub events: u64,
     /// Where the samples landed, deepest frame first, richest three.
     pub top: Vec<Symbol>,
@@ -129,7 +141,7 @@ pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Sum
             rows_p99: stage.input_rows.p99,
         });
 
-    let mut work = work
+    let (mut in_frame, mut work): (Vec<_>, Vec<_>) = work
         .owners
         .into_iter()
         .map(|(owner, log)| Work {
@@ -140,8 +152,9 @@ pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Sum
             p99_ms: log.duration_ms.p99,
             units: log.work_units.p50,
         })
-        .collect::<Vec<_>>();
+        .partition(|held| held.owner.starts_with(IN_FRAME));
     work.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
+    in_frame.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
 
     let mut summary = Summary {
         profile: profile
@@ -157,6 +170,7 @@ pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Sum
         gap_p99_ms: frames.summary.dirty_to_draw_ms.p99,
         slowest_stage,
         work,
+        in_frame,
         events: editor.event_count,
         top: cpu.top,
         samples: cpu.samples,
@@ -203,6 +217,17 @@ impl Summary {
                     part.owner, part.total_ms, part.p50_ms, part.p99_ms
                 ));
             }
+        }
+        // Inside a frame, and so on the other side of the same accounting:
+        // the draw is already in the numbers above, and this says which pass
+        // of it spent the milliseconds on the frames that went long. Only
+        // those frames record, so the span count is how many went long and
+        // the rows are the visible range each of them drew.
+        if let Some(pass) = self.in_frame.first() {
+            line.push_str(&format!(
+                "; longest prepaint pass {} {} spans {:.0} ms total, p50 {:.2} p99 {:.2} ms at {:.0} rows",
+                pass.owner, pass.spans, pass.total_ms, pass.p50_ms, pass.p99_ms, pass.units
+            ));
         }
         if self.top.is_empty() {
             return line;
@@ -524,6 +549,7 @@ mod tests {
             gap_p99_ms: 10.8,
             slowest_stage: None,
             work: Vec::new(),
+            in_frame: Vec::new(),
             events: 0,
             top: Vec::new(),
             samples: 0,
@@ -587,6 +613,7 @@ mod tests {
             gap_p99_ms: 10.8,
             slowest_stage: None,
             work: Vec::new(),
+            in_frame: Vec::new(),
             events: 0,
             top: Vec::new(),
             samples: 0,
@@ -637,6 +664,109 @@ mod tests {
             unparted.render().ends_with("at 1 units"),
             "a run whose owners recorded no parts got a part clause anyway: {}",
             unparted.render()
+        );
+    }
+
+    /// A prepaint pass is inside a frame the frame log already timed, so it
+    /// belongs on its own clause. Read as between-frame work it would be
+    /// both the costliest owner — it only records when a frame went long,
+    /// which is when it is large — and a second count of the same draw.
+    #[test]
+    fn a_prepaint_pass_is_not_between_frame_work() {
+        let log = |owner: &str, total_ms: f64| {
+            (
+                owner.to_owned(),
+                WorkOwnerLog {
+                    count: 9,
+                    total_ms,
+                    duration_ms: Distribution {
+                        p50: 4.1,
+                        p99: 4.4,
+                        max: 4.4,
+                    },
+                    work_units: Distribution {
+                        p50: 50.0,
+                        p99: 50.0,
+                        max: 50.0,
+                    },
+                },
+            )
+        };
+        let work = WorkLog {
+            owners: [log("prepaint/lines", 37.0), log("desk_sync", 12.0)]
+                .into_iter()
+                .collect(),
+        };
+        let (in_frame, between): (Vec<_>, Vec<_>) = work
+            .owners
+            .into_iter()
+            .map(|(owner, held)| Work {
+                owner,
+                spans: held.count,
+                total_ms: held.total_ms,
+                p50_ms: held.duration_ms.p50,
+                p99_ms: held.duration_ms.p99,
+                units: held.work_units.p50,
+            })
+            .partition(|held| held.owner.starts_with(IN_FRAME));
+        assert_eq!(
+            between
+                .iter()
+                .map(|held| held.owner.as_str())
+                .collect::<Vec<_>>(),
+            ["desk_sync"],
+            "a span from inside a frame was counted as work between frames"
+        );
+        assert_eq!(
+            in_frame
+                .iter()
+                .map(|held| held.owner.as_str())
+                .collect::<Vec<_>>(),
+            ["prepaint/lines"]
+        );
+    }
+
+    /// The clause the answer is read off, on a summary holding both kinds:
+    /// the between-frames number keeps its own words and the pass gets its
+    /// own, with rows rather than units, because a pass counts the visible
+    /// range and an owner counts whatever it named.
+    #[test]
+    fn the_line_says_the_longest_prepaint_pass_beside_the_work_between_frames() {
+        let held = |owner: &str, spans: usize, total_ms: f64, units: f64| Work {
+            owner: owner.to_owned(),
+            spans,
+            total_ms,
+            p50_ms: 4.12,
+            p99_ms: 4.41,
+            units,
+        };
+        let summary = Summary {
+            profile: "gui.bin".to_owned(),
+            frames: 1588,
+            draw_p99_ms: 2.92,
+            draw_max_ms: 7.85,
+            over_budget: 9,
+            worst_gap_ms: 32.0,
+            gap_p99_ms: 5.0,
+            slowest_stage: None,
+            work: vec![held("desk_sync", 48, 323.9, 1.0)],
+            in_frame: vec![held("prepaint/lines", 9, 37.1, 50.0)],
+            events: 0,
+            top: Vec::new(),
+            samples: 0,
+            thread: None,
+            line: String::new(),
+        };
+        let line = summary.render();
+        assert!(
+            line.ends_with(
+                "; longest prepaint pass prepaint/lines 9 spans 37 ms total, p50 4.12                  p99 4.41 ms at 50 rows"
+            ),
+            "the pass clause is not on the line as written: {line}"
+        );
+        assert!(
+            line.contains("between frames desk_sync 48 spans 324 ms total"),
+            "the between-frames clause changed when a pass was there too: {line}"
         );
     }
 }
