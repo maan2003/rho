@@ -591,34 +591,56 @@ impl Workspace {
 
     /// `enter` in the composer: send, or post the rewrite if an edit is
     /// open.
+    ///
+    /// What goes in the journal is what Slack accepted, never what was
+    /// pressed. A rewrite the server refuses puts the reader's words back
+    /// and says so, and the record has to agree with the screen: before
+    /// this it was written the moment enter was pressed, so a refused
+    /// rewrite and an upload that failed both left a record of something
+    /// that did not happen.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
         let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
             return;
         };
         let view = view.clone();
-        let (edited, attached) = view.update(cx, |view, cx| {
-            let channel = view.source().channel().clone();
-            let edited = view
-                .editing_message()
-                .cloned()
-                .map(|ts| (channel.clone(), ts));
-            let attached = view.attached_size().map(|bytes| (channel, bytes));
-            view.submit(cx);
-            (edited, attached)
-        });
-        if let (Some((channel, bytes)), Some(session)) = (attached, self.slack.session()) {
-            rho_journal::record(rho_journal::Event::SlackFileSent {
-                conversation: session.read(cx).model().label(&channel),
-                bytes,
+        let channel = view.read(cx).source().channel().clone();
+        let submitting = view.update(cx, |view, cx| view.submit(cx));
+        cx.spawn(async move |this, cx| {
+            let submitted = submitting.await;
+            let _ = this.update(cx, |this, cx| {
+                this.record_submitted(&channel, submitted, cx)
             });
-        }
-        let (Some((channel, ts)), Some(session)) = (edited, self.slack.session()) else {
+        })
+        .detach();
+    }
+
+    /// Writes down what a press of enter turned out to be. Nothing is
+    /// recorded for a send, which the session already journals from its own
+    /// confirmed path, or for a refusal, which is not something the reader
+    /// did.
+    fn record_submitted(
+        &mut self,
+        channel: &ChannelId,
+        submitted: rho_slack::ui::conversation::Submitted,
+        cx: &gpui::Context<Self>,
+    ) {
+        use rho_slack::ui::conversation::Submitted;
+
+        let Some(session) = self.slack.session() else {
             return;
         };
-        rho_journal::record(rho_journal::Event::SlackMessageEdited {
-            conversation: session.read(cx).model().label(&channel),
-            ts: ts.0,
-        });
+        let conversation = session.read(cx).model().label(channel);
+        match submitted {
+            Submitted::Edited(ts) => rho_journal::record(rho_journal::Event::SlackMessageEdited {
+                conversation,
+                ts: ts.0,
+            }),
+            Submitted::FileSent(bytes) => rho_journal::record(rho_journal::Event::SlackFileSent {
+                conversation,
+                bytes,
+            }),
+            Submitted::Sent | Submitted::Refused | Submitted::Nothing => {}
+        }
     }
 
     /// Attaches a picture to the conversation's next message: clipboard

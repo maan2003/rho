@@ -1179,7 +1179,11 @@ impl Workspace {
                 self.submit_prompt(&crate::SubmitPrompt, window, cx)
             }
             super::SurfaceView::SlackConversation(view) => {
-                view.update(cx, |view, cx| view.submit(cx));
+                // The answer says what Slack made of it, which the journal
+                // wants and the phone has nowhere to put. Dropping it drops
+                // the answer, not the message: the write is detached inside
+                // `submit`.
+                drop(view.update(cx, |view, cx| view.submit(cx)));
             }
             super::SurfaceView::ZulipNarrow(view) => {
                 view.update(cx, |view, cx| view.submit(cx));

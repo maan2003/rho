@@ -18,7 +18,7 @@ use editor::{
     SelectionEffects, SizingBehavior,
 };
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, EventEmitter, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, Task, Window, div};
 use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
@@ -109,6 +109,25 @@ pub enum Event {
     /// A dropped path the surface would not take, because an edit is open.
     /// The host says why, the same as it does for the other two ways in.
     AttachRefused,
+}
+
+/// What a press of enter turned out to be, once Slack had answered.
+///
+/// The host records the reader's day from this, so nothing in here is what
+/// was attempted: only what happened. A refused write is `Refused`, and the
+/// surface has already put the words back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// Nothing to send: an empty composer with no picture waiting.
+    Nothing,
+    /// A new message went out.
+    Sent,
+    /// The rewrite of this message was accepted.
+    Edited(Ts),
+    /// A picture of this many bytes went out with its message.
+    FileSent(u64),
+    /// Slack refused the write.
+    Refused,
 }
 
 /// What came of asking to attach a picture. The host says a different line
@@ -496,16 +515,21 @@ impl ConversationView {
     /// Sends the compose region, or posts the rewrite if an edit is open.
     /// The message appears when Slack accepts it, so nothing is shown that
     /// was not actually sent.
-    pub fn submit(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// The answer says what happened once Slack replied, for a host that
+    /// records the reader's day and must not record a write that did not
+    /// land. It does not carry the work: the write is spawned detached in
+    /// here and the returned task only watches for the outcome, so a caller
+    /// with no use for the answer can drop it without cancelling a message.
+    pub fn submit(&mut self, cx: &mut Context<Self>) -> Task<Submitted> {
         let text = self.input.read(cx).text();
         // A picture is a message on its own; words are not required.
         if text.trim().is_empty() && self.attached.is_none() {
-            return;
+            return Task::ready(Submitted::Nothing);
         }
         let source = self.source.clone();
         if let Some(file) = self.attached.take() {
-            self.send_attached(file, text, cx);
-            return;
+            return self.send_attached(file, text, cx);
         }
         if let Some(ts) = self.editing_message.take() {
             // The composer goes back to whatever the reader had put aside to
@@ -517,24 +541,37 @@ impl ConversationView {
             let editing = self.session.update(cx, |session, cx| {
                 session.edit_message(&source, ts.clone(), text.clone(), cx)
             });
+            let (tell, told) = futures::channel::oneshot::channel();
             cx.spawn(async move |this, cx| {
-                if editing.await.is_err() {
-                    let _ = this.update(cx, |this, cx| this.restore_edit(ts, text, held, cx));
-                }
+                let outcome = match editing.await {
+                    Ok(()) => Submitted::Edited(ts),
+                    Err(_) => {
+                        let _ = this.update(cx, |this, cx| this.restore_edit(ts, text, held, cx));
+                        Submitted::Refused
+                    }
+                };
+                let _ = tell.send(outcome);
             })
             .detach();
-            return;
+            return watch(cx, told);
         }
         self.set_compose(String::new(), cx);
         let sending = self
             .session
             .update(cx, |session, cx| session.send(&source, text.clone(), cx));
+        let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
-            if sending.await.is_err() {
-                let _ = this.update(cx, |this, cx| this.restore_compose(text, cx));
-            }
+            let outcome = match sending.await {
+                Ok(()) => Submitted::Sent,
+                Err(_) => {
+                    let _ = this.update(cx, |this, cx| this.restore_compose(text, cx));
+                    Submitted::Refused
+                }
+            };
+            let _ = tell.send(outcome);
         })
         .detach();
+        watch(cx, told)
     }
 
     /// Puts a refused message back where it was typed. Whatever the reader
@@ -757,10 +794,16 @@ impl ConversationView {
     /// local bytes: the message arrives from Slack like any other. A
     /// refusal puts the chip and the words back, so the reader can try
     /// again without retyping.
-    fn send_attached(&mut self, file: Attached, text: String, cx: &mut Context<Self>) {
+    fn send_attached(
+        &mut self,
+        file: Attached,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Submitted> {
         self.set_compose(String::new(), cx);
         self.refresh_chip(cx);
         let source = self.source.clone();
+        let bytes = file.bytes.len() as u64;
         let sending = self.session.update(cx, |session, cx| {
             session.send_file(
                 &source,
@@ -770,16 +813,23 @@ impl ConversationView {
                 cx,
             )
         });
+        let (tell, told) = futures::channel::oneshot::channel();
         cx.spawn(async move |this, cx| {
-            if sending.await.is_err() {
-                let _ = this.update(cx, |this, cx| {
-                    this.attached = Some(file);
-                    this.restore_compose(text, cx);
-                    this.refresh_chip(cx);
-                });
-            }
+            let outcome = match sending.await {
+                Ok(()) => Submitted::FileSent(bytes),
+                Err(_) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.attached = Some(file);
+                        this.restore_compose(text, cx);
+                        this.refresh_chip(cx);
+                    });
+                    Submitted::Refused
+                }
+            };
+            let _ = tell.send(outcome);
         })
         .detach();
+        watch(cx, told)
     }
 
     /// The chip line, kept last: it belongs between the transcript and the
@@ -2059,6 +2109,18 @@ fn compose_placeholder(label: &str, thread: bool) -> String {
         false => format!("message {label}"),
         true => format!("reply in {label}"),
     }
+}
+
+/// Waits for the outcome of a write that is already on its way. The write
+/// is detached, so this task holds nothing: dropping it drops the answer and
+/// not the message. A sender that goes away without answering -- the window
+/// closing under the write -- reads as nothing having happened, which is the
+/// only honest thing to record when nobody is left to hear.
+fn watch(
+    cx: &mut Context<ConversationView>,
+    told: futures::channel::oneshot::Receiver<Submitted>,
+) -> Task<Submitted> {
+    cx.background_spawn(async move { told.await.unwrap_or(Submitted::Nothing) })
 }
 
 /// The composer after a refused send: the words that did not go out, and

@@ -603,7 +603,9 @@ async fn a_picture_offered_mid_rewrite_is_refused_and_the_rewrite_survives(
     );
 
     // Enter now finishes the rewrite, because that is the only thing open.
-    window.update(cx, |view, _, cx| view.submit(cx)).unwrap();
+    // The answer is not what this test is about, and dropping it drops the
+    // answer rather than the rewrite.
+    drop(window.update(cx, |view, _, cx| view.submit(cx)).unwrap());
     cx.run_until_parked();
     assert!(
         window
@@ -632,5 +634,112 @@ async fn a_picture_offered_mid_rewrite_is_refused_and_the_rewrite_survives(
             .iter()
             .map(|message| message.text.as_str())
             .collect::<Vec<_>>()
+    );
+}
+
+/// What goes in the record is what Slack accepted.
+///
+/// The journal was written the moment enter was pressed: a rewrite the
+/// server refused left a record saying the message was edited, and an upload
+/// that failed left one saying a file was sent, while the surface -- rightly
+/// -- put the reader's words back and told them it had not happened. The
+/// record and the screen have to agree, so `submit` now answers with what
+/// became of the press and the host writes the record from that.
+#[gpui::test]
+async fn a_refused_rewrite_and_a_failed_upload_answer_with_a_refusal(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, Ts};
+    use rho_slack::ui::conversation::{EditStart, Submitted};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "ME", "text": "on it"}),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            source,
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The history crosses a real socket, so wait for the rewrite to become
+    // possible rather than for the executor to go quiet.
+    let mut started = EditStart::Nothing;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        started = window
+            .update(cx, |view, window, cx| view.edit_last_own(window, cx))
+            .unwrap();
+        if matches!(started, EditStart::Started(_)) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        matches!(started, EditStart::Started(_)),
+        "the reader's own message reached the surface and the rewrite opened"
+    );
+
+    fake.fail_next("chat.update", 1);
+    let refused = window
+        .update(cx, |view, _, cx| view.submit(cx))
+        .unwrap()
+        .await;
+    assert_eq!(
+        refused,
+        Submitted::Refused,
+        "a rewrite the server refused is not an edit that happened"
+    );
+
+    // The same press again, with the server willing: this is the edit the
+    // record is for.
+    let accepted = window
+        .update(cx, |view, _, cx| view.submit(cx))
+        .unwrap()
+        .await;
+    assert_eq!(
+        accepted,
+        Submitted::Edited(Ts("100.0".into())),
+        "and an accepted rewrite names the message it rewrote"
+    );
+
+    // A picture the upload refuses, the same way.
+    fake.fail_next("files.getUploadURLExternal", 1);
+    window
+        .update(cx, |view, _, cx| {
+            view.attach("shot.png".to_owned(), vec![0; 8], cx)
+        })
+        .unwrap();
+    let upload = window
+        .update(cx, |view, _, cx| view.submit(cx))
+        .unwrap()
+        .await;
+    assert_eq!(
+        upload,
+        Submitted::Refused,
+        "an upload that failed is not a file that was sent"
     );
 }
