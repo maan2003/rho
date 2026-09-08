@@ -186,6 +186,20 @@ impl MultiBuffer {
                 return false;
             }
 
+            // The excerpt before the replaced range owns the newline that
+            // separates it from what follows, so replacing the range can
+            // change a byte that is in front of the range's own start:
+            // taking away the last path takes that newline with it. The
+            // edit has to start where the change starts, or it names a
+            // range whose end is behind its beginning.
+            let prefix_newline_before = new_excerpts
+                .last()
+                .map(|previous| previous.has_trailing_newline);
+            let prefix_newline_after = if desired.is_empty() {
+                !suffix_is_empty
+            } else {
+                true
+            };
             for excerpt in desired {
                 new_excerpts.update_last(|previous| previous.has_trailing_newline = true, ());
                 new_excerpts.push(excerpt, ());
@@ -195,6 +209,11 @@ impl MultiBuffer {
                 (),
             );
             let new_end = new_excerpts.summary().len();
+            let edit_start = if prefix_newline_before == Some(!prefix_newline_after) {
+                crate::ExcerptDimension(old_start.0 - 1)
+            } else {
+                old_start
+            };
             new_excerpts.append(suffix, ());
             snapshot.excerpts = new_excerpts;
 
@@ -235,8 +254,8 @@ impl MultiBuffer {
             }
 
             let patch = vec![Edit {
-                old: old_start..old_end,
-                new: old_start..new_end,
+                old: edit_start..old_end,
+                new: edit_start..new_end,
             }];
             let edits = Self::sync_diff_transforms(snapshot, patch, DiffChangeKind::BufferEdited).0;
             (edits, suffix_is_empty)
