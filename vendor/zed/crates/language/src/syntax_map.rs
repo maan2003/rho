@@ -25,6 +25,11 @@ use tree_sitter::{
 };
 use web_time::Instant;
 
+/// How much text may have its concealment queries materialized inside the
+/// frame that edited it. A transcript composes buffers a chunk at a time
+/// and every one of them is under this; a file is not.
+const CONCEALMENT_FOREGROUND_LIMIT: usize = 8 * 1024;
+
 pub const MAX_BYTES_TO_QUERY: usize = 16 * 1024;
 
 pub struct SyntaxMap {
@@ -561,10 +566,19 @@ impl SyntaxSnapshot {
         }
 
         // Query materialization is part of the syntax product, but unlike
-        // parsing it is not currently budgeted. A bounded foreground parse
-        // must therefore fall back to the background when any resulting
-        // layer (including an injection) defines concealments.
+        // parsing it is not currently budgeted, so its cost is bounded here
+        // by the only thing to hand: how much text there is. Measured over
+        // a gate run it is about 95ns a byte - 190us at the largest buffer
+        // the walk composes - so the limit below is around 0.8ms, and a
+        // buffer over it falls back to the background as before.
+        //
+        // Falling back is not free: a concealing language draws one text
+        // before its parse and another after it, so a parse that lands
+        // after the frame shows the delimiters concealment exists to take
+        // away and moves the rows on the next frame. Materializing inside
+        // the frame is what keeps the two the same.
         if budget.is_some()
+            && text.len() > CONCEALMENT_FOREGROUND_LIMIT
             && self.languages(text, true).any(|language| {
                 language
                     .grammar()

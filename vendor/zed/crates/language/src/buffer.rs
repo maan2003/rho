@@ -1840,7 +1840,13 @@ impl Buffer {
             return false;
         }
         self.syntax_parsing_enabled = true;
-        self.reparse_with_priority(cx, false, Priority::High);
+        // Blocking here is what makes the first parse land in the frame
+        // that composed the buffer, so a concealing language never draws
+        // one text and then replaces it with another, and a fresh chunk is
+        // never drawn before it is highlighted. Measured on the gate
+        // corpus: without it, 18 events draw a frame they then settle away
+        // from; with it, none do.
+        self.reparse_with_priority(cx, true, Priority::High);
         true
     }
 
@@ -1929,15 +1935,19 @@ impl Buffer {
         drop(syntax_map);
 
         self.parse_status.0.send(ParseStatus::Parsing).unwrap();
-        // Concealment captures are a parsed semantic product. Keep both the
-        // tree update and capture extraction off the foreground thread.
-        let has_concealments = language
-            .grammar()
-            .is_some_and(|grammar| grammar.concealments_config.is_some());
-        if may_block
-            && !has_concealments
-            && let Some(sync_parse_timeout) = self.sync_parse_timeout
-        {
+        // Concealment is what the edit is for. A language that conceals
+        // renders one text before its parse and another after it, so a
+        // parse that lands after the frame shows the reader the delimiters
+        // the concealment exists to take away, and takes them away on the
+        // next frame with the rows moving under them. Parsing inside the
+        // frame that made the text is what keeps the two the same.
+        //
+        // Zed did not need this because its buffers are files: a parse on
+        // every keystroke of a file is a frame the reader feels, and a
+        // delimiter appearing for one frame at the cursor is not what its
+        // reader is looking at. A transcript buffer is a chunk capped at 32
+        // rows, and the delimiters are in the middle of what is being read.
+        if may_block && let Some(sync_parse_timeout) = self.sync_parse_timeout {
             if let Ok(()) = syntax_snapshot.reparse_with_timeout(
                 &text,
                 language_registry.clone(),
