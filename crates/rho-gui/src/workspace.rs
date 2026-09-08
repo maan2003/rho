@@ -528,10 +528,9 @@ pub struct Workspace {
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
     zulip: crate::zulip::Zulip,
-    pub(crate) slack: Option<Entity<rho_slack::session::Session>>,
-    /// Set while the Slack session cannot be trusted to be current. It lights
-    /// the lamp on its own, because nothing else in the queue knows.
-    pub(crate) slack_degraded: Option<String>,
+    /// The Slack client and whether it can be trusted to be current: see
+    /// [`crate::slack::Slack`].
+    pub(crate) slack: crate::slack::Slack,
     /// A readable name per open conversation, so naming a surface never has
     /// to reach into the session.
     pub(crate) slack_labels: HashMap<rho_slack::session::Source, String>,
@@ -1138,8 +1137,7 @@ impl Workspace {
             dashboard_preview: None,
             pages: crate::browser::Pages::default(),
             zulip: crate::zulip::Zulip::default(),
-            slack: None,
-            slack_degraded: None,
+            slack: crate::slack::Slack::default(),
             slack_labels: HashMap::new(),
             slack_reacting: None,
             slack_search_before: None,
@@ -1827,7 +1825,7 @@ impl Workspace {
         // A Slack session that has lost touch is worth the lamp on its own:
         // the queue cannot rank a mention nobody has received yet.
         {
-            lamp_on = lamp_on || self.slack_degraded.is_some();
+            lamp_on = lamp_on || self.slack.degraded().is_some();
         }
         if lamp_on != self.lamp_on {
             self.lamp_on = lamp_on;
@@ -2583,7 +2581,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.leave_zulip_narrow(cx);
+        self.leave_conversation(cx);
         let key = SurfaceKey::ZulipNarrow {
             label: narrow.label(),
         };
@@ -2603,10 +2601,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Marks the conversation on screen read, if one is.
-    fn leave_zulip_narrow(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_surface().view {
-            view.clone().update(cx, |view, cx| view.mark_read(cx));
+    /// Marks the conversation being left read, whichever chat it belongs
+    /// to. Leaving is the only thing that tells a chat server the reader
+    /// has seen a conversation: a Gnus summary buffer's exit. Without it,
+    /// reading a channel here leaves every other client the reader owns
+    /// badging it for messages they have already read.
+    ///
+    /// The mark is at the newest message loaded, which is what both
+    /// services do themselves when a conversation is opened.
+    pub(crate) fn leave_conversation(&mut self, cx: &mut Context<Self>) {
+        match &self.active_surface().view {
+            SurfaceView::SlackConversation(view) => {
+                view.clone().update(cx, |view, cx| view.mark_read(cx));
+            }
+            SurfaceView::ZulipNarrow(view) => {
+                view.clone().update(cx, |view, cx| view.mark_read(cx));
+            }
+            _ => {}
         }
     }
 
@@ -2637,7 +2648,7 @@ impl Workspace {
         match next {
             Some(narrow) => self.open_zulip_narrow(narrow, window, cx),
             None => {
-                self.leave_zulip_narrow(cx);
+                self.leave_conversation(cx);
                 self.open_zulip(window, cx);
             }
         }
@@ -4801,7 +4812,7 @@ impl Workspace {
             .as_ref()
             .map(|history| history.current().surface.key.clone());
         if leaving.is_some_and(|key| key != surface.key) {
-            self.leave_slack_conversation(cx);
+            self.leave_conversation(cx);
         }
         self.ensure_surface_subscription(&surface.key, cx);
         let list = self.surfaces.entry(self.active_context).or_default();
@@ -5765,7 +5776,7 @@ impl Workspace {
         // With no session there is nothing new to say about Slack, which is
         // not the same as saying every unit went quiet: the facts already
         // read from the mirror stand until a session replaces them.
-        let slack = if self.slack.is_none() {
+        let slack = if !self.slack.started() {
             self.desk_cells
                 .sources(host)
                 .map(|sources| sources.slack.clone())

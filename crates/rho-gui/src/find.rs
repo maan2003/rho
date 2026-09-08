@@ -273,7 +273,7 @@ impl Workspace {
                 .collect::<std::collections::HashMap<_, _>>();
             let workspace_name = self
                 .slack
-                .as_ref()
+                .session()
                 .map(|session| session.read(cx).model().workspace().clone());
             for candidate in &mut slack {
                 let FindTarget::Slack(source) = &candidate.target else {
@@ -317,7 +317,7 @@ impl Workspace {
     /// Slack's side of the tree: one path per conversation, and one per
     /// thread the client is tracking.
     fn slack_find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
-        let Some(session) = &self.slack else {
+        let Some(session) = self.slack.session() else {
             return Vec::new();
         };
         let session = session.read(cx);

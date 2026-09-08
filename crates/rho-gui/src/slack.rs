@@ -157,6 +157,51 @@ impl Workspace {
     }
 }
 
+/// The Slack client the desk holds, and whether it can be trusted.
+///
+/// One session for the whole client, started from the first registered
+/// workspace and not before: a reader with no Slack never opens one. The
+/// freshness flag sits beside it because it is a fact about that session
+/// and nothing else — while it is set the mirror may be behind, and it
+/// lights the lamp on its own, since nothing else in the queue knows.
+#[derive(Default)]
+pub(crate) struct Slack {
+    session: Option<gpui::Entity<Session>>,
+    degraded: Option<String>,
+}
+
+impl Slack {
+    /// The session if one has been started.
+    pub(crate) fn session(&self) -> Option<gpui::Entity<Session>> {
+        self.session.clone()
+    }
+
+    /// Whether a session has been started at all.
+    pub(crate) fn started(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Keeps a session that has just been started.
+    pub(crate) fn start(&mut self, session: gpui::Entity<Session>) {
+        self.session = Some(session);
+    }
+
+    /// Why the session cannot be trusted to be current, while it cannot.
+    pub(crate) fn degraded(&self) -> Option<&String> {
+        self.degraded.as_ref()
+    }
+
+    /// The session has fallen behind, for this reason.
+    pub(crate) fn fell_behind(&mut self, reason: String) {
+        self.degraded = Some(reason);
+    }
+
+    /// The session has caught up.
+    pub(crate) fn caught_up(&mut self) {
+        self.degraded = None;
+    }
+}
+
 impl Workspace {
     /// Opens the conversation list, starting the session on first entry.
     /// This is the way in: everything else is reached from a row.
@@ -185,8 +230,8 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::Entity<Session>> {
-        if let Some(session) = &self.slack {
-            return Some(session.clone());
+        if let Some(session) = self.slack.session() {
+            return Some(session);
         }
         let store = self.slack_credentials().ok()?;
         let name = store.workspaces().next()?;
@@ -201,7 +246,7 @@ impl Workspace {
                     workspace.on_slack_event(session.clone(), event, window, cx);
                 }),
             );
-        self.slack = Some(session.clone());
+        self.slack.start(session.clone());
         Some(session)
     }
 
@@ -233,7 +278,7 @@ impl Workspace {
                     workspace.on_slack_event(session.clone(), event, window, cx);
                 }),
             );
-        self.slack = Some(session);
+        self.slack.start(session);
     }
 
     /// The host services the Slack surfaces borrow, the same two the Zulip
@@ -285,20 +330,6 @@ impl Workspace {
     /// Shows one conversation: a channel, a group, a DM, or a thread. A
     /// thread opened from a channel is a child surface, so `ctrl-k` returns
     /// to the channel it came from.
-    /// Marks the Slack conversation being left read, which is the only
-    /// thing that tells Slack the reader has seen it: a Gnus summary
-    /// buffer's exit, and the rule the Zulip narrows already follow.
-    /// Without it, reading a channel here leaves every other client the
-    /// reader owns badging it for messages they have read.
-    ///
-    /// The mark is at the newest message loaded, which is what Slack itself
-    /// does when a channel is opened.
-    pub(crate) fn leave_slack_conversation(&mut self, cx: &mut gpui::Context<Self>) {
-        if let SurfaceView::SlackConversation(view) = &self.active_surface().view {
-            view.clone().update(cx, |view, cx| view.mark_read(cx));
-        }
-    }
-
     pub(crate) fn open_slack_source(
         &mut self,
         source: Source,
@@ -448,7 +479,7 @@ impl Workspace {
         let Some(Source::Conversation(channel)) = source else {
             return;
         };
-        let Some(session) = self.slack.clone() else {
+        let Some(session) = self.slack.session() else {
             return;
         };
         let (watching, label) = session.update(cx, |session, cx| {
@@ -566,13 +597,13 @@ impl Workspace {
             view.submit(cx);
             (edited, attached)
         });
-        if let (Some((channel, bytes)), Some(session)) = (attached, self.slack.clone()) {
+        if let (Some((channel, bytes)), Some(session)) = (attached, self.slack.session()) {
             rho_journal::record(rho_journal::Event::SlackFileSent {
                 conversation: session.read(cx).model().label(&channel),
                 bytes,
             });
         }
-        let (Some((channel, ts)), Some(session)) = (edited, self.slack.clone()) else {
+        let (Some((channel, ts)), Some(session)) = (edited, self.slack.session()) else {
             return;
         };
         rho_journal::record(rho_journal::Event::SlackMessageEdited {
@@ -874,7 +905,7 @@ impl Workspace {
     /// from a read marker, and the card coming back here is what the user
     /// asked for.
     fn slack_mark_unit_read(&mut self, unit: &SlackUnit, cx: &mut gpui::Context<Self>) {
-        let Some(session) = self.slack.clone() else {
+        let Some(session) = self.slack.session() else {
             return;
         };
         let unit = model_unit(unit);
@@ -887,7 +918,7 @@ impl Workspace {
     /// the call fails the mute still stands and the notice says the
     /// thread is still followed in Slack.
     pub(crate) fn slack_ignore_thread(&mut self, thread: &SlackUnit, cx: &mut gpui::Context<Self>) {
-        let Some(session) = self.slack.clone() else {
+        let Some(session) = self.slack.session() else {
             return;
         };
         let Some(key) = thread_key(thread) else {
@@ -904,7 +935,7 @@ impl Workspace {
     /// undo is a follow there. Nothing else brings the card back, since the
     /// follow list is what says the thread is the user's.
     pub(crate) fn slack_follow_thread(&mut self, thread: &SlackUnit, cx: &mut gpui::Context<Self>) {
-        let Some(session) = self.slack.clone() else {
+        let Some(session) = self.slack.session() else {
             return;
         };
         let Some(key) = thread_key(thread) else {
@@ -935,7 +966,7 @@ impl Workspace {
         }
         let thread = self
             .slack
-            .as_ref()
+            .session()
             .map(|session| journal_thread_labelled(session.read(cx).model(), key))
             .unwrap_or_else(|| journal_thread(&Source::Thread(key.clone())));
         rho_journal::record(rho_journal::Event::SlackThreadIgnored {
@@ -986,7 +1017,7 @@ impl Workspace {
         let cutoff = parse_mark_cutoff(input, chrono::Local::now())?;
         let plan = self
             .slack
-            .as_ref()?
+            .session()?
             .read(cx)
             .model()
             .mark_plan(cutoff.timestamp() as f64);
@@ -1008,7 +1039,7 @@ impl Workspace {
             );
             return;
         };
-        let Some(session) = self.slack.clone() else {
+        let Some(session) = self.slack.session() else {
             self.echo("slack: no session", StyleClass::SystemInfo, cx);
             return;
         };
@@ -1227,12 +1258,12 @@ impl Workspace {
             }
             SessionEvent::Health(signal) => match signal {
                 Signal::Degraded(reason) => {
-                    self.slack_degraded = Some(reason.clone());
+                    self.slack.fell_behind(reason.clone());
                     self.notice_on(None, reason, StyleClass::StatusError, cx);
                     self.invalidate_dealer_signals(cx);
                 }
                 Signal::Recovered => {
-                    self.slack_degraded = None;
+                    self.slack.caught_up();
                     self.echo("slack: caught up", StyleClass::SystemInfo, cx);
                     self.invalidate_dealer_signals(cx);
                 }
@@ -1284,7 +1315,7 @@ impl Workspace {
         &self,
         cx: &gpui::App,
     ) -> std::collections::HashMap<SlackUnit, SlackFacts> {
-        let Some(session) = self.slack.as_ref() else {
+        let Some(session) = self.slack.session() else {
             return std::collections::HashMap::new();
         };
         let now = chrono::Local::now();
