@@ -152,6 +152,12 @@ or dismissed. Verdicts differ per kind: done on a page is a dismissal and
 must cost nothing; done on an agent is accepting reviewed work and deserves
 friction; deferring a parent mutes everything inside it.
 
+A thing that lives somewhere else -- a Slack unit is the case that made
+this -- is a virtual node: it is identified by that system's own ids, it
+is dealt and filed and opened like anything else, and it becomes a real
+node in the store only when a cell is written that the other system has no
+place for, such as a snooze, a name, labels or About.
+
 **Why:** one lifecycle means one mental model and one dealer for
 everything. Tab hoarding is what humans do when tabs lack done/defer
 semantics — the tab stays open because closing it loses the commitment.

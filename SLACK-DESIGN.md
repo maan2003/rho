@@ -117,6 +117,82 @@ them past the cursor", and the cursor only ever moves by the user's hand.
 The dealer, its curves, and its verdict keys stay exactly what they are
 for agents; Slack is another source of the same card.
 
+### How a Slack unit sits in rho (8 Sep, operative)
+
+Settled with the user. Where this disagrees with the sections above and
+below it, this is what holds; the sections it corrects are named as it
+goes.
+
+**The word.** The thing is a *Slack unit*: a thread, a channel, or a
+direct message. One word in the docs and one word in the code, and the
+card is one unit -- a channel with three unhandled mentions is one card,
+as it already was.
+
+**A unit is a virtual node.** It is identified by its Slack ids and by
+nothing rho writes. It becomes a real node in the store the moment a cell
+is written that Slack has no place for: a snooze, a name, labels, About.
+Nothing is written on attention, on opening a unit, or on leaving one.
+The write of units as desk sources on attention goes. So the rho cells a
+unit can carry are snooze, name, labels and About, and a unit that has
+none of them exists only as long as Slack says it does.
+
+**Done is a cursor, and the cursor is the later of two.** rho keeps a
+local cursor per unit; Slack keeps a read mark. What has been dealt with
+is the later of the two, so reading on the phone counts and pressing `d`
+in rho counts. `d` advances rho's local cursor at once, and an outbox on
+the action journal pushes the read mark to Slack when it can; a push that
+has not been confirmed is stale, not a fault, because the other half of
+the join already says the right thing on this machine. The local cursor
+lives in the client's own local database, not in the CRDT: it is a
+position in someone else's stream, not a fact about a thing rho owns. The
+user's own reply advances the cursor, wherever they wrote it. rho never
+writes Slack's read mark on leaving a conversation -- that write goes.
+This replaces `handled_through` as a store cell in the section above.
+
+**Mute is Slack's.** A muted channel or direct message is muted in Slack,
+and a thread the user is done with is unfollowed in Slack. There is no rho
+mute cell for a unit, and following is Slack's too. A unit muted in Slack
+makes no card and no attention.
+
+**There is no watch.** The watch opt-in, its `w` key and its
+`WatchedChannel` attention reason are deleted, and with them the mirror's
+record of which channels were opted into. Every channel with unread
+traffic from someone else is a unit with attention of its own, on a curve
+below a direct message or a thread the user is in, and lower again once
+anyone else has replied in it -- somebody is already answering. A mention
+in a channel keeps the mention's priority; a channel muted in Slack makes
+nothing. Per-channel priority, if it is ever wanted, is a later question.
+
+**Nothing is owed for a message the user answered.** The "replied" state
+and its fading curve are deleted. A unit the user has answered has no
+attention at all until someone answers back; what is waiting is what
+somebody else said last.
+
+**Attention keeps its reasons**, now four without the watch: a mention, a
+direct message, a reply in a followed thread, and unread channel traffic.
+The mirror stays what it is, a local cache on disk; nothing in it enters
+the store.
+
+**The unit nodes already in the store.** The dealer simply stops reading
+unit source nodes that carry no rho-only cell, and nothing deletes them.
+A stale one is exactly that: a node whose id is a Slack unit and which
+carries no snooze, name, label or About. The alternative, a marker-gated
+one-shot that removes them, buys a little space at the cost of a
+destructive migration that has to be right on every device the CRDT
+reaches, and that races the user giving one of those units a name on
+another machine the same day. Leaving them is idempotent, costs nothing
+to write, and can be done later against the definition above if the space
+ever matters. `SlackSnoozedAt` goes with eng-8gpr's pending removal.
+
+**Why:** every one of these takes a fact rho was keeping and gives it back
+to whoever owns it. Slack owns what has been read, what is muted and what
+is followed, and rho was keeping private copies that drifted the moment
+the user touched another client. What rho owns is what Slack has no place
+for -- a snooze, a name, a label, a note -- and that is exactly what makes
+a unit worth a node. The watch was rho asking the user to tell it
+something Slack already knows: which channels they are in and which they
+muted.
+
 ### A Slack card outranks an agent of the same wait
 
 Both are someone waiting on the user. A thread that needs a reply takes

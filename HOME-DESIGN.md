@@ -24,7 +24,10 @@ cards, in the same order, with the same words the deal bar uses (`needs
 reply · 1.9h`, `finished · 2.0d`). Slack threads, agents, pings, and
 captures are all just cards, so channels need no section of their own: a
 thread waiting on a reply is above the line, a channel with mere chatter is
-below it.
+below it. That is a curve and not a filter: a channel with unread traffic
+from someone else ranks below a direct message or a thread the reader is
+in, and lower again once anyone else has replied in it, so it fades out of
+the deal on its own rather than being kept out of it.
 
 An agent created by an agent belongs to its creator. It is not dealt, not
 on Home, not in the running list, and not in Find; its waiting reaches the
