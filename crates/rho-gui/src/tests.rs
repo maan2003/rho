@@ -19,6 +19,7 @@ use rho_ui_proto::AgentId;
 use settings::{Settings, SettingsStore};
 use story::ready_with;
 
+mod call_punctuation;
 mod dashboard_cost;
 mod editor_shutdown;
 mod elision_block_geometry;
@@ -5971,54 +5972,81 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
     );
 }
 
+/// A turn is one buffer, calls included, and a call's line is still not
+/// markup. The buffer parses as markdown so the model's prose renders, and
+/// what a call ran is held in a code span: the delimiters are concealed, so
+/// the row is the row it always was, and the punctuation inside it is the
+/// punctuation that was run.
 #[gpui::test]
-fn markdown_and_tool_segments_use_separate_syntax_buffers(cx: &mut TestAppContext) {
+fn a_call_shares_the_turns_buffer_and_keeps_its_punctuation(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
+    let ran = UiBlock::Tool(UiTool {
+        id: "tool-1".to_owned(),
+        name: "shell".to_owned(),
+        arguments: r#"{"command":"echo **bold** and _under_"}"#.to_owned(),
+        preview: None,
+        status: UiToolStatus::Success,
+        output: None,
+        error: None,
+        started_at: Some(rho_core::UnixMs(10)),
+        finished_at: Some(rho_core::UnixMs(20)),
+        metadata: None,
+    });
     feed_frame(
         &workspace,
         cx,
         agent(1),
         state(
+            Vec::new(),
             vec![
                 user("first request"),
-                assistant("first assistant segment", Some(UiMessagePhase::Commentary)),
-                UiBlock::Tool(tool("tool-1", UiToolStatus::Success, Some(10), Some(20))),
                 assistant(
-                    "second assistant segment",
+                    "**first** assistant segment",
+                    Some(UiMessagePhase::Commentary),
+                ),
+                ran,
+                assistant(
+                    "**second** assistant segment",
                     Some(UiMessagePhase::FinalAnswer),
                 ),
-                user("second request"),
             ],
-            vec![assistant("next turn response", None)],
         ),
     );
+    cx.run_until_parked();
 
     let editor = active_editor(&workspace, cx);
     workspace
         .update(cx, |_, _, cx| {
             let buffers = editor.read(cx).buffer().read(cx).all_buffers();
-            let first = buffers
+            let holding = buffers
                 .iter()
-                .find(|buffer| buffer.read(cx).text().contains("first assistant segment"))
-                .expect("first Markdown buffer");
-            let second = buffers
-                .iter()
-                .find(|buffer| buffer.read(cx).text().contains("second assistant segment"))
-                .expect("second Markdown buffer");
-            let tool = buffers
-                .iter()
-                .find(|buffer| buffer.read(cx).text().contains("$ echo ok"))
-                .expect("tool buffer");
+                .filter(|buffer| buffer.read(cx).text().contains("assistant segment"))
+                .collect::<Vec<_>>();
+            assert_eq!(holding.len(), 1, "the turn is more than one buffer");
             assert!(
-                first.read(cx).language().is_some() && second.read(cx).language().is_some(),
-                "assistant messages must retain Markdown syntax"
+                holding[0].read(cx).text().contains("echo **bold**"),
+                "the call is in another buffer than the prose around it"
             );
             assert!(
-                tool.read(cx).language().is_none(),
-                "tool text must not inherit Markdown syntax or concealment"
+                holding[0].read(cx).language().is_some(),
+                "the turn's buffer must parse as markdown"
             );
         })
         .expect("inspect transcript turn buffers");
+
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("$ echo **bold** and _under_"),
+        "the call's own punctuation was read as markup: {text:?}"
+    );
+    assert!(
+        !text.contains("`"),
+        "the code span's delimiters reached the screen: {text:?}"
+    );
+    assert!(
+        text.contains("first assistant segment") && !text.contains("**first**"),
+        "the model's markdown stopped rendering: {text:?}"
+    );
 }
 
 #[gpui::test]

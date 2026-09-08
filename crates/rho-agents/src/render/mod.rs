@@ -290,6 +290,10 @@ pub fn render_block_with_agent_labels(
         UiBlock::Tool(tool) => {
             spans.extend(separator(prev, kind));
             inlay = push_tool_spans(&mut spans, tool, now_ms);
+            // A blank line inside a call's own text would end the
+            // paragraph the code span lives in and leave its delimiters on
+            // screen, so a call like that keeps a buffer to itself.
+            markdown = !spans.iter().any(|span| span.text.contains("\n\n"));
         }
         UiBlock::Notice { text } => {
             if text.is_empty() {
@@ -496,12 +500,36 @@ fn next_tab_stop(column: usize) -> usize {
 /// Finished tools render their duration as text. Running tools with a start
 /// timestamp get an empty position span instead: the live duration renders
 /// as an inlay there, so per-second ticks never edit the buffer.
+/// The backticks that make a call's line a code span: one more than the
+/// longest run inside it, which is what closes a span over text that holds
+/// backticks of its own.
+fn code_span_fence(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in text.chars() {
+        run = if character == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    "`".repeat(longest + 1)
+}
+
 fn push_tool_spans(spans: &mut Vec<Span>, tool: &UiTool, now_ms: u64) -> Option<InlaySpec> {
     let (label, class) = tool_label(&tool.name, &tool.arguments);
-    spans.push(Span::new(label, class));
+    // A call shares its buffer with the model's markdown, so the parser
+    // reads its line. What was run is quoted, not written: a code span
+    // holds it as it arrived, and the delimiters are concealed, so the
+    // reader sees the same row they saw when a call had a buffer to
+    // itself.
+    let fence = code_span_fence(&label);
+    spans.push(Span::new(format!("{fence}{label}"), class));
     spans.push(Span::new(" ", StyleClass::ToolDetail));
     let status = tool_status_label(tool.status);
     spans.push(Span::new(status, tool_status_class(tool.status)));
+
+    // The span closes before the timer, which is an inlay and never buffer
+    // text: what a call ran is what is quoted, and how long it has been
+    // running is not part of it.
+    spans.push(Span::new(fence, StyleClass::Default));
 
     let mut timer = None;
     if tool.status == UiToolStatus::Running {
@@ -796,7 +824,10 @@ mod tests {
         let mut spans = Vec::new();
         let timer = push_tool_spans(&mut spans, &finished, 10_000);
         assert_eq!(timer, None);
-        assert_eq!(text_of(&spans), "$ echo ok ok 2s\n");
+        // The delimiters are the code span the line is held in; the reader
+        // never sees them, because concealment takes them. The duration is
+        // outside: what was run is quoted, how long it took is not.
+        assert_eq!(text_of(&spans), "`$ echo ok ok` 2s\n");
     }
 
     #[test]
@@ -823,7 +854,7 @@ mod tests {
         let timer = push_tool_spans(&mut spans, &running, 3_500);
         let timer = timer.expect("running tool with start time should have a timer");
         assert_eq!(spans[timer.span_index].text, "");
-        assert_eq!(text_of(&spans), "$ echo ok …\n");
+        assert_eq!(text_of(&spans), "`$ echo ok …`\n");
     }
 
     #[test]
