@@ -2416,23 +2416,20 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Marks the conversation being left read, whichever chat it belongs
-    /// to. Leaving is the only thing that tells a chat server the reader
-    /// has seen a conversation: a Gnus summary buffer's exit. Without it,
-    /// reading a channel here leaves every other client the reader owns
-    /// badging it for messages they have already read.
+    /// Marks the conversation being left read, for a chat whose read state
+    /// rho keeps no cursor of its own for. Leaving is then the only thing
+    /// that tells the server the reader has seen a conversation: a Gnus
+    /// summary buffer's exit. The mark is at the newest message loaded,
+    /// which is what the service does itself when a conversation is opened.
     ///
-    /// The mark is at the newest message loaded, which is what both
-    /// services do themselves when a conversation is opened.
+    /// Slack is no longer one of those. What has been dealt with there is
+    /// the later of rho's own cursor and Slack's read mark, and the cursor
+    /// moves when the reader says done -- so leaving a conversation is not
+    /// a verdict, and writing Slack's mark on the way out made it one.
+    /// `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
     pub(crate) fn leave_conversation(&mut self, cx: &mut Context<Self>) {
-        match &self.active_surface().view {
-            SurfaceView::SlackConversation(view) => {
-                view.clone().update(cx, |view, cx| view.mark_read(cx));
-            }
-            SurfaceView::ZulipNarrow(view) => {
-                view.clone().update(cx, |view, cx| view.mark_read(cx));
-            }
-            _ => {}
+        if let SurfaceView::ZulipNarrow(view) = &self.active_surface().view {
+            view.clone().update(cx, |view, cx| view.mark_read(cx));
         }
     }
 

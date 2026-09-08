@@ -1022,12 +1022,6 @@ impl ConversationView {
             .update(cx, |session, cx| session.open_file(&file, cx));
     }
 
-    pub fn mark_read(&mut self, cx: &mut Context<Self>) {
-        let source = self.source.clone();
-        self.session
-            .update(cx, |session, cx| session.mark_read(&source, cx));
-    }
-
     pub fn load_older(&mut self, cx: &mut Context<Self>) {
         let source = self.source.clone();
         self.session
