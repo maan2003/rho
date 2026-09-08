@@ -12,8 +12,14 @@ use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, Unit, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
-use rho_slack::ui::conversation::EditStart;
+use rho_slack::ui::conversation::{Attaching, EditStart};
 use rho_window::style::StyleClass;
+
+/// Slack has no way to put a file on a message that already exists, so an
+/// attachment offered mid-rewrite is refused rather than sent as a second
+/// message. Said the same way whichever of the three ways in was used.
+const NOT_WHILE_EDITING: &str =
+    "slack: a rewrite cannot carry a picture; finish or leave the edit first";
 
 use crate::dashboard::SlackFacts;
 use crate::minibuffer::Candidate;
@@ -363,6 +369,9 @@ impl Workspace {
                         rho_slack::ui::conversation::Event::OpenFile(file) => {
                             workspace.open_slack_image(view, file.clone(), cx);
                         }
+                        rho_slack::ui::conversation::Event::AttachRefused => {
+                            workspace.echo(NOT_WHILE_EDITING, StyleClass::SystemInfo, cx);
+                        }
                         rho_slack::ui::conversation::Event::AttachFailed(said) => {
                             workspace.echo(
                                 &format!("slack: {said}"),
@@ -626,14 +635,17 @@ impl Workspace {
             return false;
         };
         let size = bytes.len() as u64;
-        let replaced = view
+        let outcome = view
             .clone()
             .update(cx, |view, cx| view.attach(name.clone(), bytes, cx));
-        let said = match replaced {
-            true => format!("slack: {name} attached, replacing the last one"),
-            false => format!("slack: {name} attached · {}", human_size(size)),
+        let said = match outcome {
+            Attaching::Replaced => format!("slack: {name} attached, replacing the last one"),
+            Attaching::Attached => format!("slack: {name} attached · {}", human_size(size)),
+            Attaching::NotWhileEditing => NOT_WHILE_EDITING.to_owned(),
         };
         self.echo(&said, StyleClass::SystemInfo, cx);
+        // Taken either way: a refusal that fell back to pasting the picture's
+        // bytes into the composer as text would be worse than the refusal.
         true
     }
 
@@ -649,10 +661,13 @@ impl Workspace {
             .clone()
             .update(cx, |view, cx| view.attach_path(path, cx))
         {
-            Ok(replaced) => {
-                let said = match replaced {
-                    true => format!("slack: {} attached, replacing the last one", path.display()),
-                    false => format!("slack: {} attached", path.display()),
+            Ok(outcome) => {
+                let said = match outcome {
+                    Attaching::Replaced => {
+                        format!("slack: {} attached, replacing the last one", path.display())
+                    }
+                    Attaching::Attached => format!("slack: {} attached", path.display()),
+                    Attaching::NotWhileEditing => NOT_WHILE_EDITING.to_owned(),
                 };
                 self.echo(&said, StyleClass::SystemInfo, cx);
             }

@@ -106,6 +106,22 @@ pub enum Event {
     /// A dropped path that could not be read. The host says so; this crate
     /// has no notice line of its own.
     AttachFailed(String),
+    /// A dropped path the surface would not take, because an edit is open.
+    /// The host says why, the same as it does for the other two ways in.
+    AttachRefused,
+}
+
+/// What came of asking to attach a picture. The host says a different line
+/// for each, so this is the answer rather than a bare yes and no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attaching {
+    /// The chip is now showing this picture, and there was none before.
+    Attached,
+    /// It took the place of one already waiting, which the reader is told
+    /// so they do not send the wrong file.
+    Replaced,
+    /// An edit is open, and a rewrite cannot carry a picture.
+    NotWhileEditing,
 }
 
 /// A picture waiting to go with the next message: what the chip shows and
@@ -678,7 +694,16 @@ impl ConversationView {
     /// Attaches a picture to the next message. One at a time: a second
     /// replaces the first, and the answer says so, because a chip that
     /// quietly changed under the reader would send the wrong file.
-    pub fn attach(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) -> bool {
+    ///
+    /// Nothing can be attached while an edit is open. Slack has no way to
+    /// put a file on a message that already exists -- `chat.update` carries
+    /// text -- so the honest answer is a refusal here, where the rewrite is
+    /// still on screen to be finished or left, rather than a surprise at
+    /// send time.
+    pub fn attach(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) -> Attaching {
+        if self.editing_message.is_some() {
+            return Attaching::NotWhileEditing;
+        }
         let replaced = self.attached.is_some();
         self.attached = Some(Attached {
             name,
@@ -686,7 +711,10 @@ impl ConversationView {
         });
         self.refresh_chip(cx);
         cx.notify();
-        replaced
+        match replaced {
+            true => Attaching::Replaced,
+            false => Attaching::Attached,
+        }
     }
 
     /// Reads a file from disk and attaches it: the path a drop or a prompt
@@ -696,7 +724,11 @@ impl ConversationView {
         &mut self,
         path: &std::path::Path,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Attaching> {
+        // Asked before the file is read, so a refusal costs no disk.
+        if self.editing_message.is_some() {
+            return Ok(Attaching::NotWhileEditing);
+        }
         let bytes = std::fs::read(path)
             .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
         let name = path
@@ -2458,7 +2490,8 @@ impl gpui::Render for ConversationView {
                         return;
                     };
                     match this.attach_path(&path, cx) {
-                        Ok(_) => {}
+                        Ok(Attaching::NotWhileEditing) => cx.emit(Event::AttachRefused),
+                        Ok(Attaching::Attached | Attaching::Replaced) => {}
                         Err(error) => cx.emit(Event::AttachFailed(format!("{error:#}"))),
                     }
                 }),

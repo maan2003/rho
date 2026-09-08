@@ -509,3 +509,128 @@ async fn typing_narrows_the_list_per_keystroke_and_escape_puts_it_back(cx: &mut 
         "escape puts back what the reader was looking at"
     );
 }
+
+/// A picture offered while a rewrite is open is refused, and the rewrite
+/// survives it.
+///
+/// Attaching used to be checked before the edit was, so `enter` posted a
+/// brand new message carrying the picture and the rewrite's words, left the
+/// original message unchanged and still tinted as being edited, and kept the
+/// reader's half-written line stashed where they could not reach it. Two
+/// messages where they wanted one. Slack cannot put a file on a message
+/// that already exists, so the answer is a refusal at attach time, while
+/// the rewrite is still there to be finished or left.
+#[gpui::test]
+async fn a_picture_offered_mid_rewrite_is_refused_and_the_rewrite_survives(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::ChannelId;
+    use rho_slack::ui::conversation::{Attaching, EditStart};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    // The reader's own message, which is the only kind that can be rewritten.
+    fake.add_message(
+        "C1",
+        serde_json::json!({"type": "message", "ts": "100.0", "user": "ME", "text": "on it"}),
+    );
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials.clone(), fake.api_base()).unwrap(),
+    );
+    let asking = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let source = Source::Conversation(ChannelId("C1".into()));
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            source,
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The history crosses a real socket, so wait for the rewrite to become
+    // possible rather than for the executor to go quiet.
+    let mut started = EditStart::Nothing;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        started = window
+            .update(cx, |view, window, cx| view.edit_last_own(window, cx))
+            .unwrap();
+        if matches!(started, EditStart::Started(_)) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        matches!(started, EditStart::Started(_)),
+        "the reader's own message reached the surface and the rewrite opened"
+    );
+
+    let outcome = window
+        .update(cx, |view, _, cx| {
+            view.attach("shot.png".to_owned(), vec![0; 8], cx)
+        })
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Attaching::NotWhileEditing,
+        "the picture is refused while the rewrite is open"
+    );
+
+    assert!(
+        window
+            .update(cx, |view, _, _| view.editing_message().is_some())
+            .unwrap(),
+        "and the rewrite is still open, waiting to be finished or left"
+    );
+
+    // Enter now finishes the rewrite, because that is the only thing open.
+    window.update(cx, |view, _, cx| view.submit(cx)).unwrap();
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.editing_message().is_none())
+            .unwrap(),
+        "the rewrite is done with"
+    );
+
+    // What Slack holds, which is what everyone else in the channel reads.
+    let held = cx
+        .update(|cx| {
+            gpui_tokio::Tokio::spawn(cx, async move {
+                asking
+                    .conversations_history(&ChannelId("C1".into()), None)
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.messages.len(),
+        1,
+        "one message, the one that was rewritten: {:?}",
+        held.messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+    );
+}
