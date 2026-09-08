@@ -753,12 +753,22 @@ impl Dashboard {
         order: usize,
         facts: &DealerFacts<'_>,
     ) -> Option<RankedDealCard> {
-        let node = self
+        // A handled, muted or deferred agent is the user's verdict on this
+        // very card, and the verdict is in the store: a client that has not
+        // read the store cannot say the user did not put this agent down
+        // yesterday. It used to deal anyway — the guard below was written
+        // as `is_some_and`, so no desk meant no verdict and the card went
+        // out — which is how a snoozed agent was dealt again on every cold
+        // open, for as long as the first sync took. Nothing is dealt until
+        // the desk has answered; when it does, the whole host is made again.
+        let Some(source) = self
             .deal_hosts
             .get(&agent.host)
-            .and_then(|source| source.agent_node(agent.agent_id));
-        // A handled, muted or deferred agent is the user's verdict on this
-        // very card; without a Desk there is no verdict to read.
+            .filter(|source| source.desk_synced())
+        else {
+            return None;
+        };
+        let node = source.agent_node(agent.agent_id);
         if node.is_some_and(|node| node_closed(node, facts.now)) {
             return None;
         }

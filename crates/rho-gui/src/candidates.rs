@@ -47,6 +47,11 @@ pub(crate) struct HostNodes {
     /// The agents filed under each heading, for ranking a heading by how
     /// recently anything under it was touched.
     heading_agents: HashMap<Id, Vec<rho_core::AgentId>>,
+    /// Whether the host's desk had arrived when these nodes were read. An
+    /// empty desk and a desk that has not answered yet look identical from
+    /// the nodes alone, and they mean opposite things: the first says the
+    /// user has said nothing, the second says nobody has asked.
+    desk_synced: bool,
 }
 
 impl HostNodes {
@@ -68,7 +73,12 @@ impl HostNodes {
                 );
             }
         }
-        Self::build(nodes, titles, desk.label_paths(host).into_iter().collect())
+        Self::build(
+            nodes,
+            titles,
+            desk.label_paths(host).into_iter().collect(),
+            desk.is_synced(host),
+        )
     }
 
     /// The same nodes with the notes' titles only, and no rope read.
@@ -85,7 +95,13 @@ impl HostNodes {
             .note_titles(host, cx)
             .map(|titles| (*titles).clone())
             .unwrap_or_default();
-        Self::build(nodes, titles, desk.label_paths(host).into_iter().collect())
+        let desk_synced = desk.is_synced(host);
+        Self::build(
+            nodes,
+            titles,
+            desk.label_paths(host).into_iter().collect(),
+            desk_synced,
+        )
     }
 
     /// The indexes, made in one pass over the nodes.
@@ -93,6 +109,7 @@ impl HostNodes {
         nodes: Vec<DeskNode>,
         titles: HashMap<Id, String>,
         label_paths: HashMap<Id, String>,
+        desk_synced: bool,
     ) -> Self {
         let mut by_id = HashMap::with_capacity(nodes.len());
         let mut children: HashMap<Id, Vec<usize>> = HashMap::new();
@@ -119,6 +136,7 @@ impl HostNodes {
             titles,
             label_paths,
             heading_agents: HashMap::new(),
+            desk_synced,
         };
         source.heading_agents = source.build_heading_agents();
         source
@@ -126,6 +144,11 @@ impl HostNodes {
 
     pub(crate) fn nodes(&self) -> &[DeskNode] {
         &self.nodes
+    }
+
+    /// Whether the store these nodes came from had answered yet.
+    pub(crate) fn desk_synced(&self) -> bool {
+        self.desk_synced
     }
 
     /// Where a node sits in the store's order, which is the tie-break a

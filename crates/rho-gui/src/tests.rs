@@ -11443,3 +11443,71 @@ fn a_verdict_lands_on_a_running_agent_nobody_filed(cx: &mut TestAppContext) {
         "the row it was on is gone with it, got {text:?}"
     );
 }
+
+/// The user's verdict on an agent lives in the store, so a client that has
+/// not read the store yet cannot say the agent is not already put down. It
+/// dealt anyway: `loose_agent_card` asked its guard with `is_some_and`, so
+/// no desk read as no verdict, and every agent wanting the user went into
+/// `next` — including the ones snoozed yesterday. A restart was enough to
+/// deal a snoozed agent again, for as long as the first sync took, and on a
+/// large desk that is long enough to act on.
+#[gpui::test]
+fn an_agent_is_not_dealt_before_the_desk_that_holds_its_verdict(cx: &mut TestAppContext) {
+    let waiting = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, waiting);
+
+    let workspace = test_workspace(cx);
+    // The mirror arrives first and the desk has not answered: a client
+    // between opening and its first sync.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(waiting)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(waiting, UnixMs(1)),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let dealt = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .filter_map(|card| card.agent_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    assert!(
+        dealt(cx).is_empty(),
+        "nothing is dealt out of a store nobody has read"
+    );
+
+    // The desk answers, and the agent is dealt: waiting for the store is
+    // not the same as never dealing.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        dealt(cx),
+        vec![waiting],
+        "and once it has answered the card goes out"
+    );
+}
