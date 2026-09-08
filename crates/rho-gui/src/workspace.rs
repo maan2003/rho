@@ -2944,10 +2944,33 @@ impl Workspace {
     /// anywhere the runtime can overwrite it.
     ///
     /// An empty name takes theirs off and the runtime's title comes back.
-    pub(crate) fn prompt_name_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.subject_agent_or_notice("name", window, cx) else {
+    /// `n` in the verdict menu. The subject is the card in view, the same
+    /// one every other key in that menu acts on, so naming cannot land on
+    /// a different thing from the one the user is looking at — which is
+    /// what the agent menu's own `n` could do. An agent today; a Slack
+    /// unit is the same name on its own cell and comes with the mirror.
+    pub(crate) fn cmd_verdict_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.card_in_view(cx) else {
+            self.echo("name: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         };
+        let Some(agent_id) = card.agent_id else {
+            self.echo(
+                "name: only an agent can be named",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.prompt_name_agent(agent_id, window, cx);
+    }
+
+    pub(crate) fn prompt_name_agent(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
@@ -6794,7 +6817,7 @@ impl Workspace {
             Command::Version => self.cmd_version(cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
-            Command::AgentName => self.prompt_name_agent(window, cx),
+            Command::VerdictName => self.cmd_verdict_name(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
             Command::AgentRewind => self.cmd_rewind(1, window, cx),
             Command::AgentRewindMany => self.prompt_rewind(window, cx),

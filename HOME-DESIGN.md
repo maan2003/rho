@@ -122,9 +122,14 @@ a card can be read, searched and yanked like any buffer.
 The verdicts live in one transient. `tab` opens it on any surface that is
 a card (an agent, a Slack conversation or thread, a note, a page): `d`
 done, `x` mute, `s` snooze then a count and a unit (`s 7 d` is seven
-days, `s 45 m`, `s 3 h`, `s w`, `s s` a day), `t` todo, `f` file…, `u`
-undo the last verdict, `j` open the top card (what `ctrl-j` does), and
-`tab` again for Home. `escape` closes the transient and nothing else. The writes, undo,
+days, `s 45 m`, `s 3 h`, `s w`, `s s` a day), `t` todo, `f` file…, `n`
+name…, `u` undo the last verdict, `j` open the top card (what `ctrl-j`
+does), and `tab` again for Home. Naming moved here from the agent menu
+on 8 Sep: a name is the user's own words about the thing they are looking
+at, so it belongs where every other act on the card in view is, and
+taking `space a n` away is what stops it landing on an agent under the
+point that is not the card on screen. An agent today; a Slack unit is the
+same `Property::Name` on its own cell and comes with the desk mirror. `escape` closes the transient and nothing else. The writes, undo,
 journal and the status-line label (`needs reply · 2h`) are exactly what
 deal mode did; only the keys moved. `ctrl-j` keeps opening the top card
 as an ordinary surface. The phone keeps its buttons and sheet.

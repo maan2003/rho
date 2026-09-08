@@ -11392,3 +11392,128 @@ fn a_dealt_card_leaves_the_hand_when_the_desk_says_it_was_put_down(cx: &mut Test
         "a dealt card does not outlive the verdict that put it down"
     );
 }
+
+/// Naming is the verdict menu's `n`, and its subject is the card in view.
+/// It used to be `space a n`, which took the agent under the point: the
+/// same shape as the done that went before it, and the same way to write
+/// the user's own words about one thing onto another.
+#[gpui::test]
+fn the_verdict_menu_names_the_card_in_view(cx: &mut TestAppContext) {
+    let waiting = agent(41);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, waiting);
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(waiting)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(waiting, UnixMs(1)),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    press_tab(&workspace, cx);
+    cx.simulate_keystrokes(*workspace, "n");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "f i x space t h e space l i n k e r");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("the name mutation");
+            let wrote = mutation
+                .writes
+                .iter()
+                .find(|write| write.id == rho_desk::cells::Id::Agent(waiting))
+                .expect("the name lands on the agent of the card in view");
+            assert_eq!(
+                wrote.property,
+                rho_desk::cells::Property::Name("fix the linker".to_owned())
+            );
+        })
+        .unwrap();
+}
+
+/// The shape that would let a snooze be read off the wrong node: an agent
+/// filed under a heading and carrying a label, so the dealer can reach it
+/// through the heading's subtree as well as on its own. The verdict is on
+/// `Id::Agent` either way, so both readers have to see it; a heading path
+/// that asked the heading's node instead would deal the card.
+#[gpui::test]
+fn a_snoozed_agent_under_a_heading_is_dealt_by_neither_path(cx: &mut TestAppContext) {
+    let put_away = agent(41);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, put_away);
+    let label = desk.label("linker");
+    desk.labelled(rho_desk::cells::Id::Agent(put_away), label);
+    desk.set(
+        rho_desk::cells::Id::Agent(put_away),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 4_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(put_away)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(put_away, UnixMs(1)),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    next_frame(cx, workspace);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let dealt = workspace
+                .hand(cx)
+                .cards
+                .iter()
+                .filter_map(|card| card.agent_id)
+                .collect::<Vec<_>>();
+            assert!(
+                !dealt.contains(&put_away),
+                "the snooze is on the agent's own row, and every path to it reads that row: {dealt:?}"
+            );
+        })
+        .unwrap();
+}

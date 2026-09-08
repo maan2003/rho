@@ -112,7 +112,7 @@ pub(crate) enum Command {
     // The agent under the point.
     AgentCancel,
     AgentRole,
-    AgentName,
+    VerdictName,
     AgentCompact,
     AgentRewind,
     AgentRewindMany,
@@ -167,6 +167,7 @@ pub(crate) fn verdict_menu() -> Menu {
         )
         .item("t", "todo", MenuAction::Verdict(VerdictAction::Todo))
         .item("f", "file…", MenuAction::Verdict(VerdictAction::File))
+        .item("n", "name…", MenuAction::Command(Command::VerdictName))
         .item(
             "u",
             "undo the last verdict",
@@ -429,7 +430,6 @@ pub(crate) fn agent_menu() -> Menu {
             MenuAction::Command(Command::AgentCancel),
         )
         .item("r", "role…", MenuAction::Command(Command::AgentRole))
-        .item("n", "name…", MenuAction::Command(Command::AgentName))
         .item("k", "compact", MenuAction::Command(Command::AgentCompact))
         .item(
             "w",
