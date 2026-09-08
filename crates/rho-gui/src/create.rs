@@ -1,12 +1,14 @@
 //! Creating things: one verb, one place to extend.
 //!
 //! `n` opens the `new` transient anywhere: `a` agent, `p` page, `n` note.
-//! Every flow starts with the area picker, so a new thing always has a
-//! parent the user chose and there is no unfiled pile to guard with a
-//! dealer curve. The picker's first row is the node in context — the row
-//! under the cursor, or the node behind the surface in view — so Enter
-//! alone files the new thing where the reader already is; `root` is the
-//! second row, and typing narrows to any node in the tree.
+//! Every flow starts with the area picker, so a new thing is always
+//! somewhere the user chose and there is no unfiled pile to guard with a
+//! dealer curve. The picker's first row is `here` — the row under the
+//! cursor, or the thing behind the surface in view — so Enter alone is
+//! create-from-here: the new thing takes the labels that thing carries and
+//! says it is about it, rather than asking the reader for a place they are
+//! already standing in. The labels come next, `root` last, and typing
+//! narrows to any label there is or mints one that is not.
 
 use std::rc::Rc;
 
@@ -38,10 +40,14 @@ impl NewKind {
 /// The label of the row that files at the root. A path, so it reads like
 /// every other row and cannot collide with a node's own path.
 const ROOT_ROW: &str = "root";
-/// Ranking keys that put the context row first and `root` second among
-/// equal matches, which is what an empty query makes everything.
-const CONTEXT_RECENCY: i64 = i64::MAX;
-const ROOT_RECENCY: i64 = i64::MAX - 1;
+/// The row that makes the new thing from what is on screen.
+const HERE_ROW: &str = "here";
+/// Ranking keys that put `here` first, the labels the thing on screen
+/// carries next and `root` last among equal matches, which is what an
+/// empty query makes everything.
+const HERE_RECENCY: i64 = i64::MAX;
+const CONTEXT_RECENCY: i64 = i64::MAX - 1;
+const ROOT_RECENCY: i64 = i64::MAX - 2;
 
 /// One place a new node can be filed.
 struct Area {
@@ -85,13 +91,16 @@ impl Workspace {
         self.surface_node()
     }
 
-    /// Where a new thing can go: the labels, and the root. A place is not
-    /// among them — a thing is placed by the labels it carries and carries
-    /// no parent — so the picker offers the label paths and nothing else,
-    /// and a path nobody has made yet is minted by choosing it.
+    /// Where a new thing can go: what is on screen, the labels, and the
+    /// root. A place is not among them — a thing is placed by the labels
+    /// it carries and carries no parent — so the picker offers the label
+    /// paths and nothing else, and a path nobody has made yet is minted by
+    /// choosing it.
     ///
-    /// The labels the thing in context already carries come first, so Enter
-    /// alone still files the new thing where the reader is.
+    /// `here` is the first row: the thing in view, which files the new
+    /// thing exactly where that thing is and says what it is about. So
+    /// Enter alone is create-from-here, and the picker is left for a thing
+    /// that belongs somewhere else.
     fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {
         let _ = cx;
         let mut areas = vec![Area {
@@ -100,6 +109,14 @@ impl Workspace {
             target: None,
             recency: ROOT_RECENCY,
         }];
+        if let Some((host, node_id)) = context.clone() {
+            areas.push(Area {
+                path: HERE_ROW.to_owned(),
+                kind: "what is on screen",
+                target: Some((host, node_id)),
+                recency: HERE_RECENCY,
+            });
+        }
         let carried = context
             .as_ref()
             .and_then(|(host, node_id)| self.desk_cells.facts(*host, node_id))
@@ -262,9 +279,8 @@ impl Workspace {
             return;
         };
         writes.extend(
-            area.as_ref()
-                .map(|(_, node_id)| node_id.clone())
-                .and_then(crate::workspace::filing_property)
+            self.new_thing_cells(host, area.as_ref())
+                .into_iter()
                 .map(|property| rho_desk::cells::CellWrite {
                     id: created.clone(),
                     property,

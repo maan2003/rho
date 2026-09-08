@@ -1990,15 +1990,18 @@ impl Workspace {
             }
             ConnEvent::AgentCreated { agent_id } => {
                 self.note_agent_created(host, agent_id);
-                if let Some((filing_host, area)) = self.pending_agent_filing.take()
-                    && filing_host == host
-                    && let Some(property) = filing_property(area)
-                {
-                    let writes = vec![rho_desk::cells::CellWrite {
-                        id: rho_desk::cells::Id::Agent(agent_id),
-                        property,
-                    }];
-                    self.apply_desk_writes(host, writes, None, window, cx);
+                if let Some(area) = self.pending_agent_filing.take() {
+                    let writes = self
+                        .new_thing_cells(host, Some(&area))
+                        .into_iter()
+                        .map(|property| rho_desk::cells::CellWrite {
+                            id: rho_desk::cells::Id::Agent(agent_id),
+                            property,
+                        })
+                        .collect::<Vec<_>>();
+                    if !writes.is_empty() {
+                        self.apply_desk_writes(host, writes, None, window, cx);
+                    }
                 }
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
@@ -3443,9 +3446,8 @@ impl Workspace {
         };
         let id = rho_desk::cells::Id::Page(rho_desk::PageId(*page.0.as_bytes()));
         let at_root = parent.is_none();
-        let filing = parent
-            .map(|(_, area)| area)
-            .and_then(filing_property)
+        let filing = self
+            .new_thing_cells(host, parent.as_ref())
             .into_iter()
             .map(|property| rho_desk::cells::CellWrite {
                 id: id.clone(),
@@ -5807,6 +5809,43 @@ impl Workspace {
 
     /// The node the current surface is about: the thing a note would be
     /// filed under. Every kind that has a row in the tree answers.
+    /// The cells a new thing gets from where the reader made it.
+    ///
+    /// A label is a filing and nothing more. Anything else is the thing on
+    /// screen — a Slack message, an agent's transcript, a note — and
+    /// making something there is create-from-here: the new thing takes the
+    /// labels that thing carries, which is the same place without asking
+    /// for it a second time, and says it is about it. About is provenance,
+    /// never placement, so the labels are what put the new thing on the
+    /// map and About is only how it got there.
+    pub(crate) fn new_thing_cells(
+        &self,
+        host: HostId,
+        area: Option<&(HostId, rho_desk::cells::Id)>,
+    ) -> Vec<rho_desk::cells::Property> {
+        let Some((area_host, node_id)) = area else {
+            return Vec::new();
+        };
+        if let Some(property) = filing_property(node_id.clone()) {
+            return vec![property];
+        }
+        if *area_host != host {
+            return Vec::new();
+        }
+        let mut cells = vec![rho_desk::cells::Property::About(node_id.clone())];
+        cells.extend(
+            self.desk_cells
+                .facts(host, node_id)
+                .into_iter()
+                .flat_map(|facts| facts.labels)
+                .map(|label| rho_desk::cells::Property::Labeled {
+                    label,
+                    present: true,
+                }),
+        );
+        cells
+    }
+
     pub(crate) fn surface_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
         let card = match &self.active_surface().key {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
@@ -9256,6 +9295,9 @@ impl Render for Workspace {
 /// the labels it carries and carries no parent, so an area is a label or it
 /// is the root; anything else names no place a thing can be in and files it
 /// nowhere rather than writing a parent on it.
+/// The label a new thing wears when the reader picked a label to make it
+/// in. Only a label is a filing; everything else on the desk is a thing,
+/// and a thing is not a place.
 pub(crate) fn filing_property(area: rho_desk::cells::Id) -> Option<rho_desk::cells::Property> {
     match area {
         label @ rho_desk::cells::Id::Label(_) => Some(rho_desk::cells::Property::Labeled {

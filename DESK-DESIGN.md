@@ -120,6 +120,13 @@ is still there for a thing that belongs somewhere else, but the common
 case, "another agent for this same work", stops being a question the user
 answers twice.
 
+`here` is the picker's first row, so Enter alone is create-from-here. The
+new thing takes every label the thing on screen carries — the same place,
+without being asked for it a second time — and writes `About` naming that
+thing. The labels are what put it on the map; `About` is only how it got
+there, which is why one act writes both and neither stands in for the
+other.
+
 ### Left to decide
 
 - Whether `About` is written by the notes-for-this key alone, or whether

@@ -7111,6 +7111,90 @@ fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext
         .unwrap();
 }
 
+/// Create from here, on a Slack message. The reader is looking at a
+/// thread that carries a label; `n n` and Enter make the note without
+/// asking where it goes: it takes the labels the message carries, which is
+/// the same place, and says it is about the message. About is provenance —
+/// the label is what puts the note on the map.
+#[gpui::test]
+fn a_note_made_from_a_slack_message_is_about_it_and_wears_its_labels(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let label = desk.label("rho");
+    let node = desk.thread_row(None, "C1", "600.0");
+    desk.labelled(node.clone(), label.clone());
+
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            // The message is the only card, so Home's cursor is on it: the
+            // reader is looking at the thread.
+            workspace.sync_tree_dashboard(HostId::default(), window, cx);
+            // The reader is on the message. The Slack conversation surface
+            // wants a live session, which this harness has none of; the
+            // message's own surface names the same node, which is what
+            // `here` reads.
+            workspace.open_note(HostId::default(), node.clone(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.context_area(cx),
+                Some((HostId::default(), node.clone())),
+                "the message the reader is on is what `here` means"
+            );
+        })
+        .unwrap();
+
+    // `space n n`, then bare Enter: the first row is `here`.
+    cx.simulate_keystrokes(*workspace, "space n n");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
+            assert!(
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.property == rho_desk::cells::Property::About(node.clone())),
+                "the note says what it came from: {:?}",
+                mutation.writes
+            );
+            assert!(
+                mutation.writes.iter().any(|write| write.property
+                    == rho_desk::cells::Property::Labeled {
+                        label: label.clone(),
+                        present: true,
+                    }),
+                "and is placed where the message is, without being asked: {:?}",
+                mutation.writes
+            );
+            assert!(
+                !mutation.writes.iter().any(|write| matches!(
+                    write.property,
+                    rho_desk::cells::Property::Parent(Some(_))
+                )),
+                "nothing is placed by a parent: {:?}",
+                mutation.writes
+            );
+        })
+        .unwrap();
+}
+
 /// The finder's candidate source over a real desk tree: every node arrives
 /// as its full path, and submitting one opens the surface that path names.
 #[gpui::test]
@@ -8406,7 +8490,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     // area is a label now, and a thing carries no parent.
     let area = desk.project("rho", "/tmp/rho-test-repo");
     let context = desk.due_note(None, "the area in view");
-    desk.labelled(context, area.clone());
+    desk.labelled(context.clone(), area.clone());
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -8435,7 +8519,8 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
             assert_eq!(workspace.current_surface_name_for_test(), "draft");
             assert_eq!(
                 workspace.draft_area_for_test(),
-                Some((HostId::default(), area.clone()))
+                Some((HostId::default(), context.clone())),
+                "Enter alone is create-from-here: the thing in view, not a place picked for it"
             );
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -8464,8 +8549,21 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
             // that fact itself once the agent exists.
             assert_eq!(
                 workspace.pending_agent_filing_for_test(),
-                Some((HostId::default(), area)),
-                "the agent was not filed under the area"
+                Some((HostId::default(), context.clone())),
+                "the agent was not filed from where it was made"
+            );
+            // And what it writes when the agent arrives is the place the
+            // thing in view is in, plus where the agent came from.
+            let cells = workspace.new_thing_cells(
+                HostId::default(),
+                Some(&(HostId::default(), context.clone())),
+            );
+            assert!(
+                cells.contains(&rho_desk::cells::Property::Labeled {
+                    label: area.clone(),
+                    present: true,
+                }) && cells.contains(&rho_desk::cells::Property::About(context.clone())),
+                "the agent wears the note's label and says what it is about: {cells:?}"
             );
         })
         .unwrap();
