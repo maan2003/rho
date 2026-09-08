@@ -969,3 +969,137 @@ async fn a_name_that_arrives_after_the_row_is_drawn_reaches_the_row(cx: &mut Tes
         "and no row is left saying someone: {drawn:?}"
     );
 }
+
+/// The point in a transcript is an anchor, so a message changing under it
+/// does the right thing without anyone deciding.
+///
+/// This is a pin, not a fix. The list's cursor is a row index, and a row
+/// arriving above it moved the reader onto a conversation they had not
+/// chosen — that needed a decision and got one. The transcript looks like
+/// the same problem and is not: the point is an editor selection over an
+/// anchor, and an anchor inside deleted text collapses to the boundary,
+/// which is where the message that followed now starts. Deleting the last
+/// message leaves the anchor at the end of what is left, which is the
+/// message before it. Both are what a reader wants, and neither is written
+/// down anywhere, so this is where they are written down.
+#[gpui::test]
+async fn a_message_changing_under_the_point_leaves_it_somewhere_the_reader_chose(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+    use rho_slack::session::Source;
+    use rho_slack::types::{ChannelId, Ts};
+
+    cx.update(init_test_app);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    // The last one is a different day from the other two, so deleting it
+    // takes its day rule with it and the anchor has two rows removed under
+    // it rather than one.
+    for (ts, text) in [
+        ("100.0", "first"),
+        ("200.0", "middle"),
+        ("1780000000.0", "last"),
+    ] {
+        fake.add_message(
+            "C1",
+            serde_json::json!({"type": "message", "ts": ts, "user": "UA", "text": text}),
+        );
+    }
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    let window = cx.add_window(|window, cx| {
+        let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+        rho_slack::ui::ConversationView::new(
+            session,
+            Source::Conversation(ChannelId("C1".into())),
+            rho_slack::ui::Hooks::inert(),
+            window,
+            cx,
+        )
+    });
+
+    // The reader puts the point on the middle message, the way they would
+    // by scrolling to it.
+    let point_on = async |ts: &str, cx: &mut TestAppContext| {
+        let ts = Ts(ts.to_owned());
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let placed = window
+                .update(cx, |view, window, cx| {
+                    view.place_cursor_on_for_test(&ts, window, cx)
+                })
+                .unwrap();
+            if placed {
+                return;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        panic!("{ts:?} never reached the transcript");
+    };
+    let under = async |until: &str, cx: &mut TestAppContext| {
+        let mut under = None;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            under = window
+                .update(cx, |view, _, cx| {
+                    view.cursor_message_for_test(cx).map(|message| message.text)
+                })
+                .unwrap();
+            if under.as_deref() == Some(until) {
+                break;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(10))
+                .await;
+        }
+        under
+    };
+
+    // One: the message under the point is deleted from somewhere else. The
+    // point is on the one that followed it, which is where the reader was
+    // reading towards.
+    point_on("200.0", cx).await;
+    assert_eq!(
+        under("middle", cx).await.as_deref(),
+        Some("middle"),
+        "which is what the reader's next keypress is about"
+    );
+    fake.live_delete("C1", "200.0");
+    assert_eq!(
+        under("last", cx).await.as_deref(),
+        Some("last"),
+        "the point is on the message that followed, not on the day rule \
+         that now sits where it was"
+    );
+
+    // Two: the last message in the run is deleted, and its day rule with
+    // it. There is nothing after it, so the point is on the one before.
+    fake.live_delete("C1", "1780000000.0");
+    assert_eq!(
+        under("first", cx).await.as_deref(),
+        Some("first"),
+        "with nothing after it, the point is on the message before"
+    );
+
+    // Three: someone rewrites the message the point is on. It is the same
+    // message, so the point does not go anywhere.
+    fake.live_edit("C1", "100.0", "first, rewritten");
+    assert_eq!(
+        under("first, rewritten", cx).await.as_deref(),
+        Some("first, rewritten"),
+        "an edit leaves the point on the message it was on"
+    );
+}

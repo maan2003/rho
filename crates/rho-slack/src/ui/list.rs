@@ -569,12 +569,12 @@ impl ListView {
     }
 }
 
-/// One line per conversation: the name, what is waiting in it, and when it
-/// last spoke. No ids and no last-message preview — the list is for choosing
-/// where to go, and a preview is the conversation's job.
-/// The rows the model handed over, laid out. Narrowing happened before
-/// this: the model answers a query from its own index, so nothing here
-/// looks at every conversation to decide what to draw.
+/// The rows the model handed over, laid out: one line per conversation, the
+/// name, what is waiting in it, and when it last spoke. No ids and no
+/// last-message preview — the list is for choosing where to go, and a
+/// preview is the conversation's job. Narrowing happened before this: the
+/// model answers a query from its own index, so nothing here looks at every
+/// conversation to decide what to draw.
 fn render_rows(rows: &[ConversationRow]) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
     // Read once for the whole listing rather than once a row: every row is
     // asking the same question, and the answer moving between two of them

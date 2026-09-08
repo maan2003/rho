@@ -625,6 +625,45 @@ impl ConversationView {
         }
     }
 
+    /// Puts the point on a named message, the way a reader does by
+    /// scrolling to it. For the test that pins where the point ends up when
+    /// the message under it changes: a test that cannot place the point
+    /// cannot say what happens to it.
+    pub fn place_cursor_on_for_test(
+        &mut self,
+        ts: &Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts.clone()))
+            .map(|range| range.start)
+        else {
+            return false;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        true
+    }
+
+    /// The message under the point, which is what the reader's next `e`,
+    /// reaction or `enter` is about.
+    pub fn cursor_message_for_test(&self, cx: &mut Context<Self>) -> Option<Message> {
+        self.cursor_message(cx)
+    }
+
     /// The message the cursor is on, if the transcript has one there.
     fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
         let row = self.cursor_row(cx) as u32;
@@ -1341,6 +1380,10 @@ impl ConversationView {
             });
             self.moved.scroll = Some(pinned);
         }
+        // Where the point goes if the message under it is one of the ones
+        // going away. Read before the removal, because afterwards there is
+        // nothing to read: the row is gone.
+        let landing = self.landing_for_removals(&ops, cx);
         self.editing = true;
         for op in ops {
             match op {
@@ -1367,6 +1410,73 @@ impl ConversationView {
             self.leave_the_gap_line(&key, window, cx);
         }
         self.editing = false;
+        if let Some(landing) = landing {
+            self.place_point(&landing, window, cx);
+        }
+    }
+
+    /// The row the point should end up on, given what is about to be
+    /// removed. `None` unless the point is on a message that is going: a
+    /// point anywhere else is the reader's own place and nothing moves it.
+    ///
+    /// Cost: one comparison per removal in the plan, and a walk off the
+    /// removed row that stops at the first message — over a day rule or the
+    /// unread rule, never over a run of them.
+    fn landing_for_removals(&self, ops: &[Op], cx: &mut Context<Self>) -> Option<Row> {
+        let removing = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Remove(key @ Row::Message(_)) => Some(key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if removing.is_empty() {
+            return None;
+        }
+        let under = self.transcript.key_at_row(self.cursor_row(cx) as u32, cx)?;
+        let on_it = removing.contains(&under);
+        let after = self.message_beside(under, Side::After);
+        let before = self.message_beside(under, Side::Before);
+        point_after_removal(on_it, after, before)
+    }
+
+    /// The nearest message on one side of a row, stepping over the rules
+    /// and lines that are not messages.
+    fn message_beside(&self, from: &Row, side: Side) -> Option<Row> {
+        let mut at = from;
+        loop {
+            at = match side {
+                Side::After => self.transcript.key_after(at)?,
+                Side::Before => self.transcript.key_before(at)?,
+            };
+            if matches!(at, Row::Message(_)) {
+                return Some(at.clone());
+            }
+        }
+    }
+
+    /// Puts the point on a row without moving the view. The surface moved
+    /// it, not the reader, so it is recorded as such: a page of history is
+    /// spent by the reader scrolling, never by rho tidying up after someone
+    /// else's deletion.
+    fn place_point(&mut self, key: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(start) = self.transcript.range_of(key).map(|range| range.start) else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
     }
 
     /// Puts the cursor on the first message of a page that has just landed,
@@ -1694,6 +1804,35 @@ impl Placed for Transcript<Row, Class, LineMeta> {
 
     fn below(&self, key: &Row) -> Option<Row> {
         self.key_after(key).cloned()
+    }
+}
+
+/// Which way to look for the message next to a row.
+#[derive(Clone, Copy)]
+enum Side {
+    After,
+    Before,
+}
+
+/// Where the point goes when the message it was on is deleted by someone
+/// else.
+///
+/// Three of the four cases the anchors already answer: the point is an
+/// editor selection over an anchor, and an anchor inside deleted text
+/// collapses to the boundary, which is where the message that followed now
+/// begins. The fourth is the one that needed writing down. When the next
+/// message is under a day rule, the boundary is the rule, and a point on a
+/// rule is a point with nothing under it: `e` does nothing, a reaction does
+/// nothing, `enter` does nothing, and the reader is given no reason.
+///
+/// So: the message that followed, which is where they were reading towards;
+/// at the end of the run there is nothing after it and the one before is
+/// the answer. A point that was not on the deleted message is the reader's
+/// own place and is not touched.
+fn point_after_removal(on_it: bool, after: Option<Row>, before: Option<Row>) -> Option<Row> {
+    match on_it {
+        true => after.or(before),
+        false => None,
     }
 }
 
@@ -3622,6 +3761,30 @@ mod tests {
         // A thread's composer is the one place the reader can be wrong about
         // where the words land, so it says the thread out loud.
         assert_eq!(compose_placeholder("#design", true), "reply in #design");
+    }
+
+    #[test]
+    fn a_deleted_message_hands_the_point_to_the_one_after_it() {
+        let second = Row::Message(Ts("2.0".into()));
+        let first = Row::Message(Ts("1.0".into()));
+        // The ordinary case: the reader was reading down, so the message
+        // that followed is where they were going.
+        assert_eq!(
+            point_after_removal(true, Some(second.clone()), Some(first.clone())),
+            Some(second)
+        );
+        // The last message in the run. Nothing after it, so the one before
+        // it, rather than a rule with nothing under it.
+        assert_eq!(
+            point_after_removal(true, None, Some(first.clone())),
+            Some(first.clone())
+        );
+        // The only message there was. Nothing to hand the point to, and
+        // nothing is better than a guess.
+        assert_eq!(point_after_removal(true, None, None), None);
+        // The point was somewhere else. That is the reader's own place: a
+        // deletion further up the conversation does not move them.
+        assert_eq!(point_after_removal(false, Some(first), None), None);
     }
 
     #[test]
