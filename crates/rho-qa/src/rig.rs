@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
@@ -531,6 +531,8 @@ fn down(name: &str) -> Result<()> {
 #[derive(Deserialize)]
 struct DriveLine {
     #[serde(default)]
+    at_ms: Option<u64>,
+    #[serde(default)]
     drive: Option<String>,
     #[serde(default)]
     step: Option<String>,
@@ -731,6 +733,7 @@ fn status(name: &str) -> Result<()> {
             println!("  profile  {}", summary.line);
         }
     }
+    println!("  touched  {}", touch_line(&root, name));
     println!("  state    {}", state_size(&root));
     let socket = root.join("run").join("rho").join("rho.sock");
     println!(
@@ -909,6 +912,83 @@ fn fake_slack_from_log(text: &str, fixture_workspace: Option<&str>) -> Option<Fa
     })
 }
 
+/// When this rig was last touched by a person, and by what.
+///
+/// R7's open gap. A rig with nobody on it and a rig somebody is mid-case
+/// on look identical from the outside — same processes, same directory,
+/// the same `rig status` — and the only thing that distinguished the one
+/// found up for 2h19m was that its newest screenshot was from the day
+/// before. That is too thin a thread to take a rig down on, and it was
+/// thin because nothing read it. This reads it: the newest of the drive
+/// log's last step and the newest screenshot, which are the two things a
+/// person leaves behind by driving.
+///
+/// `None` means nobody has driven this session at all, which is a
+/// different sentence and gets one.
+fn last_touch(root: &Path, name: &str) -> Option<(String, Duration)> {
+    let now = SystemTime::now();
+    let ago = |at: SystemTime| now.duration_since(at).unwrap_or_default();
+
+    let mut newest: Option<(String, SystemTime)> = None;
+    let mut keep = |what: String, at: SystemTime| {
+        if newest.as_ref().is_none_or(|(_, held)| at > *held) {
+            newest = Some((what, at));
+        }
+    };
+
+    let log = root
+        .join("run")
+        .join("rho-wayland")
+        .join(format!("{name}-drive.log"));
+    if let Ok(text) = fs::read_to_string(&log) {
+        for line in text.lines().rev() {
+            let Ok(entry) = serde_json::from_str::<DriveLine>(line) else {
+                continue;
+            };
+            let Some(at_ms) = entry.at_ms else { continue };
+            let what = entry
+                .step
+                .or(entry.drive)
+                .unwrap_or_else(|| "a step".to_owned());
+            keep(what, SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms));
+            break;
+        }
+    }
+    if let Ok(entries) = fs::read_dir(root.join("screens")) {
+        for entry in entries.flatten() {
+            let Ok(at) = entry.metadata().and_then(|data| data.modified()) else {
+                continue;
+            };
+            keep(
+                format!("screenshot {}", entry.file_name().to_string_lossy()),
+                at,
+            );
+        }
+    }
+    newest.map(|(what, at)| (what, ago(at)))
+}
+
+/// A duration as a person says it, coarsest unit first. Nothing here is
+/// worth a second decimal: the question it answers is "is anybody on this",
+/// and the answer is minutes or hours.
+fn since_label(since: Duration) -> String {
+    let seconds = since.as_secs();
+    match (seconds / 3600, (seconds % 3600) / 60) {
+        (0, 0) => format!("{seconds}s"),
+        (0, minutes) => format!("{minutes}m"),
+        (hours, minutes) => format!("{hours}h{minutes:02}m"),
+    }
+}
+
+/// The line both `status` and the refusal print: whether anyone has driven
+/// this session, and how long ago.
+fn touch_line(root: &Path, name: &str) -> String {
+    match last_touch(root, name) {
+        Some((what, since)) => format!("last driven {} ago ({what})", since_label(since)),
+        None => "never driven; nothing has been sent to this session".to_owned(),
+    }
+}
+
 /// Who is running this rig, for the session line. The agent handle if this is
 /// an agent's shell, the user otherwise, and nothing rather than a guess.
 fn holder() -> Option<String> {
@@ -946,9 +1026,13 @@ fn holding_session(root: &Path, rig: &Rig) -> Option<String> {
             rig.name
         )
     };
+    // Whether the holder is actually on it. A refusal that says only who
+    // started a session leaves the next person with a name and no way to
+    // tell a live run from one left standing overnight.
+    let touched = touch_line(root, &rig.name);
     Some(format!(
         "rig {} is already up: session {}, held by {whose}, started {at} on \
-         {binaries} binaries (daemon pid {pid}).\n{what_to_do}",
+         {binaries} binaries (daemon pid {pid}); {touched}.\n{what_to_do}",
         rig.name,
         rig.sessions.len(),
     ))
@@ -1643,6 +1727,67 @@ mod tests {
         assert_eq!((missing, none), (None, 0));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rig that nobody has driven says so, and one that somebody has
+    /// says when and what.
+    ///
+    /// The never-driven answer is checked first and on purpose: it is the
+    /// one the found-idle session would have given, and a reading that
+    /// cannot tell it from a live run is the whole gap this closes.
+    #[test]
+    fn a_rig_says_whether_anyone_has_driven_it() {
+        let dir = std::env::temp_dir().join(format!("rho-qa-touch-{}", std::process::id()));
+        let session = dir.join("run").join("rho-wayland");
+        let screens = dir.join("screens");
+        fs::create_dir_all(&session).expect("make the session directory");
+        fs::create_dir_all(&screens).expect("make the screens directory");
+
+        assert_eq!(super::last_touch(&dir, "desk"), None);
+        assert!(
+            super::touch_line(&dir, "desk").starts_with("never driven"),
+            "a session nobody drove has to say so in words: {}",
+            super::touch_line(&dir, "desk")
+        );
+
+        // A screenshot and nothing else: the thread the found-idle session
+        // was read from, now read by the rig itself.
+        let shot = screens.join("case.png");
+        fs::write(&shot, b"png").expect("write a screenshot");
+        set_modified(
+            &shot,
+            std::time::SystemTime::now() - Duration::from_secs(3 * 3600),
+        );
+        let (what, since) = super::last_touch(&dir, "desk").expect("the screenshot is a touch");
+        assert_eq!(what, "screenshot case.png");
+        assert_eq!(super::since_label(since), "3h00m");
+
+        // A step after it wins, because it is newer, and the drive log is
+        // the better witness when both are there.
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis() as u64
+            - 90_000;
+        fs::write(
+            session.join("desk-drive.log"),
+            format!("{{\"at_ms\":{at_ms},\"step\":\"key j\"}}\n").as_bytes(),
+        )
+        .expect("write the log");
+        let (what, since) = super::last_touch(&dir, "desk").expect("the step is a touch");
+        assert_eq!(what, "key j");
+        assert_eq!(super::since_label(since), "1m");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The units a person answers "is anyone on this" in.
+    #[test]
+    fn how_long_ago_is_said_in_the_coarsest_unit_that_fits() {
+        assert_eq!(super::since_label(Duration::from_secs(9)), "9s");
+        assert_eq!(super::since_label(Duration::from_secs(60)), "1m");
+        assert_eq!(super::since_label(Duration::from_secs(3599)), "59m");
+        assert_eq!(super::since_label(Duration::from_secs(8340)), "2h19m");
     }
 
     fn set_modified(path: &std::path::Path, at: std::time::SystemTime) {

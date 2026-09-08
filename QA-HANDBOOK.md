@@ -300,16 +300,25 @@ steps; it does not compare them. Two runs of "the 09:12 recipe" with different
 step counts are two different drives whatever they are called, and the count
 beside the name is what makes that visible.
 
-**And it does not tell you a rig is idle.** A rig with no drive named writes
-no drive log at all, so a session nobody ever drove and a session someone is
-using look identical from the outside — same processes, same directory, same
-`rig status`. One was found on the desk host with sway, the profiling daemon
-and fake-slack up for 2h19m, and the only thing that distinguished it from a
-live session was that the newest screenshot was from the day before. That is
-too thin a thread to take a rig down on, and the next person will not think
-to pull it. Until the log carries a heartbeat rather than only named steps,
-**say in the session notes when you take a rig and when you are done with
-it**, because the rig cannot say it for you.
+**It used to not tell you a rig was idle.** A session nobody ever drove and a
+session someone is using looked identical from the outside — same processes,
+same directory, same `rig status`. One was found on the desk host with sway,
+the profiling daemon and fake-slack up for 2h19m, and the only thing that
+distinguished it from a live session was that the newest screenshot was from
+the day before. That thread was thin because nothing read it.
+
+`rig status` and the `rig up` refusal now read it. Both print a `touched`
+line: **`last driven 2h19m ago (key j)`**, from the newest of the drive log's
+last step and the newest screenshot, or **`never driven; nothing has been sent
+to this session`** for a rig that has been standing since it came up. So the
+refusal names the holder *and* says whether they are on it, which is the
+question the next person actually has.
+
+What it still cannot see is a reader looking at a screen without pressing
+anything. Two minutes of that is indistinguishable from two minutes of
+nothing, so **say in the session notes when you take a rig and when you are
+done with it** — the rig now says a great deal more than it did, and not
+that.
 
 ### R8. A binary that will not start: read its linker before anything else
 
