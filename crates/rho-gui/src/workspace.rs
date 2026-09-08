@@ -112,14 +112,6 @@ pub struct Surface {
     pub(crate) view: SurfaceView,
 }
 
-/// A bind request waiting for the daemon's answer, and what the journal
-/// should say when it comes back.
-struct PendingGitApproval {
-    request_id: u64,
-    prompt: String,
-    response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
-}
-
 #[derive(Clone)]
 pub(crate) enum SurfaceView {
     Draft {
@@ -580,7 +572,6 @@ pub struct Workspace {
     menu_buffer: Option<MenuBuffer>,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
-    git_approval_focus: gpui::FocusHandle,
     /// Focus beneath the single modal overlay. Transients, minibuffers, and
     /// Git approval hand this target between them so borrowing keyboard
     /// focus never changes dashboard/work mode.
@@ -588,7 +579,9 @@ pub struct Workspace {
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
-    pending_git_approval: Option<PendingGitApproval>,
+    /// The SSH Git approval prompt, one of the three modal overlays:
+    /// see [`crate::git_approval::GitApproval`].
+    git_approval: crate::git_approval::GitApproval,
     /// Whether the desk is listening, on whose daemon, and whether the
     /// microphone is open: see [`crate::voice::Voice`].
     voice: crate::voice::Voice,
@@ -1154,10 +1147,9 @@ impl Workspace {
             minibuffer: None,
             transient_focus: cx.focus_handle(),
             menu_buffer: None,
-            git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
             echo: None,
-            pending_git_approval: None,
+            git_approval: crate::git_approval::GitApproval::new(cx),
             voice: crate::voice::Voice::default(),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
@@ -2305,13 +2297,10 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
-                let had_git_approval = if let Some(pending) = self.pending_git_approval.take() {
-                    let _ = pending.response.send(GitApprovalDecision::Done);
-                    true
-                } else {
-                    false
-                };
-                if had_git_approval {
+                // A daemon that goes is a daemon that is no longer asking;
+                // the request still has to be answered, or it is left
+                // blocked on a channel nobody will send on.
+                if self.git_approval.answer(GitApprovalDecision::Done) {
                     self.finish_overlay_focus(window, cx);
                 }
                 // The host's agents stay in the rail with their retained
@@ -2343,7 +2332,7 @@ impl Workspace {
                 prompt,
                 response,
             } => {
-                if self.minibuffer.is_some() || self.pending_git_approval.is_some() {
+                if self.minibuffer.is_some() || self.git_approval.waiting() {
                     let _ = response.send(GitApprovalDecision::Deny);
                     let source = self.error_source(host);
                     self.notice_on(
@@ -2362,25 +2351,14 @@ impl Workspace {
                     true => format!("{}: {prompt}", self.hosts.host_label(host)),
                     false => prompt,
                 };
-                self.pending_git_approval = Some(PendingGitApproval {
-                    request_id,
-                    prompt,
-                    response,
-                });
+                self.git_approval.ask(request_id, prompt, response);
                 self.capture_overlay_focus(window, cx);
-                window.focus(&self.git_approval_focus, cx);
+                window.focus(self.git_approval.focus_handle(), cx);
                 self.echo = None;
                 cx.notify();
             }
             ConnEvent::GitTransportDone { request_id } => {
-                if self
-                    .pending_git_approval
-                    .as_ref()
-                    .is_some_and(|pending| pending.request_id == request_id)
-                {
-                    if let Some(pending) = self.pending_git_approval.take() {
-                        let _ = pending.response.send(GitApprovalDecision::Done);
-                    }
+                if self.git_approval.done(request_id) {
                     self.finish_overlay_focus(window, cx);
                     cx.notify();
                 }
@@ -6713,8 +6691,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pending) = self.pending_git_approval.take() {
-            let _ = pending.response.send(decision);
+        if self.git_approval.answer(decision) {
             self.finish_overlay_focus(window, cx);
             cx.notify();
         }
@@ -7220,9 +7197,7 @@ impl Workspace {
     }
 
     fn has_modal_overlay(&self) -> bool {
-        self.minibuffer.is_some()
-            || self.menu_buffer.is_some()
-            || self.pending_git_approval.is_some()
+        self.minibuffer.is_some() || self.menu_buffer.is_some() || self.git_approval.waiting()
     }
 
     /// Captures normal focus on the first overlay in a chain. Replacements
@@ -10394,70 +10369,28 @@ impl Render for Workspace {
                     .child(bottom_strip(&text_style, cx).child(open.menu.render(&text_style, cx)))
                     .into_any_element()
             }))
-            .children(match (&self.pending_git_approval, &self.minibuffer) {
-                (Some(pending), _) => {
-                    let colors = cx.theme().colors();
-                    let focused = self.git_approval_focus.is_focused(window);
-                    let mut deny = div().flex().flex_row().px_1().child("n deny");
-                    if focused {
-                        deny = deny.bg(colors.element_selected);
+            .children(
+                match (
+                    self.git_approval.render(&text_style, window, cx),
+                    &self.minibuffer,
+                ) {
+                    (Some(approval), _) => Some(approval),
+                    (None, Some(minibuffer)) => Some(if phone {
+                        minibuffer.render_phone(&text_style, cx)
                     } else {
-                        deny = deny.text_color(colors.text_muted);
+                        minibuffer.render(&text_style, cx)
+                    }),
+                    // A menu is drawn as a block in the buffer on the desk and
+                    // as a sheet on the phone, and the sheet is drawn from
+                    // here: nothing else in this method knows the phone has an
+                    // overlay to draw. Without this arm the phone opens a menu
+                    // nobody can see — the buffer has no block on purpose.
+                    (None, None) if phone && self.menu_buffer.is_some() => {
+                        self.render_phone_menu_sheet(&text_style, cx)
                     }
-                    Some(
-                        div()
-                            .key_context("RhoGitApproval")
-                            .track_focus(&self.git_approval_focus)
-                            .child(
-                                bottom_strip(&text_style, cx)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .gap_1()
-                                            .px_2()
-                                            .child(
-                                                div()
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(colors.text_accent)
-                                                    .child("Git approval"),
-                                            )
-                                            .child("·")
-                                            .child(pending.prompt.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_4()
-                                            .px_2()
-                                            .child(
-                                                div()
-                                                    .text_color(colors.text_muted)
-                                                    .child("Y allow"),
-                                            )
-                                            .child(deny),
-                                    ),
-                            )
-                            .into_any_element(),
-                    )
-                }
-                (None, Some(minibuffer)) => Some(if phone {
-                    minibuffer.render_phone(&text_style, cx)
-                } else {
-                    minibuffer.render(&text_style, cx)
-                }),
-                // A menu is drawn as a block in the buffer on the desk and
-                // as a sheet on the phone, and the sheet is drawn from
-                // here: nothing else in this method knows the phone has an
-                // overlay to draw. Without this arm the phone opens a menu
-                // nobody can see — the buffer has no block on purpose.
-                (None, None) if phone && self.menu_buffer.is_some() => {
-                    self.render_phone_menu_sheet(&text_style, cx)
-                }
-                (None, None) => None,
-            })
+                    (None, None) => None,
+                },
+            )
     }
 }
 
