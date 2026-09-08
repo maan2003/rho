@@ -769,6 +769,14 @@ fn accumulate_walked_items(total: &mut u64, additional: u64) {
     *total = total.saturating_add(additional);
 }
 
+fn align_edit_start(old_start: u32, new_start: u32, row_delta: i64) -> (u32, u32) {
+    let old_start = i64::from(old_start).min(i64::from(new_start) - row_delta);
+    (
+        old_start.try_into().unwrap(),
+        (old_start + row_delta).try_into().unwrap(),
+    )
+}
+
 /// Counts the rows that wrapping will actually recompute after neighboring
 /// edits are combined. Syntax concealment commonly produces several edits on
 /// one line; treating their raw count as a large update needlessly publishes
@@ -1110,6 +1118,7 @@ impl WrapSnapshot {
         let mut wrap_edits = Vec::with_capacity(tab_edits.len());
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
         let mut new_cursor = new_snapshot.transforms.cursor::<TransformSummary>(());
+        let mut row_delta = 0_i64;
         for mut tab_edit in tab_edits.iter().cloned() {
             tab_edit.old.start.0.column = 0;
             tab_edit.old.end.0 += Point::new(1, 0);
@@ -1123,14 +1132,28 @@ impl WrapSnapshot {
             old_cursor.seek_forward(&tab_edit.old.end, Bias::Right);
             let mut old_end = old_cursor.start().output.lines;
             old_end += tab_edit.old.end.0 - old_cursor.start().input.lines;
+            if tab_edit.old.end > self.tab_snapshot.max_point() {
+                old_end = Point::new(self.max_point().row().0 + 1, 0);
+            }
 
             new_cursor.seek(&tab_edit.new.start, Bias::Right);
             let mut new_start = new_cursor.start().output.lines;
             new_start += tab_edit.new.start.0 - new_cursor.start().input.lines;
 
+            let (old_start_row, new_start_row) =
+                align_edit_start(old_start.row, new_start.row, row_delta);
+            old_start = Point::new(old_start_row, 0);
+            new_start = Point::new(new_start_row, 0);
+
             new_cursor.seek_forward(&tab_edit.new.end, Bias::Right);
             let mut new_end = new_cursor.start().output.lines;
             new_end += tab_edit.new.end.0 - new_cursor.start().input.lines;
+            if tab_edit.new.end > new_snapshot.tab_snapshot.max_point() {
+                new_end = Point::new(new_snapshot.max_point().row().0 + 1, 0);
+            }
+
+            row_delta +=
+                i64::from(new_end.row - new_start.row) - i64::from(old_end.row - old_start.row);
 
             wrap_edits.push(WrapEdit {
                 old: WrapRow(old_start.row)..WrapRow(old_end.row),
@@ -1928,6 +1951,51 @@ mod tests {
         ];
 
         assert_eq!(affected_row_count(&edits), 1);
+    }
+
+    #[test]
+    fn moved_later_edit_replays_to_the_new_snapshot() {
+        let (first_old_start, first_new_start) = align_edit_start(0, 0, 0);
+        let first = WrapEdit {
+            old: WrapRow(first_old_start)..WrapRow(0),
+            new: WrapRow(first_new_start)..WrapRow(1),
+        };
+        let row_delta = i64::from(first.new_len().0) - i64::from(first.old_len().0);
+
+        // The second edit maps to row two on both sides, but the inserted row
+        // before it means its starts must differ by one. Widen its old start
+        // back to row one so the patch keeps its running delta.
+        let (second_old_start, second_new_start) = align_edit_start(2, 2, row_delta);
+        let second = WrapEdit {
+            old: WrapRow(second_old_start)..WrapRow(3),
+            new: WrapRow(second_new_start)..WrapRow(3),
+        };
+        let patch = Patch::new(vec![first, second]);
+
+        let mut replayed = Rope::from("a\nremove\nkeep\n");
+        let snapshot = Rope::from("insert\na\nkeep\n");
+        let mut running_delta = 0_i64;
+        for edit in &patch {
+            assert_eq!(
+                i64::from(edit.new.start.0),
+                i64::from(edit.old.start.0) + running_delta
+            );
+            let old_start = replayed.point_to_offset(Point::new(edit.new.start.0, 0));
+            let old_end = replayed.point_to_offset(Point::new(
+                edit.new.start.0 + (edit.old.end - edit.old.start).0,
+                0,
+            ));
+            let new_start = snapshot.point_to_offset(Point::new(edit.new.start.0, 0));
+            let new_end = snapshot.point_to_offset(Point::new(edit.new.end.0, 0));
+            replayed.replace(
+                old_start..old_end,
+                &snapshot
+                    .chunks_in_range(new_start..new_end)
+                    .collect::<String>(),
+            );
+            running_delta += i64::from(edit.new_len().0) - i64::from(edit.old_len().0);
+        }
+        assert_eq!(replayed.to_string(), snapshot.to_string());
     }
 
     #[gpui::test]
