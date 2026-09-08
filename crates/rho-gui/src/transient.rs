@@ -110,7 +110,6 @@ pub(crate) enum Command {
     UploadTelemetry,
     Version,
     // The agent under the point.
-    AgentDone,
     AgentCancel,
     AgentRole,
     AgentName,
@@ -424,7 +423,6 @@ pub(crate) fn status_menu() -> Menu {
 /// `space a`: driving the current conversation.
 pub(crate) fn agent_menu() -> Menu {
     Menu::new("agent")
-        .item("d", "done", MenuAction::Command(Command::AgentDone))
         .item(
             "c",
             "cancel turn",

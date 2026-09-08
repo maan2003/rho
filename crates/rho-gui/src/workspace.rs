@@ -71,7 +71,7 @@ type SurfaceHistory = rho_window::history::History<SurfaceKey, WarmSurface>;
 use rho_files::{FileView, RemoteProject};
 
 use crate::{
-    AgentDone, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
+    AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardDealDone,
     DashboardDealExit, DashboardDealFile, DashboardDealMute, DashboardDealNext,
     DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
     DashboardDealTodo, DashboardDeleteRow, DashboardPasteRow, DashboardPasteRowBefore,
@@ -2972,24 +2972,6 @@ impl Workspace {
             false => format!("name: {name}"),
         };
         self.echo(&said, StyleClass::SystemInfo, cx);
-    }
-
-    /// `ctrl-shift-d`, and `d` in the agent menu: done on the agent under
-    /// the point. Done is a cursor — up to here — and the only verdict
-    /// this key writes. Putting an agent away for good is the mute `x`
-    /// writes on its card, which is one verdict in one place.
-    pub(crate) fn cmd_agent_done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
-        let targets = self.subject(window, cx).agents;
-        self.deal_agents(
-            targets,
-            "done",
-            crate::desk_view::DeskVerdict::Done,
-            window,
-            cx,
-        );
     }
 
     /// The snooze operator: `s` and a unit, with vim's count in front, so
@@ -6824,7 +6806,6 @@ impl Workspace {
             Command::Usage(chart, days) => self.open_usage_chart(chart, days, window, cx),
             Command::UploadTelemetry => self.cmd_upload_gui_telemetry(cx),
             Command::Version => self.cmd_version(cx),
-            Command::AgentDone => self.cmd_agent_done(window, cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
             Command::AgentName => self.prompt_name_agent(window, cx),
@@ -8936,9 +8917,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
                 this.select_agent(None, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
-                this.cmd_agent_done(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);

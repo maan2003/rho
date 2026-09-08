@@ -129,6 +129,14 @@ journal and the status-line label (`needs reply · 2h`) are exactly what
 deal mode did; only the keys moved. `ctrl-j` keeps opening the top card
 as an ordinary surface. The phone keeps its buttons and sheet.
 
+**A verdict has one door, the verdict menu; nothing duplicates a verdict
+elsewhere.** The agent menu's snooze went first, then its done (8 Sep):
+`space a d`, `ctrl-shift-d` and `Command::AgentDone` wrote the same
+`DeskVerdict::Done` that the menu's `d` writes, over a different subject —
+the agent under the point rather than the card in view — so the same
+verdict had two doors, two subjects and two ways to be wrong. Anything
+that acts on a card belongs in the menu or nowhere.
+
 **Why:** the user's words: deal mode stole letters from reading, made
 `escape` a verdict, and hid what the keys were. One transient shows the
 verdicts, reads as a menu, and leaves vim alone. `shift` is the one key

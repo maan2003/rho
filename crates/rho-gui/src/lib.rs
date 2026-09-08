@@ -51,7 +51,6 @@ actions!(
         AgentPrevious,
         AgentNext,
         AgentNew,
-        AgentDone,
         DashboardCancelDraft,
         DashboardReply,
         DashboardSubmit,
@@ -212,7 +211,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         // deep as `Editor`: the bundled keymap binds these keys under plain
         // `Editor` (JoinLines, git::Diff), and gpui prefers the deeper match,
         // so a root-level `RhoGui` binding would lose while typing.
-        KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
         // `tab` is the verdicts over a card and the fields on the draft: one
         // action, and the handler asks the draft first.
         KeyBinding::new(
@@ -524,8 +522,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // Talking to agents is one verb: `r` on a heading line opens a draft —
     // a reply when the heading is staffed, a first message when it isn't —
     // and propagates to vim (replace-char) anywhere else. Making an agent
-    // is `space n a` from anywhere. Done lives on ctrl-shift-d and the
-    // space menu, so `o`, `d`, and `x` keep their vim meaning.
+    // is `space n a` from anywhere. Done lives in the verdict menu and
+    // nowhere else, so `o`, `d`, and `x` keep their vim meaning.
     // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
     cx.bind_keys([
         KeyBinding::new(
