@@ -541,13 +541,13 @@ pub fn verdict_changes(
             // list would be a verdict the daemon has nothing to check, so
             // this says so rather than writing a cell nobody reads.
             Verdict::Done => Err("a Slack unit's done is rho's cursor, not a cell".to_owned()),
-            // A mute is the one verdict a cursor cannot express: the user
-            // said "not this unit", not "not up to here", so nothing
-            // arriving past the cursor reopens it. Opening it clears the
-            // state, and the silence rho asks Slack for (a thread
-            // unfollowed, a conversation marked read) is the caller's to
-            // send, so following the thread again still brings the card back.
-            Verdict::Mute => one(Property::State(State::Muted)),
+            // A mute is Slack's too (8 Sep): a thread the user is done
+            // with is unfollowed there, and a channel or direct message is
+            // muted there, which is the word Slack has for it. Both are
+            // the caller's to send, and neither is a cell -- rho kept a
+            // private copy that drifted the moment the user muted or
+            // unmuted anywhere else. `SLACK-DESIGN.md`, "Mute is Slack's".
+            Verdict::Mute => Err("a Slack unit's mute is Slack's, not a cell".to_owned()),
             // The cursor stays where it is, so the messages the user has
             // not handled are still theirs when the snooze ends. Where the
             // unit stood is recorded with it: a snooze is not a cursor and
@@ -1590,8 +1590,9 @@ mod tests {
     /// whatever Slack replays afterwards, the only question is whether
     /// there is something from them past the cursor -- and that cursor is
     /// the Slack mirror's, beside Slack's own read mark, so a done writes
-    /// nothing here at all. What is left for the store is what the mirror
-    /// cannot say: a mute, and where a snooze found the unit.
+    /// nothing here at all. Nor does a mute, which is Slack's own (8 Sep).
+    /// What is left for the store is what Slack has no place for: where a
+    /// snooze found the unit, a filing, a name.
     #[test]
     fn a_verdict_on_a_slack_unit_writes_a_cursor_rather_than_a_state() {
         let store = Store::new(device(1));
@@ -1629,17 +1630,22 @@ mod tests {
             )
             .is_err()
         );
-        // A mute is the state that keeps the unit quiet past the cursor,
-        // plus the unfollow in Slack the caller sends; nothing here says the
-        // card can never come back, because opening it must.
-        assert_eq!(
-            changes(Verdict::Mute),
-            vec![FactChange {
-                id: unit.clone(),
-                key: PropertyKey::State,
-                before: Some(Property::State(State::Open)),
-                after: Some(Property::State(State::Muted)),
-            }]
+        // A mute is refused for the same reason: it is an unfollow or a
+        // mute in Slack, sent by the caller, and rho keeping its own copy
+        // is what made the two disagree the moment the user muted or
+        // unmuted in another client.
+        assert!(
+            verdict_changes(
+                &unit,
+                &Verdict::Mute,
+                &|key| store.property(&unit, key).cloned(),
+                None,
+                Some(SlackVerdict {
+                    newest: newest.clone(),
+                }),
+                None,
+            )
+            .is_err()
         );
         // A snooze leaves the cursor alone, so the messages the user has not
         // handled are still theirs when it ends, and records where the unit

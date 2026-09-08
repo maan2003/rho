@@ -576,10 +576,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
 - [x] 2.20 Mute on a Slack unit is a cursor plus `State(Muted)` plus the
-      source's own silence. Superseded in part 8 Sep: the cursor is rho's
-      own half in the Slack mirror, not a store cell, so a mute writes
-      `State(Muted)` here and moves the cursor there. Everything else in
-      this item stands. Landed 4 Sep (b8os): `Verdict::Mute` writes both
+      source's own silence. Superseded 8 Sep: nothing of a mute is written
+      here. The cursor is rho's own half in the Slack mirror, and the mute
+      itself is Slack's -- `Session::set_unit_muted` writes Slack's
+      `muted_channels` preference for a channel or direct message,
+      `ignore_thread` unfollows a thread, and the card closes because the
+      crate has stopped asking. `shift-u` is the same call inverted;
+      opening a unit no longer unmutes it, which it used to do for the user
+      in every client they read Slack in. `State(Muted)` cells already in
+      the store stay, unread. Tests moved with it, to
+      `rho-gui/src/slack_tests.rs`:
+      `a_mute_is_made_in_slack_and_undone_there` and
+      `a_thread_unfollowed_in_slack_closes_its_card`, both against the
+      fake. Landed 4 Sep (b8os): `Verdict::Mute` writes both
       facts, the derived card reads a stored `Muted` before it compares the
       cursor, opening the unit (from a card or from the list) clears the
       state and leaves the cursor, and `x` on a conversation unit marks it

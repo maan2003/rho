@@ -470,24 +470,24 @@ fn rho_wrote_of_unit(facts: &Facts) -> bool {
         || facts.created_at.is_some()
 }
 
-fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
+fn slack_card(id: &Id, sources: &Sources) -> Option<SlackCard> {
     let Id::Slack(unit) = id else {
         return None;
     };
     let source = sources.unit(unit)?;
     Some(SlackCard {
-        // A mute is the one verdict the cursor cannot express: the user said
-        // "not this unit", not "not up to here", so nothing arriving past the
-        // cursor reopens it. Opening the unit is what clears the state.
-        state: match (facts.state, source.reason) {
-            (State::Muted, _) => State::Muted,
-            // The crate's answer is the whole of it (8 Sep): the reason it
-            // sends is already the join of rho's own cursor and Slack's read
-            // mark, so a second comparison here could only disagree with it.
-            // No reason is nothing owed -- read on the phone, dealt with by
-            // `d`, or ordinary traffic in a channel that has gone quiet.
-            (_, None) => State::Done,
-            (_, Some(_)) => State::Open,
+        // The crate's answer is the whole of it (8 Sep): the reason it
+        // sends is already the join of rho's own cursor and Slack's read
+        // mark, and of Slack's mute and follow list, so a second comparison
+        // here could only disagree with it. No reason is nothing owed --
+        // read on the phone, dealt with by `d`, muted or unfollowed in
+        // Slack, or ordinary traffic in a channel that has gone quiet. The
+        // store's own state is not consulted: a mute on a unit is Slack's,
+        // and the `State(Muted)` cells older versions wrote are read by
+        // nothing.
+        state: match source.reason {
+            None => State::Done,
+            Some(_) => State::Open,
         },
     })
 }
@@ -1027,7 +1027,7 @@ impl DeskCells {
     fn node_facts(&self, host: HostId, id: &Id) -> Option<DeskNode> {
         let desk = self.hosts.get(&host)?;
         let fact = desk.view.facts(id);
-        let slack = slack_card(id, &fact, &desk.sources);
+        let slack = slack_card(id, &desk.sources);
         let agent = agent_card(id, &fact, &desk.sources);
         Some(DeskNode {
             id: id.clone(),
@@ -1117,7 +1117,7 @@ impl DeskCells {
                 .then(|| place(id, fact, sources))
                 .flatten()
                 .filter(|parent| !desk.view.facts(parent).deleted);
-            let slack = slack_card(id, fact, sources);
+            let slack = slack_card(id, sources);
             let agent = agent_card(id, fact, sources);
             nodes.insert(
                 id.clone(),

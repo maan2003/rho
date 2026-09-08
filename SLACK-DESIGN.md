@@ -169,6 +169,17 @@ and a thread the user is done with is unfollowed in Slack. There is no rho
 mute cell for a unit, and following is Slack's too. A unit muted in Slack
 makes no card and no attention.
 
+Landed 8 Sep: `x` on a Slack card calls `Session::set_unit_muted` for a
+conversation, which writes Slack's own `muted_channels` preference
+(`users.prefs.set`, the whole list, as the web client sends it), and
+`ignore_thread` for a thread. Neither writes a cell, so the verdict is
+taken locally like a done and `shift-u` is the same call inverted -- there
+is nothing else to take back. The `State(Muted)` cells older versions
+wrote stay in the store unread, as the cursor cells do. Two things went
+with the cell: `clear_slack_mute`, which unmuted for the user everywhere
+the moment they opened a unit here, and the read mark rho used to send in
+place of a mute, which told Slack the user had read what they had not.
+
 **There is no watch.** The watch opt-in, its `w` key and its
 `WatchedChannel` attention reason are deleted, and with them the mirror's
 record of which channels were opted into. Every channel with unread

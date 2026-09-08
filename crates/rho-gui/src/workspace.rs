@@ -7411,13 +7411,14 @@ impl Workspace {
         else {
             return;
         };
-        // A discarded thread was ignored in Slack, so taking the verdict
-        // back means following it again there; the card is dealt as before
-        // once it is the user's again.
+        // A muted unit was muted in Slack, so taking the verdict back
+        // means unmuting it there: a thread is followed again, a channel
+        // or direct message is unmuted. Nothing else brings the card back,
+        // because nothing else was written.
         if matches!(verdict, crate::dashboard::DealerVerdict::Mute)
-            && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
+            && let Some(unit) = self.dashboard.card_thread(card.identity.clone())
         {
-            self.slack_follow_thread(&thread, cx);
+            self.slack_set_unit_muted(&unit, false, cx);
         }
         self.dashboard.clear_skip(&card.identity);
         rho_journal::record(rho_journal::Event::VerdictUndone {
@@ -7431,25 +7432,6 @@ impl Workspace {
         );
         self.open_card(*card, window, cx);
         self.refresh_dashboard(cx);
-    }
-
-    /// Closes a thread card because Slack said the thread is not the user's
-    /// any more. No undo entry: the verdict was made in another client, and
-    /// `shift-u` here could not take it back there.
-    pub(crate) fn mute_thread_card(
-        &mut self,
-        card: crate::dashboard::DealCardId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((writes, verdict)) = self.desk_cells.verdict_writes(
-            card.host,
-            &card.node_id,
-            crate::desk_view::DeskVerdict::Mute,
-        ) else {
-            return;
-        };
-        self.apply_desk_writes(card.host, writes, Some(verdict), window, cx);
     }
 
     /// Writes a done verdict on each node and leaves one undo entry for the
@@ -7645,15 +7627,16 @@ impl Workspace {
             crate::desk_view::DeskVerdict::Todo { .. } => rho_journal::PhoneVerdict::Todo,
             crate::desk_view::DeskVerdict::File { .. } => rho_journal::PhoneVerdict::File,
         });
-        // `x` on a Slack card silences the unit in Slack too: the same
-        // keystroke that closes the card here stops Slack raising it
-        // anywhere else, by unfollowing a thread or marking a conversation
-        // read.
+        // `x` on a Slack card is a mute in Slack and nothing here: a
+        // thread is unfollowed, a channel or direct message is muted, and
+        // the card closes because Slack has stopped asking. The room
+        // snooze (`target_node`) is a verdict on the room and not on the
+        // unit, so it is left alone.
         if matches!(dealt, crate::desk_view::DeskVerdict::Mute)
             && target_node.is_none()
             && let Some(unit) = self.dashboard.card_thread(card.identity.clone())
         {
-            self.slack_silence_unit(&unit, cx);
+            self.slack_set_unit_muted(&unit, true, cx);
         }
         // A verdict names the card it took, not the place the card was
         // filed. The breadcrumb is the path above an agent's card, so `done`
@@ -7682,11 +7665,14 @@ impl Workspace {
                 .collect(),
             _ => Vec::new(),
         };
-        // Done on a Slack unit writes no cell: the cursor above is the
-        // whole verdict, so there is no mutation to wait on and the card
-        // leaves now rather than a round trip later.
-        if matches!(dealt, crate::desk_view::DeskVerdict::Done)
-            && matches!(node_id, rho_desk::cells::Id::Slack(_))
+        // Done and mute on a Slack unit write no cell: the cursor above
+        // and what Slack was just told are the whole verdict, so there is
+        // no mutation to wait on and the card leaves now rather than a
+        // round trip later.
+        if matches!(
+            dealt,
+            crate::desk_view::DeskVerdict::Done | crate::desk_view::DeskVerdict::Mute
+        ) && matches!(node_id, rho_desk::cells::Id::Slack(_))
         {
             let mut undo = self.next_verdict_undo(
                 verb,

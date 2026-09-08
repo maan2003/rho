@@ -499,10 +499,6 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        // Before anything else, because this is the user looking at the unit
-        // whether or not the surface opens: a mute they take back must not
-        // depend on the session being up.
-        self.clear_slack_mute(unit, window, cx);
         let Some(session) = self.slack_session(window, cx) else {
             return false;
         };
@@ -538,13 +534,11 @@ impl Workspace {
             return;
         };
         self.active_context = ContextId::Slack;
-        // Looking at a unit is the user taking their mute back: the mute
-        // said "not this unit", and opening it says otherwise. Nothing else
-        // clears it, so a muted unit nobody opens stays quiet however much
-        // arrives in it. Here as well as in `open_slack_deal` because a
-        // muted unit is off the board, so the list is how it is reached.
-        let unit = unit_of_source(session.read(cx).model().workspace(), &source);
-        self.clear_slack_mute(&unit, window, cx);
+        // Opening a muted unit no longer takes the mute back (8 Sep): the
+        // mute is Slack's, and rho unmuting a conversation because the
+        // reader looked at it would be rho changing something of theirs
+        // that every other client reads. `shift-u` on the verdict is the
+        // way back, and so is unmuting in Slack.
         let key = SurfaceKey::SlackConversation(source.clone());
         self.slack_labels
             .insert(source.clone(), session.read(cx).label(&source));
@@ -1082,53 +1076,28 @@ impl Workspace {
 
     /// `s`: narrow the listing to what the user types. The prompt is the
     /// search, so there is nothing extra to dismiss afterwards.
-    /// Puts a muted unit back on the board. Only the muted state is
-    /// written: the cursor the mute left stands, so what the user had
-    /// already read does not come back with it.
-    fn clear_slack_mute(
+    /// A mute, which is Slack's (8 Sep): a thread is unfollowed there and a
+    /// channel or direct message is muted there. Rho writes no cell for it
+    /// -- a private copy drifted the moment the user muted or unmuted
+    /// anywhere else -- so this call is the whole verdict, and `shift-u`
+    /// is the same call the other way.
+    pub(crate) fn slack_set_unit_muted(
         &mut self,
         unit: &SlackUnit,
-        window: &mut gpui::Window,
+        muted: bool,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(host) = self.hosts.primary() else {
-            return;
-        };
-        let muted = self
-            .desk_cells
-            .facts_of_slack_unit(Some(host), unit)
-            .is_some_and(|facts| facts.state == rho_desk::cells::State::Muted);
-        if !muted {
-            return;
+        match (unit.thread.is_some(), muted) {
+            (true, true) => self.slack_ignore_thread(unit, cx),
+            (true, false) => self.slack_follow_thread(unit, cx),
+            (false, _) => {
+                let Some(session) = self.slack.session() else {
+                    return;
+                };
+                let unit = model_unit(unit);
+                session.update(cx, |session, cx| session.set_unit_muted(&unit, muted, cx));
+            }
         }
-        let writes = vec![rho_desk::cells::CellWrite {
-            id: rho_desk::cells::Id::Slack(unit.clone()),
-            property: rho_desk::cells::Property::State(rho_desk::cells::State::Open),
-        }];
-        self.apply_desk_writes(host, writes, None, window, cx);
-    }
-
-    /// The silence a mute asks Slack for. A mute is a verdict on the unit
-    /// here; without this the user's phone still lights up for something
-    /// they have already dealt with. A thread is unfollowed, and a
-    /// conversation, which has no subscription to drop, is marked read.
-    pub(crate) fn slack_silence_unit(&mut self, unit: &SlackUnit, cx: &mut gpui::Context<Self>) {
-        match unit.thread.is_some() {
-            true => self.slack_ignore_thread(unit, cx),
-            false => self.slack_mark_unit_read(unit, cx),
-        }
-    }
-
-    /// Marks a muted conversation read in Slack, at whatever rho knows to be
-    /// its newest message. Undo does not unread it: Slack has no way back
-    /// from a read marker, and the card coming back here is what the user
-    /// asked for.
-    fn slack_mark_unit_read(&mut self, unit: &SlackUnit, cx: &mut gpui::Context<Self>) {
-        let Some(session) = self.slack.session() else {
-            return;
-        };
-        let unit = model_unit(unit);
-        session.update(cx, |session, cx| session.mark_unit_read(&unit, cx));
     }
 
     /// `x` on a thread card is Slack's ignore thread: rho's mute is the
@@ -1164,15 +1133,12 @@ impl Workspace {
     }
 
     /// The other direction: Slack says the thread was unfollowed, here or
-    /// anywhere else, so the card is muted. An already closed card has
-    /// nothing to do, which is also what stops rho's own `x` from writing
-    /// the verdict twice when the socket echoes it back.
-    pub(crate) fn slack_thread_muted(
-        &mut self,
-        unit: &SlackUnit,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
+    /// anywhere else. The card closes on its own, because the follow list
+    /// is what says the thread is the user's and the crate reads it; all
+    /// that is left here is the record of who did it. An already closed
+    /// card has nothing to record, which is what stops rho's own `x` from
+    /// writing the line twice when the socket echoes it back.
+    pub(crate) fn slack_thread_muted(&mut self, unit: &SlackUnit, cx: &mut gpui::Context<Self>) {
         let Some(key) = thread_key(unit) else {
             return;
         };
@@ -1192,7 +1158,7 @@ impl Workspace {
             thread,
             by: rho_journal::IgnoredBy::Slack,
         });
-        self.mute_thread_card(card, window, cx);
+        self.refresh_dashboard(cx);
     }
 
     /// `mark read before`: the backlog older than a cutoff, marked read in
@@ -1576,7 +1542,7 @@ impl Workspace {
                         // card closes here without asking.
                         Change::Muted(unit) => {
                             let unit = store_unit(session.read(cx).model().workspace(), unit);
-                            self.slack_thread_muted(&unit, window, cx);
+                            self.slack_thread_muted(&unit, cx);
                         }
                         Change::Replied(_) => {}
                     }

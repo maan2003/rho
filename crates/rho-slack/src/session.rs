@@ -2090,26 +2090,35 @@ impl Session {
         }
     }
 
-    /// The conversation half of a mute: a thread is unfollowed, and a
-    /// conversation has nothing to unfollow, so the read marker at its
-    /// newest message is what stops every other client raising it. Unlike
-    /// `mark_read` this does not need the conversation on screen: a unit is
-    /// muted from a card, which the user has not opened.
-    pub fn mark_unit_read(&mut self, unit: &crate::model::Unit, cx: &mut Context<Self>) {
+    /// The conversation half of a mute (8 Sep): a thread is unfollowed and
+    /// a channel or direct message is muted in Slack, which is where a
+    /// mute lives. Rho keeps no mute of its own -- no cell, no mirror row
+    /// -- so the set sent is the one Slack last gave, with this
+    /// conversation added or dropped, and the model takes it at once so
+    /// the card closes now. A failure leaves rho saying what Slack says at
+    /// the next connect, which is the point of not keeping a copy.
+    ///
+    /// This used to mark the conversation read instead. That was rho
+    /// telling Slack the user had read something they had not, to get
+    /// silence Slack has a word for.
+    pub fn set_unit_muted(
+        &mut self,
+        unit: &crate::model::Unit,
+        muted: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let Some(latest) = self.model.unit(unit).map(|facts| facts.newest.clone()) else {
-            return;
-        };
         let channel = unit.channel.clone();
-        self.note_read(&Source::Conversation(channel.clone()), &latest);
+        self.model.set_channel_muted(&channel, muted);
         cx.notify();
+        let wanted = self.model.muted().iter().cloned().collect::<Vec<_>>();
         let task =
-            gpui_tokio::Tokio::spawn(cx, async move { client.mark_read(&channel, &latest).await });
+            gpui_tokio::Tokio::spawn(cx, async move { client.set_muted_channels(&wanted).await });
         self._tasks.push(cx.spawn(async move |this, cx| {
             if let Ok(Err(error)) = task.await {
-                tracing::warn!(error = %error, "slack mark-read failed");
+                tracing::warn!(error = %error, "slack mute failed");
             }
             let _ = this.update(cx, |_, cx| cx.notify());
         }));

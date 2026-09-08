@@ -7692,25 +7692,6 @@ impl DeskFixture {
         id
     }
 
-    /// A conversation unit: a direct message or a channel someone mentioned
-    /// the user in, which is a card in its own right rather than a thread.
-    fn conversation_row(
-        &mut self,
-        parent: Option<rho_desk::cells::Id>,
-        channel: &str,
-        newest: &str,
-    ) -> rho_desk::cells::Id {
-        let unit = rho_desk::cells::SlackUnit {
-            workspace: "acme".to_owned(),
-            channel: channel.to_owned(),
-            thread: None,
-        };
-        self.slack_units.push((unit.clone(), newest.to_owned()));
-        let id = rho_desk::cells::Id::Slack(unit);
-        self.file(id.clone(), parent);
-        id
-    }
-
     /// What the mirror says about the rows `thread_row` made: every unit
     /// has one message from someone else and nothing handled yet, which is
     /// the state a card is dealt in.
@@ -9006,87 +8987,11 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
 // in rho-slack's transport tests, in
 // `a_mark_from_another_client_lands_here_and_survives_a_reconnect`.
 
-/// A mute is not a cursor. `d` says "up to here", so the next message is
-/// news again; `x` says "not this unit", and nothing arriving in it is
-/// news until the user opens it. Opening is the only thing that clears it,
-/// and it leaves the cursor alone, so what was already read stays read.
-#[gpui::test]
-fn a_muted_slack_unit_stays_off_home_until_it_is_opened(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let node = desk.conversation_row(None, "D1", "600.0");
-    let unit = rho_desk::cells::SlackUnit {
-        workspace: "acme".to_owned(),
-        channel: "D1".to_owned(),
-        thread: None,
-    };
-    let card = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id: node.clone(),
-    };
-    let source = |newest: &str| {
-        vec![crate::desk_view::SlackSource {
-            unit: rho_desk::cells::SlackUnit {
-                workspace: "acme".to_owned(),
-                channel: "D1".to_owned(),
-                thread: None,
-            },
-            title: "lunch?".to_owned(),
-            newest: rho_desk::cells::SlackTs(newest.to_owned()),
-            newest_from_other: Some(rho_desk::cells::SlackTs(newest.to_owned())),
-            reason: Some(rho_slack::model::Attention::FollowedThread),
-        }]
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
-            assert!(workspace.dashboard.node_is_open(card.clone()));
-
-            assert!(workspace.apply_verdict_for_test(
-                HostId::default(),
-                &node,
-                crate::desk_view::DeskVerdict::Mute,
-                window,
-                cx,
-            ));
-            // The state is the whole of what a mute writes: where the
-            // reader is done is rho's own cursor beside Slack's mark, and
-            // both of those are the Slack mirror's.
-            let facts = workspace
-                .desk_cells
-                .facts_of_slack_unit(Some(HostId::default()), &unit)
-                .unwrap();
-            assert_eq!(facts.slack_handled_through, None);
-            assert_eq!(
-                facts.state,
-                rho_desk::cells::State::Muted,
-                "and it says the unit itself is not wanted"
-            );
-
-            // Someone writes again. A done would be a card here.
-            workspace.set_slack_sources_for_test(HostId::default(), source("900.0"), window, cx);
-            assert!(
-                !workspace.dashboard.node_is_open(card.clone()),
-                "the mute is about the unit, not about a cursor"
-            );
-
-            // Opening it is the user taking the mute back.
-            workspace.open_slack_deal(&unit, window, cx);
-            let facts = workspace
-                .desk_cells
-                .facts_of_slack_unit(Some(HostId::default()), &unit)
-                .unwrap();
-            assert_eq!(facts.state, rho_desk::cells::State::Open);
-            workspace.set_slack_sources_for_test(HostId::default(), source("900.0"), window, cx);
-            assert!(
-                workspace.dashboard.node_is_open(card),
-                "the message that arrived while it was muted is a card again"
-            );
-        })
-        .unwrap();
-}
+// `a_muted_slack_unit_stays_off_home_until_it_is_opened` was here. A mute
+// on a Slack unit is Slack's now, not a cell: the unit is muted there and
+// the card closes because the crate has stopped asking. Against a real
+// session and the fake in `slack_tests.rs`,
+// `a_mute_is_made_in_slack_and_undone_there`.
 
 /// Two agents filed under one note are two cards. Taking the note as the
 /// topic collapsed them into one, so every agent under a note but the
@@ -9309,117 +9214,14 @@ fn a_todo_writes_every_change_its_entry_states(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// Undoing a mute puts the state back, which is what the mute wrote here.
-/// The cursor it moved is the Slack mirror's and goes back with it, which
-/// is `undo_handled` in rho-slack; the Slack half, following the thread
-/// again, is `undoing_a_discard_follows_the_thread_again` in that crate's
-/// transport tests.
-#[gpui::test]
-fn undoing_a_mute_puts_the_unit_back_as_it_was(cx: &mut TestAppContext) {
-    let mut desk = DeskFixture::new();
-    let node = desk.thread_row(None, "C1", "500.0");
-    let unit = rho_desk::cells::SlackUnit {
-        workspace: "acme".to_owned(),
-        channel: "C1".to_owned(),
-        thread: Some("500.0".to_owned()),
-    };
-    let card = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id: node.clone(),
-    };
+// `undoing_a_mute_puts_the_unit_back_as_it_was` was here. There is no
+// state to put back: undoing a mute unmutes in Slack, which is the second
+// half of `a_mute_is_made_in_slack_and_undone_there` in `slack_tests.rs`.
 
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(
-                HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            let (writes, event) = workspace
-                .desk_cells
-                .verdict_writes(
-                    HostId::default(),
-                    &node,
-                    crate::desk_view::DeskVerdict::Mute,
-                )
-                .expect("the unit has a source, so it can take a verdict");
-            let stamp = workspace
-                .apply_desk_writes(HostId::default(), writes, Some(event), window, cx)
-                .expect("the mute is written");
-            assert!(!workspace.dashboard.node_is_open(card.clone()));
-
-            let (writes, _) = workspace
-                .desk_cells
-                .undo_verdict_writes(HostId::default(), &node, stamp)
-                .expect("the verdict left an entry to undo");
-            workspace.apply_desk_writes(HostId::default(), writes, None, window, cx);
-            let facts = workspace
-                .desk_cells
-                .facts_of_slack_unit(Some(HostId::default()), &unit)
-                .unwrap();
-            assert_eq!(facts.state, rho_desk::cells::State::Open);
-            workspace.set_slack_sources_for_test(
-                HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            assert!(
-                workspace.dashboard.node_is_open(card),
-                "the card comes back exactly as it was"
-            );
-        })
-        .unwrap();
-}
-
-/// A thread ignored in another client stops being the user's everywhere:
-/// Slack says so on the socket, and the card closes here without a keystroke
-/// and without an undo entry, because `shift-u` could not take it back in
-/// Slack either.
-#[gpui::test]
-fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
-    use rho_slack::{ChannelId, Ts, WorkspaceName};
-
-    let mut desk = DeskFixture::new();
-    let thread = desk.thread_row(None, "C1", "500.0");
-    let unit = crate::slack::store_unit_of(&rho_slack::ThreadKey {
-        workspace: WorkspaceName("acme".to_owned()),
-        channel: ChannelId("C1".to_owned()),
-        thread_ts: Ts("500.0".to_owned()),
-    });
-    let card = crate::dashboard::DealCardId {
-        host: HostId::default(),
-        node_id: thread,
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.set_slack_sources_for_test(
-                HostId::default(),
-                desk.slack_sources(),
-                window,
-                cx,
-            );
-            assert!(workspace.dashboard.node_is_open(card.clone()));
-
-            workspace.slack_thread_muted(&unit, window, cx);
-            assert!(
-                !workspace.dashboard.node_is_open(card),
-                "the card closes on Slack's word"
-            );
-            assert_eq!(
-                workspace.verdict_undo_count_for_test(),
-                0,
-                "a verdict made in another client is not this one's to undo"
-            );
-        })
-        .unwrap();
-}
+// `a_thread_unfollowed_in_slack_closes_its_card` was here. The card closes
+// because the crate drops the thread from Slack's follow list, not because
+// anything is written, so the test needs a session: it is the one of the
+// same name in `slack_tests.rs`.
 
 /// A body is text: enter is a newline on the map and on the note surface
 /// alike. Both used to fall through to the transcript prompt's submit

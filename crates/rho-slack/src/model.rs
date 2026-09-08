@@ -707,6 +707,26 @@ impl Model {
         }
     }
 
+    /// The muted set as rho last heard it from Slack.
+    pub fn muted(&self) -> &BTreeSet<ChannelId> {
+        &self.muted
+    }
+
+    /// The user's own mute, made here rather than heard from Slack. Slack
+    /// is told separately and its answer replaces this at the next
+    /// connect; this is what closes the card before the round trip, and
+    /// the reason rho keeps no mute of its own anywhere else.
+    pub fn set_channel_muted(&mut self, channel: &ChannelId, muted: bool) {
+        let changed = match muted {
+            true => self.muted.insert(channel.clone()),
+            false => self.muted.remove(channel),
+        };
+        if changed {
+            self.refresh_channel(channel);
+            self.reindex(channel);
+        }
+    }
+
     /// Moves the list's own counters for a message off the socket. This is
     /// every message, not only the ones that raise a card: the list names
     /// the whole workspace, and without this its badges sit at whatever

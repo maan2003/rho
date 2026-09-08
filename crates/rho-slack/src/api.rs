@@ -653,6 +653,26 @@ impl Client {
             .collect())
     }
 
+    /// Mutes, or unmutes, conversations for the user everywhere they read
+    /// Slack. Slack keeps the muted set as one preference string rather
+    /// than a flag on each conversation, so the write is the whole list --
+    /// which is what the web client sends too. The caller reads the set
+    /// rho already has from `users.prefs.get` and hands back the one it
+    /// wants; nothing here remembers it.
+    pub async fn set_muted_channels(&self, channels: &[ChannelId]) -> anyhow::Result<()> {
+        let value = channels
+            .iter()
+            .map(|channel| channel.0.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.post_form(
+            "users.prefs.set",
+            &[("name", "muted_channels".to_owned()), ("value", value)],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_read(&self, channel: &ChannelId, ts: &Ts) -> anyhow::Result<()> {
         self.post_form(
             "conversations.mark",

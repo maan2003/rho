@@ -209,8 +209,11 @@ the same rule in a different file (8 Sep): its cursor is rho's own half of
 a join with Slack's read mark, both halves live in the Slack mirror, and
 `d` on a unit writes no cell at all, and a unit is a node here only while
 it carries a cell Slack has no place for -- a filing, a name, labels,
-About, a snooze, a mute, a dismissal -- so the cursor cells older versions
-left behind are read by nothing and shown by nothing.
+About, a filing, a dismissal -- so the cursor cells older versions left
+behind are read by nothing and shown by nothing. A mute on a unit is not
+one of them (8 Sep): a channel or direct message is muted in Slack and a
+thread is unfollowed there, so the `State(Muted)` cells older versions
+wrote are left in the store unread too.
 `SLACK-DESIGN.md`, "How a Slack unit sits in rho". The card is
 open again the moment the source has an event that wants the user past
 the cursor (a reply from them, an agent turn ending on a question or a
@@ -221,9 +224,11 @@ label and no `:archived:` stamp line in a note body.
 `x` mute (the verdict formerly called discard; renamed 4 Sep because
 what it does is stop the thing from raising its hand): the cursor,
 plus `state := muted` so the thing stays out of Home even when it
-speaks again until the user opens it, plus the
-source's own silence where it has one (a thread unfollowed, a
-conversation marked read). `s` snooze:
+speaks again until the user opens it. For a Slack unit there is no cell
+at all (8 Sep): the mute is made where the source keeps it, a channel or
+direct message muted in Slack and a thread unfollowed, and the card
+closes because Slack has stopped asking. Undo is the same call the other
+way, which is the only thing that brings the unit back. `s` snooze:
 `defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file: a
 label path adds `Labeled(label)`, created if new, or takes it off if
 already there. `u` undo: the log entry

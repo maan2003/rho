@@ -2373,3 +2373,161 @@ fn a_unit_carrying_only_the_old_done_cursor_is_not_on_the_map(cx: &mut TestAppCo
         })
         .unwrap();
 }
+
+/// A mute is Slack's (8 Sep): a channel or direct message is muted there,
+/// and rho writes no cell of its own. The card closes because Slack has
+/// stopped asking -- the crate reads the muted set -- and `shift-u` unmutes
+/// there, which is the only thing that brings it back. Before this the mute
+/// was a `State(Muted)` cell that drifted the moment the user muted or
+/// unmuted in another client, and opening the unit here silently unmuted it
+/// for them everywhere.
+///
+/// Was: `tests.rs`, `a_muted_slack_unit_stays_off_home_until_it_is_opened`
+/// and `undoing_a_mute_puts_the_unit_back_as_it_was`, both against the cell.
+#[gpui::test]
+async fn a_mute_is_made_in_slack_and_undone_there(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+    use rho_slack::model::Attention;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000100.000000", "user": "UA", "text": "are you around?"}),
+    );
+    let unit = slack_unit("D1", None);
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.slack_set_unit_muted(&unit, true, cx);
+        })
+        .unwrap();
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        None,
+        "the card closes at once, before Slack has answered"
+    );
+    assert_eq!(
+        wait_for_muted(cx, &fake, &["D1"]).await,
+        vec!["D1".to_owned()],
+        "and Slack is the one holding the mute"
+    );
+
+    // `shift-u`: the same call the other way, because nothing else was
+    // written for an undo to take back.
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.slack_set_unit_muted(&unit, false, cx);
+        })
+        .unwrap();
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        Some(Attention::DirectMessage),
+        "the message that arrived is waiting again"
+    );
+    assert_eq!(
+        wait_for_muted(cx, &fake, &[]).await,
+        Vec::<String>::new(),
+        "and Slack has been told the mute is off"
+    );
+}
+
+/// A thread ignored in another client stops being the user's everywhere.
+/// Slack says so on the socket, the crate drops it from the follow list,
+/// and the card closes with nothing written and no undo entry -- `shift-u`
+/// here could not take it back in Slack either.
+///
+/// Was: `tests.rs`, `a_thread_unfollowed_in_slack_closes_its_card`, which
+/// closed the card by writing a mute cell on Slack's word.
+#[gpui::test]
+async fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.follow_thread("C1", "1800000000.000000");
+
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C1",
+        "ts": "1800000200.000000",
+        "thread_ts": "1800000000.000000",
+        "user": "UA",
+        "text": "any update?",
+    }));
+    let unit = slack_unit("C1", Some("1800000000.000000"));
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+
+    // Another client's unfollow, as Slack sends it.
+    fake.push_frame(serde_json::json!({
+        "type": "thread_unsubscribed",
+        "subscription": {
+            "type": "thread",
+            "channel": "C1",
+            "thread_ts": "1800000000.000000",
+            "last_read": "0000000000.000000",
+        },
+    }));
+    for _ in 0..300 {
+        cx.run_until_parked();
+        if reason_of(&workspace, cx, &unit).is_none() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        reason_of(&workspace, cx, &unit),
+        None,
+        "the thread is not the user's any more, so the card is gone"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .verdict_undo_count_for_test())
+            .unwrap(),
+        0,
+        "a verdict made in another client is not this one's to undo"
+    );
+}
+
+/// Waits until Slack's muted set is what the caller expects, or says what
+/// it was instead. The mute crosses a real socket, so a parked executor
+/// says nothing about whether it has arrived.
+async fn wait_for_muted(
+    cx: &mut TestAppContext,
+    fake: &rho_slack::fake::Fake,
+    wanted: &[&str],
+) -> Vec<String> {
+    let wanted = wanted.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    for _ in 0..300 {
+        cx.run_until_parked();
+        if fake.muted() == wanted {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    fake.muted()
+}

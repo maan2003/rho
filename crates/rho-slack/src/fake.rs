@@ -508,6 +508,12 @@ impl Fake {
             .unwrap_or_default()
     }
 
+    /// What Slack now holds as the user's muted conversations, whether the
+    /// test put them there or a mute from rho did.
+    pub fn muted(&self) -> Vec<String> {
+        self.state.lock().unwrap().muted.clone()
+    }
+
     pub fn calls(&self, method: &str) -> usize {
         self.state
             .lock()
@@ -1292,6 +1298,19 @@ fn handle(
             "ok": true,
             "prefs": {"muted_channels": state.muted.join(",")},
         }),
+        // Muting is a preference and the preference is one string, so a
+        // mute replaces the whole list. Slack answers the next `get` with
+        // whatever was set here, which is what a client that keeps no copy
+        // of its own reads back.
+        "users.prefs.set" if field("name") == "muted_channels" => {
+            state.muted = field("value")
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .collect();
+            json!({"ok": true})
+        }
         // Slack's own client sends this when a reader leaves a thread; it is
         // the only way to quiet a thread's unread badge without posting.
         // The cursor it moves is the thread's own — the conversation around

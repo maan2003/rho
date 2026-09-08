@@ -564,7 +564,12 @@ pub enum Event {
         workspace: String,
         reason: String,
     },
-    /// A Slack thread started to matter, so it has a node in the tree.
+    /// Retired: nothing writes this. A thread that starts to matter needs
+    /// no node -- a Slack unit is a virtual node and rho writes nothing on
+    /// attention -- so the event it recorded no longer happens. The
+    /// variant stays because a journal already on disk decodes by variant
+    /// order, and taking one out of the middle would misread every file
+    /// that has one.
     SlackThreadBound {
         thread: SlackThread,
         node_id: NodeIdentity,
