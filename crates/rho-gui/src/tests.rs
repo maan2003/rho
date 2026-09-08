@@ -11560,3 +11560,70 @@ fn a_running_row_is_not_drawn_before_the_desk_that_holds_its_verdict(cx: &mut Te
     let text = buffer_text(&workspace, cx);
     assert!(text.contains("running"), "home text: {text:?}");
 }
+
+/// The other half of the cold-open question: a card that did go out and
+/// is then put down by the store. The hand is derived from the dealer's
+/// cards every time it is asked, and a desk that arrives takes the host's
+/// cards whole, so the card is not sticky — it is re-derived away rather
+/// than left standing in the queue.
+#[gpui::test]
+fn a_dealt_card_leaves_the_hand_when_the_desk_says_it_was_put_down(cx: &mut TestAppContext) {
+    let waiting = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, waiting);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(vec![ui_head(waiting)], 40),
+                window,
+                cx,
+            );
+            story::feed(
+                workspace,
+                HostId::default(),
+                story_wanting(waiting, UnixMs(1)),
+                window,
+                cx,
+            );
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let dealt = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .hand(cx)
+                    .cards
+                    .iter()
+                    .filter_map(|card| card.agent_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    assert_eq!(dealt(cx), vec![waiting], "the desk said nothing, so it deals");
+
+    // The user's snooze, arriving from the store after the card went out.
+    desk.set(
+        rho_desk::cells::Id::Agent(waiting),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 4_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        dealt(cx).is_empty(),
+        "a dealt card does not outlive the verdict that put it down"
+    );
+}
