@@ -579,3 +579,127 @@ fn a_block_survives_an_edit_that_is_not_its_own(cx: &mut TestAppContext) {
         "the picture goes with the message it was under"
     );
 }
+
+/// Every block the sheet says it placed is one the editor is holding,
+/// after every splice and not only the first.
+///
+/// A probe, written for a fault reported off the user's machine: the block
+/// map syncing on a buffer event and finding a block range past the end of
+/// the wrapped text. The sheet cannot answer this about itself, because
+/// two of its steps are silent. A block whose anchor the multi buffer will
+/// not resolve is dropped where it is placed, so the records can be ahead
+/// of the editor; and a block placed on a row that later text does not
+/// reach is nothing until something asks for the display. So this asks:
+/// after each splice it takes the display snapshot, which is what syncs
+/// the block map and where that fault lands, and then counts -- every id
+/// the sheet holds for a key is a block the snapshot lists, and no key
+/// holds more ids than the item it belongs to has blocks.
+#[gpui::test]
+fn every_block_the_sheet_records_is_one_the_editor_is_holding(cx: &mut TestAppContext) {
+    use editor::display_map::{BlockId, DisplayRow};
+
+    init_editor(cx);
+    let (buffer, editor) = on_screen(cx);
+    let mut sheet = Sheet::new(buffer.clone());
+
+    let with_picture = |key: &str, text: &str, line: u32| {
+        item(key, text).with_blocks(vec![crate::BlockSpec {
+            line,
+            height: 4,
+            render: std::sync::Arc::new(|_| gpui::Empty.into_any_element()),
+            priority: 0,
+        }])
+    };
+    let held = |sheet: &Sheet, keys: &[&str], cx: &mut TestAppContext, at: &str| {
+        // Taking the display snapshot is what syncs the block map, so the
+        // fault this probe is for lands here rather than in an assertion.
+        let placed = editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let end = DisplayRow(snapshot.max_point().row().0 + 1);
+            snapshot
+                .blocks_in_range(DisplayRow(0)..end)
+                .filter_map(|(_, block)| match block.id() {
+                    BlockId::Custom(id) => Some(id),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+        });
+        for key in keys {
+            let ids = sheet.block_ids(&(*key).to_owned());
+            assert_eq!(ids.len(), 1, "{at}: {key} lost or doubled its block");
+            for id in ids {
+                assert!(
+                    placed.contains(&id),
+                    "{at}: the sheet holds {id:?} for {key} and the editor does not"
+                );
+            }
+        }
+    };
+
+    cx.update(|cx| {
+        sheet.insert_before(
+            None,
+            vec![
+                with_picture("a", "alice hello\n", 0),
+                with_picture("b", "bob hello\nand again\n", 1),
+            ],
+            cx,
+        );
+        sheet.attach(&editor, cx);
+    });
+    held(&sheet, &["a", "b"], cx, "the first fill");
+
+    // A replacement that makes an item shorter: the block was on the second
+    // line of what was there, and there is no second line now.
+    cx.update(|cx| sheet.replace(&"b".to_owned(), with_picture("b", "bob hello\n", 0), cx));
+    held(
+        &sheet,
+        &["a", "b"],
+        cx,
+        "an item loses the line its block sat on",
+    );
+
+    // And one that makes it longer again, above another item's block.
+    cx.update(|cx| {
+        sheet.insert_before(None, vec![with_picture("c", "carol hello\n", 0)], cx);
+        sheet.replace(
+            &"a".to_owned(),
+            with_picture("a", "alice hello\nand more\nand more\n", 2),
+            cx,
+        );
+    });
+    held(
+        &sheet,
+        &["a", "b", "c"],
+        cx,
+        "an item grows under its neighbours",
+    );
+
+    // The last item goes, so the buffer's end moves up past where a block
+    // was: the shape the fault report is about.
+    cx.update(|cx| sheet.remove(&"c".to_owned(), cx));
+    held(&sheet, &["a", "b"], cx, "the end of the buffer moves up");
+    assert!(
+        sheet.block_ids(&"c".to_owned()).is_empty(),
+        "and the block of the item that went is not still recorded"
+    );
+
+    // A block asked for on a line its own item does not have. The row is
+    // clamped where it is placed, and what is being asked here is what the
+    // clamp is worth afterwards: the item is then made shorter, and the row
+    // it was clamped to is not there either.
+    cx.update(|cx| {
+        sheet.insert_before(None, vec![with_picture("d", "dave hello\n", 9)], cx);
+    });
+    held(
+        &sheet,
+        &["a", "b", "d"],
+        cx,
+        "a block past its own item's lines",
+    );
+    cx.update(|cx| {
+        sheet.replace(&"a".to_owned(), item("a", "alice\n"), cx);
+        sheet.remove(&"b".to_owned(), cx);
+    });
+    held(&sheet, &["d"], cx, "and the text above it shrinks");
+}
