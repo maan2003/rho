@@ -30,6 +30,7 @@ mod fold_widening_check;
 mod history;
 mod inlay_cost;
 mod minibuffer;
+mod record_anchors;
 mod results_under_folds;
 mod scene_walk;
 mod story;

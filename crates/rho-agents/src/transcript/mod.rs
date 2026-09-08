@@ -186,6 +186,9 @@ struct PreparedChunk {
     rendered: Vec<RenderedBlock>,
     terminal_record: Option<usize>,
     text: String,
+    /// Where each of `rendered` sits in `text`, from the same walk that
+    /// built it.
+    spans: Vec<Range<usize>>,
 }
 
 impl PreparedInitialTranscript {
@@ -348,18 +351,19 @@ impl TranscriptModel {
 
         let mut gutters_changed = false;
         for (chunk, buffer) in installed.into_iter().rev() {
-            let mut offset = 0;
             {
                 let snapshot = buffer.read(cx);
-                for (record_index, rendered) in chunk.rendered.into_iter().enumerate() {
+                let spans = chunk.spans;
+                for (record_index, (rendered, span)) in
+                    chunk.rendered.into_iter().zip(spans).enumerate()
+                {
                     let record = block_record(
                         &buffer,
                         snapshot,
-                        offset,
+                        span,
                         rendered,
                         chunk.terminal_record == Some(record_index),
                     );
-                    offset += record.text.len();
                     gutters_changed |= record.gutter.is_some();
                     self.records.push(record);
                 }
@@ -623,7 +627,7 @@ impl TranscriptModel {
         // bounded foreground parse before historical work is queued.
         for (start_block, markdown, rendered) in chunks.into_iter().rev() {
             let terminal_record = rendered.iter().rposition(RenderedBlock::visible);
-            let text = rendered.iter().map(rendered_text).collect::<String>();
+            let (text, spans) = chunk_text_and_spans(&rendered);
             let buffer = cx.new(|cx| {
                 let mut buffer = Buffer::local(&text, cx);
                 if markdown {
@@ -632,22 +636,21 @@ impl TranscriptModel {
                 buffer.set_capability(language::Capability::Read, cx);
                 buffer
             });
-            prepared.push((start_block, rendered, terminal_record, buffer));
+            prepared.push((start_block, rendered, spans, terminal_record, buffer));
         }
 
-        for (start_block, rendered, terminal_record, buffer) in prepared.into_iter().rev() {
-            let mut offset = 0;
+        for (start_block, rendered, spans, terminal_record, buffer) in prepared.into_iter().rev() {
             {
                 let snapshot = buffer.read(cx);
-                for (record_index, rendered) in rendered.into_iter().enumerate() {
+                for (record_index, (rendered, span)) in rendered.into_iter().zip(spans).enumerate()
+                {
                     let record = block_record(
                         &buffer,
                         snapshot,
-                        offset,
+                        span,
                         rendered,
                         terminal_record == Some(record_index),
                     );
-                    offset += record.text.len();
                     *gutters_changed |= record.gutter.is_some();
                     self.records.push(record);
                 }
@@ -837,25 +840,26 @@ impl TranscriptModel {
             let edit_end = block_start + edit.old_range.end;
             buffer.edit([(edit_start..edit_end, edit.inserted.clone())], None, cx);
 
+            // The block's extent after the edit is where its own anchors
+            // now are: the edit moved them, and nothing re-derives them
+            // from the rendered string's length. A streaming block's end is
+            // right-biased, so text arriving before the trailing newline
+            // lands inside the block rather than after it.
+            let range = self.records[index].range.clone();
+            let block_end = range.end.to_offset(buffer);
             let (span_ranges, inlays, gutter, visualizations) =
                 spans_for_rendered(buffer, block_start, &rendered);
-            let style_end = new_text
-                .len()
-                .checked_sub(usize::from(terminal_newline_supplied_by_excerpt))
-                .map(|len| block_start + len);
-            let styles = styles_for_rendered(buffer, &rendered, &span_ranges, style_end);
+            let styles = styles_for_rendered(buffer, &rendered, &span_ranges, Some(block_end));
             let new_relative_styles = relative_style_ranges(buffer, block_start, &styles);
             changed.extend(changed_style_classes(
                 &old_relative_styles,
                 &new_relative_styles,
             ));
 
-            let new_end =
-                block_start + new_text.len() - usize::from(terminal_newline_supplied_by_excerpt);
             gutters_changed = self.records[index].gutter.is_some() || gutter.is_some();
             self.records[index] = BlockRecord {
                 buffer: record_buffer.clone(),
-                range: buffer.anchor_before(block_start)..buffer.anchor_before(new_end),
+                range,
                 kind: rendered.kind,
                 visible: rendered.visible(),
                 text: new_text,
@@ -865,6 +869,13 @@ impl TranscriptModel {
                 terminal_newline_supplied_by_excerpt,
                 visualizations,
             };
+            // Every record of this buffer, not only the edited one: an edit
+            // at a block boundary moves the bytes of one record and the
+            // anchors of the next.
+            #[cfg(debug_assertions)]
+            for record in self.records.iter().filter(|r| r.buffer == record_buffer) {
+                assert_record_names_its_text(record, buffer);
+            }
         });
 
         let empty = HashSet::new();
@@ -1321,18 +1332,19 @@ impl TranscriptModel {
         let mut buffers = Vec::with_capacity(prepared.len());
         let mut records = Vec::new();
         for (chunk, buffer) in prepared.into_iter().rev() {
-            let mut offset = 0;
             {
                 let snapshot = buffer.read(cx);
-                for (record_index, rendered) in chunk.rendered.into_iter().enumerate() {
+                let spans = chunk.spans;
+                for (record_index, (rendered, span)) in
+                    chunk.rendered.into_iter().zip(spans).enumerate()
+                {
                     let record = block_record(
                         &buffer,
                         snapshot,
-                        offset,
+                        span,
                         rendered,
                         chunk.terminal_record == Some(record_index),
                     );
-                    offset += record.text.len();
                     *gutters_changed |= record.gutter.is_some();
                     records.push(record);
                 }
@@ -1747,14 +1759,33 @@ fn render_chunks(
     }
     chunks
         .into_iter()
-        .map(|(start_block, markdown, rendered)| PreparedChunk {
-            start_block,
-            markdown,
-            terminal_record: rendered.iter().rposition(RenderedBlock::visible),
-            text: rendered.iter().map(rendered_text).collect(),
-            rendered,
+        .map(|(start_block, markdown, rendered)| {
+            let (text, spans) = chunk_text_and_spans(&rendered);
+            PreparedChunk {
+                start_block,
+                markdown,
+                terminal_record: rendered.iter().rposition(RenderedBlock::visible),
+                text,
+                spans,
+                rendered,
+            }
         })
         .collect()
+}
+
+/// The one walk over a chunk's blocks: the text its buffer is built from,
+/// and the byte span each block takes in that text. Both come out of the
+/// same pass, so nothing downstream has to re-measure a rendered string to
+/// find out where a block sits.
+fn chunk_text_and_spans(rendered: &[RenderedBlock]) -> (String, Vec<Range<usize>>) {
+    let mut text = String::new();
+    let mut spans = Vec::with_capacity(rendered.len());
+    for rendered in rendered {
+        let start = text.len();
+        text.push_str(&rendered_text(rendered));
+        spans.push(start..text.len());
+    }
+    (text, spans)
 }
 
 /// Every style class appearing in `records` — the "all changed" set for a
@@ -1854,24 +1885,22 @@ fn prompt_gap_excerpt_end(buffer: &Buffer) -> Point {
 fn block_record(
     buffer_entity: &Entity<Buffer>,
     buffer: &Buffer,
-    start: usize,
+    span: Range<usize>,
     rendered: RenderedBlock,
     terminal_newline_supplied_by_excerpt: bool,
 ) -> BlockRecord {
+    let start = span.start;
     let (span_ranges, inlays, gutter, visualizations) =
         spans_for_rendered(buffer, start, &rendered);
     let text = rendered_text(&rendered);
-    let style_end = text
-        .len()
-        .checked_sub(usize::from(terminal_newline_supplied_by_excerpt))
-        .map(|len| start + len);
-    let styles = styles_for_rendered(buffer, &rendered, &span_ranges, style_end);
+    // The block's last byte is the newline the excerpt supplies for the
+    // terminal record, and that byte belongs to the excerpt, not the block.
+    let end = span.end - usize::from(terminal_newline_supplied_by_excerpt);
+    let styles = styles_for_rendered(buffer, &rendered, &span_ranges, Some(end));
     BlockRecord {
         buffer: buffer_entity.clone(),
         range: buffer.anchor_before(start)
-            ..buffer.anchor_before(
-                start + text.len() - usize::from(terminal_newline_supplied_by_excerpt),
-            ),
+            ..block_end_anchor(buffer, end, terminal_newline_supplied_by_excerpt),
         kind: rendered.kind,
         visible: rendered.visible(),
         text,
@@ -1883,12 +1912,59 @@ fn block_record(
     }
 }
 
+/// A record's anchors name its own text, and nothing else. An elision's
+/// fold end is a record's end anchor, so a record whose end is a byte off
+/// hides the wrong rows; the assertion is here rather than in a test
+/// because the sites that can break it are the sites that build records.
+#[cfg(debug_assertions)]
+fn assert_record_names_its_text(record: &BlockRecord, buffer: &Buffer) {
+    let start = record.range.start.to_offset(buffer);
+    let end = record.range.end.to_offset(buffer);
+    let named = buffer.text_for_range(start..end).collect::<String>();
+    let expected = &record.text
+        [..record.text.len() - usize::from(record.terminal_newline_supplied_by_excerpt)];
+    debug_assert_eq!(
+        named, expected,
+        "record's anchors name {start}..{end}, which is not its own text"
+    );
+}
+
+/// A block's end, and which way it leans.
+///
+/// Only the block a turn is streaming grows at its own end, and it is the
+/// terminal one: its last byte is the newline the excerpt supplies, so its
+/// end anchor sits just before that newline and a second line arrives
+/// exactly there. Left-biased, it would stay put and leave the new line
+/// outside the block it belongs to, so the terminal block's end leans
+/// right.
+///
+/// Every other block's end is the next block's start, the same offset in
+/// the same buffer. A block that is not last must lean left, or the next
+/// block's first line - which arrives at exactly that offset - is swallowed
+/// by the block above it.
+fn block_end_anchor(buffer: &Buffer, end: usize, streaming: bool) -> Anchor {
+    if streaming {
+        buffer.anchor_after(end)
+    } else {
+        buffer.anchor_before(end)
+    }
+}
+
 fn rendered_text(rendered: &RenderedBlock) -> String {
-    rendered
+    let text: String = rendered
         .spans
         .iter()
         .map(|span| span.text.as_str())
-        .collect()
+        .collect();
+    // The streaming edit keeps a block's trailing newline as a sentinel so
+    // an append lands inside the block and never at the next block's start.
+    // That is what lets a record's anchors carry its extent through an
+    // edit, and it holds only while every visible block ends with one.
+    debug_assert!(
+        text.is_empty() || text.ends_with('\n'),
+        "a visible block's rendered text must end with a newline: {text:?}"
+    );
+    text
 }
 
 struct RenderedTextEdit {
