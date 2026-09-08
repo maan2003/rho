@@ -35,6 +35,7 @@ mod record_anchors;
 mod running_turn_elapsed;
 mod scene_walk;
 mod story;
+mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
 mod wrap_rows;
 mod wrap_under_tab;

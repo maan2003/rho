@@ -598,10 +598,7 @@ impl TranscriptModel {
         }
 
         let mut prepared = Vec::with_capacity(chunks.len());
-        // Materializing a long restored transcript can fill the parser pool.
-        // Create newest turns first so the visible live turn receives its
-        // bounded foreground parse before historical work is queued.
-        for (start_block, markdown, rendered) in chunks.into_iter().rev() {
+        for (start_block, markdown, rendered) in chunks {
             let terminal_record = rendered.iter().rposition(RenderedBlock::visible);
             let (text, spans) = chunk_text_and_spans(&rendered);
             let buffer = cx.new(|cx| {
@@ -615,7 +612,7 @@ impl TranscriptModel {
             prepared.push((start_block, rendered, spans, terminal_record, buffer));
         }
 
-        for (start_block, rendered, spans, terminal_record, buffer) in prepared.into_iter().rev() {
+        for (start_block, rendered, spans, terminal_record, buffer) in prepared {
             {
                 let snapshot = buffer.read(cx);
                 for (record_index, (rendered, span)) in rendered.into_iter().zip(spans).enumerate()
@@ -648,13 +645,7 @@ impl TranscriptModel {
                 buffer,
             });
         }
-        let new_buffers = self.buffers[first_removed..]
-            .iter()
-            .rev()
-            .map(|turn| turn.buffer.clone())
-            .collect::<Vec<_>>();
         self.reset_rebuilt_excerpts(first_removed, old_last_composed, removed_buffers, cx);
-        Self::warm_syntax(new_buffers, cx);
     }
 
     /// Reinstalls only the excerpts replaced by a suffix rebuild.
@@ -1163,11 +1154,6 @@ impl TranscriptModel {
         let changed_live = classes_in(&self.records[boundary..added_records.end]);
         self.refresh_elision_plans(range.start);
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
-        let composed = self.buffers[added_buffers.clone()]
-            .iter()
-            .map(|turn| turn.buffer.clone())
-            .collect::<Vec<_>>();
-        Self::warm_syntax(composed, cx);
         cx.notify();
     }
 
@@ -1208,15 +1194,14 @@ impl TranscriptModel {
         cx.notify();
     }
 
-    /// Builds the buffers and records for prepared chunks, newest first so
-    /// the visible tail leads the historical parser backlog.
+    /// Builds the buffers and records for prepared chunks.
     fn build_chunks<V: 'static>(
         chunks: Vec<PreparedChunk>,
         gutters_changed: &mut bool,
         cx: &mut Context<V>,
     ) -> (Vec<TranscriptBuffer>, Vec<BlockRecord>) {
         let mut prepared = Vec::with_capacity(chunks.len());
-        for chunk in chunks.into_iter().rev() {
+        for chunk in chunks {
             let buffer = cx.new(|cx| {
                 let mut buffer = Buffer::local(&chunk.text, cx);
                 if chunk.markdown {
@@ -1229,7 +1214,7 @@ impl TranscriptModel {
         }
         let mut buffers = Vec::with_capacity(prepared.len());
         let mut records = Vec::new();
-        for (chunk, buffer) in prepared.into_iter().rev() {
+        for (chunk, buffer) in prepared {
             {
                 let snapshot = buffer.read(cx);
                 let spans = chunk.spans;
