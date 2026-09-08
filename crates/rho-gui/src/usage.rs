@@ -16,14 +16,17 @@
 
 use std::sync::Arc;
 
+use collections::HashMap;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, Hsla, PathBuilder, Pixels, Point, TextStyle, Window,
     canvas, div, point, px, rgb,
 };
+use rho_agents::HostId;
 use rho_agents::usage::{
     AgentCostSummary, ChartPoint, CostSummary, QuotaSummary, SeriesColor, ShareSummary,
 };
+use rho_ui_proto::{AgentCostSeries, AgentUsageSeries};
 use theme::ActiveTheme as _;
 
 /// The least a chart is drawn at. Below this the lines are on top of each
@@ -33,6 +36,131 @@ const MIN_CHART_HEIGHT: Pixels = px(220.);
 /// What the chart is not allowed to use: the header's two or three lines,
 /// the legend above the chart and the day labels under it.
 const CHART_CHROME: Pixels = px(150.);
+
+/// What the client holds for the usage screen: every host's series, and
+/// the screen itself once something has asked for it.
+///
+/// The screen is held here rather than looked up through the surface
+/// because a series arriving has to reach it whether or not it is the
+/// screen in view. The series are held per host and merged on the way out:
+/// unlike quota headroom, cost incurred on two machines is cost incurred
+/// twice.
+#[derive(Default)]
+pub(crate) struct Usage {
+    global: HashMap<HostId, Vec<AgentUsageSeries>>,
+    agent_cost: HashMap<HostId, Vec<AgentCostSeries>>,
+    view: Option<Entity<UsageView>>,
+}
+
+/// What showing a chart asks every host for. The hosts are the workspace's,
+/// so it does the asking; what to ask for is this module's.
+pub(crate) enum Request {
+    QuotaHistory,
+    GlobalUsage { since_ms: u64 },
+    AgentCostDistribution { since_ms: u64 },
+}
+
+impl Usage {
+    /// The screen, built the first time something asks for it.
+    pub(crate) fn view(&mut self, window: &mut Window, cx: &mut App) -> Entity<UsageView> {
+        self.view
+            .get_or_insert_with(|| cx.new(|cx| UsageView::new(window, cx)))
+            .clone()
+    }
+
+    /// The screen if it has ever been opened, for a series that has just
+    /// arrived and has nowhere to go otherwise.
+    pub(crate) fn opened_view(&self) -> Option<Entity<UsageView>> {
+        self.view.clone()
+    }
+
+    /// Records what a host has just said about model cost.
+    pub(crate) fn record_global(&mut self, host: HostId, series: Vec<AgentUsageSeries>) {
+        self.global.insert(host, series);
+    }
+
+    /// Records what a host has just said about cost per agent.
+    pub(crate) fn record_agent_cost(&mut self, host: HostId, series: Vec<AgentCostSeries>) {
+        self.agent_cost.insert(host, series);
+    }
+
+    /// Drops a host that has gone, so its last numbers stop being counted.
+    pub(crate) fn forget_host(&mut self, host: HostId) {
+        self.global.remove(&host);
+        self.agent_cost.remove(&host);
+    }
+
+    /// Spend and token usage summed across hosts: unlike quota headroom,
+    /// cost incurred on two machines is cost incurred twice.
+    pub(crate) fn merged_global(&self) -> Vec<AgentUsageSeries> {
+        let mut merged: Vec<AgentUsageSeries> = Vec::new();
+        for series in self.global.values().flatten() {
+            let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing.model == series.model)
+            else {
+                merged.push(series.clone());
+                continue;
+            };
+            for bucket in &series.buckets {
+                match existing
+                    .buckets
+                    .iter_mut()
+                    .find(|candidate| candidate.bucket_start_ms == bucket.bucket_start_ms)
+                {
+                    Some(candidate) => {
+                        candidate.input_tokens += bucket.input_tokens;
+                        candidate.cache_read_tokens += bucket.cache_read_tokens;
+                        candidate.cache_write_tokens += bucket.cache_write_tokens;
+                        candidate.cache_write_1h_tokens += bucket.cache_write_1h_tokens;
+                        candidate.output_tokens += bucket.output_tokens;
+                        candidate.requests += bucket.requests;
+                        candidate.approximate |= bucket.approximate;
+                    }
+                    None => existing.buckets.push(bucket.clone()),
+                }
+            }
+            existing
+                .buckets
+                .sort_by_key(|bucket| bucket.bucket_start_ms);
+        }
+        merged
+    }
+
+    /// Each host's per-agent cost, kept apart: the screen draws one band
+    /// per host rather than one sum.
+    pub(crate) fn merged_agent_cost(&self) -> Vec<Vec<AgentCostSeries>> {
+        self.agent_cost.values().cloned().collect()
+    }
+
+    /// What the hosts must be asked for to fill `chart` over `days`. How
+    /// far back the open chart is showing is the screen's own state; this
+    /// only turns a window into a request.
+    pub(crate) fn request_for(chart: Chart, days: u64, now_ms: u64) -> Request {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+        match chart {
+            Chart::RateLimit => Request::QuotaHistory,
+            Chart::ModelCost => Request::GlobalUsage {
+                since_ms: now_ms.saturating_sub(days * DAY_MS),
+            },
+            Chart::UsageShare => {
+                // Seed the EMA with seven half-lives before the visible
+                // range so its left edge represents actual prior usage
+                // rather than a reset.
+                let warmup = if days <= 7 { 4 } else { 14 };
+                Request::GlobalUsage {
+                    since_ms: now_ms.saturating_sub((days + warmup) * DAY_MS),
+                }
+            }
+            Chart::AgentCost => {
+                let warmup = if days <= 7 { 4 } else { 14 };
+                Request::AgentCostDistribution {
+                    since_ms: now_ms.saturating_sub((days + warmup) * DAY_MS),
+                }
+            }
+        }
+    }
+}
 
 /// Which chart the usage screen is showing. The screen is one surface: `c`
 /// after `r` replaces the picture rather than opening a second place.

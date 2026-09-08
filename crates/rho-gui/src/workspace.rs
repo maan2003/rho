@@ -444,11 +444,9 @@ pub struct Workspace {
     /// A routine registry refresh also sends `Ready`, so replay is armed
     /// separately and only by an actual disconnect.
     replay_hosts: HashSet<HostId>,
-    quota_history_days: u64,
-    global_usage: HashMap<HostId, Vec<rho_ui_proto::AgentUsageSeries>>,
-    global_usage_days: u64,
-    agent_cost_usage: HashMap<HostId, Vec<rho_ui_proto::AgentCostSeries>>,
-    agent_cost_days: u64,
+    /// Everything the usage screen is drawn from, and the screen itself:
+    /// see [`crate::usage::Usage`].
+    usage: crate::usage::Usage,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     chime: Chime,
@@ -580,10 +578,6 @@ pub struct Workspace {
     /// The keyboard while a menu is open, on the desk as a block and on the
     /// phone as a sheet.
     transient_focus: gpui::FocusHandle,
-    /// The usage screen, once something has asked for it. Held here rather
-    /// than looked up through the surface because a series arriving has to
-    /// reach it whether or not it is the screen in view.
-    usage_view: Option<Entity<crate::usage::UsageView>>,
     /// The menu under the point, when one is open: a transient buffer
     /// under the point (`rho_window::transient`). Every menu is one of
     /// these now.
@@ -1112,11 +1106,7 @@ impl Workspace {
             pending_agent_filing: None,
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
-            quota_history_days: 7,
-            global_usage: HashMap::new(),
-            global_usage_days: 7,
-            agent_cost_usage: HashMap::new(),
-            agent_cost_days: 7,
+            usage: crate::usage::Usage::default(),
             duration_timer: None,
             chime: Chime,
             history: None,
@@ -1176,7 +1166,6 @@ impl Workspace {
             scroll_journal_task: None,
             minibuffer: None,
             transient_focus: cx.focus_handle(),
-            usage_view: None,
             menu_buffer: None,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
@@ -1278,8 +1267,7 @@ impl Workspace {
             ));
         self.ready_hosts.remove(&host);
         self.replay_hosts.remove(&host);
-        self.global_usage.remove(&host);
-        self.agent_cost_usage.remove(&host);
+        self.usage.forget_host(host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         let gone = self.registry.detach_host(host);
         self.selection.forget(|agent_id| gone.contains(&agent_id));
@@ -2165,7 +2153,7 @@ impl Workspace {
                 if let Some(entry) = self.hosts.get_mut(host) {
                     entry.auth = Some(auth);
                 }
-                if let Some(view) = self.usage_view.clone() {
+                if let Some(view) = self.usage.opened_view() {
                     let history = self.hosts.merged_quota_history();
                     let active = self.hosts.active_quota_namespaces();
                     view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
@@ -2256,7 +2244,7 @@ impl Workspace {
             }
             ConnEvent::QuotaHistory(series) => {
                 self.hosts.set_quota_history(host, series);
-                if let Some(view) = self.usage_view.clone() {
+                if let Some(view) = self.usage.opened_view() {
                     let history = self.hosts.merged_quota_history();
                     let active = self.hosts.active_quota_namespaces();
                     view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
@@ -2264,17 +2252,17 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::GlobalUsage(series) => {
-                self.global_usage.insert(host, series);
-                if let Some(view) = self.usage_view.clone() {
-                    let usage = self.merged_global_usage();
+                self.usage.record_global(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_global();
                     view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
                 }
                 cx.notify();
             }
             ConnEvent::AgentCostDistribution(series) => {
-                self.agent_cost_usage.insert(host, series);
-                if let Some(view) = self.usage_view.clone() {
-                    let usage = self.merged_agent_cost_usage();
+                self.usage.record_agent_cost(host, series);
+                if let Some(view) = self.usage.opened_view() {
+                    let usage = self.usage.merged_agent_cost();
                     view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
                 }
                 cx.notify();
@@ -2434,47 +2422,6 @@ impl Workspace {
     /// ChatGPT's OAuth namespaces and Claude's accounts alike, since each is
     /// its own subscription. Unnamed rows keep the historical
     /// binding-constraint merge: they say nothing about whose quota they are.
-    /// Spend and token usage sum across hosts: unlike quota headroom, cost
-    /// incurred on two machines is cost incurred twice.
-    fn merged_global_usage(&self) -> Vec<rho_ui_proto::AgentUsageSeries> {
-        let mut merged: Vec<rho_ui_proto::AgentUsageSeries> = Vec::new();
-        for series in self.global_usage.values().flatten() {
-            let Some(existing) = merged
-                .iter_mut()
-                .find(|existing| existing.model == series.model)
-            else {
-                merged.push(series.clone());
-                continue;
-            };
-            for bucket in &series.buckets {
-                match existing
-                    .buckets
-                    .iter_mut()
-                    .find(|candidate| candidate.bucket_start_ms == bucket.bucket_start_ms)
-                {
-                    Some(candidate) => {
-                        candidate.input_tokens += bucket.input_tokens;
-                        candidate.cache_read_tokens += bucket.cache_read_tokens;
-                        candidate.cache_write_tokens += bucket.cache_write_tokens;
-                        candidate.cache_write_1h_tokens += bucket.cache_write_1h_tokens;
-                        candidate.output_tokens += bucket.output_tokens;
-                        candidate.requests += bucket.requests;
-                        candidate.approximate |= bucket.approximate;
-                    }
-                    None => existing.buckets.push(bucket.clone()),
-                }
-            }
-            existing
-                .buckets
-                .sort_by_key(|bucket| bucket.bucket_start_ms);
-        }
-        merged
-    }
-
-    fn merged_agent_cost_usage(&self) -> Vec<Vec<rho_ui_proto::AgentCostSeries>> {
-        self.agent_cost_usage.values().cloned().collect()
-    }
-
     /// Enter with the cursor in one of the draft's header rows: the draft is
     /// one message however many rows it has, so this sends it. In the body,
     /// where the prompt's own insert-mode enter lives, the key stays vim's
@@ -5530,7 +5477,7 @@ impl Workspace {
         &self,
         cx: &App,
     ) -> Option<(crate::usage::Chart, usize, bool)> {
-        let view = self.usage_view.as_ref()?.read(cx);
+        let view = self.usage.opened_view()?.read(cx);
         let screens = self
             .surfaces
             .values()
@@ -6610,7 +6557,7 @@ impl Workspace {
                 SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages.read(cx).editor().clone()),
-            SurfaceKey::Usage => SurfaceView::Usage(self.usage_view(window, cx)),
+            SurfaceKey::Usage => SurfaceView::Usage(self.usage.view(window, cx)),
             SurfaceKey::DeskNode { host, node_id } => {
                 let (host, node_id) = (*host, node_id.clone());
                 match self.note_view_for(host, node_id, window, cx) {
@@ -8267,16 +8214,6 @@ impl Workspace {
 
     /// The usage screen, built once and kept. A series that arrives while
     /// another screen is in view still lands in it.
-    fn usage_view(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<crate::usage::UsageView> {
-        self.usage_view
-            .get_or_insert_with(|| cx.new(|cx| crate::usage::UsageView::new(window, cx)))
-            .clone()
-    }
-
     /// Show `chart` over `days`: ask the daemon for the range it needs, hand
     /// the screen what this client already holds so it draws at once, and
     /// display it. Picking another chart from the menu comes back through
@@ -8288,46 +8225,28 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
-        use crate::usage::Chart;
-        let view = self.usage_view(window, cx);
+        let view = self.usage.view(window, cx);
         view.update(cx, |view, cx| view.show(chart, days, cx));
-        match chart {
-            Chart::RateLimit => {
-                self.quota_history_days = days;
+        // Ask every host for the range the chart needs, then hand the screen
+        // what this client already holds so it draws now rather than when
+        // the answers come back.
+        match crate::usage::Usage::request_for(chart, days, now_ms()) {
+            crate::usage::Request::QuotaHistory => {
                 self.hosts.broadcast(|| ClientMessage::QuotaHistory);
                 let history = self.hosts.merged_quota_history();
                 let active = self.hosts.active_quota_namespaces();
                 view.update(cx, |view, cx| view.quota_arrived(history, active, cx));
             }
-            Chart::ModelCost => {
-                self.global_usage_days = days;
-                self.hosts.broadcast(|| ClientMessage::GlobalUsage {
-                    since_ms: now_ms().saturating_sub(days * DAY_MS),
-                });
-                let usage = self.merged_global_usage();
-                view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
-            }
-            Chart::UsageShare => {
-                self.global_usage_days = days;
-                // Seed the EMA with seven half-lives before the visible range
-                // so its left edge represents actual prior usage rather than
-                // a reset.
-                let warmup = if days <= 7 { 4 } else { 14 };
-                self.hosts.broadcast(|| ClientMessage::GlobalUsage {
-                    since_ms: now_ms().saturating_sub((days + warmup) * DAY_MS),
-                });
-                let usage = self.merged_global_usage();
-                view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
-            }
-            Chart::AgentCost => {
-                self.agent_cost_days = days;
-                let warmup = if days <= 7 { 4 } else { 14 };
+            crate::usage::Request::GlobalUsage { since_ms } => {
                 self.hosts
-                    .broadcast(|| ClientMessage::AgentCostDistribution {
-                        since_ms: now_ms().saturating_sub((days + warmup) * DAY_MS),
-                    });
-                let usage = self.merged_agent_cost_usage();
+                    .broadcast(|| ClientMessage::GlobalUsage { since_ms });
+                let usage = self.usage.merged_global();
+                view.update(cx, |view, cx| view.global_usage_arrived(usage, cx));
+            }
+            crate::usage::Request::AgentCostDistribution { since_ms } => {
+                self.hosts
+                    .broadcast(|| ClientMessage::AgentCostDistribution { since_ms });
+                let usage = self.usage.merged_agent_cost();
                 view.update(cx, |view, cx| view.agent_cost_arrived(usage, cx));
             }
         }
