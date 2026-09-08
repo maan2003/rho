@@ -114,6 +114,7 @@ pub(crate) enum Command {
     AgentHide,
     AgentCancel,
     AgentRole,
+    AgentName,
     AgentCompact,
     AgentRewind,
     AgentRewindMany,
@@ -435,6 +436,7 @@ pub(crate) fn agent_menu() -> Menu {
             MenuAction::Command(Command::AgentCancel),
         )
         .item("r", "role…", MenuAction::Command(Command::AgentRole))
+        .item("n", "name…", MenuAction::Command(Command::AgentName))
         .item("k", "compact", MenuAction::Command(Command::AgentCompact))
         .item(
             "w",

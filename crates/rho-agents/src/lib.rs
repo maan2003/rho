@@ -36,7 +36,7 @@ pub use fold::{
     AgentIdentity, Attention, AttentionFacts, DIGEST_VERSION, Digest, MirroredAgent,
     TranscriptFold, Verdict, Wants, attention, one_line, transcript,
 };
-pub use map::{AgentFacts, AgentLife, AgentMap, AgentSummary, HIDE_LABEL};
+pub use map::{AgentFacts, AgentFiling, AgentLife, AgentMap, AgentSummary, HIDE_LABEL};
 pub use rho_hosts::HostId;
 
 // What the composer answers to. Declared here because the composer is

@@ -2923,6 +2923,61 @@ impl Workspace {
         self.open_prompt("role:", complete, on_submit, window, cx);
     }
 
+    /// `space a n`: what the user calls this agent. The runtime titles an
+    /// agent from the first thing said to it, which is a guess and often
+    /// wrong by the time the agent is doing something else; a name is the
+    /// user saying which agent this is, and it is theirs, so it lives on
+    /// the desk as `Property::Name` on the agent's own cell rather than
+    /// anywhere the runtime can overwrite it.
+    ///
+    /// An empty name takes theirs off and the runtime's title comes back.
+    pub(crate) fn prompt_name_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.subject_agent_or_notice("name", window, cx) else {
+            return;
+        };
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.name_agent(agent_id, input.trim().to_owned(), window, cx);
+            },
+        );
+        self.open_prompt("name:", complete, on_submit, window, cx);
+    }
+
+    /// The name written where the user's own words about a thing go. The
+    /// registry reads it back through the desk's filing, so every place
+    /// that shows the agent's title shows this one instead.
+    pub(crate) fn name_agent(
+        &mut self,
+        agent_id: AgentId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.host_of(agent_id) else {
+            self.echo("name: no host for this agent", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let writes = vec![rho_desk::cells::CellWrite {
+            id: rho_desk::cells::Id::Agent(agent_id),
+            property: rho_desk::cells::Property::Name(name.clone()),
+        }];
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
+            return;
+        }
+        let said = match name.is_empty() {
+            true => "name removed".to_owned(),
+            false => format!("name: {name}"),
+        };
+        self.echo(&said, StyleClass::SystemInfo, cx);
+    }
+
     pub(crate) fn cmd_agent_done(
         &mut self,
         hide: bool,
@@ -5239,6 +5294,16 @@ impl Workspace {
                     .dashboard
                     .patch_deal_source(host, &delta.touched, &nodes)
             {
+                // The user's own words about an agent — its name, its
+                // labels, whether it is put away — are on the rows this
+                // delta named, and a patch is the path they arrive by. A
+                // lookup each says whether any of it moved; only then is
+                // anything drawn again, so a streaming event still costs
+                // what it touched.
+                let filings = self.desk_cells.agent_filings_of(host, &delta.touched);
+                if self.registry.set_agent_filings(filings) {
+                    self.refresh_home(cx);
+                }
                 let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
                 // The deal bar reads the hand; the map is not composed.
@@ -6747,6 +6812,7 @@ impl Workspace {
             Command::AgentHide => self.cmd_agent_done(true, window, cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
+            Command::AgentName => self.prompt_name_agent(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
             Command::AgentRewind => self.cmd_rewind(1, window, cx),
             Command::AgentRewindMany => self.prompt_rewind(window, cx),

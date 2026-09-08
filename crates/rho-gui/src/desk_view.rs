@@ -1151,9 +1151,10 @@ impl DeskCells {
             .collect()
     }
 
-    /// How the user filed each agent of this host: muted, and the names of
-    /// the labels on it. The registry hides and groups by this.
-    pub fn agent_filing(&self, host: HostId) -> Vec<(rho_core::AgentId, bool, Vec<String>)> {
+    /// How the user filed each agent of this host: muted, the names of the
+    /// labels on it, and the name they gave it. The registry hides, groups
+    /// and titles by this.
+    pub fn agent_filing(&self, host: HostId) -> Vec<(rho_core::AgentId, rho_agents::AgentFiling)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
@@ -1169,7 +1170,49 @@ impl DeskCells {
                     .iter()
                     .filter_map(|label| desk.view.facts(label).name)
                     .collect();
-                Some((agent, facts.state == State::Muted, labels))
+                Some((
+                    agent,
+                    rho_agents::AgentFiling {
+                        hidden: facts.state == State::Muted,
+                        labels,
+                        name: facts.name,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The filing of the agents a delta named, for the path that patches
+    /// the rows it touched rather than composing the desk again: a lookup
+    /// each, and nothing for a delta that named no agent.
+    pub fn agent_filings_of(
+        &self,
+        host: HostId,
+        touched: &std::collections::BTreeSet<Id>,
+    ) -> Vec<(rho_core::AgentId, rho_agents::AgentFiling)> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        touched
+            .iter()
+            .filter_map(|id| {
+                let Id::Agent(agent) = id else {
+                    return None;
+                };
+                let facts = desk.view.facts(id);
+                let labels = facts
+                    .labels
+                    .iter()
+                    .filter_map(|label| desk.view.facts(label).name)
+                    .collect();
+                Some((
+                    *agent,
+                    rho_agents::AgentFiling {
+                        hidden: facts.state == State::Muted,
+                        labels,
+                        name: facts.name,
+                    },
+                ))
             })
             .collect()
     }

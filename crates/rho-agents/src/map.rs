@@ -108,6 +108,18 @@ impl AgentSummary {
     }
 }
 
+/// The user's own filing of an agent, which lives on the desk and never on
+/// the wire: whether they put it away, the labels they placed it under, and
+/// the name they gave it after it was running.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentFiling {
+    pub hidden: bool,
+    pub labels: Vec<String>,
+    /// `Property::Name` on the agent's own cell. `None` is an agent the
+    /// user has not named, which reads as whatever the runtime titled it.
+    pub name: Option<String>,
+}
+
 /// Uninterpreted chronology a view may read without folding the story
 /// itself.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,8 +154,9 @@ pub struct AgentMap {
     activities: BTreeMap<AgentId, String>,
     /// The mirror, folded: what every agent is and what happened to it.
     mirror: BTreeMap<AgentId, MirroredAgent>,
-    /// The user's filing, from the store: hidden agents and their labels.
-    filing: BTreeMap<AgentId, (bool, Vec<String>)>,
+    /// The user's filing, from the store: hidden agents, their labels,
+    /// and what the user called them.
+    filing: BTreeMap<AgentId, AgentFiling>,
     /// One row per agent, in agent-id order: what the rails read.
     summaries: BTreeMap<AgentId, AgentSummary>,
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
@@ -327,19 +340,15 @@ impl AgentMap {
     /// what is derived from filing is made again only when it did.
     pub fn set_agent_filings(
         &mut self,
-        filings: impl IntoIterator<Item = (AgentId, bool, Vec<String>)>,
+        filings: impl IntoIterator<Item = (AgentId, AgentFiling)>,
     ) -> bool {
         let mut moved = Vec::new();
-        for (agent_id, hidden, labels) in filings {
-            let hidden = hidden || labels.iter().any(|label| label == HIDE_LABEL);
-            if self
-                .filing
-                .get(&agent_id)
-                .is_some_and(|filed| filed.0 == hidden && filed.1 == labels)
-            {
+        for (agent_id, mut filing) in filings {
+            filing.hidden |= filing.labels.iter().any(|label| label == HIDE_LABEL);
+            if self.filing.get(&agent_id) == Some(&filing) {
                 continue;
             }
-            self.filing.insert(agent_id, (hidden, labels));
+            self.filing.insert(agent_id, filing);
             moved.push(agent_id);
         }
         if moved.is_empty() {
@@ -437,9 +446,16 @@ impl AgentMap {
         };
         let host = mirrored.host;
         let mut summary = AgentSummary::of(mirrored);
-        if let Some((hidden, labels)) = self.filing.get(&agent_id) {
-            summary.hidden = *hidden;
-            summary.labels = labels.clone();
+        if let Some(filing) = self.filing.get(&agent_id) {
+            summary.hidden = filing.hidden;
+            summary.labels = filing.labels.clone();
+            // What the user called it wins over what the runtime titled
+            // it: the runtime's title is a guess from the first thing said
+            // to the agent, and a name is the user saying which agent this
+            // is.
+            if let Some(name) = filing.name.clone().filter(|name| !name.trim().is_empty()) {
+                summary.display_name = Some(name);
+            }
         }
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
         match &summary.activity {
@@ -938,7 +954,15 @@ mod tests {
         }
         let filings = agents
             .iter()
-            .map(|agent_id| (*agent_id, false, vec!["rho/agent".to_owned()]))
+            .map(|agent_id| {
+                (
+                    *agent_id,
+                    AgentFiling {
+                        labels: vec!["rho/agent".to_owned()],
+                        ..AgentFiling::default()
+                    },
+                )
+            })
             .collect::<Vec<_>>();
 
         assert!(registry.set_agent_filings(filings.clone()));
@@ -1152,13 +1176,19 @@ mod tests {
         }
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
 
-        assert!(map.set_agent_filings([(agent(2), true, Vec::new())]));
+        assert!(map.set_agent_filings([(
+            agent(2),
+            AgentFiling {
+                hidden: true,
+                ..AgentFiling::default()
+            },
+        )]));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(1)));
         // The agent the point is in can be one that is filed away; the
         // step out of it starts from the front rather than nowhere.
         assert_eq!(map.next_agent(Some(agent(2)), 1), Some(agent(3)));
 
-        assert!(map.set_agent_filings([(agent(2), false, Vec::new())]));
+        assert!(map.set_agent_filings([(agent(2), AgentFiling::default())]));
         assert_eq!(map.next_agent(Some(agent(3)), 1), Some(agent(2)));
     }
 

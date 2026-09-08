@@ -8006,6 +8006,71 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// The runtime titles an agent from the first thing said to it, which is a
+/// guess; a name is the user saying which agent this is. It is written on
+/// the desk, so it reaches the row the same way the labels do, and the
+/// runtime's title is what a nameless agent still reads as.
+#[gpui::test]
+fn a_renamed_running_agents_home_row_reads_the_new_name(cx: &mut TestAppContext) {
+    let running = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "phone feed");
+    desk.agent_row(heading, running);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        activity: Some("wiring the flick recogniser".to_owned()),
+                        turn_running: true,
+                        ..ui_head(running)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        !buffer_text(&workspace, cx).contains("the recogniser rig"),
+        "the agent has no name yet"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.name_agent(running, "the recogniser rig".to_owned(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("the recogniser rig"),
+        "the running row reads the name the user gave it, got {text:?}"
+    );
+
+    // Taking the name off gives the runtime's title back rather than
+    // leaving the row nameless.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.name_agent(running, String::new(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        !text.contains("the recogniser rig  "),
+        "the name is gone from the row, got {text:?}"
+    );
+}
+
 /// Where the user filed an agent is half of which agent it is: two of them
 /// on the same kind of work read as one name said twice until the row says
 /// where each one lives. The labels are the ones the registry already holds
