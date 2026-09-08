@@ -5300,13 +5300,19 @@ impl Workspace {
         // The sources decide who is on the desk at all, so what they moved
         // decides what this costs: an agent that named only itself patches
         // its own row, and only a change of shape walks the desk.
-        let change = self.refresh_desk_sources(host, moved, cx);
-        self.desk_cells.apply_source_change(host, change);
+        let change = timed_desk_step("desk_sync/refresh_sources", work_units, || {
+            self.refresh_desk_sources(host, moved, cx)
+        });
+        timed_desk_step("desk_sync/apply_source_change", work_units, || {
+            self.desk_cells.apply_source_change(host, change)
+        });
         // A row that exists only because a source says so — a tab the
         // browser has just opened, a unit the mirror has just raised — has
         // nothing written, so no store event will ever give it the buffer
         // the map draws it from. It gets one here.
-        self.desk_cells.reconcile_buffers(host, cx);
+        timed_desk_step("desk_sync/reconcile_buffers", work_units, || {
+            self.desk_cells.reconcile_buffers(host, cx)
+        });
         // The desk's nodes are already to hand; asking the dealer whether
         // they sit where its source has them costs a walk of the ids and no
         // rope. That question comes first, because its answer decides
@@ -5320,7 +5326,7 @@ impl Workspace {
         // every row's name and labels cloned for an event that reads them
         // and puts them down again.
         let moved = moved.map(|agents| agents.iter().copied().collect::<Vec<_>>());
-        let patched = {
+        let patched = timed_desk_step("desk_sync/deal_shape_and_patch", work_units, || {
             let Self {
                 desk_cells,
                 dashboard,
@@ -5335,11 +5341,15 @@ impl Workspace {
                         .collect::<BTreeSet<_>>();
                     dashboard.patch_deal_source(host, &touched, nodes)
                 })
-        };
+        });
         if patched && let Some(agents) = &moved {
-            self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(agents), cx);
+            timed_desk_step("desk_sync/refresh_deal_cards", work_units, || {
+                self.refresh_deal_cards(host, crate::dashboard::DealScope::Agents(agents), cx)
+            });
             self.dashboard.sync_hand(&self.agent_last_interaction);
-            self.sync_note_views(host, cx);
+            timed_desk_step("desk_sync/sync_note_views", work_units, || {
+                self.sync_note_views(host, cx)
+            });
             cx.notify();
             return;
         }
@@ -5347,15 +5357,24 @@ impl Workspace {
         // A note whose first line was edited keeps its shape and moves every
         // breadcrumb beneath it, so this reads the titles again; it is the
         // nodes and the indexes and no rope.
-        let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
-        self.dashboard.set_deal_source(host, source);
+        timed_desk_step("desk_sync/set_deal_source", work_units, || {
+            let source = crate::candidates::HostNodes::of_notes(&mut self.desk_cells, host, cx);
+            self.dashboard.set_deal_source(host, source);
+        });
+
         let scope = match &moved {
             Some(agents) => crate::dashboard::DealScope::Agents(agents),
             None => crate::dashboard::DealScope::Whole,
         };
-        self.refresh_deal_cards(host, scope, cx);
-        self.refresh_dashboard(cx);
-        self.sync_note_views(host, cx);
+        timed_desk_step("desk_sync/refresh_deal_cards", work_units, || {
+            self.refresh_deal_cards(host, scope, cx)
+        });
+        timed_desk_step("desk_sync/refresh_dashboard", work_units, || {
+            self.refresh_dashboard(cx)
+        });
+        timed_desk_step("desk_sync/sync_note_views", work_units, || {
+            self.sync_note_views(host, cx)
+        });
     }
 
     /// What the desk knows of one agent, or nothing when the agent is not
@@ -9219,4 +9238,27 @@ mod tests {
         assert_eq!(sequences, vec![0, 1, 2, 3]);
         assert_eq!(sequences.pop(), Some(3));
     }
+}
+
+/// Times one step of a desk sync under its own name.
+///
+/// `sync_tree_rows` is timed whole, which says the desk's map costs
+/// milliseconds between frames but not which pass spends them; the passes
+/// are a source refresh, a map patch, a buffer reconcile, the dealer's
+/// two questions and three redraws, and they have nothing in common but
+/// the function they sit in. Each records under `desk_sync/<pass>`, so
+/// the whole and its parts are read from the same log and the parts sum
+/// to something a reader can check against the whole. `work_units` is
+/// the same number the whole span carries — the agents the event named —
+/// so a part's cost per unit means what the whole's does.
+fn timed_desk_step<T>(label: &'static str, work_units: u64, step: impl FnOnce() -> T) -> T {
+    let start = std::time::Instant::now();
+    let held = step();
+    gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+        owner: gpui::profiler::MainThreadWorkKind::Other(label),
+        start,
+        end: std::time::Instant::now(),
+        work_units,
+    });
+    held
 }

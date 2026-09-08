@@ -571,7 +571,10 @@ pub fn main_thread_work_owner(kind: gpui::profiler::MainThreadWorkKind) -> &'sta
         ModelEvent => "model_event",
         DeskSync => "desk_sync",
         TaskCompletion => "task_completion",
-        Other => "other",
+        // The label is the name: a span the caller named is reported
+        // under that name and nothing else, so `desk_sync/…` sorts and
+        // reads beside the `desk_sync` it is part of.
+        Other(label) => label,
     }
 }
 

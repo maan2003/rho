@@ -187,6 +187,22 @@ impl Summary {
                 "; between frames {} {} spans {:.0} ms total, p50 {:.2} p99 {:.2} ms at {:.0} units",
                 work.owner, work.spans, work.total_ms, work.p50_ms, work.p99_ms, work.units
             ));
+            // A part of that owner, when it recorded any: `owner/part` is
+            // inside the span above, so its total is a share of a number
+            // already printed rather than another one beside it. The
+            // costliest part is the whole point of asking — a floor with
+            // no name is not actionable — and the rest are in the sidecar.
+            let inside = format!("{}/", work.owner);
+            if let Some(part) = self
+                .work
+                .iter()
+                .find(|held| held.owner.starts_with(&inside))
+            {
+                line.push_str(&format!(
+                    ", largest part {} at {:.0} ms total, p50 {:.2} p99 {:.2} ms",
+                    part.owner, part.total_ms, part.p50_ms, part.p99_ms
+                ));
+            }
         }
         if self.top.is_empty() {
             return line;
@@ -548,6 +564,79 @@ mod tests {
              11471 events, slowest stage buffer_edit p99 0.04 ms at 2 rows; \
              between frames desk_sync 412 spans 913 ms total, p50 1.84 p99 6.02 ms at 1 units; \
              90 samples on rho-gui: memcpy 13%"
+        );
+    }
+
+    /// A part of the costliest owner is named beside it, and a span that
+    /// merely shares its first letters is not mistaken for one.
+    ///
+    /// The floor this was written for is a `desk_sync` that costs
+    /// milliseconds between frames without any frame being late, so the
+    /// question the line has to answer is which pass inside it spends
+    /// them. A part is `owner/pass`; `desk_sync_extra` is a different
+    /// owner and stays out of that clause.
+    #[test]
+    fn the_line_names_the_costliest_part_of_the_costliest_owner() {
+        let bare = Summary {
+            profile: "gui.bin".to_owned(),
+            frames: 81,
+            draw_p99_ms: 3.574,
+            draw_max_ms: 3.574,
+            over_budget: 0,
+            worst_gap_ms: 10.8,
+            gap_p99_ms: 10.8,
+            slowest_stage: None,
+            work: Vec::new(),
+            events: 0,
+            top: Vec::new(),
+            samples: 0,
+            thread: None,
+            line: String::new(),
+        };
+        let part = |owner: &str, total_ms: f64| Work {
+            owner: owner.to_owned(),
+            spans: 412,
+            total_ms,
+            p50_ms: 1.84,
+            p99_ms: 6.02,
+            units: 1.0,
+        };
+        // As `summarize` sorts them: costliest first.
+        let parted = Summary {
+            work: vec![
+                part("desk_sync", 913.4),
+                part("desk_sync_extra", 700.0),
+                part("desk_sync/refresh_sources", 512.5),
+                part("desk_sync/sync_note_views", 90.0),
+            ],
+            ..bare
+        };
+        let line = parted.render();
+        assert!(
+            line.ends_with(
+                "between frames desk_sync 412 spans 913 ms total, p50 1.84 p99 6.02 ms at \
+                 1 units, largest part desk_sync/refresh_sources at 512 ms total, p50 1.84 \
+                 p99 6.02 ms"
+            ),
+            "the costliest part is not named as the costliest owner's: {line}"
+        );
+        assert_eq!(
+            line.matches("desk_sync_extra").count(),
+            0,
+            "an owner whose name begins with the costliest owner's was read as a part of \
+             it: {line}"
+        );
+
+        // The same line without any part, so the clause is the parts'
+        // doing and not the renderer's.
+        let unparted = Summary {
+            work: vec![part("desk_sync", 913.4), part("desk_sync_extra", 700.0)],
+            ..parted
+        };
+        assert!(
+            unparted.render().ends_with("at 1 units"),
+            "a run whose owners recorded no parts got a part clause anyway: {}",
+            unparted.render()
         );
     }
 }

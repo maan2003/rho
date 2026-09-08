@@ -1180,17 +1180,24 @@ impl Drop for EditorTimingGuard {
 /// exactly what makes the *next* frame late. A record names its owner rather
 /// than leaving it to be guessed from a stack.
 #[derive(Debug, Copy, Clone)]
-#[repr(u8)]
 #[expect(missing_docs)]
 pub enum MainThreadWorkKind {
     /// Reconciling a model event into the UI.
-    ModelEvent = 1,
+    ModelEvent,
     /// Rebuilding or patching the desk's map.
-    DeskSync = 2,
+    DeskSync,
     /// Work a background task handed back to the main thread.
-    TaskCompletion = 3,
-    /// Anything else the caller chose to name.
-    Other = 4,
+    TaskCompletion,
+    /// Anything else the caller chose to name, under that name.
+    ///
+    /// The named kinds above are the ones gpui knows the shape of. An
+    /// application whose between-frame work has parts — a sync made of
+    /// several passes, say — can record each part under its own label
+    /// and keep the whole beside it, and a reader gets the breakdown
+    /// without gpui having to grow a variant per application. The label
+    /// is `'static` so a record stays `Copy` and the ring keeps costing
+    /// a fixed number of bytes per entry.
+    Other(&'static str),
 }
 
 /// One span of main-thread work outside a frame.
