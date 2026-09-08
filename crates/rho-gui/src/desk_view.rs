@@ -152,18 +152,108 @@ pub struct PageSource {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sources {
     pub host: u64,
-    pub agents: Vec<AgentSource>,
-    pub slack: Vec<SlackSource>,
-    pub pages: Vec<PageSource>,
+    agents: Vec<AgentSource>,
+    slack: Vec<SlackSource>,
+    pages: Vec<PageSource>,
+    /// Where each source sits in its own list. The walk asks for one
+    /// agent, one unit or one page per node it builds, and asking by
+    /// scanning made a walk cost the nodes times the sources. The lists
+    /// are private so these cannot drift from them.
+    by_agent: HashMap<rho_core::AgentId, usize>,
+    by_unit: HashMap<rho_desk::cells::SlackUnit, usize>,
+    by_page: HashMap<rho_desk::PageId, usize>,
+}
+
+// How many source entries the walk has looked at. A lookup that scans
+// costs the length of what it scans, so this counts entries examined and
+// not calls made: the difference between the two is the whole question.
+//
+// Thread-local because the suite runs tests concurrently in one process: a
+// shared counter reads as one test's work plus whatever its neighbours were
+// doing, which is a number that cannot be wrong in any way you can see.
+#[cfg(test)]
+thread_local! {
+    static SOURCE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn charge_scan(entries: usize) {
+    SOURCE_SCANS.with(|scans| scans.set(scans.get() + entries));
+}
+
+#[cfg(not(test))]
+fn charge_scan(_entries: usize) {}
+
+#[cfg(test)]
+pub(crate) fn take_source_scans() -> usize {
+    SOURCE_SCANS.with(|scans| scans.replace(0))
 }
 
 impl Sources {
+    pub fn new(
+        host: u64,
+        agents: Vec<AgentSource>,
+        slack: Vec<SlackSource>,
+        pages: Vec<PageSource>,
+    ) -> Self {
+        let by_agent = agents
+            .iter()
+            .enumerate()
+            .map(|(at, source)| (source.agent, at))
+            .collect();
+        let by_unit = slack
+            .iter()
+            .enumerate()
+            .map(|(at, source)| (source.unit.clone(), at))
+            .collect();
+        let by_page = pages
+            .iter()
+            .enumerate()
+            .map(|(at, source)| (source.page, at))
+            .collect();
+        Self {
+            host,
+            agents,
+            slack,
+            pages,
+            by_agent,
+            by_unit,
+            by_page,
+        }
+    }
+
+    /// The same sources with Slack's replaced, for a test that supplies
+    /// the timestamps no store fixture can hold.
+    #[cfg(test)]
+    pub fn with_slack(self, slack: Vec<SlackSource>) -> Self {
+        Self::new(self.host, self.agents, slack, self.pages)
+    }
+
+    pub fn agents(&self) -> &[AgentSource] {
+        &self.agents
+    }
+
+    pub fn slack(&self) -> &[SlackSource] {
+        &self.slack
+    }
+
+    pub fn pages(&self) -> &[PageSource] {
+        &self.pages
+    }
+
     fn agent(&self, agent: rho_core::AgentId) -> Option<&AgentSource> {
-        self.agents.iter().find(|source| source.agent == agent)
+        charge_scan(1);
+        self.by_agent.get(&agent).map(|at| &self.agents[*at])
+    }
+
+    fn unit(&self, unit: &rho_desk::cells::SlackUnit) -> Option<&SlackSource> {
+        charge_scan(1);
+        self.by_unit.get(unit).map(|at| &self.slack[*at])
     }
 
     fn page(&self, page: rho_desk::PageId) -> Option<&PageSource> {
-        self.pages.iter().find(|source| source.page == page)
+        charge_scan(1);
+        self.by_page.get(&page).map(|at| &self.pages[*at])
     }
 }
 
@@ -293,7 +383,7 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
     let Id::Slack(unit) = id else {
         return None;
     };
-    let source = sources.slack.iter().find(|source| &source.unit == unit)?;
+    let source = sources.unit(unit)?;
     let past = |cursor: Option<&SlackTs>| match (source.newest_from_other.as_ref(), cursor) {
         (Some(newest), Some(cursor)) => newest.is_after(cursor),
         (Some(_), None) => true,
@@ -853,12 +943,12 @@ impl DeskCells {
             .collect::<BTreeMap<Id, Facts>>();
         // Open by its source: a waiting agent and a Slack unit with new
         // traffic matter even when the user has never said anything.
-        for agent in &sources.agents {
+        for agent in sources.agents() {
             if agent.wants_user() {
                 facts.entry(Id::Agent(agent.agent)).or_default();
             }
         }
-        for unit in &sources.slack {
+        for unit in sources.slack() {
             facts.entry(Id::Slack(unit.unit.clone())).or_default();
         }
         // A tab the reader opened from a page is where they deliberately
@@ -868,7 +958,7 @@ impl DeskCells {
         // or not, or the burst would draw at the root instead of under the
         // page it came from.
         let mut origins = Vec::new();
-        for page in &sources.pages {
+        for page in sources.pages() {
             if let Some(origin) = page.opened_from {
                 facts.entry(Id::Page(page.page)).or_default();
                 origins.push(origin);

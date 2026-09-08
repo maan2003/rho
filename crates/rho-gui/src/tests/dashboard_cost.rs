@@ -75,12 +75,13 @@ fn desk_of_agents(
 
 /// One agent's title moves, on a map of `count` filed agents.
 ///
-/// Returns what the event cost: whether the map was composed, how many rows
-/// were drawn again, and how long the whole event took.
+/// Returns what the event cost: how many times the dealer's source was
+/// taken whole and how many times it was patched, how many source entries
+/// the walk looked at, and how long the whole event took.
 fn cost_of_one_agent_s_news(
     cx: &mut gpui::TestAppContext,
     count: u64,
-) -> (usize, usize, std::time::Duration) {
+) -> (usize, usize, usize, std::time::Duration) {
     let (workspace, agents) = desk_of_agents(cx, count);
     let (taken, patched) = workspace
         .update(cx, |workspace, _, _| {
@@ -94,6 +95,7 @@ fn cost_of_one_agent_s_news(
     // both a steadier number and a stronger question: cost must not
     // accumulate across events either.
     const EVENTS: u32 = 32;
+    crate::desk_view::take_source_scans();
     let started = std::time::Instant::now();
     for nth in 0..EVENTS {
         workspace
@@ -116,13 +118,14 @@ fn cost_of_one_agent_s_news(
         next_frame(cx, workspace);
     }
     let took = started.elapsed() / EVENTS;
+    let scans = crate::desk_view::take_source_scans() / EVENTS as usize;
 
     let (taken_after, patched_after) = workspace
         .update(cx, |workspace, _, _| {
             workspace.dashboard.deal_work_for_test()
         })
         .expect("read the dealer's work");
-    (taken_after - taken, patched_after - patched, took)
+    (taken_after - taken, patched_after - patched, scans, took)
 }
 
 /// What one agent's news must cost, whatever the map's size.
@@ -132,8 +135,11 @@ fn cost_of_one_agent_s_news(
 /// satisfy every other assertion here trivially, which is the way a test
 /// like this is usually wrong.
 fn assert_one_agent_s_news_is_cheap(cx: &mut gpui::TestAppContext, count: u64) {
-    let (taken, patched, took) = cost_of_one_agent_s_news(cx, count);
-    eprintln!("{count} agents: taken {taken}, patched {patched}, {took:?} per event");
+    let (taken, patched, scans, took) = cost_of_one_agent_s_news(cx, count);
+    eprintln!(
+        "{count} agents: taken {taken}, patched {patched}, {scans} source \
+         entries, {took:?} per event"
+    );
     assert!(
         patched >= 32,
         "one agent's news patched nothing on a desk of {count} agents: the \
@@ -150,6 +156,19 @@ fn assert_one_agent_s_news_is_cheap(cx: &mut gpui::TestAppContext, count: u64) {
         patched <= 64,
         "32 events patched {patched} times on a desk of {count} agents; each \
          names one agent and must cost that agent and no more"
+    );
+    // The walk asks the sources for one agent, unit or page per node it
+    // builds. Asking by scanning made a walk cost the nodes times the
+    // sources, which at 128 agents was 16,384 entries for one agent's
+    // news. An index makes each ask one entry, so the count is the nodes
+    // and not their square. Counted rather than timed on purpose: at these
+    // sizes the difference is microseconds and a clock would not see it,
+    // which is exactly why it could come back unnoticed.
+    assert!(scans > 0, "the walk did not run, so this measured nothing");
+    assert!(
+        scans <= count as usize * 2,
+        "one agent's news looked at {scans} source entries on a desk of \
+         {count} agents; a lookup that scans is back"
     );
 }
 

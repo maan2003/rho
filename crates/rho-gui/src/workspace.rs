@@ -5386,7 +5386,7 @@ impl Workspace {
         let held = self
             .desk_cells
             .sources(host)
-            .map(|sources| sources.agents.clone());
+            .map(|sources| sources.agents().to_vec());
         let agents = match (moved, held) {
             (Some(moved), Some(mut agents)) if !filed => {
                 for agent in moved {
@@ -5418,7 +5418,7 @@ impl Workspace {
         let slack = if !self.slack.started() {
             self.desk_cells
                 .sources(host)
-                .map(|sources| sources.slack.clone())
+                .map(|sources| sources.slack().to_vec())
                 .unwrap_or_default()
         } else if self.hosts.primary() == Some(host) {
             self.slack_thread_facts(cx)
@@ -5447,12 +5447,12 @@ impl Workspace {
         } else {
             Vec::new()
         };
-        let sources = crate::desk_view::Sources {
-            host: self.registry.host_machine_seed(host),
+        let sources = crate::desk_view::Sources::new(
+            self.registry.host_machine_seed(host),
             agents,
             slack,
             pages,
-        };
+        );
         self.desk_cells.set_sources(host, sources);
         // The user's verdicts are the one thing attention needs that no
         // row carries; the registry derives it from them and the digest,
@@ -5507,8 +5507,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut sources = self.desk_cells.sources(host).cloned().unwrap_or_default();
-        sources.slack = slack;
+        let sources = self
+            .desk_cells
+            .sources(host)
+            .cloned()
+            .unwrap_or_default()
+            .with_slack(slack);
         self.desk_cells.set_sources(host, sources);
         self.sync_tree_dashboard(host, window, cx);
     }
