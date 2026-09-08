@@ -85,30 +85,51 @@ impl Workspace {
         self.surface_node()
     }
 
+    /// Where a new thing can go: the labels, and the root. A place is not
+    /// among them — a thing is placed by the labels it carries and carries
+    /// no parent — so the picker offers the label paths and nothing else,
+    /// and a path nobody has made yet is minted by choosing it.
+    ///
+    /// The labels the thing in context already carries come first, so Enter
+    /// alone still files the new thing where the reader is.
     fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {
+        let _ = cx;
         let mut areas = vec![Area {
             path: ROOT_ROW.to_owned(),
             kind: "root",
             target: None,
             recency: ROOT_RECENCY,
         }];
-        let threads = self.slack_thread_facts(cx);
-        for (path, kind, host, node_id) in
-            self.dashboard.area_candidates(&self.registry, &threads, cx)
-        {
-            let recency = if context == Some((host, node_id.clone())) {
-                CONTEXT_RECENCY
-            } else {
-                0
-            };
-            areas.push(Area {
-                path,
-                kind,
-                target: Some((host, node_id)),
-                recency,
-            });
+        let carried = context
+            .as_ref()
+            .and_then(|(host, node_id)| self.desk_cells.facts(*host, node_id))
+            .map(|facts| facts.labels)
+            .unwrap_or_default();
+        for host in self.desk_cells.hosts().collect::<Vec<_>>() {
+            for (label, path) in self.desk_cells.label_paths(host) {
+                let recency = if carried.contains(&label) {
+                    CONTEXT_RECENCY
+                } else {
+                    0
+                };
+                areas.push(Area {
+                    path,
+                    kind: "label",
+                    target: Some((host, label)),
+                    recency,
+                });
+            }
         }
         areas
+    }
+
+    #[cfg(test)]
+    pub(crate) fn areas_for_test(&mut self, cx: &mut Context<Self>) -> Vec<(String, String)> {
+        let context = self.context_area(cx);
+        self.areas(context, cx)
+            .into_iter()
+            .map(|area| (area.path, area.kind.to_owned()))
+            .collect()
     }
 
     /// `n a`, `n p`, `n n`: ask for the area, then make the thing.
@@ -235,12 +256,20 @@ impl Workspace {
             );
             return;
         };
-        let Some((created, writes)) = self
-            .desk_cells
-            .create_note_writes(host, area.as_ref().map(|(_, node_id)| node_id.clone()))
-        else {
+        // A note carries no parent either: the area is a label, and the
+        // note is created at the root wearing it.
+        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
             return;
         };
+        writes.extend(
+            area.as_ref()
+                .map(|(_, node_id)| node_id.clone())
+                .and_then(crate::workspace::filing_property)
+                .map(|property| rho_desk::cells::CellWrite {
+                    id: created.clone(),
+                    property,
+                }),
+        );
         if self
             .apply_desk_writes(host, writes, None, window, cx)
             .is_none()

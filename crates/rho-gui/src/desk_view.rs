@@ -1072,7 +1072,19 @@ impl DeskCells {
             // Deleting one thing does not delete what was filed under it:
             // the row whose place has gone is shown at the root, and undoing
             // the one cell puts the hierarchy back.
-            let parent = place(id, fact, sources).filter(|parent| !desk.view.facts(parent).deleted);
+            // A thing is placed by the labels it carries. Where it carries
+            // one that is on the map, that is where it is drawn, and the
+            // derived place (a tab's origin page, an agent's host) yields:
+            // otherwise a labelled page hangs under both, and the map says
+            // two things about where it is.
+            let labelled = fact
+                .labels
+                .iter()
+                .any(|label| label != id && facts.contains_key(label));
+            let parent = (!labelled)
+                .then(|| place(id, fact, sources))
+                .flatten()
+                .filter(|parent| !desk.view.facts(parent).deleted);
             let slack = slack_card(id, fact, sources);
             let agent = agent_card(id, fact, sources);
             nodes.insert(
@@ -1553,6 +1565,18 @@ impl DeskCells {
     /// and a new one keeps the case the user typed. The id never reaches
     /// the user; the path is the whole interface.
     pub fn label_path_writes(&mut self, host: HostId, path: &str) -> Option<(Id, Vec<CellWrite>)> {
+        let (chain, writes) = self.label_path_chain_writes(host, path)?;
+        Some((chain.last()?.clone(), writes))
+    }
+
+    /// [`Self::label_path_writes`], with every label on the way down rather
+    /// than the leaf alone: the minimal-set rule has to know what the new
+    /// label is nested under, and a path just minted is not on the map yet.
+    pub fn label_path_chain_writes(
+        &mut self,
+        host: HostId,
+        path: &str,
+    ) -> Option<(Vec<Id>, Vec<CellWrite>)> {
         let names = path
             .split('/')
             .map(str::trim)
@@ -1564,6 +1588,7 @@ impl DeskCells {
         let nodes = self.nodes(host);
         let mut writes = Vec::new();
         let mut parent: Option<Id> = None;
+        let mut chain = Vec::new();
         for name in names {
             let existing = nodes.iter().find(|node| {
                 matches!(node.id, Id::Label(_))
@@ -1592,9 +1617,10 @@ impl DeskCells {
                     id
                 }
             };
+            chain.push(id.clone());
             parent = Some(id);
         }
-        parent.map(|id| (id, writes))
+        (!chain.is_empty()).then_some((chain, writes))
     }
 
     /// `w`: the label the path names stands for this workdir, minted if
@@ -1653,14 +1679,84 @@ impl DeskCells {
     /// `f`: the thing carries the label the path names, or stops carrying
     /// it when it already does. The label is minted if the path is new, in
     /// the same mutation, so a label never exists without something on it.
+    /// The chain of a label: itself, then the labels it is nested under.
+    /// A label path is exactly this read backwards, so "is `rho` implied by
+    /// `rho/agent`" is a walk of it.
+    fn label_chain(&self, host: HostId, label: &Id) -> Vec<Id> {
+        let nodes = self.nodes(host);
+        let mut chain = vec![label.clone()];
+        let mut next = nodes
+            .iter()
+            .find(|node| &node.id == label)
+            .and_then(|node| node.parent.clone());
+        while let Some(id) = next.filter(|id| matches!(id, Id::Label(_))) {
+            if chain.contains(&id) {
+                break;
+            }
+            next = nodes
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| node.parent.clone());
+            chain.push(id);
+        }
+        chain
+    }
+
+    /// The label the thing already carries that puts it under `path`
+    /// anyway, named as the user would read it. A thing carrying
+    /// `rho/agent` is under `rho`, so labelling it `rho` says nothing; the
+    /// picker tells the reader that rather than growing the set.
+    ///
+    /// `None` when the path names no label yet: a label nobody has made can
+    /// have nothing under it.
+    pub fn label_deeper_than(&self, host: HostId, id: &Id, path: &str) -> Option<String> {
+        let paths = self.label_paths(host);
+        let (label, _) = paths.iter().find(|(_, named)| named == path)?;
+        let carried = self.facts(host, id)?.labels;
+        carried.iter().find_map(|held| {
+            (held != label && self.label_chain(host, held).contains(label))
+                .then(|| {
+                    paths
+                        .iter()
+                        .find(|(id, _)| id == held)
+                        .map(|(_, named)| named.clone())
+                })
+                .flatten()
+        })
+    }
+
     pub fn label_writes(
         &mut self,
         host: HostId,
         id: &Id,
         path: &str,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
-        let (label, mut writes) = self.label_path_writes(host, path)?;
-        let present = !self.facts(host, id)?.labels.contains(&label);
+        let (chain, mut writes) = self.label_path_chain_writes(host, path)?;
+        let label = chain.last()?.clone();
+        let carried = self.facts(host, id)?.labels;
+        let present = !carried.contains(&label);
+        // The set kept is the smallest one that says where the thing is:
+        // a label the new one is nested under says nothing once the deeper
+        // one is on, so it comes off in the same mutation.
+        if present {
+            // The path just walked names the labels above this one, minted
+            // or not; a label on the map may also be nested under labels
+            // the path did not spell, so both are asked.
+            let mut implied = self.label_chain(host, &label);
+            implied.extend(chain.iter().cloned());
+            writes.extend(
+                carried
+                    .iter()
+                    .filter(|held| *held != &label && implied.contains(held))
+                    .map(|held| CellWrite {
+                        id: id.clone(),
+                        property: Property::Labeled {
+                            label: held.clone(),
+                            present: false,
+                        },
+                    }),
+            );
+        }
         let verdict = Verdict::Label {
             label: label.clone(),
             present,

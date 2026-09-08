@@ -1984,10 +1984,11 @@ impl Workspace {
                 self.note_agent_created(host, agent_id);
                 if let Some((filing_host, area)) = self.pending_agent_filing.take()
                     && filing_host == host
+                    && let Some(property) = filing_property(area)
                 {
                     let writes = vec![rho_desk::cells::CellWrite {
                         id: rho_desk::cells::Id::Agent(agent_id),
-                        property: filing_property(area),
+                        property,
                     }];
                     self.apply_desk_writes(host, writes, None, window, cx);
                 }
@@ -3434,16 +3435,20 @@ impl Workspace {
         };
         let id = rho_desk::cells::Id::Page(rho_desk::PageId(*page.0.as_bytes()));
         let at_root = parent.is_none();
-        let writes = vec![
-            rho_desk::cells::CellWrite {
+        let filing = parent
+            .map(|(_, area)| area)
+            .and_then(filing_property)
+            .into_iter()
+            .map(|property| rho_desk::cells::CellWrite {
                 id: id.clone(),
-                property: rho_desk::cells::Property::Parent(parent.map(|(_, parent)| parent)),
-            },
-            rho_desk::cells::CellWrite {
-                id: id.clone(),
-                property: rho_desk::cells::Property::CreatedAt(crate::desk_view::now_timestamp()),
-            },
-        ];
+                property,
+            });
+        let writes = std::iter::once(rho_desk::cells::CellWrite {
+            id: id.clone(),
+            property: rho_desk::cells::Property::CreatedAt(crate::desk_view::now_timestamp()),
+        })
+        .chain(filing)
+        .collect();
         if self
             .apply_desk_writes(host, writes, None, window, cx)
             .is_none()
@@ -7203,6 +7208,13 @@ impl Workspace {
         if path.is_empty() {
             return;
         }
+        // The smallest set that says where the thing is: a label it already
+        // carries a deeper one of says nothing, so it is not added.
+        if let Some(deeper) = self.desk_cells.label_deeper_than(host, &id, path) {
+            let said = format!("already under {deeper}");
+            self.echo(&said, StyleClass::SystemInfo, cx);
+            return;
+        }
         let Some((writes, event)) = self.desk_cells.label_writes(host, &id, path) else {
             self.echo("label: nothing to label", StyleClass::SystemInfo, cx);
             return;
@@ -7214,16 +7226,54 @@ impl Workspace {
                 ..
             }
         );
-        if self
-            .apply_desk_writes(host, writes, Some(event), window, cx)
-            .is_none()
-        {
+        let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {
             return;
-        }
+        };
         let said = match removed {
             true => format!("label removed: {path}"),
             false => format!("label: {path}"),
         };
+        // Filing the card in view is a verdict on it like any other, so it
+        // is registered for undo and its word waits for the daemon's
+        // acceptance. Undo takes the label back off; a shallower label the
+        // minimal-set rule took off in the same mutation is not put back,
+        // because the log entry states the one cell the verdict names.
+        if let Some(card) = self
+            .card_in_view(cx)
+            .filter(|card| card.host == host && card.identity.node_id == id)
+        {
+            let event = crate::dashboard::DealerEvent {
+                card: card.identity.clone(),
+                kind: card.kind,
+                verdict: crate::dashboard::DealerVerdict::File,
+                at: chrono::Local::now().fixed_offset(),
+                skip_until: None,
+            };
+            let undo = self.next_verdict_undo(
+                said.clone(),
+                VerdictUndoState::DeskVerdict {
+                    card: Box::new(card.clone()),
+                    verdict: crate::dashboard::DealerVerdict::File,
+                    host,
+                    node: id.clone(),
+                    at: stamp,
+                },
+            );
+            let phone_verdict = self
+                .phone
+                .enabled
+                .then_some(rho_journal::PhoneVerdict::File);
+            self.pending_tree_verdicts.insert(
+                (host, stamp),
+                PendingTreeVerdict {
+                    event,
+                    echo: said,
+                    undo,
+                    phone_verdict,
+                },
+            );
+            return;
+        }
         self.echo(&said, StyleClass::SystemInfo, cx);
     }
 
@@ -7242,7 +7292,7 @@ impl Workspace {
             .facts(host, &target)
             .map(|facts| facts.labels)
             .unwrap_or_default();
-        let mut destinations = self
+        let destinations = self
             .desk_cells
             .label_paths(host)
             .into_iter()
@@ -7254,16 +7304,9 @@ impl Workspace {
                 (path, description.to_owned(), host, label)
             })
             .collect::<Vec<_>>();
-        let threads = self.slack_thread_facts(cx);
-        // Labels are offered as their own paths, above, so the places are
-        // everything else: one row per label, not two.
-        destinations.extend(
-            self.dashboard
-                .area_candidates(&self.registry, &threads, cx)
-                .into_iter()
-                .filter(|(_, _, _, node_id)| !matches!(node_id, rho_desk::cells::Id::Label(_)))
-                .map(|(path, kind, host, node_id)| (path, kind.to_owned(), host, node_id)),
-        );
+        // Labels are the whole picker: a thing is placed by what it
+        // carries, so there is no place to offer beside them, and a path
+        // nobody has made yet is minted by naming it.
         self.pending_filing_destinations = destinations;
         self.pending_filing_selected = None;
         self.open_prompt(
@@ -7284,22 +7327,10 @@ impl Workspace {
                     .collect()
             }),
             std::rc::Rc::new(move |workspace, heading, window, cx| {
-                let Some((_, node_id)) = workspace
-                    .pending_filing_destinations
-                    .iter()
-                    .find(|(value, ..)| *value == heading)
-                    .map(|(_, _, host, node_id)| (*host, node_id.clone()))
-                else {
-                    // An unknown path is a label the user is naming as they
-                    // type it: labelling mints what the path names.
-                    workspace.label_card(host, target.clone(), &heading, window, cx);
-                    return;
-                };
-                if matches!(node_id, rho_desk::cells::Id::Label(_)) {
-                    workspace.label_card(host, target.clone(), &heading, window, cx);
-                    return;
-                }
-                workspace.file_under(host, target.clone(), node_id, &heading, window, cx);
+                // Every row is a label, and a path that matches no row is a
+                // label the user is naming as they type it: either way
+                // labelling mints what the path names.
+                workspace.label_card(host, target.clone(), &heading, window, cx);
             }),
             window,
             cx,
@@ -7307,51 +7338,6 @@ impl Workspace {
         if let Some(minibuffer) = &mut self.minibuffer {
             minibuffer.set_complete_whole_input();
         }
-    }
-
-    /// Puts a thing under a place. On a dealt card it is a verdict like any
-    /// other, so the dealer sees it and the journal records it; on a map row
-    /// it is the one parent cell and its undo.
-    fn file_under(
-        &mut self,
-        host: HostId,
-        target: rho_desk::cells::Id,
-        parent: rho_desk::cells::Id,
-        heading: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let dealt = self
-            .card_in_view(cx)
-            .is_some_and(|card| card.identity.node_id == target);
-        if dealt {
-            if !self.submit_tree_verdict(
-                None,
-                crate::desk_view::DeskVerdict::File { parent },
-                crate::dashboard::DealerVerdict::File,
-                format!("file under {heading}"),
-                window,
-                cx,
-            ) {
-                self.echo(
-                    "file: the deal card disappeared",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            }
-            return;
-        }
-        let writes = vec![rho_desk::cells::CellWrite {
-            id: target,
-            property: rho_desk::cells::Property::Parent(Some(parent)),
-        }];
-        if self
-            .apply_desk_writes(host, writes, None, window, cx)
-            .is_none()
-        {
-            return;
-        }
-        self.echo(&format!("file under {heading}"), StyleClass::SystemInfo, cx);
     }
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9258,13 +9244,17 @@ impl Render for Workspace {
 /// other axis: filing into one is being labelled, not being reparented
 /// under it. Written as a parent, the agent went in and the map still drew
 /// it at the root with the label it was made in left empty.
-pub(crate) fn filing_property(area: rho_desk::cells::Id) -> rho_desk::cells::Property {
+/// How a new thing is filed where the picker put it. A thing is placed by
+/// the labels it carries and carries no parent, so an area is a label or it
+/// is the root; anything else names no place a thing can be in and files it
+/// nowhere rather than writing a parent on it.
+pub(crate) fn filing_property(area: rho_desk::cells::Id) -> Option<rho_desk::cells::Property> {
     match area {
-        label @ rho_desk::cells::Id::Label(_) => rho_desk::cells::Property::Labeled {
+        label @ rho_desk::cells::Id::Label(_) => Some(rho_desk::cells::Property::Labeled {
             label,
             present: true,
-        },
-        parent => rho_desk::cells::Property::Parent(Some(parent)),
+        }),
+        _ => None,
     }
 }
 

@@ -4235,11 +4235,11 @@ fn filing_completion_keeps_duplicate_heading_identity() {
 }
 
 #[gpui::test]
-fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut TestAppContext) {
-    // Filing is a verdict on the card's own node: one `Parent` write, and
-    // an undo that puts the node back where it was.
+fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut TestAppContext) {
+    // Filing is a verdict on the card's own node: one `Labeled` write, and
+    // an undo that takes the label off again.
     let mut desk = DeskFixture::new();
-    let destination = desk.note(None, "Verdict agent");
+    let destination = desk.label("rho");
     let dealt = desk.due_note(None, "Deal QA note");
 
     cx.update(bind_test_keymaps);
@@ -4274,8 +4274,16 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
-            assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property == rho_desk::cells::Property::Parent(Some(destination.clone()))));
+            assert!(
+                mutation.writes.iter().any(|write| write.id == dealt
+                    && write.property
+                        == rho_desk::cells::Property::Labeled {
+                            label: destination.clone(),
+                            present: true,
+                        }),
+                "the card is filed by the label it was dealt under: {:?}",
+                mutation.writes
+            );
             mutation.stamp
         })
         .unwrap();
@@ -4289,10 +4297,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
                 cx,
             );
             assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("file under Verdict agent: Deal QA note")
-            );
+            assert_eq!(workspace.echo_text_for_test(), Some("label: rho"));
         })
         .unwrap();
 
@@ -4301,8 +4306,16 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing undo mutation");
-            assert!(mutation.writes.iter().any(|write| write.id == dealt
-                && write.property == rho_desk::cells::Property::Parent(None)));
+            assert!(
+                mutation.writes.iter().any(|write| write.id == dealt
+                    && write.property
+                        == rho_desk::cells::Property::Labeled {
+                            label: destination.clone(),
+                            present: false,
+                        }),
+                "undoing takes the label back off: {:?}",
+                mutation.writes
+            );
         })
         .unwrap();
 }
@@ -7026,15 +7039,18 @@ fn a_slack_verdict_is_read_from_the_store_not_from_slack(cx: &mut TestAppContext
         .unwrap();
 }
 
-/// Creation: `n` from anywhere, the area always asked with the node in
-/// context as the first answer, so Enter alone files the new thing where
-/// the reader already is.
+/// Creation: `n` from anywhere, the area always asked, and the labels the
+/// thing in context carries offered first, so Enter alone files the new
+/// thing where the reader already is. The area is a label: a thing is
+/// placed by what it carries and carries no parent.
 #[gpui::test]
-fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext) {
+fn new_note_takes_the_label_the_thing_in_context_carries(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let elsewhere = desk.note(None, "elsewhere");
+    let elsewhere = desk.label("elsewhere");
+    let here = desk.label("here");
     let context = desk.note(None, "the area in view");
+    desk.labelled(context.clone(), here.clone());
 
     let workspace = overview_workspace(cx);
     workspace
@@ -7046,14 +7062,13 @@ fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
-            let areas = workspace
-                .dashboard
-                .area_candidates(&workspace.registry, &Default::default(), cx)
-                .into_iter()
-                .map(|(path, kind, _, _)| (path, kind))
-                .collect::<Vec<_>>();
-            assert!(areas.contains(&("the area in view".to_owned(), "note")));
-            assert!(areas.contains(&("elsewhere".to_owned(), "note")));
+            let areas = workspace.areas_for_test(cx);
+            assert!(areas.contains(&("here".to_owned(), "label".to_owned())));
+            assert!(areas.contains(&("elsewhere".to_owned(), "label".to_owned())));
+            assert!(
+                !areas.iter().any(|(path, _)| path == "the area in view"),
+                "a note is not an area a thing can be filed under: {areas:?}"
+            );
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -7070,14 +7085,22 @@ fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext
                 take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
             assert!(
                 mutation.writes.iter().any(|write| write.property
-                    == rho_desk::cells::Property::Parent(Some(context.clone()))),
-                "Enter on the first row files the note where the cursor is"
+                    == rho_desk::cells::Property::Labeled {
+                        label: here.clone(),
+                        present: true,
+                    }),
+                "Enter on the first row gives the note the label the cursor's thing carries"
             );
             assert!(
-                !mutation.writes.iter().any(|write| write.property
-                    == rho_desk::cells::Property::Parent(Some(elsewhere.clone()))),
-                "no other area is written to"
+                !mutation.writes.iter().any(|write| matches!(
+                    write.property,
+                    rho_desk::cells::Property::Parent(Some(_))
+                )),
+                "nothing is placed by a parent: {:?}",
+                mutation.writes
             );
+            let _ = &elsewhere;
+            let _ = &context;
         })
         .unwrap();
 }
@@ -8372,10 +8395,12 @@ fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
 fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
-    let area = desk.due_note(None, "the area in view");
-    // The one registered project is the workdir the draft inherits when
-    // the area names none.
-    desk.project("rho", "/tmp/rho-test-repo");
+    // The one registered project is the workdir the draft inherits, and
+    // the label the thing in context carries is the area offered first: an
+    // area is a label now, and a thing carries no parent.
+    let area = desk.project("rho", "/tmp/rho-test-repo");
+    let context = desk.due_note(None, "the area in view");
+    desk.labelled(context, area.clone());
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -9358,10 +9383,11 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
 }
 
 /// `f` names a label by path: `rho/agent` is the label `agent` under the
-/// label `rho`, both minted on the spot if they are new, and the thing then
-/// hangs on the map in its place and under the label as well.
+/// label `rho`, both minted on the spot if they are new, and the label is
+/// then where the thing is: it hangs under the label and no longer under
+/// the place it was in.
 #[gpui::test]
-fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAppContext) {
+fn a_label_is_named_by_path_and_says_where_the_thing_is(cx: &mut TestAppContext) {
     use rho_desk::cells::{Id, Property};
 
     let mut desk = DeskFixture::new();
@@ -9412,8 +9438,9 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
         })
         .unwrap();
 
-    // The map is a DAG drawn as a tree: the note is under the area it was
-    // filed in and under the label it now carries, and both rows are real.
+    // A thing is placed by the labels it carries: the label it now carries
+    // is where it is, and the note it was filed under yields to it. Taking
+    // the label off below puts that place back.
     workspace
         .update(cx, |workspace, _, _| {
             let places = workspace
@@ -9422,7 +9449,7 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
                 .filter(|node| node.id == thing)
                 .map(|node| node.under)
                 .collect::<Vec<_>>();
-            assert_eq!(places, vec![Some(area.clone()), Some(label.clone())]);
+            assert_eq!(places, vec![Some(label.clone())]);
         })
         .unwrap();
 
@@ -9477,14 +9504,127 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
                 1,
                 "the thing is back in one place"
             );
+            assert_eq!(
+                workspace
+                    .desk_cells_snapshot_for_test(HostId::default())
+                    .into_iter()
+                    .find(|node| node.id == thing)
+                    .and_then(|node| node.under),
+                Some(area.clone()),
+                "the place it was in is where it is again"
+            );
         })
         .unwrap();
 }
 
-/// The one picker offers both axes: the labels a thing can carry and the
-/// places it can sit in, so `f` is the only filing key there is.
+/// The set kept is the smallest one that says where the thing is. A thing
+/// carrying `rho` filed under `rho/agent` is under `rho` by the label's own
+/// nesting, so `rho` comes off in the same mutation rather than sitting
+/// beside it saying the same thing; and labelling it `rho` again after that
+/// says nothing at all, so nothing is written.
 #[gpui::test]
-fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
+fn filing_under_a_deeper_label_takes_the_shallower_one_off(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let thing = desk.note(None, "the flick recogniser");
+    let rho = desk.label("rho");
+    desk.labelled(thing.clone(), rho.clone());
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let carried = |workspace: &mut Workspace| {
+        let mut paths = workspace
+            .desk_cells
+            .facts(HostId::default(), &thing)
+            .expect("the thing has facts")
+            .labels
+            .iter()
+            .filter_map(|label| {
+                workspace
+                    .desk_cells
+                    .label_paths(HostId::default())
+                    .into_iter()
+                    .find(|(id, _)| id == label)
+                    .map(|(_, path)| path)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    };
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                carried(workspace),
+                vec!["rho/agent".to_owned()],
+                "the deeper label replaces the one it is nested under"
+            );
+
+            // The shallower one again is a no-op: the thing is already
+            // under it, and the picker says so instead of growing the set.
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.label_card(HostId::default(), thing.clone(), "rho", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                carried(workspace),
+                vec!["rho/agent".to_owned()],
+                "labelling it with a label it is already under writes nothing"
+            );
+            assert!(
+                take_desk_mutation(workspace, HostId::default()).is_none(),
+                "and sends nothing"
+            );
+        })
+        .unwrap();
+}
+
+/// A thing under two labels is drawn under each: labels are a second axis,
+/// and a primary label would be the parent again under another name.
+#[gpui::test]
+fn a_thing_under_two_labels_is_drawn_under_each(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let thing = desk.note(None, "the flick recogniser");
+    let rho = desk.label("rho");
+    let phone = desk.label("phone");
+    desk.labelled(thing.clone(), rho.clone());
+    desk.labelled(thing.clone(), phone.clone());
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let rows = workspace.desk_cells_snapshot_for_test(HostId::default());
+            let under = rows
+                .iter()
+                .filter(|node| node.id == thing)
+                .map(|node| node.under.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(under.len(), 2, "one row per label, got {under:?}");
+            assert!(under.contains(&Some(rho)) && under.contains(&Some(phone)));
+        })
+        .unwrap();
+}
+
+/// The picker offers labels and nothing else: a thing is placed by what it
+/// carries and carries no parent, so a note is not a place to file under.
+#[gpui::test]
+fn filing_offers_labels_and_no_places(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let area = desk.note(None, "Verdict agent");
     let dealt = desk.due_note(None, "Deal QA note");
@@ -9515,11 +9655,11 @@ fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
                 "the label is a place to file under"
             );
             assert!(
-                workspace
+                !workspace
                     .filing_destinations_for_test()
                     .iter()
                     .any(|(path, ..)| path == "Verdict agent"),
-                "notes are still offered"
+                "a note is not a place a thing can be filed under"
             );
             let _ = &dealt;
         })
@@ -9847,7 +9987,7 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
     });
 
     let mut desk = DeskFixture::new();
-    let project = desk.note(None, "Release research");
+    let project = desk.label("Release research");
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -10237,22 +10377,20 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
     );
 }
 
-/// `n a` into a label makes the agent a member of it. Filing it as a child
-/// left the label empty on the map and the agent at the root.
+/// `n a` into a label makes the agent a member of it, and an area that is
+/// not a label files it nowhere: a thing carries no parent, so there is no
+/// parent to write instead.
 #[test]
-fn a_new_agent_made_in_a_label_is_labelled_not_reparented() {
+fn a_new_thing_is_filed_by_its_label_and_never_by_a_parent() {
     use rho_desk::cells::{Id, Property};
 
     let label = Id::Label(rho_desk::cells::Uuid([3; 16]));
     assert!(matches!(
-        crate::workspace::filing_property(label.clone()),
-        Property::Labeled { present: true, .. }
+        crate::workspace::filing_property(label),
+        Some(Property::Labeled { present: true, .. })
     ));
     let note = Id::Note(rho_desk::cells::Uuid([4; 16]));
-    assert!(matches!(
-        crate::workspace::filing_property(note.clone()),
-        Property::Parent(Some(parent)) if parent == note
-    ));
+    assert_eq!(crate::workspace::filing_property(note), None);
 }
 
 /// Enter in the workdir row sends the draft. The prompt's own enter is

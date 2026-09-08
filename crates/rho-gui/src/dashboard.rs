@@ -1961,69 +1961,10 @@ fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
 }
 
 /// What a row that is not a note says. Agent rows carry their name in the
-/// row prefix already, so their buffer stays empty rather than repeating it.
-fn derived_title(
-    node: &crate::desk_view::DeskNode,
-    _registry: &AgentMap,
-    threads: &HashMap<SlackUnit, SlackFacts>,
-) -> String {
-    use rho_desk::cells::Id;
-
-    // A name the user wrote wins over anything derived, whatever the row
-    // is: a Slack conversation they renamed reads as what they called it,
-    // not as what Slack calls it. A note is the exception, because its
-    // title is the first line of its body.
-    if let Some(name) = node.name.as_ref().filter(|name| !name.trim().is_empty())
-        && !matches!(node.id, Id::Note(_))
-    {
-        return name.clone();
-    }
-    match &node.id {
-        Id::Agent(_) | Id::Note(_) => String::new(),
-        Id::Label(_) => "label".to_owned(),
-        Id::Host(_) => "this host".to_owned(),
-        Id::Page(_) => node_page(node)
-            .and_then(rho_browser::live_page_name)
-            .unwrap_or_else(|| "page".to_owned()),
-        Id::File { path, .. } => path.to_string(),
-        // The store holds the unit's identity, which is ids and a
-        // timestamp; what it is called lives in the mirror. A thread rho
-        // has not caught up with yet says so rather than showing its keys.
-        Id::Slack(unit) => match threads.get(unit) {
-            Some(facts) if facts.title.is_empty() => facts.conversation.clone(),
-            Some(facts) => format!("{} · {}", facts.conversation, facts.title),
-            // A unit rho has not caught up with yet is named by any sibling
-            // that knows what Slack calls the conversation, so its ids are
-            // never shown.
-            None => threads
-                .iter()
-                .find(|(key, _)| key.workspace == unit.workspace && key.channel == unit.channel)
-                .map(|(_, facts)| facts.conversation.clone())
-                .unwrap_or_else(|| "conversation".to_owned()),
-        },
-        Id::PullRequest { repo, number } => format!("{repo}#{number}"),
-    }
-}
 
 /// What an area row calls itself in the picker.
 /// Every label as the path a person would type, `rho/agent`. The label
 /// axis only: a label filed under something that is not a label is named
-/// by its own name, because the path is the filing rather than the place.
-fn area_kind(id: &rho_desk::cells::Id) -> &'static str {
-    use rho_desk::cells::Id;
-
-    match id {
-        Id::Note(_) => "note",
-        Id::Label(_) => "label",
-        Id::Agent(_) => "agent",
-        Id::Host(_) => "host",
-        Id::Page(_) => "page",
-        Id::Slack(unit) if unit.thread.is_some() => "thread",
-        Id::Slack(_) => "conversation",
-        Id::File { .. } => "file",
-        Id::PullRequest { .. } => "pull request",
-    }
-}
 
 /// A note's title is the first line of its body. The rest of the body is
 /// the note itself: it belongs on the note's own surface, never in a path,
@@ -2109,49 +2050,6 @@ impl RankedDealCard {
     }
 }
 
-impl Dashboard {
-    /// Every node a new thing can be filed under, as its full path. Any
-    /// kind is an area: a note under a Slack thread is notes for that
-    /// thread, an agent under a page is the engineer on it. A row with
-    /// nothing readable to type at is left out.
-    pub(crate) fn area_candidates(
-        &self,
-        registry: &AgentMap,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        _cx: &App,
-    ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
-        let mut areas = Vec::new();
-        for (host, source) in &self.deal_hosts {
-            for node in source.nodes() {
-                let breadcrumb = source.breadcrumb(&node.id);
-                // A note's breadcrumb already ends with the note itself;
-                // every other kind hangs its title under its parent's.
-                let path = if node.is_note() {
-                    breadcrumb
-                } else {
-                    let title = source
-                        .shown_title(&node.id)
-                        .or_else(|| {
-                            node.agent()
-                                .map(|agent_id| registry.agent_human_name(agent_id))
-                        })
-                        .unwrap_or_else(|| derived_title(node, registry, threads));
-                    if breadcrumb.is_empty() {
-                        title
-                    } else {
-                        format!("{breadcrumb} › {title}")
-                    }
-                };
-                if path.trim().is_empty() {
-                    continue;
-                }
-                areas.push((path, area_kind(&node.id), *host, node.id.clone()));
-            }
-        }
-        areas
-    }
-}
-
 /// What a thread's card says and how hard it pushes. Why it is here, then
 /// whose turn it is, then how long it has been that way. Somebody waiting
 /// outranks a note of the same age, the way a blocked agent outranks an FYI.
@@ -2191,48 +2089,6 @@ mod tests {
     /// A name the user wrote wins over the name the source gave, on any
     /// id: a Slack conversation they renamed reads as what they called it,
     /// and one they have not is still named by the mirror.
-    #[test]
-    fn a_name_the_user_wrote_beats_the_one_the_source_gave() {
-        let unit = rho_desk::cells::SlackUnit {
-            workspace: "acme".to_owned(),
-            channel: "C1".to_owned(),
-            thread: None,
-        };
-        let node = |name: Option<&str>| crate::desk_view::DeskNode {
-            id: rho_desk::cells::Id::Slack(unit.clone()),
-            parent: None,
-            under: None,
-            state: rho_desk::cells::State::Open,
-            defer_until: None,
-            deadline: None,
-            pace_days: 0,
-            labels: Default::default(),
-            name: name.map(str::to_owned),
-            created_at: None,
-        };
-        let registry = AgentMap::default();
-        let facts = HashMap::from([(
-            unit.clone(),
-            SlackFacts {
-                title: "any update?".to_owned(),
-                conversation: "#design".to_owned(),
-                raised_at: chrono::Local::now().fixed_offset(),
-                wait_days: 0.0,
-                waiting_on: None,
-                latest: "500.0".to_owned(),
-                newest_from_other: Some("500.0".to_owned()),
-                reason: Some(rho_slack::model::Attention::FollowedThread),
-            },
-        )]);
-        assert_eq!(
-            derived_title(&node(None), &registry, &facts),
-            "#design · any update?"
-        );
-        assert_eq!(
-            derived_title(&node(Some("the release room")), &registry, &facts),
-            "the release room"
-        );
-    }
 
     #[test]
     fn a_slack_thread_deals_like_an_agent_waiting_on_a_reply() {
