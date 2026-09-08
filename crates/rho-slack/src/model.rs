@@ -301,6 +301,22 @@ pub struct ConversationRow {
     pub latest: Option<Ts>,
 }
 
+/// What the next-unread key found.
+///
+/// Three cases and not an Option, because "nothing here" and "nothing
+/// here, and this much waiting outside what you are looking at" are
+/// different things to be told, and the reader is owed the difference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NextUnread {
+    /// Open this one.
+    Go(ChannelId),
+    /// Nothing unread the narrowing reaches, and this many outside it.
+    /// Never zero, and never raised when no query stands.
+    Outside(usize),
+    /// Nothing unread anywhere the key would go.
+    Nothing,
+}
+
 pub struct Model {
     workspace: WorkspaceName,
     self_id: UserId,
@@ -1479,17 +1495,46 @@ impl Model {
     /// one is a question about the workspace, and stays one; this is a
     /// question about the list on screen. Two questions, two answers, and
     /// the difference is deliberate.
-    pub fn next_unread(&self, from: Option<&ChannelId>) -> Option<ChannelId> {
+    pub fn next_unread(&self, from: Option<&ChannelId>) -> NextUnread {
         let rows = self.walked();
-        let unread = |row: &&ConversationRow| !row.muted && (row.unread || row.mention_count > 0);
         let at = from
             .and_then(|from| rows.iter().position(|row| &row.id == from))
             .map_or(0, |at| at + 1);
-        rows.iter()
+        let found = rows
+            .iter()
             .skip(at)
             .chain(rows.iter().take(at))
-            .find(|row| unread(row) && Some(&row.id) != from)
-            .map(|row| row.id.clone())
+            .find(|row| Self::unread(row) && Some(&row.id) != from)
+            .map(|row| row.id.clone());
+        if let Some(channel) = found {
+            return NextUnread::Go(channel);
+        }
+        // Nothing left on screen. Whether that is the end of the unread or
+        // only the end of what the query reaches is the difference between
+        // "you are done" and "you are done in here", and the reader is owed
+        // it: the same walk, once, and only at the edge.
+        match self.query.is_empty() {
+            true => NextUnread::Nothing,
+            false => {
+                let inside = rows.iter().map(|row| &row.id).collect::<BTreeSet<_>>();
+                let outside = self
+                    .order
+                    .values()
+                    .filter(|row| Self::unread(row) && !inside.contains(&row.id))
+                    .count();
+                match outside {
+                    0 => NextUnread::Nothing,
+                    outside => NextUnread::Outside(outside),
+                }
+            }
+        }
+    }
+
+    /// Whether a conversation is somewhere the next-unread key will take
+    /// the reader: unread or holding a mention, and not muted. Muted is
+    /// the reader saying "not this one", which the key obeys.
+    fn unread(row: &&ConversationRow) -> bool {
+        !row.muted && (row.unread || row.mention_count > 0)
     }
 
     /// The rows a key walks: the narrowed ones while a query stands, the
@@ -3450,15 +3495,24 @@ mod tests {
             .map(|row| row.id)
             .collect::<Vec<_>>();
         let (first, second) = (order[0].clone(), order[1].clone());
-        assert_eq!(model.next_unread(None), Some(first.clone()));
-        assert_eq!(model.next_unread(Some(&first)), Some(second.clone()));
+        assert_eq!(model.next_unread(None), NextUnread::Go(first.clone()));
+        assert_eq!(
+            model.next_unread(Some(&first)),
+            NextUnread::Go(second.clone())
+        );
         // Round again: one key, pressed until there is nothing left.
-        assert_eq!(model.next_unread(Some(&second)), Some(first.clone()));
+        assert_eq!(
+            model.next_unread(Some(&second)),
+            NextUnread::Go(first.clone())
+        );
 
         // The one the reader is in does not count, however unread Slack
         // still thinks it is: they are looking at it.
         model.set_counts([count("C1", false), count("D1", true)]);
-        assert_eq!(model.next_unread(Some(&ChannelId("D1".into()))), None);
+        assert_eq!(
+            model.next_unread(Some(&ChannelId("D1".into()))),
+            NextUnread::Nothing
+        );
     }
 
     /// `shift-n` walks the list the reader is looking at, which is the
@@ -3505,7 +3559,7 @@ mod tests {
         );
         assert_eq!(
             model.next_unread(None),
-            Some(ChannelId("C1".into())),
+            NextUnread::Go(ChannelId("C1".into())),
             "the key goes to the unread one on screen, not the one off it"
         );
 
@@ -3520,8 +3574,9 @@ mod tests {
         ]);
         assert_eq!(
             model.next_unread(None),
-            None,
-            "and it stops at the edge of the list rather than leaving it"
+            NextUnread::Outside(1),
+            "at the edge it stops, and says how much waits outside rather \
+             than jumping there or claiming there is nothing"
         );
         assert_eq!(
             model.mark_plan(f64::MAX).conversations.len(),
@@ -3532,7 +3587,25 @@ mod tests {
 
         // Out of the narrowing, the key sees the whole list again.
         model.narrow("");
-        assert_eq!(model.next_unread(None), Some(ChannelId("D1".into())));
+        assert_eq!(
+            model.next_unread(None),
+            NextUnread::Go(ChannelId("D1".into()))
+        );
+
+        // Read everything, narrowed: nothing outside either, so the key
+        // says nothing waits rather than counting zero.
+        model.narrow("design");
+        model.set_counts([
+            ConversationCount {
+                has_unreads: false,
+                ..count("D1")
+            },
+            ConversationCount {
+                has_unreads: false,
+                ..count("C1")
+            },
+        ]);
+        assert_eq!(model.next_unread(None), NextUnread::Nothing);
     }
 
     #[test]
@@ -3560,7 +3633,7 @@ mod tests {
             rows.last()
                 .is_some_and(|row| row.muted && row.unread_count == 4)
         );
-        assert_eq!(model.next_unread(None), None);
+        assert_eq!(model.next_unread(None), NextUnread::Nothing);
 
         // Unmuted again, and it comes straight back up.
         model.set_muted([]);

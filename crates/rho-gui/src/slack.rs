@@ -9,7 +9,7 @@ use gpui::AppContext as _;
 use rho_desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
-use rho_slack::model::{Change, Model, Unit, Waiting};
+use rho_slack::model::{Change, Model, NextUnread, Unit, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::{Attaching, EditStart};
@@ -498,9 +498,35 @@ impl Workspace {
             _ => None,
         };
         match session.read(cx).model().next_unread(here.as_ref()) {
-            Some(channel) => self.open_slack_source(Source::Conversation(channel), window, cx),
-            None => self.open_slack(window, cx),
+            NextUnread::Go(channel) => {
+                self.open_slack_source(Source::Conversation(channel), window, cx)
+            }
+            // The reader has read everything the narrowing reaches. The key
+            // stops here rather than jumping out of the list they are in,
+            // and says what it is not showing them: nothing moves, and
+            // nothing is quietly left out.
+            NextUnread::Outside(waiting) => self.echo(
+                &Self::outside_the_narrowing(waiting),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+            NextUnread::Nothing => self.open_slack(window, cx),
         }
+    }
+
+    /// What the reader is told when the next-unread key reaches the edge of
+    /// a narrowing with unread still outside it. Its own function so the
+    /// singular reads like English and both cases can be asserted without a
+    /// window.
+    fn outside_the_narrowing(waiting: usize) -> String {
+        let plural = match waiting {
+            1 => "conversation",
+            _ => "conversations",
+        };
+        format!(
+            "slack: {waiting} unread {plural} outside the narrowing; \
+             s with an empty query shows every conversation"
+        )
     }
 
     /// `enter` on a list row, or on a message: the row's conversation, or

@@ -1454,3 +1454,74 @@ async fn the_next_unread_key_stays_inside_the_narrowed_list(cx: &mut TestAppCont
          and not to the one it was not: {shown:?}"
     );
 }
+
+/// At the edge of a narrowing the key stops and says what it is not
+/// showing. Nothing jumps out of the list, and nothing claims the reader is
+/// finished when a conversation they cannot see is waiting.
+#[gpui::test]
+async fn the_edge_of_a_narrowing_says_what_waits_outside_it(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+
+    // The same disagreeing walks as the test above: unread inside the
+    // narrowing and unread outside it, the outside one newer.
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C3",
+        "ts": "9000.0",
+        "user": "UD",
+        "text": "about ops",
+    }));
+    fake.push_frame(serde_json::json!({
+        "type": "message",
+        "channel": "C1",
+        "ts": "9001.0",
+        "user": "UD",
+        "text": "and about the design",
+    }));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.slack_narrow_for_test("ops", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The one unread the narrowing reaches, which opening reads.
+    cx.simulate_keystrokes(*workspace, "shift-n");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_open_label_for_test(cx))
+            .unwrap()
+            .as_deref(),
+        Some("#dev-ops"),
+        "the first press goes to the unread one on screen"
+    );
+
+    // And again, with nothing left inside the narrowing.
+    cx.simulate_keystrokes(*workspace, "shift-n");
+    cx.run_until_parked();
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, cx| workspace
+                .slack_open_label_for_test(cx))
+            .unwrap()
+            .as_deref(),
+        Some("#dev-ops"),
+        "the second press does not move the reader out of the narrowing"
+    );
+    assert_eq!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .echo_text_for_test()
+                .map(str::to_owned))
+            .unwrap()
+            .as_deref(),
+        Some(
+            "slack: 1 unread conversation outside the narrowing; \
+             s with an empty query shows every conversation"
+        ),
+        "it says what it is not showing them"
+    );
+}
