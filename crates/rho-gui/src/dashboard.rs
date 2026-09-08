@@ -1233,6 +1233,14 @@ impl Dashboard {
         agent_id: AgentId,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> bool {
+        // The verdict that put the agent away is in the store, so until a
+        // desk has answered there is nothing to read and the honest answer
+        // is that the agent is not the reader's to see. Answering "not put
+        // down" instead is how Home listed two snoozed agents as running
+        // for the first half second of every cold open.
+        if !self.deal_hosts.values().any(|source| source.desk_synced()) {
+            return true;
+        }
         self.deal_hosts
             .values()
             .any(|source| agent_node_closed(source, agent_id, now))

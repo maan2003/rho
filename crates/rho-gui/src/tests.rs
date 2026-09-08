@@ -11511,3 +11511,52 @@ fn an_agent_is_not_dealt_before_the_desk_that_holds_its_verdict(cx: &mut TestApp
         "and once it has answered the card goes out"
     );
 }
+
+/// Home's running list reads the same verdict as the dealer and used to
+/// read it its own way: `agent_put_down` asked every deal source and there
+/// were none, so `any` was false and a snoozed agent read as running. On a
+/// rig, on the user's own desk, that put two snoozed agents back on Home
+/// for the first half second after the client restarted.
+#[gpui::test]
+fn a_running_row_is_not_drawn_before_the_desk_that_holds_its_verdict(cx: &mut TestAppContext) {
+    let running = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "rho");
+    desk.agent_row(heading, running);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        turn_running: true,
+                        ..ui_head(running)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        !buffer_text(&workspace, cx).contains("running"),
+        "no desk has answered, so nothing is said about the agent either way"
+    );
+
+    // The desk answers and the row is drawn, because waiting for the store
+    // is not the same as never drawing.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = buffer_text(&workspace, cx);
+    assert!(text.contains("running"), "home text: {text:?}");
+}
