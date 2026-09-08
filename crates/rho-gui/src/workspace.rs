@@ -527,7 +527,7 @@ pub struct Workspace {
     pages: crate::browser::Pages,
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
-    zulip: Option<Entity<rho_zulip::session::Session>>,
+    zulip: crate::zulip::Zulip,
     pub(crate) slack: Option<Entity<rho_slack::session::Session>>,
     /// Set while the Slack session cannot be trusted to be current. It lights
     /// the lamp on its own, because nothing else in the queue knows.
@@ -1137,7 +1137,7 @@ impl Workspace {
             pending_semantic_group: None,
             dashboard_preview: None,
             pages: crate::browser::Pages::default(),
-            zulip: None,
+            zulip: crate::zulip::Zulip::default(),
             slack: None,
             slack_degraded: None,
             slack_labels: HashMap::new(),
@@ -2566,28 +2566,12 @@ impl Workspace {
     /// `enter` on the dashboard's Zulip row: switch to the Zulip context
     /// and show its inbox. The client starts on first entry.
     pub(crate) fn open_zulip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.zulip_session(cx);
+        self.zulip.session(cx);
         self.active_context = ContextId::Zulip;
         let surface = self.make_surface(SurfaceKey::ZulipInbox, window, cx);
         self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
-    }
-
-    fn zulip_session(&mut self, cx: &mut Context<Self>) -> Entity<rho_zulip::session::Session> {
-        self.zulip
-            .get_or_insert_with(|| cx.new(rho_zulip::session::Session::new))
-            .clone()
-    }
-
-    /// The host services the Zulip surfaces borrow: editor chrome and the
-    /// transcript's Markdown pipeline, so chat reads like every other
-    /// buffer in the frame.
-    fn zulip_hooks() -> rho_zulip::ui::Hooks {
-        rho_zulip::ui::Hooks {
-            configure_editor: rho_window::editor_config::configure,
-            configure_markdown: rho_window::markdown::configure_buffer,
-        }
     }
 
     /// Shows one Zulip conversation, marking the conversation being left
@@ -2607,8 +2591,8 @@ impl Workspace {
         let surface = match self.find_surface(|surface| surface.key == key).cloned() {
             Some(surface) => surface,
             None => {
-                let session = self.zulip_session(cx);
-                let hooks = Self::zulip_hooks();
+                let session = self.zulip.session(cx);
+                let hooks = crate::zulip::Zulip::hooks();
                 let view =
                     cx.new(|cx| rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx));
                 Self::wrap_surface(key, SurfaceView::ZulipNarrow(view))
@@ -2642,7 +2626,7 @@ impl Workspace {
     /// the one being left as read. With nothing unread it returns to the
     /// inbox rather than sitting on a read conversation.
     fn zulip_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.zulip.clone() else {
+        let Some(session) = self.zulip.started() else {
             return;
         };
         let current = match &self.active_surface().view {
@@ -6554,8 +6538,8 @@ impl Workspace {
                 unreachable!("browser surfaces are created by create_browser_page")
             }
             SurfaceKey::ZulipInbox => {
-                let session = self.zulip_session(cx);
-                let hooks = Self::zulip_hooks();
+                let session = self.zulip.session(cx);
+                let hooks = crate::zulip::Zulip::hooks();
                 SurfaceView::ZulipInbox(
                     cx.new(|cx| rho_zulip::ui::InboxView::new(session, hooks, window, cx)),
                 )

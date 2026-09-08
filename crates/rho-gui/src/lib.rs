@@ -26,6 +26,7 @@ pub(crate) mod voice;
 #[cfg(feature = "walk-support")]
 pub mod walk;
 pub mod workspace;
+pub(crate) mod zulip;
 
 use gpui::{App, KeyBinding, actions};
 use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycle, RoleCycleGroup};
