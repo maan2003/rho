@@ -178,6 +178,88 @@ reading a page of prose. Splitting them means neither has to compromise,
 and both are the same text: editing a note on its surface and editing it on
 the map are one edit on one CRDT.
 
+## The desk mirror
+
+The client holds a replica of the desk cells on disk, the way it holds a
+replica of the agent log, and reads only the replica. The daemon is where
+the store lives; the replica is what the client opens with, and what it is
+never without.
+
+**Why.** Today `DeskCells` is built empty at launch and filled by the first
+`DeskSynced`. Between those two moments the client holds a desk that says
+nothing, and an empty desk and a desk that has not arrived are the same
+value with opposite meanings: the first says the user has said nothing, the
+second says nobody has asked. Every reader that could not tell them apart
+read the first meaning and was wrong. Two of them shipped: the dealer dealt
+agents the user had snoozed, and Home listed them as running, for as long
+as the first sync took on the user's own store. Those are patched by asking
+`is_synced` at each reader, which is a guard that has to be remembered at
+every new one. The replica removes the state instead of guarding it: there
+is no window in which the client has no desk, because the desk is a file it
+opens.
+
+It also buys the cold open. A desk read from disk is drawn in the first
+frame; the sync that follows is a delta, not the whole store.
+
+**Resume, not reload.** The wire is already shaped for this.
+`ClientMessage::DeskSync` carries `known: Version` — the per-device Lamport
+map the client already holds — and the daemon answers
+`desk_cells.sync_since(&known)`, which is `Store::since`: every cell and
+verdict whose stamp is newer than the client's lane for that device. Within
+one process this already works; a restart loses `confirmed` and so sends an
+empty `known` and is answered with the whole store. Persisting `confirmed`
+and its version is the whole of the client's half. Deletion needs nothing
+extra: a delete is a cell with a stamp like any other, so it arrives in the
+same delta and cannot be missed by resuming.
+
+This is the agent mirror's shape. `agent-mirror.redb` keeps a `StoredHost`
+per host with the journal `seq` it has read through, and `Follow { since }`
+asks for the rest; the desk keeps a `StoredHost` per host with the
+`Version` it has read through, and `DeskSync { known }` asks for the rest.
+One is a scalar and one is a map per device, and that is the only
+difference that matters.
+
+**The file.** `desk-mirror.redb`, beside `agent-mirror.redb` in the client
+state directory that `main` resolves — a library never reaches for it, the
+rule that already governs `desk_device()` and the agent mirror. Tables: the
+cells by id, the verdict events by `(id, stamp)`, the note bodies by id,
+and one `StoredHost` per host holding the version and the store's identity.
+The device id stays where it is, in `desk-device`; it is already persistent,
+which is what makes a persisted version usable at all.
+
+**Whose store is it.** The agent mirror asks the daemon for a
+`machine_seed` and starts over when it is not the database this copy counts
+in, or when the journal is shorter than the copy. The desk has no such
+question on the wire: `DeskSynced` says nothing about which store answered.
+Without it a client that has a version from one store and connects to
+another — a restored backup, a different machine behind the same
+name — sends a `known` the new store has never issued and is answered with
+the cells it has not got, and the client goes on holding rows the daemon
+does not have and calling them the user's desk. So `DeskSynced` gains the
+store's identity, and a client whose replica names a different one drops
+the replica and syncs from nothing. This is the reason the daemon commit is
+the sensitive one.
+
+**What the replica is not.** It holds `confirmed` — what the daemon has
+acknowledged — and never `view`. A client that dies with mutations in
+flight must open without them: an unacknowledged write is the daemon's to
+accept or refuse, and a replica that remembered it would show the user a
+verdict that was never taken. `view` is rebuilt from `confirmed` at open,
+which is what it already is after a rejection.
+
+**Bodies.** `DeskSynced` sends `desk_cells.bodies()` — every note's text, in
+full, on every sync, resumed or not. The cells resume and the text does
+not, so a delta of one cell still carries the whole desk's prose. That is
+its own fault and its own fix, and it is not in the way of this one: the
+replica can hold the bodies it was last sent and the daemon can keep
+sending them all, and nothing is wrong except the bytes. Fixing it means
+per-body versions, and it comes after.
+
+**Order.** Client first, daemon second. The client's half — persist,
+open from the replica, send the version it holds — is correct against
+today's daemon, which already answers `since`. The daemon's half is the
+store identity on `DeskSynced` and the reset it forces.
+
 ## Deferred on purpose
 
 - **Agent help with filing** — an agent suggesting the parent for a note,
