@@ -694,6 +694,14 @@ impl AgentMap {
         self.agent_summary(agent_id)
             .and_then(|agent| agent.parent_agent)
     }
+    /// The user made this agent themself. An agent created by an agent
+    /// belongs to its creator: it is not dealt, not on Home, not in the
+    /// running list, and not in Find, and its waiting reaches the user
+    /// through its creator's card. The fact is who created it, which never
+    /// changes; filing is placement and says nothing about it.
+    pub fn created_by_user(&self, agent_id: AgentId) -> bool {
+        self.agent_parent(agent_id).is_none()
+    }
     pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
         self.agent_summary(agent_id)
             .is_some_and(|agent| agent.hidden)
@@ -886,6 +894,19 @@ mod tests {
                 event,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_agent_created_by_an_agent_belongs_to_its_creator() {
+        let mut registry = AgentMap::default();
+        let host = HostId::default();
+        registry.set_host_data(host, 0, 2);
+        let mut entries = log(agent(1), 0, vec![created(1)]);
+        entries.extend(log(agent(2), 1, vec![child_of(Some(agent(1)), 2)]));
+        registry.tell(host, &entries);
+
+        assert!(registry.created_by_user(agent(1)));
+        assert!(!registry.created_by_user(agent(2)));
     }
 
     /// The desk files every agent in one go, so the registry rebuilds once.

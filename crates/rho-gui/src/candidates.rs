@@ -376,8 +376,12 @@ pub(crate) fn find_candidates(
     }
     // An agent nobody filed is findable all the same: filing says where a
     // thing sits, and the finder is for the ones the reader cannot point at.
+    // An agent created by an agent belongs to its creator and is not found.
     for agent_id in registry.known_agents().copied() {
-        if filed.contains(&agent_id) || registry.agent_hidden(agent_id) {
+        if filed.contains(&agent_id)
+            || registry.agent_hidden(agent_id)
+            || !registry.created_by_user(agent_id)
+        {
             continue;
         }
         let hit = rho_agents::find::hit(registry, agent_id, None);

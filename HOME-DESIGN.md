@@ -26,6 +26,11 @@ captures are all just cards, so channels need no section of their own: a
 thread waiting on a reply is above the line, a channel with mere chatter is
 below it.
 
+An agent created by an agent belongs to its creator. It is not dealt, not
+on Home, not in the running list, and not in Find; its waiting reaches the
+reader only through its creator's card. Only agents the reader created
+directly are theirs to deal with.
+
 ### Order: Next, Running, Later
 
 ```

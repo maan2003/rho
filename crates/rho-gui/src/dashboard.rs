@@ -213,7 +213,6 @@ impl DealQueue {
 /// Everything a card is made of besides the node it is about.
 struct DealerFacts<'a> {
     by_agent: HashMap<AgentId, &'a DealAgentFacts>,
-    spawned: HashMap<AgentId, Vec<AgentId>>,
     threads: &'a HashMap<SlackUnit, SlackFacts>,
     now: chrono::DateTime<chrono::FixedOffset>,
     interactions: &'a HashMap<AgentId, i64>,
@@ -510,18 +509,8 @@ impl Dashboard {
             .iter()
             .map(|facts| (facts.agent_id, facts))
             .collect::<HashMap<_, _>>();
-        // Who each agent spawned, so that the walk down from a filed agent
-        // costs its own descendants rather than a pass over every agent
-        // for every agent.
-        let mut spawned: HashMap<AgentId, Vec<AgentId>> = HashMap::new();
-        for agent in agents {
-            if let Some(parent) = agent.parent {
-                spawned.entry(parent).or_default().push(agent.agent_id);
-            }
-        }
         DealerFacts {
             by_agent,
-            spawned,
             threads,
             now,
             interactions: agent_interactions,
@@ -643,8 +632,7 @@ impl Dashboard {
         carded.insert(agent_id);
         // Every agent is its own topic. Taking the note as the topic made
         // two agents filed under one note compete for a single card, so all
-        // but the loudest disappeared from Home; a spawned child with no
-        // row of its own shared its parent's identity as well.
+        // but the loudest disappeared from Home.
         let node_id = source
             .agent_node(agent_id)
             .map(|node| node.id.clone())
@@ -672,8 +660,9 @@ impl Dashboard {
         })
     }
 
-    /// Every agent a heading holds: the ones filed under it and, through
-    /// them, the ones they spawned.
+    /// Every agent a heading holds: the ones filed under it. An agent
+    /// created by an agent is nobody's to deal (see `deal_agent_facts`),
+    /// so a filing is never walked down into what its agent spawned.
     fn agent_cards_under(
         &self,
         source: &crate::candidates::HostNodes,
@@ -683,19 +672,9 @@ impl Dashboard {
         carded: &mut HashSet<AgentId>,
     ) -> Vec<RankedDealCard> {
         let mut cards = Vec::new();
-        for root_agent in &context.bindings {
-            let mut agents = vec![*root_agent];
-            let mut cursor = 0;
-            while cursor < agents.len() {
-                let parent = agents[cursor];
-                agents.extend(facts.spawned.get(&parent).into_iter().flatten().copied());
-                cursor += 1;
-            }
-            for agent_id in agents {
-                if let Some(card) = self.agent_card(source, agent_id, context, order, facts, carded)
-                {
-                    cards.push(card);
-                }
+        for agent_id in &context.bindings {
+            if let Some(card) = self.agent_card(source, *agent_id, context, order, facts, carded) {
+                cards.push(card);
             }
         }
         cards
@@ -1343,7 +1322,6 @@ impl Dashboard {
         // note's, and a thread's wait is the mirror's.
         let facts = DealerFacts {
             by_agent: HashMap::new(),
-            spawned: HashMap::new(),
             threads,
             now,
             interactions: agent_interactions,
@@ -1364,8 +1342,7 @@ impl Dashboard {
             self.dealer.insert(card);
         }
         // Whoever the row lends a place to: the agents filed under it, and
-        // the ones already carded there, which is where a spawned agent
-        // reached through its parent's filing shows up.
+        // the ones already carded there.
         let mut agents = self
             .deal_hosts
             .get(&host)
@@ -1459,22 +1436,20 @@ impl Dashboard {
         }
         let facts = DealerFacts {
             by_agent: std::iter::once((agent_id, &agent)).collect(),
-            spawned: HashMap::new(),
             threads: &EMPTY_THREADS,
             now,
             interactions: agent_interactions,
         };
         let order = self.agent_order(host, agent_id);
         let mut carded = HashSet::new();
-        // Where the card is shown: the first note in the map's order that
-        // reaches this agent, through its own filing or through whoever
-        // spawned it. A note that is closed or waiting reaches nothing, and
+        // Where the card is shown: the note this agent is filed under. A
+        // note that is closed or waiting reaches nothing, and
         // a host with no desk yet reaches nothing either, which is what
         // makes the card a loose one at the root.
         let context = self
             .deal_hosts
             .get(&host)
-            .and_then(|source| self.heading_for_agent(host, source, agent_id, registry, now));
+            .and_then(|source| self.heading_for_agent(host, source, agent_id, now));
         let card = match (context, self.deal_hosts.get(&host)) {
             (Some(context), Some(source)) => {
                 self.agent_card(source, agent_id, &context, order, &facts, &mut carded)
@@ -1495,38 +1470,21 @@ impl Dashboard {
             .unwrap_or(usize::MAX)
     }
 
-    /// The note an agent's card hangs under: the earliest in the map's
-    /// order among its own filing and the filings of everyone who spawned
-    /// it. `None` when nothing live reaches it, which makes it a loose
+    /// The note an agent's card hangs under: the one its row is filed
+    /// under. `None` when no live note reaches it, which makes it a loose
     /// card at the root.
     fn heading_for_agent(
         &self,
         host: HostId,
         source: &crate::candidates::HostNodes,
         agent_id: AgentId,
-        registry: &AgentMap,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> Option<HeadingContext> {
-        let mut best: Option<(usize, &crate::desk_view::DeskNode)> = None;
-        let mut cursor = Some(agent_id);
-        let mut guard = 0;
-        while let Some(agent) = cursor {
-            guard += 1;
-            if guard > 64 {
-                break;
-            }
-            if let Some(node) = source.agent_node(agent)
-                && let Some(parent) = &node.parent
-                && let Some(heading) = source.node(parent)
-                && heading.is_note()
-                && let Some(at) = source.order_of(&heading.id)
-                && best.is_none_or(|(held, _)| at < held)
-            {
-                best = Some((at, heading));
-            }
-            cursor = registry.agent_parent(agent);
+        let node = source.agent_node(agent_id)?;
+        let heading = source.node(node.parent.as_ref()?)?;
+        if !heading.is_note() {
+            return None;
         }
-        let (_, heading) = best?;
         self.heading_context(host, source, heading, now)
     }
 
@@ -1723,18 +1681,21 @@ pub struct ReplyGutter;
 #[derive(Clone, Debug, PartialEq)]
 pub struct DealAgentFacts {
     pub agent_id: AgentId,
-    pub parent: Option<AgentId>,
     pub host: HostId,
     pub heading: String,
     pub facts: rho_agents::AgentFacts,
     pub attention: rho_agents::Attention,
 }
 
-/// One agent's facts, for a remake that names exactly it.
+/// One agent's facts, for a remake that names exactly it. `None` for an
+/// agent created by an agent: that one belongs to its creator and is
+/// never dealt, so its remake makes nothing.
 fn agent_deal_facts(registry: &AgentMap, agent_id: AgentId) -> Option<DealAgentFacts> {
+    if !registry.created_by_user(agent_id) {
+        return None;
+    }
     Some(DealAgentFacts {
         agent_id,
-        parent: registry.agent_parent(agent_id),
         host: registry.host_of_agent(agent_id)?,
         heading: registry
             .agent_human_name(agent_id)
@@ -1753,14 +1714,18 @@ fn agent_deal_facts(registry: &AgentMap, agent_id: AgentId) -> Option<DealAgentF
 static EMPTY_THREADS: std::sync::LazyLock<HashMap<SlackUnit, SlackFacts>> =
     std::sync::LazyLock::new(HashMap::new);
 
+/// Every agent the dealer may card: the ones the user created. An agent
+/// created by an agent belongs to its creator and is left out here, which
+/// is the one place the rule is applied for every card the dealer makes;
+/// its waiting reaches the user through its creator's card.
 fn deal_agent_facts(registry: &AgentMap) -> Vec<DealAgentFacts> {
     registry
         .known_agents()
+        .filter(|agent_id| registry.created_by_user(**agent_id))
         .filter_map(|agent_id| {
             let host = registry.host_of_agent(*agent_id)?;
             Some(DealAgentFacts {
                 agent_id: *agent_id,
-                parent: registry.agent_parent(*agent_id),
                 host,
                 heading: registry
                     .agent_human_name(*agent_id)

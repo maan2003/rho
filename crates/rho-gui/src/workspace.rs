@@ -1366,11 +1366,16 @@ impl Workspace {
             crate::home::card_title(card, |agent_id| registry.agent_display_label(agent_id))
         });
         let now_ms = now.timestamp_millis();
+        // An agent created by an agent belongs to its creator and is not
+        // the reader's to watch; only the ones the reader made are listed.
         let mut running = self
             .registry
             .known_agents()
             .copied()
-            .filter(|agent_id| self.registry.agent_facts(*agent_id).turn_running)
+            .filter(|agent_id| {
+                self.registry.created_by_user(*agent_id)
+                    && self.registry.agent_facts(*agent_id).turn_running
+            })
             .collect::<Vec<_>>();
         // Sorted by what the row shows, or the order is of something the
         // reader cannot see.
