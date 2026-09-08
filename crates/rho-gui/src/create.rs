@@ -70,6 +70,14 @@ impl Workspace {
                     if let Some(card) = self.dashboard.agent_card_id(agent_id) {
                         return Some((card.host, card.node_id));
                     }
+                    // An agent the user has not filed has no row on the
+                    // desk, so there is no node to name it by; the row on
+                    // Home still names the agent itself. Falling through
+                    // to the surface left it naming nothing, because Home
+                    // is a list and stands for no node of its own.
+                    if let Some(host) = self.registry.host_of_agent(agent_id) {
+                        return Some((host, rho_desk::cells::Id::Agent(agent_id)));
+                    }
                 }
                 crate::home::HomeTarget::None => {}
             }

@@ -8007,6 +8007,82 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// A Home row that names a thing can take a verdict, filed or not. An
+/// agent the user has not filed has no row on the desk, so the lookup that
+/// answers "which node is this agent" found nothing and the row fell
+/// through to the surface — and Home is a list that stands for no node, so
+/// the row named nothing: one tap of shift opened nothing and said nothing.
+/// Filing an agent is one of the things that tap is for, so the row that
+/// most needs the menu was the one that could not open it.
+#[gpui::test]
+fn the_verdicts_open_over_an_unfiled_running_agents_home_row(cx: &mut TestAppContext) {
+    let running = agent(31);
+    let mut desk = DeskFixture::new();
+    desk.note(None, "phone feed");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        activity: Some("wiring the flick recogniser".to_owned()),
+                        turn_running: true,
+                        ..ui_head(running)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The cursor on the running row, which is the last one Home draws here.
+    let home = workspace
+        .update(cx, |workspace, _, _| workspace.home_view())
+        .unwrap()
+        .expect("home is in view");
+    workspace
+        .update(cx, |_, _, cx| {
+            home.update(cx, |home, cx| {
+                let editor = home.editor().clone();
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let text = snapshot.buffer_snapshot().text();
+                    let row = text
+                        .lines()
+                        .position(|line| line.contains("wiring the flick recogniser"))
+                        .expect("the running row is drawn") as u32;
+                    editor.selections.change_with(&snapshot, |selections| {
+                        selections.select_ranges([
+                            language::Point::new(row, 0)..language::Point::new(row, 0)
+                        ]);
+                    });
+                });
+            });
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.context_area(cx),
+                Some((HostId::default(), rho_desk::cells::Id::Agent(running))),
+                "the row names the agent it watches, filed or not"
+            );
+            assert!(
+                workspace.open_verdict_transient(window, cx),
+                "one tap of shift opens the verdicts over it"
+            );
+        })
+        .unwrap();
+}
+
 /// The runtime titles an agent from the first thing said to it, which is a
 /// guess; a name is the user saying which agent this is. It is written on
 /// the desk, so it reaches the row the same way the labels do, and the
