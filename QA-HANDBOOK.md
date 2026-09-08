@@ -887,13 +887,30 @@ wl_display_flush` and `recvmsg < wl_connection_read < wl_display_read_events`
 — the Wayland socket, per frame, nothing of rho's under it — which no leaf
 leaderboard could have said.
 
-*What it cannot tell you yet.* Only the frames whose mapping symbolized come
-back as names. In that same profile every rho frame printed as an address,
-because the profiling build links with `-Wl,--compress-debug-sections=zstd`
-and the symbolizer abandons a mapping whose debug section it cannot read —
-even though `.symtab` sits uncompressed in the same binary with every name in
-it. A chain of addresses is not an answer, so check that rho's own frames are
-named before drawing anything from a chain that passes through them.
+*When the frames are addresses, check the reader's features first.* Only the
+frames whose mapping symbolized come back as names, and a chain of addresses
+is not an answer, so check that rho's own frames are named before drawing
+anything from a chain that passes through them. In the profile that answered
+the Wayland question every rho frame printed as an address and the symbolizer
+said `failed to read ELF section with index 44`. Section 44 is
+`.debug_abbrev`: the dev shell links with `-Wl,--compress-debug-sections=zstd`
+and the symbolizer gave up on the whole mapping over it.
+
+The temptation there is to blame the linker flag and change it, and that is
+the wrong end. blazesym reads zstd; its decompressors are cargo features, and
+the graph had zlib on and zstd off, so it was our own build of the reader
+refusing a format it can support. `rho-profiling` now names blazesym with the
+`zstd` feature so the sampler's copy has it. Read the features rather than
+guessing at them:
+
+```
+cargo tree -i blazesym -e features
+```
+
+The rule this is an instance of: when a reader will not read a file, ask what
+the reader was compiled to do before you change the file. The file was
+telling the truth — `.symtab` sat uncompressed in the same binary with all
+534,913 names in it the whole time.
 
 ## Adding a case
 

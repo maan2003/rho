@@ -1290,6 +1290,7 @@ dependencies = [
  "memmap2",
  "rustc-demangle",
  "tempfile",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -14201,6 +14202,7 @@ name = "rho-profiling"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blazesym",
  "dial9-tokio-telemetry",
  "dial9-trace-format",
  "flate2",

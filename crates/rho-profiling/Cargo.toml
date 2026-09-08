@@ -9,6 +9,16 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Not used by any line in this crate. It is here to turn on one cargo feature
+# in the copy of blazesym that dial9's sampler already depends on: blazesym
+# decompresses debug sections behind features, and without "zstd" it abandons
+# any mapping whose sections were linked with
+# `-Wl,--compress-debug-sections=zstd`, which is what the dev shell asks for.
+# The symptom is a profile whose rho frames are bare addresses and a
+# "failed to read ELF section with index 44" from the symbolizer. Features
+# unify across the graph for one resolved version, so naming it here fixes the
+# copy the sampler holds. Keep the version equal to the sampler's.
+blazesym = { version = "0.2.5", features = ["zstd"] }
 dial9-tokio-telemetry = { version = "0.3.14", features = ["cpu-profiling"] }
 dial9-trace-format = "0.4.1"
 flate2 = "1"
