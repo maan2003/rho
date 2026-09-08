@@ -1525,3 +1525,221 @@ async fn the_edge_of_a_narrowing_says_what_waits_outside_it(cx: &mut TestAppCont
         "it says what it is not showing them"
     );
 }
+
+/// What one arriving message costs the two Slack surfaces, at a size a
+/// reader would work in.
+///
+/// The per-event and per-frame paths are the two places in this client
+/// where a number is the requirement rather than a nicety, so the number is
+/// measured here rather than by hand when someone remembers to. Three
+/// hundred conversations in the listing and a transcript of several hundred
+/// lines is the workspace this is about; the fake's five rows say nothing
+/// about either.
+///
+/// What is asserted is the shape, not the wall clock. The same arrival is
+/// measured twice, once against a listing of a handful of conversations and
+/// once against three hundred, with the same number of messages either way:
+/// a cost that follows the listing shows up as a ratio between the two, and
+/// a ratio survives a shared machine having a busy afternoon, which a
+/// microsecond ceiling does not.
+#[gpui::test]
+async fn one_arriving_message_costs_what_it_touches(cx: &mut TestAppContext) {
+    let small = arrival_cost(cx, 0).await;
+    let big = arrival_cost(cx, 300).await;
+    eprintln!("one arriving message, small listing: {small:?}");
+    eprintln!("one arriving message, big listing:   {big:?}");
+    assert!(
+        big.rows > 100,
+        "the listing has to be big enough to mean something: {} rows",
+        big.rows
+    );
+    assert!(
+        big.lines > 100,
+        "and the transcript too: {} lines",
+        big.lines
+    );
+    assert!(
+        big.list < small.list * LISTING_FACTOR,
+        "a message arriving cost the listing {:?} over {} rows against {:?} over {} rows; \
+         that is a cost following the listing, not the row that moved",
+        big.list,
+        big.rows,
+        small.list,
+        small.rows
+    );
+    assert!(
+        big.conversation < small.conversation * TRANSCRIPT_FACTOR,
+        "a message arriving cost the transcript {:?} beside {:?}, with the same transcript \
+         either way; the listing beside it is not the transcript's business",
+        big.conversation,
+        small.conversation
+    );
+    // The frame is not asserted yet: it is the next thing to fix, and a
+    // ceiling it cannot meet would only be a test that is always red.
+}
+
+/// How much bigger a redraw of the listing may be against three hundred
+/// conversations than against a handful.
+///
+/// Not three, which is what the rule wants and what the highlights now
+/// cost: reading the cursor at the top of a redraw asks the editor for a
+/// display snapshot, and that resyncs the whole buffer however little of it
+/// moved. That is the same pass the frame pays and it is the next thing to
+/// fix; this bound comes down with it. Twenty-five still catches a redraw
+/// that walks the listing itself, which is what it is here for.
+const LISTING_FACTOR: u32 = 25;
+
+/// How much bigger a redraw of the open conversation may be when the
+/// listing beside it is fifty times longer and its own transcript is the
+/// same. One, in principle; three for the noise of a shared machine.
+const TRANSCRIPT_FACTOR: u32 = 3;
+
+/// One arrival on both surfaces, measured against a listing of `channels`
+/// conversations beside the ones the fake always has.
+#[derive(Debug)]
+struct ArrivalCost {
+    /// The worst redraw of the listing, and how many lines it was drawing.
+    list: std::time::Duration,
+    rows: usize,
+    /// The worst redraw of the open conversation, and its transcript.
+    conversation: std::time::Duration,
+    lines: usize,
+    /// One frame, drawn after the messages have all landed. Measured, not
+    /// asserted.
+    frame: std::time::Duration,
+}
+
+/// Messages delivered one at a time into the open conversation. The same
+/// number either way, so the transcript is not what differs between the two
+/// measurements.
+const ARRIVALS: usize = 200;
+
+async fn arrival_cost(cx: &mut TestAppContext, channels: usize) -> ArrivalCost {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+    fake.add_user("UB", "bo");
+    for at in 0..channels {
+        fake.add_channel(&format!("K{at}"), &format!("team-{at}"));
+        fake.add_message(
+            &format!("K{at}"),
+            serde_json::json!({
+                "type": "message",
+                "ts": format!("{}.000000", 1_700_000_000 + at),
+                "user": "UB",
+                "text": "seeded",
+            }),
+        );
+    }
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack(window, cx);
+        })
+        .unwrap();
+    // The listing arrives over a socket, so the executor going quiet says
+    // nothing about whether it is there yet.
+    for _ in 0..200 {
+        cx.run_until_parked();
+        cx.draw_window(workspace.into());
+        cx.run_until_parked();
+        let rows = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if rows.len() > channels {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                rho_slack::session::Source::Conversation(rho_slack::types::ChannelId("C2".into())),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.draw_window(workspace.into());
+    cx.run_until_parked();
+
+    // The messages, one at a time, the way a socket delivers them. The
+    // worst of them is what is kept: a cost that creeps with the transcript
+    // shows up there and not in an average.
+    let mut cost = ArrivalCost {
+        list: std::time::Duration::ZERO,
+        rows: 0,
+        conversation: std::time::Duration::ZERO,
+        lines: 0,
+        frame: std::time::Duration::ZERO,
+    };
+    for step in 0..ARRIVALS {
+        fake.push_frame(serde_json::json!({
+            "type": "message",
+            "channel": "C2",
+            "ts": format!("{}.000000", 1_800_000_000 + step),
+            "user": "UD",
+            "text": "another line of the transcript",
+        }));
+        // Waited for one at a time, because the cost of a message is the
+        // cost of a redraw and two messages coalescing into one redraw
+        // would measure the wrong thing.
+        for _ in 0..50 {
+            cx.run_until_parked();
+            let drawn = workspace
+                .update(cx, |workspace, _, cx| {
+                    workspace
+                        .slack_conversation_cost_for_test(cx)
+                        .map_or(0, |(_, drawn)| drawn)
+                })
+                .unwrap();
+            if drawn > cost.lines {
+                break;
+            }
+            cx.executor()
+                .timer(std::time::Duration::from_millis(5))
+                .await;
+        }
+        let (list, conversation) = workspace
+            .update(cx, |workspace, _, cx| {
+                (
+                    workspace.slack_list_cost_for_test(cx),
+                    workspace.slack_conversation_cost_for_test(cx),
+                )
+            })
+            .unwrap();
+        if let Some((redraw, drawn)) = list {
+            cost.list = cost.list.max(redraw);
+            cost.rows = drawn;
+        }
+        if let Some((redraw, drawn)) = conversation {
+            cost.conversation = cost.conversation.max(redraw);
+            cost.lines = drawn;
+        }
+    }
+
+    let frame_at = std::time::Instant::now();
+    cx.draw_window(workspace.into());
+    cost.frame = frame_at.elapsed();
+    cost
+}

@@ -57,6 +57,12 @@ const SLACK_KEY_BASE: usize = usize::MAX - 500;
 /// than a conversation will ever hold on screen.
 const SLACK_TRANSCRIPT_KEY_BASE: usize = usize::MAX / 4;
 
+/// The listing paints in buckets for the same reason the transcript does, so
+/// it needs the same shape of block: a key per class per bucket, in a range
+/// of its own. Buckets come from a counter that only goes up, so the block
+/// has to be wide rather than exact.
+const SLACK_LIST_KEY_BASE: usize = usize::MAX / 2;
+
 impl rho_transcript::Style for Class {
     fn highlight_key(self, bucket: u32) -> HighlightKey {
         HighlightKey::SyntaxTreeView(
@@ -172,6 +178,18 @@ impl Class {
 
     pub fn highlight_key(self) -> HighlightKey {
         HighlightKey::SyntaxTreeView(SLACK_KEY_BASE + self.slot())
+    }
+
+    /// The key a listing paints this class with in one bucket of rows.
+    ///
+    /// One key per class per bucket is what lets a row that moved be
+    /// repainted without re-sending the rows that did not: the editor
+    /// replaces the ranges under a key, so a key covering the whole listing
+    /// can only ever be replaced whole.
+    pub fn list_highlight_key(self, bucket: u32) -> HighlightKey {
+        HighlightKey::SyntaxTreeView(
+            SLACK_LIST_KEY_BASE + bucket as usize * Self::ALL.len() + self.slot(),
+        )
     }
 
     pub fn resolve(self, cx: &App) -> HighlightStyle {

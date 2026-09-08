@@ -1223,6 +1223,14 @@ impl Workspace {
         &self.active_pane().current().surface
     }
 
+    /// Every surface the workspace is holding, for a test that has to reach
+    /// one the reader is not looking at: a message arriving costs the list
+    /// its redraw whether or not the list is the surface on screen.
+    #[cfg(test)]
+    pub(crate) fn open_surfaces_for_test(&self) -> impl Iterator<Item = &Surface> {
+        self.surfaces.values().flatten()
+    }
+
     /// Back one surface, or nowhere if the reader is at the oldest entry.
     ///
     /// The surface handed back is the one that was left, still holding its

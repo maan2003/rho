@@ -8,6 +8,7 @@
 //! line number: an arriving message must not move the selection under a
 //! keypress.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use editor::{Editor, EditorMode, SizingBehavior};
@@ -20,7 +21,7 @@ use theme::ActiveTheme as _;
 use crate::model::{ConversationRow, Empty};
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
-use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out, when_label};
+use crate::ui::{Class, Hooks, Span, lay_out, when_label};
 
 pub struct ListView {
     session: Entity<Session>,
@@ -39,8 +40,33 @@ pub struct ListView {
     muted: usize,
     /// Lines above the listing: the health notice, when there is one.
     banner: usize,
+    /// The buckets whose highlights this draw has to re-send, and how many
+    /// lines each bucket holds. A bucket is a run of lines sharing one
+    /// highlight key per class, so a line that moved costs its bucket and
+    /// not the listing.
+    touched: BTreeSet<u32>,
+    held: BTreeMap<u32, usize>,
+    /// Classes each bucket currently paints, so a bucket that has lost one
+    /// can be told to paint it no longer. The editor keeps what it was last
+    /// given under a key until it is given something else.
+    painted: BTreeMap<u32, HashSet<Class>>,
+    /// Only ever goes up: a bucket number is never reused, so a line
+    /// inserted next to another cannot be given a number that still has
+    /// ranges under it.
+    next_bucket: u32,
+    /// How long the last redraw took. The per-event path is one of the few
+    /// where a number is the requirement, so the surface times itself and a
+    /// test reads it, rather than a test timing the socket and the executor
+    /// along with it.
+    #[cfg(any(test, feature = "fake"))]
+    last_refresh: std::time::Duration,
     _observe: gpui::Subscription,
 }
+
+/// Lines to a bucket. The listing's rows are one line each, so this is the
+/// number of rows repainted when one of them moves; the transcript's own
+/// number, because there is no reason for two.
+const BUCKET: usize = rho_transcript::BUCKET;
 
 /// One line of the buffer as it currently stands.
 struct DrawnLine {
@@ -50,6 +76,8 @@ struct DrawnLine {
     muted: bool,
     text: String,
     styles: Vec<(Class, Range<usize>)>,
+    /// The run of lines this one is painted with.
+    bucket: u32,
 }
 
 impl ListView {
@@ -103,6 +131,12 @@ impl ListView {
             unmuted: 0,
             muted: 0,
             banner: 0,
+            touched: BTreeSet::new(),
+            held: BTreeMap::new(),
+            painted: BTreeMap::new(),
+            next_bucket: 0,
+            #[cfg(any(test, feature = "fake"))]
+            last_refresh: std::time::Duration::ZERO,
             _observe: observe,
         };
         view.refresh(window, cx);
@@ -238,6 +272,8 @@ impl ListView {
     /// writes the whole buffer, because in those cases the buffer and the
     /// listing no longer have a line in common to build from.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "fake"))]
+        let started = std::time::Instant::now();
         let held = self.id_at(self.cursor_row(cx));
         let banner = self.banner_spans(cx);
         let listing = self.session.read(cx).has_rows();
@@ -276,6 +312,24 @@ impl ListView {
             self.place_cursor(row, window, cx);
         }
         cx.notify();
+        #[cfg(any(test, feature = "fake"))]
+        {
+            self.last_refresh = started.elapsed();
+        }
+    }
+
+    /// What the last redraw cost, for the test that holds the per-event
+    /// path to a number.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn last_refresh_for_test(&self) -> std::time::Duration {
+        self.last_refresh
+    }
+
+    /// How many lines the listing is drawing, so a cost has a size beside
+    /// it.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn drawn_line_count_for_test(&self) -> usize {
+        self.drawn.len()
     }
 
     /// Writes the whole listing. The first draw, and the fallback whenever
@@ -339,6 +393,7 @@ impl ListView {
                 muted: false,
                 text,
                 styles,
+                bucket: 0,
             });
         }
         // The ids come from the render, which knows which lines are rows
@@ -364,6 +419,7 @@ impl ListView {
             let len = buffer.len();
             buffer.edit([(0..len, text)], None, cx);
         });
+        self.renumber();
         self.paint(cx);
     }
 
@@ -415,6 +471,7 @@ impl ListView {
                         muted: row.muted,
                         text,
                         styles,
+                        bucket: 0,
                     },
                     cx,
                 );
@@ -496,6 +553,7 @@ impl ListView {
                     muted: false,
                     text,
                     styles,
+                    bucket: 0,
                 },
                 cx,
             );
@@ -506,7 +564,11 @@ impl ListView {
         if at >= self.drawn.len() {
             return;
         }
-        self.drawn.remove(at);
+        let gone = self.drawn.remove(at);
+        self.touched.insert(gone.bucket);
+        if let Some(held) = self.held.get_mut(&gone.bucket) {
+            *held = held.saturating_sub(1);
+        }
         self.buffer.update(cx, |buffer, cx| {
             buffer.edit(
                 [(
@@ -519,9 +581,12 @@ impl ListView {
         });
     }
 
-    fn insert_line(&mut self, at: usize, line: DrawnLine, cx: &mut Context<Self>) {
+    fn insert_line(&mut self, at: usize, mut line: DrawnLine, cx: &mut Context<Self>) {
         let at = at.min(self.drawn.len());
         let text = format!("{}\n", line.text);
+        line.bucket = self.bucket_beside(at);
+        self.touched.insert(line.bucket);
+        *self.held.entry(line.bucket).or_default() += 1;
         self.drawn.insert(at, line);
         self.buffer.update(cx, |buffer, cx| {
             buffer.edit(
@@ -532,43 +597,152 @@ impl ListView {
         });
     }
 
-    /// Re-anchors and re-applies the highlights.
+    /// The bucket a line inserted here joins: the one its neighbour is
+    /// painted with, while that bucket has room, and a fresh one otherwise.
     ///
-    /// This is the one part of a redraw still proportional to the listing
-    /// rather than to what moved: the editor takes the whole set of ranges
-    /// for a class at once, so every line's ranges are handed over again
-    /// even when one line changed. It is anchor arithmetic and no string
-    /// work, and it is the next thing to fix — with an incremental
-    /// highlight on the editor side, not by drawing the list some other
-    /// way.
+    /// Never a number that has been used before. The editor holds what it
+    /// was last given under a key, so a reused number would put a line
+    /// under ranges belonging to lines that have since gone.
+    fn bucket_beside(&mut self, at: usize) -> u32 {
+        let beside = self
+            .drawn
+            .get(at)
+            .or_else(|| self.drawn.get(at.wrapping_sub(1)))
+            .map(|line| line.bucket);
+        match beside {
+            Some(bucket) if self.held.get(&bucket).is_none_or(|held| *held < BUCKET) => bucket,
+            _ => {
+                let bucket = self.next_bucket;
+                self.next_bucket += 1;
+                bucket
+            }
+        }
+    }
+
+    /// Numbers the whole listing afresh, in runs of `BUCKET`, and says that
+    /// every bucket it has ever painted needs re-sending.
+    ///
+    /// A rebuild rewrites the buffer, so the anchors every old bucket holds
+    /// are anchors into text that is gone. Clearing them is what stops a
+    /// colour from before the rebuild sitting on a line drawn after it.
+    fn renumber(&mut self) {
+        self.touched.extend(self.painted.keys().copied());
+        self.held.clear();
+        for (at, line) in self.drawn.iter_mut().enumerate() {
+            let bucket = self.next_bucket + (at / BUCKET) as u32;
+            line.bucket = bucket;
+        }
+        for line in &self.drawn {
+            *self.held.entry(line.bucket).or_default() += 1;
+        }
+        self.touched.extend(self.held.keys().copied());
+        self.next_bucket += self.drawn.len().div_ceil(BUCKET).max(1) as u32;
+    }
+
+    /// Re-anchors and re-sends the highlights of the buckets that changed,
+    /// and of no others.
+    ///
+    /// The editor replaces the ranges under a key, so a key that covered
+    /// the whole listing could only ever be replaced whole: one message
+    /// arriving re-anchored every range of every row and handed all sixteen
+    /// classes back. A key per class per bucket is what makes a row that
+    /// moved cost its own run of rows. Which lines the listing holds is
+    /// still walked, because a line's offset is the text above it, but that
+    /// is length arithmetic with no anchor and no editor in it.
     fn paint(&mut self, cx: &mut Context<Self>) {
-        let mut styles: Vec<(Class, Range<usize>)> = Vec::new();
+        let touched = std::mem::take(&mut self.touched);
+        if touched.is_empty() {
+            return;
+        }
+        let mut styles: BTreeMap<u32, Vec<(Class, Range<usize>)>> = BTreeMap::new();
+        for bucket in &touched {
+            styles.entry(*bucket).or_default();
+        }
         let mut base = 0usize;
         for line in &self.drawn {
-            styles.extend(
-                line.styles
-                    .iter()
-                    .map(|(class, range)| (*class, base + range.start..base + range.end)),
-            );
+            if let Some(held) = styles.get_mut(&line.bucket) {
+                held.extend(
+                    line.styles
+                        .iter()
+                        .map(|(class, range)| (*class, base + range.start..base + range.end)),
+                );
+            }
             base += line.text.len() + 1;
         }
         let anchored = self.buffer.update(cx, |buffer, _| {
             let snapshot = buffer.snapshot();
             styles
                 .into_iter()
-                .map(|(class, range)| {
-                    let clamp = |offset: usize| offset.min(snapshot.len());
-                    (
-                        class,
-                        vec![
-                            snapshot.anchor_before(clamp(range.start))
-                                ..snapshot.anchor_after(clamp(range.end)),
-                        ],
-                    )
+                .map(|(bucket, ranges)| {
+                    let ranges = ranges
+                        .into_iter()
+                        .map(|(class, range)| {
+                            let clamp = |offset: usize| offset.min(snapshot.len());
+                            (
+                                class,
+                                snapshot.anchor_before(clamp(range.start))
+                                    ..snapshot.anchor_after(clamp(range.end)),
+                            )
+                        })
+                        .collect::<Vec<(Class, Range<Anchor>)>>();
+                    (bucket, ranges)
                 })
-                .collect::<Vec<(Class, Vec<Range<Anchor>>)>>()
+                .collect::<Vec<(u32, Vec<(Class, Range<Anchor>)>)>>()
         });
-        apply_highlights(&self.editor, &self.multi_buffer, &anchored, cx);
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut sending: Vec<(
+            u32,
+            Class,
+            Vec<multi_buffer::Anchor>,
+            Vec<multi_buffer::Anchor>,
+        )> = Vec::new();
+        for (bucket, ranges) in anchored {
+            let mut per_class: HashMap<Class, (Vec<_>, Vec<_>)> = HashMap::new();
+            for (class, range) in ranges {
+                let Some(start) = snapshot.anchor_in_excerpt(range.start) else {
+                    continue;
+                };
+                let Some(end) = snapshot.anchor_in_excerpt(range.end) else {
+                    continue;
+                };
+                let held = per_class.entry(class).or_default();
+                held.0.push(start);
+                held.1.push(end);
+            }
+            let present = per_class.keys().copied().collect::<HashSet<_>>();
+            // A class this bucket no longer paints still has ranges under
+            // its key, so it is sent back empty rather than left behind.
+            let stale = self
+                .painted
+                .get(&bucket)
+                .map(|painted| painted.difference(&present).copied().collect::<Vec<_>>())
+                .unwrap_or_default();
+            match present.is_empty() {
+                true => self.painted.remove(&bucket),
+                false => self.painted.insert(bucket, present),
+            };
+            for (class, (starts, ends)) in per_class {
+                sending.push((bucket, class, starts, ends));
+            }
+            for class in stale {
+                sending.push((bucket, class, Vec::new(), Vec::new()));
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            for (bucket, class, starts, ends) in sending {
+                let ranges = starts
+                    .into_iter()
+                    .zip(ends)
+                    .map(|(start, end)| start..end)
+                    .collect::<Vec<_>>();
+                editor.highlight_text(
+                    class.list_highlight_key(bucket),
+                    ranges,
+                    class.resolve(cx),
+                    cx,
+                );
+            }
+        });
     }
 }
 

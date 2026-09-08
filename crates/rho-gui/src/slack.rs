@@ -345,6 +345,46 @@ impl Workspace {
         view.read(cx).drawn_lines_for_test(cx)
     }
 
+    /// What the list's last redraw cost, and how many lines it drew.
+    ///
+    /// Found across the open surfaces rather than on the active one: the
+    /// cost that matters is what a message costs the list while the reader
+    /// is in a conversation, which is when both surfaces redraw.
+    #[cfg(test)]
+    pub(crate) fn slack_list_cost_for_test(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(std::time::Duration, usize)> {
+        self.open_surfaces_for_test().find_map(|surface| {
+            let SurfaceView::SlackList(view) = &surface.view else {
+                return None;
+            };
+            let view = view.read(cx);
+            Some((
+                view.last_refresh_for_test(),
+                view.drawn_line_count_for_test(),
+            ))
+        })
+    }
+
+    /// The same for the open conversation.
+    #[cfg(test)]
+    pub(crate) fn slack_conversation_cost_for_test(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(std::time::Duration, usize)> {
+        self.open_surfaces_for_test().find_map(|surface| {
+            let SurfaceView::SlackConversation(view) = &surface.view else {
+                return None;
+            };
+            let view = view.read(cx);
+            Some((
+                view.last_refresh_for_test(),
+                view.drawn_row_count_for_test(),
+            ))
+        })
+    }
+
     /// A session built elsewhere, for a test that wants Slack surfaces over
     /// a fake server rather than over the user's workspace. The one seam:
     /// everything after it — opening the list, narrowing it, escaping —

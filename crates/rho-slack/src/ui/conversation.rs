@@ -52,6 +52,12 @@ pub struct ConversationView {
     /// cursor and the view on their own, and none of that is the reader
     /// asking for anything.
     editing: bool,
+    /// How long the last redraw took. The per-event path is one of the few
+    /// where a number is the requirement, so the surface times itself and a
+    /// test reads it, rather than a test timing the socket and the executor
+    /// along with it.
+    #[cfg(any(test, feature = "fake"))]
+    last_refresh: std::time::Duration,
     /// One user action buys one page. Set when a fill is asked for, cleared
     /// when the reader scrolls or moves the cursor themselves, so a landed
     /// page cannot walk the whole conversation back to its beginning.
@@ -431,6 +437,8 @@ impl ConversationView {
             editor,
             revision: 0,
             editing: false,
+            #[cfg(any(test, feature = "fake"))]
+            last_refresh: std::time::Duration::ZERO,
             fill: Fill::default(),
             moved: Moved::default(),
             dealt: None,
@@ -1291,6 +1299,8 @@ impl ConversationView {
     /// item, a page costs one insert, and everything else keeps its anchors,
     /// so the cursor and the scroll stay where the reader put them.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "fake"))]
+        let started = std::time::Instant::now();
         let Some((revision, updates)) = self
             .session
             .read(cx)
@@ -1326,6 +1336,24 @@ impl ConversationView {
         self.refresh_holes(cx);
         self.refresh_chip(cx);
         cx.notify();
+        #[cfg(any(test, feature = "fake"))]
+        {
+            self.last_refresh = started.elapsed();
+        }
+    }
+
+    /// What the last redraw cost, for the test that holds the per-event
+    /// path to a number.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn last_refresh_for_test(&self) -> std::time::Duration {
+        self.last_refresh
+    }
+
+    /// How many rows the transcript is drawing, so a cost has a size beside
+    /// it.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn drawn_row_count_for_test(&self) -> usize {
+        self.transcript.keys().count()
     }
 
     /// A picture whose bytes were still arriving when its message was
