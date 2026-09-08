@@ -84,3 +84,11 @@ required-features = ["fake"]
 rho-slack = { path = ".", features = ["fake"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# A Session is a gpui entity, so testing one needs gpui's test app and the
+# tokio bridge its own request loops run on. The session tests stand a real
+# Session over the fake server, which is where the rules that need both a
+# client and a model live.
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
