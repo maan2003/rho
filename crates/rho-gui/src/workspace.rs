@@ -5743,9 +5743,14 @@ impl Workspace {
         true
     }
 
-    /// "Notes for this": the note filed under whatever the reader is
-    /// looking at, created the first time the key is pressed. A note
-    /// surface answers with itself, so the key is idempotent there.
+    /// "Notes for this": the note about whatever the reader is looking at,
+    /// created the first time the key is pressed. A note surface answers
+    /// with itself, so the key is idempotent there.
+    ///
+    /// The note is not filed under the thing — nothing is placed by a
+    /// parent — it is placed where the thing is, by the labels the thing
+    /// carries, and says what it is about. `About` is the whole of the
+    /// relation, so it is also how the second press finds the note again.
     pub(crate) fn open_notes_for_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((host, node_id)) = self.surface_node() else {
             self.notice_on(
@@ -5764,13 +5769,19 @@ impl Workspace {
             self.open_note(host, node_id, window, cx);
             return;
         }
-        let existing = self
+        let notes = self
             .desk_cells
             .tree_source(host, cx)
             .into_iter()
             .flat_map(|(nodes, _, _)| nodes)
-            .find(|node| node.parent == Some(node_id.clone()) && node.is_note())
-            .map(|node| node.id);
+            .filter(|node| node.is_note())
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let existing = notes.into_iter().find(|note| {
+            self.desk_cells
+                .facts(host, note)
+                .is_some_and(|facts| facts.about.as_ref() == Some(&node_id))
+        });
         if let Some(existing) = existing {
             self.open_note(host, existing, window, cx);
             return;
@@ -5778,10 +5789,28 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        let Some((created, writes)) = self.desk_cells.create_note_writes(host, Some(node_id))
-        else {
+        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
             return;
         };
+        // Where the thing is, which is where its note belongs.
+        let mut cells = self.new_thing_cells(host, Some(&(host, node_id.clone())));
+        // And what the note is for. Making a thing from a thing already
+        // says this; a label is a place rather than a thing, and the note
+        // for a place is still about it.
+        if !cells
+            .iter()
+            .any(|cell| matches!(cell, rho_desk::cells::Property::About(_)))
+        {
+            cells.push(rho_desk::cells::Property::About(node_id.clone()));
+        }
+        writes.extend(
+            cells
+                .into_iter()
+                .map(|property| rho_desk::cells::CellWrite {
+                    id: created.clone(),
+                    property,
+                }),
+        );
         if self
             .apply_desk_writes(host, writes, None, window, cx)
             .is_none()

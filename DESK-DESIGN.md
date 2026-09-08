@@ -85,7 +85,8 @@ ranks the node in context first, and hands what was chosen to
 for anything else. So the draft is already half of the new rule: choose a
 label and a new thing is placed the way the rule says.
 
-Three places still write a parent on a thing, and they are the work:
+Three places wrote a parent on a thing, and they were the work. All three
+are done:
 
 - **`filing_property`** — a new thing filed under a note or an agent.
 - **`file_under`** — the `f` picker's non-label rows ("anything else picked
@@ -93,10 +94,12 @@ Three places still write a parent on a thing, and they are the work:
 - **notes for this** — the note it creates is the child of the thing on
   screen, and it finds an existing one by `parent == the thing`.
 
-The first two become label writes and their pickers stop offering places.
-The third is the one that is not filing at all: a note *about* the thing on
-screen. `About(Id)` is the cell for that and it already exists, so the key
-keeps its meaning and stops using the placement axis to say it.
+The first two became label writes and their pickers stopped offering
+places. The third was never filing at all: a note *about* the thing on
+screen. `About(Id)` is the cell for that and it already existed, so the key
+keeps its meaning and stops using the placement axis to say it — the note
+is placed where the thing is, by the labels the thing carries, and `About`
+is both the relation and how the second press finds the note again.
 
 ### The picker offers the smallest set that says where it is
 
@@ -129,9 +132,10 @@ other.
 
 ### Left to decide
 
-- Whether `About` is written by the notes-for-this key alone, or whether
-  every relation rho already derives (`FromSlack`, `FromPage`, an agent's
-  spawner) reads the same way to the user.
+- Whether every relation rho already derives (`FromSlack`, `FromPage`, an
+  agent's spawner) reads the same way to the user as the `About` the two
+  acts write. Nothing rho derives is stored as `About`; a derived relation
+  stays derived.
 - What the map draws for a thing with two labels: it is under both, and an
   outline draws each row once. Drawing it under each is the honest answer
   and the one that costs a reader nothing; a "primary label" would be the

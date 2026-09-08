@@ -7472,16 +7472,20 @@ fn back_never_lands_on_a_transcript_whose_daemon_is_gone(cx: &mut TestAppContext
         .unwrap();
 }
 
-/// "Notes for this" from a surface that is not a note: the note is created
-/// under the thing on screen, and pressing the key again returns to it
-/// rather than making a second one.
+/// "Notes for this" from a surface that is not a note: the note says it is
+/// about the thing on screen and is placed where that thing is, and
+/// pressing the key again returns to it rather than making a second one.
+/// Nothing is filed under the agent — a thing carries no parent — so
+/// About is what the second press finds it by.
 #[gpui::test]
-fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) {
+fn notes_for_this_makes_a_note_about_the_surfaces_node(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let agent_id = agent(77);
     let mut desk = DeskFixture::new();
-    let topic = desk.note(None, "nixos");
+    let label = desk.label("nixos");
+    let topic = desk.note(None, "the old outline");
     let agent_node = desk.agent_row(topic, agent_id);
+    desk.labelled(agent_node.clone(), label.clone());
 
     let workspace = test_workspace(cx);
     workspace
@@ -7514,13 +7518,23 @@ fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) 
             else {
                 panic!("notes for this opens the note surface");
             };
+            let facts = workspace
+                .desk_cells
+                .facts(HostId::default(), &node_id)
+                .expect("the note the key just made");
             assert_eq!(
-                workspace
-                    .desk_cells
-                    .node(HostId::default(), &node_id)
-                    .and_then(|node| node.parent),
-                Some(agent_node),
-                "the note is filed under the agent on screen"
+                facts.about,
+                Some(agent_node.clone()),
+                "the note says what it is about"
+            );
+            assert!(
+                facts.labels.contains(&label),
+                "and is where the agent is: {:?}",
+                facts.labels
+            );
+            assert_eq!(
+                facts.parent, None,
+                "nothing is placed by a parent, least of all a note for a thing"
             );
             node_id
         })
