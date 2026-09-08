@@ -49,7 +49,6 @@ use language::{Buffer, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_hosts::connection::VisualizationClient;
 use rho_ui_proto::AgentId;
-use rho_ui_proto::mirror::{AgentPos, DetailResult};
 use rho_window::highlights::{apply_class_highlights, excerpt_range};
 use rho_window::style::{Region, StyleClass};
 use rho_window::visualization::Visualization;
@@ -114,25 +113,6 @@ pub struct TranscriptModel {
     visualization_client: VisualizationClient,
     visualization_cache: HashMap<String, Entity<Visualization>>,
     attachments: Vec<Attachment>,
-    /// Result bodies asked for and not yet drawn, one entry per request:
-    /// the position asked, and the composed blocks that asked for it. An
-    /// answer is drawn into that range or dropped - a chunk that went away
-    /// while its answer was in flight leaves nothing behind, and a chunk
-    /// composed again asks again. Nothing is held for a chunk that is not
-    /// on the screen: a cache would be a second copy of the results the
-    /// reader did not ask for.
-    asks: Vec<Ask>,
-    /// Positions to ask for, filled as blocks are composed and drained by
-    /// whoever holds the connection. The transcript has none.
-    wanted: Vec<AgentPos>,
-}
-
-/// One outstanding request for the bodies at a position.
-struct Ask {
-    pos: AgentPos,
-    /// The blocks composed together with the call that asked. The answer
-    /// is drawn into these and no others.
-    blocks: Range<usize>,
 }
 
 /// One editor displaying this transcript, plus the per-editor state that
@@ -266,8 +246,6 @@ impl TranscriptModel {
             visualization_client,
             visualization_cache: HashMap::new(),
             attachments: Vec::new(),
-            asks: Vec::new(),
-            wanted: Vec::new(),
         }
     }
 
@@ -332,7 +310,6 @@ impl TranscriptModel {
         self.head = 0;
         self.uncomposed = prepared.first_block;
         self.agent_labels = prepared.agent_labels;
-        self.want_bodies(self.uncomposed..self.blocks.len());
         let mut installed = Vec::with_capacity(prepared.chunks.len());
         // Register newest buffers first; syntax activation below follows the
         // same order so the visible tail leads the historical parser backlog.
@@ -549,7 +526,6 @@ impl TranscriptModel {
             }
         }
         self.turn_boundary = new_boundary;
-        self.want_bodies(self.block_of(start)..self.blocks.len());
 
         self.refresh_elision_plans(self.block_of(start));
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
@@ -884,7 +860,6 @@ impl TranscriptModel {
         } else {
             (&changed, &empty)
         };
-        self.want_bodies(block_index..block_index + 1);
         self.refresh_elision_plans(block_index);
         self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
         cx.notify();
@@ -993,78 +968,6 @@ impl TranscriptModel {
     /// for, or in the tail the transcript opened on.
     pub fn is_composed(&self, block: usize) -> bool {
         block < self.head || block >= self.uncomposed
-    }
-
-    /// Notes the result bodies the blocks in `blocks` need, one request per
-    /// position however many calls name it. Called wherever blocks are
-    /// composed: what is drawn is what asks, so history nobody has scrolled
-    /// to costs nothing.
-    fn want_bodies(&mut self, blocks: Range<usize>) {
-        for index in blocks.clone() {
-            let Some(UiBlock::Tool(tool)) = self.blocks.get(index).map(|block| &**block) else {
-                continue;
-            };
-            let Some(pos) = tool.result_at else {
-                continue;
-            };
-            if tool.output.is_some() || tool.error.is_some() {
-                continue;
-            }
-            if self.asks.iter().any(|ask| ask.pos == pos) {
-                continue;
-            }
-            self.asks.push(Ask {
-                pos,
-                blocks: blocks.clone(),
-            });
-            self.wanted.push(pos);
-        }
-    }
-
-    /// The positions whose bodies the transcript is waiting to be told,
-    /// clearing them. The transcript holds no connection; whoever does
-    /// drains this and asks.
-    pub fn take_wanted(&mut self) -> Vec<AgentPos> {
-        std::mem::take(&mut self.wanted)
-    }
-
-    /// Draws one answer's results under the calls that asked for them. The
-    /// chunk that asked may be gone by now - scrolled out of the composed
-    /// runs, or rebuilt from the store - and then the answer is dropped and
-    /// nothing is spliced: the chunk asks again when it is composed again.
-    pub fn splice_results<V: 'static>(
-        &mut self,
-        pos: AgentPos,
-        results: &[DetailResult],
-        now_ms: u64,
-        cx: &mut Context<V>,
-    ) {
-        let Some(ask) = self.asks.iter().position(|ask| ask.pos == pos) else {
-            return;
-        };
-        let ask = self.asks.remove(ask);
-        for block_index in ask.blocks {
-            let Some(UiBlock::Tool(tool)) = self.blocks.get(block_index).map(|block| &**block)
-            else {
-                continue;
-            };
-            if tool.result_at != Some(pos) {
-                continue;
-            }
-            let Some(result) = results.iter().find(|result| result.id == tool.id) else {
-                continue;
-            };
-            let Some(record) = self.record_of(block_index) else {
-                continue;
-            };
-            let mut tool = tool.clone();
-            // The story says whether the call failed; the body is the only
-            // thing that says what it said.
-            tool.output = Some(result.output.clone());
-            tool.error = result.error.clone();
-            self.blocks[block_index] = Arc::new(UiBlock::Tool(tool));
-            self.resplice_block(record, block_index, now_ms, cx);
-        }
     }
 
     /// The record covering a block, or `None` while the block is in the
@@ -1177,7 +1080,6 @@ impl TranscriptModel {
             self.head = 0;
             self.uncomposed = 0;
         }
-        self.want_bodies(range.clone());
         let added_records = first_record..first_record + added_records;
         let added_buffers = first_buffer..first_buffer + added_buffers;
 
@@ -1279,10 +1181,6 @@ impl TranscriptModel {
             .map(|turn| (transcript_path(turn.start_block), turn.buffer))
             .collect::<Vec<_>>();
         self.records.clear();
-        // Nothing composed is waiting for a body any more. Whatever the
-        // reopened tail needs it asks for again, and an answer to the old
-        // request arrives to no chunk and is dropped.
-        self.asks.clear();
         self.head = 0;
         self.uncomposed = self.blocks.len();
         self.turn_boundary = 0;
