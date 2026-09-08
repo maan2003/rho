@@ -590,14 +590,9 @@ pub struct Workspace {
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
     pending_git_approval: Option<PendingGitApproval>,
-    realtime_task: Option<Task<()>>,
-    realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    realtime_input_muted: Option<tokio::sync::watch::Sender<bool>>,
-    voice_input_muted: bool,
-    voice_session_enabled: bool,
-    /// The daemon running the voice session; the session is torn down with
-    /// that host.
-    voice_host: Option<HostId>,
+    /// Whether the desk is listening, on whose daemon, and whether the
+    /// microphone is open: see [`crate::voice::Voice`].
+    voice: crate::voice::Voice,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
     _keystroke_subscription: gpui::Subscription,
@@ -1165,12 +1160,7 @@ impl Workspace {
             overlay_return_focus: None,
             echo: None,
             pending_git_approval: None,
-            realtime_task: None,
-            realtime_stop: None,
-            realtime_input_muted: None,
-            voice_input_muted: false,
-            voice_session_enabled: false,
-            voice_host: None,
+            voice: crate::voice::Voice::default(),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _keystroke_subscription: keystroke_subscription,
@@ -1250,8 +1240,8 @@ impl Workspace {
             .copied()
             .map(ContextId::Agent)
             .collect::<HashSet<_>>();
-        if self.voice_host == Some(host) {
-            self.stop_voice();
+        if self.voice.is_on(host) {
+            self.voice.stop();
         }
         self.hosts.detach(host);
         let _ = self
@@ -2344,8 +2334,8 @@ impl Workspace {
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                 }
-                if self.voice_host == Some(host) {
-                    self.stop_voice();
+                if self.voice.is_on(host) {
+                    self.voice.stop();
                 }
                 self.update_statuses(cx);
                 cx.notify();
@@ -2492,19 +2482,15 @@ impl Workspace {
     }
 
     fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
-        if self.realtime_task.is_some() {
-            self.voice_input_muted = !self.voice_input_muted;
-            if let Some(input_muted) = &self.realtime_input_muted {
-                input_muted.send_replace(self.voice_input_muted);
-            }
-            let message = match self.voice_input_muted {
+        if self.voice.running() {
+            let message = match self.voice.toggle_mute() {
                 true => "voice microphone muted",
                 false => "voice microphone unmuted",
             };
             self.notice_on(None, message, StyleClass::SystemInfo, cx);
             return;
         }
-        self.voice_input_muted = false;
+        self.voice.unmute();
         // Voice follows what the user is looking at: start on the selected
         // agent's daemon.
         let host = self
@@ -2517,26 +2503,20 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_end_voice(&mut self, cx: &mut Context<Self>) {
-        self.voice_session_enabled = false;
-        if self.realtime_task.is_some() {
-            self.stop_voice();
+        self.voice.end();
+        if self.voice.running() {
+            self.voice.stop();
             self.notice_on(None, "ending voice session…", StyleClass::SystemInfo, cx);
         } else {
             self.notice_on(None, "voice is not active", StyleClass::SystemInfo, cx);
         }
     }
 
-    fn stop_voice(&mut self) {
-        if let Some(stop) = self.realtime_stop.take() {
-            let _ = stop.send(());
-        }
-    }
-
     fn start_voice(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
-        if self.realtime_task.is_some() {
+        if self.voice.running() {
             return;
         }
-        let Some(host) = host.or(self.voice_host).or_else(|| self.hosts.primary()) else {
+        let Some(host) = host.or(self.voice.host()).or_else(|| self.hosts.primary()) else {
             self.notice_on(
                 None,
                 "voice: no daemon attached",
@@ -2545,22 +2525,19 @@ impl Workspace {
             );
             return;
         };
-        self.voice_host = Some(host);
-        self.voice_session_enabled = true;
+        self.voice.wants_host(host);
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice_input_muted);
+        let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.voice.muted());
         let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
-        self.realtime_stop = Some(stop);
-        self.realtime_input_muted = Some(input_muted);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting voice on {}…", self.hosts.host_label(host)),
             false => "starting voice…".to_owned(),
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
-        self.realtime_task = Some(cx.spawn(async move |this, cx| {
+        let session = cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
                 Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
@@ -2571,20 +2548,19 @@ impl Workspace {
                     .await;
             }
             let _ = this.update(cx, |this, cx| {
-                this.realtime_task = None;
-                this.realtime_stop = None;
-                this.realtime_input_muted = None;
+                this.voice.finished();
                 let message = match result {
                     Ok(()) => "voice stopped listening".to_owned(),
                     Err(error) => format!("voice failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                let host = this.voice_host.filter(|host| this.hosts.is_online(*host));
-                if host.is_some() && this.voice_session_enabled {
+                let host = this.voice.host().filter(|host| this.hosts.is_online(*host));
+                if host.is_some() && this.voice.wanted() {
                     this.start_voice(host, cx);
                 }
             });
-        }));
+        });
+        self.voice.started(session, stop, input_muted);
     }
 
     /// `enter` on the dashboard's Zulip row: switch to the Zulip context

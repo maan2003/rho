@@ -22,6 +22,7 @@ pub mod telemetry;
 #[doc(hidden)]
 pub mod transient;
 pub(crate) mod usage;
+pub(crate) mod voice;
 #[cfg(feature = "walk-support")]
 pub mod walk;
 pub mod workspace;
