@@ -1841,6 +1841,13 @@ impl Model {
             .map(|user| format!("@{}", user.name))
     }
 
+    /// Whether the roster has a name for this id. What `author` falls back
+    /// to is not a name, and the session has to be able to tell the
+    /// difference to know whether there is anything to ask Slack.
+    pub fn knows_user(&self, id: &UserId) -> bool {
+        self.user(id).is_some()
+    }
+
     pub fn author(&self, message: &Message) -> String {
         message
             .user

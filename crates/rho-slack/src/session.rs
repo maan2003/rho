@@ -6,7 +6,7 @@
 //! and no storage: it emits [`SessionEvent`], and the host decides what a
 //! raised thread means for its inbox, its journal, and its lamp.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -313,6 +313,11 @@ pub struct Session {
     /// the outage left before the lamp goes out.
     catch_up: Arc<Notify>,
     pending_sends: usize,
+    /// Author ids `users.info` has already been asked about, whether or not
+    /// it answered. One ask per person, so a channel full of a stranger's
+    /// messages is one request, and a request that failed is not retried on
+    /// every page.
+    asked_names: HashSet<UserId>,
     /// Files already fetched into the state cache, by Slack file id. An
     /// image is shown from here, so a redraw never refetches.
     cached_files: HashMap<String, std::path::PathBuf>,
@@ -360,6 +365,7 @@ impl Session {
             loaded: HashMap::new(),
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
+            asked_names: HashSet::new(),
             cached_files: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
@@ -378,6 +384,7 @@ impl Session {
             loaded: HashMap::new(),
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
+            asked_names: HashSet::new(),
             cached_files: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
@@ -730,6 +737,7 @@ impl Session {
         }
         // The counters move for channel traffic too: the list is the whole
         // workspace, and `note_message` answers only about cards.
+        self.learn_names(std::slice::from_ref(&message), cx);
         self.model.note_counts(&message);
         let change = self.model.note_message(&message, now);
         self.route(&message);
@@ -891,6 +899,51 @@ impl Session {
             return;
         };
         self.fetch(source, None, false, Some(since), cx);
+    }
+
+    /// Names for the authors the roster has no name for.
+    ///
+    /// The roster is asked for once per connect, so anyone who joined since
+    /// has no name here, and a page that landed before it did has none
+    /// either. `Model::author` reads "someone" for both, and it read
+    /// "someone" for the rest of the run: nothing asked Slack who they were.
+    /// This is what asks — one `users.info` per unknown id, once, and the
+    /// answer goes into the model and the mirror as the fact it is.
+    ///
+    /// Cost: the ids in what just arrived that are new, which is bounded by
+    /// the messages it brought and is nothing at all once the roster covers
+    /// them.
+    fn learn_names(&mut self, messages: &[Message], cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let model = &self.model;
+        let asked = &mut self.asked_names;
+        let unknown = messages
+            .iter()
+            .filter_map(|message| message.user.clone())
+            .filter(|id| !model.knows_user(id) && asked.insert(id.clone()))
+            .collect::<Vec<_>>();
+        for id in unknown {
+            let client = client.clone();
+            let task = gpui_tokio::Tokio::spawn(cx, async move { client.user_info(&id).await });
+            self._tasks.push(cx.spawn(async move |this, cx| {
+                let Ok(Ok(user)) = task.await else {
+                    return;
+                };
+                let _ = this.update(cx, |session, cx| {
+                    let workspace = session.model.workspace().0.clone();
+                    if let Some(mirror) = session.mirror.as_ref() {
+                        mirror.put_users(&workspace, std::slice::from_ref(&user));
+                    }
+                    session.model.add_users([user]);
+                    // The name is a fact the surfaces render from, so this
+                    // is the only thing owed them: what carried "someone"
+                    // reads it again on the next draw.
+                    cx.notify();
+                });
+            }));
+        }
     }
 
     /// The unread counts again, after an outage. Nothing else in the roster
@@ -1230,6 +1283,7 @@ impl Session {
                         mirror.clear_gap(&scope, &above);
                     }
                 }
+                session.learn_names(&fetched, cx);
                 cx.notify();
             });
         }));
@@ -1332,6 +1386,7 @@ impl Session {
                     }
                 }
                 session.mirror_page(&source, &fetched, true, reached_oldest);
+                session.learn_names(&fetched, cx);
                 cx.notify();
             });
         }));
@@ -1381,6 +1436,7 @@ impl Session {
                 // Straight to the mirror: nobody has opened this conversation,
                 // so there is no surface to feed and no read marker to move.
                 session.mirror_page(&source, &messages, false, false);
+                session.learn_names(&messages, cx);
                 if let Some(mirror) = session.mirror.as_ref() {
                     mirror_island(mirror, &scope, &messages);
                 }
@@ -1498,6 +1554,7 @@ impl Session {
                     }
                 }
                 session.mirror_page(&source, &fetched, bounded.is_none(), reached_oldest);
+                session.learn_names(&fetched, cx);
                 let messages = session
                     .loaded
                     .get(&source)

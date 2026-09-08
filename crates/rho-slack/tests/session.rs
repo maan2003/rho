@@ -223,3 +223,63 @@ async fn a_refused_send_leaves_no_complaint_above_the_history(cx: &mut TestAppCo
         "and the line above the history is about the history"
     );
 }
+
+/// A name rho does not have is asked for, once.
+///
+/// The roster is fetched once per connect, so someone who joins after that
+/// has no name in it. Before this, every message they sent read `someone`
+/// for the rest of the run: nothing asked Slack who they were, and
+/// `users.info` was a method with no caller. Now the first message from an
+/// unknown author is one ask, and the answer is a fact in the model.
+#[gpui::test]
+async fn a_message_from_someone_the_roster_never_had_is_asked_about_once(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.session
+        .update(cx, |session, cx| session.open(&design(), cx));
+
+    // Somebody who joined after rho asked who was in the workspace, saying
+    // two things rather than one: the ask is per person, not per message.
+    rig.fake.add_user("UZ", "zed");
+    rig.fake.live_message("C1", "UZ", "hello, just joined");
+    rig.fake.live_message("C1", "UZ", "and again");
+
+    let mut named = None;
+    for _ in 0..200 {
+        cx.run_until_parked();
+        named = rig.session.read_with(cx, |session, _| {
+            session
+                .loaded(&design())
+                .and_then(|loaded| {
+                    loaded
+                        .messages
+                        .iter()
+                        .find(|message| message.text == "and again")
+                        .map(|message| session.model().author(message))
+                })
+                .filter(|author| author != "someone")
+        });
+        if named.is_some() {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert_eq!(
+        named.as_deref(),
+        Some("zed"),
+        "the author rho had never heard of has a name"
+    );
+    let asked = rig
+        .fake
+        .fields("users.info", "user")
+        .into_iter()
+        .flatten()
+        .filter(|user| user == "UZ")
+        .count();
+    assert_eq!(
+        asked, 1,
+        "asked once for the person, not once for each of their messages"
+    );
+}
