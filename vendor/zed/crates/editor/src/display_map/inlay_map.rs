@@ -781,9 +781,18 @@ impl InlayMap {
                 self.concealments
                     .sync_from(rebuild_start, &self.snapshot.buffer);
                 let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                // A concealment that *ends* where the rebuild starts has to be
+                // rebuilt with it. The prefix is sliced with `Bias::Left`, so a
+                // transform ending exactly here is left out of it, and
+                // `append_transforms_from` skips concealments ending at or
+                // before its start -- between the two the concealed text comes
+                // back as ordinary text, and the delimiter the reader was never
+                // meant to see appears. An inlay at a concealment's edge is the
+                // ordinary way to arrive here: splicing one rebuilds from its
+                // offset, which is exactly the concealment's end.
                 let rebuild_start = concealments
                     .iter()
-                    .find(|range| range.start < rebuild_start && rebuild_start < range.end)
+                    .find(|range| range.start < rebuild_start && rebuild_start <= range.end)
                     .map_or(rebuild_start, |range| range.start);
                 let prefix_end = transforms.summary().input.len;
                 push_isomorphic(
@@ -929,15 +938,16 @@ impl InlayMap {
             .chain(new_changed.first().map(|range| range.start))
             .min()
             .unwrap();
-        let source_end = old_changed
-            .last()
-            .map(|range| range.end)
-            .into_iter()
-            .chain(new_changed.last().map(|range| range.end))
-            .max()
-            .unwrap();
-        let old =
-            self.snapshot.to_inlay_offset(source_start)..self.snapshot.to_inlay_offset(source_end);
+        // The rebuild below re-emits everything from `source_start` to the end
+        // of the buffer, and what it emits there is not always what was there
+        // before: whether an inlay is suppressed depends on the concealment
+        // it falls in, so a concealment changing here can move an inlay that
+        // sits past `source_end`. An edit that stopped at `source_end` would
+        // then under-report the change, and the maps below would keep a
+        // transform tree whose length no longer matches this snapshot --
+        // which is the assertion `FoldMap::read` trips on. The edit says what
+        // was rebuilt: from the first changed offset to the end.
+        let old = self.snapshot.to_inlay_offset(source_start)..self.snapshot.len();
 
         self.concealments.replace(normalized, &self.snapshot.buffer);
         let mut cursor = self.snapshot.transforms.cursor::<MultiBufferOffset>(());
@@ -962,8 +972,7 @@ impl InlayMap {
         }
         self.snapshot.transforms = transforms;
         self.snapshot.version += 1;
-        let new =
-            self.snapshot.to_inlay_offset(source_start)..self.snapshot.to_inlay_offset(source_end);
+        let new = self.snapshot.to_inlay_offset(source_start)..self.snapshot.len();
         self.snapshot.check_invariants();
 
         (self.snapshot.clone(), vec![Edit { old, new }])
@@ -2480,6 +2489,77 @@ mod tests {
             ],
         );
         assert_eq!(snapshot.text(), "visiblea\tX!");
+    }
+
+    /// An inlay is often placed exactly where concealed text ends -- a
+    /// duration drawn after a quoted command, say. Splicing it rebuilds the
+    /// transforms from its own offset, and the concealment ending there must
+    /// come through the rebuild: the prefix is sliced short of it and the
+    /// rebuild used to skip it, which put the concealed delimiter back on
+    /// screen.
+    #[gpui::test]
+    fn an_inlay_at_a_concealments_edge_does_not_uncover_it(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple("a`b`c", cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let (mut map, _) = InlayMap::new(snapshot.clone());
+
+        let (concealed, _) = map.replace_concealments(vec![
+            MultiBufferOffset(1)..MultiBufferOffset(2),
+            MultiBufferOffset(3)..MultiBufferOffset(4),
+        ]);
+        assert_eq!(concealed.text(), "abc");
+
+        let (spliced, _) = map.splice(
+            &[],
+            vec![Inlay::mock_hint(
+                0,
+                snapshot.anchor_before(MultiBufferOffset(4)),
+                " 5s",
+            )],
+        );
+        assert_eq!(spliced.text(), "ab 5sc");
+    }
+
+    /// What `replace_concealments` returns has to account for every byte it
+    /// changed. It rebuilds to the end of the buffer, and what it emits there
+    /// can differ -- an inlay's visibility follows the concealment it falls
+    /// in -- so an edit stopping at the last changed range under-reports, and
+    /// the maps below keep a transform tree whose length no longer matches
+    /// this snapshot. `FoldMap::read` asserts on exactly that.
+    #[gpui::test]
+    fn a_concealment_change_reports_every_byte_it_moved(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple("a`b`c", cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let (mut map, _) = InlayMap::new(snapshot.clone());
+        map.splice(
+            &[],
+            vec![Inlay::mock_hint(
+                0,
+                snapshot.anchor_before(MultiBufferOffset(4)),
+                " 5s",
+            )],
+        );
+        let (before, _) = map.replace_concealments(vec![
+            MultiBufferOffset(1)..MultiBufferOffset(2),
+            MultiBufferOffset(3)..MultiBufferOffset(4),
+        ]);
+        let was = before.len();
+
+        let (after, edits) =
+            map.replace_concealments(vec![MultiBufferOffset(1)..MultiBufferOffset(2)]);
+
+        let moved = after.len().0.0 as i64 - was.0.0 as i64;
+        let reported = edits
+            .iter()
+            .map(|edit| {
+                (edit.new.end.0.0 as i64 - edit.new.start.0.0 as i64)
+                    - (edit.old.end.0.0 as i64 - edit.old.start.0.0 as i64)
+            })
+            .sum::<i64>();
+        assert_eq!(
+            moved, reported,
+            "the edit does not account for what the rebuild changed"
+        );
     }
 
     #[gpui::test]
