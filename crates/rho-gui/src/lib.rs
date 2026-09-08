@@ -118,6 +118,8 @@ actions!(
         SlackOpenRow,
         SlackCompose,
         SlackSearch,
+        SlackFindMessage,
+        SlackOpenFound,
         SlackMarkReadBefore,
         SlackWatchChannel,
         SlackNextUnread,
@@ -426,6 +428,17 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
     ]);
     cx.bind_keys([
+        // The results of a search: one place per hit. `enter` goes there,
+        // `escape` and `q` leave the way any other surface is left, and
+        // `shift-s` asks again without going back to the list first.
+        KeyBinding::new("enter", SlackOpenFound, Some("RhoSlackResults > Editor")),
+        KeyBinding::new("escape", SurfaceClose, Some("RhoSlackResults > Editor")),
+        KeyBinding::new("q", SurfaceClose, Some("RhoSlackResults > Editor")),
+        KeyBinding::new(
+            "shift-s",
+            SlackFindMessage,
+            Some("RhoSlackResults > Editor"),
+        ),
         KeyBinding::new("enter", SlackOpenRow, Some("RhoSlackList > Editor")),
         KeyBinding::new("enter", HomeOpenRow, Some("RhoHome > Editor")),
         KeyBinding::new(
@@ -455,6 +468,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
+            // `s` narrows the list by name; `shift-s` asks Slack what
+            // people said. Two different questions, and the second one is
+            // a request over a network rather than an index in memory.
+            KeyBinding::new("shift-s", SlackFindMessage, Some(context)),
             // The next conversation with something in it, the way `n` walks
             // the Zulip inbox. `shift-n` and not `n`, because `n` in a
             // transcript is the search the reader just ran.

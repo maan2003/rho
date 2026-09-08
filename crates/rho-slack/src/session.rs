@@ -15,7 +15,7 @@ use futures::channel::mpsc;
 use gpui::{AppContext as _, Context, EventEmitter, Task};
 use tokio::sync::Notify;
 
-use crate::api::Client;
+use crate::api::{Client, SearchPage};
 use crate::config::{Credentials, Paths};
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
@@ -75,6 +75,32 @@ pub enum SessionEvent {
     /// Something the user should be told, once, in the message strip.
     Notice(String),
     Health(Signal),
+    /// An answer to the last search the reader asked for. Only the last:
+    /// an answer to a query they have already replaced is dropped before
+    /// this is emitted.
+    Found(Found),
+}
+
+/// What came back from a search, ready to be drawn.
+///
+/// The query is carried with the answer because the surface has to say what
+/// it is showing the results *of*, and by the time an answer lands the
+/// reader may have typed something else entirely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub query: String,
+    pub page: Result<SearchPage, SearchRefused>,
+}
+
+/// Why a search did not answer, in the terms the reader is told it in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchRefused {
+    /// The Slack session rho holds is not allowed to search. Its own case
+    /// because it is the one failure the reader can do something about, and
+    /// what they do about it is not "try again".
+    NotAllowed,
+    /// Anything else: the network, Slack, a query Slack would not take.
+    Failed,
 }
 
 #[derive(Default)]
@@ -318,6 +344,9 @@ pub struct Session {
     /// messages is one request, and a request that failed is not retried on
     /// every page.
     asked_names: HashSet<UserId>,
+    /// How many searches the reader has asked for. The answer to any but
+    /// the last is not shown: see `search`.
+    asked: u64,
     /// Files already fetched into the state cache, by Slack file id. An
     /// image is shown from here, so a redraw never refetches.
     cached_files: HashMap<String, std::path::PathBuf>,
@@ -366,6 +395,7 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             asked_names: HashSet::new(),
+            asked: 0,
             cached_files: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
@@ -385,6 +415,7 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             asked_names: HashSet::new(),
+            asked: 0,
             cached_files: HashMap::new(),
             mirror: open_mirror(&paths.mirror),
             paths,
@@ -913,6 +944,51 @@ impl Session {
     /// Cost: the ids in what just arrived that are new, which is bounded by
     /// the messages it brought and is nothing at all once the roster covers
     /// them.
+    /// Asks Slack what people said, and emits the answer when it comes.
+    ///
+    /// Nothing is read from the mirror and nothing is written to it: the
+    /// mirror holds only what rho has already paged, so answering from it
+    /// would answer "what have I read" rather than the question. The answer
+    /// is a list of places and is not a fact about the workspace, so it goes
+    /// to whoever asked as an event and the model never hears about it.
+    ///
+    /// A query in flight when a second is asked for is abandoned rather than
+    /// raced: `asked` counts queries, and an answer that is not the current
+    /// one is dropped, so what the reader is shown is always the last thing
+    /// they typed and never an older answer that took longer.
+    pub fn search(&mut self, query: &str, page: u32, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.asked += 1;
+        let asked = self.asked;
+        let query = query.to_owned();
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let query = query.clone();
+            async move { client.search_messages(&query, page).await }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let answer = task.await;
+            let _ = this.update(cx, |session, cx| {
+                if session.asked != asked {
+                    return;
+                }
+                let page = match answer {
+                    Ok(Ok(page)) => Ok(page),
+                    // The refusal rho can name is the one the reader can act
+                    // on: Slack answers a session that may not search with
+                    // one of these two, and every other failure is a failure.
+                    Ok(Err(error)) => match refused_search(&format!("{error}")) {
+                        true => Err(SearchRefused::NotAllowed),
+                        false => Err(SearchRefused::Failed),
+                    },
+                    Err(_) => Err(SearchRefused::Failed),
+                };
+                cx.emit(SessionEvent::Found(Found { query, page }));
+            });
+        }));
+    }
+
     fn learn_names(&mut self, messages: &[Message], cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
@@ -2446,6 +2522,13 @@ pub fn older_request(
     }
 }
 
+/// Whether what Slack said is "this session may not search". Its own
+/// function so the two names Slack uses for it are in one place and can be
+/// asserted without a network.
+fn refused_search(said: &str) -> bool {
+    said.contains("missing_scope") || said.contains("not_allowed_token_type")
+}
+
 /// Puts a message the socket brought into the mirror. A message landing in
 /// a scope the mirror holds nothing for is an island: there is no telling
 /// what sits under it, so it gets a gap of its own and the reader is told
@@ -3421,5 +3504,18 @@ mod tests {
             older_request(loading, reached_oldest, cursor, None).is_some(),
             "and the next scroll is still allowed to ask"
         );
+    }
+
+    /// The two names Slack uses for "this session may not search", so the
+    /// one failure the reader can act on is told apart from the rest
+    /// without a network.
+    #[test]
+    fn a_session_that_may_not_search_is_told_apart_from_a_search_that_failed() {
+        assert!(refused_search("search.messages failed: missing_scope"));
+        assert!(refused_search(
+            "search.messages failed: not_allowed_token_type"
+        ));
+        assert!(!refused_search("search.messages failed: fatal_error"));
+        assert!(!refused_search("error sending request"));
     }
 }

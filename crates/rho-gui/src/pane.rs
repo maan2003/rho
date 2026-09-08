@@ -44,6 +44,12 @@ pub enum SurfaceKey {
         label: String,
     },
     SlackList,
+    /// The places one Slack search found. The query is the identity, so a
+    /// second search replaces the surface rather than stacking another one
+    /// behind it: the results are a way through, not a thing to keep.
+    SlackResults {
+        query: String,
+    },
     /// One Slack conversation. The source is the identity: two threads in
     /// the same channel are two surfaces, and their labels are not unique.
     SlackConversation(rho_slack::session::Source),

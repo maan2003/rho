@@ -297,6 +297,12 @@ pub enum SurfaceIdentity {
     },
     Dashboard,
     Usage,
+    /// The places one Slack search found. The query is the identity: two
+    /// searches are the same surface drawn twice, and the journal should say
+    /// which one the reader was reading.
+    SlackSearch {
+        query: String,
+    },
 }
 
 /// Who ignored the thread: this rho, or Slack telling rho that another

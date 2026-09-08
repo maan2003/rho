@@ -79,10 +79,10 @@ use crate::{
     HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
     MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, SearchRepeat,
     SearchRepeatReverse, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackMarkReadBefore,
-    SlackNextUnread, SlackOpenRow, SlackReactTo, SlackSearch, SlackWatchChannel, SubmitPrompt,
-    SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage, SlackFindMessage,
+    SlackMarkReadBefore, SlackNextUnread, SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch,
+    SlackWatchChannel, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, TranscriptTop,
+    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -132,6 +132,7 @@ pub(crate) enum SurfaceView {
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
     SlackList(Entity<rho_slack::ui::ListView>),
+    SlackResults(Entity<rho_slack::ui::ResultsView>),
     SlackConversation(Entity<rho_slack::ui::ConversationView>),
     Image(Entity<rho_window::image_view::ImageView>),
 }
@@ -156,6 +157,7 @@ impl SurfaceView {
             Self::ZulipInbox(_) => SurfaceKind::ZulipInbox,
             Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
             Self::SlackList(_) => SurfaceKind::SlackList,
+            Self::SlackResults(_) => SurfaceKind::SlackResults,
             Self::SlackConversation(_) => SurfaceKind::SlackConversation,
             Self::Image(_) => SurfaceKind::Image,
         }
@@ -4277,6 +4279,7 @@ impl Workspace {
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
             SurfaceKey::SlackList => "slack".to_owned(),
+            SurfaceKey::SlackResults { query } => query.clone(),
             SurfaceKey::SlackConversation(source) => self
                 .slack_labels
                 .get(source)
@@ -4302,6 +4305,7 @@ impl Workspace {
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
             SurfaceKey::SlackList => "slack list",
+            SurfaceKey::SlackResults { .. } => "slack search",
             SurfaceKey::SlackConversation(_) => "slack",
             SurfaceKey::Image { .. } => "image",
         }
@@ -4400,6 +4404,9 @@ impl Workspace {
                 label: label.clone(),
             },
             SurfaceKey::SlackList => SurfaceIdentity::SlackList,
+            SurfaceKey::SlackResults { query } => SurfaceIdentity::SlackSearch {
+                query: query.clone(),
+            },
             SurfaceKey::SlackConversation(source) => SurfaceIdentity::SlackConversation {
                 thread: crate::slack::journal_thread(source),
             },
@@ -4483,6 +4490,10 @@ impl Workspace {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
                 SurfaceView::SlackList(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                SurfaceView::SlackResults(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
@@ -6030,6 +6041,7 @@ impl Workspace {
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
+            SurfaceView::SlackResults(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
             SurfaceView::Image(_) => self.chrome_editor(),
         }
@@ -6084,6 +6096,7 @@ impl Workspace {
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::SlackResults(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Image(view) => view.read(cx).focus_handle(cx),
         }
@@ -6106,7 +6119,9 @@ impl Workspace {
             | SurfaceKey::DeskNode { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
-            SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
+            SurfaceKey::SlackList
+            | SurfaceKey::SlackResults { .. }
+            | SurfaceKey::SlackConversation(_) => None,
             SurfaceKey::Image { .. } => None,
             SurfaceKey::Browser(_) => None,
         };
@@ -6211,6 +6226,9 @@ impl Workspace {
                     cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx)),
                 )
             }
+            SurfaceKey::SlackResults { .. } => {
+                unreachable!("results surfaces are created by open_slack_results")
+            }
             SurfaceKey::SlackConversation(_) => {
                 unreachable!("slack conversations are created by open_slack_source")
             }
@@ -6254,7 +6272,9 @@ impl Workspace {
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
-            SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
+            SurfaceKey::SlackList
+            | SurfaceKey::SlackResults { .. }
+            | SurfaceKey::SlackConversation(_) => None,
             SurfaceKey::Image { .. } => None,
         };
         if let Some(agent_id) = selected {
@@ -8608,6 +8628,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            SurfaceView::SlackResults(view) => div()
+                .id("rho-surface-slack-results")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::SlackConversation(view) => div()
                 .id("rho-surface-slack-conversation")
                 .size_full()
@@ -8841,6 +8867,16 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
                 this.prompt_slack_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackFindMessage, window, cx| {
+                this.prompt_slack_find(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackOpenFound, window, cx| {
+                // Not on a hit: the line opens nothing, so `enter` is the
+                // editor's own again.
+                if !this.slack_open_found(window, cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &SlackEditMessage, window, cx| {
                 // Not on a message of the reader's own: `e` is vim's own

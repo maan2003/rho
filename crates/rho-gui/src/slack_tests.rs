@@ -1230,3 +1230,168 @@ async fn a_rewrite_whose_message_is_deleted_closes_and_keeps_the_words(cx: &mut 
         "the words reached Slack as a new message"
     );
 }
+
+/// A workspace with Slack over the fake server, seeded and drawn.
+///
+/// The workspace comes first: `test_workspace` initialises the app, and
+/// doing that after the fake had started would replace the runtime the
+/// session's loops live in. The fake is handed back because it has to
+/// outlive the test that reads from it.
+async fn slack_workspace(
+    cx: &mut TestAppContext,
+) -> (
+    gpui::WindowHandle<crate::workspace::Workspace>,
+    rho_slack::fake::Fake,
+    tempfile::TempDir,
+) {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    let credentials = rho_slack::config::Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    let client = std::sync::Arc::new(
+        rho_slack::api::Client::with_base(credentials, fake.api_base()).unwrap(),
+    );
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let paths = rho_slack::config::Paths::under(state.path());
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let session = cx.new(|cx| rho_slack::session::Session::with_client(client, paths, cx));
+            workspace.install_slack_session_for_test(session, window, cx);
+            workspace.open_slack(window, cx);
+        })
+        .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+            .expect("draw a frame");
+        cx.run_until_parked();
+        let rows = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_rows_for_test(cx))
+            .unwrap();
+        if rows.len() > 1 {
+            return (workspace, fake, state);
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    panic!("the fake's conversations never reached the list");
+}
+
+/// Waits for the results surface to say something other than that it is
+/// still asking. The search crosses a real socket, so the executor going
+/// quiet says nothing about whether the answer has arrived.
+async fn wait_for_results(
+    cx: &mut TestAppContext,
+    workspace: &gpui::WindowHandle<crate::workspace::Workspace>,
+) -> Vec<String> {
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let lines = workspace
+            .update(cx, |workspace, _, cx| workspace.slack_results_for_test(cx))
+            .unwrap();
+        if !lines.iter().any(|line| line.starts_with("looking for")) && !lines.is_empty() {
+            return lines;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    panic!("the search never answered");
+}
+
+/// A hit is a place, and `enter` on one goes there.
+///
+/// The whole point of searching messages is arriving at the message. This
+/// drives the reader's own keys — `shift-s`, the query, `enter` — and
+/// asserts the transcript that comes up is the conversation the hit named,
+/// showing the message that matched.
+#[gpui::test]
+async fn a_search_finds_places_and_enter_goes_to_one(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.add_message(
+        "C3",
+        serde_json::json!({"ts": "700.0", "user": "UD", "text": "the staging rollback is done"}),
+    );
+    fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "600.0", "user": "UA", "text": "lunch?"}),
+    );
+
+    cx.simulate_keystrokes(*workspace, "shift-s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r o l l b a c k enter");
+    let lines = wait_for_results(cx, &workspace).await;
+
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("1 for rollback"),
+        "the surface says what it is showing: {lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("dana  #dev-ops  "),
+        "a row is who said it, where, and when, with no ids: {lines:?}"
+    );
+    assert_eq!(
+        lines.get(2).map(String::as_str),
+        Some("  the staging rollback is done"),
+        "and the line that matched, under it: {lines:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "enter");
+    // The conversation is loaded over the same real socket, so wait on the
+    // transcript rather than on the executor.
+    let mut transcript = Vec::new();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        transcript = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.slack_transcript_for_test(cx)
+            })
+            .unwrap();
+        if transcript.iter().any(|line| line.contains("rollback")) {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    assert!(
+        transcript
+            .iter()
+            .any(|line| line.contains("the staging rollback is done")),
+        "enter goes to the message, in its conversation: {transcript:?}"
+    );
+}
+
+/// A search that does not answer says so, once, where the results would be.
+/// Silence and "nobody said that" are different facts and the reader is
+/// owed the difference.
+#[gpui::test]
+async fn a_search_that_fails_says_so_where_the_results_would_be(cx: &mut TestAppContext) {
+    let (workspace, fake, _state) = slack_workspace(cx).await;
+    fake.fail_next("search.messages", 1);
+
+    cx.simulate_keystrokes(*workspace, "shift-s");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r o l l b a c k enter");
+    let lines = wait_for_results(cx, &workspace).await;
+
+    assert_eq!(
+        lines,
+        vec![
+            "0 for rollback".to_owned(),
+            "slack did not answer the search".to_owned(),
+        ],
+        "one line, in the reader's words: {lines:?}"
+    );
+}

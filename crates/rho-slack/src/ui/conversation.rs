@@ -64,6 +64,10 @@ pub struct ConversationView {
     /// the cursor when it opens. It stays for the life of the surface, so
     /// the reader can scroll away and still find what they were dealt.
     dealt: Option<Ts>,
+    /// Why the surface landed there. Only the tint depends on it: the
+    /// reader is owed the difference between the message rho asked them to
+    /// answer and the message they went looking for.
+    landing: Landing,
     /// Whether the dealt message has been scrolled to yet. It may not be
     /// loaded when the deal opens; the first refresh that brings it in does
     /// the scroll.
@@ -430,6 +434,7 @@ impl ConversationView {
             fill: Fill::default(),
             moved: Moved::default(),
             dealt: None,
+            landing: Landing::Dealt,
             dealt_placed: false,
             unread_from: None,
             unread_at: None,
@@ -1117,6 +1122,18 @@ impl ConversationView {
     /// surface, with the cursor on it and the view centred on it. A deal is
     /// one message to answer, and this is that message.
     pub fn reveal(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        self.land(ts, Landing::Dealt, window, cx);
+    }
+
+    /// Shows the message a search found. The same landing as a deal's --
+    /// the chunk fetched if the mirror lacks it, the cursor on the message,
+    /// the view centred -- under its own tint.
+    pub fn reveal_found(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        self.land(ts, Landing::Found, window, cx);
+    }
+
+    fn land(&mut self, ts: Ts, landing: Landing, window: &mut Window, cx: &mut Context<Self>) {
+        self.landing = landing;
         if self.dealt.as_ref() == Some(&ts) && self.dealt_placed {
             return;
         }
@@ -1725,10 +1742,12 @@ impl ConversationView {
             .into_iter()
             .map(|(line, file)| (line, file.clone()))
             .collect::<Vec<_>>();
-        if self.dealt.as_ref() == Some(&message.ts)
-            || self.editing_message.as_ref() == Some(&message.ts)
-        {
-            mark_dealt(&mut item);
+        if self.dealt.as_ref() == Some(&message.ts) {
+            mark_landing(&mut item, self.landing);
+        } else if self.editing_message.as_ref() == Some(&message.ts) {
+            // A rewrite is tinted as a deal is: it is the one message this
+            // surface is about for as long as it is open.
+            mark_landing(&mut item, Landing::Dealt);
         }
         if self
             .session
@@ -2419,12 +2438,30 @@ fn mark_pending(item: &mut Rendered) {
     item.styles = vec![(Class::Muted, 0..item.text.trim_end_matches('\n').len())];
 }
 
-/// Tints the message a deal is about. The trailing newline is left out: it
-/// is the gap to the next message, and tinting it would draw an empty band
-/// under the card.
-fn mark_dealt(item: &mut Rendered) {
+/// Why the surface put the reader on a particular message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Landing {
+    /// A card rho is asking them to answer.
+    Dealt,
+    /// A place they went looking for.
+    Found,
+}
+
+impl Landing {
+    fn class(self) -> Class {
+        match self {
+            Self::Dealt => Class::Dealt,
+            Self::Found => Class::Found,
+        }
+    }
+}
+
+/// Tints the message the surface landed on. The trailing newline is left
+/// out: it is the gap to the next message, and tinting it would draw an
+/// empty band under the card.
+fn mark_landing(item: &mut Rendered, landing: Landing) {
     item.backgrounds
-        .push((Class::Dealt, 0..item.text.trim_end_matches('\n').len()));
+        .push((landing.class(), 0..item.text.trim_end_matches('\n').len()));
 }
 
 /// The break between days, which is the only separator the transcript has.
@@ -3693,7 +3730,7 @@ mod tests {
             &model(),
             false,
         );
-        mark_dealt(&mut item);
+        mark_landing(&mut item, Landing::Dealt);
         let (class, range) = item.backgrounds.last().cloned().unwrap();
         assert_eq!(class, Class::Dealt);
         assert_eq!(&item.text[range.clone()], item.text.trim_end_matches('\n'));

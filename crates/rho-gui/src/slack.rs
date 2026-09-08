@@ -314,6 +314,26 @@ impl Workspace {
         view.read(cx).drawn_conversations_for_test(cx)
     }
 
+    /// The lines of the search results as the reader reads them, for a
+    /// test that asserts what is on screen rather than what came back.
+    #[cfg(test)]
+    pub(crate) fn slack_results_for_test(&self, cx: &gpui::App) -> Vec<String> {
+        let SurfaceView::SlackResults(view) = &self.active_surface().view else {
+            return Vec::new();
+        };
+        view.read(cx).drawn_lines_for_test()
+    }
+
+    /// The transcript on screen, for a test that asserts where a hit landed
+    /// the reader.
+    #[cfg(test)]
+    pub(crate) fn slack_transcript_for_test(&self, cx: &gpui::App) -> Vec<String> {
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return Vec::new();
+        };
+        view.read(cx).drawn_lines_for_test(cx)
+    }
+
     /// A session built elsewhere, for a test that wants Slack surfaces over
     /// a fake server rather than over the user's workspace. The one seam:
     /// everything after it — opening the list, narrowing it, escaping —
@@ -1207,6 +1227,113 @@ impl Workspace {
     /// match, and this is only the reminder of what is being reached for.
     const SLACK_MATCHES_OFFERED: usize = 64;
 
+    /// `shift-s`: find a message. The prompt offers nothing while the
+    /// reader types and reads nothing until they submit -- searching is a
+    /// request over a network against a history rho does not hold, which is
+    /// the whole reason it is not the finder.
+    pub(crate) fn prompt_slack_find(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.slack_session(window, cx).is_none() {
+            return;
+        }
+        self.open_prompt(
+            "slack find:",
+            std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new()),
+            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
+                workspace.slack_find(&input, window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Runs a search and opens the surface its answer will be drawn on. The
+    /// surface is opened now rather than when the answer lands: the reader
+    /// asked, and a screen saying so is the honest thing to show them while
+    /// Slack is thinking.
+    fn slack_find(&mut self, query: &str, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        self.active_context = ContextId::Slack;
+        let key = SurfaceKey::SlackResults {
+            query: query.clone(),
+        };
+        let surface = match self.find_surface(|surface| surface.key == key).cloned() {
+            Some(surface) => surface,
+            None => {
+                let hooks = Self::slack_hooks();
+                let view = cx
+                    .new(|cx| rho_slack::ui::ResultsView::new(session.clone(), hooks, window, cx));
+                Self::wrap_surface(key, SurfaceView::SlackResults(view))
+            }
+        };
+        self.show_slack_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        if let SurfaceView::SlackResults(view) = &self.active_surface().view {
+            view.clone()
+                .update(cx, |view, cx| view.asking(&query, window, cx));
+        }
+        session.update(cx, |session, cx| session.search(&query, 1, cx));
+        cx.notify();
+    }
+
+    /// `enter` on a hit: the conversation, opened at that message. The
+    /// window is fetched when the mirror has never held it, so the reader
+    /// lands where they chose rather than at the newest messages.
+    pub(crate) fn slack_open_found(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackResults(view) = &self.active_surface().view else {
+            return false;
+        };
+        let Some(place) = view.clone().update(cx, |view, cx| view.cursor_place(cx)) else {
+            return false;
+        };
+        self.open_slack_source(place.source, window, cx);
+        let SurfaceView::SlackConversation(view) = &self.active_surface().view else {
+            return false;
+        };
+        view.clone()
+            .update(cx, |view, cx| view.reveal_found(place.ts, window, cx));
+        true
+    }
+
+    /// What the search answered, drawn on the surface the reader is waiting
+    /// on. An answer for a query whose surface has been closed is dropped:
+    /// nothing is opened behind their back.
+    fn slack_found(
+        &mut self,
+        found: &rho_slack::session::Found,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let key = SurfaceKey::SlackResults {
+            query: found.query.clone(),
+        };
+        let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() else {
+            return;
+        };
+        let SurfaceView::SlackResults(view) = surface.view else {
+            return;
+        };
+        let found = found.clone();
+        view.update(cx, |view, cx| match &found.page {
+            Ok(page) => view.found(&found.query, &page.hits, page.total, window, cx),
+            Err(why) => view.refused(&found.query, why, window, cx),
+        });
+        cx.notify();
+    }
+
     pub(crate) fn prompt_slack_search(
         &mut self,
         window: &mut gpui::Window,
@@ -1311,6 +1438,9 @@ impl Workspace {
             self.slack_labels.insert(source, label);
         }
         match event {
+            SessionEvent::Found(found) => {
+                self.slack_found(found, window, cx);
+            }
             SessionEvent::Connected => {
                 rho_journal::record(rho_journal::Event::SlackConnected {
                     workspace: session.read(cx).model().workspace().0.clone(),

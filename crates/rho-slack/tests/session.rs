@@ -339,3 +339,58 @@ async fn a_place_the_mirror_has_never_held_is_fetched_and_landed_on(cx: &mut Tes
         "and it arrives with the conversation around it, not on its own: {landed:?}"
     );
 }
+
+/// The reader typing a second query must not be shown the first one's
+/// answer. Two searches go out back to back; only the last one's answer is
+/// raised, whichever order Slack answers them in.
+#[gpui::test]
+async fn an_answer_to_a_query_the_reader_has_replaced_is_never_raised(cx: &mut TestAppContext) {
+    let rig = rig(cx).await;
+    rig.wait_for_roster(cx).await;
+    rig.fake.add_message(
+        "C1",
+        serde_json::json!({"ts": "700.0", "user": "UA", "text": "the staging rollback is done"}),
+    );
+    let answers = cx.update(|cx| {
+        let answers = cx.new(|_| Vec::new());
+        cx.subscribe(&rig.session, {
+            let answers = answers.clone();
+            move |_, event: &SessionEvent, cx| {
+                if let SessionEvent::Found(found) = event {
+                    answers.update(cx, |answers, _| answers.push(found.query.clone()));
+                }
+            }
+        })
+        .detach();
+        answers
+    });
+
+    rig.session.update(cx, |session, cx| {
+        session.search("staging", 1, cx);
+        session.search("rollback", 1, cx);
+    });
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if !answers
+            .read_with(cx, |answers, _| answers.clone())
+            .is_empty()
+        {
+            break;
+        }
+        cx.executor()
+            .timer(std::time::Duration::from_millis(10))
+            .await;
+    }
+    // Long enough that an answer to the abandoned query would have landed
+    // if it were going to: both requests went to the same server at once.
+    cx.executor()
+        .timer(std::time::Duration::from_millis(100))
+        .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        answers.read_with(cx, |answers, _| answers.clone()),
+        vec!["rollback".to_owned()],
+        "the reader is shown the last thing they typed, and only that"
+    );
+}

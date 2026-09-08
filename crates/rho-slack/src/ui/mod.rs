@@ -9,6 +9,7 @@
 
 pub mod conversation;
 pub mod list;
+pub mod results;
 
 use std::ops::Range;
 
@@ -18,6 +19,7 @@ use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Window};
 use language::Buffer;
 pub use list::ListView;
 use multi_buffer::MultiBuffer;
+pub use results::{Place, ResultsView};
 use text::Anchor;
 use theme::ActiveTheme as _;
 
@@ -73,6 +75,7 @@ impl rho_transcript::Style for Class {
         let tint = match self {
             Class::Unfurl => colors.element_background,
             Class::Dealt => colors.element_selected,
+            Class::Found => colors.element_hover,
             _ => return None,
         };
         let key = HighlightKey::SyntaxTreeView(
@@ -119,10 +122,15 @@ pub enum Class {
     /// still see it after scrolling around. It stays until the surface
     /// closes: a deal is one thing to answer, not a flash.
     Dealt,
+    /// The message a search landed on. Its own tint rather than `Dealt`'s:
+    /// "what I went looking for" and "what rho is asking me to answer" are
+    /// two different reasons for a message to be lit, and a reader should
+    /// not have to work out which one they are looking at.
+    Found,
 }
 
 impl Class {
-    pub const ALL: [Class; 15] = [
+    pub const ALL: [Class; 16] = [
         Class::Sender,
         Class::You,
         Class::Time,
@@ -138,6 +146,7 @@ impl Class {
         Class::Italic,
         Class::Struck,
         Class::Dealt,
+        Class::Found,
     ];
 
     fn slot(self) -> usize {
@@ -157,6 +166,7 @@ impl Class {
             Self::Italic => 12,
             Self::Struck => 13,
             Self::Dealt => 14,
+            Self::Found => 15,
         }
     }
 
@@ -191,7 +201,7 @@ impl Class {
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
             Self::Link | Self::Unfurl => (colors.link_text_hover, FontWeight::NORMAL),
-            Self::Dealt => (colors.text, FontWeight::NORMAL),
+            Self::Dealt | Self::Found => (colors.text, FontWeight::NORMAL),
             Self::Bold | Self::Italic | Self::Struck => unreachable!("styled above"),
         };
         HighlightStyle {

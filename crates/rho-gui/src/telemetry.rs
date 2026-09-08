@@ -33,6 +33,7 @@ pub(crate) enum SurfaceKind {
     ZulipInbox,
     ZulipNarrow,
     SlackList,
+    SlackResults,
     SlackConversation,
     Messages,
     Usage,
@@ -57,6 +58,7 @@ impl SurfaceKind {
             Self::ZulipInbox => "zulip_inbox",
             Self::ZulipNarrow => "zulip_narrow",
             Self::SlackList => "slack_list",
+            Self::SlackResults => "slack_results",
             Self::SlackConversation => "slack_conversation",
             Self::Messages => "messages",
             Self::Usage => "usage",
@@ -65,7 +67,7 @@ impl SurfaceKind {
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 15] = [
+const SURFACE_KINDS: [SurfaceKind; 16] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
@@ -77,6 +79,7 @@ const SURFACE_KINDS: [SurfaceKind; 15] = [
     SurfaceKind::ZulipInbox,
     SurfaceKind::ZulipNarrow,
     SurfaceKind::SlackList,
+    SurfaceKind::SlackResults,
     SurfaceKind::SlackConversation,
     SurfaceKind::Messages,
     SurfaceKind::Usage,
