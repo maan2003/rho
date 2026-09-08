@@ -1001,7 +1001,25 @@ impl FoldMap {
                         if fold_range.end.0 <= sum.input.len {
                             continue;
                         }
-                        assert!(fold_range.start.0 >= sum.input.len);
+                        // A fold under `ElisionPolicy::Tail` is two
+                        // transforms, a placeholder over its head and the
+                        // visible tail after it, so the prefix copied above
+                        // can stop between them: the boundary it lands on
+                        // is inside the fold's range, and the fold the
+                        // cursor yields here is one whose head is already
+                        // in the tree. What is left of it is the tail,
+                        // which is text.
+                        //
+                        // Zed does not meet this because a fold there is
+                        // one transform whatever it holds, so no boundary
+                        // is ever inside one and a fold the cursor yields
+                        // is either wholly copied or wholly ahead.
+                        if fold_range.start.0 < sum.input.len {
+                            let text_summary = inlay_snapshot
+                                .text_summary_for_range(InlayOffset(sum.input.len)..fold_range.end);
+                            push_isomorphic(&mut new_transforms, text_summary);
+                            continue;
+                        }
 
                         while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
                             next_fold_range.start < fold_range.end
