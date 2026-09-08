@@ -1303,9 +1303,28 @@ impl FoldMap {
                         Option<std::ops::Range<MultiBufferOffset>>,
                         Option<std::ops::Range<MultiBufferOffset>>,
                     ) = (None, None);
+                    // The two ends stand a fixed distance apart in the
+                    // buffer - past the edit both sides are the same bytes,
+                    // so whatever the edit added or removed is all that
+                    // separates them - and widening must leave that
+                    // distance alone. So the boundary each side is widened
+                    // to is named in the buffer, where the two sides can be
+                    // compared at all, and said back on each side through
+                    // its own inlays. Adding one and the same *inlay* step
+                    // to both, which is what this did, is only right where
+                    // the inlays either side of the boundary match: an
+                    // inlay on one side and not the other moves one end
+                    // further through the document than the other, and the
+                    // two ends stop naming one document.
                     loop {
                         old_transforms.seek_forward(&edit.old.end, Bias::Right);
-                        let old_delta = if old_transforms.item().is_some_and(|t| t.is_fold()) {
+                        new_transforms.seek_forward(&edit.new.end, Bias::Right);
+                        let old_end = old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                        let new_end = inlay_snapshot.to_buffer_offset(edit.new.end);
+                        // What the edit itself did, in buffer bytes.
+                        let skew = new_end.0 as isize - old_end.0 as isize;
+                        let mut target = old_end;
+                        if old_transforms.item().is_some_and(|t| t.is_fold()) {
                             #[cfg(feature = "wrap-test-support")]
                             {
                                 widened_out_of.0 = Some(
@@ -1314,12 +1333,10 @@ impl FoldMap {
                                             .to_buffer_offset(old_transforms.end().0),
                                 );
                             }
-                            old_transforms.end().0.0.0 - edit.old.end.0.0
-                        } else {
-                            0
-                        };
-                        new_transforms.seek_forward(&edit.new.end, Bias::Right);
-                        let new_delta = if new_transforms.item().is_some_and(|t| t.is_fold()) {
+                            target = target
+                                .max(old_inlay_snapshot.to_buffer_offset(old_transforms.end().0));
+                        }
+                        if new_transforms.item().is_some_and(|t| t.is_fold()) {
                             #[cfg(feature = "wrap-test-support")]
                             {
                                 widened_out_of.1 = Some(
@@ -1327,16 +1344,25 @@ impl FoldMap {
                                         ..inlay_snapshot.to_buffer_offset(new_transforms.end().0),
                                 );
                             }
-                            new_transforms.end().0.0.0 - edit.new.end.0.0
-                        } else {
-                            0
-                        };
-                        let delta = old_delta.max(new_delta);
-                        if delta == 0 {
+                            // The new side's fold end said in the old
+                            // side's buffer, which is where the two are
+                            // compared.
+                            let end = inlay_snapshot.to_buffer_offset(new_transforms.end().0);
+                            target = target
+                                .max(MultiBufferOffset((end.0 as isize - skew).max(0) as usize));
+                        }
+                        if target <= old_end {
                             break;
                         }
-                        edit.old.end.0.0 += delta;
-                        edit.new.end.0.0 += delta;
+                        // An end travels forwards, so each side takes the
+                        // inlay offset past any inlay standing on the
+                        // boundary: the inlay falls inside the widened edit
+                        // rather than just beyond it.
+                        edit.old.end = widen_end_over_inlays(&old_inlay_snapshot, target);
+                        edit.new.end = widen_end_over_inlays(
+                            &inlay_snapshot,
+                            MultiBufferOffset((target.0 as isize + skew).max(0) as usize),
+                        );
                     }
                     // Whether the two ends met, and whether they had a
                     // right to.

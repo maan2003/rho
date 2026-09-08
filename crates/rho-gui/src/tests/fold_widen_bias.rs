@@ -172,3 +172,12 @@ fn a_left_biased_inlay_on_a_widened_start_lands_inside_it(cx: &mut TestAppContex
 fn a_right_biased_inlay_on_a_widened_start_lands_inside_it(cx: &mut TestAppContext) {
     inlay_on_a_widened_boundary(cx, true, false);
 }
+#[gpui::test]
+fn a_left_biased_inlay_on_a_widened_end_lands_inside_it(cx: &mut TestAppContext) {
+    inlay_on_a_widened_boundary(cx, false, true);
+}
+
+#[gpui::test]
+fn a_right_biased_inlay_on_a_widened_end_lands_inside_it(cx: &mut TestAppContext) {
+    inlay_on_a_widened_boundary(cx, false, false);
+}
