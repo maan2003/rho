@@ -41,6 +41,24 @@ pub enum WalkEvent {
     Idle,
 }
 
+/// What a seeded turn is made of.
+///
+/// The three shapes ask different questions of the same window. `Prose` is
+/// settled but not elided. `Tools` puts working output in every turn, which
+/// the elision policy folds, so the document carries one fold per turn.
+/// `ShortTurns` makes each turn a line of question and a line of answer,
+/// which is the ordinary document and the one that composes the most
+/// buffers: a buffer is a run of blocks with the same markdown flag, an
+/// answer is markdown and a question is not, so a transcript of short turns
+/// composes one buffer per block where a transcript of long ones composes
+/// one per four rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prefill {
+    Prose,
+    Tools,
+    ShortTurns,
+}
+
 /// Whether wall-clock draw cost is an oracle in addition to deterministic work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalkMode {
@@ -63,14 +81,8 @@ pub struct WalkConfig {
     /// rewrap, or to ask what one keystroke costs on a document worth
     /// scrolling, has to start with the document already there.
     pub prefill_turns: usize,
-    /// Whether each seeded turn carries working output of its own.
-    ///
-    /// A turn of prose is settled but not elided: the elision policy folds
-    /// working output - tool bursts and reasoning - and leaves a final
-    /// answer standing. A document worth asking what an elision costs has
-    /// to carry one fold per turn, so this puts a tool in every seeded
-    /// turn and the transcript elides it.
-    pub prefill_tools: bool,
+    /// What each seeded turn is made of.
+    pub prefill: Prefill,
     /// A fixed drive, run in place of a generated sequence.
     ///
     /// A generator cannot be asked for a particular shape of run. The two
@@ -386,7 +398,7 @@ fn run_events_with_detached_host(
         seed,
         mode,
         prefill_turns,
-        prefill_tools,
+        prefill,
         ..
     } = config;
     gpui::profiler::set_editor_trace_enabled(true);
@@ -427,7 +439,7 @@ fn run_events_with_detached_host(
         .collect();
     let workspace = cx.add_window(|window, cx| Workspace::new(specs, window, cx));
     let agent = AgentId::from_counter(1, &AgentIdDomain(0)).expect("generated agent id");
-    let mut state = initial_state(prefill_turns, prefill_tools);
+    let mut state = initial_state(prefill_turns, prefill);
     workspace
         .update(&mut cx, |workspace, window, cx| {
             workspace.select_agent(Some(agent), window, cx);
@@ -904,7 +916,7 @@ fn prompt_row(
 /// tool output, because tool output is concealed and concealed rows are
 /// gone before the tab map counts them. Rows that survive to the tab map
 /// are the only ones a rewrap has to do.
-fn initial_state(prefill_turns: usize, prefill_tools: bool) -> UiAgentState {
+fn initial_state(prefill_turns: usize, prefill: Prefill) -> UiAgentState {
     let tool = UiTool {
         id: "generated-tool".to_owned(),
         name: "shell_command".to_owned(),
@@ -919,11 +931,46 @@ fn initial_state(prefill_turns: usize, prefill_tools: bool) -> UiAgentState {
         metadata: None,
     };
     let mut blocks = Vec::with_capacity(prefill_turns * 3 + 3);
+    if prefill == Prefill::ShortTurns {
+        for turn in 0..prefill_turns {
+            blocks.push(Arc::new(UiBlock::UserMessage {
+                text: format!("question {turn}"),
+            }));
+            // One settled tool, in the oldest turn, so that a body arriving
+            // for it is a change under whatever the window has composed:
+            // that is what makes the screen open again on its tail.
+            if turn == 0 {
+                blocks.push(Arc::new(UiBlock::Tool(UiTool {
+                    id: "settled-tool-0".to_owned(),
+                    ..tool.clone()
+                })));
+            }
+            blocks.push(Arc::new(UiBlock::AssistantMessage {
+                text: format!("answer {turn}\n"),
+                phase: Some(UiMessagePhase::FinalAnswer),
+            }));
+        }
+        blocks.extend([
+            Arc::new(UiBlock::UserMessage {
+                text: "generated request near a wrapping boundary ".repeat(8),
+            }),
+            Arc::new(UiBlock::AssistantMessage {
+                text: "generated streaming tail ".repeat(8),
+                phase: Some(UiMessagePhase::FinalAnswer),
+            }),
+        ]);
+        return UiAgentState {
+            blocks,
+            status: UiAgentStatus::Streaming,
+            context_used: None,
+            usage: Default::default(),
+        };
+    }
     for turn in 0..prefill_turns {
         blocks.push(Arc::new(UiBlock::UserMessage {
             text: format!("settled question {turn} about a wrapping boundary"),
         }));
-        if prefill_tools {
+        if prefill == Prefill::Tools {
             blocks.push(Arc::new(UiBlock::Tool(UiTool {
                 id: format!("settled-tool-{turn}"),
                 ..tool.clone()
@@ -1016,7 +1063,7 @@ mod tests {
             steps: 8,
             mode: WalkMode::Debug,
             prefill_turns: 0,
-            prefill_tools: false,
+            prefill: Prefill::Prose,
             script: None,
         })
         .expect("generated scene sequence");
@@ -1032,7 +1079,7 @@ mod tests {
                 steps: 6,
                 mode: WalkMode::Debug,
                 prefill_turns: 0,
-                prefill_tools: false,
+                prefill: Prefill::Prose,
                 script: None,
             },
             &[

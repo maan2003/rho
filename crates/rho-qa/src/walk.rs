@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use rho_gui::walk::{WalkConfig, WalkEvent, WalkHarness, WalkMode};
+use rho_gui::walk::{Prefill, WalkConfig, WalkEvent, WalkHarness, WalkMode};
 
 /// The wrap map's two whole-document drives, on a transcript already worth
 /// scrolling: a width change and a jump to the top, with keystrokes beside
@@ -91,6 +91,31 @@ const ELIDED_HISTORY_DRIVE: &[WalkEvent] = &[
     WalkEvent::ScrollToTop,
     WalkEvent::Idle,
     WalkEvent::AgentChunk { bytes: 64 },
+    WalkEvent::Idle,
+];
+
+/// A transcript of short turns, opened and then opened again.
+///
+/// The window opens on its last two hundred rows and builds a buffer for
+/// every run of blocks that share a markdown flag. A turn of prose is four
+/// rows and its question and answer coalesce with their neighbours, so the
+/// other drives compose about one buffer per four rows; a turn that is one
+/// line of question and one of answer flips the flag at every block, so the
+/// same two hundred rows compose a buffer per block. Every one of them is
+/// handed to the parser at once, and their parses land in one sync - which
+/// is the largest count and the largest draw the gate prints.
+///
+/// Nothing bounds buffers per row, so this drive is here to put the
+/// worst ordinary document under that bound rather than the convenient one.
+/// The first idle carries the open. The tool body arrives for the oldest
+/// turn in the transcript, which is a change under everything composed, so
+/// the screen opens again on its tail and pays the compose a second time -
+/// the recompose is not a rare path, it is what a settled block changing
+/// does.
+const SHORT_TURN_OPEN_DRIVE: &[WalkEvent] = &[
+    WalkEvent::Idle,
+    WalkEvent::Idle,
+    WalkEvent::ToolBody { bytes: 64 },
     WalkEvent::Idle,
 ];
 
@@ -185,7 +210,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                     steps,
                     mode,
                     prefill_turns: 0,
-                    prefill_tools: false,
+                    prefill: Prefill::Prose,
                     script: None,
                 },
             )
@@ -199,7 +224,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 steps: LARGE_TRANSCRIPT_DRIVE.len(),
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
-                prefill_tools: false,
+                prefill: Prefill::Prose,
                 script: Some(LARGE_TRANSCRIPT_DRIVE),
             },
         ));
@@ -210,8 +235,19 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 steps: HISTORY_PAGING_DRIVE.len(),
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
-                prefill_tools: false,
+                prefill: Prefill::Prose,
                 script: Some(HISTORY_PAGING_DRIVE),
+            },
+        ));
+        runs.push((
+            "short".to_owned(),
+            WalkConfig {
+                seed: 0,
+                steps: SHORT_TURN_OPEN_DRIVE.len(),
+                mode,
+                prefill_turns: LARGE_TRANSCRIPT_TURNS,
+                prefill: Prefill::ShortTurns,
+                script: Some(SHORT_TURN_OPEN_DRIVE),
             },
         ));
         runs.push((
@@ -221,7 +257,7 @@ pub fn run(args: WalkArgs) -> Result<()> {
                 steps: ELIDED_HISTORY_DRIVE.len(),
                 mode,
                 prefill_turns: LARGE_TRANSCRIPT_TURNS,
-                prefill_tools: true,
+                prefill: Prefill::Tools,
                 script: Some(ELIDED_HISTORY_DRIVE),
             },
         ));
