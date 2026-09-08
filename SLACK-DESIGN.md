@@ -401,6 +401,69 @@ nothing to say, or the user starts checking the other app again.
 Typed events: connected, disconnected, item ingested, replied, each with
 the thread identity. No strings where an enum will do.
 
+### A narrowing lasts as long as the reader is in it
+
+The finder narrows the list to the names that answer what was typed. What
+should be true of that narrowing when the reader walks away from the list
+and comes back, and what should be true of it when it stops matching
+anything, are two questions the code answers today without having decided
+either.
+
+**What is true now, observed rather than assumed.** Narrowing to `ops`,
+opening a conversation from the narrowed list, and coming back with
+`ctrl-k` leaves the list showing `#dev-ops` and `#ops-alerts` and the
+banner still reading `matching "ops" · 2 of 6`. The narrowing survives the
+visit, because the query lives in the model rather than in the view, and
+the model outlives every surface drawn from it. It does not survive a
+restart: no table holds the query, so a fresh run starts on the whole
+list.
+
+**Both of those are right, and this is the decision that says so.** A
+narrowing is the reader in the middle of something -- they typed `ops` to
+get to the ops channels, and going into one of them and back out is the
+middle of that, not the end of it. Widening the list under them on the way
+back would put a conversation where they left one and hand the same
+keypress a different meaning, which is the failure the point-on-a-
+conversation rule already exists to prevent. Across a restart the opposite
+holds: rho coming up showing two of six conversations, with a banner
+explaining a word the reader typed yesterday, is rho hiding their Slack
+from them. A narrowing is a motion, not a setting, and motions do not
+outlive the run.
+
+**What follows from keeping it, and is wrong today.** `shift-n` walks
+`Model::next_unread`, which reads the whole list and knows nothing about
+the query. With a narrowing standing, the next-unread key takes the reader
+to a conversation the list is not showing and cannot show, and the banner
+then describes a list they are no longer in. Keeping the narrowing means
+`shift-n` walks what is on screen: the narrowed vector when a query
+stands, the whole list otherwise. That is the reader's own rule -- the key
+moves them through the list they are looking at -- and it costs the
+matches rather than the workspace, since the narrowed set is already held
+in list order.
+
+**A narrowing that no longer matches anything.** Today the list draws no
+rows, a banner reading `matching "zzz" · 0 of 6`, and a line saying
+`nothing matches`. That is the right shape and it stays: an empty
+narrowing must never widen itself back to the whole list. The reader's
+query is theirs until they change it, and a list that silently became a
+different list is worse than an empty one -- the count on the banner
+already says the six conversations are still there.
+
+What has to be added is the difference between the two ways of arriving
+there. Typing a word nothing answers and watching the last channel that
+answered your word get renamed, archived, or left are the same screen now,
+and they are not the same fact. When a narrowing empties because the
+mirror moved rather than because of the last keystroke, the line says so
+-- that what matched has gone, not that nothing ever did -- and it names
+the way out, since `s` and an empty query is the only way back and nothing
+on screen says it.
+
+**Why:** the narrowing is the one piece of state on this surface the
+reader put there by typing. Everything else on the list -- what is unread,
+what is muted, where a row sits -- is Slack's, and rho redraws it as it
+changes. State the reader typed is cleared by the reader, and state Slack
+owns is never allowed to clear it for them.
+
 ### Searching what people said
 
 The finder narrows the conversation *list* by name; nothing finds a
