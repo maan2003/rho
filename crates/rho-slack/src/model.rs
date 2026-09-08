@@ -209,6 +209,11 @@ const FIRST_REACTIONS: [&str; 6] = [
 
 /// Whether a character can be part of a handle or a channel name, which is
 /// what bounds a mention in typed text.
+/// The channel-wide mentions, which name everyone rather than anyone: what
+/// the composer offers for `@` beside the members, and what `encode` puts on
+/// the wire as `<!here>` and `<!channel>`.
+const BROADCASTS: [&str; 2] = ["here", "channel"];
+
 fn is_name_char(character: char) -> bool {
     character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
 }
@@ -1246,14 +1251,27 @@ impl Model {
     pub fn suggestions(&self, channel: &ChannelId, sigil: char, needle: &str) -> Vec<Suggestion> {
         let needle = needle.to_lowercase();
         let mut found = match sigil {
-            '@' => self
-                .members_of(channel)
-                .into_iter()
-                .filter(|user| user.id != self.self_id)
-                .map(|user| Suggestion {
-                    value: format!("@{}", user.handle),
-                    detail: user.name.clone(),
+            // The broadcasts are offered beside the members. They are in no
+            // member list, so a composer that had only the roster to draw on
+            // gave the reader no way to find out they exist.
+            '@' => BROADCASTS
+                .iter()
+                .map(|name| Suggestion {
+                    value: format!("@{name}"),
+                    detail: match *name {
+                        "here" => "everyone here now".to_owned(),
+                        _ => "everyone in the channel".to_owned(),
+                    },
                 })
+                .chain(
+                    self.members_of(channel)
+                        .into_iter()
+                        .filter(|user| user.id != self.self_id)
+                        .map(|user| Suggestion {
+                            value: format!("@{}", user.handle),
+                            detail: user.name.clone(),
+                        }),
+                )
                 .collect::<Vec<_>>(),
             '#' => self
                 .conversations
@@ -1348,6 +1366,12 @@ impl Model {
 
     fn wire_form(&self, sigil: char, name: &str) -> Option<String> {
         match sigil {
+            // The broadcasts are not users and are in no member list, so the
+            // user table can never answer for them. Slack's wire form is its
+            // own, and rho has always read one coming in — a broadcast earns
+            // a card as surely as the reader's own handle does. Until now it
+            // could read one and not send one.
+            '@' if BROADCASTS.contains(&name) => Some(format!("<!{name}>")),
             '@' => {
                 let user = self.users.values().find(|user| user.handle == name)?;
                 Some(format!("<@{}>", user.id.0))
@@ -3370,9 +3394,11 @@ mod tests {
                 .map(|found| found.value)
                 .collect::<Vec<_>>()
         };
-        // The reader is never a mention of themselves.
-        assert_eq!(values('@', ""), vec!["@ada"]);
+        // The reader is never a mention of themselves, and the two channel
+        // -wide mentions are offered beside the people.
+        assert_eq!(values('@', ""), vec!["@ada", "@channel", "@here"]);
         assert_eq!(values('@', "ad"), vec!["@ada"]);
+        assert_eq!(values('@', "her"), vec!["@here"]);
         assert!(values('@', "zzz").is_empty());
         assert_eq!(values('#', "des"), vec!["#design"]);
 
@@ -3402,5 +3428,24 @@ mod tests {
             "mail me@example.com about @nobody"
         );
         assert_eq!(model.encode(":tada: ships"), ":tada: ships");
+    }
+
+    /// A broadcast is not a user and is in no member list, so the user table
+    /// can never answer for it. rho has always read one coming in — that is
+    /// what earns a card from an `@here` somebody else sent — and without
+    /// this it could read one and not send one: `@here` went out as the four
+    /// characters, reaching nobody at all.
+    #[test]
+    fn the_two_channel_wide_mentions_go_out_as_broadcasts() {
+        let model = model();
+        assert_eq!(
+            model.encode("@here standup in five"),
+            "<!here> standup in five"
+        );
+        assert_eq!(model.encode("ship it @channel"), "ship it <!channel>");
+        // The same rules as any other mention: one starting a word, and the
+        // word is the whole of it.
+        assert_eq!(model.encode("over@here.example"), "over@here.example");
+        assert_eq!(model.encode("@herero"), "@herero");
     }
 }
