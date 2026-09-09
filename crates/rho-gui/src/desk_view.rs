@@ -572,6 +572,12 @@ pub struct DeskCells {
     names: BTreeMap<HostId, String>,
 }
 
+impl Default for DeskCells {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeskCells {
     pub fn new() -> Self {
         Self {
