@@ -763,7 +763,8 @@ fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay(
                 assert_eq!(
                     input.last().unwrap(),
                     &json!({
-                        "type": "function_call_output", "name": "exec", "output": "Command completed",
+                        "type": "function_call_output", "namespace": "functions",
+                        "name": "exec", "output": "Command completed",
                     })
                 );
                 if compacted {

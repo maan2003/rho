@@ -739,6 +739,7 @@ fn convert_tool_result(result: ToolResult, name: Option<&ToolName>) -> Value {
 fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -> Value {
     let mut item = json!({
         "type": "function_call_output",
+        "namespace": "functions",
         "output": update.output.as_ref(),
     });
     if let Some(name) = name {
