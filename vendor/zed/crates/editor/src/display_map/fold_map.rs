@@ -773,9 +773,12 @@ impl FoldMap {
             // snapshots have to be in hand to convert either way.
             let old_inlay_snapshot = self.snapshot.inlay_snapshot.clone();
 
-            // Removing an excerpt invalidates anchors into it. Such folds no
-            // longer have a stable ordering in the new buffer, so discard
-            // them before using the fold tree with the new snapshot.
+            // Removing an excerpt makes its anchors unresolvable. Such folds
+            // no longer have a stable ordering in the new buffer, so discard
+            // them before using the fold tree with the new snapshot. A text
+            // edit can make an anchor invalid while it remains resolvable at
+            // its biased position, and that fold must be retained: the text
+            // it hides is still there.
             let mut invalid_folds_by_start =
                 HashMap::<MultiBufferOffset, HashSet<FoldId>>::default();
             let mut invalid_fold_edits = Vec::new();
@@ -785,8 +788,8 @@ impl FoldMap {
                 let mut folds =
                     intersecting_folds(&old_inlay_snapshot, &self.snapshot.folds, old_range, true);
                 while let Some(fold) = folds.item() {
-                    if !fold.range.start.is_valid(&inlay_snapshot.buffer)
-                        || !fold.range.end.is_valid(&inlay_snapshot.buffer)
+                    if !inlay_snapshot.buffer.can_resolve(&fold.range.start)
+                        || !inlay_snapshot.buffer.can_resolve(&fold.range.end)
                     {
                         let newly_invalid = invalid_folds_by_start
                             .entry(fold.range.start.to_offset(&old_inlay_snapshot.buffer))
@@ -3293,7 +3296,9 @@ mod tests {
             let (snapshot, _) = map.read(inlay_snapshot, vec![]);
             assert_eq!(snapshot.text(), "⋯fghijkl");
 
-            // Edit within one of the folds.
+            // Delete the text fragment carrying the first fold's start
+            // anchor. The anchor remains resolvable, so both folds remain and
+            // are still merged into one placeholder.
             let buffer_snapshot = buffer.update(cx, |buffer, cx| {
                 buffer.edit(
                     [(MultiBufferOffset(0)..MultiBufferOffset(1), "12345")],
@@ -3305,6 +3310,7 @@ mod tests {
             let (inlay_snapshot, inlay_edits) =
                 inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
             let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+            assert_eq!(snapshot.fold_count(), 2);
             assert_eq!(snapshot.text(), "12345⋯fghijkl");
         }
     }
