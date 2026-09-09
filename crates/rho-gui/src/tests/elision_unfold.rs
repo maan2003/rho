@@ -18,7 +18,7 @@ use editor::Editor;
 use gpui::{AppContext as _, TestAppContext};
 use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 
-use super::{history_folds, init_test_app};
+use super::{history_elisions, init_test_app};
 
 /// Nothing stays folded once the model elides nothing, even when the spec
 /// that made the fold can no longer say where it was.
@@ -77,7 +77,7 @@ fn a_spec_that_stops_resolving_still_unfolds_its_turn(cx: &mut TestAppContext) {
         })
     });
     assert_eq!(
-        history_folds(&editor, cx).len(),
+        history_elisions(&editor, cx).len(),
         1,
         "the turn the model elides is folded"
     );
@@ -106,7 +106,7 @@ fn a_spec_that_stops_resolving_still_unfolds_its_turn(cx: &mut TestAppContext) {
         })
     });
     assert_eq!(
-        history_folds(&editor, cx).len(),
+        history_elisions(&editor, cx).len(),
         0,
         "a fold outlived the spec that made it"
     );

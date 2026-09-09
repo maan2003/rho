@@ -39,7 +39,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use editor::Editor;
 use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
-pub use elisions::HistoryFold;
 use elisions::{ElisionState, ElisionSync};
 use gpui::{AppContext as _, Context, Entity, IntoElement as _, Reservation, WeakEntity};
 use inlays::{InlayRecord, PlacedInlay};

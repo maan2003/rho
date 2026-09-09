@@ -2,10 +2,8 @@
 //!
 //! A turn that is all working output is elided with its last rows kept on
 //! screen, and those rows are the ones a reader reaches for: they hold the
-//! calls. The fold's range covers them, so the caret rest that keeps a
-//! caret out of hidden text was snapping every motion in them back to the
-//! fold's first character — the reported "the cursor will not move in the
-//! call lines".
+//! calls. They are ordinary buffer rows below the elision's own row, so a
+//! caret moves along and down them like any other text.
 
 use editor::display_map::{DisplayPoint, DisplayRow};
 use gpui::{Focusable as _, TestAppContext};
@@ -57,14 +55,30 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
         .expect("focus editor");
     cx.simulate_keystrokes(*workspace, "escape");
 
-    // The placeholder row is row 1. A caret leaving it steps onto the first
-    // call the elision left on screen rather than into the head it hides.
-    cx.simulate_keystrokes(*workspace, "j l");
-    let first_call = DisplayPoint::new(DisplayRow(2), 0);
+    // The elision draws on a row of its own and the calls it leaves on
+    // screen follow it, so the first row a caret can reach below the user's
+    // message is the first shown call.
+    let first_call = DisplayRow(
+        shown
+            .lines()
+            .position(|line| line.starts_with("$ echo"))
+            .expect("a call is on screen") as u32,
+    );
+    // The rows between are the blank line that separates the response and
+    // the elision's own row, and a caret steps down through what it can
+    // rest on until it reaches the calls without going past them.
+    let mut landed = head(&editor, cx);
+    for _ in 0..4 {
+        if landed.row() >= first_call {
+            break;
+        }
+        cx.simulate_keystrokes(*workspace, "j");
+        landed = head(&editor, cx);
+    }
     assert_eq!(
-        head(&editor, cx),
+        landed.row(),
         first_call,
-        "a caret leaving the placeholder lands on the first shown call"
+        "a caret stepping down reaches the first shown call"
     );
 
     // Those rows are ordinary text: the caret moves along and down them.
@@ -73,14 +87,14 @@ fn the_caret_moves_through_the_calls_an_elision_leaves_on_screen(cx: &mut TestAp
     cx.simulate_keystrokes(*workspace, "l");
     let along = head(&editor, cx);
     assert!(
-        along.row() == first_call.row() && along.column() > first_call.column(),
+        along.row() == first_call && along.column() > landed.column(),
         "the caret moves along a call the elision left on screen: {along:?}"
     );
     cx.simulate_keystrokes(*workspace, "j");
     let down = head(&editor, cx);
     assert_eq!(
         down.row(),
-        DisplayRow(first_call.row().0 + 1),
+        DisplayRow(first_call.0 + 1),
         "the caret moves down from one shown call to the next: {down:?}"
     );
 }

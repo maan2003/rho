@@ -23,7 +23,7 @@ use editor::Editor;
 use gpui::{AppContext as _, Entity, TestAppContext};
 use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 
-use super::{history_folds, init_test_app};
+use super::{history_elisions, init_test_app};
 
 /// Three buffers, and the last one replaced: two elisions have to stand
 /// above the rebuild for the copied prefix to stop inside one of them.
@@ -98,7 +98,7 @@ fn rebuilding_a_buffer_under_elided_turns_that_keep_a_tail(cx: &mut TestAppConte
         })
     });
     assert_eq!(
-        history_folds(&editor, cx).len(),
+        history_elisions(&editor, cx).len(),
         TURNS,
         "every turn is elided before the rebuild"
     );
@@ -133,7 +133,7 @@ fn rebuilding_a_buffer_under_elided_turns_that_keep_a_tail(cx: &mut TestAppConte
     });
 
     assert_eq!(
-        history_folds(&editor, cx).len(),
+        history_elisions(&editor, cx).len(),
         REBUILT_FROM,
         "the turns above the rebuild are still elided and the rebuilt one is not"
     );
