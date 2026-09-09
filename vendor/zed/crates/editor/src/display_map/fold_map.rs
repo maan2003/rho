@@ -1801,17 +1801,29 @@ impl FoldSnapshot {
     /// against this range rather than the fold's whole range.
     pub fn elided_range(&self, fold: &Fold) -> Option<Range<MultiBufferOffset>> {
         let buffer = &self.inlay_snapshot.buffer;
-        let start = self
-            .inlay_snapshot
-            .to_inlay_offset(fold.range.start.to_offset(buffer));
-        let end = self
-            .inlay_snapshot
-            .to_inlay_offset(fold.range.end.to_offset(buffer));
-        let (elided, _) = elided_ranges(&self.inlay_snapshot, start..end, fold.elision_policy);
-        elided.map(|range| {
-            self.inlay_snapshot.to_buffer_offset(range.start)
-                ..self.inlay_snapshot.to_buffer_offset(range.end)
-        })
+        let range = fold.range.start.to_offset(buffer)..fold.range.end.to_offset(buffer);
+        match fold.elision_policy {
+            ElisionPolicy::Hidden => Some(range),
+            ElisionPolicy::Visible => None,
+            // Only the split has to be found in inlay coordinates, because
+            // rows are what a tail is counted in and inlays make rows. The
+            // other two policies stay in buffer offsets: a round trip
+            // through the inlay map moves an offset that sits inside a
+            // concealment, and a fold's own ends must not move.
+            ElisionPolicy::Tail { .. } => {
+                let start = self.inlay_snapshot.to_inlay_offset(range.start);
+                let end = self.inlay_snapshot.to_inlay_offset(range.end);
+                let (elided, _) =
+                    elided_ranges(&self.inlay_snapshot, start..end, fold.elision_policy);
+                elided.map(|elided| {
+                    range.start
+                        ..self
+                            .inlay_snapshot
+                            .to_buffer_offset(elided.end)
+                            .min(range.end)
+                })
+            }
+        }
     }
 
     #[ztracing::instrument(skip_all)]
