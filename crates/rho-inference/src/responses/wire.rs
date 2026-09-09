@@ -214,6 +214,22 @@ impl ResponsesRequest {
         request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {
+        // Resolve names before incremental replay or compaction hides calls.
+        let tool_names = request
+            .input
+            .iter()
+            .filter_map(|block| match &**block {
+                ContextBlock::InferenceResponse { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|item| match item {
+                InferenceResponseItem::ToolCall { id, name, .. } => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
@@ -239,7 +255,7 @@ impl ResponsesRequest {
             .iter()
             .filter(|item| !matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(item.clone(), &mut input);
+            convert_timeline_item(item.clone(), &tool_names, &mut input);
         }
         // The Responses API requires a manual compaction trigger to be the
         // final input item. Multiple queued requests are equivalent, so
@@ -248,7 +264,7 @@ impl ResponsesRequest {
             .iter()
             .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(WireTimelineItem::CompactionTrigger, &mut input);
+            convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_names, &mut input);
         }
 
         let prompt_cache_key = session
@@ -395,14 +411,24 @@ fn append_block_items(
     }
 }
 
-fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
+fn convert_timeline_item(
+    item: WireTimelineItem,
+    tool_names: &std::collections::HashMap<ToolCallId, ToolName>,
+    out: &mut Vec<Value>,
+) {
     match item {
         WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
         WireTimelineItem::CompactionTrigger => out.push(json!({
             "type": "compaction_trigger",
         })),
-        WireTimelineItem::ToolResult(result) => out.push(convert_tool_result(result)),
-        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(&update)),
+        WireTimelineItem::ToolResult(result) => {
+            let name = tool_names.get(&result.call_id);
+            out.push(convert_tool_result(result, name));
+        }
+        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(
+            &update,
+            tool_names.get(&update.call_id),
+        )),
         WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }
 }
@@ -668,7 +694,7 @@ fn message_phase_wire(phase: MessagePhase) -> &'static str {
     }
 }
 
-fn convert_tool_result(result: ToolResult) -> Value {
+fn convert_tool_result(result: ToolResult, name: Option<&ToolName>) -> Value {
     let output_type = match result.tool_type {
         ToolType::Function => "function_call_output",
         ToolType::Custom => "custom_tool_call_output",
@@ -697,25 +723,28 @@ fn convert_tool_result(result: ToolResult) -> Value {
         }));
         Value::Array(content)
     };
-    json!({
+    let mut item = json!({
         "type": output_type,
         "call_id": result.call_id.as_str(),
         "output": output,
-    })
+    });
+    if let Some(name) = name {
+        item["name"] = json!(name.as_str());
+    }
+    item
 }
 
-/// An update replays as an extra output item for its call; the API accepts
-/// multiple output items per call_id.
-fn convert_tool_update(update: &rho_core::ToolUpdate) -> Value {
-    let output_type = match update.tool_type {
-        ToolType::Function => "function_call_output",
-        ToolType::Custom => "custom_tool_call_output",
-    };
-    json!({
-        "type": output_type,
-        "call_id": update.call_id.as_str(),
+/// Updates are standalone events, not additional replies to a historical call.
+/// They retain their name even when compaction removes the call from the input.
+fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -> Value {
+    let mut item = json!({
+        "type": "function_call_output",
         "output": update.output.as_ref(),
-    })
+    });
+    if let Some(name) = name {
+        item["name"] = json!(name.as_str());
+    }
+    item
 }
 
 fn convert_tool_spec(tool: ToolSpec) -> Value {

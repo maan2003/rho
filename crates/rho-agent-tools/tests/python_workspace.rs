@@ -2,7 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_agent_tools::{PythonTool, SourceWaker, Tool, ToolHaste};
+use rho_agent_tools::{PythonTool, SourceWaker, Tool};
 use rho_core::{ToolCall, ToolType};
 use rho_tool_shell::ShellTools;
 use rho_workspaces::{Repo, View};
@@ -34,7 +34,7 @@ fn main() {
             arguments: "assert Path('value').read_text() == 'workspace'\nPath('value').write_text('python')\nprint(Path.cwd())\nimport os, subprocess\nos.chdir('/')\nassert Path.cwd() == Path('/')".into(),
         }, SourceWaker::new(wake.clone()));
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !matches!(cell.haste(), ToolHaste::Ended { .. }) {
+            while !cell.python_exec().unwrap().quiescent() {
                 wake.notified().await;
             }
         }).await.unwrap();

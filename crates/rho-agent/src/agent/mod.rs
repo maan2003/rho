@@ -396,6 +396,7 @@ impl AgentHandle {
             wait_answers: Vec::new(),
             context_used: replayed.context_used,
             turn: None,
+            latest_python_exec: None,
             total_usage,
             sidecar,
             working: false,
@@ -647,17 +648,17 @@ impl Standing {
     /// Whether the agent is stopped, given the oldest thing the user has
     /// queued.
     ///
-    /// A stop waits on a person, so only user input that arrived after it lifts
-    /// it: `DECISION-stopped-agents-wait-for-a-person`. Derived from the queue
-    /// rather than recorded, because the queue already says it.
-    fn stopped(&self, user_oldest_at: Option<UnixMs>) -> bool {
+    /// A stop waits for fresh input; a user message or peer mail after it lifts
+    /// it: `DECISION-stopped-agents-wait-for-fresh-input`. Derived from the
+    /// queue rather than recorded, because the queue already says it.
+    fn stopped(&self, fresh_input_at: Option<UnixMs>) -> bool {
         match self {
             Self::Nothing | Self::Asked => false,
             // A cancel empties the queues and a failed request had already
             // drained them, so anything dated at or after the stop is somebody
             // typing since. Anything older was already on its way.
             Self::Cancelled { at } | Self::Failed { at, .. } => {
-                !user_oldest_at.is_some_and(|oldest| oldest >= *at)
+                !fresh_input_at.is_some_and(|oldest| oldest >= *at)
             }
         }
     }
@@ -674,6 +675,19 @@ pub(crate) enum ToolCallAnswer {
     Sent,
 }
 
+fn validate_tool_calls(
+    mode: Option<rho_agent_tools::CodeMode>,
+    calls: &[ToolCall],
+) -> Result<(), &'static str> {
+    if mode == Some(rho_agent_tools::CodeMode::Python)
+        && (calls.len() > 1 || calls.iter().any(|call| call.name.as_str() != "exec"))
+    {
+        Err("Python mode permits at most one exec call per model response; no calls were executed")
+    } else {
+        Ok(())
+    }
+}
+
 /// The core's bookkeeping for one call: which tool, how much of its story the
 /// model has, and since when it has been holding something. The output itself
 /// lives in the session, which is asked for it at every boundary.
@@ -687,18 +701,24 @@ struct RunningTool {
 
 impl RunningTool {
     fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
-        self.session
-            .sources()
-            .into_iter()
-            .map(|(id, haste)| SourceKind::Tool {
-                answer: if self.answered_sources.contains(&id) {
-                    ToolCallAnswer::Sent
-                } else {
-                    ToolCallAnswer::Owed
+        self.session.sources().into_iter().map(|(id, facts)| {
+            let answer = if self.answered_sources.contains(&id) {
+                ToolCallAnswer::Sent
+            } else {
+                ToolCallAnswer::Owed
+            };
+            match facts {
+                rho_agent_tools::SourceFacts::Tool(haste) => SourceKind::Tool { answer, haste },
+                rho_agent_tools::SourceFacts::PythonExec(facts) => SourceKind::PythonExec {
+                    answer,
+                    facts,
+                    latest: false,
                 },
-                haste,
-                control_only_completion: self.session.control_only_completion(),
-            })
+                rho_agent_tools::SourceFacts::PythonOperation(facts) => {
+                    SourceKind::PythonOperation { answer, facts }
+                }
+            }
+        })
     }
 }
 
@@ -748,6 +768,7 @@ struct Agent {
     /// until it has spoken once — after a restart included, which is safe
     /// because no tool survives one.
     turn: Option<ModelTurn>,
+    latest_python_exec: Option<(ToolCallId, Arc<rho_agent_tools::PythonExec>)>,
     /// Cumulative provider-reported usage across this agent's requests.
     total_usage: AgentUsageBucket,
     sidecar: Sidecar,
@@ -782,14 +803,6 @@ impl Agent {
             // One question per event. Either it says to wait and hands over the
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
-            let patience = self
-                .tools
-                .values_mut()
-                .filter_map(|tool| tool.session.take_patience())
-                .max_by_key(|(sequence, _)| *sequence);
-            if let (Some((_, seconds)), Some(turn)) = (patience, self.turn.as_mut()) {
-                turn.asked = ModelAsked::Wait(Duration::from_secs(seconds));
-            }
             let now = UnixMs::now();
             let deadline = match boundary(&self.sources(), self.turn.as_ref(), &self.phase, now) {
                 Boundary::No { recheck } => recheck,
@@ -858,7 +871,31 @@ impl Agent {
         // What each call is, with nothing decided about it: every one of
         // these is something the tool observed, and what any of them is
         // worth is `boundary`'s business.
-        sources.extend(self.tools.values().flat_map(RunningTool::sources));
+        for tool in self.tools.values() {
+            let latest = self
+                .latest_python_exec
+                .as_ref()
+                .is_some_and(|(id, _)| *id == tool.call.id);
+            sources.extend(tool.sources().map(|source| match source {
+                SourceKind::PythonExec { answer, facts, .. } => SourceKind::PythonExec {
+                    answer,
+                    facts,
+                    latest,
+                },
+                other => other,
+            }));
+        }
+        // A quiet completed exec may leave the transcript session, but its
+        // patience remains authoritative for this model turn.
+        if let Some((id, exec)) = &self.latest_python_exec
+            && !self.tools.contains_key(id)
+        {
+            sources.push(SourceKind::PythonExec {
+                answer: ToolCallAnswer::Sent,
+                facts: exec.facts(),
+                latest: true,
+            });
+        }
         sources
     }
 
@@ -1242,9 +1279,6 @@ impl Agent {
     // -- acting on it -------------------------------------------------------
 
     async fn start_request(&mut self, now: UnixMs) {
-        for tool in self.tools.values_mut() {
-            tool.session.close_patience();
-        }
         // Tools and instructions come from the workdirs, which are only
         // opened now: a load never fails on them, a turn may.
         let surface = match self.surface.get().await {
@@ -1498,6 +1532,14 @@ impl Agent {
                 _ => None,
             })
             .collect();
+        if let Err(error) = validate_tool_calls(
+            self.surface.get_if_ready().and_then(|s| s.code_mode),
+            &calls,
+        ) {
+            self.fail(now, PendingInferenceResponse::default(), error.into())
+                .await;
+            return;
+        }
         let final_text = calls.is_empty().then(|| final_answer_text(&items));
 
         let block = ContextBlock::InferenceResponse {
@@ -1555,6 +1597,7 @@ impl Agent {
         // A turn that issues no calls buys no further look-in: whatever is
         // still running speaks for itself. A `wait` among the calls names the
         // interval instead.
+        self.latest_python_exec = None;
         self.turn = Some(ModelTurn {
             spoke_at: now,
             asked: asked_of(&calls),
@@ -1632,8 +1675,9 @@ impl Agent {
         }
 
         impl ToolSession for BornExited {
-            fn haste(&self) -> ToolHaste {
-                ToolHaste::Ended { at: self.at }
+            fn sources(&self) -> Vec<(u64, rho_agent_tools::SourceFacts)> {
+                let haste = ToolHaste::Ended { at: self.at };
+                vec![(0, rho_agent_tools::SourceFacts::Tool(haste))]
             }
             fn done(&self) -> bool {
                 true
@@ -1666,6 +1710,9 @@ impl Agent {
                 at: now,
             }),
         };
+        if let Some(exec) = session.python_exec() {
+            self.latest_python_exec = Some((call.id.clone(), exec));
+        }
         self.tools.insert(
             call.id.clone(),
             RunningTool {

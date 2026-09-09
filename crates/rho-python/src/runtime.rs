@@ -10,7 +10,7 @@ use crate::{CellId, Event, Input, MAX_MESSAGE_BYTES};
 
 pub(super) fn spawn(
     input: mpsc::Receiver<Input>,
-    events: tokio::sync::mpsc::Sender<Event>,
+    executions: crate::Executions,
     cancelled: Arc<Mutex<HashSet<CellId>>>,
     shutdown: Arc<AtomicBool>,
     space: Arc<tokio::sync::Notify>,
@@ -22,7 +22,7 @@ pub(super) fn spawn(
         .name("rho-python".into())
         .stack_size(16 * 1024 * 1024)
         .spawn(move || {
-            let ended = events.clone();
+            let ended = Arc::clone(&executions);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Filesystem state (not the process or descriptor table) is private
                 // to this dedicated thread. Python chdir must not move the daemon
@@ -51,7 +51,7 @@ pub(super) fn spawn(
                     .build();
                 interpreter.enter(|vm| -> Result<(), String> {
                     let scope = vm.new_scope_with_builtins();
-                    let ev = events.clone();
+                    let execs = Arc::clone(&executions);
                     let emit = vm.new_function(
                         "_emit",
                         move |encoded: String, vm: &VirtualMachine| -> PyResult<()> {
@@ -61,8 +61,27 @@ pub(super) fn spawn(
                             let event = serde_json::from_str(&encoded).map_err(|e| {
                                 vm.new_value_error(format!("invalid runtime event: {e}"))
                             })?;
-                            ev.blocking_send(event)
-                                .map_err(|_| vm.new_runtime_error("Python host disconnected"))
+                            let cell = match &event {
+                                Event::Started { cell }
+                                | Event::Returned { cell, .. }
+                                | Event::Call { cell, .. }
+                                | Event::Text { cell, .. }
+                                | Event::Patience { cell, .. }
+                                | Event::Finished { cell, .. } => *cell,
+                                Event::Stopped { .. } => {
+                                    return Err(vm.new_value_error("invalid execution event"));
+                                }
+                            };
+                            let finished = matches!(event, Event::Finished { .. });
+                            let exec =
+                                execs.lock().unwrap().get(&cell).cloned().ok_or_else(|| {
+                                    vm.new_runtime_error("execution no longer exists")
+                                })?;
+                            exec.event(event);
+                            if finished {
+                                execs.lock().unwrap().remove(&cell);
+                            }
+                            Ok(())
                         },
                     );
                     let inbox = Mutex::new(input);
@@ -143,7 +162,12 @@ pub(super) fn spawn(
                 .clone()
                 .unwrap_or_else(|| "Python runtime stopped during startup".into())));
             space.notify_waiters();
-            let _ = ended.blocking_send(Event::Stopped { error });
+            let execs = std::mem::take(&mut *ended.lock().unwrap());
+            for exec in execs.into_values() {
+                exec.event(Event::Stopped {
+                    error: error.clone(),
+                });
+            }
         })
         .map_err(|e| e.to_string())?;
     ready_rx

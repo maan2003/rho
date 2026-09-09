@@ -12,9 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::{
-    Finished, FutureTool, SourceWaker, Tool, ToolHaste, ToolSession, output, stands_on_its_own,
-};
+use crate::{Finished, FutureTool, SourceWaker, Tool, ToolSession, output, stands_on_its_own};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
@@ -24,35 +22,38 @@ pub struct PythonTool {
     shared: Arc<Shared>,
     next_cell: AtomicU64,
     spec: ToolSpec,
-    driver: tokio::task::JoinHandle<()>,
+    runtime: tokio::runtime::Handle,
 }
 struct Shared {
     shell: ShellTools,
     others: HashMap<String, Arc<dyn FutureTool>>,
-    cells: Mutex<HashMap<u64, Arc<Mutex<Cell>>>>,
+    cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
     jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
     sequence: AtomicU64,
     images: Mutex<BTreeMap<u64, rho_core::ImageContent>>,
 }
-struct Cell {
+struct ExecState {
     waker: SourceWaker,
     output: BoundedOutput,
     since: Option<UnixMs>,
     important: Option<UnixMs>,
     finished: Option<UnixMs>,
+    started: bool,
+    returned: Option<UnixMs>,
+    returned_error: Option<String>,
+    completion: Option<crate::PythonCompletion>,
+    operations: Vec<Arc<Mutex<Operation>>>,
+    dispatched: bool,
     error: bool,
     delivered: bool,
     meaningful: bool,
-    patience: Option<(u64, u64)>,
-    patience_open: bool,
-    patience_set: bool,
+    patience: Option<u64>,
     jobs: Vec<Arc<Job>>,
     pending: usize,
     cancelled: tokio::sync::watch::Sender<bool>,
-    last_completion: UnixMs,
     images: Vec<rho_core::ImageContent>,
 }
-impl Cell {
+impl ExecState {
     fn say(&mut self, text: &str, important: bool) {
         self.write(text, important);
         self.output.push(b"\n");
@@ -74,6 +75,10 @@ impl Cell {
                 .iter()
                 .all(|j| j.state.lock().unwrap().finished.is_some())
     }
+}
+struct Operation {
+    id: u64,
+    finished: Option<UnixMs>,
 }
 struct Job {
     id: u64,
@@ -212,101 +217,11 @@ Available tools:
         });
         let shell = shared.shell.clone();
         let runtime = tokio::runtime::Handle::current();
-        let (session, mut events) = Session::new(move || {
-            // Session runs setup only on its dedicated CLONE_FS-unshared thread.
-            unsafe { runtime.block_on(shell.enter_interpreter_thread()) }
+        let setup_runtime = runtime.clone();
+        let session = Session::new(move || {
+            unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
                 .map_err(|error| error.to_string())
         })?;
-        let weak = Arc::downgrade(&shared);
-        let sender = session.sender();
-        let driver = tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                let Some(shared) = weak.upgrade() else { break };
-                match event {
-                    Event::Call {
-                        cell,
-                        request,
-                        name,
-                        arguments,
-                    } => {
-                        let link = shared
-                            .cells
-                            .lock()
-                            .unwrap()
-                            .get(&cell)
-                            .cloned()
-                            .filter(|link| !*link.lock().unwrap().cancelled.borrow());
-                        if let Some(link) = link {
-                            register_call(&shared, &sender, request, name, arguments, link);
-                        } else {
-                            let sender = sender.clone();
-                            tokio::spawn(async move {
-                                resolve(
-                                    &sender,
-                                    request,
-                                    Err("Originating cell no longer exists".into()),
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    Event::Text {
-                        cell,
-                        text,
-                        important,
-                        ..
-                    } => {
-                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
-                            link.lock().unwrap().write(&text, important);
-                        }
-                    }
-                    Event::Patience { cell, seconds } => {
-                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
-                            let mut link = link.lock().unwrap();
-                            if link.patience_open
-                                && !*link.cancelled.borrow()
-                                && (1..=3600).contains(&seconds)
-                            {
-                                link.patience = Some((
-                                    shared.sequence.fetch_add(1, Ordering::Relaxed),
-                                    seconds,
-                                ));
-                                link.patience_set = true;
-                                link.waker.wake();
-                            } else {
-                                link.say(
-                                    "set_patience ignored: its originating model turn has ended",
-                                    true,
-                                );
-                            }
-                        }
-                    }
-                    Event::Finished { cell, error } => {
-                        if let Some(link) = shared.cells.lock().unwrap().get(&cell) {
-                            let mut link = link.lock().unwrap();
-                            if let Some(error) = error {
-                                link.error = true;
-                                link.say(&error, true);
-                            }
-                            link.finished = Some(UnixMs::now());
-                            link.waker.wake();
-                        }
-                    }
-                    Event::Stopped { error } => {
-                        for link in shared.cells.lock().unwrap().values() {
-                            let mut link = link.lock().unwrap();
-                            link.error = true;
-                            link.say(error.as_deref().unwrap_or("Python runtime stopped"), true);
-                            link.finished = Some(UnixMs::now());
-                            link.cancelled.send_replace(true);
-                            for job in &link.jobs {
-                                job.cancel.notify_one();
-                            }
-                        }
-                    }
-                }
-            }
-        });
         Ok(Self {
             session,
             shared,
@@ -318,17 +233,15 @@ Available tools:
                 input_schema: Value::Null,
                 format: Some(rho_core::ToolFormat::Text),
             },
-            driver,
+            runtime,
         })
     }
 }
 impl Drop for PythonTool {
     fn drop(&mut self) {
-        self.driver.abort();
         for cell in self.shared.cells.lock().unwrap().values() {
             let mut cell = cell.lock().unwrap();
             cell.cancelled.send_replace(true);
-            cell.finished = Some(UnixMs::now());
             cell.say("Python notebook closed", true);
         }
         for job in self.shared.jobs.lock().unwrap().values() {
@@ -342,22 +255,25 @@ impl Tool for PythonTool {
     }
     fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession> {
         let cell = self.next_cell.fetch_add(1, Ordering::Relaxed);
-        let link = Arc::new(Mutex::new(Cell {
+        let link = Arc::new(Mutex::new(ExecState {
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
             since: None,
             important: None,
             finished: None,
+            started: false,
+            returned: None,
+            returned_error: None,
+            completion: None,
+            operations: Vec::new(),
+            dispatched: false,
             error: false,
             delivered: false,
             meaningful: false,
             patience: None,
-            patience_open: true,
-            patience_set: false,
             jobs: Vec::new(),
             pending: 0,
             cancelled: tokio::sync::watch::channel(false).0,
-            last_completion: UnixMs::now(),
             images: Vec::new(),
         }));
         self.shared
@@ -365,19 +281,22 @@ impl Tool for PythonTool {
             .lock()
             .unwrap()
             .insert(cell, Arc::clone(&link));
-        if let Err(error) = self.session.sender().send(Input::Execute {
-            cell,
-            source: call.arguments,
-        }) {
-            self.shared.cells.lock().unwrap().remove(&cell);
-            return Box::new(Finished::error(error));
-        }
-        Box::new(PythonCell {
+        let exec = Arc::new(PythonExec {
             cell,
             link,
             shared: Arc::clone(&self.shared),
             sender: self.session.sender(),
-        })
+            runtime: self.runtime.clone(),
+        });
+        if let Err(error) = self
+            .session
+            .sender()
+            .execute(cell, call.arguments, exec.clone())
+        {
+            self.shared.cells.lock().unwrap().remove(&cell);
+            return Box::new(Finished::error(error));
+        }
+        Box::new(PythonCell(exec))
     }
 }
 async fn resolve(sender: &Sender, request: u64, result: Result<Value, String>) {
@@ -411,7 +330,8 @@ fn register_call(
     request: u64,
     name: String,
     args: Value,
-    link: Arc<Mutex<Cell>>,
+    link: Arc<Mutex<ExecState>>,
+    runtime: &tokio::runtime::Handle,
 ) {
     // Publish command handles synchronously: write_stdin in the same cell can
     // refer to a command whose process has not started yet.
@@ -455,17 +375,27 @@ fn register_call(
     } else {
         Ok(None)
     };
+    let operation = (name != "command").then(|| {
+        Arc::new(Mutex::new(Operation {
+            id: request,
+            finished: None,
+        }))
+    });
     {
         let mut cell = link.lock().unwrap();
+        cell.dispatched = true;
+        if let Some(operation) = &operation {
+            cell.operations.push(operation.clone());
+        }
+        cell.waker.wake();
         cell.pending += 1;
-        cell.meaningful = true;
         if let Ok(Some(job)) = &job {
             cell.jobs.push(Arc::clone(job));
         }
     }
     let shared = Arc::clone(shared);
     let sender = sender.clone();
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let mut cancelled = link.lock().unwrap().cancelled.subscribe();
         let work = async {
             match &job {
@@ -492,8 +422,10 @@ fn register_call(
         }
         {
             let mut cell = link.lock().unwrap();
+            if let Some(operation) = operation {
+                operation.lock().unwrap().finished = Some(UnixMs::now());
+            }
             cell.pending -= 1;
-            cell.last_completion = UnixMs::now();
             cell.waker.wake();
         }
         resolve(&sender, request, result).await;
@@ -504,7 +436,7 @@ async fn run_command(
     shell: &ShellTools,
     job: &Job,
     args: &Value,
-    link: &Arc<Mutex<Cell>>,
+    link: &Arc<Mutex<ExecState>>,
 ) -> Result<Value, String> {
     let work = async {
         let cmd = args["cmd"].as_str().ok_or("command requires cmd")?;
@@ -556,7 +488,7 @@ async fn host_call(
     shared: &Shared,
     name: &str,
     args: Value,
-    link: &Arc<Mutex<Cell>>,
+    link: &Arc<Mutex<ExecState>>,
 ) -> Result<Value, String> {
     if name == "image" {
         let id = args["id"].as_u64().ok_or("Expected an image reference")?;
@@ -684,11 +616,129 @@ async fn host_call(
             .unwrap_or_else(|_| Value::String((*result.output).clone())))
     }
 }
-struct PythonCell {
+pub struct PythonExec {
     cell: u64,
-    link: Arc<Mutex<Cell>>,
+    link: Arc<Mutex<ExecState>>,
     shared: Arc<Shared>,
     sender: Sender,
+    runtime: tokio::runtime::Handle,
+}
+impl PythonExec {
+    /// All Python activity and host operations have stopped; output may still
+    /// need draining. Distinct from the submitted code's return.
+    pub fn quiescent(&self) -> bool {
+        self.link.lock().unwrap().closed()
+    }
+
+    pub fn facts(&self) -> crate::PythonExecFacts {
+        let state = self.link.lock().unwrap();
+        crate::PythonExecFacts {
+            started: state.started,
+            returned: state.returned,
+            completion: state.completion,
+            output: crate::PythonOutput {
+                since: state.since,
+                notification: state.important,
+            },
+            patience: state.patience.map(std::time::Duration::from_secs),
+        }
+    }
+}
+struct PythonCell(Arc<PythonExec>);
+impl std::ops::Deref for PythonCell {
+    type Target = PythonExec;
+    fn deref(&self) -> &PythonExec {
+        &self.0
+    }
+}
+impl rho_python::Execution for PythonExec {
+    fn event(&self, event: Event) {
+        match event {
+            Event::Call {
+                request,
+                name,
+                arguments,
+                ..
+            } => {
+                if *self.link.lock().unwrap().cancelled.borrow() {
+                    let sender = self.sender.clone();
+                    self.runtime.spawn(async move {
+                        resolve(&sender, request, Err("Execution cancelled".into())).await;
+                    });
+                } else {
+                    register_call(
+                        &self.shared,
+                        &self.sender,
+                        request,
+                        name,
+                        arguments,
+                        self.link.clone(),
+                        &self.runtime,
+                    );
+                }
+            }
+            Event::Started { .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.started = true;
+                state.waker.wake();
+            }
+            Event::Returned { error, .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.returned = Some(UnixMs::now());
+                if let Some(error) = &error {
+                    state.error = true;
+                    state.say(error, true);
+                }
+                state.completion = Some(crate::PythonCompletion {
+                    at: state.returned.unwrap(),
+                    failed: error.is_some(),
+                    produced_output: state.meaningful,
+                    dispatched: state.dispatched,
+                    set_patience: state.patience.is_some(),
+                });
+                state.returned_error = error;
+                state.waker.wake();
+            }
+            Event::Text {
+                text, important, ..
+            } => self.link.lock().unwrap().write(&text, important),
+            Event::Patience { seconds, .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.patience = Some(seconds);
+                state.waker.wake();
+            }
+            Event::Finished { error, .. } => {
+                let mut state = self.link.lock().unwrap();
+                if let Some(error) = error {
+                    let error = state
+                        .returned_error
+                        .as_ref()
+                        .and_then(|root| error.strip_prefix(root))
+                        .unwrap_or(&error)
+                        .trim_start_matches('\n')
+                        .to_owned();
+                    if !error.is_empty() {
+                        state.error = true;
+                        state.say(&error, true);
+                    }
+                }
+                state.finished = Some(UnixMs::now());
+                if state.returned.is_none() {
+                    state.returned = state.finished;
+                }
+                state.waker.wake();
+            }
+            Event::Stopped { error } => {
+                let mut state = self.link.lock().unwrap();
+                state.error = true;
+                state.say(error.as_deref().unwrap_or("Python runtime stopped"), true);
+                state.finished = Some(UnixMs::now());
+                state.returned = state.finished;
+                state.cancelled.send_replace(true);
+                state.waker.wake();
+            }
+        }
+    }
 }
 impl PythonCell {
     fn render(&mut self, first: bool) -> Option<ToolOutput> {
@@ -702,6 +752,9 @@ impl PythonCell {
         }
         cell.since = None;
         cell.important = None;
+        cell.completion = None;
+        cell.operations
+            .retain(|op| op.lock().unwrap().finished.is_none());
         cell.jobs.retain(|job| {
             let mut state = job.state.lock().unwrap();
             if !state.unsent.is_empty() {
@@ -764,50 +817,37 @@ impl PythonCell {
     }
 }
 impl ToolSession for PythonCell {
-    fn haste(&self) -> ToolHaste {
-        let cell = self.link.lock().unwrap();
-        if cell.closed() {
-            let at = cell
-                .jobs
-                .iter()
-                .filter_map(|job| {
-                    job.state
-                        .lock()
-                        .unwrap()
-                        .finished
-                        .as_ref()
-                        .map(|(at, _)| *at)
-                })
-                .chain([cell.finished.unwrap(), cell.last_completion])
-                .max()
-                .unwrap();
-            return ToolHaste::Ended { at };
-        }
-        if let Some(since) = cell.important {
-            ToolHaste::Soon { since }
-        } else if let Some(since) = cell.since {
-            ToolHaste::Eventually { since }
-        } else {
-            ToolHaste::None
-        }
-    }
-    fn sources(&self) -> Vec<(u64, ToolHaste)> {
-        let mut sources = vec![(0, self.haste())];
+    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        use crate::{PythonOperationFacts, PythonOutput, SourceFacts};
+        let mut sources = vec![(0, SourceFacts::PythonExec(self.facts()))];
         let cell = self.link.lock().unwrap();
         sources.extend(cell.jobs.iter().map(|job| {
             let state = job.state.lock().unwrap();
-            let haste = if let Some((at, _)) = state.finished {
-                ToolHaste::Ended { at }
-            } else if let Some(since) = state.important {
-                ToolHaste::Soon { since }
-            } else if let Some(since) = state.since {
-                ToolHaste::Eventually { since }
-            } else {
-                ToolHaste::None
-            };
-            (job.id, haste)
+            (
+                job.id,
+                SourceFacts::PythonOperation(PythonOperationFacts {
+                    finished: state.finished.as_ref().map(|(at, _)| *at),
+                    output: PythonOutput {
+                        since: state.since,
+                        notification: state.important,
+                    },
+                }),
+            )
+        }));
+        sources.extend(cell.operations.iter().map(|operation| {
+            let operation = operation.lock().unwrap();
+            (
+                operation.id,
+                SourceFacts::PythonOperation(PythonOperationFacts {
+                    finished: operation.finished,
+                    output: PythonOutput::default(),
+                }),
+            )
         }));
         sources
+    }
+    fn python_exec(&self) -> Option<Arc<PythonExec>> {
+        Some(self.0.clone())
     }
     fn done(&self) -> bool {
         self.link.lock().unwrap().delivered
@@ -824,22 +864,6 @@ impl ToolSession for PythonCell {
         for job in &self.link.lock().unwrap().jobs {
             job.cancel.notify_one();
         }
-    }
-    fn take_patience(&mut self) -> Option<(u64, u64)> {
-        self.link.lock().unwrap().patience.take()
-    }
-    fn close_patience(&mut self) {
-        let mut cell = self.link.lock().unwrap();
-        cell.patience_open = false;
-        cell.patience = None;
-    }
-    fn control_only_completion(&self) -> bool {
-        let cell = self.link.lock().unwrap();
-        cell.patience_set
-            && !cell.meaningful
-            && cell.jobs.is_empty()
-            && !cell.error
-            && !*cell.cancelled.borrow()
     }
 }
 impl Drop for PythonCell {

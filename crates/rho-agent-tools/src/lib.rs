@@ -18,12 +18,15 @@ use std::sync::{Arc, Mutex};
 
 pub use code_mode::CodeModeTool;
 use futures::future::BoxFuture;
-pub use python::PythonTool;
+pub use python::{PythonExec, PythonTool};
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs};
 use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;
 pub use shell::ShellTool;
-pub use tool::{SourceWaker, Tool, ToolHaste, ToolSession};
+pub use tool::{
+    PythonCompletion, PythonExecFacts, PythonOperationFacts, PythonOutput, SourceFacts,
+    SourceWaker, Tool, ToolHaste, ToolSession,
+};
 
 /// A tool whose whole answer is one future. Usable directly by the model or
 /// from a code-mode script, which is why it is not a [`Tool`] itself.
@@ -106,8 +109,9 @@ impl Finished {
 }
 
 impl ToolSession for Finished {
-    fn haste(&self) -> ToolHaste {
-        ToolHaste::Ended { at: self.at }
+    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        let haste = ToolHaste::Ended { at: self.at };
+        vec![(0, crate::SourceFacts::Tool(haste))]
     }
 
     fn done(&self) -> bool {
@@ -164,11 +168,12 @@ impl OneShot {
 }
 
 impl ToolSession for OneShot {
-    fn haste(&self) -> ToolHaste {
-        match &*self.result.lock().unwrap() {
+    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        let haste = match &*self.result.lock().unwrap() {
             Some((_, at)) => ToolHaste::Ended { at: *at },
             None => ToolHaste::None,
-        }
+        };
+        vec![(0, crate::SourceFacts::Tool(haste))]
     }
 
     fn done(&self) -> bool {

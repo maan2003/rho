@@ -690,6 +690,98 @@ fn serializes_custom_tool_calls_and_results() {
 }
 
 #[test]
+fn exec_updates_are_named_and_unpaired_across_compaction_and_incremental_replay() {
+    let call = inference_response(
+        Some("resp-call"),
+        vec![InferenceResponseItem::ToolCall {
+            provider_specific: provider_specific(
+                "custom_tool_call",
+                json!({
+                    "type": "custom_tool_call", "id": "ctc_exec", "call_id": "call-exec",
+                    "name": "exec", "input": "command('sleep 5')",
+                }),
+            ),
+            id: tool_call_id("call-exec"),
+            name: tool_name("exec"),
+            tool_type: ToolType::Custom,
+            arguments: "command('sleep 5')".to_owned(),
+        }],
+    );
+    let result = Arc::new(ContextBlock::ToolResults {
+        results: vec![ToolResult {
+            call_id: tool_call_id("call-exec"),
+            tool_type: ToolType::Custom,
+            body: ToolOutput {
+                full_output: None,
+                images: Arc::new(Vec::new()),
+                output: Arc::new("Running".to_owned()),
+                status: rho_core::ToolOutputStatus::Success,
+            },
+            started_at: rho_core::UnixMs(1),
+            finished_at: rho_core::UnixMs(2),
+            metadata: None,
+        }],
+    });
+    let update = Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+        call_id: tool_call_id("call-exec"),
+        tool_type: ToolType::Custom,
+        output: Arc::new("Command completed".to_owned()),
+        full_output: None,
+        at: rho_core::UnixMs(3),
+    }));
+    let compact = inference_response(
+        Some("resp-compact"),
+        vec![InferenceResponseItem::Compaction {
+            provider_specific: provider_specific(
+                "compaction",
+                json!({
+                    "type": "compaction", "id": "cmp_exec", "encrypted_content": "sealed",
+                }),
+            ),
+        }],
+    );
+    for model in [
+        ResponsesModel::Test("gpt-test".to_owned()),
+        ResponsesModel::Gpt6Astra,
+    ] {
+        let mut session = test_inference_service("gpt-test");
+        session.config.responses_config.model = model;
+        for compacted in [false, true] {
+            for cached in [None, Some("resp-call")] {
+                let mut blocks = vec![call.clone(), result.clone()];
+                if compacted {
+                    blocks.push(compact.clone());
+                }
+                blocks.push(update.clone());
+                let body = serde_json::to_value(ResponsesRequest::from_inference_request(
+                    &session.config,
+                    inference_request(blocks, Vec::new()),
+                    cached,
+                ))
+                .unwrap();
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(
+                    input.last().unwrap(),
+                    &json!({
+                        "type": "function_call_output", "name": "exec", "output": "Command completed",
+                    })
+                );
+                if compacted {
+                    assert!(input.iter().all(|item| item.get("call_id").is_none()));
+                } else {
+                    let result = input
+                        .iter()
+                        .find(|item| item["type"] == "custom_tool_call_output")
+                        .unwrap();
+                    assert_eq!(result["name"], "exec");
+                    assert_eq!(result["call_id"], "call-exec");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn astra_responses_lite_moves_tools_and_instructions_into_input() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(

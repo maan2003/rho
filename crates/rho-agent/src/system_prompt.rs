@@ -354,7 +354,7 @@ Use the separate `wait` tool when there is nothing else to do.
 
 const CODE_MODE_PROMPT: &str = "## Python Code Mode
 
-`exec` runs a persistent Python notebook with top-level await. Globals are shared;
+`exec` is your only top-level tool. Issue at most one exec call per response.\nIt runs a persistent Python notebook with top-level await. Globals are shared;
 live cells interleave at await. `command`, `write_stdin`, and `tools.NAME` register
 Rust-owned work immediately. Output and completion arrive automatically: no await
 or print is needed to see them. Put independent calls in one exec cell to run them

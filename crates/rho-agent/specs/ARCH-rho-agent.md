@@ -11,7 +11,7 @@ dropped. `AgentHandle` is the only outside view: commands in over an unbounded
 channel, state out as a published `AgentState`.
 
 Everything that produces transcript blocks is a **source**: the user queue, the
-mail queue, each called tool, and each command launched inside Python. Command
+mail queue, each called tool, and each host operation launched inside Python. Command
 sources are independently scheduled and retain their own first-drain state, even
 when their output travels on one shared `exec` call. A source accumulates on its
 own and reports plain facts — when something arrived, whether a call has been answered,
@@ -37,7 +37,7 @@ same principle as a source: `Asked` says somebody asked for a request the source
 would not have made, `Cancelled`/`Failed` say what happened and when, and whether
 either still stops the agent is `boundary`'s reading of them against the user
 queue
-([DECISION-stopped-agents-wait-for-a-person](DECISION-stopped-agents-wait-for-a-person.md)).
+([DECISION-stopped-agents-wait-for-fresh-input](DECISION-stopped-agents-wait-for-fresh-input.md)).
 `boundary` never reads `owed`. Loading an agent is not its own state; it only
 supplies `owed` differently ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
@@ -52,13 +52,14 @@ knows about another, or about the clock.
 Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A
 registry type would have been that map with pass-through methods, so there is
-not one. In direct-tool and JavaScript code modes, `wait` is the one tool the core supplies itself: its argument is the
-interval `boundary` reads and nothing else, so no session is spawned for it and
-the core writes its reply at the next drain. Python cells can instead relay a
-model-authored `set_patience` interval, eligible only until the next request.
-The core closes that eligibility when starting a request and can tell a running
-tool to `cancel`, meaning wind down. It still collects parting output, so a tool
-has the last word
+not one. Direct and JavaScript tools keep their generic urgency facts and core
+`wait` tool. Python exposes one `exec` per model response. Its shared Rust execution
+handle and each host operation report distinct source facts; a provider reply
+does not mean that Python finished. Native callbacks synchronously update the
+handle from the interpreter thread, including its model-authored patience.
+The boundary reads the latest response's execution handle directly; an old
+execution never changes a newer response's interval. The core can cancel work
+and still collects its parting output
 ([DECISION-model-sets-the-pace](DECISION-model-sets-the-pace.md)).
 
 A session hands its output over in two shapes, and the split is in the trait

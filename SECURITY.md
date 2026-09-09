@@ -738,19 +738,22 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   retains its first 8 MiB with explicit overflow counts. At most 64 job records
   are retained, evicting oldest completed, delivered records; temporary files
   disappear with their records. Up to 32 image references are retained.
-- Runtime messages are capped at 1 MiB, input and event queues at 256 entries,
+- Runtime payloads are capped at 1 MiB and the completion/input queue at 256 entries,
   live cells at 128, and pending host requests and registered tasks at 1,024 each.
   Reliable asynchronous completion delivery applies backpressure without blocking
-  event draining. These bounds do not cap arbitrary Python allocations.
-- Commands inside Python are independent scheduling sources. Their output remains
+  the interpreter. Python-to-Rust callbacks commit synchronously and have no
+  deferred event consumer. These bounds do not cap arbitrary Python allocations.
+- Commands and internal tool calls inside Python are independent scheduling sources. Their output remains
   attached to the originating `exec` call; command IDs identify the work, not
   notebook cell IDs. The core tracks each command's first drain separately.
 - `notify` marks meaningful output; `text` and captured stdout/stderr mark
   ordinary progress. Standard streams expose no daemon file descriptors. Both
   become output on the originating call at the core's next request boundary;
   neither starts inference directly. `set_patience` conveys a model-authored
-  one-turn interval, not a Python sleep or a tool-selected timeout. The next
-  request closes old cells' setter eligibility. A quiet successful setter-only
+  one-turn interval, not a Python sleep or a tool-selected timeout. It updates
+  its execution's shared Rust state synchronously. Only the execution from the
+  latest model response controls check-ins; old settings need no mutation or
+  stale-setter warnings. A quiet successful setter-only
   completion is not news that immediately defeats its own interval; failures,
   command completion, and meaningful output retain normal wake/batching rules.
 - Notebook state and live jobs are ephemeral and do not survive restart. The

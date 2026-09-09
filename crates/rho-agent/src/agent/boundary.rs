@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use rho_agent_tools::ToolHaste;
+use rho_agent_tools::{PythonExecFacts, PythonOperationFacts, ToolHaste};
 use rho_core::UnixMs;
 
 use super::{Phase, Standing, ToolCallAnswer};
@@ -44,9 +44,15 @@ pub(crate) enum SourceKind {
     Tool {
         answer: ToolCallAnswer,
         haste: ToolHaste,
-        /// Quiet successful setter completion is not news that defeats its own
-        /// interval.
-        control_only_completion: bool,
+    },
+    PythonExec {
+        answer: ToolCallAnswer,
+        facts: PythonExecFacts,
+        latest: bool,
+    },
+    PythonOperation {
+        answer: ToolCallAnswer,
+        facts: PythonOperationFacts,
     },
 }
 
@@ -183,25 +189,29 @@ pub(crate) fn boundary(
     // Only an idle agent hands the question to its sources; every other phase
     // answers on its own. Exhaustive rather than a run of early returns, because
     // with those the precedence lived in the order they were written.
-    let user_oldest_at = sources.iter().find_map(|source| match source {
-        SourceKind::User { oldest_at, .. } => *oldest_at,
-        SourceKind::Mail { .. } | SourceKind::Tool { .. } => None,
-    });
+    let fresh_input_at = sources
+        .iter()
+        .filter_map(|source| match source {
+            SourceKind::User { oldest_at, .. } => *oldest_at,
+            SourceKind::Mail { newest_at, .. } => *newest_at,
+            _ => None,
+        })
+        .max();
     match phase {
         Phase::Requesting(_) => {
             let interrupt = sources.iter().any(|source| match source {
                 SourceKind::User { interrupt, .. } => *interrupt,
                 // However loud a peer or a tool is, the model finishes what it
                 // is saying.
-                SourceKind::Mail { .. } | SourceKind::Tool { .. } => false,
+                _ => false,
             });
             return match interrupt {
                 true => Boundary::AbortAndResend,
                 false => NEVER,
             };
         }
-        // `DECISION-stopped-agents-wait-for-a-person`.
-        Phase::Idle { standing, .. } if standing.stopped(user_oldest_at) => return NEVER,
+        // `DECISION-stopped-agents-wait-for-fresh-input`.
+        Phase::Idle { standing, .. } if standing.stopped(fresh_input_at) => return NEVER,
         // What the next request owes is not itself a reason to make one, so
         // `owed` is never read here: only `standing` is.
         Phase::Idle {
@@ -241,6 +251,29 @@ pub(crate) fn boundary(
                 Some(until) if until > now => Due::Until(until),
                 _ => Due::Nothing,
             },
+            SourceKind::PythonExec {
+                facts,
+                answer,
+                latest,
+            } => {
+                // The newest execution is pending even if a provider reply was
+                // already sent. Old observed monitors don't delay new results.
+                if facts.returned.is_none() && (*latest || *answer == ToolCallAnswer::Owed) {
+                    Due::UntilItEnds
+                } else {
+                    Due::Nothing
+                }
+            }
+            SourceKind::PythonOperation { answer, facts } => {
+                if facts.finished.is_none()
+                    && facts.output.notification.is_none()
+                    && *answer == ToolCallAnswer::Owed
+                {
+                    Due::UntilItEnds
+                } else {
+                    Due::Nothing
+                }
+            }
             SourceKind::Tool { answer, haste, .. } => match (answer, haste) {
                 // An ended call has nothing left to wait for, nor has one that
                 // says what it holds stands on its own — which is it saying not
@@ -270,9 +303,17 @@ pub(crate) fn boundary(
     // Rule 2. Nothing here asks what is running: the model said whether to look
     // again, and a model that asked for nothing gets a quiet agent rather than
     // one that keeps offering it the same silence.
+    let python_patience = sources.iter().find_map(|source| match source {
+        SourceKind::PythonExec {
+            latest: true,
+            facts,
+            ..
+        } => facts.patience,
+        _ => None,
+    });
     let checkin = turn.and_then(|turn| match turn.asked {
         ModelAsked::Nothing => None,
-        ModelAsked::Calls => Some(turn.spoke_at + DEFAULT_WAIT),
+        ModelAsked::Calls => Some(turn.spoke_at + python_patience.unwrap_or(DEFAULT_WAIT)),
         ModelAsked::Wait(asked) => Some(turn.spoke_at + asked),
     });
 
@@ -283,15 +324,33 @@ pub(crate) fn boundary(
             // send rather than a special case.
             SourceKind::User { oldest_at, .. } => oldest_at.map(|at| at + patience(USER_PATIENCE)),
             SourceKind::Mail { oldest_at, .. } => oldest_at.map(|at| at + patience(MAIL_PATIENCE)),
-            // An ending and a flag are the same kind of news and wait the same.
-            // Both date from the moment they happened, so a tool that ends
-            // after an hour of output gets its siblings' full attention rather
-            // than looking an hour overdue.
-            SourceKind::Tool {
-                haste: ToolHaste::Ended { .. },
-                control_only_completion: true,
-                ..
-            } => None,
+            SourceKind::PythonExec { facts, .. } => facts
+                .output
+                .notification
+                .map(|at| at + patience(TOOL_PATIENCE))
+                .or_else(|| facts.output.since.map(|at| at + PROGRESS_PATIENCE))
+                .into_iter()
+                .chain(
+                    facts
+                        .completion
+                        .filter(|done| {
+                            // Returning after only dispatching work or setting patience
+                            // doesn't itself give the model anything new to act on.
+                            done.failed
+                                || done.produced_output
+                                || (!done.dispatched && !done.set_patience)
+                        })
+                        .map(|done| done.at + patience(TOOL_PATIENCE)),
+                )
+                .min(),
+            SourceKind::PythonOperation { facts, .. } => facts
+                .output
+                .notification
+                .map(|at| at + patience(TOOL_PATIENCE))
+                .or_else(|| facts.output.since.map(|at| at + PROGRESS_PATIENCE))
+                .into_iter()
+                .chain(facts.finished.map(|at| at + patience(TOOL_PATIENCE)))
+                .min(),
             SourceKind::Tool { haste, .. } => match haste {
                 ToolHaste::None => None,
                 // Mid-thought, so nobody asked for it and it is nobody's reason

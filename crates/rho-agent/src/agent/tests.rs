@@ -92,7 +92,6 @@ fn tool(haste: ToolHaste) -> SourceKind {
     SourceKind::Tool {
         answer: ToolCallAnswer::Owed,
         haste,
-        control_only_completion: false,
     }
 }
 
@@ -102,9 +101,8 @@ fn answered(call: SourceKind) -> SourceKind {
         SourceKind::Tool { haste, .. } => SourceKind::Tool {
             answer: ToolCallAnswer::Sent,
             haste,
-            control_only_completion: false,
         },
-        SourceKind::User { .. } | SourceKind::Mail { .. } => panic!("only a call has an answer"),
+        _ => panic!("only a generic call has an answer"),
     }
 }
 
@@ -804,7 +802,7 @@ fn a_cancelled_agent_is_not_woken_by_its_tools_dying_words() {
 //  1       cancel  mail   still held — a peer is not a person
 //  2       cancel  user   SEND
 #[test]
-fn only_a_person_lifts_a_stop() {
+fn fresh_user_or_mail_lifts_a_stop() {
     let stopped = |sources| {
         let mut schedule = ask(sources);
         schedule.phase = Phase::Idle {
@@ -817,8 +815,8 @@ fn only_a_person_lifts_a_stop() {
     assert_eq!(stopped(Vec::new()).recheck(UnixMs(2)), None);
     assert_eq!(
         stopped(vec![pending_mail(1, 1)]).recheck(UnixMs(2)),
-        None,
-        "mail is queued and waits there"
+        Some(UnixMs(1_001)),
+        "fresh mail revives the agent and gets normal burst batching"
     );
     // Input from before the stop is what the stop was about, so it is only
     // input that arrived after it that counts.
@@ -988,10 +986,22 @@ fn a_finished_call_answers_at_once_however_much_is_running_behind_it() {
 
 #[test]
 fn patience_setter_completion_does_not_defeat_its_interval() {
-    let control = SourceKind::Tool {
+    let control = SourceKind::PythonExec {
         answer: ToolCallAnswer::Owed,
-        haste: ToolHaste::Ended { at: UnixMs(1) },
-        control_only_completion: true,
+        latest: true,
+        facts: rho_agent_tools::PythonExecFacts {
+            started: true,
+            returned: Some(UnixMs(1)),
+            completion: Some(rho_agent_tools::PythonCompletion {
+                at: UnixMs(1),
+                failed: false,
+                produced_output: false,
+                dispatched: false,
+                set_patience: true,
+            }),
+            output: Default::default(),
+            patience: Some(Duration::from_secs(300)),
+        },
     };
     let scenario = ask(vec![control.clone()]).waiting(300);
     assert_eq!(scenario.recheck(UnixMs(1)), Some(UnixMs(300_000)));
@@ -1113,7 +1123,14 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         loop {
             let sources = running.session.sources();
             if sources.len() == 3
-                && let Some((_, ToolHaste::Ended { at })) = sources.iter().find(|(id, _)| *id == 1)
+                && let Some((
+                    _,
+                    rho_agent_tools::SourceFacts::PythonOperation(
+                        rho_agent_tools::PythonOperationFacts {
+                            finished: Some(at), ..
+                        },
+                    ),
+                )) = sources.iter().find(|(id, _)| *id == 1)
             {
                 break *at;
             }
@@ -1148,7 +1165,10 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     assert!(!first.output.contains("Python cell"));
     assert!(running.sources().all(|source| matches!(
         source,
-        SourceKind::Tool {
+        SourceKind::PythonExec {
+            answer: ToolCallAnswer::Sent,
+            ..
+        } | SourceKind::PythonOperation {
             answer: ToolCallAnswer::Sent,
             ..
         }
@@ -1159,7 +1179,14 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         loop {
             let sources = running.session.sources();
             if sources.iter().any(|(id, _)| *id == 3)
-                && let Some((_, ToolHaste::Ended { at })) = sources.iter().find(|(id, _)| *id == 2)
+                && let Some((
+                    _,
+                    rho_agent_tools::SourceFacts::PythonOperation(
+                        rho_agent_tools::PythonOperationFacts {
+                            finished: Some(at), ..
+                        },
+                    ),
+                )) = sources.iter().find(|(id, _)| *id == 2)
             {
                 break *at;
             }
@@ -1171,10 +1198,9 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     assert!(
         running.sources().any(|source| matches!(
             source,
-            SourceKind::Tool {
+            SourceKind::PythonOperation {
                 answer: ToolCallAnswer::Owed,
-                haste: ToolHaste::None | ToolHaste::Eventually { .. },
-                ..
+                facts: rho_agent_tools::PythonOperationFacts { finished: None, .. },
             }
         )),
         "a command registered after exec's reply still owes its own first result"
@@ -1191,7 +1217,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     std::fs::write(directory.path().join("finish"), "").unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if matches!(running.session.haste(), ToolHaste::Ended { .. }) {
+            if running.session.python_exec().unwrap().quiescent() {
                 break;
             }
             wake.notified().await;
@@ -1210,4 +1236,128 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     assert_eq!(last.output.matches("Command completed:").count(), 2);
     assert!(!last.output.contains("Python cell"));
     assert!(running.session.done());
+}
+
+#[test]
+fn python_exec_pending_is_not_the_same_as_provider_reply_sent() {
+    let exec = SourceKind::PythonExec {
+        answer: ToolCallAnswer::Sent,
+        latest: true,
+        facts: rho_agent_tools::PythonExecFacts {
+            started: false,
+            returned: None,
+            completion: None,
+            output: Default::default(),
+            patience: None,
+        },
+    };
+    let scenario = ask(vec![exec, ended_call(1_000)]);
+    assert_eq!(scenario.recheck(UnixMs(1_000)), Some(UnixMs(11_000)));
+    assert_eq!(scenario.boundary(UnixMs(11_000)), Boundary::Now);
+}
+
+#[test]
+fn only_current_python_exec_controls_checkin_and_old_monitor_does_not_delay() {
+    let old = SourceKind::PythonExec {
+        answer: ToolCallAnswer::Sent,
+        latest: false,
+        facts: rho_agent_tools::PythonExecFacts {
+            started: true,
+            returned: None,
+            completion: None,
+            output: Default::default(),
+            patience: Some(Duration::from_secs(3600)),
+        },
+    };
+    let current = SourceKind::PythonExec {
+        answer: ToolCallAnswer::Sent,
+        latest: true,
+        facts: rho_agent_tools::PythonExecFacts {
+            started: true,
+            returned: Some(UnixMs(1)),
+            completion: None,
+            output: Default::default(),
+            patience: Some(Duration::from_secs(300)),
+        },
+    };
+    assert_eq!(
+        ask(vec![old.clone(), current.clone()]).recheck(UnixMs(1)),
+        Some(UnixMs(300_000))
+    );
+    assert_eq!(
+        ask(vec![old, current, ended_call(5)]).boundary(UnixMs(5)),
+        Boundary::Now
+    );
+}
+
+#[test]
+fn fresh_mail_revives_failure_but_old_mail_and_tool_completion_do_not() {
+    let mut scenario = ask(vec![pending_mail(10, 10), ended_call(30)]);
+    scenario.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Failed {
+            at: UnixMs(20),
+            error: Arc::from("failed"),
+        },
+    };
+    assert_eq!(
+        scenario.boundary(UnixMs(30)),
+        Boundary::No { recheck: None }
+    );
+    scenario.sources.push(pending_mail(25, 25));
+    assert_ne!(
+        scenario.boundary(UnixMs(30)),
+        Boundary::No { recheck: None }
+    );
+    scenario.sources.clear();
+    assert_eq!(
+        scenario.boundary(UnixMs(2_000)),
+        Boundary::No { recheck: None }
+    );
+}
+
+#[test]
+fn python_accepts_one_exec_or_final_prose_not_multiple_calls() {
+    use rho_agent_tools::CodeMode;
+    let mut exec = call("exec-1");
+    exec.name = ToolName::try_from("exec").unwrap();
+    assert!(validate_tool_calls(Some(CodeMode::Python), &[]).is_ok());
+    assert!(validate_tool_calls(Some(CodeMode::Python), &[exec.clone()]).is_ok());
+    assert!(validate_tool_calls(Some(CodeMode::Python), &[exec.clone(), exec.clone()]).is_err());
+    assert!(validate_tool_calls(Some(CodeMode::Python), &[call("not-exec")]).is_err());
+    assert!(validate_tool_calls(Some(CodeMode::JavaScript), &[exec.clone(), exec]).is_ok());
+    assert!(validate_tool_calls(None, &[call("a"), call("b")]).is_ok());
+}
+
+#[test]
+fn quiet_python_dispatch_does_not_bypass_operation_batching_when_output_arrives() {
+    let exec = SourceKind::PythonExec {
+        answer: ToolCallAnswer::Owed,
+        latest: true,
+        facts: rho_agent_tools::PythonExecFacts {
+            started: true,
+            returned: Some(UnixMs(1)),
+            completion: Some(rho_agent_tools::PythonCompletion {
+                at: UnixMs(1),
+                failed: false,
+                produced_output: false,
+                dispatched: true,
+                set_patience: false,
+            }),
+            output: rho_agent_tools::PythonOutput {
+                since: Some(UnixMs(30_000)),
+                notification: None,
+            },
+            patience: None,
+        },
+    };
+    let operation = |finished| SourceKind::PythonOperation {
+        answer: ToolCallAnswer::Owed,
+        facts: rho_agent_tools::PythonOperationFacts {
+            finished,
+            output: Default::default(),
+        },
+    };
+    let scenario = ask(vec![exec, operation(Some(UnixMs(30_000))), operation(None)]);
+    assert_eq!(scenario.recheck(UnixMs(30_000)), Some(UnixMs(40_000)));
 }

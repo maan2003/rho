@@ -9,8 +9,8 @@
 //! at that moment in whatever shape it judges best.
 //! `DECISION-pull-based-sources`.
 //!
-//! The core can cancel work and close turn-local patience eligibility. Output
-//! and model-authored patience requests flow from the tool to the core.
+//! The core can cancel work. Python callbacks update shared execution facts
+//! synchronously; the boundary reads patience from the latest execution.
 
 use std::sync::Arc;
 
@@ -51,6 +51,40 @@ pub enum ToolHaste {
     Ended { at: UnixMs },
 }
 
+/// Python reports execution and output facts, not generic tool urgency.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PythonOutput {
+    pub since: Option<UnixMs>,
+    pub notification: Option<UnixMs>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PythonCompletion {
+    pub at: UnixMs,
+    pub failed: bool,
+    pub produced_output: bool,
+    pub dispatched: bool,
+    pub set_patience: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PythonExecFacts {
+    pub started: bool,
+    pub returned: Option<UnixMs>,
+    pub completion: Option<PythonCompletion>,
+    pub output: PythonOutput,
+    pub patience: Option<std::time::Duration>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PythonOperationFacts {
+    pub finished: Option<UnixMs>,
+    pub output: PythonOutput,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceFacts {
+    Tool(ToolHaste),
+    PythonExec(PythonExecFacts),
+    PythonOperation(PythonOperationFacts),
+}
+
 /// Tell the core that something changed.
 ///
 /// Deliberately carries no payload: what changed is discovered by asking, at a
@@ -82,33 +116,13 @@ impl SourceWaker {
 /// `REQ-provider-transcript-protocol`. The split is here rather than left to
 /// the core to sort out, so the required one cannot be missing.
 pub trait ToolSession: Send {
-    /// How much of a hurry whatever it is holding is in.
-    ///
-    /// Read only by the decision that picks the next request boundary. It never
-    /// governs what is collected — every call is asked for its one result, and
-    /// every answered call is asked for updates, whatever this says.
-    fn haste(&self) -> ToolHaste;
+    /// Independently scheduled sources. IDs are stable and never reused within
+    /// an invocation; the core tracks their drains separately from protocol
+    /// replies.
+    fn sources(&self) -> Vec<(u64, SourceFacts)>;
 
-    /// Independently scheduled sources within this invocation. IDs are stable
-    /// and never reused within the session. The core tracks whether each source
-    /// has been drained, separately from the provider's one reply per tool
-    /// call. Ordinary tools have one source; notebooks also expose each
-    /// command.
-    fn sources(&self) -> Vec<(u64, ToolHaste)> {
-        vec![(0, self.haste())]
-    }
-
-    /// Turn-local idle request: (session sequence, seconds).
-    fn take_patience(&mut self) -> Option<(u64, u64)> {
+    fn python_exec(&self) -> Option<Arc<crate::PythonExec>> {
         None
-    }
-
-    /// A new model request closes this cell’s ability to set patience.
-    fn close_patience(&mut self) {}
-
-    /// Successful quiet completion of a cell that only set patience.
-    fn control_only_completion(&self) -> bool {
-        false
     }
 
     /// Whether the core can forget this call: nothing left to say, ever.

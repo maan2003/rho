@@ -381,23 +381,26 @@ than by running a supervisor, extension protocol, or daemon process graph.
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
 - `rho-python` owns an in-process RustPython notebook on one dedicated thread.
-  Only serializable cell, host-call, output, and completion messages cross its
-  boundary; interpreter objects never leave that thread. This keeps a future
-  worker process independent of agent policy. The notebook shares globals and
-  runs live top-level-await cells on the standard asyncio selector loop. Rust
-  messages wake that loop through an eventfd; task and callback contexts retain
-  cell attribution. Ordinary filesystem Python
-  runs on a thread with private cwd state inside the agent’s workspace mount
-  view; this is path mapping, not a Python sandbox.
-- `rho-agent-tools` adapts that notebook to the model-facing `exec` source. It
-  owns commands and their retained output independently of Python handles or
-  cell evaluation, dispatches authorized nested tools, and reports independent
-  source facts for every command. Sharing an `exec` transcript call does not merge
-  command scheduling or first-drain state.
-  The core alone decides request boundaries, including one-turn model patience.
-  Both Python and JavaScript/V8 (`rho-code-mode`) remain selectable runtimes.
-  `eng-high` and `advisor-high` default to Python; other code-mode roles use JavaScript.
-  JavaScript keeps the core `wait` tool; Python uses `set_patience` in `exec`.
+  Each submitted execution carries a shared Rust host handle. Registration,
+  output, execution lifecycle, and patience callbacks update that handle
+  synchronously before Python continues; no Python object crosses threads.
+  Async host completions wake the interpreter through eventfd and resolve its
+  futures on the interpreter thread. Shared globals and ordinary asyncio remain.
+  Python runs with private cwd state inside the agent's workspace mount view;
+  this is path mapping, not a sandbox.
+- `rho-agent-tools` owns each `PythonExec` and its independently registered host
+  operations. The submitted code returning, remaining Python activity stopping,
+  operations finishing, and transcript delivery are separate facts. Async task
+  and callback tracking exists for attribution and cleanup, not wake policy.
+  `rho-agent`'s boundary consumes explicit `PythonExec` and `PythonOperation`
+  sources, without adapting them into generic tool urgency. It reads patience
+  directly from the latest response's execution handle, retained even after a
+  quiet completed transcript session is reaped. Older executions retain their
+  own settings but do not set the new response's pace.
+  Python exposes only `exec` and accepts at most one call per model response.
+  Both Python and JavaScript/V8 (`rho-code-mode`) remain available: `eng-high`
+  and `advisor-high` use Python; other code-mode roles use JavaScript. Generic
+  tool scheduling and JavaScript's core `wait` remain separate from Python facts.
   Direct tools are unchanged when code mode is disabled.
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to

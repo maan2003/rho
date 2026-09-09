@@ -418,15 +418,18 @@ async fn follow(
 }
 
 impl ToolSession for ExecSession {
-    fn haste(&self) -> ToolHaste {
-        let state = self.state.lock().unwrap();
-        match (state.closed_at, state.soon_since) {
-            (Some(at), _) => ToolHaste::Ended { at },
-            (None, Some(since)) => ToolHaste::Soon { since },
-            // Output from a command still running is not news until the
-            // command ends or the model looks in.
-            (None, None) => ToolHaste::None,
-        }
+    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        let haste = {
+            let state = self.state.lock().unwrap();
+            match (state.closed_at, state.soon_since) {
+                (Some(at), _) => ToolHaste::Ended { at },
+                (None, Some(since)) => ToolHaste::Soon { since },
+                // Output from a command still running is not news until the
+                // command ends or the model looks in.
+                (None, None) => ToolHaste::None,
+            }
+        };
+        vec![(0, crate::SourceFacts::Tool(haste))]
     }
 
     fn done(&self) -> bool {

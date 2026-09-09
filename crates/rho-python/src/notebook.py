@@ -226,10 +226,17 @@ def _execute(cell, source):
     context = contextvars.copy_context()
     context.run(_cell.set, cell)
     async def evaluate():
-        code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        result = eval(code, _namespace)
-        if isinstance(result, types.CoroutineType):
-            await result
+        _send('started', cell=cell)
+        try:
+            code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+            result = eval(code, _namespace)
+            if isinstance(result, types.CoroutineType):
+                await result
+        except BaseException as exc:
+            _send('returned', cell=cell, error=_format_error(exc))
+            raise
+        else:
+            _send('returned', cell=cell, error=None)
     try:
         _cells[cell]['root'] = _loop.create_task(evaluate(), context=context)
     except BaseException as exc:

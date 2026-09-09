@@ -73,7 +73,7 @@ and `owed` survives every move:
 - fresh user input takes the agent back out of a stop without settling anything
   and without being written down: `Standing::stopped` compares the instant of the
   stop with the oldest thing the user has queued
-  ([DECISION-stopped-agents-wait-for-a-person](DECISION-stopped-agents-wait-for-a-person.md));
+  ([DECISION-stopped-agents-wait-for-fresh-input](DECISION-stopped-agents-wait-for-fresh-input.md));
 - a retry gives `Standing::Asked`, hurrying the request rather than changing what
   has to be in it.
 

@@ -297,32 +297,36 @@ impl CellSession {
 }
 
 impl ToolSession for CellSession {
-    fn haste(&self) -> ToolHaste {
-        if self.handle.outcome() != CellOutcome::Running {
-            let at = self
-                .link
-                .ended_at
-                .lock()
-                .unwrap()
-                .unwrap_or_else(UnixMs::now);
-            return ToolHaste::Ended { at };
-        }
-        let soon = *self.link.soon_since.lock().unwrap();
-        if soon.is_some() || self.handle.yield_requested() {
-            return ToolHaste::Soon {
-                since: soon.unwrap_or_else(UnixMs::now),
-            };
-        }
-        if self.handle.has_new_output() {
-            let since = *self
-                .link
-                .output_since
-                .lock()
-                .unwrap()
-                .get_or_insert_with(UnixMs::now);
-            return ToolHaste::Eventually { since };
-        }
-        ToolHaste::None
+    fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
+        let haste = if self.handle.outcome() != CellOutcome::Running {
+            ToolHaste::Ended {
+                at: self
+                    .link
+                    .ended_at
+                    .lock()
+                    .unwrap()
+                    .unwrap_or_else(UnixMs::now),
+            }
+        } else {
+            let soon = *self.link.soon_since.lock().unwrap();
+            if soon.is_some() || self.handle.yield_requested() {
+                ToolHaste::Soon {
+                    since: soon.unwrap_or_else(UnixMs::now),
+                }
+            } else if self.handle.has_new_output() {
+                ToolHaste::Eventually {
+                    since: *self
+                        .link
+                        .output_since
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(UnixMs::now),
+                }
+            } else {
+                ToolHaste::None
+            }
+        };
+        vec![(0, crate::SourceFacts::Tool(haste))]
     }
 
     fn done(&self) -> bool {

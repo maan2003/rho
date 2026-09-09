@@ -95,7 +95,7 @@ async fn until(
 ) -> ToolHaste {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let haste = session.haste();
+        let haste = test_haste(session);
         if want(haste) {
             return haste;
         }
@@ -104,6 +104,30 @@ async fn until(
             "timed out at {haste:?}"
         );
         let _ = tokio::time::timeout(Duration::from_millis(200), wake.notified()).await;
+    }
+}
+
+// Legacy test predicates; production Python reports only Python-specific facts.
+fn test_haste(session: &dyn ToolSession) -> ToolHaste {
+    if let Some(exec) = session.python_exec() {
+        let quiescent = exec.quiescent();
+        let facts = exec.facts();
+        if quiescent {
+            return ToolHaste::Ended {
+                at: facts.returned.unwrap(),
+            };
+        }
+        if let Some(since) = facts.output.notification {
+            return ToolHaste::Soon { since };
+        }
+        return facts
+            .output
+            .since
+            .map_or(ToolHaste::None, |since| ToolHaste::Eventually { since });
+    }
+    match session.sources()[0].1 {
+        crate::SourceFacts::Tool(haste) => haste,
+        _ => unreachable!(),
     }
 }
 
@@ -123,7 +147,11 @@ async fn a_finished_command_is_answered_whole() {
         ),
         SourceWaker::new(Arc::clone(&wake)),
     );
-    assert_eq!(session.haste(), ToolHaste::None, "silent until it ends");
+    assert_eq!(
+        test_haste(&*session),
+        ToolHaste::None,
+        "silent until it ends"
+    );
     until(&wake, &*session, ended).await;
     let output = session.first_output();
     assert!(
@@ -311,7 +339,7 @@ async fn a_script_notify_is_urgent_and_its_end_arrives_as_an_update() {
         first.output
     );
     assert!(first.output.contains("halfway"), "{}", first.output);
-    assert_eq!(session.haste(), ToolHaste::None, "drained");
+    assert_eq!(test_haste(&*session), ToolHaste::None, "drained");
 
     until(&wake, &*session, ended).await;
     let update = session.more_output().unwrap();
@@ -398,7 +426,6 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     .await;
     assert!(monitor.first_output().output.contains("monitor started"));
     assert!(!monitor.done());
-    monitor.close_patience();
 
     let mut inspect = tools[0].run(
         call(
@@ -419,10 +446,19 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*idle, ended).await;
-    assert_eq!(idle.take_patience().unwrap().1, 300);
-    assert!(idle.control_only_completion());
+    assert_eq!(
+        idle.python_exec().unwrap().facts().patience,
+        Some(Duration::from_secs(300))
+    );
+    assert!(
+        idle.python_exec()
+            .unwrap()
+            .facts()
+            .completion
+            .unwrap()
+            .set_patience
+    );
     idle.first_output();
-    idle.close_patience();
 
     // No assignment or await: Rust owns the command and its source attachment.
     let mut writer = tools[0].run(
@@ -471,8 +507,19 @@ async fn python_immediate_stdin_and_patience_controls() {
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*control, ended).await;
-    assert_eq!(control.take_patience().unwrap().1, 300);
-    assert!(control.control_only_completion());
+    assert_eq!(
+        control.python_exec().unwrap().facts().patience,
+        Some(Duration::from_secs(300))
+    );
+    assert!(
+        control
+            .python_exec()
+            .unwrap()
+            .facts()
+            .completion
+            .unwrap()
+            .set_patience
+    );
     assert_eq!(control.first_output().status, ToolOutputStatus::Success);
 }
 
@@ -590,31 +637,34 @@ async fn python_registration_cancels_an_unawaited_command_and_blocked_stdin_toge
 }
 
 #[tokio::test]
-async fn old_python_cells_cannot_override_new_turn_patience() {
+async fn old_execution_keeps_its_own_patience_without_touching_new_execution() {
     let tools = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
     let wake = Arc::new(Notify::new());
-    let mut cell = tools[0].run(
+    let mut old = tools[0].run(
         call(
-            "p1",
+            "old",
             "exec",
-            json!(
-                "import asyncio\nnotify('waiting')\nawait asyncio.sleep(0.1)\nset_patience(3600)"
-            ),
+            json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_patience(3600)"),
         ),
         SourceWaker::new(wake.clone()),
     );
-    until(&wake, &*cell, |h| matches!(h, ToolHaste::Soon { .. })).await;
-    cell.close_patience();
-    cell.first_output();
-    until(&wake, &*cell, ended).await;
-    assert!(cell.take_patience().is_none());
-    assert!(!cell.control_only_completion());
-    assert!(
-        cell.more_output()
-            .unwrap()
-            .output
-            .contains("originating model turn has ended")
+    until(&wake, &*old, |h| matches!(h, ToolHaste::Soon { .. })).await;
+    old.first_output();
+    let new = tools[0].run(
+        call("new", "exec", json!("set_patience(300)")),
+        SourceWaker::new(wake.clone()),
     );
+    until(&wake, &*new, ended).await;
+    until(&wake, &*old, ended).await;
+    assert_eq!(
+        old.python_exec().unwrap().facts().patience,
+        Some(Duration::from_secs(3600))
+    );
+    assert_eq!(
+        new.python_exec().unwrap().facts().patience,
+        Some(Duration::from_secs(300))
+    );
+    assert!(!old.more_output().unwrap().output.contains("ignored"));
 }
 
 struct PendingTool(Arc<std::sync::atomic::AtomicUsize>);
@@ -708,17 +758,152 @@ async fn python_retained_pages_do_not_split_unicode_characters() {
     );
 }
 
-#[tokio::test]
-async fn closing_a_turn_discards_an_undrained_patience_setter() {
+#[tokio::test(flavor = "current_thread")]
+async fn python_host_state_is_committed_before_return_without_agent_polling() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("registered");
     let tools = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
     let wake = Arc::new(Notify::new());
+    let source = format!(
+        "set_patience(300)\ncommand('echo registered')\ntools.web__run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
+        marker.to_str().unwrap()
+    );
     let mut cell = tools[0].run(
-        call("p1", "exec", json!("set_patience(300)")),
+        call("sync", "exec", json!(source)),
         SourceWaker::new(wake.clone()),
     );
-    until(&wake, &*cell, ended).await;
-    cell.close_patience();
-    assert!(cell.take_patience().is_none());
+    assert!(cell.python_exec().unwrap().facts().returned.is_none());
+    // Don't let the Tokio executor run. Python's native callbacks must commit
+    // registration and patience before the subsequent filesystem write.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let exec = cell.python_exec().unwrap();
+    assert!(exec.facts().started);
+    assert_eq!(exec.facts().patience, Some(Duration::from_secs(300)));
+    assert_eq!(
+        cell.sources().len(),
+        3,
+        "exec and two independent operations"
+    );
     cell.cancel();
-    assert!(!cell.control_only_completion());
+    until(&wake, &*cell, ended).await;
+    cell.first_output();
+    drop(cell);
+    // State remains readable without a transcript session; no drained setter.
+    assert_eq!(exec.facts().patience, Some(Duration::from_secs(300)));
+}
+
+#[tokio::test]
+async fn top_level_return_does_not_finish_detached_python_activity() {
+    let directory = tempfile::tempdir().unwrap();
+    let release = directory.path().join("release");
+    let tools = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
+    let wake = Arc::new(Notify::new());
+    let source = format!(
+        "async def monitor():\n    while not Path({:?}).exists():\n        await asyncio.sleep(0.01)\n    notify('detached finished')\nasyncio.create_task(monitor())",
+        release.to_str().unwrap()
+    );
+    let mut cell = tools[0].run(
+        call("detached", "exec", json!(source)),
+        SourceWaker::new(wake.clone()),
+    );
+    let exec = cell.python_exec().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exec.facts().returned.is_none() {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!exec.quiescent());
+    cell.first_output();
+    assert!(!cell.done());
+    std::fs::write(release, "").unwrap();
+    until(&wake, &*cell, ended).await;
+    assert!(
+        cell.more_output()
+            .unwrap()
+            .output
+            .contains("detached finished")
+    );
+    assert!(cell.done());
+}
+
+#[tokio::test]
+async fn operation_output_does_not_retroactively_change_exec_return_facts() {
+    struct ReleasedTool(Arc<Notify>);
+    impl crate::FutureTool for ReleasedTool {
+        fn spec(&self) -> rho_core::ToolSpec {
+            let mut spec = PendingTool(Default::default()).spec();
+            spec.name = ToolName::try_from("released").unwrap();
+            spec
+        }
+        fn call(&self, _: ToolCall) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
+            let release = self.0.clone();
+            Box::pin(async move {
+                release.notified().await;
+                crate::output("nested result", ToolOutputStatus::Success)
+            })
+        }
+    }
+    let release = Arc::new(Notify::new());
+    let tools = tools(
+        shell(),
+        vec![
+            Arc::new(ReleasedTool(release.clone())),
+            Arc::new(PendingTool(Default::default())),
+        ],
+        Some(crate::CodeMode::Python),
+    )
+    .unwrap();
+    let wake = Arc::new(Notify::new());
+    let mut cell = tools[0].run(
+        call(
+            "return-facts",
+            "exec",
+            json!("tools.released()\ntools.pending()"),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    let exec = cell.python_exec().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exec.facts().returned.is_none() {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let completion = exec.facts().completion.unwrap();
+    assert!(completion.dispatched);
+    assert!(!completion.produced_output);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !cell.sources().iter().any(|(_, facts)| {
+            matches!(
+                facts,
+                crate::SourceFacts::PythonOperation(crate::PythonOperationFacts {
+                    finished: Some(_),
+                    ..
+                })
+            )
+        }) {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(exec.facts().completion, Some(completion));
+    assert!(exec.facts().output.since.is_some());
+    assert!(cell.first_output().output.contains("nested result"));
+    assert!(exec.facts().completion.is_none());
+    cell.cancel();
+    until(&wake, &*cell, ended).await;
+    cell.more_output();
+    assert!(
+        exec.facts().completion.is_none(),
+        "quiescence is not a second top-level return"
+    );
 }

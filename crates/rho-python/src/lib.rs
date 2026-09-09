@@ -1,15 +1,16 @@
-//! In-process Python notebook with a message-only host boundary.
+//! In-process Python notebook with synchronous Rust host callbacks.
 //!
-//! RustPython objects live exclusively on one interpreter thread. Commands and
-//! completions crossing this API are serializable: moving this thread into a
-//! worker does not require moving interpreter objects or agent policy with it.
-//! This is ordinary, unsandboxed Python. A dedicated thread has private cwd
-//! state and is initialized in the agent’s workspace view before Python starts.
-//! Other process-global operations retain their normal in-process semantics.
+//! RustPython objects stay on the interpreter thread. Each execution carries a
+//! shared Rust host handle; callbacks commit host state before Python
+//! continues. Asynchronous completions wake the interpreter, which resolves
+//! Python futures. This is ordinary, unsandboxed Python. A dedicated thread has
+//! private cwd state and is initialized in the agent’s workspace view before
+//! Python starts. Other process-global operations retain their normal
+//! in-process semantics.
 
 mod runtime;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -47,6 +48,13 @@ pub enum Input {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
+    Started {
+        cell: CellId,
+    },
+    Returned {
+        cell: CellId,
+        error: Option<String>,
+    },
     Call {
         cell: CellId,
         request: RequestId,
@@ -72,16 +80,40 @@ pub enum Event {
     },
 }
 
+/// An execution's Rust-owned state. Called synchronously on the interpreter
+/// thread; implementations must not re-enter Python or wait for async work.
+pub trait Execution: Send + Sync {
+    fn event(&self, event: Event);
+}
+
+type Executions = Arc<Mutex<HashMap<CellId, Arc<dyn Execution>>>>;
+
 /// A cloneable sender, not an owner of the interpreter's lifetime.
 #[derive(Clone)]
 pub struct Sender {
     tx: mpsc::SyncSender<Input>,
+    executions: Executions,
     cancelled: Arc<Mutex<HashSet<CellId>>>,
     space: Arc<tokio::sync::Notify>,
     wake: Arc<OwnedFd>,
 }
 
 impl Sender {
+    /// Publish the execution handle before making its code runnable.
+    pub fn execute(
+        &self,
+        cell: CellId,
+        source: String,
+        exec: Arc<dyn Execution>,
+    ) -> Result<(), String> {
+        self.executions.lock().unwrap().insert(cell, exec);
+        if let Err(error) = self.send(Input::Execute { cell, source }) {
+            self.executions.lock().unwrap().remove(&cell);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn send(&self, input: Input) -> Result<(), String> {
         if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > MAX_MESSAGE_BYTES {
             return Err("Python input exceeds 1 MiB".into());
@@ -136,9 +168,9 @@ impl Session {
     /// It may enter the agent's mount namespace and set the initial directory.
     pub fn new(
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
-    ) -> Result<(Self, tokio::sync::mpsc::Receiver<Event>), String> {
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::sync_channel(256);
-        let (events, receiver) = tokio::sync::mpsc::channel(256);
+        let executions: Executions = Default::default();
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let space = Arc::new(tokio::sync::Notify::new());
@@ -149,25 +181,23 @@ impl Session {
         let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
         runtime::spawn(
             rx,
-            events,
+            Arc::clone(&executions),
             Arc::clone(&cancelled),
             Arc::clone(&shutdown),
             Arc::clone(&space),
             Arc::clone(&wake),
             setup,
         )?;
-        Ok((
-            Self {
-                sender: Sender {
-                    tx,
-                    cancelled,
-                    space,
-                    wake,
-                },
-                shutdown,
+        Ok(Self {
+            sender: Sender {
+                tx,
+                executions,
+                cancelled,
+                space,
+                wake,
             },
-            receiver,
-        ))
+            shutdown,
+        })
     }
 
     pub fn sender(&self) -> Sender {
@@ -192,6 +222,62 @@ mod tests {
 
     use super::*;
 
+    struct RecordedExecution(tokio::sync::mpsc::Sender<Event>);
+    impl Execution for RecordedExecution {
+        fn event(&self, event: Event) {
+            if !matches!(event, Event::Started { .. } | Event::Returned { .. }) {
+                let _ = self.0.blocking_send(event);
+            }
+        }
+    }
+    struct TestSession {
+        session: Session,
+        events: tokio::sync::mpsc::Sender<Event>,
+    }
+    impl TestSession {
+        fn sender(&self) -> TestSender {
+            TestSender {
+                sender: self.session.sender(),
+                events: self.events.clone(),
+            }
+        }
+    }
+    #[derive(Clone)]
+    struct TestSender {
+        sender: Sender,
+        events: tokio::sync::mpsc::Sender<Event>,
+    }
+    impl TestSender {
+        fn send(&self, input: Input) -> Result<(), String> {
+            match input {
+                Input::Execute { cell, source } => self.sender.execute(
+                    cell,
+                    source,
+                    Arc::new(RecordedExecution(self.events.clone())),
+                ),
+                other => self.sender.send(other),
+            }
+        }
+        async fn send_async(&self, input: Input) -> Result<(), String> {
+            self.sender.send_async(input).await
+        }
+        fn cancel(&self, cell: CellId) {
+            self.sender.cancel(cell);
+        }
+    }
+    fn test_session(
+        setup: impl FnOnce() -> Result<(), String> + Send + 'static,
+    ) -> Result<(TestSession, tokio::sync::mpsc::Receiver<Event>), String> {
+        let (events, receiver) = tokio::sync::mpsc::channel(256);
+        Ok((
+            TestSession {
+                session: Session::new(setup)?,
+                events,
+            },
+            receiver,
+        ))
+    }
+
     async fn next(rx: &mut tokio::sync::mpsc::Receiver<Event>) -> Event {
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -201,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_text_io_uses_utf8() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -232,7 +318,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     #[tokio::test]
     async fn live_cells_share_globals_and_keep_attribution() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session.sender().send(Input::Execute { cell: 1, source: "values = []\nvalues.append(1)\nawait asyncio.sleep(0.1)\nvalues.append(3)\nnotify(values)".into() }).unwrap();
         session
             .sender()
@@ -261,7 +347,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     #[tokio::test]
     async fn command_starts_without_await_and_can_be_awaited_later() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -307,7 +393,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     #[tokio::test]
     async fn cancels_python_loop_without_losing_notebook() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -332,7 +418,7 @@ with tempfile.TemporaryDirectory() as directory:
     }
     #[tokio::test]
     async fn completion_bursts_apply_backpressure_without_losing_awaits() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session.sender().send(Input::Execute { cell:1, source:"import asyncio\njobs = [command('test') for _ in range(600)]\nawait asyncio.gather(*jobs)".into() }).unwrap();
         let mut deliveries = tokio::task::JoinSet::new();
         let mut calls = 0;
@@ -367,7 +453,7 @@ with tempfile.TemporaryDirectory() as directory:
 
     #[tokio::test]
     async fn gathered_errors_can_be_handled_and_child_tasks_stay_attributed() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session.sender().send(Input::Execute {cell:1,source:"import asyncio\nasync def child():\n    await asyncio.sleep(0.01)\n    notify('child')\n    raise ValueError('expected')\nresults = await asyncio.gather(child(), return_exceptions=True)\nassert isinstance(results[0], ValueError)".into()}).unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text { cell: 1, .. }));
         assert!(matches!(
@@ -380,7 +466,7 @@ with tempfile.TemporaryDirectory() as directory:
     }
     #[tokio::test]
     async fn cancellation_survives_execute_and_cancel_in_the_same_inbox_batch() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -406,7 +492,7 @@ with tempfile.TemporaryDirectory() as directory:
     }
     #[tokio::test]
     async fn standard_asyncio_queues_task_groups_timeouts_and_streams_work() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -470,7 +556,7 @@ assert process.returncode == 0
 
     #[tokio::test]
     async fn asyncio_task_limit_rejects_a_new_cell_without_losing_the_loop() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session.sender().send(Input::Execute {cell: 1, source: "for _ in range(1023):\n    asyncio.create_task(asyncio.sleep(3600))\nnotify('full')\nawait asyncio.Event().wait()".into()}).unwrap();
         assert!(matches!(next(&mut rx).await, Event::Text { cell: 1, .. }));
         session
@@ -512,7 +598,7 @@ assert process.returncode == 0
 
     #[tokio::test]
     async fn standard_asyncio_thread_work_preserves_cell_context() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -533,7 +619,7 @@ assert process.returncode == 0
 
     #[tokio::test]
     async fn standard_asyncio_callbacks_keep_their_cell_alive_and_can_be_cancelled() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -563,7 +649,7 @@ assert process.returncode == 0
 
     #[tokio::test]
     async fn large_output_requests_are_capped_without_rejecting_the_cell() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -589,7 +675,7 @@ assert process.returncode == 0
 
     #[tokio::test]
     async fn standard_streams_preserve_print_format_and_cell_attribution() {
-        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session
             .sender()
             .send(Input::Execute {
@@ -617,10 +703,10 @@ assert process.returncode == 0
         let path_one = one.path().to_owned();
         let path_two = two.path().to_owned();
         let (first, mut first_rx) =
-            Session::new(move || std::env::set_current_dir(path_one).map_err(|e| e.to_string()))
+            test_session(move || std::env::set_current_dir(path_one).map_err(|e| e.to_string()))
                 .unwrap();
         let (second, mut second_rx) =
-            Session::new(move || std::env::set_current_dir(path_two).map_err(|e| e.to_string()))
+            test_session(move || std::env::set_current_dir(path_two).map_err(|e| e.to_string()))
                 .unwrap();
         first.sender().send(Input::Execute {cell:1,source:"import pathlib\nfrom pathlib import Path\nimport os\nPath('sub').mkdir()\nos.chdir('sub')\nPath('note.txt').write_text('one')\nassert Path('note.txt').read_text() == 'one'\nimport shutil, json\nshutil.copyfile('note.txt', 'copy.txt')\nassert [p.name for p in Path('.').glob('copy.*')] == ['copy.txt']\nwith open('data.json', 'w') as f:\n    json.dump({'ok': True}, f)\nwith open('data.json') as f:\n    assert json.load(f)['ok']".into()}).unwrap();
         second.sender().send(Input::Execute {cell:1,source:"assert pathlib.Path is Path\nPath('note.txt').write_text('two')\nassert Path('note.txt').read_text() == 'two'".into()}).unwrap();
