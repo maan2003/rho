@@ -8952,6 +8952,11 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
 /// a message arriving during the snooze does not bring the card back. A
 /// snooze used to be voided by the next reply, which made "not until
 /// Monday" mean "until somebody writes".
+///
+/// The wake time is the whole of it (9 Sep). The `SlackSnoozedAt` cell
+/// that recorded where the unit stood is retired: nothing ever read it,
+/// so it never held the snooze, and this test is what says the snooze
+/// holds without it.
 #[gpui::test]
 fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
@@ -8999,11 +9004,6 @@ fn a_snooze_outlasts_a_newer_message_from_someone_else(cx: &mut TestAppContext) 
             assert_eq!(
                 facts.slack_handled_through, None,
                 "a snooze is not a close: what was unhandled is still theirs"
-            );
-            assert_eq!(
-                facts.slack_snoozed_at,
-                Some(rho_desk::cells::SlackTs("600.0".to_owned())),
-                "and where the unit stood when they looked away is recorded with it"
             );
             assert!(
                 workspace.dashboard.node_defer_until(card.clone()).is_some(),

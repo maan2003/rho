@@ -634,7 +634,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       those cells leave nothing on the map, which is the virtual-node rule
       landed 8 Sep); snooze records `SlackSnoozedAt(newest)` beside
       `DeferUntil` and is voided when `newest_from_other` passes it, the
-      cursor untouched; `Name` beats the derived title on any id but a
+      cursor untouched (superseded: the voiding was never built and the
+      cell was read by nobody, so `SlackSnoozedAt` is retired 9 Sep and a
+      snooze is `DeferUntil` and the pace); `Name` beats the derived title on any id but a
       note; the dealer deals DMs and mentioned channels, not only threads;
       the 2.17 sequence passes in the rig, three mentions are one card
       landing on the first new one, and a restart keeps a done unit

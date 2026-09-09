@@ -89,6 +89,10 @@ Nothing but a verdict key moves them.
   arrived during the snooze and voids `defer_until`; the card is back as
   "needs reply". Without `snoozed_at` the view cannot tell that message
   from one that was already sitting there when the snooze was made.
+  (Superseded 8 Sep by the operative section below: a snooze is not a
+  cursor and nothing arriving during one takes it back. The voiding rule
+  was never built, so `snoozed_at` was read by nobody; the property is
+  retired 9 Sep, and the wake time is the whole of the snooze.)
 - `f` file: the unit's `parent` is set to the id the user picks (a label
   or any thing); the cursor is untouched, the card keeps being dealt.
   Filing is a place, not a close.
@@ -209,6 +213,17 @@ reaches, and that races the user giving one of those units a name on
 another machine the same day. Leaving them is idempotent, costs nothing
 to write, and can be done later against the definition above if the space
 ever matters. `SlackSnoozedAt` goes with eng-8gpr's pending removal.
+
+Landed 9 Sep: `SlackSnoozedAt` is retired. Nothing wrote it but the snooze
+verdict and nothing ever read it, so a snooze has always been held by
+`defer_until` alone; the cursor it needed is the mirror's, which is why a
+snooze used to be refused outright when the caller had no newest message.
+The `Property` and `PropertyKey` variants stay where they are, with a doc
+saying they are retired, because cells and verdict entries are decoded by
+variant order -- the same reason the journal keeps `SlackThreadBound`.
+Old cells and old verdict entries decode and are read by nobody, as the
+mute and cursor cells before them are. `SlackVerdict` went with it: the
+mirror's newest message was carried into a verdict for this cell alone.
 
 Landed 8 Sep: `compute_nodes` in `rho-gui/src/desk_view.rs` drops a stored
 `Id::Slack` row that neither the mirror is asking about nor carries a cell

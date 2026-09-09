@@ -437,6 +437,11 @@ struct SlackCard {
 /// `SlackHandledThrough` cells the versions before 8 Sep wrote are read
 /// once by the seed and never again, so a unit carrying only one of those
 /// is stale. Nothing deletes them; the desk stops asking.
+///
+/// A snooze is on this list as `defer_until`, which the verdict writes.
+/// The retired `SlackSnoozedAt` cell was read here too until 9 Sep, and
+/// took nothing with it: the same verdict writes both, so a unit snoozed
+/// by an older version is still a node by its wake time.
 fn rho_wrote_of_unit(facts: &Facts) -> bool {
     facts.filed
         || facts.parent.is_some()
@@ -447,7 +452,6 @@ fn rho_wrote_of_unit(facts: &Facts) -> bool {
         || facts.defer_until.is_some()
         || facts.deadline.is_some()
         || facts.pace_days != 0
-        || facts.slack_snoozed_at.is_some()
         || facts.deleted
         || facts.created_at.is_some()
 }
@@ -1819,7 +1823,6 @@ impl DeskCells {
             &|key| view.property(id, key).cloned(),
             None,
             None,
-            None,
         )
         .ok()?;
         writes.extend(changes.iter().filter_map(|change| {
@@ -2169,25 +2172,6 @@ impl DeskCells {
             .collect()
     }
 
-    /// What the mirror says a Slack unit's newest message is, for a verdict
-    /// about to write a cursor. `None` for everything that is not a Slack
-    /// unit, and for a unit no source knows about, which is a verdict on a
-    /// card that cannot be dealt.
-    fn slack_verdict(&self, host: HostId, id: &Id) -> Option<rho_desk::cells::SlackVerdict> {
-        let Id::Slack(unit) = id else {
-            return None;
-        };
-        self.hosts
-            .get(&host)?
-            .sources
-            .slack
-            .iter()
-            .find(|source| &source.unit == unit)
-            .map(|source| rho_desk::cells::SlackVerdict {
-                newest: source.newest.clone(),
-            })
-    }
-
     /// Where an agent's story stands, for a verdict about to write a
     /// cursor. `None` for everything that is not an agent, and for an agent
     /// no source knows about, which is a verdict on a card that cannot be
@@ -2215,11 +2199,8 @@ impl DeskCells {
         id: &Id,
         verdict: DeskVerdict,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
-        // What a verdict on a Slack unit writes is a message timestamp, and
-        // that timestamp is the mirror's rather than the store's.
-        let slack = self.slack_verdict(host, id);
         let agent = self.agent_verdict(host, id);
-        self.verdict_writes_with_cursor(host, id, verdict, slack, agent)
+        self.verdict_writes_with_cursor(host, id, verdict, agent)
     }
 
     fn verdict_writes_with_cursor(
@@ -2227,7 +2208,6 @@ impl DeskCells {
         host: HostId,
         id: &Id,
         verdict: DeskVerdict,
-        slack: Option<rho_desk::cells::SlackVerdict>,
         agent: Option<rho_desk::cells::AgentVerdict>,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
@@ -2264,7 +2244,6 @@ impl DeskCells {
                         defer_until,
                         pace_days: pace,
                     }),
-                    slack.clone(),
                     agent,
                 )
                 .ok()?;
@@ -2307,7 +2286,6 @@ impl DeskCells {
             &verdict,
             &|key| view.property(id, key).cloned(),
             None,
-            slack,
             agent,
         )
         .ok()?;

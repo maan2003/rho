@@ -932,6 +932,84 @@ mod tests {
         assert_eq!(all.cells.len(), whole.cells.len());
     }
 
+    /// A store written by a version that still wrote `SlackSnoozedAt`
+    /// opens, decodes and reads on this one.
+    ///
+    /// The property is retired (9 Sep): nothing writes it and nothing
+    /// reads it, and the variant stays exactly where it was because cells
+    /// and verdict entries are decoded by variant order -- dropping it
+    /// would read every stored `Deleted` as a `CreatedAt`. This is that
+    /// claim, against a database on disk: an old snooze cell and an old
+    /// verdict entry that names it are written, the store is reopened,
+    /// and both come back with the facts unchanged and no fault.
+    #[tokio::test]
+    async fn a_store_holding_the_retired_snooze_cell_opens_and_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("rho.redb"));
+        let unit = Id::Slack(rho_desk::cells::SlackUnit {
+            workspace: "acme".to_owned(),
+            channel: "C1".to_owned(),
+            thread: Some("500.0".to_owned()),
+        });
+        let wake = at(4_000_000_000_000);
+        let stood_at = rho_desk::cells::SlackTs("600.0".to_owned());
+        {
+            let mut write = db.write().await;
+            initialize(&mut write).unwrap();
+            let mut meta = load_meta_from_write(&mut write).unwrap();
+            let mut cells = Store::new(meta.daemon_device);
+            cells
+                .write(unit.clone(), Property::DeferUntil(Some(wake)))
+                .unwrap();
+            cells
+                .write(unit.clone(), Property::SlackSnoozedAt(stood_at.clone()))
+                .unwrap();
+            let stamp = Stamp {
+                device: meta.daemon_device,
+                version: 1,
+            };
+            let mut snapshot = cells.snapshot();
+            snapshot.verdicts.push((
+                unit.clone(),
+                stamp,
+                VerdictEvent::Applied {
+                    verdict: Verdict::Defer { until: wake },
+                    at: stamp,
+                    changes: vec![FactChange {
+                        id: unit.clone(),
+                        key: PropertyKey::SlackSnoozedAt,
+                        before: None,
+                        after: Some(Property::SlackSnoozedAt(stood_at.clone())),
+                    }],
+                },
+            ));
+            persist_cells_and_verdicts(&mut write, &snapshot).unwrap();
+            meta.frontier = cells.version().clone();
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            write.commit();
+        }
+
+        let store = DeskCellStore::new(db.clone()).await.unwrap();
+        let snapshot = store.sync_since(&Version::new()).unwrap();
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .any(|cell| cell.property == Property::SlackSnoozedAt(stood_at.clone())),
+            "the retired cell decodes and is handed on as it was written"
+        );
+        assert!(
+            !snapshot.verdicts.is_empty(),
+            "and so does the verdict entry that names it"
+        );
+        let reopened = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
+        assert_eq!(
+            reopened.facts(&unit).defer_until,
+            Some(wake),
+            "the snooze is the wake time, which is what holds the card down"
+        );
+    }
+
     /// The parent conversion runs on the store it is opened on, and the
     /// marker means it runs once: a parent written after it has run is the
     /// user's own and stays until rho itself takes it off.

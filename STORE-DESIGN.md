@@ -476,6 +476,9 @@ else is built on. The transient lands after slice 2.
    `SlackSnoozedAt(ts)`, written by snooze beside `DeferUntil`, because
    "a message newer than the snooze" needs a Slack position to compare
    against and the store has no wall clock; the cursor stays untouched.
+   (Retired 9 Sep: the comparison was never built, so nothing ever read
+   the cell. The variant stays for decode order, documented as retired;
+   `SLACK-DESIGN.md`, "The unit nodes already in the store".)
 3. Labels: the label key, the picker with `rho/agent`, the map's label
    axis. Found while starting it (b8os, 4 Sep): a GUI that writes a
    verdict variant the running daemon does not know aborts that daemon
