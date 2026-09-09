@@ -1006,7 +1006,7 @@ impl Workspace {
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
-            desk_cells: DeskCells::new(crate::desk_view::desk_device()),
+            desk_cells: DeskCells::new(),
             note_views: HashMap::new(),
             verdict_undo: Vec::new(),
             next_verdict_undo_sequence: 0,

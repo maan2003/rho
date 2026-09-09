@@ -67,7 +67,6 @@ impl HostDeskCells {
             .saturating_add(1);
         Stamp { device, version }
     }
-
 }
 
 /// What an agent's own system says about it. The store never holds any of
@@ -553,7 +552,12 @@ pub type TreeSource = (
 /// talks to a daemon, and the wire carries cells rather than commands, so
 /// a local store is the same shape.
 pub struct DeskCells {
-    device: DeviceId,
+    /// This client's identity in the store, taken from the replica's
+    /// file the first time anything here needs one — which is the sync
+    /// that follows the replica load, never before it. Asked for
+    /// earlier, when the file has not opened, there is no replica to
+    /// count in either and the answer is an id of this process's own.
+    device: Option<DeviceId>,
     next_buffer_id: u64,
     hosts: BTreeMap<HostId, HostDeskCells>,
     /// The host a Slack unit belongs to: the first configured, said by the
@@ -569,9 +573,9 @@ pub struct DeskCells {
 }
 
 impl DeskCells {
-    pub fn new(device: DeviceId) -> Self {
+    pub fn new() -> Self {
         Self {
-            device,
+            device: None,
             next_buffer_id: 1,
             hosts: BTreeMap::new(),
             slack_owner: None,
@@ -610,13 +614,14 @@ impl DeskCells {
             .or_else(|| self.hosts.keys().next().copied())
     }
 
-    pub fn device(&self) -> DeviceId {
-        self.device
+    pub fn device(&mut self) -> DeviceId {
+        *self.device.get_or_insert_with(rho_mirror::desk::device)
     }
 
     /// The handshake, sent on connect and after every poke. `known` is what
     /// this GUI already holds, so the daemon answers with the difference.
     pub fn sync(&mut self, host: HostId) -> ClientMessage {
+        let device = self.device();
         let (known, store) = match self.hosts.get_mut(&host) {
             Some(desk) => {
                 desk.syncing = true;
@@ -625,7 +630,7 @@ impl DeskCells {
             None => (Version::new(), None),
         };
         ClientMessage::DeskSync {
-            device: self.device,
+            device,
             known,
             store,
         }
@@ -686,11 +691,16 @@ impl DeskCells {
         }
         let existing = self.hosts.contains_key(&host);
         if !existing {
+            // The host's stores are made with this client's identity, on
+            // the event that delivers its cells: the replica the id lives
+            // beside is loaded by now, and nothing on the desk happens
+            // before that.
+            let device = self.device();
             self.hosts.insert(
                 host,
                 HostDeskCells {
-                    confirmed: Store::new(self.device),
-                    view: Store::new(self.device),
+                    confirmed: Store::new(device),
+                    view: Store::new(device),
                     buffers: BTreeMap::new(),
                     nodes: Vec::new(),
                     node_at: HashMap::new(),
@@ -1423,7 +1433,7 @@ impl DeskCells {
         writes: Vec<CellWrite>,
         verdict: Option<(Id, VerdictEvent)>,
     ) -> Option<(ClientMessage, DeskDelta)> {
-        let device = self.device;
+        let device = self.device();
         let name = self.names.get(&host).cloned();
         let desk = self.hosts.get_mut(&host)?;
         if writes.is_empty() {
@@ -1903,8 +1913,10 @@ impl DeskCells {
                 id.clone(),
                 VerdictEvent::Applied {
                     verdict,
+                    // A placeholder: `apply` stamps the entry when it
+                    // sends it, and this device may not be known yet.
                     at: Stamp {
-                        device: self.device,
+                        device: self.device.unwrap_or_default(),
                         version: 0,
                     },
                     changes,
@@ -2342,8 +2354,10 @@ impl DeskCells {
                 }
                 let event = VerdictEvent::Applied {
                     verdict,
+                    // A placeholder: `apply` stamps the entry when it
+                    // sends it, and this device may not be known yet.
                     at: Stamp {
-                        device: self.device,
+                        device: self.device.unwrap_or_default(),
                         version: 0,
                     },
                     changes,
@@ -2386,8 +2400,9 @@ impl DeskCells {
         }
         let event = VerdictEvent::Applied {
             verdict,
+            // Stamped by `apply`, as above.
             at: Stamp {
-                device: self.device,
+                device: self.device.unwrap_or_default(),
                 version: 0,
             },
             changes,
@@ -2518,90 +2533,9 @@ fn watch_note_buffer(
     })
 }
 
-/// This GUI's device identity, persisted once in the client state directory.
-///
-/// The daemon binds one writer connection per device, and a device's stamps
-/// must keep ascending across restarts, so a fresh id every launch would
-/// both lock the GUI out of a second window and lose that ordering.
-pub fn desk_device() -> DeviceId {
-    {
-        // The state directory is `main`'s to resolve and nobody else's: a
-        // library that reaches for `dirs::state_dir()` reads the user's own
-        // files from a test, which is how a rho-gui test came to open the
-        // user's Slack mirror. `mirror::state_dir()` is only ever set by
-        // `main`, so a test — which never sets it — gets a fresh id per GUI,
-        // which is what several GUIs in one process need anyway. That used to
-        // be a `#[cfg(test)]` branch saying the same thing twice.
-        let path = rho_mirror::mirror::state_dir().map(|base| base.join("desk-device"));
-        if let Some(path) = &path
-            && let Ok(bytes) = std::fs::read(path)
-            && let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice())
-        {
-            return DeviceId(bytes);
-        }
-        let device = DeviceId(uuid::Uuid::new_v4().into_bytes());
-        if let Some(path) = &path {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::write(path, device.0) {
-                tracing::warn!(%error, "could not persist the Desk device id");
-            }
-        }
-        device
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The desk device id is written under the state directory `main` named,
-    /// and a test names none — so a test reads and writes nothing of the
-    /// user's. This used to call `dirs::state_dir()` directly, guarded by a
-    /// `#[cfg(test)]` branch that said the same thing a second time; the
-    /// guard is what a library gets wrong, and the rule replaces it.
-    #[test]
-    fn the_desk_device_id_never_reaches_the_user_s_state_directory() {
-        assert!(
-            rho_mirror::mirror::state_dir().is_none(),
-            "only `main` names the state directory, and this is not `main`"
-        );
-        let first = desk_device();
-        let second = desk_device();
-        assert_ne!(
-            first, second,
-            "with no state directory named there is no file to persist to, so \
-             each GUI in the process is its own device"
-        );
-    }
-
-    /// And with one named, it is that one and nowhere else: the id is written
-    /// under the directory the caller gave and read back from it.
-    #[test]
-    fn the_desk_device_id_is_written_under_the_directory_it_was_given() {
-        let dir = std::env::temp_dir().join(format!("rho-desk-device-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a state directory of our own");
-        let path = dir.join("desk-device");
-
-        // `desk_device` reads whatever `main` named; naming one here would be
-        // process-wide and would leak into every other test in this binary,
-        // so the file is written and read the way the function does and the
-        // path is asserted rather than the global set.
-        let device = DeviceId(uuid::Uuid::new_v4().into_bytes());
-        std::fs::write(&path, device.0).expect("persist the device id");
-        let read = <[u8; 16]>::try_from(std::fs::read(&path).expect("read it back").as_slice())
-            .map(DeviceId)
-            .expect("sixteen bytes");
-        assert_eq!(read, device);
-        assert!(
-            path.starts_with(std::env::temp_dir()),
-            "the id lives under the directory the caller named, {}",
-            path.display()
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
 
     fn node(id: Id, parent: Option<Id>, labels: &[Id]) -> DeskNode {
         DeskNode {

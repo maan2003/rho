@@ -1563,11 +1563,10 @@ work on it.
   resolved that path by default and the test named none.
   *`desk_view::desk_device`* asked `dirs::state_dir()` and had a
   `#[cfg(test)]` branch beside it generating a fresh id so tests would not
-  collide. It now reads `mirror::state_dir()`, which only `main` ever sets —
-  so a test, which never sets it, has no file to persist to and gets a fresh
-  id per GUI. The guard was the rule written twice; deleting it is the whole
-  simplification. Two tests: that the id never reaches the user's state
-  directory, and that with a directory named it is written under that one.
+  collide. The guard was the rule written twice; deleting it is the whole
+  simplification. The id is now a row in the client's database
+  (`mirror::desk::device`), which only `main` names the directory of, so a
+  test — which names none — has no database and gets a fresh id per GUI.
   *`rho-workspaces::sandbox_base`* did the same, and one of its own tests —
   `creates_provenance_free_git_sandbox` — was making a sandbox under the
   user's state directory as a result. `Repo` now holds

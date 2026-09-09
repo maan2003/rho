@@ -53,8 +53,6 @@ fn home() -> Result<PathBuf> {
 pub const SNAPSHOT_CONTENTS: &[&str] = &[
     // The store: the DAG of cells across hosts, and the biggest thing here.
     "rho.redb",
-    // Which device this is.
-    "desk-device",
     // The client's one database: the agent mirror, the desk replica, the
     // Slack mirror and its cursors, the action journal and the inbox, each
     // under its own tables. Beside a daemon it is a fallback only — it is
@@ -82,10 +80,10 @@ pub const SNAPSHOT_CONTENTS: &[&str] = &[
 ///   directory. A client never has it.
 /// - `gui-telemetry`, `qlog`, `debug`: what a run wrote, not what it needs.
 pub const GUI_SNAPSHOT_CONTENTS: &[&str] = &[
-    // Which device this is. The desk device says yes; it names a device,
-    // not a person, and a rig that lies about it deals the wrong hand.
-    "desk-device",
-    // The client's one database, and with it everything the screens read:
+    // The client's one database, and with it everything the screens read,
+    // including which device this is: the desk device id is a row in it
+    // now, so a rig that copies the file is the same device as the client
+    // it copied, and one that does not is a new device.
     // the agent mirror and the inbox behind Home, the desk the client
     // already holds, what a verdict wrote so undo means something after a
     // restart, and the Slack flood as the user's own device has it.

@@ -1093,8 +1093,8 @@ mod tests {
 
         // A client's own store, holding a write this daemon has not seen.
         let away = DeviceId([22; 16]);
-        let mut client = Store::from_snapshot(away, store.sync_since(&Version::new()).unwrap())
-            .unwrap();
+        let mut client =
+            Store::from_snapshot(away, store.sync_since(&Version::new()).unwrap()).unwrap();
         client
             .apply_mutation(&CellMutation {
                 stamp: Stamp {
@@ -1124,7 +1124,10 @@ mod tests {
             "the daemon counts the away device's write as its own now"
         );
         // Nothing to send is not an error, and it writes nothing.
-        store.apply_cells(client.since(client.version())).await.unwrap();
+        store
+            .apply_cells(client.since(client.version()))
+            .await
+            .unwrap();
     }
 
     async fn seed_note(store: &DeskCellStore, device: DeviceId) -> Id {
@@ -1247,10 +1250,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.frontier().unwrap().get(&offline),
-            Some(&(global + 2))
-        );
+        assert_eq!(store.frontier().unwrap().get(&offline), Some(&(global + 2)));
     }
 
     /// A Slack unit is addressable without anyone creating it, so a todo

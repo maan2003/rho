@@ -221,14 +221,17 @@ difference that matters.
 
 **The file.** The client's own database, `rho-client.redb` in the state
 directory that `main` resolves — a library never reaches for it, the rule
-that already governs `desk_device()` and the agent mirror. The replica is
+that already governs the agent mirror. The replica is
 tables in it, beside the agent mirror's, the Slack mirror's, the journal's
 and the inbox's; one file, opened once, each crate keeping its own names
 and its own types. Tables: the
 cells by id, the verdict events by `(id, stamp)`, the note bodies by id,
 and one `StoredHost` per host holding the version and the store's identity.
-The device id stays where it is, in `desk-device`; it is already persistent,
-which is what makes a persisted version usable at all.
+The device id is a row in the same file. It has to be: the version is a
+count of this device's writes, so a replica deleted while its id survived
+would write stamps the daemon has already counted and lose them to
+last-writer-wins without a word. Delete the file and the id goes with it,
+and this is a new device with nothing behind it.
 
 **Whose store is it.** The agent mirror asks the daemon for a
 `machine_seed` and starts over when it is not the database this copy counts

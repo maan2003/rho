@@ -23,6 +23,7 @@ rho-ui-proto.workspace = true
 senax-encoder = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rho-core.workspace = true

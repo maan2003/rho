@@ -38,6 +38,13 @@ use rho_ui_proto::desk_tree::cells::{
 /// mirror keys its cursor by name.
 const DESK_HOSTS: TableDefinition<&str, Sen<StoredDeskHost>> =
     TableDefinition::new("gui_desk_host_v1");
+/// This device's id in the desk store, one row. It belongs in the
+/// database and not beside it because it means nothing without the
+/// replica: the daemon counts this device's stamps, so a fresh replica
+/// reusing the old id writes stamps the daemon has already counted, and
+/// last-writer-wins drops them without a word. Delete the file and the
+/// id goes with it, and this is a new device.
+const DESK_DEVICE: TableDefinition<(), Sen<DeviceId>> = TableDefinition::new("gui_desk_device_v1");
 /// One cell per row, at the key the store itself uses. A cell is never
 /// removed: a delete is a `Deleted(true)` cell with a stamp like any
 /// other, so it resumes in the same delta as everything else and cannot
@@ -448,6 +455,54 @@ pub fn close() {
     }
 }
 
+/// This client's device id, minted on the first launch that had a
+/// database and kept in it ever after.
+///
+/// The daemon binds one writer connection per device and a device's
+/// stamps must keep ascending across restarts, so a fresh id every
+/// launch would both lock the GUI out of a second window and lose that
+/// ordering.
+///
+/// Read when the replica is, and from the same file: nothing waits for
+/// the database here, because nothing on the desk happens before the
+/// replica is loaded anyway. Until it opens there is no replica and no
+/// id, and the caller gets one of this process's own — which is also
+/// what a test wants, since several GUIs in one process are several
+/// devices.
+pub fn device() -> DeviceId {
+    match global().as_ref() {
+        Some(mirror) => device_in(&mirror.db),
+        None => DeviceId(uuid::Uuid::new_v4().into_bytes()),
+    }
+}
+
+/// The device row in a database the caller opened. A test passes its own
+/// tempdir's; nothing here resolves a path.
+pub fn device_in(db: &RhoDb) -> DeviceId {
+    // Read and mint in the one write transaction: the table may not exist
+    // yet — this can run before the mirror has opened its tables — and a
+    // read of a table that was never created is a panic, while opening it
+    // for writing creates it. It also makes the mint atomic, which two
+    // GUIs sharing a file would need.
+    //
+    // Not on the mirror's writer thread either: the id has to be on disk
+    // before it is handed out, or a crash between minting and writing
+    // leaves the next launch a different device with these stamps behind
+    // it.
+    futures::executor::block_on(async {
+        let mut write = db.write().await;
+        let mut table = write.open_table(DESK_DEVICE);
+        if let Some(device) = table.get(&()) {
+            return device.value().into_owned();
+        }
+        let device = DeviceId(uuid::Uuid::new_v4().into_bytes());
+        table.insert(&(), SenValue::borrowed(&device));
+        drop(table);
+        write.commit();
+        device
+    })
+}
+
 pub fn load(host: &str) -> HeldDesk {
     global()
         .as_ref()
@@ -484,6 +539,28 @@ mod tests {
 
     fn note(seed: u8) -> Id {
         Id::Note(Uuid([seed; 16]))
+    }
+
+    /// The device id is minted once and kept, so the stamps this device
+    /// writes go on ascending across a restart. A second database is a
+    /// second device: the id lives with the replica whose writes it
+    /// counts, and a fresh replica reusing an old id would write stamps
+    /// the daemon has already counted and lose them silently.
+    #[test]
+    fn the_device_id_is_minted_once_per_database_and_read_back_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(dir.path()).unwrap();
+        let first = device_in(&db);
+        assert_eq!(first, device_in(&db), "the same database, the same device");
+        drop(db);
+
+        let other = tempfile::tempdir().unwrap();
+        let db = rho_db::client::open(other.path()).unwrap();
+        assert_ne!(
+            first,
+            device_in(&db),
+            "another database has never written a stamp, so it is another device"
+        );
     }
 
     /// What the replica is for: a client that has written a host's cells

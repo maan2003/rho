@@ -255,7 +255,10 @@ impl Workspace {
         }
         let notes = bodies.len() as u32;
         if !writes.is_empty() {
-            if self.apply_desk_writes(host, writes, None, window, cx).is_none() {
+            if self
+                .apply_desk_writes(host, writes, None, window, cx)
+                .is_none()
+            {
                 return;
             }
             self.fill_note_bodies(host, bodies, cx);
