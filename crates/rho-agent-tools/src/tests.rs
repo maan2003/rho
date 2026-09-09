@@ -35,8 +35,7 @@ async fn javascript_runtime_remains_selectable() {
 async fn python_tool_entries_use_the_callable_namespace() {
     let tool = crate::PythonTool::new(shell(), Vec::new()).unwrap();
     let description = tool.spec().description;
-    assert!(description.contains("tools.apply_patch:"));
-    assert!(!description.contains("\napply_patch:"));
+    assert!(!description.contains("apply_patch"));
     assert!(description.contains("tools.web__run(search_query="));
     assert!(description.contains("same cell to run them concurrently"));
 }
@@ -537,38 +536,46 @@ async fn python_asyncio_timeout_does_not_own_the_managed_command() {
 }
 
 #[tokio::test]
-async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() {
-    let directory = tempfile::tempdir().unwrap();
-    let tools = tools(
-        ShellTools::in_directory(
-            Duration::from_secs(5),
-            directory.path().to_str().unwrap().into(),
-            PathOverrides::default(),
-        ),
-        Vec::new(),
-        Some(crate::CodeMode::Python),
-    )
-    .unwrap();
-    let wake = Arc::new(Notify::new());
-    let mut create = tools[0].run(call("create", "exec", json!(
-        "tools.apply_patch('*** Begin Patch\\n*** Add File: example.txt\\n+first\\n*** End Patch')"
-    )), SourceWaker::new(wake.clone()));
-    until(&wake, &*create, ended).await;
-    let output = create.first_output();
-    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
-    assert!(output.output.contains("example.txt"), "{output:?}");
-    assert_eq!(
-        std::fs::read_to_string(directory.path().join("example.txt")).unwrap(),
-        "first\n"
+async fn only_python_omits_apply_patch() {
+    let python = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
+    assert!(!python[0].spec().description.contains("apply_patch"));
+    let javascript = tools(shell(), Vec::new(), Some(crate::CodeMode::JavaScript)).unwrap();
+    assert!(javascript[0].spec().description.contains("apply_patch"));
+    assert!(
+        tools(shell(), Vec::new(), None)
+            .unwrap()
+            .iter()
+            .any(|tool| tool.spec().name.as_str() == "apply_patch")
     );
+}
 
-    let mut update = tools[0].run(call("update", "exec", json!(
-        "result = await tools.apply_patch('*** Begin Patch\\n*** Update File: example.txt\\n@@\\n-first\\n+second\\n*** End Patch')\nassert isinstance(result, str)\nassert Path('example.txt').read_text() == 'second\\n'"
+#[tokio::test]
+async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() {
+    struct Echo;
+    impl crate::FutureTool for Echo {
+        fn spec(&self) -> rho_core::ToolSpec {
+            let mut spec = PendingTool(Default::default()).spec();
+            spec.name = ToolName::try_from("echo").unwrap();
+            spec.tool_type = ToolType::Custom;
+            spec
+        }
+        fn call(
+            &self,
+            call: ToolCall,
+        ) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
+            Box::pin(async move { crate::output(call.arguments, ToolOutputStatus::Success) })
+        }
+    }
+    let tools = tools(shell(), vec![Arc::new(Echo)], Some(crate::CodeMode::Python)).unwrap();
+    let wake = Arc::new(Notify::new());
+    let mut cell = tools[0].run(call("echo", "exec", json!(
+        "tools.echo('unawaited output')\nresult = await tools.echo('awaited output')\nassert isinstance(result, str)\nassert result == 'awaited output'"
     )), SourceWaker::new(wake.clone()));
-    until(&wake, &*update, ended).await;
-    let output = update.first_output();
+    until(&wake, &*cell, ended).await;
+    let output = cell.first_output();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
-    assert!(output.output.contains("example.txt"), "{output:?}");
+    assert!(output.output.contains("unawaited output"), "{output:?}");
+    assert!(output.output.contains("awaited output"), "{output:?}");
 }
 
 #[tokio::test]

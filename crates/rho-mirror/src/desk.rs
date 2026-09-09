@@ -397,7 +397,6 @@ static GLOBAL: std::sync::OnceLock<std::sync::RwLock<Option<DeskMirror>>> =
     std::sync::OnceLock::new();
 static CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Who to tell when the replica is there to be read.
-#[expect(clippy::type_complexity)]
 static OPENED: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(Vec::new());
 
 fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {

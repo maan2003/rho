@@ -119,25 +119,15 @@ command("git diff --stat")
 command("rg -n 'TODO' src")
 ```
 
-Internal tools register the same way:
-```python
-tools.apply_patch("""*** Begin Patch
-*** Update File: config.toml
-@@
--retries = 2
-+retries = 3
-*** End Patch""")
-```
-
 Search the web without awaiting or reprinting the result:
 ```python
 tools.web__run(search_query=[{"q": "Python asyncio TaskGroup documentation"}])
 ```
 Use the returned references in a later cell for tools.web__run(open=[...]).
 
-When an edit is already prepared in `patch`, await only the dependencies:
+After editing a file, await only the dependencies:
 ```python
-await tools.apply_patch(patch)
+Path("config.toml").write_text(updated_config, encoding="utf-8")
 check = await command("cargo check")
 if check["exit_code"] == 0:
     command("cargo test")
@@ -191,12 +181,7 @@ Details and limits
 Available tools:
 "#,
         );
-        for spec in shell
-            .specs()
-            .into_iter()
-            .filter(|s| s.name.as_str() != "exec_command" && s.name.as_str() != "write_stdin")
-            .chain(others.iter().map(|t| t.spec()))
-        {
+        for spec in others.iter().map(|t| t.spec()) {
             description.push_str(&format!(
                 "tools.{}: {}\nArguments: {}\n",
                 spec.name.as_str(),
@@ -564,15 +549,11 @@ async fn host_call(
         link.lock().unwrap().say(&result.to_string(), false);
         return Ok(result);
     }
-    let other = shared.others.get(name);
-    let spec = other
-        .map(|t| t.spec())
-        .or_else(|| {
-            shared.shell.specs().into_iter().find(|s| {
-                s.name.as_str() == name && name != "exec_command" && name != "write_stdin"
-            })
-        })
+    let tool = shared
+        .others
+        .get(name)
         .ok_or_else(|| format!("Unknown tool: {name}"))?;
+    let spec = tool.spec();
     let call = ToolCall {
         id: format!("python-{name}")
             .try_into()
@@ -587,10 +568,7 @@ async fn host_call(
             args.to_string()
         },
     };
-    let result = match other {
-        Some(tool) => tool.call(call).await,
-        None => shared.shell.call(call).await,
-    };
+    let result = tool.call(call).await;
     if result.status != ToolOutputStatus::Success {
         return Err((*result.output).clone());
     }
