@@ -17,7 +17,7 @@ pub(crate) mod replay;
 mod tests;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -663,18 +663,14 @@ impl Standing {
     }
 }
 
-/// Whether this call's one answer has gone out. The core's own bookkeeping,
-/// and the only thing about a call it remembers: what the call is *doing* is
-/// the tool's to report, every time it is asked.
-///
-/// It is also what "the model is waiting on this call" means, there being no
-/// other definition of it: the model waits on a call until the call answers.
+/// Whether a call or one of its nested sources has been drained. The core
+/// owns this bookkeeping; what the source is doing is the tool's to report.
+/// For the outer call this also selects the provider's result/update shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolCallAnswer {
-    /// Still owed. The next thing this call produces is its one
-    /// [`ToolResult`].
+    /// Still awaiting its first contribution at a request boundary.
     Owed,
-    /// Sent, so everything after it arrives as a [`ToolUpdate`].
+    /// Already drained; subsequent output is an update.
     Sent,
 }
 
@@ -686,6 +682,24 @@ struct RunningTool {
     started_at: UnixMs,
     session: Box<dyn ToolSession>,
     answer: ToolCallAnswer,
+    answered_sources: HashSet<u64>,
+}
+
+impl RunningTool {
+    fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
+        self.session
+            .sources()
+            .into_iter()
+            .map(|(id, haste)| SourceKind::Tool {
+                answer: if self.answered_sources.contains(&id) {
+                    ToolCallAnswer::Sent
+                } else {
+                    ToolCallAnswer::Owed
+                },
+                haste,
+                control_only_completion: self.session.control_only_completion(),
+            })
+    }
 }
 
 /// The in-flight request. Provisional until it finishes: a failure drops the
@@ -844,11 +858,7 @@ impl Agent {
         // What each call is, with nothing decided about it: every one of
         // these is something the tool observed, and what any of them is
         // worth is `boundary`'s business.
-        sources.extend(self.tools.values().map(|tool| SourceKind::Tool {
-            answer: tool.answer,
-            haste: tool.session.haste(),
-            control_only_completion: tool.session.control_only_completion(),
-        }));
+        sources.extend(self.tools.values().flat_map(RunningTool::sources));
         sources
     }
 
@@ -1307,6 +1317,14 @@ impl Agent {
         let mut results: Vec<ToolResult> = std::mem::take(&mut self.wait_answers);
         let mut updates = Vec::new();
         for tool in self.tools.values_mut() {
+            // Snapshot before draining: work registered later still owes its
+            // first contribution, even if exec already has its protocol reply.
+            tool.answered_sources = tool
+                .session
+                .sources()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
             // Whatever the tool is reporting: a request that leaves one call
             // unanswered is rejected whole, so the first drain after a call is
             // made answers it and the tool says what it has, even if that is
@@ -1655,6 +1673,7 @@ impl Agent {
                 call,
                 session,
                 answer: ToolCallAnswer::Owed,
+                answered_sources: Default::default(),
             },
         );
     }

@@ -359,6 +359,8 @@ async fn python_commands_outlive_cells_and_retain_truncated_output() {
         result.output
     );
     assert!(!result.output.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(!result.output.contains("Retained"));
+    assert!(!result.output.contains("beyond retention limit"));
     assert!(cell.done());
     drop(cell);
     let mut read = tools[0].run(

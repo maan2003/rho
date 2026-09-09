@@ -1081,3 +1081,133 @@ async fn python_surface_has_exec_only_and_direct_surface_keeps_wait() {
     assert!(!direct.system_prompt.contains("## Python Code Mode"));
     assert!(!direct.system_prompt.contains("## JavaScript Code Mode"));
 }
+
+#[cfg(feature = "code-mode")]
+#[tokio::test]
+async fn python_commands_are_independent_boundary_sources_even_after_exec_answers() {
+    use rho_agent_tools::PythonTool;
+    use rho_tool_shell::ShellTools;
+    use rho_workspaces::PathOverrides;
+
+    let directory = tempfile::tempdir().unwrap();
+    let tool = PythonTool::new(
+        ShellTools::in_directory(
+            Duration::from_secs(20),
+            directory.path().to_str().unwrap().into(),
+            PathOverrides::default(),
+        ),
+        Vec::new(),
+    )
+    .unwrap();
+    let wake = Arc::new(Notify::new());
+    let mut invocation = call("python-sources");
+    invocation.arguments = "command('echo first')\nsecond = command('while [ ! -f release ]; do sleep 0.01; done; echo second')\nawait second\ncommand('while [ ! -f finish ]; do sleep 0.01; done; echo third')".into();
+    let mut running = RunningTool {
+        session: tool.run(invocation.clone(), SourceWaker::new(wake.clone())),
+        call: invocation,
+        started_at: UnixMs::now(),
+        answer: ToolCallAnswer::Owed,
+        answered_sources: Default::default(),
+    };
+    let first_at = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sources = running.session.sources();
+            if sources.len() == 3
+                && let Some((_, ToolHaste::Ended { at })) = sources.iter().find(|(id, _)| *id == 1)
+            {
+                break *at;
+            }
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut schedule = ask(running.sources().collect());
+    schedule.turn = None;
+    assert_eq!(
+        schedule.boundary(first_at),
+        Boundary::No {
+            recheck: Some(first_at + TOOL_PATIENCE)
+        },
+        "the finished command must wait for its sibling, not wake through the cell",
+    );
+    assert_eq!(schedule.boundary(first_at + TOOL_PATIENCE), Boundary::Now);
+
+    // Exactly the normal request drain: the provider gets one exec result, but
+    // each current source has independently contributed to it.
+    running.answered_sources = running
+        .session
+        .sources()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    running.answer = ToolCallAnswer::Sent;
+    let first = running.session.first_output();
+    assert!(first.output.contains("Command completed:"));
+    assert!(first.output.contains("Commands still running: 2."));
+    assert!(!first.output.contains("Python cell"));
+    assert!(running.sources().all(|source| matches!(
+        source,
+        SourceKind::Tool {
+            answer: ToolCallAnswer::Sent,
+            ..
+        }
+    )));
+
+    std::fs::write(directory.path().join("release"), "").unwrap();
+    let second_at = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sources = running.session.sources();
+            if sources.iter().any(|(id, _)| *id == 3)
+                && let Some((_, ToolHaste::Ended { at })) = sources.iter().find(|(id, _)| *id == 2)
+            {
+                break *at;
+            }
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        running.sources().any(|source| matches!(
+            source,
+            SourceKind::Tool {
+                answer: ToolCallAnswer::Owed,
+                haste: ToolHaste::None | ToolHaste::Eventually { .. },
+                ..
+            }
+        )),
+        "a command registered after exec's reply still owes its own first result"
+    );
+    let mut schedule = ask(running.sources().collect());
+    schedule.turn = None;
+    assert_eq!(
+        schedule.boundary(second_at),
+        Boundary::No {
+            recheck: Some(second_at + TOOL_PATIENCE)
+        }
+    );
+
+    std::fs::write(directory.path().join("finish"), "").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(running.session.haste(), ToolHaste::Ended { .. }) {
+                break;
+            }
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut schedule = ask(running.sources().collect());
+    schedule.turn = None;
+    assert_eq!(
+        schedule.boundary(UnixMs::now()),
+        Boundary::Now,
+        "nothing to batch once every command ends"
+    );
+    let last = running.session.more_output().unwrap();
+    assert_eq!(last.output.matches("Command completed:").count(), 2);
+    assert!(!last.output.contains("Python cell"));
+    assert!(running.session.done());
+}

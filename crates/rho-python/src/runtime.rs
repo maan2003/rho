@@ -40,6 +40,9 @@ pub(super) fn spawn(
                 // ordinary unsandboxed operations.
                 let mut settings = rustpython_vm::Settings::default();
                 settings.install_signal_handlers = false;
+                // The standalone RustPython CLI resolves the default -1 to 1;
+                // embedding skips that step. I/O checks > 0, unlike sys.flags.
+                settings.utf8_mode = 1;
                 let builder = Interpreter::builder(settings);
                 let defs = rustpython_stdlib::stdlib_module_defs(&builder.ctx);
                 let interpreter = builder

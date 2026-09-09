@@ -391,7 +391,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   view; this is path mapping, not a Python sandbox.
 - `rho-agent-tools` adapts that notebook to the model-facing `exec` source. It
   owns commands and their retained output independently of Python handles or
-  cell evaluation, dispatches authorized nested tools, and reports source facts.
+  cell evaluation, dispatches authorized nested tools, and reports independent
+  source facts for every command. Sharing an `exec` transcript call does not merge
+  command scheduling or first-drain state.
   The core alone decides request boundaries, including one-turn model patience.
   Both Python and JavaScript/V8 (`rho-code-mode`) remain selectable runtimes.
   `eng-high` and `advisor-high` default to Python; other code-mode roles use JavaScript.

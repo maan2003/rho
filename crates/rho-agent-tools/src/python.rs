@@ -704,30 +704,47 @@ impl PythonCell {
         cell.important = None;
         cell.jobs.retain(|job| {
             let mut state = job.state.lock().unwrap();
-            if !state.unsent.is_empty() { chunks.push(format!("Command {} output:\n{}", job.id, decode_output_lossy(std::mem::replace(&mut state.unsent, BoundedOutput::for_tokens(Some(job.budget))).into_bytes()))); }
+            if !state.unsent.is_empty() {
+                chunks.push(format!(
+                    "Command {} output:\n{}",
+                    job.id,
+                    decode_output_lossy(
+                        std::mem::replace(
+                            &mut state.unsent,
+                            BoundedOutput::for_tokens(Some(job.budget))
+                        )
+                        .into_bytes()
+                    )
+                ));
+            }
             state.since = None;
             state.important = None;
             if let Some((_, summary)) = state.finished.clone() {
-                chunks.push(format!("Command completed: {summary}. Retained {} bytes; dropped {} bytes beyond retention limit.", state.len, state.dropped));
+                chunks.push(format!("Command completed: {summary}"));
                 state.delivered = true;
                 false
-            } else { true }
+            } else {
+                true
+            }
         });
         if cell.closed() && !cell.delivered {
-            chunks.push(
-                if cell.error {
-                    "Python cell failed."
-                } else {
-                    "Python cell completed."
-                }
-                .into(),
-            );
             cell.delivered = true;
+            if chunks.is_empty() {
+                chunks.push("Execution completed.".into());
+            }
         } else if first {
-            chunks.push(format!(
-                "Python cell {} is live; output arrives automatically on this call.",
-                self.cell
-            ));
+            if cell.jobs.is_empty() {
+                chunks.push("Execution is still running; output arrives automatically.".into());
+            } else {
+                chunks.push(format!(
+                    "Commands still running: {}. Output arrives automatically; do not rerun them.",
+                    cell.jobs
+                        .iter()
+                        .map(|job| job.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
         if chunks.is_empty() {
             return None;
@@ -766,28 +783,31 @@ impl ToolSession for PythonCell {
                 .unwrap();
             return ToolHaste::Ended { at };
         }
-        let mut soon = cell.important;
-        let mut since = cell.since;
-        for job in &cell.jobs {
-            let state = job.state.lock().unwrap();
-            for at in state
-                .important
-                .into_iter()
-                .chain(state.finished.as_ref().map(|(at, _)| *at))
-            {
-                soon = Some(soon.map_or(at, |old| old.min(at)));
-            }
-            if let Some(at) = state.since {
-                since = Some(since.map_or(at, |old| old.min(at)));
-            }
-        }
-        if let Some(since) = soon {
+        if let Some(since) = cell.important {
             ToolHaste::Soon { since }
-        } else if let Some(since) = since {
+        } else if let Some(since) = cell.since {
             ToolHaste::Eventually { since }
         } else {
             ToolHaste::None
         }
+    }
+    fn sources(&self) -> Vec<(u64, ToolHaste)> {
+        let mut sources = vec![(0, self.haste())];
+        let cell = self.link.lock().unwrap();
+        sources.extend(cell.jobs.iter().map(|job| {
+            let state = job.state.lock().unwrap();
+            let haste = if let Some((at, _)) = state.finished {
+                ToolHaste::Ended { at }
+            } else if let Some(since) = state.important {
+                ToolHaste::Soon { since }
+            } else if let Some(since) = state.since {
+                ToolHaste::Eventually { since }
+            } else {
+                ToolHaste::None
+            };
+            (job.id, haste)
+        }));
+        sources
     }
     fn done(&self) -> bool {
         self.link.lock().unwrap().delivered

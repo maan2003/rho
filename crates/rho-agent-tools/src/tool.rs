@@ -89,6 +89,15 @@ pub trait ToolSession: Send {
     /// every answered call is asked for updates, whatever this says.
     fn haste(&self) -> ToolHaste;
 
+    /// Independently scheduled sources within this invocation. IDs are stable
+    /// and never reused within the session. The core tracks whether each source
+    /// has been drained, separately from the provider's one reply per tool
+    /// call. Ordinary tools have one source; notebooks also expose each
+    /// command.
+    fn sources(&self) -> Vec<(u64, ToolHaste)> {
+        vec![(0, self.haste())]
+    }
+
     /// Turn-local idle request: (session sequence, seconds).
     fn take_patience(&mut self) -> Option<(u64, u64)> {
         None

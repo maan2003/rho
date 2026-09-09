@@ -200,6 +200,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_text_io_uses_utf8() {
+        let (session, mut rx) = Session::new(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import io, sys, tempfile
+from pathlib import Path
+assert sys.flags.utf8_mode == 1
+assert io.text_encoding(None) == 'utf-8'
+sample = '— 雪🙂 café'
+with io.TextIOWrapper(io.BytesIO(sample.encode('utf-8'))) as wrapper:
+    assert wrapper.read() == sample
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory) / 'unicode.txt'
+    path.write_bytes(sample.encode('utf-8'))
+    assert path.read_text() == sample
+    path.write_text(sample)
+    assert path.read_bytes() == sample.encode('utf-8')
+"#
+                .into(),
+            })
+            .unwrap();
+        match next(&mut rx).await {
+            Event::Finished { error, .. } => assert!(error.is_none(), "{error:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn live_cells_share_globals_and_keep_attribution() {
         let (session, mut rx) = Session::new(|| Ok(())).unwrap();
         session.sender().send(Input::Execute { cell: 1, source: "values = []\nvalues.append(1)\nawait asyncio.sleep(0.1)\nvalues.append(3)\nnotify(values)".into() }).unwrap();

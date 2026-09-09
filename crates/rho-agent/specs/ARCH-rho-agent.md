@@ -11,8 +11,10 @@ dropped. `AgentHandle` is the only outside view: commands in over an unbounded
 channel, state out as a published `AgentState`.
 
 Everything that produces transcript blocks is a **source**: the user queue, the
-mail queue, and one entry per called tool. A source accumulates on its own and
-reports plain facts — when something arrived, whether a call has been answered,
+mail queue, each called tool, and each command launched inside Python. Command
+sources are independently scheduled and retain their own first-drain state, even
+when their output travels on one shared `exec` call. A source accumulates on its
+own and reports plain facts — when something arrived, whether a call has been answered,
 whether a tool has ended. It chooses no durations and starts no requests
 ([DECISION-pull-based-sources](DECISION-pull-based-sources.md)).
 

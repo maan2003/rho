@@ -742,6 +742,9 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   live cells at 128, and pending host requests and registered tasks at 1,024 each.
   Reliable asynchronous completion delivery applies backpressure without blocking
   event draining. These bounds do not cap arbitrary Python allocations.
+- Commands inside Python are independent scheduling sources. Their output remains
+  attached to the originating `exec` call; command IDs identify the work, not
+  notebook cell IDs. The core tracks each command's first drain separately.
 - `notify` marks meaningful output; `text` and captured stdout/stderr mark
   ordinary progress. Standard streams expose no daemon file descriptors. Both
   become output on the originating call at the core's next request boundary;

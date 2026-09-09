@@ -19,7 +19,8 @@ def _format_error(exc):
     while tb is not None:
         code = tb.tb_frame.f_code
         if code.co_filename != '<rho-runtime>':
-            lines.append(f'  {code.co_filename}:{tb.tb_lineno} in {code.co_name}')
+            filename = '<exec>' if code.co_filename.startswith('<rho-cell-') else code.co_filename
+            lines.append(f'  {filename}:{tb.tb_lineno} in {code.co_name}')
         tb = tb.tb_next
     return '\n'.join(lines)
 
