@@ -4217,8 +4217,8 @@ impl Workspace {
 
     /// The active context's surfaces as `(name, kind)` for completion.
     pub fn buffer_table(&self) -> Vec<(String, String)> {
-        self.surfaces
-            .get(&self.active_context)
+        let list = self.surfaces.get(&self.active_context);
+        let mut rows = list
             .map(|list| {
                 list.iter()
                     .map(|surface| {
@@ -4227,9 +4227,22 @@ impl Workspace {
                             Self::surface_kind(&surface.key).to_owned(),
                         )
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Home is every context's, shown in it or not: a reader inside
+        // Slack is in a context whose list has never held Home, and the
+        // picker is the way back from any surface to it.
+        if !list.is_some_and(|list| list.iter().any(|surface| surface.key == SurfaceKey::Home)) {
+            rows.insert(
+                0,
+                (
+                    self.surface_name(&SurfaceKey::Home),
+                    Self::surface_kind(&SurfaceKey::Home).to_owned(),
+                ),
+            );
+        }
+        rows
     }
 
     /// Resolves a `:buffer`/`:close` argument: exact name first, then a
@@ -4253,8 +4266,19 @@ impl Workspace {
     }
 
     /// Shows the named surface in the context's viewport.
-    fn switch_buffer(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn switch_buffer(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(surface) = self.surface_named(name).cloned() else {
+            // The row the picker offers from a context that has never
+            // shown Home: opening it is what makes it that context's.
+            if name == self.surface_name(&SurfaceKey::Home) {
+                self.open_home(window, cx);
+                return;
+            }
             self.notice_on(
                 None,
                 &format!("no surface matching `{name}`"),

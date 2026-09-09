@@ -11526,3 +11526,42 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
         })
         .unwrap();
 }
+
+/// Home is a row in the buffer picker from any surface.
+///
+/// The picker lists the context's own surfaces, and a context that has
+/// never shown Home -- Slack's is the one the reader is in most -- offered
+/// every surface except the one they want back. Home is every context's,
+/// so the row is there whether or not it has been opened, and choosing it
+/// opens it.
+#[gpui::test]
+fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // Slack's context, before anything of Slack's has been opened
+            // in it: the list is empty and Home has never been shown here.
+            workspace.active_context = crate::workspace::ContextId::Slack;
+            let home = workspace
+                .buffer_table()
+                .into_iter()
+                .filter(|(name, _)| name == "home")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                home,
+                vec![("home".to_owned(), "home".to_owned())],
+                "one home row, in a context that has never shown it"
+            );
+
+            workspace.switch_buffer("home", window, cx);
+            assert!(workspace.home_in_view(), "and choosing it opens Home");
+
+            let home = workspace
+                .buffer_table()
+                .into_iter()
+                .filter(|(name, _)| name == "home")
+                .count();
+            assert_eq!(home, 1, "and it is still one row, not two");
+        })
+        .unwrap();
+}
