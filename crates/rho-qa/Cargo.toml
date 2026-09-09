@@ -34,3 +34,6 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 tempfile.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+rho-db.workspace = true
+senax-encoder.workspace = true
