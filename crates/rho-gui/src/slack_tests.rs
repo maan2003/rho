@@ -2531,3 +2531,110 @@ async fn wait_for_muted(
     }
     fake.muted()
 }
+
+/// `tab` over a Slack conversation opens the verdicts, and `tab` again,
+/// from the menu's own row, is Home.
+///
+/// The same rule as an agent card: HOME-DESIGN says the verdicts open on
+/// any surface that is a card, and a Slack conversation is one. It held
+/// only for a unit the dealer had a card for, so walking into a channel
+/// Slack was quiet about answered `tab` with Home -- and a channel is
+/// exactly where the reader wants `x`, `s` or a name.
+#[gpui::test]
+async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
+    cx: &mut TestAppContext,
+) {
+    use rho_slack::fake::Fake;
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    cx.executor().allow_parking();
+    let fake = cx
+        .update(|cx| gpui_tokio::Tokio::spawn(cx, async { Fake::start().await }))
+        .await
+        .unwrap()
+        .unwrap();
+    seed_workspace(&fake);
+
+    // A desk of the primary host's, so the unit the fake is asking about
+    // is a row and the dealer has a card to deal.
+    let desk = crate::tests::DeskFixture::new();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            crate::tests::story::feed(
+                workspace,
+                rho_agents::HostId::default(),
+                desk.synced(),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    let state = tempfile::tempdir().expect("a state directory of this test's own");
+    let workspace = workspace_with_slack(cx, workspace, &fake, &state).await;
+    fake.push_frame(
+        serde_json::json!({"type": "message", "channel": "D1", "ts": "1800000100.000000", "user": "UA", "text": "are you around?"}),
+    );
+    let unit = slack_unit("D1", None);
+    wait_for_reasons(cx, &workspace, std::slice::from_ref(&unit)).await;
+
+    // The dealt card.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.pull_card(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "tab over the dealt Slack card opens the verdicts"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the menu's own tab row closes it"
+            );
+            assert!(workspace.home_in_view(), "and lands on Home");
+        })
+        .unwrap();
+
+    // And a channel walked into rather than dealt: nothing is asking about
+    // `#random`, so before this it had no node and `tab` left for Home.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_slack_source(
+                crate::slack::unit_source(&slack_unit("C2", None)),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "tab over a conversation the dealer has no card for opens them too"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.home_in_view(), "and tab again is Home from there");
+        })
+        .unwrap();
+}

@@ -1607,6 +1607,16 @@ fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> rho_journal::Slack
 }
 
 impl Workspace {
+    /// The unit a conversation surface stands for: the desk's own id for
+    /// what is on screen, whether or not the desk has a card for it. Only
+    /// the workspace's name comes from the session, so this is `None`
+    /// exactly when there is no session at all.
+    pub(crate) fn slack_surface_unit(&self, source: &Source, cx: &gpui::App) -> Option<SlackUnit> {
+        let session = self.slack.session()?;
+        let workspace = session.read(cx).model().workspace().clone();
+        Some(unit_of_source(&workspace, source))
+    }
+
     /// What every tracked unit is currently about. The dealer reads this
     /// live from the mirror rather than storing any of it in the tree.
     ///

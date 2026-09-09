@@ -88,7 +88,7 @@ impl Workspace {
                 crate::home::HomeTarget::None => {}
             }
         }
-        self.surface_node()
+        self.surface_node(cx)
     }
 
     /// Where a new thing can go: what is on screen, the labels, and the

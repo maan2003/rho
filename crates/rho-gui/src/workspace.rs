@@ -5635,7 +5635,7 @@ impl Workspace {
     /// carries, and says what it is about. `About` is the whole of the
     /// relation, so it is also how the second press finds the note again.
     pub(crate) fn open_notes_for_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((host, node_id)) = self.surface_node() else {
+        let Some((host, node_id)) = self.surface_node(cx) else {
             self.notice_on(
                 None,
                 "notes: nothing here to file a note under",
@@ -5758,7 +5758,7 @@ impl Workspace {
         cells
     }
 
-    pub(crate) fn surface_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub(crate) fn surface_node(&self, cx: &App) -> Option<(HostId, rho_desk::cells::Id)> {
         let card = match &self.active_surface().key {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
@@ -5767,19 +5767,16 @@ impl Workspace {
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Terminal { agent_id, .. } => self.dashboard.agent_card_id(*agent_id),
             SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
-            SurfaceKey::SlackConversation(rho_slack::session::Source::Thread(key)) => self
-                .dashboard
-                .thread_card_id(&crate::slack::store_unit_of(key)),
-            // A channel surface is dealt for one of its messages, and that
-            // message is what has a node. With several open in the same
-            // channel, the newest is the one the reader was sent to.
-            SurfaceKey::SlackConversation(rho_slack::session::Source::Conversation(channel)) => {
-                self.dashboard
-                    .open_thread_cards()
-                    .into_iter()
-                    .filter(|(_, unit)| unit.channel == channel.0)
-                    .max_by(|(_, left), (_, right)| left.thread.cmp(&right.thread))
-                    .map(|(card, _)| card)
+            // A conversation or a thread is the unit itself, dealt or not.
+            // The dealer's card carries the same id when there is one, and
+            // when there is none the unit still names the thing on screen,
+            // the way an agent's transcript names the agent. Reading the
+            // card was what made `tab` do nothing in a conversation Slack
+            // was not asking about: a unit rho has written nothing about is
+            // no node yet, and a verdict is what makes it one.
+            SurfaceKey::SlackConversation(source) => {
+                let unit = self.slack_surface_unit(source, cx)?;
+                return Some((self.hosts.primary()?, rho_desk::cells::Id::Slack(unit)));
             }
             _ => None,
         }?;
@@ -6983,7 +6980,7 @@ impl Workspace {
         // the row under the cursor when the map is what they are reading.
         // The card in hand is the target only when it is that thing, so
         // filing a page while a Slack card sits in the queue files the page.
-        if let Some(node) = self.surface_node() {
+        if let Some(node) = self.surface_node(cx) {
             return Some(node);
         }
         self.context_area(cx)
@@ -7010,7 +7007,7 @@ impl Workspace {
         if self.home_in_view() {
             return self.context_area(cx);
         }
-        self.surface_node()
+        self.surface_node(cx)
     }
 
     /// The card the reader is on: the one behind the surface in view, or
