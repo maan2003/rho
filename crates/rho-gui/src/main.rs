@@ -541,9 +541,28 @@ impl ProfileCheckpoint {
         // The work ring is global and keeps its own history, so it is read
         // here rather than collected into the snapshot: there is nothing
         // per-checkpoint to accumulate.
-        let result = export_frame_profile(&self.frame_path, snapshot.frames.clone())
-            .and_then(|()| export_editor_profile(&self.editor_path, snapshot.editor.clone()))
-            .and_then(|()| export_work_profile(&self.work_path));
+        let (work, pushed) = gpui::profiler::snapshot_main_thread_work();
+        // One origin for all three series. Each used to count from its own
+        // first record, which made a span's `start_ns` and a frame's
+        // `draw_start_ns` two different clocks that happened to share a unit:
+        // a prepaint pass could not be read against the frame it belonged to,
+        // because the offset between them was the gap between the first work
+        // span and the first draw and nothing said what that was. The earliest
+        // record of the three is used rather than a fixed process start so
+        // that nothing lands before zero.
+        let anchor = [
+            snapshot.frames.first().map(|frame| frame.draw_start),
+            snapshot.editor.first().map(|timing| timing.start),
+            work.first().map(|work| work.start),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let result = export_frame_profile(&self.frame_path, snapshot.frames.clone(), anchor)
+            .and_then(|()| {
+                export_editor_profile(&self.editor_path, snapshot.editor.clone(), anchor)
+            })
+            .and_then(|()| export_work_profile(&self.work_path, work, pushed, anchor));
         WRITING_PROFILE.set(false);
         result
     }
@@ -633,14 +652,17 @@ fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
     }
 }
 
-fn export_editor_profile(path: &Path, timings: Vec<gpui::profiler::EditorTiming>) -> Result<()> {
-    let anchor = timings.first().map(|timing| timing.start);
+fn export_editor_profile(
+    path: &Path,
+    timings: Vec<gpui::profiler::EditorTiming>,
+    anchor: Option<gpui::profiler::Instant>,
+) -> Result<()> {
     let events = timings
         .into_iter()
         .map(|timing| EditorRecord {
             stage: editor_stage_name(timing.kind),
             start_ns: anchor
-                .map(|anchor| duration_ns(timing.start.duration_since(anchor)))
+                .map(|anchor| duration_ns(timing.start.saturating_duration_since(anchor)))
                 .unwrap_or(0),
             duration_ns: duration_ns(timing.end.duration_since(timing.start)),
             tid: timing.tid,
@@ -685,9 +707,12 @@ fn export_editor_profile(path: &Path, timings: Vec<gpui::profiler::EditorTiming>
     write_json_atomic(path, &profile)
 }
 
-fn export_work_profile(path: &Path) -> Result<()> {
-    let (work, pushed) = gpui::profiler::snapshot_main_thread_work();
-    let anchor = work.first().map(|work| work.start);
+fn export_work_profile(
+    path: &Path,
+    work: Vec<gpui::profiler::MainThreadWork>,
+    pushed: u64,
+    anchor: Option<gpui::profiler::Instant>,
+) -> Result<()> {
     let spans = work
         .into_iter()
         .map(|work| WorkRecord {
@@ -729,14 +754,17 @@ fn export_work_profile(path: &Path) -> Result<()> {
     write_json_atomic(path, &profile)
 }
 
-fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) -> Result<()> {
-    let anchor = timings.first().map(|timing| timing.draw_start);
+fn export_frame_profile(
+    path: &Path,
+    timings: Vec<gpui::profiler::FrameTiming>,
+    anchor: Option<gpui::profiler::Instant>,
+) -> Result<()> {
     let frames = timings
         .into_iter()
         .map(|timing| FrameRecord {
             window_id: timing.window_id.as_u64(),
             draw_start_ns: anchor
-                .map(|anchor| duration_ns(timing.draw_start.duration_since(anchor)))
+                .map(|anchor| duration_ns(timing.draw_start.saturating_duration_since(anchor)))
                 .unwrap_or(0),
             draw_ns: duration_ns(timing.draw_duration()),
             prepaint_ns: duration_ns(timing.prepaint_duration()),
@@ -895,6 +923,76 @@ mod profile_checkpoint_tests {
             editor_path: editor_path.clone(),
             work_path: work_path.clone(),
         }
+    }
+
+    /// A span from inside a frame lands inside that frame's window.
+    ///
+    /// The three series used to be numbered from their own first record, so
+    /// a work span and a frame each counted from a different moment and the
+    /// offset between them was unrecoverable: a prepaint pass could not be
+    /// read against the draw it was part of. Here the first work span is
+    /// deliberately older than the first frame, which is what pulled them
+    /// apart, and the pass inside the frame must still land inside it.
+    #[test]
+    fn a_span_inside_a_frame_lands_inside_that_frame() {
+        use gpui::profiler::{MainThreadWork, MainThreadWorkKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint(directory.path());
+        gpui::profiler::set_frame_trace_enabled(true);
+        let base = gpui::profiler::Instant::now();
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        // Older than any frame, and the reason the two clocks disagreed.
+        gpui::profiler::record_main_thread_work(MainThreadWork {
+            owner: MainThreadWorkKind::Other("test/before_any_frame"),
+            start: base,
+            end: at(1),
+            work_units: 0,
+        });
+        gpui::profiler::record_main_thread_work(MainThreadWork {
+            owner: MainThreadWorkKind::Other("test/inside_the_frame"),
+            start: at(101),
+            end: at(102),
+            work_units: 39,
+        });
+        checkpoint
+            .state
+            .lock()
+            .unwrap()
+            .collected_frames
+            .push(gpui::profiler::FrameTiming {
+                window_id: gpui::WindowId::default(),
+                work: Default::default(),
+                dirty_at: None,
+                invalidations: 1,
+                draw_start: at(100),
+                prepaint_end: at(103),
+                paint_end: at(104),
+                draw_end: at(105),
+            });
+
+        let snapshot = checkpoint.snapshot();
+        checkpoint.install_locked(&snapshot, true).unwrap();
+
+        let frames: serde_json::Value =
+            serde_json::from_slice(&fs::read(&checkpoint.frame_path).unwrap()).unwrap();
+        let work: serde_json::Value =
+            serde_json::from_slice(&fs::read(&checkpoint.work_path).unwrap()).unwrap();
+        let frame = &frames["frames"][0];
+        let draw_start = frame["draw_start_ns"].as_u64().unwrap();
+        let draw_end = draw_start + frame["draw_ns"].as_u64().unwrap();
+        let span = work["spans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|span| span["owner"] == "test/inside_the_frame")
+            .expect("the span that was recorded inside the frame");
+        let start = span["start_ns"].as_u64().unwrap();
+        assert!(
+            (draw_start..draw_end).contains(&start),
+            "a span recorded inside the frame reads as outside it: \
+             span at {start} ns, frame {draw_start}..{draw_end} ns"
+        );
     }
 
     #[test]

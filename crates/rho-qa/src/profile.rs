@@ -36,6 +36,11 @@ const DRAW_BUDGET_MS: f64 = 4.0;
 /// out of the between-frame work rather than beside it.
 const IN_FRAME: &str = "prepaint/";
 
+/// The editor's whole prepaint, recorded on every frame rather than only on
+/// the long ones. It is the sum of the passes under it, so it is read on its
+/// own and never ranked beside them.
+const EDITOR_PREPAINT: &str = "prepaint/editor";
+
 /// The summary of one session's profile, printed on `rig down` and kept in
 /// the rig's session entry so a landing note can quote it verbatim.
 #[derive(Serialize, Deserialize)]
@@ -62,6 +67,16 @@ pub struct Summary {
     /// would count the same milliseconds twice.
     #[serde(default)]
     pub in_frame: Vec<Work>,
+    /// The editor element's whole prepaint, every frame it drew. Read
+    /// against `window_prepaint_p50_ms` it says how much of the window's
+    /// prepaint the editor is answerable for, which the passes cannot say:
+    /// they only record when a prepaint went long.
+    #[serde(default)]
+    pub editor_prepaint: Option<Work>,
+    /// The window's own prepaint p50, from the frame log, so the pair above
+    /// has something to be a share of.
+    #[serde(default)]
+    pub window_prepaint_p50_ms: f64,
     pub events: u64,
     /// Where the samples landed, deepest frame first, richest three.
     pub top: Vec<Symbol>,
@@ -154,6 +169,10 @@ pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Sum
         })
         .partition(|held| held.owner.starts_with(IN_FRAME));
     work.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
+    let editor_prepaint = in_frame
+        .iter()
+        .position(|held| held.owner == EDITOR_PREPAINT)
+        .map(|at| in_frame.remove(at));
     in_frame.sort_by(|left, right| right.total_ms.total_cmp(&left.total_ms));
 
     let mut summary = Summary {
@@ -171,6 +190,8 @@ pub fn summarize_with_chains(profile: &Path, chains: Option<&str>) -> Result<Sum
         slowest_stage,
         work,
         in_frame,
+        editor_prepaint,
+        window_prepaint_p50_ms: frames.summary.prepaint_ms.p50,
         events: editor.event_count,
         top: cpu.top,
         samples: cpu.samples,
@@ -223,6 +244,16 @@ impl Summary {
         // of it spent the milliseconds on the frames that went long. Only
         // those frames record, so the span count is how many went long and
         // the rows are the visible range each of them drew.
+        // The editor's whole prepaint, every frame, beside the window's: the
+        // share is the point. A window prepaint over budget with a small
+        // editor share is not the editor's to fix, and the passes below
+        // cannot say so because they only record past their own floor.
+        if let Some(editor) = &self.editor_prepaint {
+            line.push_str(&format!(
+                "; editor prepaint {} frames, p50 {:.2} p99 {:.2} ms of a window p50 {:.2} ms",
+                editor.spans, editor.p50_ms, editor.p99_ms, self.window_prepaint_p50_ms
+            ));
+        }
         if let Some(pass) = self.in_frame.first() {
             line.push_str(&format!(
                 "; longest prepaint pass {} {} spans {:.0} ms total, p50 {:.2} p99 {:.2} ms at {:.0} rows",
@@ -276,6 +307,7 @@ struct FrameLog {
 struct FrameSummary {
     frame_count: u64,
     draw_ms: Distribution,
+    prepaint_ms: Distribution,
     dirty_to_draw_ms: Distribution,
 }
 
@@ -550,6 +582,8 @@ mod tests {
             slowest_stage: None,
             work: Vec::new(),
             in_frame: Vec::new(),
+            editor_prepaint: None,
+            window_prepaint_p50_ms: 0.0,
             events: 0,
             top: Vec::new(),
             samples: 0,
@@ -614,6 +648,8 @@ mod tests {
             slowest_stage: None,
             work: Vec::new(),
             in_frame: Vec::new(),
+            editor_prepaint: None,
+            window_prepaint_p50_ms: 0.0,
             events: 0,
             top: Vec::new(),
             samples: 0,
@@ -726,6 +762,68 @@ mod tests {
         );
     }
 
+    /// The editor's whole prepaint is the sum of the passes under it, so
+    /// ranking it beside them would name the whole as the costliest part and
+    /// say nothing. It is pulled out and read against the window's prepaint
+    /// instead, which is the number that says whose the frame's cost is.
+    #[test]
+    fn the_whole_editor_prepaint_is_read_against_the_window_not_its_own_passes() {
+        let held = |owner: &str, spans: usize, total_ms: f64, p50: f64, p99: f64| Work {
+            owner: owner.to_owned(),
+            spans,
+            total_ms,
+            p50_ms: p50,
+            p99_ms: p99,
+            units: 39.0,
+        };
+        let mut in_frame = vec![
+            held("prepaint/editor", 1557, 900.0, 0.42, 2.90),
+            held("prepaint/shape_lines", 18, 64.2, 2.54, 3.99),
+        ];
+        let editor_prepaint = in_frame
+            .iter()
+            .position(|held| held.owner == EDITOR_PREPAINT)
+            .map(|at| in_frame.remove(at));
+        assert_eq!(
+            in_frame
+                .iter()
+                .map(|held| held.owner.as_str())
+                .collect::<Vec<_>>(),
+            ["prepaint/shape_lines"],
+            "the whole prepaint was left to compete with its own passes"
+        );
+        let summary = Summary {
+            profile: "gui.bin".to_owned(),
+            frames: 1557,
+            draw_p99_ms: 6.19,
+            draw_max_ms: 26.12,
+            over_budget: 194,
+            worst_gap_ms: 43.0,
+            gap_p99_ms: 23.0,
+            slowest_stage: None,
+            work: Vec::new(),
+            in_frame,
+            editor_prepaint,
+            window_prepaint_p50_ms: 1.64,
+            events: 0,
+            top: Vec::new(),
+            samples: 0,
+            thread: None,
+            line: String::new(),
+        };
+        let line = summary.render();
+        assert!(
+            line.contains(
+                "; editor prepaint 1557 frames, p50 0.42 p99 2.90 ms of a window p50 1.64 ms"
+            ),
+            "the editor's share of the window is not on the line: {line}"
+        );
+        assert!(
+            line.contains("longest prepaint pass prepaint/shape_lines"),
+            "the longest pass is the whole prepaint rather than a pass: {line}"
+        );
+    }
+
     /// The clause the answer is read off, on a summary holding both kinds:
     /// the between-frames number keeps its own words and the pass gets its
     /// own, with rows rather than units, because a pass counts the visible
@@ -751,6 +849,8 @@ mod tests {
             slowest_stage: None,
             work: vec![held("desk_sync", 48, 323.9, 1.0)],
             in_frame: vec![held("prepaint/lines", 9, 37.1, 50.0)],
+            editor_prepaint: None,
+            window_prepaint_p50_ms: 0.0,
             events: 0,
             top: Vec::new(),
             samples: 0,

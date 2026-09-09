@@ -8414,7 +8414,14 @@ impl PrepaintPasses {
         self.last = now;
     }
 
-    /// Closes the last segment and records the lot, if the prepaint went long.
+    /// Records the prepaint whole, always, and the passes it broke into only
+    /// when it went long.
+    ///
+    /// The whole is recorded every frame because the question a gated
+    /// instrument cannot answer is how much of the window's prepaint the
+    /// editor holds on an ordinary frame: a 3 ms floor hides every prepaint
+    /// under it, so a window spending 3.5 ms with the editor taking 0.4 of
+    /// it reads exactly like one that drew no editor at all.
     ///
     /// `rows` is the visible range, so a segment's cost per row means what a
     /// frame's does; a pass that is flat in the rows drawn and long anyway is
@@ -8422,6 +8429,12 @@ impl PrepaintPasses {
     fn finish(mut self, rows: u64) {
         self.mark("prepaint/rest");
         let ended = self.last;
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("prepaint/editor"),
+            start: self.started,
+            end: ended,
+            work_units: rows,
+        });
         if ended.saturating_duration_since(self.started) < Self::LONG {
             return;
         }

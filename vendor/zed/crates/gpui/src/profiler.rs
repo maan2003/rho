@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use scheduler::{Instant, SpawnTime};
+use scheduler::SpawnTime;
 use std::{
     cell::LazyCell,
     collections::{HashMap, VecDeque},
@@ -15,6 +15,10 @@ use std::{
 mod actions;
 pub use actions::{ActionStatistics, ActionTiming, take_action_stats};
 pub(crate) use actions::{save_action_timing, update_running_action};
+/// The clock every timing here is stamped with. Public because the structs
+/// that carry it are: a caller that reads `MainThreadWork::start` needs to
+/// be able to name what it read.
+pub use scheduler::Instant;
 
 use serde::{Deserialize, Serialize};
 
