@@ -2204,8 +2204,10 @@ async fn handle_message(
             );
             let device = session.device;
             match services.desk_cells.apply_mutation(device, mutation).await {
+                // No answer goes back. The write was done on the client
+                // when the client made it; what the other devices need is
+                // the poke that says there is something to sync.
                 Ok(()) => {
-                    let _ = outgoing_tx.send(ServerMessage::DeskMutationAccepted { stamp });
                     let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
                     let _ = services
                         .events
@@ -4279,7 +4281,7 @@ mod tests {
         let device = DeviceId([7; 16]);
 
         let (older_tx, mut older_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (newer_tx, mut newer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (newer_tx, _newer_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut older: Option<DeskSession> = None;
         let mut newer: Option<DeskSession> = None;
 
@@ -4347,12 +4349,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let answered = std::iter::from_fn(|| newer_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            answered
-                .iter()
-                .any(|message| matches!(message, ServerMessage::DeskMutationAccepted { .. })),
-            "the live window's write lands: {answered:?}"
+        // Nothing is sent back for it, so the store is where the answer is.
+        assert_eq!(
+            services
+                .desk_cells
+                .frontier()
+                .unwrap()
+                .get(&device)
+                .copied(),
+            Some(1),
+            "the live window's write lands"
         );
     }
 

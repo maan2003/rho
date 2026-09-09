@@ -559,7 +559,6 @@ impl Workspace {
                 if self.shell_touches.len() == 1
                     && self.phone.snap.is_none()
                     && self.phone.stack.is_empty()
-                    && !self.phone_current_deal_has_pending_tree_verdict(cx)
                     && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
                     && self.minibuffer.is_none()
                 {
@@ -944,18 +943,6 @@ impl Workspace {
             .push(PhoneTransition::Verdict(sequence));
     }
 
-    pub(super) fn phone_current_deal_has_pending_tree_verdict(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(card) = self.open_card_in_view(cx) else {
-            return false;
-        };
-        self.pending_tree_verdicts
-            .values()
-            .any(|pending| pending.event.card == card.identity)
-    }
-
     pub(super) fn phone_snap_in_progress(&self) -> bool {
         self.phone.snap.is_some()
     }
@@ -985,28 +972,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict(cx) {
+        if self.phone.snap.is_some() {
             return;
         }
         let before = self.open_card_in_view(cx).map(|card| card.identity);
-        let pending_before = self.pending_tree_verdicts.len();
         let undo_before = self.verdict_undo.last().map(|entry| entry.sequence);
         run(self, window, cx);
         cx.defer_in(window, move |this, _window, cx| {
             let after = this.open_card_in_view(cx).map(|card| card.identity);
-            let submitted = this.pending_tree_verdicts.len() > pending_before;
-            if before.is_some() && (before != after || submitted) {
-                if !submitted
-                    && let Some(sequence) = this.verdict_undo.last().map(|entry| entry.sequence)
+            if before.is_some() && before != after {
+                // A verdict that wrote a cell finished inside `run` and
+                // told the phone itself; what is left here is the one that
+                // only moved the card, which still owes the strip its
+                // transition and its record.
+                if let Some(sequence) = this.verdict_undo.last().map(|entry| entry.sequence)
                     && Some(sequence) != undo_before
                 {
                     this.phone
                         .transitions
                         .push(PhoneTransition::Verdict(sequence));
                 }
-                if !submitted {
-                    this.record_phone_verdict(verdict, cx);
-                }
+                this.record_phone_verdict(verdict, cx);
             }
         });
     }

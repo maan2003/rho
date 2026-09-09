@@ -250,14 +250,34 @@ takes the answer as a first sync. One round trip, and at no point is the
 user reading one desk made of two stores. This is the reason the daemon
 commit is the sensitive one.
 
-**What the replica holds today.** `confirmed` — the cells the daemon has
-sent back — and not `view`, so a client that dies with a write in flight
-opens without it. That was right while the daemon could refuse a write;
-it no longer can (9 Sep, see STORE-DESIGN, "The daemon does not refuse a
-desk mutation"), so a write the user has been shown is real from the
-moment it is in the local replica, and the replica is what has to hold
-it. The client's completion model is the next commit, and this paragraph
-goes with it.
+**What the replica holds.** Everything the client has written and
+everything the daemon has sent, which since 9 Sep is the same store: a
+write goes into the view and into the replica on disk in the same breath,
+before the message goes out. It used to hold only what the daemon had
+acknowledged, on the reasoning that a write in flight was the daemon's to
+accept or refuse; the daemon does not refuse any more, so a write the
+reader has been shown is theirs and a client that is closed a moment
+later must open holding it.
+
+**A verdict is complete when it is written here.** Not when a
+`DeskMutationAccepted` comes back: that message is gone, and the queues
+that waited on it with it. The undo is armed, the dealer is told, the
+card leaves and the bar says so, all in the keystroke that made the
+verdict. What goes out to the daemon is a copy for the other devices,
+and nothing on this one waits for it. Offline, the desk works.
+
+**The cold-open gate reads "the client's replica is loaded".** The rule
+it guards is unchanged: nothing is dealt until the store has been read,
+because a client that has not read it cannot say the user did not put
+this agent away yesterday. What changed is where that reading comes
+from. The replica is opened in `Workspace::new`, before a socket exists,
+so Home's first draw is the user's own desk rather than a list waiting
+on a daemon.
+
+**Next: bodies do not resume from the mirror.** A note's text is still
+sent whole on every sync and the replica's copy is not what the reader
+opens on. That is the next step on this path, and it is not in this
+change. It needs per-body versions.
 
 **The daemon does not refuse a mutation.** It merges every one it can
 decode; last-writer-wins is the whole rule. Nothing on the desk waits for

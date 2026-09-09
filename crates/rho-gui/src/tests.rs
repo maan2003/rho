@@ -583,19 +583,11 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
     cx.run_until_parked();
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.run_until_parked();
-    // A tree verdict lands when the daemon accepts it.
+    // The verdict is done when it is written here; the mutation on the wire
+    // is a copy going out, not a question.
     workspace
-        .update(cx, |workspace, window, cx| {
-            let stamp = take_desk_mutation(workspace, HostId::default())
-                .expect("verdict mutation")
-                .stamp;
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
         })
         .unwrap();
     cx.run_until_parked();
@@ -635,20 +627,10 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
     })
     .unwrap();
     cx.run_until_parked();
-    // The undo is a mutation like any other: the card comes back when the
-    // daemon has taken it.
+    // The undo is a mutation like any other, and the card is back already.
     workspace
-        .update(cx, |workspace, window, cx| {
-            let stamp = take_desk_mutation(workspace, HostId::default())
-                .expect("undo mutation")
-                .stamp;
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
         })
         .unwrap();
     cx.run_until_parked();
@@ -683,165 +665,6 @@ fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext)
                     .desk_cells
                     .row_after_delete(HostId::default(), &first),
                 Some(second)
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppContext) {
-    // A note woken long ago, so the dealer offers it as a card.
-    let mut desk = DeskFixture::new();
-    let note = desk.note(None, "Pending phone verdict");
-    desk.set(
-        note.clone(),
-        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
-            unix_ms: 1_577_836_800_000,
-            precision: rho_desk::cells::TimestampPrecision::Day,
-        })),
-    );
-    desk.set(note, rho_desk::cells::Property::PaceDays(1));
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-
-    let identity = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.current_deal_card_for_test(cx).unwrap().0
-        })
-        .unwrap();
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.dispatch_action(*workspace, crate::UndoVerdict);
-    cx.run_until_parked();
-    let verdict_stamp = workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default())
-                .expect("tree verdict mutation")
-                .stamp
-        })
-        .unwrap();
-
-    // Neither another verdict, undo, nor an upward flick may move or mutate
-    // the card until the first verdict is acknowledged.
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    cx.update_window(*workspace, |_, window, cx| {
-        for event in [
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Started,
-                position: point(px(200.), px(600.)),
-                timestamp: std::time::Duration::ZERO,
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Moved,
-                position: point(px(200.), px(300.)),
-                timestamp: std::time::Duration::from_millis(80),
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(1),
-                phase: TouchPhase::Ended,
-                position: point(px(200.), px(300.)),
-                timestamp: std::time::Duration::from_millis(100),
-                ..Default::default()
-            },
-        ] {
-            window.dispatch_event(event.to_platform_input(), cx);
-        }
-    })
-    .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).unwrap().0,
-                identity
-            );
-            assert!(
-                workspace
-                    .take_host_messages_for_test(HostId::default())
-                    .into_iter()
-                    .all(|message| !matches!(
-                        message,
-                        rho_ui_proto::ClientMessage::DeskMutationApply { .. }
-                    ))
-            );
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted {
-                    stamp: verdict_stamp,
-                },
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-
-    cx.update_window(*workspace, |_, window, cx| {
-        for event in [
-            TouchEvent {
-                id: TouchId(2),
-                phase: TouchPhase::Started,
-                position: point(px(200.), px(250.)),
-                timestamp: std::time::Duration::ZERO,
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(2),
-                phase: TouchPhase::Moved,
-                position: point(px(200.), px(550.)),
-                timestamp: std::time::Duration::from_millis(80),
-                ..Default::default()
-            },
-            TouchEvent {
-                id: TouchId(2),
-                phase: TouchPhase::Ended,
-                position: point(px(200.), px(550.)),
-                timestamp: std::time::Duration::from_millis(100),
-                ..Default::default()
-            },
-        ] {
-            window.dispatch_event(event.to_platform_input(), cx);
-        }
-    })
-    .unwrap();
-    cx.run_until_parked();
-    let undo_stamp = workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default())
-                .expect("tree verdict undo mutation")
-                .stamp
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
-                window,
-                cx,
-            );
-            assert_eq!(
-                workspace.current_deal_card_for_test(cx).unwrap().0,
-                identity
             );
         })
         .unwrap();
@@ -1037,7 +860,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     cx.dispatch_action(*workspace, crate::DashboardDealTodo);
     cx.run_until_parked();
 
-    let (created, stamp) = workspace
+    let created = workspace
         .update(cx, |workspace, _, _| {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
             let Some((
@@ -1081,24 +904,17 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             );
             assert!(mutation.writes.iter().any(|write| write.id == note
                 && write.property == Property::State(rho_desk::cells::State::Done)));
-            // The daemon also requires the note to be parented on the heading.
+            // The new note is parented on the heading it was written on.
             assert!(mutation.writes.iter().any(|write| write.id == created
                 && write.property == Property::Parent(Some(note.clone()))));
-            (created, mutation.stamp)
+            created
         })
         .unwrap();
 
     // A note with no words of its own comes back in a week saying only
     // `defer …`; it carries the words of the card it was written on.
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, cx| {
             let buffer = workspace
                 .desk_cells
                 .buffer(HostId::default(), &created)
@@ -4386,7 +4202,7 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
     // dealer flow: bare Enter accepts it rather than submitting an empty name.
     cx.dispatch_action(*workspace, crate::MinibufferConfirm);
     cx.run_until_parked();
-    let stamp = workspace
+    workspace
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
@@ -4400,18 +4216,10 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_label(cx: &mut Te
                 "the card is filed by the label it was dealt under: {:?}",
                 mutation.writes
             );
-            mutation.stamp
         })
         .unwrap();
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, _| {
             assert_eq!(workspace.verdict_undo_count_for_test(), 1);
             assert_eq!(workspace.echo_text_for_test(), Some("label: rho"));
         })
@@ -4603,9 +4411,10 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
                     (wrote.unix_ms - expected.unix_ms).abs() < 5_000,
                     "{keys}: woke at {wrote:?}, expected about {expected:?}"
                 );
-                // The words the bar will say once the daemon takes it.
+                // The words are said now: the verdict is done when it is
+                // written here, and the bar does not wait for a daemon.
                 assert_eq!(
-                    workspace.pending_verdict_echo_for_test(),
+                    workspace.echo_text_for_test(),
                     Some(format!("{said}: Card to snooze").as_str()),
                     "{keys}"
                 );
@@ -5118,22 +4927,13 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                         mutation.verdict,
                         Some((_, rho_desk::cells::VerdictEvent::Applied { .. }))
                     ));
+                    // Said as the verdict is made, not a round trip later.
+                    assert_eq!(workspace.echo_text_for_test(), Some($echo));
                     mutation.stamp
                 })
                 .unwrap();
-            workspace
-                .update(cx, |workspace, window, cx| {
-                    story::feed(workspace,
-                        HostId::default(),
-                        ConnEvent::DeskMutationAccepted { stamp },
-                        window,
-                        cx,
-                    );
-                    assert_eq!(workspace.echo_text_for_test(), Some($echo));
-                })
-                .unwrap();
             cx.dispatch_action(*workspace, crate::UndoVerdict);
-            let undo_stamp = workspace
+            workspace
                 .update(cx, |workspace, _, _| {
                     let mutation =
                         take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
@@ -5150,17 +4950,10 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                     assert_eq!(node.state, rho_desk::cells::State::Open);
                     assert_eq!(node.defer_until, Some(woke));
                     assert_eq!(node.pace_days, 1);
-                    mutation.stamp
                 })
                 .unwrap();
             workspace
-                .update(cx, |workspace, window, cx| {
-                    story::feed(workspace,
-                        HostId::default(),
-                        ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
-                        window,
-                        cx,
-                    );
+                .update(cx, |workspace, _, cx| {
                     assert_eq!(
                         workspace.current_deal_card_for_test(cx).map(|card| card.0),
                         Some(crate::dashboard::DealCardId {
@@ -5185,27 +4978,16 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     verdict_and_undo!(crate::DashboardDealSnooze, snoozed.as_str());
     verdict_and_undo!(crate::DashboardDealTodo, "todo: Named card");
 
-    // A delayed acknowledgement belongs to the submitted card, even if the
-    // user has moved on to another deal in the meantime.
+    // The echo belongs to the card the verdict was taken on, and it is said
+    // as the verdict is made rather than a round trip later.
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    let delayed = workspace
+    workspace
         .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default())
-                .expect("delayed verdict mutation")
-                .stamp
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
         })
         .unwrap();
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp: delayed },
-                window,
-                cx,
-            );
-            // The echo names the card the verdict was about, not whatever
-            // the reader has moved on to.
+        .update(cx, |workspace, _, _| {
             assert_eq!(workspace.echo_text_for_test(), Some("done: Named card"));
         })
         .unwrap();
@@ -6389,19 +6171,6 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             take_desk_mutation(workspace, HostId::default()).expect("verdict mutation")
         })
         .unwrap();
-    first
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted {
-                    stamp: mutation.stamp,
-                },
-                window,
-                cx,
-            );
-        })
-        .unwrap();
 
     // The daemon now holds the verdict; the second device is only poked.
     desk.store.apply_mutation(&mutation).unwrap();
@@ -6972,17 +6741,8 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, window, cx| {
-            let stamp = take_desk_mutation(workspace, HostId::default())
-                .expect("verdict mutation")
-                .stamp;
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
         })
         .unwrap();
     cx.run_until_parked();
@@ -9732,7 +9492,7 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    let (stamp, agent) = workspace
+    let (_stamp, agent) = workspace
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
@@ -9754,17 +9514,6 @@ fn undoing_a_filing_puts_back_the_label_it_took_off(cx: &mut TestAppContext) {
                 mutation.writes
             );
             (mutation.stamp, agent)
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
         })
         .unwrap();
 
@@ -9972,7 +9721,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
     cx.dispatch_action(*workspace, crate::MinibufferConfirm);
     cx.run_until_parked();
 
-    let (label, stamp) = workspace
+    let (label, _stamp) = workspace
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("label mutation");
@@ -10002,17 +9751,6 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
                 "and leaves its place alone"
             );
             (label, mutation.stamp)
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
         })
         .unwrap();
     cx.run_until_parked();
@@ -10891,22 +10629,9 @@ fn a_verdict_names_the_agent_it_took(cx: &mut TestAppContext) {
 
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.run_until_parked();
-    let stamp = workspace
-        .update(cx, |workspace, _, _| {
-            take_desk_mutation(workspace, HostId::default())
-                .expect("verdict mutation")
-                .stamp
-        })
-        .unwrap();
     workspace
-        .update(cx, |workspace, window, cx| {
-            story::feed(
-                workspace,
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp },
-                window,
-                cx,
-            );
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
             assert_eq!(workspace.echo_text_for_test(), Some("done: the deploy"));
         })
         .unwrap();

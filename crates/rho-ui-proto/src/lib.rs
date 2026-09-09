@@ -581,9 +581,6 @@ pub enum ServerMessage {
         delta: desk_tree::cells::Snapshot,
         bodies: Vec<desk_tree::cells::BodySnapshot>,
     },
-    DeskMutationAccepted {
-        stamp: desk_tree::cells::Stamp,
-    },
     DeskCellsAvailable {
         frontier: desk_tree::cells::Version,
     },

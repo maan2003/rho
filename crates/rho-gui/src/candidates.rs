@@ -47,11 +47,12 @@ pub(crate) struct HostNodes {
     /// The agents filed under each heading, for ranking a heading by how
     /// recently anything under it was touched.
     heading_agents: HashMap<Id, Vec<rho_core::AgentId>>,
-    /// Whether the host's desk had arrived when these nodes were read. An
-    /// empty desk and a desk that has not answered yet look identical from
-    /// the nodes alone, and they mean opposite things: the first says the
-    /// user has said nothing, the second says nobody has asked.
-    desk_synced: bool,
+    /// Whether the client held the host's desk when these nodes were
+    /// read, from its own replica or from the daemon. An empty desk and a
+    /// desk nobody has loaded yet look identical from the nodes alone, and
+    /// they mean opposite things: the first says the user has said
+    /// nothing, the second says nobody has read the store.
+    desk_loaded: bool,
 }
 
 impl HostNodes {
@@ -77,7 +78,7 @@ impl HostNodes {
             nodes,
             titles,
             desk.label_paths(host).into_iter().collect(),
-            desk.is_synced(host),
+            desk.is_loaded(host),
         )
     }
 
@@ -95,12 +96,12 @@ impl HostNodes {
             .note_titles(host, cx)
             .map(|titles| (*titles).clone())
             .unwrap_or_default();
-        let desk_synced = desk.is_synced(host);
+        let desk_loaded = desk.is_loaded(host);
         Self::build(
             nodes,
             titles,
             desk.label_paths(host).into_iter().collect(),
-            desk_synced,
+            desk_loaded,
         )
     }
 
@@ -109,7 +110,7 @@ impl HostNodes {
         nodes: Vec<DeskNode>,
         titles: HashMap<Id, String>,
         label_paths: HashMap<Id, String>,
-        desk_synced: bool,
+        desk_loaded: bool,
     ) -> Self {
         let mut by_id = HashMap::with_capacity(nodes.len());
         let mut children: HashMap<Id, Vec<usize>> = HashMap::new();
@@ -136,7 +137,7 @@ impl HostNodes {
             titles,
             label_paths,
             heading_agents: HashMap::new(),
-            desk_synced,
+            desk_loaded,
         };
         source.heading_agents = source.build_heading_agents();
         source
@@ -146,9 +147,9 @@ impl HostNodes {
         &self.nodes
     }
 
-    /// Whether the store these nodes came from had answered yet.
-    pub(crate) fn desk_synced(&self) -> bool {
-        self.desk_synced
+    /// Whether the store these nodes came from had been loaded.
+    pub(crate) fn desk_loaded(&self) -> bool {
+        self.desk_loaded
     }
 
     /// Where a node sits in the store's order, which is the tie-break a

@@ -728,12 +728,6 @@ impl DeskCells {
         self.sync(host)
     }
 
-    pub fn mutation_accepted(&mut self, host: HostId, stamp: Stamp) {
-        // Nothing to do but note it: the cells are already in the view and
-        // the poke that follows brings them into `confirmed`.
-        let _ = (host, stamp);
-    }
-
     /// What the sources say, for the join every view reads through. The
     /// workspace recomputes this from the registry and the Slack mirror;
     /// none of it is ever written to the store.
@@ -1323,16 +1317,18 @@ impl DeskCells {
 
     /// True while the host has answered a handshake, so callers can tell an
     /// empty desk from one that has not arrived yet.
-    pub fn is_synced(&self, host: HostId) -> bool {
+    /// The client holds this host's desk: from its own replica on disk or
+    /// from the daemon, which are the same thing to every reader.
+    pub fn is_loaded(&self, host: HostId) -> bool {
         self.hosts.contains_key(&host)
     }
 
-    /// Sends a mutation and shows it at once. The daemon's answer either
-    /// confirms it or takes it back.
-    /// A write this GUI makes. The view takes it at once and the map with
-    /// it, so a verdict shows before the round trip and costs its own
-    /// cells; the delta goes back to the caller, which is what the map and
-    /// the dealer are brought up on.
+    /// A write this GUI makes. It is done when it is here: the view takes
+    /// it, the map takes it, and the replica on disk takes it, all before
+    /// the message goes out. The daemon is a copy this client syncs
+    /// through, so nothing about the write waits on it. The delta goes
+    /// back to the caller, which is what the map and the dealer are
+    /// brought up on.
     pub fn apply(
         &mut self,
         host: HostId,
@@ -1340,6 +1336,7 @@ impl DeskCells {
         verdict: Option<(Id, VerdictEvent)>,
     ) -> Option<(ClientMessage, DeskDelta)> {
         let device = self.device;
+        let name = self.names.get(&host).cloned();
         let desk = self.hosts.get_mut(&host)?;
         if writes.is_empty() {
             return None;
@@ -1363,9 +1360,22 @@ impl DeskCells {
             writes,
             verdict,
         };
+        let before = desk.view.version().clone();
         if let Err(error) = desk.view.apply_mutation(&mutation) {
             tracing::error!(%error, "refusing to send an invalid Desk mutation");
             return None;
+        }
+        // Written down here rather than when the daemon answers. A verdict
+        // the reader has been shown is theirs, and a client that is closed
+        // before the round trip finishes must open holding it.
+        if let Some(name) = name {
+            rho_mirror::desk::write_delta(
+                &name,
+                desk.store,
+                desk.namespace,
+                desk.view.since(&before),
+                Vec::new(),
+            );
         }
         let mut delta = DeskDelta::default();
         for write in &mutation.writes {

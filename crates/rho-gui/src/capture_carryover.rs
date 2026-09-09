@@ -255,10 +255,10 @@ impl Workspace {
         }
         let notes = bodies.len() as u32;
         if !writes.is_empty() {
-            let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+            if self.apply_desk_writes(host, writes, None, window, cx).is_none() {
                 return;
-            };
-            self.pending_desk_texts.insert((host, stamp), bodies);
+            }
+            self.fill_note_bodies(host, bodies, cx);
             self.sync_tree_dashboard(host, window, cx);
         }
         mark_carried(&db);

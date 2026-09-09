@@ -76,9 +76,6 @@ pub enum ConnEvent {
         delta: rho_desk::cells::Snapshot,
         bodies: Vec<rho_desk::cells::BodySnapshot>,
     },
-    DeskMutationAccepted {
-        stamp: rho_desk::cells::Stamp,
-    },
     DeskCellsAvailable {
         frontier: rho_desk::cells::Version,
     },
@@ -1229,9 +1226,6 @@ async fn run(
                 delta,
                 bodies,
             }),
-            ServerMessage::DeskMutationAccepted { stamp } => {
-                Some(ConnEvent::DeskMutationAccepted { stamp })
-            }
             ServerMessage::DeskCellsAvailable { frontier } => {
                 Some(ConnEvent::DeskCellsAvailable { frontier })
             }

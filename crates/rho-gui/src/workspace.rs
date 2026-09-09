@@ -13,7 +13,7 @@
 
 #[path = "workspace_phone.rs"]
 mod phone;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -379,10 +379,6 @@ enum VerdictUndoState {
     },
 }
 
-struct PendingTreeUndo {
-    entry: VerdictUndo,
-}
-
 fn undo_sequence_insert_position(existing: impl Iterator<Item = u64>, sequence: u64) -> usize {
     existing
         .take_while(|candidate| *candidate < sequence)
@@ -497,18 +493,11 @@ pub struct Workspace {
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
     note_views: HashMap<(HostId, rho_desk::cells::Id), crate::note_view::NoteView>,
-    pending_tree_verdicts: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeVerdict>,
-    pending_tree_undos: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeUndo>,
-    /// Text a paste owes its new notes, held until the daemon accepts the
-    /// creation those notes came from.
-    pub(crate) pending_desk_texts:
-        BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::cells::Id, String)>>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
     desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_desk::cells::Id)>,
-    pending_semantic_batches: BTreeMap<(HostId, rho_desk::cells::Stamp), clock::Lamport>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     /// The browser pages the desk refers to, the ones on their way out, and
@@ -1027,14 +1016,10 @@ impl Workspace {
             mode_indicator,
             desk_cells: DeskCells::new(crate::desk_view::desk_device()),
             note_views: HashMap::new(),
-            pending_tree_verdicts: BTreeMap::new(),
-            pending_desk_texts: BTreeMap::new(),
-            pending_tree_undos: BTreeMap::new(),
             verdict_undo: Vec::new(),
             next_verdict_undo_sequence: 0,
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
-            pending_semantic_batches: BTreeMap::new(),
             pages: crate::browser::Pages::default(),
             zulip: crate::zulip::Zulip::default(),
             slack: crate::slack::Slack::default(),
@@ -1065,6 +1050,13 @@ impl Workspace {
         };
         for spec in specs {
             this.attach_host(spec, cx);
+        }
+        // The desk is this client's and its replica is on this disk, so it
+        // is read here, before a socket exists. Home's first draw then
+        // shows the user's own verdicts instead of a list that waits to
+        // hear from a daemon and deals what they put away yesterday.
+        for host in this.hosts.ids() {
+            this.open_desk_from_replica(host, window, cx);
         }
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
@@ -1659,14 +1651,14 @@ impl Workspace {
     /// before a word has been exchanged with the daemon. A host the copy
     /// has never held is left alone: that is the one case where the
     /// client really has not read a store, and the readers that ask
-    /// `is_synced` are right to wait.
+    /// `is_loaded` are right to wait.
     fn open_desk_from_replica(
         &mut self,
         host: HostId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.desk_cells.is_synced(host) {
+        if self.desk_cells.is_loaded(host) {
             return;
         }
         let name = self.hosts.host_label(host);
@@ -2012,13 +2004,6 @@ impl Workspace {
             ConnEvent::DeskResyncRequired => {
                 let sync = self.desk_cells.resync_required(host);
                 self.send_to_host(host, sync);
-            }
-            ConnEvent::DeskMutationAccepted { stamp } => {
-                // The cells are already in the view and the map: the write
-                // that made them went through this client. Nothing about
-                // the map has moved, so nothing about it is drawn again.
-                self.desk_cells.mutation_accepted(host, stamp);
-                self.complete_desk_mutation(host, stamp, window, cx);
             }
             ConnEvent::DeskTextApplied { id, operation } => {
                 // A body edit from another device moves that note's words
@@ -3172,9 +3157,11 @@ impl Workspace {
             cx,
         ) {
             self.echo("todo: the note is unavailable", StyleClass::SystemInfo, cx);
-            return;
         }
-        self.echo(&format!("todo: {days}d"), StyleClass::SystemInfo, cx);
+        // The pace was echoed here only because the verdict's own words
+        // waited on the daemon. They are said as the verdict is made now,
+        // and a second line over the top of them would take the card's
+        // name back off the bar.
     }
 
     /// `shift-s`: the room the card sits in goes quiet, not the card.
@@ -5984,23 +5971,16 @@ impl Workspace {
         Some(stamp)
     }
 
-    /// The daemon took the mutation. Everything that was waiting on that
-    /// answer happens here, in the order the user sees it.
-    fn complete_desk_mutation(
+    /// The words a just-created note owes its buffer. The write made the
+    /// buffers before this is reached, so each body is typed straight in
+    /// and each edit sends its own text operation.
+    pub(crate) fn fill_note_bodies(
         &mut self,
         host: HostId,
-        stamp: rho_desk::cells::Stamp,
-        window: &mut Window,
+        bodies: Vec<(rho_desk::cells::Id, String)>,
         cx: &mut Context<Self>,
     ) {
-        self.pending_semantic_batches.remove(&(host, stamp));
-        // Pasted notes exist now, so their bodies can be typed into the
-        // buffers the sync just created. Each edit sends its own text op.
-        for (node_id, text) in self
-            .pending_desk_texts
-            .remove(&(host, stamp))
-            .unwrap_or_default()
-        {
+        for (node_id, text) in bodies {
             let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
                 continue;
             };
@@ -6008,18 +5988,12 @@ impl Workspace {
                 buffer.edit([(0..0, text.as_str())], None, cx);
             });
         }
-        if let Some(verdict) = self.pending_tree_verdicts.remove(&(host, stamp)) {
-            self.complete_tree_verdict(verdict, window, cx);
-        }
-        if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
-            self.complete_verdict_undo(undone.entry, window, cx);
-        }
     }
 
     /// The verdict is made: the undo is armed, the dealer is told, and the
-    /// card leaves. Reached from the daemon's acceptance for every verdict
-    /// that writes a cell, and straight away for the one that does not --
-    /// done on a Slack unit, which is rho's own cursor and nothing else.
+    /// card leaves. Reached as soon as the write is in the client's own
+    /// replica, which is where the desk lives; the daemon is a copy this
+    /// client syncs through and the verdict does not wait on it.
     fn complete_tree_verdict(
         &mut self,
         verdict: PendingTreeVerdict,
@@ -6935,17 +6909,6 @@ impl Workspace {
         self.menu_buffer.as_ref().is_some_and(|open| open.verdict)
     }
 
-    /// What the bar will say once the daemon takes the verdict. The echo
-    /// waits for that, so a test that stops at the mutation has to look
-    /// here to see the words the reader is promised.
-    #[cfg(test)]
-    pub(crate) fn pending_verdict_echo_for_test(&self) -> Option<&str> {
-        self.pending_tree_verdicts
-            .values()
-            .next_back()
-            .map(|pending| pending.echo.as_str())
-    }
-
     fn has_modal_overlay(&self) -> bool {
         self.minibuffer.is_some() || self.menu_buffer.is_some() || self.git_approval.waiting()
     }
@@ -7138,10 +7101,7 @@ impl Workspace {
     /// and open the most important of the rest. Nothing is retained, so two
     /// pulls in a row see the same world and the skip is what moves them on.
     pub(crate) fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.phone.enabled
-            && (self.phone_snap_in_progress()
-                || self.phone_current_deal_has_pending_tree_verdict(cx))
-        {
+        if self.phone.enabled && self.phone_snap_in_progress() {
             return;
         }
         let now = chrono::Local::now().fixed_offset();
@@ -7325,14 +7285,15 @@ impl Workspace {
                 .phone
                 .enabled
                 .then_some(rho_journal::PhoneVerdict::File);
-            self.pending_tree_verdicts.insert(
-                (host, stamp),
+            self.complete_tree_verdict(
                 PendingTreeVerdict {
                     event,
                     echo: said,
                     undo,
                     phone_verdict,
                 },
+                window,
+                cx,
             );
             return;
         }
@@ -7586,10 +7547,7 @@ impl Workspace {
     }
 
     pub(crate) fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.phone.enabled
-            && (self.phone_snap_in_progress()
-                || self.phone_current_deal_has_pending_tree_verdict(cx))
-        {
+        if self.phone.enabled && self.phone_snap_in_progress() {
             return;
         }
         let Some(entry) = self.verdict_undo.pop() else {
@@ -7606,22 +7564,24 @@ impl Workspace {
                 self.undo_marked_read_before(entry, host, nodes, window, cx);
             }
             VerdictUndoState::DeskVerdict { host, node, at, .. } => {
-                // Undo is the log's own inverse: the daemon accepts `Undone`
-                // only while the cells still hold what the verdict wrote.
+                // Undo is the log's own inverse, and whether it can be made
+                // is asked here: a fact that has moved on since the verdict
+                // is nothing to put back.
                 let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
                 else {
                     self.restore_verdict_undo(entry);
                     self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
                 };
-                let Some(stamp) = self.apply_desk_writes(host, writes, Some(verdict), window, cx)
-                else {
+                if self
+                    .apply_desk_writes(host, writes, Some(verdict), window, cx)
+                    .is_none()
+                {
                     self.restore_verdict_undo(entry);
                     self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
-                };
-                self.pending_tree_undos
-                    .insert((host, stamp), PendingTreeUndo { entry });
+                }
+                self.complete_verdict_undo(entry, window, cx);
             }
         }
     }
@@ -7635,10 +7595,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.phone.enabled
-            && (self.phone_snap_in_progress()
-                || self.phone_current_deal_has_pending_tree_verdict(cx))
-        {
+        if self.phone.enabled && self.phone_snap_in_progress() {
             return false;
         }
         let Some(card) = self.card_in_view(cx) else {
@@ -7750,8 +7707,7 @@ impl Workspace {
             return false;
         };
         if let Some(note) = todo_note {
-            self.pending_desk_texts
-                .insert((card.host, stamp), vec![(note, card.breadcrumb.clone())]);
+            self.fill_note_bodies(card.host, vec![(note, card.breadcrumb.clone())], cx);
         }
         let mut undo = self.next_verdict_undo(
             verb,
@@ -7764,14 +7720,15 @@ impl Workspace {
             },
         );
         undo.slack_cursors = slack_cursors;
-        self.pending_tree_verdicts.insert(
-            (card.host, stamp),
+        self.complete_tree_verdict(
             PendingTreeVerdict {
                 event,
                 echo,
                 undo,
                 phone_verdict,
             },
+            window,
+            cx,
         );
         true
     }
@@ -7967,11 +7924,14 @@ impl Workspace {
         else {
             return;
         };
-        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
             return;
-        };
+        }
         if !texts.is_empty() {
-            self.pending_desk_texts.insert((host, stamp), texts);
+            self.fill_note_bodies(host, texts, cx);
         }
         cx.on_next_frame(window, move |this, window, cx| {
             this.sync_tree_dashboard(host, window, cx);

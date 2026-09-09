@@ -759,12 +759,13 @@ impl Dashboard {
         // yesterday. It used to deal anyway — the guard below was written
         // as `is_some_and`, so no desk meant no verdict and the card went
         // out — which is how a snoozed agent was dealt again on every cold
-        // open, for as long as the first sync took. Nothing is dealt until
-        // the desk has answered; when it does, the whole host is made again.
+        // open. Nothing is dealt until the client's replica is loaded,
+        // which is off this disk and does not wait on a daemon; when it
+        // is, the whole host is made again.
         let source = self
             .deal_hosts
             .get(&agent.host)
-            .filter(|source| source.desk_synced())?;
+            .filter(|source| source.desk_loaded())?;
         let node = source.agent_node(agent.agent_id);
         if node.is_some_and(|node| node_closed(node, facts.now)) {
             return None;
@@ -1230,12 +1231,12 @@ impl Dashboard {
         agent_id: AgentId,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) -> bool {
-        // The verdict that put the agent away is in the store, so until a
-        // desk has answered there is nothing to read and the honest answer
-        // is that the agent is not the reader's to see. Answering "not put
-        // down" instead is how Home listed two snoozed agents as running
-        // for the first half second of every cold open.
-        if !self.deal_hosts.values().any(|source| source.desk_synced()) {
+        // The verdict that put the agent away is in the store, so until the
+        // client's replica is loaded there is nothing to read and the
+        // honest answer is that the agent is not the reader's to see.
+        // Answering "not put down" instead is how Home listed two snoozed
+        // agents as running for the first half second of every cold open.
+        if !self.deal_hosts.values().any(|source| source.desk_loaded()) {
             return true;
         }
         self.deal_hosts

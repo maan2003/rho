@@ -626,6 +626,27 @@ above (the daemon shrinks to coordinator) reverses that, and a refusal
 in the middle only ever took back writes the client had already shown
 the user.
 
+### The desk lives on the client
+
+The user's goal, 9 Sep, and the operative design: the desk store lives on
+the client, and the daemon holds a copy only so that clients can sync
+through it and catch up.
+
+What that costs in code, taken with the refusal removal: a verdict is
+complete the moment it is in the client's own replica, so the write goes
+to the view and to the disk before the message goes out, and the undo,
+the dealer, the card and the echo all happen there. `DeskMutationAccepted`
+is gone from the protocol, along with the maps that held a verdict, an
+undo and a paste's text until it came back. The gate that holds the
+dealer until the store has been read now reads "the client's replica is
+loaded", and the replica is opened in `Workspace::new` before a socket
+exists.
+
+What is still owed: a note's body does not resume from the mirror, so
+every sync carries the whole desk's prose and the reader's text is the
+one thing the replica cannot give them at open. Per-body versions are
+the fix, and that is the next step on this path.
+
 ## Symptoms to watch for
 
 - A fact in the store that a source could have answered.
@@ -635,6 +656,7 @@ the user.
 - A view rule enforced by rewriting storage.
 - A restarted GUI refused its own device.
 - The daemon judging what a client wrote rather than merging it.
+- A verdict on the client waiting for a daemon to say it happened.
 
 ## What done means
 
