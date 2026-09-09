@@ -1795,40 +1795,6 @@ impl FoldSnapshot {
         self.transforms.summary().output.longest_row
     }
 
-    /// The part of a fold the reader cannot see, in buffer offsets, or
-    /// `None` when the whole of it is on screen. Under
-    /// [`ElisionPolicy::Tail`] a fold keeps its last rows visible, and
-    /// those rows are ordinary text: a caret rests in them, a motion
-    /// crosses them. Only the elided head is a place the caret cannot go,
-    /// so every rule written against a fold's boundaries is written
-    /// against this range rather than the fold's whole range.
-    pub fn elided_range(&self, fold: &Fold) -> Option<Range<MultiBufferOffset>> {
-        let buffer = &self.inlay_snapshot.buffer;
-        let range = fold.range.start.to_offset(buffer)..fold.range.end.to_offset(buffer);
-        match fold.elision_policy {
-            ElisionPolicy::Hidden => Some(range),
-            ElisionPolicy::Visible => None,
-            // Only the split has to be found in inlay coordinates, because
-            // rows are what a tail is counted in and inlays make rows. The
-            // other two policies stay in buffer offsets: a round trip
-            // through the inlay map moves an offset that sits inside a
-            // concealment, and a fold's own ends must not move.
-            ElisionPolicy::Tail { .. } => {
-                let start = self.inlay_snapshot.to_inlay_offset(range.start);
-                let end = self.inlay_snapshot.to_inlay_offset(range.end);
-                let (elided, _) =
-                    elided_ranges(&self.inlay_snapshot, start..end, fold.elision_policy);
-                elided.map(|elided| {
-                    range.start
-                        ..self
-                            .inlay_snapshot
-                            .to_buffer_offset(elided.end)
-                            .min(range.end)
-                })
-            }
-        }
-    }
-
     #[ztracing::instrument(skip_all)]
     pub fn folds_in_range<T>(&self, range: Range<T>) -> impl Iterator<Item = &Fold>
     where

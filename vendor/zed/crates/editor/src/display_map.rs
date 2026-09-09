@@ -2555,9 +2555,8 @@ impl DisplaySnapshot {
                     .clip_offset(MultiBufferOffset(offset.0.saturating_sub(1)), Bias::Left)
                     ..offset,
             ) {
-                let Some(range) = self.fold_snapshot().elided_range(fold) else {
-                    continue;
-                };
+                let range = fold.range.start.to_offset(buffer_snapshot)
+                    ..fold.range.end.to_offset(buffer_snapshot);
                 if range.end == offset
                     && matches!(
                         fold.placeholder.caret_rest,
@@ -2586,9 +2585,8 @@ impl DisplaySnapshot {
         let buffer_snapshot = self.buffer_snapshot();
         let range = range.start.to_offset(buffer_snapshot)..range.end.to_offset(buffer_snapshot);
         for fold in self.folds_in_range(range.clone()) {
-            let Some(fold_range) = self.fold_snapshot().elided_range(fold) else {
-                continue;
-            };
+            let fold_range = fold.range.start.to_offset(buffer_snapshot)
+                ..fold.range.end.to_offset(buffer_snapshot);
             if fold_range != range {
                 continue;
             }
@@ -2628,9 +2626,8 @@ impl DisplaySnapshot {
             );
         let mut target = None;
         for fold in self.folds_in_range(window) {
-            let Some(range) = self.fold_snapshot().elided_range(fold) else {
-                continue;
-            };
+            let range = fold.range.start.to_offset(buffer_snapshot)
+                ..fold.range.end.to_offset(buffer_snapshot);
             match fold.placeholder.caret_rest {
                 CaretRest::Any => {}
                 CaretRest::Start => {
