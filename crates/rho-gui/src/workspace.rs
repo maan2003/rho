@@ -472,6 +472,13 @@ pub struct Workspace {
     /// `Log` at a time, and the rebuild walks every agent.
     desk_sync_pending: HashMap<HostId, Option<BTreeSet<AgentId>>>,
     _dealer_signal_task: Task<()>,
+    /// Held so it lives as long as the workspace: it reads the desk from
+    /// the replica the moment the file is open, which is after this
+    /// constructor has run.
+    desk_replica_task: Option<Task<()>>,
+    /// What the replica would hold, said by a test instead of a file.
+    #[cfg(test)]
+    pub(crate) desk_replica_for_test: HashMap<String, rho_mirror::desk::HeldDesk>,
     lamp_on: bool,
     dealer_signals_initialized: bool,
     chime_above_threshold: bool,
@@ -1001,6 +1008,9 @@ impl Workspace {
             dealer_signal_eval_scheduled: false,
             desk_sync_pending: HashMap::new(),
             _dealer_signal_task: dealer_signal_task,
+            desk_replica_task: None,
+            #[cfg(test)]
+            desk_replica_for_test: HashMap::new(),
             lamp_on: false,
             dealer_signals_initialized: false,
             chime_above_threshold: false,
@@ -1043,12 +1053,34 @@ impl Workspace {
             this.attach_host(spec, cx);
         }
         // The desk is this client's and its replica is on this disk, so it
-        // is read here, before a socket exists. Home's first draw then
-        // shows the user's own verdicts instead of a list that waits to
-        // hear from a daemon and deals what they put away yesterday.
+        // is read without a socket. Home's first draw then shows the
+        // user's own verdicts instead of a list that waits to hear from a
+        // daemon and deals what they put away yesterday.
+        //
+        // Read again when the file opens, because it opens on the model
+        // thread this constructor has only just started: the read below
+        // finds nothing on a cold start, and waiting for it here would be
+        // a frame waiting on redb rebuilding an allocator. Nothing waits;
+        // the desk simply arrives, still long before any daemon answers.
         for host in this.hosts.ids() {
             this.open_desk_from_replica(host, window, cx);
         }
+        let (opened, replica) = futures::channel::oneshot::channel();
+        rho_mirror::desk::on_open(move || {
+            let _ = opened.send(());
+        });
+        this.desk_replica_task = Some(cx.spawn(async move |this, cx| {
+            if replica.await.is_err() {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                for host in this.hosts.ids() {
+                    this.open_desk_from_replica(host, window, cx);
+                }
+                this.refresh_home(cx);
+            })
+            .ok();
+        }));
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         let home = this.make_surface(SurfaceKey::Home, window, cx);
@@ -1645,7 +1677,21 @@ impl Workspace {
     /// has never held is left alone: that is the one case where the
     /// client really has not read a store, and the readers that ask
     /// `is_loaded` are right to wait.
-    fn open_desk_from_replica(
+    /// The replica's copy of one host's desk. A test hands one over
+    /// instead: the file is the session's, resolved by `main` and shared
+    /// by the whole process, and a test that installed one would be
+    /// writing every other test's verdicts into it.
+    #[cfg(not(test))]
+    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
+        rho_mirror::desk::load(name)
+    }
+
+    #[cfg(test)]
+    fn held_desk(&mut self, name: &str) -> rho_mirror::desk::HeldDesk {
+        self.desk_replica_for_test.remove(name).unwrap_or_default()
+    }
+
+    pub(crate) fn open_desk_from_replica(
         &mut self,
         host: HostId,
         window: &mut Window,
@@ -1659,7 +1705,7 @@ impl Workspace {
             return;
         }
         self.desk_cells.host_named(host, name.clone());
-        let held = rho_mirror::desk::load(&name);
+        let held = self.held_desk(&name);
         if !held.known {
             return;
         }

@@ -7601,6 +7601,18 @@ impl DeskFixture {
         self.store.write(id, property).unwrap();
     }
 
+    /// The same desk as the replica on disk holds it, for a client that
+    /// opens with nothing to talk to.
+    pub(super) fn held(&self) -> rho_mirror::desk::HeldDesk {
+        rho_mirror::desk::HeldDesk {
+            known: true,
+            namespace: Self::NAMESPACE,
+            store: Self::STORE,
+            snapshot: self.store.snapshot(),
+            bodies: self.bodies.clone(),
+        }
+    }
+
     pub(super) fn synced(&self) -> ConnEvent {
         ConnEvent::DeskSynced {
             store: Self::STORE,
@@ -11519,4 +11531,64 @@ fn the_buffer_picker_offers_home_before_the_context_has_shown_it(cx: &mut TestAp
             assert_eq!(home, 1, "and it is still one row, not two");
         })
         .unwrap();
+}
+
+/// Home is drawn from the replica with nothing to talk to. The desk lives
+/// on the client, so a cold start owes the reader their own verdicts
+/// before any daemon answers — and the file opens on the model thread the
+/// constructor starts, so the read in `Workspace::new` finds nothing and
+/// the one that counts is the one the open itself asks for.
+#[gpui::test]
+fn a_cold_open_draws_home_from_the_replica_with_no_host_reachable(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "release notes");
+    desk.set(
+        note.clone(),
+        rho_desk::cells::Property::Name("release notes".into()),
+    );
+    desk.set(note.clone(), rho_desk::cells::Property::PaceDays(1));
+    desk.set(
+        note.clone(),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_000_000_000_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+
+    let workspace = test_workspace(cx);
+    cx.run_until_parked();
+    let before = home_text(&workspace, cx);
+    assert!(
+        !before.contains("release notes"),
+        "nothing is on Home before the replica is read: {before}"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .desk_replica_for_test
+                .insert("local".to_owned(), desk.held());
+            workspace.open_desk_from_replica(HostId::default(), window, cx);
+            workspace.refresh_home(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = home_text(&workspace, cx);
+    assert!(
+        text.contains("release notes"),
+        "the desk the client already holds is on Home without a daemon: {text}"
+    );
+}
+
+fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let home = workspace.home_view().expect("home is in view");
+            home.update(cx, |home, cx| {
+                let editor = home.editor().clone();
+                editor.read(cx).buffer().read(cx).snapshot(cx).text()
+            })
+        })
+        .unwrap()
 }
