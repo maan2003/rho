@@ -30,8 +30,6 @@ pub(crate) enum SurfaceKind {
     Diff,
     Terminal,
     Browser,
-    ZulipInbox,
-    ZulipNarrow,
     SlackList,
     SlackResults,
     SlackConversation,
@@ -55,8 +53,6 @@ impl SurfaceKind {
             Self::Diff => "diff",
             Self::Terminal => "terminal",
             Self::Browser => "browser",
-            Self::ZulipInbox => "zulip_inbox",
-            Self::ZulipNarrow => "zulip_narrow",
             Self::SlackList => "slack_list",
             Self::SlackResults => "slack_results",
             Self::SlackConversation => "slack_conversation",
@@ -67,7 +63,7 @@ impl SurfaceKind {
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 16] = [
+const SURFACE_KINDS: [SurfaceKind; 14] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
@@ -76,8 +72,6 @@ const SURFACE_KINDS: [SurfaceKind; 16] = [
     SurfaceKind::Diff,
     SurfaceKind::Terminal,
     SurfaceKind::Browser,
-    SurfaceKind::ZulipInbox,
-    SurfaceKind::ZulipNarrow,
     SurfaceKind::SlackList,
     SurfaceKind::SlackResults,
     SurfaceKind::SlackConversation,

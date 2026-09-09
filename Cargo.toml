@@ -51,7 +51,6 @@ members = [
   "crates/rho-web-search",
   "crates/rho-workspaces",
   "crates/rho-workspaces-types",
-  "crates/rho-zulip",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
@@ -158,7 +157,6 @@ rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workspaces = { path = "crates/rho-workspaces" }
 rho-workspaces-types = { path = "crates/rho-workspaces-types" }
-rho-zulip = { path = "crates/rho-zulip", default-features = false }
 rpassword = "7"
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [

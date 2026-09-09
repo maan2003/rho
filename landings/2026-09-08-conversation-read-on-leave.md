@@ -1,5 +1,10 @@
 # Leaving a conversation marks it read, in both chats
 
+**Retired 9 Sep 2026.** Zulip is gone from rho, so the rule below has
+no second arm, and Slack's arm went with the cursor join the same week:
+leaving a conversation is not a verdict any more. The record of the day
+stands as written.
+
 Leaving a Slack conversation has marked it read since `8d643712`; the
 Zulip narrows have done the same for longer, but only when the reader
 moved to another narrow or back to the inbox. The two were the same rule

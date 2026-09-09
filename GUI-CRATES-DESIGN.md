@@ -350,9 +350,8 @@ wrong at the design, not at the polish.
     bar and there is no pane, which is the same reason `/` is the host's.
     A key means one thing per context, and a context is named: `n` and `N`
     are bound in `RhoTranscript` and `RhoDashboard`, the two surfaces that
-    have a search, and the Zulip inbox and the Slack rooms keep them for
-    the next unread by their own contexts rather than by being loaded
-    later. A test asserts both halves; load order carrying a rule was the
+    have a search, and the Slack rooms keep `shift-n` for the next unread
+    by their own context rather than by being loaded later. A test asserts both halves; load order carrying a rule was the
     fragility it replaces.
   - **The point survives leaving and returning**, and it survives as a
     store position — which block, and how far into it — never a buffer

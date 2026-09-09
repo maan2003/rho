@@ -1,5 +1,10 @@
 # Leaving a Slack conversation marks it read
 
+**Retired 9 Sep 2026.** Zulip is gone from rho, and with it the
+summary-buffer exit this compares Slack's mark to. Slack's own read on
+leave went with the cursor join on 8 Sep; what is below is the record of
+the day, not how either chat works now.
+
 *eng-bgkw, 2026-09-07.*
 
 Reading a channel in rho did not tell Slack it had been read, so the phone

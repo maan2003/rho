@@ -77,7 +77,6 @@ rho-terminal = { workspace = true }
 rho-transcript.workspace = true
 image = { version = "0.25", default-features = false }
 org-element = { version = "0.1.0", default-features = false }
-rho-zulip = { workspace = true, features = ["ui"] }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
   "wav",

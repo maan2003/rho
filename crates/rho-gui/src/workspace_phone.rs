@@ -1117,7 +1117,6 @@ impl Workspace {
                 super::SurfaceView::Draft { .. }
                     | super::SurfaceView::Transcript { .. }
                     | super::SurfaceView::SlackConversation(_)
-                    | super::SurfaceView::ZulipNarrow(_)
             )
         }) {
             Some(
@@ -1170,9 +1169,6 @@ impl Workspace {
                 // the answer, not the message: the write is detached inside
                 // `submit`.
                 drop(view.update(cx, |view, cx| view.submit(cx)));
-            }
-            super::SurfaceView::ZulipNarrow(view) => {
-                view.update(cx, |view, cx| view.submit(cx));
             }
             _ => {}
         }

@@ -39,10 +39,6 @@ pub enum SurfaceKey {
         terminal_id: u64,
     },
     Browser(rho_browser::PageId),
-    ZulipInbox,
-    ZulipNarrow {
-        label: String,
-    },
     SlackList,
     /// The places one Slack search found. The query is the identity, so a
     /// second search replaces the surface rather than stacking another one

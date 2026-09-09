@@ -279,6 +279,10 @@ pub enum SurfaceIdentity {
     Browser {
         page_id: String,
     },
+    /// Retired: Zulip is gone from rho and nothing writes these. They
+    /// stay because a journal already on disk decodes by variant order,
+    /// and taking one out of the middle would misread every file that has
+    /// a later variant in it.
     ZulipInbox,
     ZulipNarrow {
         label: String,

@@ -14654,7 +14654,6 @@ dependencies = [
  "rho-transcript",
  "rho-ui-proto",
  "rho-window",
- "rho-zulip",
  "rodio",
  "rust-embed",
  "rustc-hash 2.1.3",
@@ -15159,29 +15158,6 @@ dependencies = [
  "camino",
  "prefix-id",
  "senax-encoder",
-]
-
-[[package]]
-name = "rho-zulip"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs",
- "editor",
- "futures 0.3.33",
- "gpui",
- "language",
- "multi_buffer",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "text",
- "theme",
- "tokio",
- "tracing",
- "ui",
 ]
 
 [[package]]

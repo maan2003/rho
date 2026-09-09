@@ -94,7 +94,7 @@ use crate::{
     SlackEditLast, SlackEditMessage, SlackFindMessage, SlackMarkReadBefore, SlackNextUnread,
     SlackOpenFound, SlackOpenRow, SlackReactTo, SlackSearch, SubmitPrompt, SurfaceBack,
     SurfaceClose, TaskBoard, TranscriptTop, UndoVerdict, UploadGuiTelemetry, VerdictMenu,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    VoiceToggle,
 };
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -141,8 +141,6 @@ pub(crate) enum SurfaceView {
     Diff(Entity<rho_files::DiffView>),
     Terminal(Entity<rho_terminal::TerminalView>),
     Browser(Entity<rho_browser::PageView>),
-    ZulipInbox(Entity<rho_zulip::ui::InboxView>),
-    ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
     SlackList(Entity<rho_slack::ui::ListView>),
     SlackResults(Entity<rho_slack::ui::ResultsView>),
     SlackConversation(Entity<rho_slack::ui::ConversationView>),
@@ -166,8 +164,6 @@ impl SurfaceView {
             Self::Diff(_) => SurfaceKind::Diff,
             Self::Terminal(_) => SurfaceKind::Terminal,
             Self::Browser(_) => SurfaceKind::Browser,
-            Self::ZulipInbox(_) => SurfaceKind::ZulipInbox,
-            Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
             Self::SlackList(_) => SurfaceKind::SlackList,
             Self::SlackResults(_) => SurfaceKind::SlackResults,
             Self::SlackConversation(_) => SurfaceKind::SlackConversation,
@@ -188,11 +184,9 @@ impl PartialEq for Surface {
 pub(crate) enum ContextId {
     Draft,
     Agent(AgentId),
-    /// Zulip's own window arrangement: entering it from the dashboard
-    /// leaves the agent surface exactly as it was, and leaving it comes
-    /// back to them.
-    Zulip,
-    /// Slack's own arrangement, on the same terms as Zulip's.
+    /// Slack's own window arrangement: entering it from the dashboard
+    /// leaves the agent surfaces exactly as they were, and leaving it
+    /// comes back to them.
     Slack,
 }
 
@@ -504,9 +498,7 @@ pub struct Workspace {
     /// the one shown in the right-hand preview card: see
     /// [`crate::browser::Pages`].
     pages: crate::browser::Pages,
-    /// The Zulip client, started the first time its dashboard row is
-    /// opened. Chat costs nothing until asked for.
-    zulip: crate::zulip::Zulip,
+
     /// The Slack client and whether it can be trusted to be current: see
     /// [`crate::slack::Slack`].
     pub(crate) slack: crate::slack::Slack,
@@ -1021,7 +1013,6 @@ impl Workspace {
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
             pages: crate::browser::Pages::default(),
-            zulip: crate::zulip::Zulip::default(),
             slack: crate::slack::Slack::default(),
             slack_labels: HashMap::new(),
             slack_reacting: None,
@@ -1818,7 +1809,7 @@ impl Workspace {
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
             ContextId::Agent(agent_id) => live.contains(agent_id),
-            ContextId::Zulip | ContextId::Slack => true,
+            ContextId::Slack => true,
         };
         self.forget_contexts(keep);
         self.phone.retain_contexts(keep);
@@ -2352,10 +2343,6 @@ impl Workspace {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
         }
-        if matches!(self.active_surface().view, SurfaceView::ZulipNarrow(_)) {
-            self.zulip_submit(cx);
-            return;
-        }
         if matches!(
             self.active_surface().view,
             SurfaceView::SlackConversation(_)
@@ -2467,110 +2454,6 @@ impl Workspace {
             });
         });
         self.voice.started(session, stop, input_muted);
-    }
-
-    /// `enter` on the dashboard's Zulip row: switch to the Zulip context
-    /// and show its inbox. The client starts on first entry.
-    pub(crate) fn open_zulip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.zulip.session(cx);
-        self.active_context = ContextId::Zulip;
-        let surface = self.make_surface(SurfaceKey::ZulipInbox, window, cx);
-        self.display_surface(surface, cx);
-        self.focus_active_surface(window, cx);
-        cx.notify();
-    }
-
-    /// Shows one Zulip conversation, marking the conversation being left
-    /// as read — a Gnus summary buffer's exit, which is what makes `n`
-    /// walk unreads down to nothing.
-    pub(crate) fn open_zulip_narrow(
-        &mut self,
-        narrow: rho_zulip::Narrow,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.leave_conversation(cx);
-        let key = SurfaceKey::ZulipNarrow {
-            label: narrow.label(),
-        };
-        self.active_context = ContextId::Zulip;
-        let surface = match self.find_surface(|surface| surface.key == key).cloned() {
-            Some(surface) => surface,
-            None => {
-                let session = self.zulip.session(cx);
-                let hooks = crate::zulip::Zulip::hooks();
-                let view =
-                    cx.new(|cx| rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx));
-                Self::wrap_surface(key, SurfaceView::ZulipNarrow(view))
-            }
-        };
-        self.display_surface(surface, cx);
-        self.focus_active_surface(window, cx);
-        cx.notify();
-    }
-
-    /// Marks the conversation being left read, for a chat whose read state
-    /// rho keeps no cursor of its own for. Leaving is then the only thing
-    /// that tells the server the reader has seen a conversation: a Gnus
-    /// summary buffer's exit. The mark is at the newest message loaded,
-    /// which is what the service does itself when a conversation is opened.
-    ///
-    /// Slack is no longer one of those. What has been dealt with there is
-    /// the later of rho's own cursor and Slack's read mark, and the cursor
-    /// moves when the reader says done -- so leaving a conversation is not
-    /// a verdict, and writing Slack's mark on the way out made it one.
-    /// `SLACK-DESIGN.md`, "How a Slack unit sits in rho".
-    pub(crate) fn leave_conversation(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_surface().view {
-            view.clone().update(cx, |view, cx| view.mark_read(cx));
-        }
-    }
-
-    /// `enter` inside the Zulip inbox: open the conversation under the
-    /// cursor.
-    fn zulip_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let SurfaceView::ZulipInbox(view) = &self.active_surface().view else {
-            return;
-        };
-        let Some(narrow) = view.clone().update(cx, |view, cx| view.cursor_narrow(cx)) else {
-            return;
-        };
-        self.open_zulip_narrow(narrow, window, cx);
-    }
-
-    /// The reading loop: the next unread conversation anywhere, marking
-    /// the one being left as read. With nothing unread it returns to the
-    /// inbox rather than sitting on a read conversation.
-    fn zulip_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.zulip.started() else {
-            return;
-        };
-        let current = match &self.active_surface().view {
-            SurfaceView::ZulipNarrow(view) => Some(view.read(cx).narrow().clone()),
-            _ => None,
-        };
-        let next = session.read(cx).next_unread(current.as_ref());
-        match next {
-            Some(narrow) => self.open_zulip_narrow(narrow, window, cx),
-            None => {
-                self.leave_conversation(cx);
-                self.open_zulip(window, cx);
-            }
-        }
-    }
-
-    /// `P`: page further back in the conversation on screen.
-    fn zulip_load_older(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_surface().view {
-            view.clone().update(cx, |view, cx| view.load_older(cx));
-        }
-    }
-
-    /// `enter` in a Zulip conversation: send the composed message.
-    fn zulip_submit(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_surface().view {
-            view.clone().update(cx, |view, cx| view.submit(cx));
-        }
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
@@ -4301,8 +4184,6 @@ impl Workspace {
                 self.registry.agent_display_label(*agent_id)
             ),
             SurfaceKey::Browser(browser) => browser.to_string(),
-            SurfaceKey::ZulipInbox => "zulip".to_owned(),
-            SurfaceKey::ZulipNarrow { label } => label.clone(),
             SurfaceKey::SlackList => "slack".to_owned(),
             SurfaceKey::SlackResults { query } => query.clone(),
             SurfaceKey::SlackConversation(source) => self
@@ -4327,8 +4208,6 @@ impl Workspace {
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
             SurfaceKey::Browser(_) => "browser",
-            SurfaceKey::ZulipInbox => "zulip inbox",
-            SurfaceKey::ZulipNarrow { .. } => "zulip",
             SurfaceKey::SlackList => "slack list",
             SurfaceKey::SlackResults { .. } => "slack search",
             SurfaceKey::SlackConversation(_) => "slack",
@@ -4424,10 +4303,6 @@ impl Workspace {
             SurfaceKey::Browser(page_id) => SurfaceIdentity::Browser {
                 page_id: page_id.to_string(),
             },
-            SurfaceKey::ZulipInbox => SurfaceIdentity::ZulipInbox,
-            SurfaceKey::ZulipNarrow { label } => SurfaceIdentity::ZulipNarrow {
-                label: label.clone(),
-            },
             SurfaceKey::SlackList => SurfaceIdentity::SlackList,
             SurfaceKey::SlackResults { query } => SurfaceIdentity::SlackSearch {
                 query: query.clone(),
@@ -4506,14 +4381,6 @@ impl Workspace {
                 }
                 SurfaceView::Terminal(view) => view.read(cx).scroll_offset() as i64,
                 SurfaceView::Browser(_) => 0,
-                SurfaceView::ZulipInbox(view) => {
-                    let editor = view.read(cx).editor().clone();
-                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
-                }
-                SurfaceView::ZulipNarrow(view) => {
-                    let editor = view.read(cx).editor().clone();
-                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
-                }
                 SurfaceView::SlackList(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
@@ -4584,16 +4451,6 @@ impl Workspace {
         method: rho_journal::SurfaceShowMethod,
         cx: &mut Context<Self>,
     ) {
-        // Leaving a Slack conversation is the only thing that tells Slack
-        // it has been read, so the surface being replaced is marked on the
-        // way out — the same summary-buffer exit the Zulip narrows do.
-        let leaving = self
-            .history
-            .as_ref()
-            .map(|history| history.current().surface.key.clone());
-        if leaving.is_some_and(|key| key != surface.key) {
-            self.leave_conversation(cx);
-        }
         self.ensure_surface_subscription(&surface.key, cx);
         let list = self.surfaces.entry(self.active_context).or_default();
         match list.iter_mut().find(|s| **s == surface) {
@@ -5142,8 +4999,8 @@ impl Workspace {
     fn test_named_surface(&mut self, name: &str, cx: &mut Context<Self>) -> Surface {
         let editor = self.active_editor(cx);
         Self::wrap_surface(
-            SurfaceKey::ZulipNarrow {
-                label: name.to_owned(),
+            SurfaceKey::SlackResults {
+                query: name.to_owned(),
             },
             SurfaceView::DeskNode(editor),
         )
@@ -6130,8 +5987,6 @@ impl Workspace {
             SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self.chrome_editor(),
             SurfaceView::Browser(_) => self.chrome_editor(),
-            SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
-            SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackResults(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
@@ -6185,8 +6040,6 @@ impl Workspace {
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
             SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
-            SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
-            SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackResults(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().focus_handle(cx),
@@ -6208,9 +6061,7 @@ impl Workspace {
             | SurfaceKey::Home
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::DeskNode { .. }
-            | SurfaceKey::ZulipInbox
-            | SurfaceKey::ZulipNarrow { .. } => None,
+            | SurfaceKey::DeskNode { .. } => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackConversation(_) => None,
@@ -6299,16 +6150,6 @@ impl Workspace {
             SurfaceKey::Browser(_) => {
                 unreachable!("browser surfaces are created by create_browser_page")
             }
-            SurfaceKey::ZulipInbox => {
-                let session = self.zulip.session(cx);
-                let hooks = crate::zulip::Zulip::hooks();
-                SurfaceView::ZulipInbox(
-                    cx.new(|cx| rho_zulip::ui::InboxView::new(session, hooks, window, cx)),
-                )
-            }
-            SurfaceKey::ZulipNarrow { .. } => {
-                unreachable!("conversation surfaces are created by open_zulip_narrow")
-            }
             SurfaceKey::SlackList => {
                 let session = self
                     .slack_session(window, cx)
@@ -6361,9 +6202,7 @@ impl Workspace {
             | SurfaceKey::DeskNode { .. }
             | SurfaceKey::Messages
             | SurfaceKey::Usage
-            | SurfaceKey::File { .. }
-            | SurfaceKey::ZulipInbox
-            | SurfaceKey::ZulipNarrow { .. } => None,
+            | SurfaceKey::File { .. } => None,
             SurfaceKey::SlackList
             | SurfaceKey::SlackResults { .. }
             | SurfaceKey::SlackConversation(_) => None,
@@ -8673,18 +8512,6 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            SurfaceView::ZulipInbox(view) => div()
-                .id("rho-surface-zulip-inbox")
-                .size_full()
-                .overflow_hidden()
-                .child(view.clone())
-                .into_any_element(),
-            SurfaceView::ZulipNarrow(view) => div()
-                .id("rho-surface-zulip-narrow")
-                .size_full()
-                .overflow_hidden()
-                .child(view.clone())
-                .into_any_element(),
             SurfaceView::SlackList(view) => div()
                 .id("rho-surface-slack-list")
                 .size_full()
@@ -8923,15 +8750,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))
-            .on_action(cx.listener(|this, _: &ZulipOpenRow, window, cx| {
-                this.zulip_open_row(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ZulipNextUnread, window, cx| {
-                this.zulip_next_unread(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ZulipLoadOlder, _, cx| {
-                this.zulip_load_older(cx);
-            }))
             .on_action(cx.listener(|this, _: &SlackOpenRow, window, cx| {
                 this.slack_open_row(window, cx);
             }))

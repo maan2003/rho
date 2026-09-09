@@ -5415,13 +5415,6 @@ fn n_is_the_search_repeat_where_there_is_a_search_and_the_next_unread_where_ther
             assert_eq!(routes("shift-n", &room), Some("rho_gui::SlackNextUnread"));
             assert_ne!(routes("n", &room), Some("rho_gui::SearchRepeat"));
 
-            let inbox = [
-                KeyContext::parse("RhoGui").unwrap(),
-                KeyContext::parse("RhoZulipInbox").unwrap(),
-                KeyContext::parse(&format!("Editor VimControl vim_mode={mode}")).unwrap(),
-            ];
-            assert_eq!(routes("n", &inbox), Some("rho_gui::ZulipNextUnread"));
-
             // A surface with neither a search nor a room keeps vim's own,
             // which in this app means nothing at all.
             let note = surface("RhoNote", mode);

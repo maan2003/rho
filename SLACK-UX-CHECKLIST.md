@@ -372,8 +372,8 @@ done right after the transcript primitive (2.4) and before 2.10:
       2.9, so it comes before 2.10. This is
       still on demand under the budget rule: the web client fetches
       exactly the same page when a user scrolls to it.
-- [x] 2.5 Next unread conversation from inside a conversation: `shift-n`,
-      the same key Zulip uses in rho. Wraps to the list when nothing is
+- [x] 2.5 Next unread conversation from inside a conversation: `shift-n`.
+      Wraps to the list when nothing is
       unread. `Model::next_unread` walks the list order from the row you
       are on, wraps once, and never lands where it started; when nothing
       is left it opens the list. Bound in the four Slack normal/helix

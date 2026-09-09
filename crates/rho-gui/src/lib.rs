@@ -28,7 +28,6 @@ pub(crate) mod voice;
 #[cfg(feature = "walk-support")]
 pub mod walk;
 pub mod workspace;
-pub(crate) mod zulip;
 
 use gpui::{App, KeyBinding, actions};
 use rho_agents::{DraftFieldClear, DraftFieldSubmit, DraftValueCycle, RoleCycleGroup};
@@ -104,15 +103,12 @@ actions!(
         GitApprovalDeny,
         VoiceToggle,
         UploadGuiTelemetry,
-        ZulipOpenRow,
         SurfaceBack,
         DealOpen,
         DealCloseAndNext,
         OverviewToggle,
         VerdictMenu,
         SurfaceClose,
-        ZulipNextUnread,
-        ZulipLoadOlder,
         SlackOpenRow,
         SlackCompose,
         SlackSearch,
@@ -360,26 +356,12 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
     ]);
-    // The Zulip surfaces read like Gnus: the inbox is a group buffer whose
-    // rows are acted on by single normal-mode keys, and `n` walks to the
-    // next unread conversation from anywhere in the client, marking the one
-    // you leave as read. `enter` in a conversation's compose region sends,
-    // matching the shell and transcript prompts.
-    cx.bind_keys([
-        KeyBinding::new("enter", ZulipOpenRow, Some("RhoZulipInbox > Editor")),
-        KeyBinding::new(
-            "enter",
-            SubmitPrompt,
-            Some("RhoZulipNarrow > Editor && vim_mode == insert"),
-        ),
-    ]);
     // `n` and `N` repeat the last search. Vim's own do nothing in this app:
     // they go through a pane's search bar and there is no pane, which is why
     // `/` is the host's in the first place. Bound in the two contexts that
     // have a buffer search and nowhere else — a key means one thing per
-    // context, and the Zulip inbox and the Slack rooms keep `n` and `N` for
-    // the next unread by their own binding, not by being loaded after this
-    // one.
+    // context, and the Slack rooms keep their own `shift-n` for the next
+    // unread by their own binding, not by being loaded after this one.
     for surface in ["RhoTranscript", "RhoDashboard"] {
         for mode in ["normal", "helix_normal"] {
             let context =
@@ -389,18 +371,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
                 KeyBinding::new("shift-n", SearchRepeatReverse, Some(&context)),
             ]);
         }
-    }
-    for context in [
-        "RhoZulipInbox > Editor && vim_mode == normal",
-        "RhoZulipInbox > Editor && vim_mode == helix_normal",
-        "RhoZulipNarrow > Editor && vim_mode == normal",
-        "RhoZulipNarrow > Editor && vim_mode == helix_normal",
-    ] {
-        cx.bind_keys([
-            KeyBinding::new("n", ZulipNextUnread, Some(context)),
-            KeyBinding::new("shift-p", ZulipLoadOlder, Some(context)),
-            KeyBinding::new("q", SurfaceClose, Some(context)),
-        ]);
     }
     // Slack reads the same way: `enter` opens the row or the thread the
     // cursor is on, `i` goes to the composer and `enter` there sends, `q`
@@ -470,9 +440,9 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             // people said. Two different questions, and the second one is
             // a request over a network rather than an index in memory.
             KeyBinding::new("shift-s", SlackFindMessage, Some(context)),
-            // The next conversation with something in it, the way `n` walks
-            // the Zulip inbox. `shift-n` and not `n`, because `n` in a
-            // transcript is the search the reader just ran.
+            // The next conversation with something in it. `shift-n` and
+            // not `n`, because `n` in a transcript is the search the reader
+            // just ran.
             KeyBinding::new("shift-n", SlackNextUnread, Some(context)),
         ]);
     }

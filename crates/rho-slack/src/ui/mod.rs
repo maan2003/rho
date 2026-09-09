@@ -2,7 +2,7 @@
 //!
 //! Both are ordinary editors over multibuffers, so motions, search, and Vim
 //! come from the editor rather than bespoke list chrome — the same trick
-//! Rho's dashboard and the Zulip client play.
+//! Rho's dashboard plays.
 //!
 //! A channel, a group, a DM, and a thread are all the same surface: they
 //! differ in where a composed message goes, not in how they read.
@@ -52,8 +52,8 @@ impl Hooks {
     }
 }
 
-/// Highlight-key space for Slack surfaces, kept clear of the Zulip client's
-/// slots so a frame holding both cannot collide.
+/// Highlight-key space for Slack surfaces, kept clear of the other
+/// surfaces' slots so a frame holding several cannot collide.
 const SLACK_KEY_BASE: usize = usize::MAX - 500;
 
 /// The transcript needs a key per class per bucket, so it takes a wide block

@@ -408,8 +408,9 @@ impl Workspace {
         self.seed_slack_cursors(cx);
     }
 
-    /// The host services the Slack surfaces borrow, the same two the Zulip
-    /// client borrows, so chat reads like every other buffer in the frame.
+    /// The host services the Slack surfaces borrow: editor chrome and the
+    /// transcript's Markdown pipeline, so chat reads like every other
+    /// buffer in the frame.
     pub(crate) fn slack_hooks() -> rho_slack::ui::Hooks {
         rho_slack::ui::Hooks {
             configure_editor: rho_window::editor_config::configure,
