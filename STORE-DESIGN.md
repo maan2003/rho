@@ -546,11 +546,9 @@ else is built on. The transient lands after slice 2.
    honest shape), and pending mutations that survive a restart: the
    `pending` queue and any unsent text operations are on disk too and go
    out on connect in order, which is what makes a verdict or a note edit
-   taken offline real rather than lost. That queue exposes one daemon
-   rule to relax: a stamp today may not jump more than one past the
-   daemon's global maximum, which an offline batch does by design; the
-   rule becomes per device (a device's own versions strictly increase),
-   which is all the CRDT needs. Namespaces for the text replica stay the
+   taken offline real rather than lost. That queue no longer runs into
+   anything at the daemon: the stamp-jump rule, which an offline batch
+   broke by design, is gone with the rest of the refusals (9 Sep). Namespaces for the text replica stay the
    daemon's per connection; operations kept from an earlier session keep
    the replica id they were made under. What this is not yet: encrypted,
    or a log the daemon cannot read. It is the device's copy that the
@@ -594,6 +592,40 @@ and whether or not its socket has noticed, so there is never a second live
 writer in one device's namespace. A connection ending releases the device
 only if the hold is still its own, so the window that took it keeps it.
 
+## The daemon does not refuse a desk mutation
+
+The user, 9 Sep: "it is not job of daemon, remove it!" The desk store is
+the client's; the daemon holds a copy so that clients can sync through it
+and catch up. A copy does not get a vote on what the user wrote.
+
+So the daemon takes every mutation it can decode and merges it. Gone: the
+verdict shape check, the before/after check against the cells, "not
+applied by its mutation", "cannot remove a fact", and the stamp-jump
+refusal. Last-writer-wins is the whole of the merge rule, and it needs no
+frontier to enforce: a stamp the store has already counted merges as
+itself, an older one loses to what beat it, a newer one wins. What is
+left at the daemon is about the connection, not the verdict: a mutation
+must carry this connection's device, a connection must sync before it
+writes, and a displaced connection may not write at all (see above) —
+each of which breaks the connection rather than answering it.
+
+`DeskMutationRejected` is gone from the protocol, and with it the
+client's rejection paths: the replay queue of pending mutations, the
+view rebuilt from `confirmed`, and the taking-back of what a verdict's
+answer promised. A mutation the store cannot decode at all is logged and
+dropped; nobody is waiting for an answer to it.
+
+Undo moves to the same footing: an entry whose before-values no longer
+stand is nothing to put back, decided on the client. Undo returns what
+the verdict took away, and it is not a way to reach past a write made
+after it.
+
+Why this was ever there: the daemon was the store and the client was a
+view of it, so the daemon was the place that could say no. The direction
+above (the daemon shrinks to coordinator) reverses that, and a refusal
+in the middle only ever took back writes the client had already shown
+the user.
+
 ## Symptoms to watch for
 
 - A fact in the store that a source could have answered.
@@ -602,6 +634,7 @@ only if the hold is still its own, so the window that took it keeps it.
 - A verdict that changes facts without a log entry.
 - A view rule enforced by rewriting storage.
 - A restarted GUI refused its own device.
+- The daemon judging what a client wrote rather than merging it.
 
 ## What done means
 

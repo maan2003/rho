@@ -2020,12 +2020,6 @@ impl Workspace {
                 self.desk_cells.mutation_accepted(host, stamp);
                 self.complete_desk_mutation(host, stamp, window, cx);
             }
-            ConnEvent::DeskMutationRejected { stamp, reason } => {
-                self.desk_cells.mutation_rejected(host, stamp, cx);
-                self.reject_desk_mutation(host, stamp, cx);
-                self.sync_tree_dashboard(host, window, cx);
-                self.notice_on(None, &format!("desk: {reason}"), StyleClass::SystemInfo, cx);
-            }
             ConnEvent::DeskTextApplied { id, operation } => {
                 // A body edit from another device moves that note's words
                 // and the breadcrumbs made of them, which is its subtree
@@ -6051,21 +6045,6 @@ impl Workspace {
             self.finish_deal_verdict(window, cx);
         }
         self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
-    }
-
-    /// The daemon refused it. `DeskCells` has already restored the last
-    /// merged cells; what is left is to take back what the answer promised.
-    fn reject_desk_mutation(
-        &mut self,
-        host: HostId,
-        stamp: rho_desk::cells::Stamp,
-        _cx: &mut Context<Self>,
-    ) {
-        self.pending_desk_texts.remove(&(host, stamp));
-        self.pending_tree_verdicts.remove(&(host, stamp));
-        if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
-            self.restore_verdict_undo(undone.entry);
-        }
     }
 
     pub(crate) fn refresh_dashboard(&mut self, cx: &mut Context<Self>) {

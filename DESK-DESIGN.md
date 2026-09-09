@@ -250,12 +250,19 @@ takes the answer as a first sync. One round trip, and at no point is the
 user reading one desk made of two stores. This is the reason the daemon
 commit is the sensitive one.
 
-**What the replica is not.** It holds `confirmed` — what the daemon has
-acknowledged — and never `view`. A client that dies with mutations in
-flight must open without them: an unacknowledged write is the daemon's to
-accept or refuse, and a replica that remembered it would show the user a
-verdict that was never taken. `view` is rebuilt from `confirmed` at open,
-which is what it already is after a rejection.
+**What the replica holds today.** `confirmed` — the cells the daemon has
+sent back — and not `view`, so a client that dies with a write in flight
+opens without it. That was right while the daemon could refuse a write;
+it no longer can (9 Sep, see STORE-DESIGN, "The daemon does not refuse a
+desk mutation"), so a write the user has been shown is real from the
+moment it is in the local replica, and the replica is what has to hold
+it. The client's completion model is the next commit, and this paragraph
+goes with it.
+
+**The daemon does not refuse a mutation.** It merges every one it can
+decode; last-writer-wins is the whole rule. Nothing on the desk waits for
+permission, and there is no replay queue behind the view: a write is
+never taken back out of the middle. The reasoning is in STORE-DESIGN.
 
 **Bodies.** `DeskSynced` sends `desk_cells.bodies()` — every note's text, in
 full, on every sync, resumed or not. The cells resume and the text does

@@ -376,23 +376,14 @@ impl DeskCellStore {
             .ok_or("Desk cells V2 metadata is missing")?
             .value()
             .into_owned();
-        let accepted = meta.frontier.get(&session_device).copied().unwrap_or(0);
-        if mutation.stamp.version <= accepted {
-            return match write
-                .open_table(MUTATIONS_READ)
-                .get(SenValue::borrowed(&mutation.stamp))
-            {
-                Some(old) if old.value().as_ref() == Some(&mutation) => Ok(()),
-                _ => Err("Desk mutation version is not newer than its device frontier".into()),
-            };
-        }
-        let observed = meta.frontier.values().copied().max().unwrap_or(0);
-        if mutation.stamp.version > observed.saturating_add(1) || observed == u64::MAX {
-            return Err("Desk mutation version advances beyond the observable frontier".into());
-        }
         let snapshot = read_snapshot_from_write(&mut write)?;
         let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
-        validate_user_mutation(&store, &mutation)?;
+        // Whatever the mutation says, it is merged. A stamp the store has
+        // already counted merges as itself, an older one loses to what beat
+        // it, and a newer one wins: last-writer-wins is the whole of the
+        // rule, and it needs no frontier to enforce. Refusing a stamp that
+        // ran ahead of the frontier only ever refused writes a client had
+        // already shown the user.
         store.apply_mutation(&mutation)?;
         persist_cells_and_verdicts(&mut write, &store.snapshot())?;
         meta.frontier = store.version().clone();
@@ -591,124 +582,6 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
             return Err("Desk path exceeds 4096 bytes".into());
         }
         _ => {}
-    }
-    Ok(())
-}
-
-/// What the daemon will accept from a client.
-///
-/// The store holds the user's facts and only those, so there is no
-/// machine-owned row to protect and no kind to police: every property is
-/// the user's to write about any subject. What is left to check is that a
-/// verdict entry says the truth, because undo is built on it — the facts it
-/// claims to have changed must be the facts the mutation actually writes,
-/// and the values it claims stood there before must be the ones that do.
-fn validate_user_mutation(store: &Store, mutation: &CellMutation) -> Result<(), String> {
-    let Some((verdict_id, event)) = &mutation.verdict else {
-        return Ok(());
-    };
-    let (verdict, changes) = match event {
-        VerdictEvent::Applied {
-            verdict, changes, ..
-        } => (verdict, changes),
-        VerdictEvent::Undone { of } => match store.verdict_event(verdict_id, *of) {
-            Some(VerdictEvent::Applied {
-                verdict, changes, ..
-            }) => (verdict, changes),
-            _ => return Err("Desk verdict undo does not reference an applied verdict".into()),
-        },
-    };
-    let applied = matches!(event, VerdictEvent::Applied { .. });
-    validate_verdict_shape(verdict_id, verdict, changes, mutation, applied)?;
-    let mut seen = std::collections::BTreeSet::new();
-    for change in changes {
-        if !seen.insert((change.id.clone(), change.key.clone())) {
-            return Err("Desk verdict contains duplicate fact changes".into());
-        }
-        let (expected_current, expected_write) = match applied {
-            true => (&change.before, &change.after),
-            false => (&change.after, &change.before),
-        };
-        // A todo's note does not exist until the verdict writes it, so its
-        // entry states what a thing nobody has said anything about reads as
-        // holding rather than what the store returns.
-        let unwritten_note = applied
-            && matches!(verdict, rho_desk::cells::Verdict::Todo { note } if *note == change.id)
-            && !store.facts(&change.id).any()
-            && matches!(
-                expected_current,
-                Some(Property::Deleted(true))
-                    | Some(Property::DeferUntil(None))
-                    | Some(Property::PaceDays(0))
-            );
-        // A fact nobody has written reads as its unwritten claim, and that
-        // is what the entry states, so the store's missing cell answers to
-        // the same reading rather than to `None`.
-        let current = store
-            .property(&change.id, &change.key)
-            .cloned()
-            .or_else(|| change.key.unwritten());
-        if !unwritten_note && current.as_ref() != expected_current.as_ref() {
-            return Err("Desk verdict source value does not match current state".into());
-        }
-        let Some(expected_write) = expected_write else {
-            return Err("Desk verdict changes cannot remove a fact".into());
-        };
-        if !mutation
-            .writes
-            .iter()
-            .any(|write| write.id == change.id && &write.property == expected_write)
-        {
-            return Err("Desk verdict change is not applied by its mutation".into());
-        }
-    }
-    Ok(())
-}
-
-fn validate_verdict_shape(
-    verdict_id: &Id,
-    verdict: &rho_desk::cells::Verdict,
-    changes: &[rho_desk::cells::FactChange],
-    mutation: &CellMutation,
-    applied: bool,
-) -> Result<(), String> {
-    use rho_desk::cells::Verdict;
-
-    // The entry is checked against the shape rho-desk builds for this
-    // verdict, so the writer and the checker share one definition. `before`
-    // is the writer's to state; everything else has to match.
-    let expected = rho_desk::cells::verdict_changes(
-        verdict_id,
-        verdict,
-        &|key| {
-            changes
-                .iter()
-                .find(|change| &change.id == verdict_id && &change.key == key)
-                .and_then(|change| change.before.clone())
-        },
-        rho_desk::cells::todo_cadence(changes),
-        rho_desk::cells::slack_verdict(verdict_id, changes),
-        rho_desk::cells::agent_verdict(verdict_id, changes),
-    )?;
-    let sorted = |mut changes: Vec<rho_desk::cells::FactChange>| {
-        changes.sort_by(|left, right| (&left.id, &left.key).cmp(&(&right.id, &right.key)));
-        changes
-    };
-    let valid = sorted(changes.to_vec()) == sorted(expected)
-        && match verdict {
-            // The note a todo creates is filed under the thing the verdict
-            // was dealt on by the same mutation, or it lands nowhere.
-            Verdict::Todo { note } => {
-                !applied
-                    || mutation.writes.iter().any(|write| {
-                        write.id == *note
-                            && write.property == Property::Parent(Some(verdict_id.clone()))
-                    })
-            }
-            _ => true,
-        };
-    if !valid {
-        return Err("Desk verdict changes do not match the verdict semantics".into());
     }
     Ok(())
 }
@@ -1185,8 +1058,9 @@ mod tests {
                 .is_err()
         );
 
-        // A device that was away writes from its own version, but never
-        // from one the frontier cannot explain.
+        // A device that was away writes from its own version, however far
+        // ahead of the frontier that leaves it: a batch made offline is
+        // exactly the write that would jump, and the daemon takes it.
         let offline = DeviceId([7; 16]);
         let name = |id: &Id, text: &str| CellWrite {
             id: id.clone(),
@@ -1207,21 +1081,23 @@ mod tests {
             .await
             .unwrap();
         let global = store.frontier().unwrap().values().copied().max().unwrap();
-        assert!(
-            store
-                .apply_mutation(
-                    offline,
-                    CellMutation {
-                        stamp: Stamp {
-                            device: offline,
-                            version: global + 2,
-                        },
-                        writes: vec![name(&id, "jump")],
-                        verdict: None,
+        store
+            .apply_mutation(
+                offline,
+                CellMutation {
+                    stamp: Stamp {
+                        device: offline,
+                        version: global + 2,
                     },
-                )
-                .await
-                .is_err()
+                    writes: vec![name(&id, "jump")],
+                    verdict: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.frontier().unwrap().get(&offline),
+            Some(&(global + 2))
         );
     }
 
@@ -1287,27 +1163,8 @@ mod tests {
             }
             writes
         };
-        // The note has to land under the thing the verdict was dealt on.
-        assert!(
-            store
-                .apply_mutation(
-                    device,
-                    CellMutation {
-                        stamp,
-                        writes: writes(None),
-                        verdict: Some((
-                            unit.clone(),
-                            VerdictEvent::Applied {
-                                verdict: Verdict::Todo { note: note.clone() },
-                                at: stamp,
-                                changes: changes.clone(),
-                            },
-                        )),
-                    },
-                )
-                .await
-                .is_err()
-        );
+        // Where the new note lands is the client's to write; the daemon
+        // merges the mutation and the parent comes out as it was sent.
         store
             .apply_mutation(
                 device,
@@ -1399,13 +1256,14 @@ mod tests {
             }
         };
 
+        // A defer whose entry names only the wake time used to be refused
+        // as an unapplied verdict. The daemon merges it now, pace and all
+        // left as they stood: what a verdict writes is the client's to say.
         let only_the_wake_time = defer(next_version(&store), vec![wakes.clone()]);
-        assert!(
-            store
-                .apply_mutation(device, only_the_wake_time)
-                .await
-                .is_err()
-        );
+        store
+            .apply_mutation(device, only_the_wake_time)
+            .await
+            .unwrap();
         let whole = defer(next_version(&store), vec![wakes, paced_to_zero]);
         store.apply_mutation(device, whole).await.unwrap();
 

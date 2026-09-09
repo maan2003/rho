@@ -79,10 +79,6 @@ pub enum ConnEvent {
     DeskMutationAccepted {
         stamp: rho_desk::cells::Stamp,
     },
-    DeskMutationRejected {
-        stamp: rho_desk::cells::Stamp,
-        reason: String,
-    },
     DeskCellsAvailable {
         frontier: rho_desk::cells::Version,
     },
@@ -1235,9 +1231,6 @@ async fn run(
             }),
             ServerMessage::DeskMutationAccepted { stamp } => {
                 Some(ConnEvent::DeskMutationAccepted { stamp })
-            }
-            ServerMessage::DeskMutationRejected { stamp, reason } => {
-                Some(ConnEvent::DeskMutationRejected { stamp, reason })
             }
             ServerMessage::DeskCellsAvailable { frontier } => {
                 Some(ConnEvent::DeskCellsAvailable { frontier })

@@ -2188,23 +2188,20 @@ async fn handle_message(
         }
         ClientMessage::DeskMutationApply { mutation } => {
             let stamp = mutation.stamp;
+            // Nothing here is a verdict on what the user wrote: the two
+            // conditions below are about this connection, and they break it
+            // the same way the text path does. The desk is the client's, and
+            // the daemon holds a copy so that clients can sync through it.
             let Some(session) = desk_session.as_ref() else {
-                let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
-                    stamp,
-                    reason: "Desk connection must sync before writing".into(),
-                });
-                return Ok(Refresh::None);
+                anyhow::bail!("Desk connection must sync before writing");
             };
             // Displaced, so this connection's device id belongs to another
             // window now: writing under it would put two authors in one
             // CRDT namespace.
-            if session.binding.displaced.load(Ordering::SeqCst) {
-                let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
-                    stamp,
-                    reason: "The desk moved to a newer window on this device".into(),
-                });
-                return Ok(Refresh::None);
-            }
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
             let device = session.device;
             match services.desk_cells.apply_mutation(device, mutation).await {
                 Ok(()) => {
@@ -2214,8 +2211,13 @@ async fn handle_message(
                         .events
                         .send(ServerMessage::DeskCellsAvailable { frontier });
                 }
-                Err(reason) => {
-                    let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected { stamp, reason });
+                // What is left is a mutation that could not be decoded into
+                // the store at all. There is no answer for it any more, and
+                // the client is not waiting for one; the log is where it
+                // goes.
+                Err(error) => {
+                    tracing::warn!(%error, device = ?device, version = stamp.version,
+                        "a desk mutation did not merge");
                 }
             }
             Ok(Refresh::None)
@@ -4307,8 +4309,6 @@ mod tests {
         );
 
         let mutation = CellMutation {
-            // The first version this device has ever written: the store
-            // refuses a stamp that runs ahead of what it could have seen.
             stamp: Stamp { device, version: 1 },
             writes: vec![CellWrite {
                 id: Id::Note(Uuid([9; 16])),
@@ -4316,7 +4316,12 @@ mod tests {
             }],
             verdict: None,
         };
-        desk_message(
+        // The daemon no longer answers a write with a refusal, so the one
+        // condition that is about the connection rather than about what the
+        // user wrote breaks the connection, the way the text path already
+        // did. Two authors in one CRDT namespace is not a thing to carry on
+        // through.
+        let broken = desk_message(
             &services,
             &older_tx,
             1,
@@ -4326,17 +4331,10 @@ mod tests {
             },
         )
         .await
-        .expect("the refusal is an answer, not a broken connection");
-        let refused = std::iter::from_fn(|| older_rx.try_recv().ok())
-            .filter_map(|message| match message {
-                ServerMessage::DeskMutationRejected { reason, .. } => Some(reason),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        .expect_err("it may not write under a device id that is another window's now");
         assert_eq!(
-            refused,
-            ["The desk moved to a newer window on this device"],
-            "and it may not write under a device id that is another window's now"
+            broken.to_string(),
+            "The desk moved to a newer window on this device"
         );
 
         // The window that took the device writes.

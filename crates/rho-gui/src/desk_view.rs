@@ -15,13 +15,12 @@ use text::{BufferId, ReplicaId};
 use crate::workspace::Workspace;
 
 struct HostDeskCells {
-    /// What the daemon has told us. A rejected mutation falls back to this.
+    /// What the daemon has told us, kept so that a poke can be read
+    /// against it and a sync can ask for the rest.
     confirmed: Store,
     /// What the reader sees: `confirmed` plus every mutation still in
     /// flight, so a keypress shows before the round trip finishes.
     view: Store,
-    /// Mutations sent and not yet visible in `confirmed`, oldest first.
-    pending: Vec<CellMutation>,
     buffers: BTreeMap<Id, Entity<Buffer>>,
     /// The map as it stands, in the order it is drawn, and where each id
     /// sits in it. Kept rather than made: a delta patches the rows it
@@ -69,29 +68,6 @@ impl HostDeskCells {
         Stamp { device, version }
     }
 
-    /// Replays the unconfirmed writes over the confirmed cells. Used when a
-    /// rejection drops one from the middle of the queue.
-    fn rebuild_view(&mut self, device: DeviceId) {
-        let mut view = Store::new(device);
-        // The confirmed store is this GUI's own merge; it cannot fail to
-        // merge into an empty store of the same device.
-        let _ = view.merge(self.confirmed.snapshot());
-        for mutation in &self.pending {
-            if let Err(error) = view.apply_mutation(mutation) {
-                tracing::warn!(%error, "dropping an unreplayable Desk mutation");
-            }
-        }
-        self.view = view;
-    }
-
-    /// Forgets the mutations the daemon has now told us about, which is what
-    /// keeps the replay queue from growing for the life of the process.
-    fn prune_pending(&mut self) {
-        let confirmed = self.confirmed.version().clone();
-        self.pending.retain(|mutation| {
-            confirmed.get(&mutation.stamp.device).copied().unwrap_or(0) < mutation.stamp.version
-        });
-    }
 }
 
 /// What an agent's own system says about it. The store never holds any of
@@ -674,7 +650,6 @@ impl DeskCells {
                 HostDeskCells {
                     confirmed: Store::new(self.device),
                     view: Store::new(self.device),
-                    pending: Vec::new(),
                     buffers: BTreeMap::new(),
                     nodes: Vec::new(),
                     node_at: HashMap::new(),
@@ -706,13 +681,11 @@ impl DeskCells {
             if let Err(error) = desk.view.merge(delta) {
                 tracing::error!(%error, "Desk cell delta did not merge into the view");
             }
-            desk.prune_pending();
         }
-        // The delta is already in both stores, so there is nothing to
-        // replay: the pending writes it confirmed merged as themselves,
-        // and the ones it did not are still in the view where they were
-        // put. Only a rejection takes a write back out of the middle,
-        // and that is the one path that replays.
+        // The delta is already in both stores, and nothing ever takes a
+        // write back out of the middle any more: the daemon merges what
+        // it is sent rather than judging it, so the view needs no replay
+        // queue behind it.
         // Written down before anything is drawn from it, and only once
         // the merge has taken it: a copy of cells the store itself
         // refused would be a desk this client could never bring into
@@ -759,21 +732,6 @@ impl DeskCells {
         // Nothing to do but note it: the cells are already in the view and
         // the poke that follows brings them into `confirmed`.
         let _ = (host, stamp);
-    }
-
-    /// A rejected mutation never happened. The view falls back to the last
-    /// merged cells, which is what the reader must see.
-    pub fn mutation_rejected(&mut self, host: HostId, stamp: Stamp, cx: &mut Context<Workspace>) {
-        let device = self.device;
-        let Some(desk) = self.hosts.get_mut(&host) else {
-            return;
-        };
-        desk.pending.retain(|mutation| mutation.stamp != stamp);
-        desk.rebuild_view(device);
-        // A write taken out of the middle can be the one that put a row
-        // somewhere, so the map is built again rather than patched.
-        self.rebuild_map(host);
-        self.reconcile_buffers(host, cx);
     }
 
     /// What the sources say, for the join every view reads through. The
@@ -1409,7 +1367,6 @@ impl DeskCells {
             tracing::error!(%error, "refusing to send an invalid Desk mutation");
             return None;
         }
-        desk.pending.push(mutation.clone());
         let mut delta = DeskDelta::default();
         for write in &mutation.writes {
             delta.write(&write.id, &write.property);
@@ -2359,7 +2316,12 @@ impl DeskCells {
     }
 
     /// Undoes an applied verdict by reapplying its before-values and
-    /// appending the `Undone` log entry the daemon validates against them.
+    /// appending the `Undone` log entry.
+    ///
+    /// A fact that has moved on since the verdict is left where it is: undo
+    /// puts back what the verdict took away, and it is not a way to reach
+    /// past whatever was written after it. Nothing left to put back means
+    /// there is no undo to make.
     pub fn undo_verdict_writes(
         &self,
         host: HostId,
@@ -2369,8 +2331,10 @@ impl DeskCells {
         let VerdictEvent::Applied { changes, .. } = self.verdict_event(host, id, at)? else {
             return None;
         };
+        let view = &self.hosts.get(&host)?.view;
         let writes = changes
             .iter()
+            .filter(|change| view.property(&change.id, &change.key) == change.after.as_ref())
             .filter_map(|change| {
                 Some(CellWrite {
                     id: change.id.clone(),

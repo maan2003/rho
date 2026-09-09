@@ -584,10 +584,6 @@ pub enum ServerMessage {
     DeskMutationAccepted {
         stamp: desk_tree::cells::Stamp,
     },
-    DeskMutationRejected {
-        stamp: desk_tree::cells::Stamp,
-        reason: String,
-    },
     DeskCellsAvailable {
         frontier: desk_tree::cells::Version,
     },
