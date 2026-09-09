@@ -28,6 +28,8 @@ The public surface is intentionally small:
 - `InferenceState` exposes disabled namespaces, namespace names, and quota
   summaries. The current account selected internally is not part of the public
   settings contract. Request setup never queries quota.
+- `Inference::route_probe_history` exposes the retained route measurements for
+  diagnostics without exposing provider account ids or credentials.
 - `InferenceSession::request` queues a `rho_core::InferenceRequest`;
   `InferenceSession::run` drives the concrete session and yields
   `rho_core::InferenceEvent` values ending in `InferenceEvent::Finished`.
@@ -54,6 +56,15 @@ configuration.
   WebSocket connection.
 - `responses/ws.rs` owns WebSocket request construction, connection reuse/reopen,
   WebSocket defaults, and event-loop timeouts/pings.
+- `responses/route.rs` owns the production-only ChatGPT edge comparison loop.
+  Every 30 minutes it measures DNS and two bounded direct-dial candidates with
+  authenticated `gpt-5.6-luna`, default-tier, `generate: false` requests. Its
+  score is send-to-first-`codex.rate_limits` latency; it still drains each probe
+  through completion before reusing the socket. Its account-scoped winner
+  applies only to Luna/default sessions; custom endpoints and every other
+  model/tier keep ordinary DNS routing. Each route result is retained for 30
+  days with its namespace, destination, validated Cloudflare colo, success
+  state, and both raw latency samples.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking.
 - `accounts.rs` is the deep account module: it owns the persisted current
@@ -99,15 +110,17 @@ should treat a stream ending before `Finished` as an error.
 
 ## WebSocket connection ownership
 
-Each `InferenceSession` owns a single `Arc<tokio::sync::Mutex<Option<WebSocketConnection>>>`
-— one warm socket per session (i.e. per agent/thread), shared across clones of
-the session. A turn locks the slot for its whole duration: it reuses the socket
-when still valid, and reopens it when missing, when OAuth rotated the bearer, or
-when it is nearing the server's ~60-minute age cap. A failed turn drops the
-socket so the next turn reconnects. Because the slot is per session, distinct
-sessions (multiple agents, sub-agent delegations) each keep their own warm
-socket without a shared keyed pool; the number of live sessions bounds the
-number of open sockets.
+Each `InferenceSession` task owns one warm socket per session (i.e. per
+agent/thread). It reuses the socket when still valid, and reopens it when
+missing, when OAuth rotated the bearer, when it is nearing the server's
+~60-minute age cap, or when the Luna/default route selector changes. Route
+changes never interrupt an in-flight turn: an idle socket is replaced
+immediately, while a busy session changes routes after its terminal event and
+uses full transcript replay because provider response ids are connection-bound.
+A failed pinned connection falls back to DNS in the same connection attempt;
+401, 403, and 429 responses preserve their existing auth/rate-limit semantics.
+Distinct sessions each keep their own warm socket; the number of live sessions
+bounds the number of open sockets.
 
 Runtime ownership and cancellation must remain explicit: dropping a consumer
 stream or aborting the caller's task must not leave an unobserved inference turn

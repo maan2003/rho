@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rho_core::{InferenceEvent, InferenceRequest};
 use senax_encoder::{Decode, Encode};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[cfg(test)]
@@ -534,6 +533,7 @@ impl SessionTask {
     /// split exists to hold, and it is why the task may have a `select!` where
     /// the caller may not.
     async fn drive(mut self, mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let mut route_updates = self.config.inference.routes().subscribe();
         loop {
             tokio::select! {
                 biased;
@@ -581,7 +581,7 @@ impl SessionTask {
                         }
                     }
                 },
-                () = self.pump() => unreachable!("the socket is never finished with"),
+                () = self.pump(&mut route_updates) => unreachable!("the socket is never finished with"),
             }
         }
     }
@@ -617,7 +617,10 @@ impl SessionTask {
     /// Send what is queued and read what comes back, emitting as it goes.
     /// Never returns: with nothing to send it keeps any warm socket alive, and
     /// with no socket either it pends.
-    async fn pump(&mut self) {
+    async fn pump(
+        &mut self,
+        route_updates: &mut tokio::sync::watch::Receiver<super::route::RouteSelection>,
+    ) {
         loop {
             // 1. Send a queued envelope (connecting first if needed). Read
             // once: what the phase says is settled before anything below is
@@ -679,17 +682,38 @@ impl SessionTask {
             let timeout = self.turn.is_some().then_some(ws::EVENT_TIMEOUT);
             // Read to a value first, so the borrow of the connection is over
             // before anything below reaches for it again.
-            let read = self
-                .connection
-                .as_mut()
-                .unwrap()
-                .next_message(timeout)
-                .await
-                .and_then(|message| {
-                    message.ok_or_else(|| {
-                        anyhow::anyhow!("stream error: websocket ended before response.completed")
-                    })
-                });
+            let read = if self.turn.is_none() {
+                tokio::select! {
+                    changed = route_updates.changed() => {
+                        if changed.is_ok() {
+                            let desired = self.config.inference.routes().for_session(
+                                &self.config.responses_config,
+                                self.selected_auth.as_ref(),
+                            );
+                            if self.connection.as_ref().is_some_and(|connection| connection.route != desired) {
+                                self.connection = None;
+                                if let Err(error) = self.ensure_connection().await {
+                                    tracing::debug!(%error, "failed to replace idle ChatGPT route connection");
+                                    self.connection = None;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    message = self.connection.as_mut().unwrap().next_message(timeout) => message,
+                }
+            } else {
+                self.connection
+                    .as_mut()
+                    .unwrap()
+                    .next_message(timeout)
+                    .await
+            }
+            .and_then(|message| {
+                message.ok_or_else(|| {
+                    anyhow::anyhow!("stream error: websocket ended before response.completed")
+                })
+            });
 
             match read {
                 Ok(WsMessage::Text(text)) => self.apply_text(text.as_ref()).await,
@@ -779,6 +803,12 @@ impl SessionTask {
     /// A read/write failure: replay or fail the active turn, or just drop the
     /// dead socket when idle.
     async fn on_socket_failure(&mut self, error: anyhow::Error) {
+        if let Some(connection) = &self.connection {
+            self.config
+                .inference
+                .routes()
+                .report_connect_failure(connection.route, self.selected_auth.as_ref());
+        }
         match self.turn.is_some() {
             true => self.fail_turn(error).await,
             // Nothing to fail, so the dead socket is the whole of it.
@@ -1011,8 +1041,14 @@ impl SessionTask {
         self.selected_auth = Some(selected.clone());
 
         let reusable = self.connection.as_ref().is_some_and(|connection| {
+            let route = self
+                .config
+                .inference
+                .routes()
+                .for_session(&self.config.responses_config, Some(&selected));
             connection.bearer_token == resolved.bearer_token
                 && connection.client_secret == resolved.client_secret
+                && connection.route == route
                 && connection.opened_at.elapsed() < ws::MAX_CONNECTION_AGE
         });
         if reusable {
@@ -1029,19 +1065,32 @@ impl SessionTask {
                     .to_wire_uuid(&self.config.base_url, resolved.client_secret)
                     .to_string()
             });
+        let mut route = self
+            .config
+            .inference
+            .routes()
+            .for_session(&self.config.responses_config, Some(&selected));
         let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
-        match connect_async(request).await {
+        let mut result = ws::connect(request, route).await;
+        if let Err(error) = &result
+            && route != super::route::DialRoute::Dns
+            && !matches!(websocket_status(error), Some(401 | 403 | 429))
+        {
+            self.config
+                .inference
+                .routes()
+                .report_connect_failure(route, Some(&selected));
+            route = super::route::DialRoute::Dns;
+            let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
+            result = ws::connect(request, route).await;
+        }
+        match result {
             Ok((socket, _response)) => {
-                self.connection = Some(WebSocketConnection::new(socket, &resolved));
+                self.connection = Some(WebSocketConnection::new(socket, &resolved, route));
                 Ok(())
             }
             Err(error) => {
-                let status = match &error {
-                    tokio_tungstenite::tungstenite::Error::Http(response) => {
-                        Some(response.status().as_u16())
-                    }
-                    _ => None,
-                };
+                let status = websocket_status(&error);
                 if status == Some(429) {
                     return Err(ProviderError::rate_limit(
                         "websocket handshake failed",
@@ -1055,6 +1104,13 @@ impl SessionTask {
                 Err(error.into())
             }
         }
+    }
+}
+
+fn websocket_status(error: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => Some(response.status().as_u16()),
+        _ => None,
     }
 }
 

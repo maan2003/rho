@@ -13,7 +13,9 @@ pub use accounts::{
 };
 pub use auth_cli::{AuthArgs, run_auth_cli};
 pub use inference::{Inference, InferenceConfig};
-pub use responses::{InferenceAuth, OpenAiResponsesProviderData, PromptCacheKey, ResolvedOAuth};
+pub use responses::{
+    InferenceAuth, InferenceRouteProbe, OpenAiResponsesProviderData, PromptCacheKey, ResolvedOAuth,
+};
 pub use session::InferenceSession;
 
 /// Installs the TLS crypto provider if nothing has yet. Any HTTP client built

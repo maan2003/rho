@@ -111,6 +111,7 @@ fn builds_responses_request_with_tools_and_item_timeline() {
 
     let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
+    assert!(json.get("generate").is_none());
 
     assert_eq!(json["model"], "gpt-test");
     assert!(json.get("temperature").is_none());

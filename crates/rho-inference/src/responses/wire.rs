@@ -124,6 +124,8 @@ senax_encoder::__private::inventory::submit! {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<bool>,
     pub model: String,
     pub instructions: Arc<str>,
     pub input: Vec<Value>,
@@ -173,6 +175,37 @@ pub(crate) struct ContextManagementRequest {
 }
 
 impl ResponsesRequest {
+    pub(crate) fn luna_default_probe(prompt_cache_key: uuid::Uuid) -> Self {
+        Self {
+            generate: Some(false),
+            model: "gpt-5.6-luna".to_owned(),
+            instructions: Arc::from(""),
+            input: vec![json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [],
+            })],
+            store: Some(false),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: Some(false),
+            text: Some(TextRequest { verbosity: "low" }),
+            reasoning: Some(ReasoningRequest {
+                context: "all_turns",
+                effort: "medium",
+                summary: "auto",
+            }),
+            service_tier: Some("default"),
+            include: vec!["reasoning.encrypted_content"],
+            prompt_cache_key,
+            context_management: Vec::new(),
+            previous_response_id: None,
+            client_metadata: Some(json!({
+                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            })),
+        }
+    }
+
     pub(crate) fn from_inference_request(
         session: &SessionConfig,
         request: InferenceRequest,
@@ -321,6 +354,7 @@ impl ResponsesRequest {
             .unwrap_or_default();
 
         Self {
+            generate: None,
             model: config.model.as_str().to_owned(),
             instructions,
             input,
