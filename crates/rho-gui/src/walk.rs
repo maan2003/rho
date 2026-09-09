@@ -404,6 +404,7 @@ fn run_events_with_detached_host(
     // Every bound on the work behind a scene has to be the walk's own, or
     // the same seed hashes a different scene on a busy box.
     editor::display_map::set_wrap_batch_clock_enabled(false);
+    rho_window::markdown::set_sync_parse_budget_enabled(false);
     gpui::profiler::set_editor_trace_enabled(true);
     gpui::profiler::set_frame_trace_enabled(true);
     let mut timings = gpui::profiler::EditorTimingCollector::new();

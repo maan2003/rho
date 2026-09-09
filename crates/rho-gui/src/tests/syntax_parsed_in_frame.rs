@@ -135,3 +135,76 @@ fn opening_parses_the_screen_it_opens_on(cx: &mut TestAppContext) {
          reaches them, not to open"
     );
 }
+
+/// Two hundred turns whose last answer is `tail`, so feeding two of these
+/// in a row changes one turn's text and nothing else.
+fn history_with_tail(tail: &str) -> super::UiAgentState {
+    let mut blocks = Vec::new();
+    for turn in 0..199 {
+        blocks.push(super::user(&format!("ask {turn}")));
+        blocks.push(super::assistant(
+            &format!("turn {turn} line one\nturn {turn} line two\n"),
+            Some(super::UiMessagePhase::FinalAnswer),
+        ));
+    }
+    blocks.push(super::user("ask about the tail"));
+    blocks.push(super::assistant(
+        tail,
+        Some(super::UiMessagePhase::FinalAnswer),
+    ));
+    super::state(blocks, Vec::new())
+}
+
+/// An answer that grows replaces the buffer it lands in, and the
+/// replacement is parsed in the frame that made it.
+///
+/// A new buffer has no syntax until something asks. If the asking is left
+/// to the editor it arrives 50 ms later, on the debounced scroll the
+/// replacement itself caused: the markup a parse conceals is on screen
+/// until then and the text shifts under the reader on a timer, which is
+/// also a scene that changes with the clock outside any live cadence.
+#[gpui::test]
+fn a_replaced_tail_buffer_is_parsed_in_the_frame_that_made_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        history_with_tail("tail line one\n"),
+    );
+    let editor = active_editor(&workspace, cx);
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        history_with_tail("tail line one\ntail line two with `code`\n"),
+    );
+
+    let (has_language, unparsed) = workspace
+        .update(cx, |_, _, cx| {
+            let multi_buffer = editor.read(cx).buffer().clone();
+            let last_row = multi_buffer.read(cx).snapshot(cx).max_point().row;
+            let point = multi_buffer::MultiBufferPoint::new(last_row.saturating_sub(1), 0);
+            let (buffer, _) = multi_buffer
+                .read(cx)
+                .point_to_buffer_offset(point, cx)
+                .expect("the grown answer is composed");
+            let has_language = buffer.read(cx).language().is_some();
+            (
+                has_language,
+                buffer.update(cx, |buffer, cx| buffer.ensure_syntax_parsed(cx)),
+            )
+        })
+        .expect("read the buffer the grown answer landed in");
+
+    assert!(
+        has_language,
+        "the grown answer has to hold syntax, or the question is vacuous"
+    );
+    assert!(
+        !unparsed,
+        "the frame that replaced the buffer is the frame that draws it: \
+         its syntax is parsed there, not on a timer afterwards"
+    );
+}

@@ -371,13 +371,14 @@ impl TranscriptModel {
 
     /// Parses the syntax of the buffers the window is about to draw.
     ///
-    /// Everywhere else the editor does this for itself, on an excerpt
-    /// change, a display-map change or a scroll — but it parses what it
-    /// can see, and at open it has not laid out yet and can see nothing.
-    /// So the first screen is warmed here, and only the first screen: a
-    /// window's rows counted back from the tail, which is where a
-    /// transcript opens. What is above them is parsed when the reader
-    /// scrolls to it, by the element that draws it.
+    /// The editor does this for itself on a scroll, but only after a 50 ms
+    /// debounce, and at open it has not laid out yet and can see nothing.
+    /// So the screen is warmed here: at open, and again whenever a buffer
+    /// is replaced, because a new buffer's parse is what conceals its
+    /// markup and a parse that lands later draws the delimiters first.
+    /// Only the screen: a window's rows counted back from the tail, which
+    /// is where a transcript opens. What is above them is parsed when the
+    /// reader scrolls to it, by the element that draws it.
     fn warm_first_screen<V: 'static>(&mut self, cx: &mut Context<V>) {
         let mut rows = 0;
         let mut screen = Vec::new();
@@ -531,6 +532,13 @@ impl TranscriptModel {
 
         self.refresh_elision_plans(self.block_of(start));
         self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
+        // A replaced buffer is a new one, and a new one is parsed only when
+        // something asks. Without this the asking is the editor's, 50 ms
+        // after the scroll its own change caused, so the markup the parse
+        // conceals is on screen until then and the screen changes with the
+        // clock. This is the same screen the window is about to draw,
+        // warmed in the frame that made it.
+        self.warm_first_screen(cx);
         cx.notify();
     }
 
