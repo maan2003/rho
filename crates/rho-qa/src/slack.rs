@@ -67,8 +67,21 @@ async fn serve(args: FakeSlackArgs) -> Result<()> {
         None => args.mirror.with_extension("seed.redb"),
     };
     copy(&args.mirror, &scratch)?;
-    let mirror = Mirror::open(&scratch)
+    let mut mirror = Mirror::open(&scratch)
         .with_context(|| format!("open the mirror copy at {}", scratch.display()))?;
+
+    // A rig cloned before the client's databases became one keeps its Slack
+    // mirror in the old `slack.redb`; the consolidated client writes the same
+    // tables into `rho-client.redb`. Take whichever of the two has a
+    // workspace, so an old snapshot still seeds a fake.
+    let retired = args.mirror.with_file_name("slack.redb");
+    if mirror.workspaces().is_empty() && retired.exists() {
+        drop(mirror);
+        copy(&retired, &scratch)?;
+        mirror = Mirror::open(&scratch)
+            .with_context(|| format!("open the mirror copy at {}", scratch.display()))?;
+    }
+    let mirror = mirror;
 
     let workspace = match args.workspace {
         Some(name) => name,
