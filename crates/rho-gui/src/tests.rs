@@ -23,6 +23,7 @@ mod call_punctuation;
 mod dashboard_cost;
 mod editor_shutdown;
 mod elision_block_geometry;
+mod elision_caret;
 mod elision_tail_rebuild;
 mod elision_unfold;
 mod find_cost;

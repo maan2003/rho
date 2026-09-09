@@ -1792,6 +1792,28 @@ impl FoldSnapshot {
         self.transforms.summary().output.longest_row
     }
 
+    /// The part of a fold the reader cannot see, in buffer offsets, or
+    /// `None` when the whole of it is on screen. Under
+    /// [`ElisionPolicy::Tail`] a fold keeps its last rows visible, and
+    /// those rows are ordinary text: a caret rests in them, a motion
+    /// crosses them. Only the elided head is a place the caret cannot go,
+    /// so every rule written against a fold's boundaries is written
+    /// against this range rather than the fold's whole range.
+    pub fn elided_range(&self, fold: &Fold) -> Option<Range<MultiBufferOffset>> {
+        let buffer = &self.inlay_snapshot.buffer;
+        let start = self
+            .inlay_snapshot
+            .to_inlay_offset(fold.range.start.to_offset(buffer));
+        let end = self
+            .inlay_snapshot
+            .to_inlay_offset(fold.range.end.to_offset(buffer));
+        let (elided, _) = elided_ranges(&self.inlay_snapshot, start..end, fold.elision_policy);
+        elided.map(|range| {
+            self.inlay_snapshot.to_buffer_offset(range.start)
+                ..self.inlay_snapshot.to_buffer_offset(range.end)
+        })
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn folds_in_range<T>(&self, range: Range<T>) -> impl Iterator<Item = &Fold>
     where
