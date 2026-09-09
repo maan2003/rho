@@ -180,6 +180,15 @@ impl Hosts {
             .map(|host| host.id)
     }
 
+    /// The host that owns a thing with exactly one home, a Slack unit above
+    /// all: the first host configured, answering or not. Unlike `primary`
+    /// this never moves when a host goes quiet, so a unit's cells stay on
+    /// one host instead of splitting across two, and a write made while the
+    /// owner is away is refused where the user can see it.
+    pub fn owner(&self) -> Option<HostId> {
+        self.hosts.first().map(|host| host.id)
+    }
+
     pub fn connection(&self, host: HostId) -> Option<&Connection> {
         self.get(host).map(Host::connection)
     }

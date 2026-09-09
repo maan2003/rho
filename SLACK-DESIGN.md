@@ -214,6 +214,20 @@ another machine the same day. Leaving them is idempotent, costs nothing
 to write, and can be done later against the definition above if the space
 ever matters. `SlackSnoozedAt` goes with eng-8gpr's pending removal.
 
+Landed 9 Sep: a Slack unit belongs to one host, the first configured,
+answering or not. The desk used to give the mirror's units to whichever
+host was up, so a unit written about on two days with two hosts up had its
+cells in two stores and a row on each. Ownership does not move, so writes
+go to the owner alone whether it is answering or not: the desk lives on
+this client, so a write while the owner is quiet lands in its replica and
+the sync after it returns carries it up, the same as any other node. That
+is why the away case needs no notice and no second host. Reads are
+generous the other way: the owner's row folds in what any other host holds
+about the unit, and the owner's own cells win where both spoke. No
+migration and no setting -- cells already split are read where they lie.
+`Hosts::owner` in `rho-hosts/src/hosts.rs` is the rule; `compute_nodes`
+draws Slack rows on the owner only.
+
 Landed 9 Sep: `SlackSnoozedAt` is retired. Nothing wrote it but the snooze
 verdict and nothing ever read it, so a snooze has always been held by
 `defer_until` alone; the cursor it needed is the mirror's, which is why a

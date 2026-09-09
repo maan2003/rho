@@ -443,7 +443,7 @@ impl Workspace {
         // A Slack room is findable because Slack says it exists rather than
         // because the tree holds a row for it, so its labels are joined on
         // here instead of coming down with the node.
-        if let Some(host) = self.hosts.primary() {
+        if let Some(host) = self.hosts.owner() {
             let paths = self
                 .desk_cells
                 .label_paths(host)

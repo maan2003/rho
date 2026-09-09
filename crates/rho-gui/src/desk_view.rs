@@ -556,6 +556,11 @@ pub struct DeskCells {
     device: DeviceId,
     next_buffer_id: u64,
     hosts: BTreeMap<HostId, HostDeskCells>,
+    /// The host a Slack unit belongs to: the first configured, said by the
+    /// workspace whenever the attached hosts change. Slack rows are drawn
+    /// on that host alone, so a unit whose cells ended up on two hosts is
+    /// still one row.
+    slack_owner: Option<HostId>,
     /// The name each host answers to, which is what the replica on disk
     /// is keyed by. A host id is handed out in attach order and means
     /// nothing across a restart; the name is the same one the agent
@@ -569,6 +574,7 @@ impl DeskCells {
             device,
             next_buffer_id: 1,
             hosts: BTreeMap::new(),
+            slack_owner: None,
             names: BTreeMap::new(),
         }
     }
@@ -579,6 +585,29 @@ impl DeskCells {
     /// no copy, which is what the replica has always promised to be.
     pub fn host_named(&mut self, host: HostId, name: String) {
         self.names.insert(host, name);
+    }
+
+    /// Which host Slack units belong to now. Nothing moves cells when this
+    /// changes: the rows are simply drawn on the new owner, and cells left
+    /// on another host are read from there as they always were.
+    pub fn slack_owned_by(&mut self, host: Option<HostId>) {
+        if self.slack_owner == host {
+            return;
+        }
+        self.slack_owner = host;
+        // The owner changing moves every Slack row from one map to another,
+        // and a map is only otherwise rebuilt when its own host speaks.
+        for host in self.hosts.keys().copied().collect::<Vec<_>>() {
+            self.rebuild_map(host);
+        }
+    }
+
+    /// Who owns Slack units right now. Until the workspace says, the first
+    /// host to have said anything does, which is the same host in every
+    /// ordinary case: ids are handed out in attach order.
+    fn slack_owner(&self) -> Option<HostId> {
+        self.slack_owner
+            .or_else(|| self.hosts.keys().next().copied())
     }
 
     pub fn device(&self) -> DeviceId {
@@ -703,6 +732,19 @@ impl DeskCells {
         // refused would be a desk this client could never bring into
         // line.
         self.apply_to_map(host, &delta_ids);
+        // Cells about a Slack unit that land on a host which does not own
+        // it are still the owner's row, so the owner's map is made again.
+        // Only the split legacy cells reach this; the ordinary desk writes
+        // Slack cells on the owner and rebuilds nothing extra.
+        if let Some(owner) = self.slack_owner()
+            && owner != host
+            && delta_ids
+                .touched
+                .iter()
+                .any(|id| matches!(id, Id::Slack(_)))
+        {
+            self.rebuild_map(owner);
+        }
         self.merge_bodies(host, &bodies, cx);
         if let Some(name) = self.names.get(&host) {
             rho_mirror::desk::write_delta(name, store, namespace, held, bodies);
@@ -1056,6 +1098,10 @@ impl DeskCells {
             return Vec::new();
         };
         let sources = &desk.sources;
+        // A Slack unit has one owner, so its row is drawn there and nowhere
+        // else. Cells for it may still sit on another host, from a write
+        // made back when the desk followed whichever host was answering.
+        let owns_slack = self.slack_owner() == Some(host);
         let mut facts = desk
             .view
             .all_facts()
@@ -1064,10 +1110,28 @@ impl DeskCells {
             // as it says so; one it has stopped telling rho about is a row
             // only if the user wrote something Slack has no place for.
             .filter(|(id, facts)| match id {
-                Id::Slack(unit) => sources.unit(unit).is_some() || rho_wrote_of_unit(facts),
+                Id::Slack(unit) => {
+                    owns_slack && (sources.unit(unit).is_some() || rho_wrote_of_unit(facts))
+                }
                 _ => true,
             })
             .collect::<BTreeMap<Id, Facts>>();
+        // The generous read: what another host holds about a unit is the
+        // owner's row too, and the owner's own cells win where both spoke.
+        if owns_slack {
+            for desk in self
+                .hosts
+                .iter()
+                .filter(|(other, _)| **other != host)
+                .map(|(_, desk)| desk)
+            {
+                for (id, other_facts) in desk.view.all_facts() {
+                    if matches!(id, Id::Slack(_)) && rho_wrote_of_unit(&other_facts) {
+                        facts.entry(id).or_insert(other_facts);
+                    }
+                }
+            }
+        }
         // Open by its source: a waiting agent and a Slack unit with new
         // traffic matter even when the user has never said anything.
         for agent in sources.agents() {
@@ -1075,8 +1139,10 @@ impl DeskCells {
                 facts.entry(Id::Agent(agent.agent)).or_default();
             }
         }
-        for unit in sources.slack() {
-            facts.entry(Id::Slack(unit.unit.clone())).or_default();
+        if owns_slack {
+            for unit in sources.slack() {
+                facts.entry(Id::Slack(unit.unit.clone())).or_default();
+            }
         }
         // A tab the reader opened from a page is where they deliberately
         // went, so it is on the map even before they say anything about
@@ -2152,19 +2218,27 @@ impl DeskCells {
     /// closed on is a fact like any other, and opening the card needs it to
     /// know where to land the reader.
     pub fn facts_of_slack_unit(&self, host: Option<HostId>, unit: &SlackUnit) -> Option<Facts> {
-        Some(self.hosts.get(&host?)?.view.facts(&Id::Slack(unit.clone())))
+        let id = Id::Slack(unit.clone());
+        let owner = self.hosts.get(&host?).map(|desk| desk.view.facts(&id));
+        if owner.as_ref().is_some_and(rho_wrote_of_unit) {
+            return owner;
+        }
+        // Nothing said here, so ask the others: a cursor or a verdict may
+        // have landed on whichever host was answering at the time.
+        self.hosts
+            .values()
+            .map(|desk| desk.view.facts(&id))
+            .find(rho_wrote_of_unit)
+            .or(owner)
     }
 
     /// Every Slack unit the store holds an old cursor for. Read once ever,
     /// by the seed that moves those cursors into the Slack mirror; nothing
     /// reads the cells afterwards and nothing deletes them.
-    pub fn slack_handled_cells(&self, host: HostId) -> Vec<(SlackUnit, SlackTs)> {
-        let Some(desk) = self.hosts.get(&host) else {
-            return Vec::new();
-        };
-        desk.view
-            .all_facts()
-            .into_iter()
+    pub fn slack_handled_cells(&self) -> Vec<(SlackUnit, SlackTs)> {
+        self.hosts
+            .values()
+            .flat_map(|desk| desk.view.all_facts())
             .filter_map(|(id, facts)| match id {
                 Id::Slack(unit) => Some((unit, facts.slack_handled_through?)),
                 _ => None,

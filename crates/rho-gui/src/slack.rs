@@ -478,10 +478,7 @@ impl Workspace {
         if session.read(cx).handled_seeded() {
             return;
         }
-        let Some(host) = self.hosts.primary() else {
-            return;
-        };
-        let cells = self.desk_cells.slack_handled_cells(host);
+        let cells = self.desk_cells.slack_handled_cells();
         session.update(cx, |session, _| {
             for (unit, ts) in cells {
                 session.seed_handled(&model_unit(&unit), &Ts(ts.0));
@@ -1239,7 +1236,7 @@ impl Workspace {
         // again on the next start. Every unit the plan covers gets one, at
         // the newest message at or before the cutoff, so anything that
         // arrived since is still theirs.
-        let host = self.hosts.primary();
+        let host = self.hosts.owner();
         let workspace_name = session.read(cx).model().workspace().clone();
         let mut nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> = plan
             .conversations
@@ -1551,7 +1548,7 @@ impl Workspace {
                 // The mirror moved, so the join every Slack card is derived
                 // from has to be rebuilt: a unit that started to matter is a
                 // row the moment the message lands, with nothing written.
-                if let Some(host) = self.hosts.primary() {
+                if let Some(host) = self.hosts.owner() {
                     self.sync_tree_dashboard(host, window, cx);
                 }
                 self.invalidate_dealer_signals(cx);

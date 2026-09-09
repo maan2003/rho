@@ -2638,3 +2638,125 @@ async fn tab_over_a_slack_conversation_opens_the_verdicts_and_again_is_home(
         })
         .unwrap();
 }
+
+/// A Slack unit belongs to one host, the first configured, whether it is
+/// answering or not. Cells written back when the desk followed whichever
+/// host was up landed on the second host, and they are read from where they
+/// are rather than migrated: the unit is one row, on its owner, carrying
+/// what the other host holds, and the second host draws no row of its own.
+#[gpui::test]
+fn a_slack_unit_written_on_the_second_host_is_one_row_on_the_first(cx: &mut TestAppContext) {
+    let owner = rho_agents::HostId::default();
+    let other = rho_agents::HostId(1);
+    let unit = slack_unit("C1", None);
+    let id = rho_desk::cells::Id::Slack(unit.clone());
+
+    // What the write made while the owner was away left behind: a name is a
+    // fact Slack has nowhere to keep, so it is the unit's own row.
+    let mut elsewhere = crate::tests::DeskFixture::new();
+    elsewhere.set(
+        id.clone(),
+        rho_desk::cells::Property::Name("the release".to_owned()),
+    );
+    let here = crate::tests::DeskFixture::new();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            crate::tests::story::feed(workspace, owner, here.synced(), window, cx);
+            crate::tests::story::feed(workspace, other, elsewhere.synced(), window, cx);
+            // The owner comes back.
+            crate::tests::story::feed(workspace, owner, here.synced(), window, cx);
+
+            let rows = |host| {
+                workspace
+                    .desk_cells
+                    .nodes(host)
+                    .iter()
+                    .filter(|node| matches!(node.id, rho_desk::cells::Id::Slack(_)))
+                    .map(|node| (node.id.clone(), node.name.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(owner),
+                vec![(id.clone(), Some("the release".to_owned()))],
+                "one row, on the owner, with the facts the other host holds"
+            );
+            assert!(
+                rows(other).is_empty(),
+                "and no second row on the host the cells happen to sit on"
+            );
+            assert_eq!(
+                workspace
+                    .desk_cells
+                    .facts_of_slack_unit(Some(owner), &unit)
+                    .and_then(|facts| facts.name),
+                Some("the release".to_owned()),
+                "and asking the owner about the unit finds them"
+            );
+        })
+        .unwrap();
+}
+
+/// The other half of the same rule: the owner being away is not a refusal.
+/// The desk lives on this client, so a verdict on a Slack unit lands in the
+/// owner's own replica while it is quiet, and the sync after it returns
+/// carries it up. Writing it on whichever host was answering instead is
+/// what split a unit's cells across two stores.
+#[gpui::test]
+fn a_verdict_on_a_slack_unit_written_while_its_host_is_away_reaches_it_on_return(
+    cx: &mut TestAppContext,
+) {
+    let host = rho_agents::HostId::default();
+    let mut desk = crate::tests::DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+    let unit = slack_unit("C1", Some("500.0"));
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(host, desk.slack_sources(), window, cx);
+            // The host of this workspace has never answered.
+            assert!(
+                workspace.apply_verdict_for_test(
+                    host,
+                    &node,
+                    crate::desk_view::DeskVerdict::Defer {
+                        until: rho_desk::cells::Timestamp {
+                            unix_ms: 4_000_000_000_000,
+                            precision: rho_desk::cells::TimestampPrecision::Day,
+                        },
+                    },
+                    window,
+                    cx,
+                ),
+                "a quiet owner does not refuse the write"
+            );
+            assert!(
+                workspace
+                    .desk_cells
+                    .facts_of_slack_unit(Some(host), &unit)
+                    .is_some_and(|facts| facts.defer_until.is_some()),
+                "it is in the owner's own replica while the owner is away"
+            );
+            workspace.take_host_messages_for_test(host);
+
+            // The owner returns and says where it stands, which is before
+            // the write.
+            workspace.force_host_online(host);
+            crate::tests::story::feed(workspace, host, desk.synced(), window, cx);
+            assert!(
+                workspace
+                    .take_host_messages_for_test(host)
+                    .iter()
+                    .any(|message| match message {
+                        rho_ui_proto::ClientMessage::DeskCellsApply { cells } =>
+                            cells.cells.iter().any(|cell| cell.id == node),
+                        _ => false,
+                    }),
+                "and the sync after it returns carries the write to the daemon"
+            );
+        })
+        .unwrap();
+}

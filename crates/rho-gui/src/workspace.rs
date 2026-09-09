@@ -1096,6 +1096,7 @@ impl Workspace {
                 rho_mirror::model::ModelCommand::HostCommands { host, commands },
             ));
         self.registry.attach_host(host, spec.name);
+        self.desk_cells.slack_owned_by(self.hosts.owner());
         host
     }
 
@@ -1122,6 +1123,7 @@ impl Workspace {
             self.voice.stop();
         }
         self.hosts.detach(host);
+        self.desk_cells.slack_owned_by(self.hosts.owner());
         let _ = self
             .model
             .unbounded_send(rho_mirror::model::ToModel::Command(
@@ -5430,7 +5432,8 @@ impl Workspace {
                 .collect::<Vec<_>>(),
         };
         // The Slack mirror lives on this client, and its conversations are
-        // the primary host's desk.
+        // the owning host's desk: the first configured, so the unit does not
+        // change hands when that host goes quiet.
         // With no session there is nothing new to say about Slack, which is
         // not the same as saying every unit went quiet: the facts already
         // read from the mirror stand until a session replaces them.
@@ -5439,7 +5442,7 @@ impl Workspace {
                 .sources(host)
                 .map(|sources| sources.slack().to_vec())
                 .unwrap_or_default()
-        } else if self.hosts.primary() == Some(host) {
+        } else if self.hosts.owner() == Some(host) {
             self.slack_thread_facts(cx)
                 .into_iter()
                 .map(|(unit, facts)| crate::desk_view::SlackSource {
@@ -5800,7 +5803,7 @@ impl Workspace {
             // no node yet, and a verdict is what makes it one.
             SurfaceKey::SlackConversation(source) => {
                 let unit = self.slack_surface_unit(source, cx)?;
-                return Some((self.hosts.primary()?, rho_desk::cells::Id::Slack(unit)));
+                return Some((self.hosts.owner()?, rho_desk::cells::Id::Slack(unit)));
             }
             _ => None,
         }?;
