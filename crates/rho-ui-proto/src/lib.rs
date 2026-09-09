@@ -139,6 +139,12 @@ pub enum ClientMessage {
         /// difference from a number that was never its own.
         store: Option<desk_tree::cells::DeviceId>,
     },
+    /// The client's half of a sync: the cells it holds that the daemon's
+    /// frontier does not cover. The store is the client's, so the daemon
+    /// catches up from it the same way it is caught up from.
+    DeskCellsApply {
+        cells: desk_tree::cells::Snapshot,
+    },
     DeskMutationApply {
         mutation: desk_tree::cells::CellMutation,
     },

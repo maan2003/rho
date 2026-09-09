@@ -642,6 +642,12 @@ dealer until the store has been read now reads "the client's replica is
 loaded", and the replica is opened in `Workspace::new` before a socket
 exists.
 
+Sync is two ways for the same reason: the daemon sends the cells above
+the client's `known`, and the client sends the cells above the daemon's
+frontier (`DeskCellsApply`). A copy that only ever received would lose
+any write made while it was away, since a write is complete on the client
+and nothing replays it.
+
 What is still owed: a note's body does not resume from the mirror, so
 every sync carries the whole desk's prose and the reader's text is the
 one thing the replica cannot give them at open. Per-body versions are

@@ -274,6 +274,18 @@ from. The replica is opened in `Workspace::new`, before a socket exists,
 so Home's first draw is the user's own desk rather than a list waiting
 on a daemon.
 
+**Sync is two ways.** `DeskSync` asks for what the daemon has and answers
+with what the client has: the daemon sends the cells above the client's
+`known`, and the client sends the cells above the daemon's frontier,
+which `DeskSynced`'s delta carries as its version. `ClientMessage::
+DeskCellsApply` is that half, and the daemon merges it like anything
+else. Without it a write is delivered exactly once or never: a verdict
+taken while the daemon was down, or one lost on the wire, would sit on
+one disk forever, because a write completes on the client and nothing
+replays it. With it, the next handshake carries it. Ordinary syncs send
+nothing back, since the cells the daemon just sent are the ones the
+client would have offered.
+
 **Next: bodies do not resume from the mirror.** A note's text is still
 sent whole on every sync and the replica's copy is not what the reader
 opens on. That is the next step on this path, and it is not in this

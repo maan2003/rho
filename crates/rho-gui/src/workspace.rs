@@ -1628,7 +1628,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (again, delta) = self.desk_cells.synced(
+        let (back, delta) = self.desk_cells.synced(
             host,
             cells.store,
             cells.node_namespace,
@@ -1636,8 +1636,8 @@ impl Workspace {
             cells.bodies,
             cx,
         );
-        if let Some(again) = again {
-            self.send_to_host(host, again);
+        for message in back {
+            self.send_to_host(host, message);
         }
         self.sync_tree_delta(host, &delta, window, cx);
         self.carry_over_captures(host, window, cx);

@@ -6138,6 +6138,74 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
 }
 
 #[gpui::test]
+fn a_verdict_the_daemon_never_heard_goes_back_at_the_next_sync(cx: &mut TestAppContext) {
+    // The write is done on the client, so nothing on this side is waiting
+    // to be told it happened -- and nothing replays it either. A verdict
+    // taken while the daemon was away, or one lost on the wire, would
+    // reach no other device ever again if the handshake did not carry it
+    // back. Sync is two ways: the answer says what the daemon has, and
+    // what this client holds above the daemon's frontier goes with it.
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "Written while the daemon was away");
+    desk.set(
+        note.clone(),
+        rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_577_836_800_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    // Sent and dropped: the fixture's store never takes this mutation, the
+    // way a daemon that was not running never took it.
+    workspace
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation");
+        })
+        .unwrap();
+
+    let sent_back = workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskCellsApply { cells } => Some(cells),
+                    _ => None,
+                })
+        })
+        .unwrap()
+        .expect("the client sends the cells the daemon's frontier lacks");
+    assert!(
+        sent_back.cells.iter().any(|cell| cell.id == note
+            && cell.property == rho_desk::cells::Property::State(rho_desk::cells::State::Done)),
+        "the verdict the daemon never heard is in what goes back: {:?}",
+        sent_back.cells
+    );
+
+    // And it merges there, which is the whole point: the other devices can
+    // read it now.
+    desk.store.merge(sent_back).unwrap();
+    assert_eq!(
+        desk.store.facts(&note).state,
+        rho_desk::cells::State::Done,
+        "the daemon holds the write it missed"
+    );
+}
+
+#[gpui::test]
 fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut TestAppContext) {
     // Two GUIs on one desk: the first deals a verdict, the daemon accepts
     // it, and the second sees it only because the poke made it sync.

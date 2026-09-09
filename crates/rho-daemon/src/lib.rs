@@ -2186,6 +2186,31 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
+        ClientMessage::DeskCellsApply { cells } => {
+            // The other half of the handshake. The same two conditions as a
+            // mutation, and for the same reason: they are about this
+            // connection, not about what the cells say.
+            let Some(session) = desk_session.as_ref() else {
+                anyhow::bail!("Desk connection must sync before writing");
+            };
+            anyhow::ensure!(
+                !session.binding.displaced.load(Ordering::SeqCst),
+                "The desk moved to a newer window on this device"
+            );
+            match services.desk_cells.apply_cells(cells).await {
+                Ok(()) => {
+                    let frontier = services.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                    let _ = services
+                        .events
+                        .send(ServerMessage::DeskCellsAvailable { frontier });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, device = ?session.device,
+                        "a client's catch-up cells did not merge");
+                }
+            }
+            Ok(Refresh::None)
+        }
         ClientMessage::DeskMutationApply { mutation } => {
             let stamp = mutation.stamp;
             // Nothing here is a verdict on what the user wrote: the two

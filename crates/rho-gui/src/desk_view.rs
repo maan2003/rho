@@ -598,9 +598,17 @@ impl DeskCells {
         }
     }
 
-    /// The daemon's answer. Returns a further `DeskSync` when a poke
-    /// arrived while this one was in flight and the answer does not already
-    /// cover it.
+    /// The daemon's answer, and what goes back for it.
+    ///
+    /// Sync is two ways because the store is the client's: the answer says
+    /// what the daemon has that this client lacks, and what this client
+    /// has above the daemon's frontier goes the other way in the same
+    /// breath. Without that half a verdict taken while the daemon was away
+    /// would sit on this disk and reach no other device, since nothing
+    /// replays a write that was never sent.
+    ///
+    /// A further `DeskSync` comes back too when a poke arrived while this
+    /// one was in flight and the answer does not already cover it.
     pub fn synced(
         &mut self,
         host: HostId,
@@ -609,7 +617,7 @@ impl DeskCells {
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
         cx: &mut Context<Workspace>,
-    ) -> (Option<ClientMessage>, DeskDelta) {
+    ) -> (Vec<ClientMessage>, DeskDelta) {
         let frontier = delta.version.clone();
         // The copy's own share of the delta, taken before the merges
         // consume it. `delta.version` is the daemon's frontier, which is
@@ -669,14 +677,14 @@ impl DeskCells {
         }
         {
             let Some(desk) = self.hosts.get_mut(&host) else {
-                return (None, DeskDelta::quiet());
+                return (Vec::new(), DeskDelta::quiet());
             };
             desk.namespace = namespace;
             desk.store = store;
             desk.syncing = false;
             if let Err(error) = desk.confirmed.merge(delta.clone()) {
                 tracing::error!(%error, "Desk cell delta did not merge");
-                return (None, DeskDelta::quiet());
+                return (Vec::new(), DeskDelta::quiet());
             }
             if let Err(error) = desk.view.merge(delta) {
                 tracing::error!(%error, "Desk cell delta did not merge into the view");
@@ -696,13 +704,23 @@ impl DeskCells {
             rho_mirror::desk::write_delta(name, store, namespace, held, bodies);
         }
         self.give_buffers(host, &delta_ids, cx);
-        let again = match self.hosts.get_mut(&host).and_then(|desk| desk.poked.take()) {
+        let mut back = Vec::new();
+        // The client's half of the answer. Empty when the daemon is level
+        // with this replica, which is every sync in the ordinary case: the
+        // cells it just sent are in the view and count as its own.
+        if let Some(desk) = self.hosts.get(&host) {
+            let catch_up = desk.view.since(&frontier);
+            if !catch_up.cells.is_empty() || !catch_up.verdicts.is_empty() {
+                back.push(ClientMessage::DeskCellsApply { cells: catch_up });
+            }
+        }
+        if let Some(poke) = self.hosts.get_mut(&host).and_then(|desk| desk.poked.take())
             // The answer already carries everything the poke announced.
-            Some(poke) if covers(&frontier, &poke) => None,
-            Some(_) => Some(self.sync(host)),
-            None => None,
-        };
-        (again, delta_ids)
+            && !covers(&frontier, &poke)
+        {
+            back.push(self.sync(host));
+        }
+        (back, delta_ids)
     }
 
     /// `DeskCellsAvailable`: a poke, not a delta. One handshake is in flight

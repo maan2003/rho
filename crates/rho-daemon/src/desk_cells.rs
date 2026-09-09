@@ -360,6 +360,34 @@ impl DeskCellStore {
         Ok(note)
     }
 
+    /// The client's half of a sync: cells it holds that this store's
+    /// frontier does not cover. The desk is the client's, so this is how
+    /// the daemon catches up — a write made while it was away, or one that
+    /// never made it off the wire, arrives here at the next handshake
+    /// rather than living on one device forever.
+    pub(crate) async fn apply_cells(&self, cells: Snapshot) -> Result<(), String> {
+        if cells.cells.is_empty() && cells.verdicts.is_empty() {
+            return Ok(());
+        }
+        let mut write = self.db.write().await;
+        let mut meta = write
+            .open_table(META)
+            .get(&())
+            .ok_or("Desk cells V2 metadata is missing")?
+            .value()
+            .into_owned();
+        let snapshot = read_snapshot_from_write(&mut write)?;
+        let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
+        store.merge(cells)?;
+        persist_cells_and_verdicts(&mut write, &store.snapshot())?;
+        meta.frontier = store.version().clone();
+        write
+            .open_table(META)
+            .insert(&(), SenValue::borrowed(&meta));
+        write.commit();
+        Ok(())
+    }
+
     pub(crate) async fn apply_mutation(
         &self,
         session_device: DeviceId,
@@ -975,6 +1003,52 @@ mod tests {
 
     /// Writes one note at the root the way a client does. A note is
     /// whatever the user has said about it, so this is the whole of one.
+    /// The client's half of a sync. A write the daemon never heard about --
+    /// made while it was down, or lost on the wire -- comes back at the
+    /// next handshake, because the store is the client's and the daemon
+    /// catches up from it.
+    #[tokio::test]
+    async fn a_clients_catch_up_cells_merge_and_move_the_frontier() {
+        let store = fixture_store().await;
+        let device = DeviceId([21; 16]);
+        let id = seed_note(&store, device).await;
+
+        // A client's own store, holding a write this daemon has not seen.
+        let away = DeviceId([22; 16]);
+        let mut client = Store::from_snapshot(away, store.sync_since(&Version::new()).unwrap())
+            .unwrap();
+        client
+            .apply_mutation(&CellMutation {
+                stamp: Stamp {
+                    device: away,
+                    version: 9,
+                },
+                writes: vec![CellWrite {
+                    id: id.clone(),
+                    property: Property::Name("written while away".into()),
+                }],
+                verdict: None,
+            })
+            .unwrap();
+
+        let frontier = store.frontier().unwrap();
+        store.apply_cells(client.since(&frontier)).await.unwrap();
+
+        let held = Store::from_snapshot(
+            DeviceId([0; 16]),
+            store.sync_since(&Version::new()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(held.facts(&id).name.as_deref(), Some("written while away"));
+        assert_eq!(
+            store.frontier().unwrap().get(&away).copied(),
+            Some(9),
+            "the daemon counts the away device's write as its own now"
+        );
+        // Nothing to send is not an error, and it writes nothing.
+        store.apply_cells(client.since(client.version())).await.unwrap();
+    }
+
     async fn seed_note(store: &DeskCellStore, device: DeviceId) -> Id {
         let namespace = store.node_namespace(device).await.unwrap();
         let id = Id::Note(Uuid::random());
