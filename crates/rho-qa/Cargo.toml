@@ -36,4 +36,6 @@ tempfile.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 rho-db.workspace = true
+rho-mirror.workspace = true
 senax-encoder.workspace = true
+text.workspace = true

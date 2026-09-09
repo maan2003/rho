@@ -15080,6 +15080,7 @@ dependencies = [
  "rho-db",
  "rho-fake-model",
  "rho-gui",
+ "rho-mirror",
  "rho-slack",
  "rho-ui-proto",
  "rustls",
@@ -15088,6 +15089,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "text",
  "tokio",
 ]
 

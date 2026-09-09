@@ -11384,6 +11384,7 @@ fn cells_counted_in_another_store_replace_what_the_client_held(cx: &mut TestAppC
             workspace.desk_arrived(
                 HostId::default(),
                 crate::workspace::DeskArrival {
+                    from: "test",
                     store: held_store,
                     node_namespace: 42,
                     delta: held.0,
@@ -11484,6 +11485,7 @@ fn a_desk_off_the_client_s_own_copy_holds_the_verdict_it_was_given(cx: &mut Test
             workspace.desk_arrived(
                 HostId::default(),
                 crate::workspace::DeskArrival {
+                    from: "test",
                     store: DeskFixture::STORE,
                     node_namespace: 42,
                     delta: held.0,
@@ -11610,4 +11612,87 @@ fn home_text(workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext)
             })
         })
         .unwrap()
+}
+
+/// Text typed here is kept here. The daemon never sends a client its own
+/// operations back, so a note written on this client and only sent would
+/// be gone from the mirror at the next cold open, and the sync that
+/// follows would ask for words it wrote itself.
+#[gpui::test]
+fn a_body_typed_here_is_kept_in_what_this_client_holds(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "release notes");
+
+    let workspace = test_workspace(cx);
+    cx.run_until_parked();
+    let sync = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .desk_replica_for_test
+                .insert("local".to_owned(), desk.held());
+            workspace.open_desk_from_replica(HostId::default(), window, cx);
+            let timestamp = rho_desk::TreeClock {
+                value: 9,
+                replica_id: 7,
+            };
+            let operation = rho_desk::TextOperation::Edit {
+                timestamp,
+                version: Vec::new(),
+                ranges: vec![(0, 0)],
+                new_text: vec!["typed here".into()],
+            };
+            workspace.desk_cells.keep_text(
+                HostId::default(),
+                note.clone(),
+                &operation,
+                &rho_desk::TextTransaction {
+                    id: timestamp,
+                    edit_ids: vec![timestamp],
+                },
+            );
+            workspace.desk_cells.sync(HostId::default())
+        })
+        .unwrap();
+
+    let rho_ui_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
+        panic!("the handshake is a DeskSync");
+    };
+    assert_eq!(
+        bodies.get(&note).and_then(|held| held.get(&7)).copied(),
+        Some(9),
+        "the operation this client wrote counts as held: {bodies:?}"
+    );
+}
+
+/// The text a client already holds is asked about, not asked for. The
+/// replica holds the note's history, so the sync that follows a cold
+/// open says how much of it is here and the daemon answers with the rest;
+/// before this every sync carried the whole desk's prose.
+#[gpui::test]
+fn a_sync_says_how_much_of_each_note_the_replica_already_holds(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "release notes");
+
+    let workspace = test_workspace(cx);
+    cx.run_until_parked();
+    let sync = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .desk_replica_for_test
+                .insert("local".to_owned(), desk.held());
+            workspace.open_desk_from_replica(HostId::default(), window, cx);
+            workspace.desk_cells.sync(HostId::default())
+        })
+        .unwrap();
+
+    let rho_ui_proto::ClientMessage::DeskSync { bodies, .. } = sync else {
+        panic!("the handshake is a DeskSync");
+    };
+    let held = bodies
+        .get(&note)
+        .expect("the note whose words came off the disk is named");
+    assert!(
+        !held.is_empty(),
+        "and what is held of it is said, so the daemon sends only the rest: {held:?}"
+    );
 }

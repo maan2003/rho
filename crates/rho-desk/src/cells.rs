@@ -358,7 +358,82 @@ pub struct BodySnapshot {
     pub transactions: Vec<crate::TextTransaction>,
 }
 
+/// How much of one note's text a client holds: the highest operation
+/// counter it has seen from each text replica. A text replica numbers
+/// its own operations in order, so the highest one covers every earlier
+/// one and this is the whole of "what I have".
+pub type BodyVersion = BTreeMap<u16, u32>;
+
 impl BodySnapshot {
+    /// What this history holds, to ask for the rest with.
+    pub fn version(&self) -> BodyVersion {
+        let mut version = BodyVersion::new();
+        for stamp in self
+            .operations
+            .iter()
+            .map(|operation| operation.timestamp())
+            .chain(self.transactions.iter().map(|transaction| transaction.id))
+        {
+            let held = version.entry(stamp.replica_id).or_default();
+            *held = (*held).max(stamp.value);
+        }
+        version
+    }
+
+    /// The operations `version` lacks, and nothing else. `None` when it
+    /// lacks none: a body with nothing new in it is not sent at all,
+    /// which is the point — the whole desk's prose rode on every sync.
+    pub fn since(&self, version: &BodyVersion) -> Option<Self> {
+        let new = |stamp: &crate::TreeClock| {
+            version
+                .get(&stamp.replica_id)
+                .is_none_or(|held| stamp.value > *held)
+        };
+        let operations = self
+            .operations
+            .iter()
+            .filter(|operation| new(&operation.timestamp()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let transactions = self
+            .transactions
+            .iter()
+            .filter(|transaction| new(&transaction.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        (!operations.is_empty() || !transactions.is_empty()).then(|| Self {
+            id: self.id.clone(),
+            operations,
+            transactions,
+        })
+    }
+
+    /// Takes in what arrived, keeping what it already had. Deltas are
+    /// partial now, so a body on disk is built up rather than replaced;
+    /// an operation that arrives twice is stored once.
+    pub fn merge(&mut self, delta: Self) {
+        let held = self
+            .operations
+            .iter()
+            .map(|operation| operation.timestamp())
+            .collect::<BTreeSet<_>>();
+        self.operations
+            .extend(delta.operations.into_iter().filter(|operation| {
+                !held.contains(&operation.timestamp())
+            }));
+        let held = self
+            .transactions
+            .iter()
+            .map(|transaction| transaction.id)
+            .collect::<BTreeSet<_>>();
+        self.transactions.extend(
+            delta
+                .transactions
+                .into_iter()
+                .filter(|transaction| !held.contains(&transaction.id)),
+        );
+    }
+
     pub fn buffer(
         &self,
         replica_id: u16,
@@ -1652,5 +1727,80 @@ mod tests {
         second.merge(daemon.since(second.version())).unwrap();
         assert_eq!(first.snapshot(), daemon.snapshot());
         assert_eq!(second.snapshot(), daemon.snapshot());
+    }
+
+    /// A body is asked for by what is held of it, and answered with the
+    /// rest. Before this the whole desk's prose rode on every sync, and a
+    /// client that already had all of it was sent all of it again.
+    #[test]
+    fn a_body_answers_a_version_with_the_operations_it_lacks_and_nothing_when_it_lacks_none() {
+        let body = BodySnapshot {
+            id: Id::Note(Uuid([3; 16])),
+            operations: vec![edit(1, 1), edit(1, 2), edit(7, 1)],
+            transactions: Vec::new(),
+        };
+
+        assert_eq!(
+            body.version(),
+            BodyVersion::from([(1, 2), (7, 1)]),
+            "what is held is the highest counter from each text replica"
+        );
+        assert!(
+            body.since(&body.version()).is_none(),
+            "a client holding all of it is sent nothing at all"
+        );
+
+        let missed = body
+            .since(&BodyVersion::from([(1, 1)]))
+            .expect("there is more than the one operation it holds");
+        assert_eq!(
+            missed
+                .operations
+                .iter()
+                .map(|operation| operation.timestamp())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::TreeClock {
+                    value: 2,
+                    replica_id: 1
+                },
+                crate::TreeClock {
+                    value: 1,
+                    replica_id: 7
+                }
+            ],
+            "the later operation of the replica it knows, and the replica it does not know at all"
+        );
+    }
+
+    /// The replica builds a body up out of the pieces it is sent, and an
+    /// operation that arrives twice is stored once.
+    #[test]
+    fn a_body_takes_in_what_arrives_and_keeps_what_it_had() {
+        let mut held = BodySnapshot {
+            id: Id::Note(Uuid([4; 16])),
+            operations: vec![edit(1, 1)],
+            transactions: Vec::new(),
+        };
+        held.merge(BodySnapshot {
+            id: held.id.clone(),
+            operations: vec![edit(1, 1), edit(1, 2)],
+            transactions: Vec::new(),
+        });
+        assert_eq!(
+            held.version(),
+            BodyVersion::from([(1, 2)]),
+            "the new operation is in and the repeated one is not doubled"
+        );
+        assert_eq!(held.operations.len(), 2);
+    }
+
+    fn edit(replica_id: u16, value: u32) -> crate::TextOperation {
+        crate::TextOperation::Edit {
+            timestamp: crate::TreeClock { value, replica_id },
+            version: Vec::new(),
+            ranges: vec![(0, 0)],
+            new_text: vec!["x".into()],
+        }
     }
 }

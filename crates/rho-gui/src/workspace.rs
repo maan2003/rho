@@ -79,6 +79,9 @@ pub(crate) struct DeskArrival {
     pub(crate) node_namespace: u16,
     pub(crate) delta: rho_desk::cells::Snapshot,
     pub(crate) bodies: Vec<rho_desk::cells::BodySnapshot>,
+    /// Where these cells came from, for the log: the daemon's answer or
+    /// this client's own copy.
+    pub(crate) from: &'static str,
 }
 use rho_files::{FileView, RemoteProject};
 
@@ -476,6 +479,10 @@ pub struct Workspace {
     /// the replica the moment the file is open, which is after this
     /// constructor has run.
     desk_replica_task: Option<Task<()>>,
+    /// Whether the replica has had its chance to open, either because it
+    /// did or because this session has no file to open. The first
+    /// handshake waits for this and nothing else does.
+    desk_replica_settled: bool,
     /// What the replica would hold, said by a test instead of a file.
     #[cfg(test)]
     pub(crate) desk_replica_for_test: HashMap<String, rho_mirror::desk::HeldDesk>,
@@ -1009,6 +1016,7 @@ impl Workspace {
             desk_sync_pending: HashMap::new(),
             _dealer_signal_task: dealer_signal_task,
             desk_replica_task: None,
+            desk_replica_settled: false,
             #[cfg(test)]
             desk_replica_for_test: HashMap::new(),
             lamp_on: false,
@@ -1074,8 +1082,17 @@ impl Workspace {
                 return;
             }
             this.update_in(cx, |this, window, cx| {
+                this.desk_replica_settled = true;
                 for host in this.hosts.ids() {
                     this.open_desk_from_replica(host, window, cx);
+                    // The handshake that was held back, now that it can
+                    // say what this client holds. Asking before the file
+                    // was open asked for the whole desk, prose and all,
+                    // on every cold start.
+                    if this.hosts.is_online(host) {
+                        let sync = this.desk_cells.sync(host);
+                        this.send_to_host(host, sync);
+                    }
                 }
                 this.refresh_home(cx);
             })
@@ -1653,6 +1670,22 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // What a desk cost to arrive, and from where. The two sources read
+        // the same to everything below, so the log is the only place they
+        // are told apart — and "did that sync carry the whole desk again"
+        // is the question this crate's copy exists to answer.
+        tracing::debug!(
+            from = cells.from,
+            cells = cells.delta.cells.len(),
+            verdicts = cells.delta.verdicts.len(),
+            bodies = cells.bodies.len(),
+            operations = cells
+                .bodies
+                .iter()
+                .map(|body| body.operations.len())
+                .sum::<usize>(),
+            "desk arrived"
+        );
         let (back, delta) = self.desk_cells.synced(
             host,
             cells.store,
@@ -1715,6 +1748,7 @@ impl Workspace {
                 node_namespace: held.namespace,
                 delta: held.snapshot,
                 bodies: held.bodies,
+                from: "replica",
             },
             window,
             cx,
@@ -2030,6 +2064,7 @@ impl Workspace {
                     node_namespace,
                     delta,
                     bodies,
+                    from: "daemon",
                 },
                 window,
                 cx,
@@ -2248,8 +2283,13 @@ impl Workspace {
                 self.open_desk_from_replica(host, window, cx);
                 // The Desk handshake belongs to the connection, not to the
                 // window: a reconnect asks only for what it is missing.
-                let sync = self.desk_cells.sync(host);
-                self.send_to_host(host, sync);
+                // Held back while the replica is still opening, because a
+                // handshake sent before it can only ask for everything;
+                // the task that opens it sends this one instead.
+                if self.desk_replica_settled {
+                    let sync = self.desk_cells.sync(host);
+                    self.send_to_host(host, sync);
+                }
                 let source = self.hosts.host_label(host);
                 self.notice_on(
                     None,

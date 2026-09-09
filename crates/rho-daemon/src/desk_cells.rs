@@ -160,6 +160,23 @@ impl DeskCellStore {
     /// The words of every note this build can read. One it cannot is left
     /// where it is: the reader loses that note's text for now rather than
     /// the whole desk.
+    /// The bodies a client lacks, by what it says it holds. A note it
+    /// has never held is missing from `known` and comes whole; a note
+    /// with nothing new in it is not sent at all, which is what stops a
+    /// one-cell delta carrying the whole desk's prose.
+    pub(crate) fn bodies_since(
+        &self,
+        known: &std::collections::BTreeMap<Id, rho_desk::cells::BodyVersion>,
+    ) -> Vec<BodySnapshot> {
+        self.bodies()
+            .into_iter()
+            .filter_map(|body| match known.get(&body.id) {
+                Some(version) => body.since(version),
+                None => Some(body),
+            })
+            .collect()
+    }
+
     pub(crate) fn bodies(&self) -> Vec<BodySnapshot> {
         let mut skipped = 0usize;
         let bodies: Vec<BodySnapshot> = self
@@ -1167,6 +1184,58 @@ mod tests {
             .await
             .unwrap();
         id
+    }
+
+    /// A sync carries the text a client lacks and no more. The whole
+    /// desk's prose used to ride on every sync, however small the delta:
+    /// a client that already had a note's words was sent them again on
+    /// every reconnect and every poke.
+    #[tokio::test]
+    async fn a_sync_carries_the_body_operations_the_client_lacks_and_no_others() {
+        let store = fixture_store().await;
+        let device = DeviceId([9; 16]);
+        let id = seed_note(&store, device).await;
+
+        let whole = store.bodies_since(&std::collections::BTreeMap::new());
+        let body = whole
+            .iter()
+            .find(|body| body.id == id)
+            .expect("a client that holds nothing is sent the note whole");
+        assert!(!body.operations.is_empty());
+
+        let known = std::collections::BTreeMap::from([(id.clone(), body.version())]);
+        assert!(
+            !store
+                .bodies_since(&known)
+                .iter()
+                .any(|body| body.id == id),
+            "a client holding every operation of a body is sent none of it"
+        );
+
+        // One more word typed on another device, which this client has
+        // never seen.
+        let namespace = store.node_namespace(DeviceId([11; 16])).await.unwrap();
+        let mut buffer = text::Buffer::new(
+            text::ReplicaId::new(namespace),
+            text::BufferId::new(2).unwrap(),
+            "",
+        );
+        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, " and more")]));
+        store
+            .apply_body(namespace, id.clone(), operation, None)
+            .await
+            .unwrap();
+
+        let missed = store
+            .bodies_since(&known)
+            .into_iter()
+            .find(|body| body.id == id)
+            .expect("the operation it has not seen is sent");
+        assert_eq!(
+            missed.operations.len(),
+            1,
+            "only the new operation, not the history it already holds"
+        );
     }
 
     #[tokio::test]

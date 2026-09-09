@@ -22,6 +22,12 @@ struct HostDeskCells {
     /// flight, so a keypress shows before the round trip finishes.
     view: Store,
     buffers: BTreeMap<Id, Entity<Buffer>>,
+    /// How much of each note's text this client holds, so the next sync
+    /// can ask for the rest of it rather than the whole of it. Kept here
+    /// rather than read off the buffers: the sync is sent before any
+    /// buffer exists on a cold start, and the replica's own histories are
+    /// what the client resumes from.
+    body_versions: BTreeMap<Id, rho_desk::cells::BodyVersion>,
     /// The map as it stands, in the order it is drawn, and where each id
     /// sits in it. Kept rather than made: a delta patches the rows it
     /// names, and only a change of shape walks the facts again.
@@ -628,17 +634,30 @@ impl DeskCells {
     /// this GUI already holds, so the daemon answers with the difference.
     pub fn sync(&mut self, host: HostId) -> ClientMessage {
         let device = self.device();
-        let (known, store) = match self.hosts.get_mut(&host) {
+        let (known, store, bodies) = match self.hosts.get_mut(&host) {
             Some(desk) => {
                 desk.syncing = true;
-                (desk.confirmed.version().clone(), Some(desk.store))
+                (
+                    desk.confirmed.version().clone(),
+                    Some(desk.store),
+                    desk.body_versions.clone(),
+                )
             }
-            None => (Version::new(), None),
+            None => (Version::new(), None, BTreeMap::new()),
         };
+        // The other half of "what did that sync cost": what this client
+        // said it already had.
+        tracing::debug!(
+            host = self.names.get(&host),
+            known = known.len(),
+            bodies = bodies.len(),
+            "desk sync asked"
+        );
         ClientMessage::DeskSync {
             device,
             known,
             store,
+            bodies,
         }
     }
 
@@ -708,6 +727,7 @@ impl DeskCells {
                     confirmed: Store::new(device),
                     view: Store::new(device),
                     buffers: BTreeMap::new(),
+                    body_versions: BTreeMap::new(),
                     nodes: Vec::new(),
                     node_at: HashMap::new(),
                     titles: Rc::default(),
@@ -855,8 +875,49 @@ impl DeskCells {
     /// Merges the handshake's body histories. A snapshot never replaces a
     /// newer operation that arrived on its own: the two are queued
     /// independently, so the merge is by operation, not by replacement.
+    /// Keeps a local edit in the replica, next to sending it on. The
+    /// daemon never sends a client its own operations back, so text typed
+    /// here and only sent would be missing from the mirror on the next
+    /// cold open: the note would read empty until a daemon answered.
+    pub(crate) fn keep_text(
+        &mut self,
+        host: HostId,
+        id: Id,
+        operation: &rho_desk::TextOperation,
+        transaction: &rho_desk::TextTransaction,
+    ) {
+        let stamp = operation.timestamp();
+        let Some(desk) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        let held = desk.body_versions.entry(id.clone()).or_default();
+        let seen = held.entry(stamp.replica_id).or_default();
+        *seen = (*seen).max(stamp.value);
+        let Some(name) = self.names.get(&host) else {
+            return;
+        };
+        rho_mirror::desk::write_bodies(
+            name,
+            vec![BodySnapshot {
+                id,
+                operations: vec![operation.clone()],
+                transactions: vec![transaction.clone()],
+            }],
+        );
+    }
+
     fn merge_bodies(&mut self, host: HostId, bodies: &[BodySnapshot], cx: &mut Context<Workspace>) {
         for body in bodies {
+            if let Some(desk) = self.hosts.get_mut(&host) {
+                // Said before the operations are applied, because what the
+                // next sync asks for is what arrived, whether or not this
+                // build could decode every operation in it.
+                let held = desk.body_versions.entry(body.id.clone()).or_default();
+                for (replica, value) in body.version() {
+                    let seen = held.entry(replica).or_default();
+                    *seen = (*seen).max(value);
+                }
+            }
             let operations = body
                 .operations
                 .iter()
@@ -2525,16 +2586,14 @@ fn watch_note_buffer(
         {
             let operation = rho_desk::TextOperation::from_text(operation);
             let timestamp = operation.timestamp();
-            workspace.send_desk_text(
-                host,
-                id.clone(),
-                operation,
-                rho_desk::TextTransaction {
-                    id: timestamp,
-                    edit_ids: vec![timestamp],
-                },
-                cx,
-            );
+            let transaction = rho_desk::TextTransaction {
+                id: timestamp,
+                edit_ids: vec![timestamp],
+            };
+            workspace
+                .desk_cells
+                .keep_text(host, id.clone(), &operation, &transaction);
+            workspace.send_desk_text(host, id.clone(), operation, transaction, cx);
         }
     })
 }

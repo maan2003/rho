@@ -289,23 +289,32 @@ replays it. With it, the next handshake carries it. Ordinary syncs send
 nothing back, since the cells the daemon just sent are the ones the
 client would have offered.
 
-**Next: bodies do not resume from the mirror.** A note's text is still
-sent whole on every sync and the replica's copy is not what the reader
-opens on. That is the next step on this path, and it is not in this
-change. It needs per-body versions.
+**Bodies resume from the mirror.** `DeskSync` carries a `BodyVersion`
+per note — the highest operation counter this client holds from each text
+replica — and the daemon answers with the operations those lack and
+leaves out the bodies with nothing new in them. A note the client has
+never held is missing from the map and comes whole. The replica builds
+each history up out of the pieces it is sent rather than replacing it,
+and the versions it resumes with are read from the histories it holds.
+Text typed on this client is written into the replica beside being sent:
+the daemon never sends a client its own operations back, so a note
+written here and only sent would read empty at the next cold open. That
+write carries bodies alone and leaves the host's cell version vector
+where the daemon's deltas set it — local typing is not a claim to have
+seen anything of the store.
 
 **The daemon does not refuse a mutation.** It merges every one it can
 decode; last-writer-wins is the whole rule. Nothing on the desk waits for
 permission, and there is no replay queue behind the view: a write is
 never taken back out of the middle. The reasoning is in STORE-DESIGN.
 
-**Bodies.** `DeskSynced` sends `desk_cells.bodies()` — every note's text, in
-full, on every sync, resumed or not. The cells resume and the text does
-not, so a delta of one cell still carries the whole desk's prose. That is
-its own fault and its own fix, and it is not in the way of this one: the
-replica can hold the bodies it was last sent and the daemon can keep
-sending them all, and nothing is wrong except the bytes. Fixing it means
-per-body versions, and it comes after.
+**Bodies.** `DeskSynced` sends `desk_cells.bodies_since(&known)`: the
+operations the client's own `BodyVersion` per note does not cover. A
+text replica numbers its operations in order, so the highest counter
+from each replica is the whole of "what I have", and one number per
+replica per note is all the client has to say. It used to send every
+note's text in full on every sync, so a delta of one cell carried the
+whole desk's prose.
 
 **Order.** Client first, daemon second. The client's half — persist,
 open from the replica, send the version it holds — is correct against

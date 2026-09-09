@@ -138,6 +138,11 @@ pub enum ClientMessage {
         /// recognise the name answers with the whole store rather than a
         /// difference from a number that was never its own.
         store: Option<desk_tree::cells::DeviceId>,
+        /// How much of each note's text the client already holds, by note.
+        /// The daemon answers with the operations these lack and leaves
+        /// out the bodies with nothing new in them; a note missing from
+        /// the map is one the client has never held, and comes whole.
+        bodies: std::collections::BTreeMap<desk_tree::cells::Id, desk_tree::cells::BodyVersion>,
     },
     /// The client's half of a sync: the cells it holds that the daemon's
     /// frontier does not cover. The store is the client's, so the daemon
@@ -1196,6 +1201,10 @@ mod tests {
                 device,
                 known: Version::from([(device, 11)]),
                 store: Some(device),
+                bodies: std::collections::BTreeMap::from([(
+                    id.clone(),
+                    desk_tree::cells::BodyVersion::from([(4, 1)]),
+                )]),
             },
             ClientMessage::DeskMutationApply { mutation },
             ClientMessage::DeskTextApply {

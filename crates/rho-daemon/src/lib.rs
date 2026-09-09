@@ -2118,6 +2118,7 @@ async fn handle_message(
             device,
             known,
             store,
+            bodies,
         } => {
             if desk_session
                 .as_ref()
@@ -2182,7 +2183,7 @@ async fn handle_message(
                 store,
                 node_namespace,
                 delta,
-                bodies: services.desk_cells.bodies(),
+                bodies: services.desk_cells.bodies_since(&bodies),
             });
             Ok(Refresh::None)
         }
@@ -4311,6 +4312,7 @@ mod tests {
         let mut newer: Option<DeskSession> = None;
 
         let sync = |device| ClientMessage::DeskSync {
+            bodies: std::collections::BTreeMap::new(),
             device,
             known: Version::default(),
             store: None,

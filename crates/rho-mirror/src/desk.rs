@@ -126,6 +126,13 @@ enum Write {
         delta: Snapshot,
         bodies: Vec<BodySnapshot>,
     },
+    /// Text this client typed. It says nothing about the cells, so the
+    /// host's version vector is left alone: a local edit is not a claim
+    /// to have seen anything of the store.
+    Bodies {
+        host: String,
+        bodies: Vec<BodySnapshot>,
+    },
     Reset(String),
     Flush(mpsc::SyncSender<()>),
 }
@@ -235,6 +242,16 @@ impl DeskMirror {
         });
     }
 
+    /// Text typed on this client, kept next to what arrived. The daemon
+    /// never sends a client its own operations back, so this is the only
+    /// way a note written here survives a restart.
+    pub fn write_bodies(&self, host: &str, bodies: Vec<BodySnapshot>) {
+        self.send(Write::Bodies {
+            host: host.to_owned(),
+            bodies,
+        });
+    }
+
     /// Everything held for a host, dropped. For a store this replica does
     /// not count in: the cells came from somewhere else and asking for
     /// what is new would never bring them into line.
@@ -297,6 +314,28 @@ fn writer(db: RhoDb, receiver: mpsc::Receiver<Write>) {
     }
 }
 
+/// Body history added to what is held, never replacing it: the daemon
+/// sends only the operations this client lacks, and the client's own
+/// typing arrives here the same way, one operation at a time.
+fn keep_bodies(transaction: &mut rho_db::WriteTxn, host: &str, bodies: &[BodySnapshot]) {
+    let mut table = transaction.open_table(DESK_BODIES);
+    for body in bodies {
+        let key = BodyKey {
+            host: host.to_owned(),
+            id: body.id.clone(),
+        };
+        let merged = match table.get(SenValue::borrowed(&key)) {
+            Some(held) => {
+                let mut held = held.value().into_owned();
+                held.merge(body.clone());
+                held
+            }
+            None => body.clone(),
+        };
+        table.insert(SenValue::Owned(key), SenValue::borrowed(&merged));
+    }
+}
+
 fn apply(
     transaction: &mut rho_db::WriteTxn,
     write: Write,
@@ -332,16 +371,7 @@ fn apply(
                     verdicts.insert(SenValue::Owned(key), SenValue::borrowed(event));
                 }
             }
-            {
-                let mut table = transaction.open_table(DESK_BODIES);
-                for body in &bodies {
-                    let key = BodyKey {
-                        host: host.clone(),
-                        id: body.id.clone(),
-                    };
-                    table.insert(SenValue::Owned(key), SenValue::borrowed(body));
-                }
-            }
+            keep_bodies(transaction, &host, &bodies);
             transaction.open_table(DESK_HOSTS).insert(
                 &host.as_str(),
                 SenValue::borrowed(&StoredDeskHost {
@@ -351,6 +381,7 @@ fn apply(
                 }),
             );
         }
+        Write::Bodies { host, bodies } => keep_bodies(transaction, &host, &bodies),
         Write::Reset(host) => {
             transaction.open_table(DESK_HOSTS).remove(&host.as_str());
             {
@@ -411,10 +442,14 @@ fn global() -> std::sync::RwLockReadGuard<'static, Option<DeskMirror>> {
 /// waits on the file being opened.
 pub fn open_stated(db: Option<RhoDb>) {
     let Some(db) = db else {
+        // Nothing to open, and the readers waiting on it are told so;
+        // this session reads the desk from the daemon alone.
+        opened();
         return;
     };
     if let Err(error) = init(db) {
         tracing::warn!(%error, "the desk replica is unavailable; this session reads the desk from the daemon");
+        opened();
     }
 }
 
@@ -515,7 +550,11 @@ pub fn device_in(db: &RhoDb) -> DeviceId {
 /// how it is told to look again, and it costs no wait: the frame that
 /// asked goes on drawing.
 pub fn on_open(hook: impl FnOnce() + Send + 'static) {
-    if global().is_some() {
+    // A session told of no state directory has no replica and never will,
+    // which is settled news rather than news that has not arrived: a test,
+    // and a client that could not be told where its files live, must not
+    // sit waiting for a file that is not coming.
+    if global().is_some() || crate::mirror::state_dir().is_none() {
         hook();
         return;
     }
@@ -550,8 +589,20 @@ pub fn write_delta(
     delta: Snapshot,
     bodies: Vec<BodySnapshot>,
 ) {
-    if let Some(mirror) = global().as_ref() {
-        mirror.write_delta(host, store, namespace, delta, bodies);
+    match global().as_ref() {
+        Some(mirror) => mirror.write_delta(host, store, namespace, delta, bodies),
+        // Not an error — a session told of no state directory keeps
+        // nothing — but it is the answer to "why did this client resume
+        // from nothing", so it is said once per delta rather than never.
+        None => tracing::debug!(host, "no desk replica is open; this delta is not kept"),
+    }
+}
+
+/// Text typed on this client, kept in the replica.
+pub fn write_bodies(host: &str, bodies: Vec<BodySnapshot>) {
+    match global().as_ref() {
+        Some(mirror) => mirror.write_bodies(host, bodies),
+        None => tracing::debug!(host, "no desk replica is open; this text is not kept"),
     }
 }
 
@@ -588,6 +639,10 @@ mod tests {
     #[test]
     fn a_reader_is_told_when_the_replica_opens_and_told_at_once_if_it_already_has() {
         let dir = tempfile::tempdir().unwrap();
+        // A session told of no state directory is told at once instead:
+        // there is no file coming, and a reader waiting for one would
+        // never draw. So this test names one, its own.
+        crate::mirror::set_state_dir(dir.path().to_owned());
         let db = rho_db::client::open(dir.path()).unwrap();
         let before = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&before);
@@ -618,6 +673,88 @@ mod tests {
             "asking after the open is answered where it stands"
         );
         close();
+    }
+
+    /// The replica builds a note's history up out of the pieces it is
+    /// sent. The daemon answers a sync with only the operations the
+    /// client lacks, so a body that arrived as a delta must not replace
+    /// the one on disk, or the words the client already had are lost the
+    /// moment somebody types the next one.
+    #[test]
+    fn a_body_delta_is_added_to_what_is_held_rather_than_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = DeskMirror::open(dir.path()).unwrap();
+        let store = Store::new(DeviceId([7; 16]));
+        let id = note(1);
+        let first = BodySnapshot {
+            id: id.clone(),
+            operations: vec![edit(1, 1)],
+            transactions: Vec::new(),
+        };
+        let second = BodySnapshot {
+            id: id.clone(),
+            operations: vec![edit(1, 2)],
+            transactions: Vec::new(),
+        };
+
+        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), vec![first]);
+        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), vec![second]);
+        mirror.flush();
+
+        let held = mirror.load("desk");
+        let body = held
+            .bodies
+            .iter()
+            .find(|body| body.id == id)
+            .expect("the note's history is held");
+        assert_eq!(
+            body.version(),
+            rho_ui_proto::desk_tree::cells::BodyVersion::from([(1, 2)]),
+            "both operations are there, the first one not thrown away by the second delta"
+        );
+    }
+
+    /// Text typed on this client is kept, and keeping it says nothing
+    /// about the cells: the version vector the next sync asks with is the
+    /// one the daemon's deltas set, not an empty one left by local typing.
+    #[test]
+    fn text_typed_here_is_kept_and_leaves_the_cell_version_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = DeskMirror::open(dir.path()).unwrap();
+        let mut store = Store::new(DeviceId([7; 16]));
+        store.write(note(2), Property::Name("release notes".into()));
+        let id = note(1);
+
+        mirror.write_delta("desk", DAEMON, 1, store.snapshot(), Vec::new());
+        mirror.write_bodies(
+            "desk",
+            vec![BodySnapshot {
+                id: id.clone(),
+                operations: vec![edit(1, 1)],
+                transactions: Vec::new(),
+            }],
+        );
+        mirror.flush();
+
+        let held = mirror.load("desk");
+        assert!(
+            held.bodies.iter().any(|body| body.id == id),
+            "the note typed here is held"
+        );
+        assert_eq!(
+            held.snapshot.version,
+            store.snapshot().version,
+            "and the version vector is still what the daemon's delta left"
+        );
+    }
+
+    fn edit(replica_id: u16, value: u32) -> rho_ui_proto::desk_tree::TextOperation {
+        rho_ui_proto::desk_tree::TextOperation::Edit {
+            timestamp: rho_ui_proto::desk_tree::TreeClock { value, replica_id },
+            version: Vec::new(),
+            ranges: vec![(0, 0)],
+            new_text: vec!["x".into()],
+        }
     }
 
     /// The device id is minted once and kept, so the stamps this device
