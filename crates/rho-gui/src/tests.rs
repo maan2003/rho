@@ -8367,6 +8367,194 @@ fn a_snoozed_agent_is_off_home_when_its_turn_runs(cx: &mut TestAppContext) {
     );
 }
 
+/// The verdict taken while the agent is on screen, which is the sequence
+/// the user reported: open the transcript, snooze it a day, go back to
+/// Home, and the agent is listed again. A delta that moves no rows takes
+/// the patched path through `desk_changed`, and that path rebuilt Home
+/// only when the delta also moved a filing. A Verdict Defer moves neither
+/// shape nor filing, so Home kept the rows it had built before the
+/// verdict and went on listing the agent the user had just put away —
+/// until some later verdict happened to take a path that did rebuild it.
+#[gpui::test]
+fn a_snooze_taken_now_leaves_home_at_once(cx: &mut TestAppContext) {
+    let snoozed = agent(53);
+    let seen = agent(54);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    let snoozed_node = desk.agent_row(topic.clone(), snoozed);
+    desk.agent_row(topic, seen);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![
+                        story::UiAgentHead {
+                            activity: Some("wiring the flick recogniser".to_owned()),
+                            turn_running: true,
+                            ..ui_head(snoozed)
+                        },
+                        story::UiAgentHead {
+                            activity: Some("reading the mirror".to_owned()),
+                            turn_running: true,
+                            ..ui_head(seen)
+                        },
+                    ],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let home_text = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let home = workspace.home_view().expect("home is in view");
+                home.update(cx, |home, cx| {
+                    let editor = home.editor().clone();
+                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
+                })
+            })
+            .unwrap()
+    };
+    let before = home_text(cx);
+    assert!(
+        before.contains("wiring the flick recogniser"),
+        "the agent is on Home before the verdict: {before}"
+    );
+
+    // The verdict itself, taken the way the user takes it: on the agent's
+    // own transcript. The row already exists, so the shape is held and the
+    // client's own write comes back as a delta patched where it lands.
+    let _ = snoozed_node;
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(Some(snoozed), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, Some(1), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // Back the way the user comes back: the surface behind, not a fresh
+    // Home. Opening Home again would rebuild it and hide the fault.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.cmd_surface_back(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let after = home_text(cx);
+    assert!(
+        after.contains("reading the mirror"),
+        "the agent nobody snoozed is still running on Home: {after}"
+    );
+    assert!(
+        !after.contains("wiring the flick recogniser"),
+        "the agent is still on Home after the snooze it was given: {after}"
+    );
+}
+
+/// The same verdict with Home never leaving the screen. The agent already
+/// has a row, so the delta the client's own write makes moves no shape and
+/// no filing, and that was the one delta that did not rebuild Home: the
+/// rows drawn under the reader's cursor were the rows from before the
+/// verdict they had just given.
+#[gpui::test]
+fn a_snooze_taken_on_home_leaves_home_at_once(cx: &mut TestAppContext) {
+    let snoozed = agent(55);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "phone feed");
+    desk.agent_row(topic, snoozed);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            story::feed(workspace, HostId::default(), desk.synced(), window, cx);
+            story::feed(
+                workspace,
+                HostId::default(),
+                ready_with(
+                    vec![story::UiAgentHead {
+                        activity: Some("wiring the flick recogniser".to_owned()),
+                        turn_running: true,
+                        ..ui_head(snoozed)
+                    }],
+                    40,
+                ),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let home = workspace
+        .update(cx, |workspace, _, _| workspace.home_view())
+        .unwrap()
+        .expect("home is in view");
+    let home_text = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |_, _, cx| {
+                home.update(cx, |home, cx| {
+                    let editor = home.editor().clone();
+                    editor.read(cx).buffer().read(cx).snapshot(cx).text()
+                })
+            })
+            .unwrap()
+    };
+    let before = home_text(cx);
+    assert!(
+        before.contains("wiring the flick recogniser"),
+        "the agent is on Home before the verdict: {before}"
+    );
+
+    // The cursor on the agent's row, which is what the verdict lands on.
+    workspace
+        .update(cx, |_, _, cx| {
+            home.update(cx, |home, cx| {
+                let editor = home.editor().clone();
+                editor.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let text = snapshot.buffer_snapshot().text();
+                    let row = text
+                        .lines()
+                        .position(|line| line.contains("wiring the flick recogniser"))
+                        .expect("the running row is drawn") as u32;
+                    editor.selections.change_with(&snapshot, |selections| {
+                        selections.select_ranges([
+                            language::Point::new(row, 0)..language::Point::new(row, 0)
+                        ]);
+                    });
+                });
+            });
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, Some(1), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let after = home_text(cx);
+    assert!(
+        !after.contains("wiring the flick recogniser"),
+        "the agent is still on Home after the snooze it was given: {after}"
+    );
+}
+
 /// An agent the user muted is not on Home while it runs. A mute is not a
 /// cursor: it is the user saying "not this agent", and a running turn
 /// decides how loudly an agent may ask, not whether it may ask at all.

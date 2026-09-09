@@ -1278,7 +1278,23 @@ impl Workspace {
             surface: Self::journal_surface(&surface.key),
             method: rho_journal::SurfaceShowMethod::Mru,
         });
+        self.rebuild_home_when_shown(&surface.key, cx);
         cx.notify();
+    }
+
+    /// Home's rows are the dealer's hand and the desk's verdicts as they
+    /// stood when they were last built, and `refresh_home` can only build
+    /// them while Home is a surface. A verdict taken on a transcript is
+    /// taken with Home gone, so the refresh it asks for lands nowhere, and
+    /// the rows the reader steps back to are the rows from before the
+    /// verdict: the agent they had just put away, still listed, and still
+    /// listed until some later verdict happened to be taken while Home was
+    /// up. Coming back is the moment the answer is wanted, so it is built
+    /// then, at both of the places a surface is shown.
+    fn rebuild_home_when_shown(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
+        if *key == SurfaceKey::Home {
+            self.refresh_home(cx);
+        }
     }
 
     /// A surface out of history is only as live as what it holds. A
@@ -4649,6 +4665,7 @@ impl Workspace {
             surface: Self::journal_surface(&shown.key),
             method,
         });
+        self.rebuild_home_when_shown(&shown.key, cx);
     }
 
     /// Put a surface at the head of history in a named context, without any
@@ -5345,18 +5362,23 @@ impl Workspace {
             if patched {
                 // The user's own words about an agent — its name, its
                 // labels, whether it is put away — are on the rows this
-                // delta named, and a patch is the path they arrive by. A
-                // lookup each says whether any of it moved; only then is
-                // anything drawn again, so a streaming event still costs
-                // what it touched.
+                // delta named, and a patch is the path they arrive by.
                 let filings = self.desk_cells.agent_filings_of(host, &delta.touched);
-                if self.registry.set_agent_filings(filings) {
-                    self.refresh_home(cx);
-                }
+                self.registry.set_agent_filings(filings);
                 let touched = delta.touched.iter().cloned().collect::<Vec<_>>();
                 self.refresh_deal_cards(host, crate::dashboard::DealScope::Nodes(&touched), cx);
                 // The deal bar reads the hand; the map is not composed.
                 self.dashboard.sync_hand(&self.agent_last_interaction);
+                // Home is a window onto the same ranking and onto the same
+                // verdicts, so it is rebuilt wherever the dealer is
+                // invalidated. This path was the exception: it rebuilt Home
+                // only when the delta also moved a filing, so a Verdict
+                // Defer taken from a transcript left Home holding the rows
+                // it had built before the verdict. The agent the user had
+                // just put away was still listed, and stayed listed until
+                // some later verdict happened to take a path that did
+                // rebuild Home.
+                self.refresh_home(cx);
                 self.sync_note_views(host, cx);
                 cx.notify();
                 return;
