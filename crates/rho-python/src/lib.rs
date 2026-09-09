@@ -168,6 +168,7 @@ impl Session {
     /// It may enter the agent's mount namespace and set the initial directory.
     pub fn new(
         setup: impl FnOnce() -> Result<(), String> + Send + 'static,
+        tools: Value,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::sync_channel(256);
         let executions: Executions = Default::default();
@@ -186,7 +187,10 @@ impl Session {
             Arc::clone(&shutdown),
             Arc::clone(&space),
             Arc::clone(&wake),
-            setup,
+            move || {
+                setup()?;
+                Ok(tools)
+            },
         )?;
         Ok(Self {
             sender: Sender {
@@ -271,7 +275,7 @@ mod tests {
         let (events, receiver) = tokio::sync::mpsc::channel(256);
         Ok((
             TestSession {
-                session: Session::new(setup)?,
+                session: Session::new(setup, serde_json::json!([]))?,
                 events,
             },
             receiver,

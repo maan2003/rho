@@ -865,3 +865,108 @@ fn responses_lite_previous_response_skips_developer_prefix() {
         "true"
     );
 }
+
+#[test]
+fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
+    let call = |id: &str, response: &str, command: &str| {
+        inference_response(
+            Some(response),
+            vec![InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific(
+                    "custom_tool_call",
+                    json!({
+                        "type": "custom_tool_call", "id": format!("ctc_{id}"),
+                        "call_id": id, "name": "exec", "input": command,
+                    }),
+                ),
+                id: tool_call_id(id),
+                name: tool_name("exec"),
+                tool_type: ToolType::Custom,
+                arguments: command.to_owned(),
+            }],
+        )
+    };
+    let reply = |id: &str, text: &str| {
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![ToolResult {
+                call_id: tool_call_id(id),
+                tool_type: ToolType::Custom,
+                body: ToolOutput {
+                    full_output: None,
+                    images: Arc::new(Vec::new()),
+                    output: Arc::new(text.to_owned()),
+                    status: rho_core::ToolOutputStatus::Success,
+                },
+                started_at: rho_core::UnixMs(1),
+                finished_at: rho_core::UnixMs(2),
+                metadata: None,
+            }],
+        })
+    };
+    let update = |id: &str, text: &str| {
+        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+            call_id: tool_call_id(id),
+            tool_type: ToolType::Custom,
+            output: Arc::new(text.to_owned()),
+            full_output: None,
+            at: rho_core::UnixMs(3),
+        }))
+    };
+    let blocks = vec![
+        call("call-old", "resp-old", "command('rho pr checks ...')"),
+        reply("call-old", "Command 15 running: rho pr checks ..."),
+        call("call-current", "resp-current", "command('cargo test')"),
+        reply("call-current", "Command 16 running: cargo test"),
+        update(
+            "call-old",
+            "Command 15 output (rho pr checks ...): CI pending",
+        ),
+        update(
+            "call-current",
+            "Command 16 completed (cargo test): exit_code=0",
+        ),
+    ];
+    let session = test_inference_service("gpt-test");
+    for cached in [None, Some("resp-current")] {
+        let body = serde_json::to_value(ResponsesRequest::from_inference_request(
+            &session.config,
+            inference_request(blocks.clone(), Vec::new()),
+            cached,
+        ))
+        .unwrap();
+        let outputs = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("custom_tool_call_output" | "function_call_output")
+                )
+            })
+            .collect::<Vec<_>>();
+        let current = if cached.is_some() { 0 } else { 1 };
+        assert_eq!(outputs.len(), current + 3);
+        assert_eq!(
+            outputs[current],
+            &json!({
+                "type": "custom_tool_call_output", "name": "exec",
+                "call_id": "call-current", "output": "Command 16 running: cargo test",
+            })
+        );
+        assert_eq!(
+            outputs[current + 1],
+            &json!({
+                "type": "function_call_output", "namespace": "functions", "name": "exec",
+                "output": "Command 15 output (rho pr checks ...): CI pending",
+            })
+        );
+        assert_eq!(
+            outputs[current + 2],
+            &json!({
+                "type": "function_call_output", "namespace": "functions", "name": "exec",
+                "output": "Command 16 completed (cargo test): exit_code=0",
+            })
+        );
+    }
+}

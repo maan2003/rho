@@ -68,10 +68,10 @@ agent and the idle mechanism described above when blocked on a reply.
                  parent message; your final response is mailed to that Engineer."
             }
         };
-        let message_tool = if code_mode.is_some() {
-            "tools.message_agent"
-        } else {
-            "message_agent"
+        let message_tool = match code_mode {
+            Some(rho_agent_tools::CodeMode::Python) => "agents.message",
+            Some(rho_agent_tools::CodeMode::JavaScript) => "tools.message_agent",
+            None => "message_agent",
         };
         format!(
             "## Team Context
@@ -355,11 +355,12 @@ Use the separate `wait` tool when there is nothing else to do.
 const CODE_MODE_PROMPT: &str = "## Python Code Mode
 
 `exec` is your only top-level tool. Issue at most one exec call per response.\nIt runs a persistent Python notebook with top-level await. Globals are shared;
-live cells interleave at await. `command`, `write_stdin`, and `tools.NAME` register
+live cells interleave at await. `command`, `write_stdin`, and host functions register
 Rust-owned work immediately. Output and completion arrive automatically: no await
 or print is needed to see them. Put independent calls in one exec cell to run them
-concurrently. Await only for dependencies within Python. Internal tools live under
-`tools` (for example `tools.web__run`), not as global functions.
+concurrently. Await only for dependencies within Python. Use `view_image(...)` and `web.run(...)` directly.
+Agent operations are `agents.message`, `agents.cancel`, and `agents.spawn_new_advisor`.
+Before delegating, call `display(agents.delegate_engineer)` for its guidance and arguments.
 
 Use shell commands to inspect files and Python when you need to manipulate their
 data. See exec for examples and API details.

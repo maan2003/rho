@@ -6,6 +6,7 @@ import json
 import pathlib
 import sys
 import types
+import inspect
 
 _cell = contextvars.ContextVar('rho_cell')
 _requests = {}
@@ -109,9 +110,9 @@ def _request(name, arguments):
     global _sequence
     if len(_requests) >= 1024:
         raise RuntimeError('Too many pending host requests')
-    _sequence += 1
     result = _loop.create_future()
     result.id = _sequence
+    _sequence += 1
     _requests[result.id] = result
     try:
         _send('call', cell=_cell.get(), request=result.id, name=name, arguments=arguments)
@@ -148,7 +149,13 @@ def write_stdin(handle, chars='', *, max_tokens=2000):
 def display(value, *, max_tokens=2000):
     if isinstance(value, Command):
         return _request('display', dict(id=value.id, max_tokens=_budget(max_tokens)))
-    text(value, max_tokens=max_tokens)
+    if inspect.isfunction(value):
+        docs = f'{value.__module__}.{value.__name__}{inspect.signature(value)}\n\n{inspect.getdoc(value) or ""}'
+    else:
+        text(value, max_tokens=max_tokens)
+        return
+    text(docs, max_tokens=max_tokens)
+    return docs
 
 
 def _render(value, budget):
@@ -178,13 +185,16 @@ def image(reference):
     return _request('image', reference)
 
 
-class Tools:
-    def __getattr__(self, name):
-        def call(arguments=None, **kwargs):
-            if arguments is not None and kwargs:
-                raise TypeError('Pass either an argument or keyword arguments')
-            return _request(name, kwargs if arguments is None else arguments)
-        return call
+def _host_function(name):
+    def call(arguments=None, **kwargs):
+        if arguments is not None and kwargs:
+            raise TypeError('Pass either an argument or keyword arguments')
+        return _request(name, kwargs if arguments is None else arguments)
+    return call
+
+
+web = types.ModuleType('web')
+web.run = _host_function('web__run')
 
 class _Output:
     encoding = 'utf-8'
@@ -216,7 +226,53 @@ sys.stderr = sys.__stderr__ = _Output()
 
 _namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
                   display=display, text=text, notify=notify, set_patience=set_patience,
-                  tools=Tools(), image=image, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
+                  web=web,
+                  image=image, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
+
+
+def _configure_tools(specs):
+    agents = types.ModuleType('agents')
+
+    def message(*, agent_id, message):
+        return _request('message_agent', dict(agent_id=agent_id, message=message))
+
+    def cancel(*, engineer_id):
+        return _request('interrupt_engineer', dict(engineer_id=engineer_id))
+
+    def spawn_new_advisor(msg):
+        return _request('ask_advisor', dict(message=msg))
+
+    def delegate_engineer(*, task_name, prompt, workdirs=None):
+        arguments = dict(task_name=task_name, prompt=prompt)
+        if workdirs is not None:
+            arguments['workdirs'] = workdirs
+        return _request('spawn_engineer', arguments)
+
+    agent_functions = {
+        'message_agent': message,
+        'interrupt_engineer': cancel,
+        'ask_advisor': spawn_new_advisor,
+        'spawn_engineer': delegate_engineer,
+    }
+    for spec in specs:
+        name = spec['name']
+        if name in agent_functions:
+            function = agent_functions[name]
+            function.__module__ = 'agents'
+            schema = spec['input_schema']
+            if name == 'ask_advisor' and 'message' in schema.get('properties', {}):
+                schema['properties']['msg'] = schema['properties'].pop('message')
+                schema['required'] = ['msg']
+            function.__doc__ = spec['description'] + '\nArguments: ' + json.dumps(schema)
+            setattr(agents, function.__name__, function)
+        elif name != 'web__run':
+            _namespace[name] = _host_function(name)
+    _namespace['agents'] = agents
+    sys.modules['agents'] = agents
+
+
+_configure_tools(json.loads(_tool_config))
+
 
 def _execute(cell, source):
     if len(_cells) >= 128 or cell in _cells:

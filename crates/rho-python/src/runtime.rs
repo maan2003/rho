@@ -15,7 +15,7 @@ pub(super) fn spawn(
     shutdown: Arc<AtomicBool>,
     space: Arc<tokio::sync::Notify>,
     wake: Arc<OwnedFd>,
-    setup: impl FnOnce() -> Result<(), String> + Send + 'static,
+    setup: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
 ) -> Result<(), String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
@@ -34,7 +34,7 @@ pub(super) fn spawn(
                         std::io::Error::last_os_error()
                     ));
                 }
-                setup()?;
+                let tools = setup()?;
                 // Importing subprocess/signal must not replace the embedding
                 // host's Ctrl-C handler. Explicit Python signal changes remain
                 // ordinary unsandboxed operations.
@@ -134,6 +134,10 @@ pub(super) fn spawn(
                             .set_item(name, function.into(), vm)
                             .map_err(|e| format_exception(vm, e))?;
                     }
+                    scope
+                        .globals
+                        .set_item("_tool_config", vm.ctx.new_str(tools.to_string()).into(), vm)
+                        .map_err(|e| format_exception(vm, e))?;
                     let source = include_str!("notebook.py");
                     let code = vm
                         .compile(source, rustpython_vm::compiler::Mode::Exec, "<rho-runtime>")

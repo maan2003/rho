@@ -36,8 +36,11 @@ async fn python_tool_entries_use_the_callable_namespace() {
     let tool = crate::PythonTool::new(shell(), Vec::new()).unwrap();
     let description = tool.spec().description;
     assert!(!description.contains("apply_patch"));
-    assert!(description.contains("tools.web__run(search_query="));
+    assert!(description.contains("web.run(search_query="));
     assert!(description.contains("same cell to run them concurrently"));
+    assert!(description.contains("handle.cancel() requests cancellation"));
+    assert!(description.contains("job.cancel()"));
+    assert!(description.contains("await job"));
 }
 
 #[tokio::test]
@@ -64,7 +67,7 @@ async fn python_independent_commands_in_one_cell_run_concurrently() {
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     assert!(output.output.contains("first"), "{output:?}");
     assert!(output.output.contains("second"), "{output:?}");
-    assert_eq!(output.output.matches("Command completed:").count(), 2);
+    assert_eq!(output.output.matches("Process exited with code").count(), 2);
 }
 
 fn call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -381,11 +384,14 @@ async fn python_commands_outlive_cells_and_retain_truncated_output() {
     until(&wake, &*cell, ended).await;
     let result = cell.first_output();
     assert!(
-        result.output.contains("Command completed"),
+        result.output.contains("Process exited with code"),
         "{}",
         result.output
     );
-    assert!(!result.output.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(!result.output.contains("\nabcdefghijklmnopqrstuvwxyz"));
+    assert!(!result.output.contains("Session ID:"));
+    assert!(!result.output.contains("session ID"));
+    assert!(!result.output.contains("Command:"));
     assert!(!result.output.contains("Retained"));
     assert!(!result.output.contains("beyond retention limit"));
     assert!(cell.done());
@@ -423,7 +429,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
         matches!(h, ToolHaste::Eventually { .. })
     })
     .await;
-    assert!(monitor.first_output().output.contains("monitor started"));
+    assert_eq!(monitor.first_output().output.trim(), "monitor started");
     assert!(!monitor.done());
 
     let mut inspect = tools[0].run(
@@ -471,12 +477,12 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     until(&wake, &*writer, ended).await;
     let output = writer.first_output();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
-    assert!(output.output.contains("Command completed"));
+    assert!(output.output.contains("Process exited with code"));
     until(&wake, &*monitor, ended).await;
     let output = monitor.more_output().unwrap();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     assert!(output.output.contains("ready"));
-    assert!(!output.output.contains("Command completed"));
+    assert!(!output.output.contains("Process exited with code"));
     assert!(monitor.done());
 }
 
@@ -569,13 +575,15 @@ async fn python_nested_tools_deliver_unawaited_output_and_keep_native_results() 
     let tools = tools(shell(), vec![Arc::new(Echo)], Some(crate::CodeMode::Python)).unwrap();
     let wake = Arc::new(Notify::new());
     let mut cell = tools[0].run(call("echo", "exec", json!(
-        "tools.echo('unawaited output')\nresult = await tools.echo('awaited output')\nassert isinstance(result, str)\nassert result == 'awaited output'"
+        "echo('unawaited output')\nresult = await echo('awaited output')\nassert isinstance(result, str)\nassert result == 'awaited output'"
     )), SourceWaker::new(wake.clone()));
     until(&wake, &*cell, ended).await;
     let output = cell.first_output();
     assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
     assert!(output.output.contains("unawaited output"), "{output:?}");
     assert!(output.output.contains("awaited output"), "{output:?}");
+    assert!(!output.output.contains("Session ID:"));
+    assert!(!output.output.contains("session ID"));
 }
 
 #[tokio::test]
@@ -602,7 +610,7 @@ async fn python_registration_settles_startup_failure_and_preserves_exit_metadata
     );
     until(&wake, &*failed, ended).await;
     let output = failed.first_output();
-    assert!(output.output.contains("Command completed"), "{output:?}");
+    assert!(output.output.contains("Command failed:"), "{output:?}");
     assert!(
         output.output.contains("Command stdin not ready or closed"),
         "{output:?}"
@@ -639,7 +647,7 @@ async fn python_registration_cancels_an_unawaited_command_and_blocked_stdin_toge
     until(&wake, &*cell, ended).await;
     let output = cell.more_output().unwrap();
     assert_eq!(output.status, ToolOutputStatus::Cancelled, "{output:?}");
-    assert!(output.output.contains("Command completed"), "{output:?}");
+    assert!(output.output.contains("Command failed:"), "{output:?}");
     assert!(cell.done());
 }
 
@@ -712,11 +720,7 @@ async fn python_cancellation_owns_pending_host_calls() {
     .unwrap();
     let wake = Arc::new(Notify::new());
     let mut cell = tools[0].run(
-        call(
-            "p1",
-            "exec",
-            json!("notify('starting'); await tools.pending()"),
-        ),
+        call("p1", "exec", json!("notify('starting'); await pending()")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*cell, |h| matches!(h, ToolHaste::Soon { .. })).await;
@@ -734,7 +738,7 @@ async fn python_cancellation_owns_pending_host_calls() {
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     let mut second = tools[0].run(
-        call("p2", "exec", json!("await tools.pending()")),
+        call("p2", "exec", json!("await pending()")),
         SourceWaker::new(wake.clone()),
     );
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -772,7 +776,7 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
     let tools = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
     let wake = Arc::new(Notify::new());
     let source = format!(
-        "set_patience(300)\ncommand('echo registered')\ntools.web__run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
+        "set_patience(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
         marker.to_str().unwrap()
     );
     let mut cell = tools[0].run(
@@ -826,7 +830,10 @@ async fn top_level_return_does_not_finish_detached_python_activity() {
     .await
     .unwrap();
     assert!(!exec.quiescent());
-    cell.first_output();
+    assert_eq!(
+        cell.first_output().output.as_str(),
+        "No output yet. Output and completion arrive automatically."
+    );
     assert!(!cell.done());
     std::fs::write(release, "").unwrap();
     until(&wake, &*cell, ended).await;
@@ -868,11 +875,7 @@ async fn operation_output_does_not_retroactively_change_exec_return_facts() {
     .unwrap();
     let wake = Arc::new(Notify::new());
     let mut cell = tools[0].run(
-        call(
-            "return-facts",
-            "exec",
-            json!("tools.released()\ntools.pending()"),
-        ),
+        call("return-facts", "exec", json!("released()\npending()")),
         SourceWaker::new(wake.clone()),
     );
     let exec = cell.python_exec().unwrap();
@@ -903,7 +906,7 @@ async fn operation_output_does_not_retroactively_change_exec_return_facts() {
     .await
     .unwrap();
     assert_eq!(exec.facts().completion, Some(completion));
-    assert!(exec.facts().output.since.is_some());
+    assert!(exec.facts().output.since.is_none());
     assert!(cell.first_output().output.contains("nested result"));
     assert!(exec.facts().completion.is_none());
     cell.cancel();
@@ -912,5 +915,159 @@ async fn operation_output_does_not_retroactively_change_exec_return_facts() {
     assert!(
         exec.facts().completion.is_none(),
         "quiescence is not a second top-level return"
+    );
+}
+
+#[tokio::test]
+async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
+    struct EchoTool(rho_core::ToolSpec);
+    impl crate::FutureTool for EchoTool {
+        fn spec(&self) -> rho_core::ToolSpec {
+            self.0.clone()
+        }
+        fn call(
+            &self,
+            call: ToolCall,
+        ) -> futures::future::BoxFuture<'static, rho_core::ToolOutput> {
+            Box::pin(async move {
+                crate::output(
+                    format!("{}:{}", call.name.as_str(), call.arguments),
+                    ToolOutputStatus::Success,
+                )
+            })
+        }
+    }
+    let others = [
+        "spawn_engineer",
+        "interrupt_engineer",
+        "message_agent",
+        "ask_advisor",
+        "web__run",
+        "view_image",
+    ]
+    .into_iter()
+    .map(|name| {
+        let mut spec = crate::FutureTool::spec(&PendingTool(Default::default()));
+        spec.name = ToolName::try_from(name).unwrap();
+        spec.description = format!("{name} full documentation");
+        Arc::new(EchoTool(spec)) as Arc<dyn crate::FutureTool>
+    })
+    .collect();
+    let tool = crate::PythonTool::new(shell(), others).unwrap();
+    let description = tool.spec().description;
+    assert!(description.contains("display(agents.delegate_engineer)"));
+    assert!(description.contains("agents.spawn_new_advisor: ask_advisor full documentation"));
+    assert!(!description.contains("tools.ask_advisor"));
+    assert!(!description.contains("spawn_engineer full documentation"));
+    assert!(!description.contains("encoding="));
+    assert!(description.contains("web.run: standard OpenAI web run"));
+    assert!(!description.contains("web__run full documentation"));
+    let wake = Arc::new(Notify::new());
+    let mut cell = tool.run(
+        call(
+            "agents-api",
+            "exec",
+            json!(
+                r#"
+import types
+assert isinstance(agents, types.ModuleType)
+docs = display(agents.delegate_engineer)
+assert "spawn_engineer full documentation" in docs
+assert "agents.delegate_engineer(" in docs
+assert "task_name" in docs and "prompt" in docs
+assert "tools" not in globals()
+assert "spawn_engineer" not in globals()
+assert "ask_advisor" not in globals()
+assert "message_agent" not in globals()
+assert "interrupt_engineer" not in globals()
+result = await agents.delegate_engineer(task_name="test", prompt="work")
+assert result.startswith("spawn_engineer:")
+assert (await agents.message(agent_id="eng-test", message="hello")).startswith("message_agent:")
+agents.cancel(engineer_id="eng-test")
+agents.spawn_new_advisor("background review")
+assert (await web.run(search_query=[])).startswith("web__run:")
+assert (await view_image(path="test.png")).startswith("view_image:")
+"#
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*cell, ended).await;
+    let output = cell.first_output();
+    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+    assert!(output.output.contains("background review"), "{output:?}");
+    assert!(output.output.contains("interrupt_engineer:"), "{output:?}");
+}
+
+#[tokio::test]
+async fn python_announces_sources_once_in_registration_order_including_late_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let release = directory.path().join("release");
+    let registered = directory.path().join("registered");
+    let tools = tools(
+        shell(),
+        vec![Arc::new(PendingTool(Default::default()))],
+        Some(crate::CodeMode::Python),
+    )
+    .unwrap();
+    let wake = Arc::new(Notify::new());
+    let source = format!(
+        "command('sleep 600')\npending()\ncommand('sleep 601')\nasync def later():\n    while not Path({:?}).exists():\n        await asyncio.sleep(0.01)\n    pending()\n    Path({:?}).touch()\nasyncio.create_task(later())",
+        release.to_str().unwrap(),
+        registered.to_str().unwrap()
+    );
+    let mut cell = tools[0].run(
+        call("source-order", "exec", json!(source)),
+        SourceWaker::new(wake.clone()),
+    );
+    let exec = cell.python_exec().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exec.facts().returned.is_none() {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = cell.first_output().output;
+    let lines = first.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3, "{first}");
+    assert!(lines[0].starts_with("Command running with session ID "));
+    assert!(lines[1].starts_with("Operation pending running with session ID "));
+    assert!(lines[2].starts_with("Command running with session ID "));
+    let mut ids = lines
+        .iter()
+        .map(|line| line.rsplit(' ').next().unwrap().parse::<u32>().unwrap())
+        .collect::<Vec<_>>();
+    assert!(ids.iter().all(|id| (1_000..10_000).contains(id)));
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        3
+    );
+    assert!(cell.more_output().is_none());
+    std::fs::write(release, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !registered.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let late = cell.more_output().unwrap().output;
+    assert!(late.starts_with("Operation pending running with session ID "));
+    let late_id = late.rsplit(' ').next().unwrap().parse::<u32>().unwrap();
+    assert!((1_000..10_000).contains(&late_id));
+    assert!(!ids.contains(&late_id));
+    ids.push(late_id);
+    assert!(cell.more_output().is_none());
+    cell.cancel();
+    until(&wake, &*cell, ended).await;
+    let finished = cell.more_output().unwrap().output;
+    let positions = ids
+        .iter()
+        .map(|id| finished.find(&format!("Session ID: {id}")).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{finished}"
     );
 }

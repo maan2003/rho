@@ -20,11 +20,11 @@ const JOB_LIMIT: usize = 64;
 pub struct PythonTool {
     session: Session,
     shared: Arc<Shared>,
-    next_cell: AtomicU64,
     spec: ToolSpec,
     runtime: tokio::runtime::Handle,
 }
 struct Shared {
+    next_cell: AtomicU64,
     shell: ShellTools,
     others: HashMap<String, Arc<dyn FutureTool>>,
     cells: Mutex<HashMap<u64, Arc<Mutex<ExecState>>>>,
@@ -32,6 +32,19 @@ struct Shared {
     sequence: AtomicU64,
     images: Mutex<BTreeMap<u64, rho_core::ImageContent>>,
 }
+// Each modular shift is reversible by subtraction. Together they permute all
+// 9,000 slots without a lookup table; public labels repeat every 9,000 internal
+// requests. Handles and output ordering always use the original internal ID.
+fn session_id(internal_id: u64) -> u32 {
+    let x = internal_id % 9_000;
+    let (mut left, mut right) = (x / 100, x % 100);
+    left = (left + right * right + 17 * right + 43) % 90;
+    right = (right + left * left + 29 * left + 71) % 100;
+    left = (left + right * right + 53 * right + 19) % 90;
+    right = (right + left * left + 11 * left + 37) % 100;
+    (1_000 + 100 * left + right) as u32
+}
+
 struct ExecState {
     waker: SourceWaker,
     output: BoundedOutput,
@@ -78,10 +91,14 @@ impl ExecState {
 }
 struct Operation {
     id: u64,
+    name: String,
+    output: BoundedOutput,
+    announced: bool,
     finished: Option<UnixMs>,
 }
 struct Job {
     id: u64,
+    name: String,
     state: Mutex<JobState>,
     stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
     cancel: Notify,
@@ -89,6 +106,7 @@ struct Job {
     ready: tokio::sync::watch::Sender<bool>,
 }
 struct JobState {
+    announced: bool,
     file: std::fs::File,
     len: usize,
     dropped: usize,
@@ -107,9 +125,13 @@ impl PythonTool {
 Work registers immediately; output arrives automatically. Put independent calls in the same cell to run them concurrently; await only when later Python statements depend on completion.
 - command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are optional. Awaiting it returns completion metadata (id, exit_code), not stdout.
 - write_stdin(handle, chars='', max_tokens=2000) registers an input write and retained-output read. It waits for stdin readiness, not subsequent output; an empty page is valid. Await only if Python needs the returned page or write completion. display(handle) also reads a page.
-- tools.NAME(**kwargs) registers an internal tool call. Custom tools take a single string. Await only for Python dependencies; text results are strings, JSON results are parsed values. Tool schemas follow the examples.
+- handle.cancel() requests cancellation of a running command. Awaiting handle.cancel() waits only for the cancellation request to be handled; await handle to wait for the command to finish.
+- agents.spawn_new_advisor("...") starts an advisor consultation immediately. Include the question, relevant file paths, scope, and desired output in the string. Output arrives automatically; await only when code needs its result. Full guidance, examples, and argument schema are below when available.
+- Before delegating, call display(agents.delegate_engineer) to read its full guidance and arguments. display(callable) shows its documentation.
+- Host functions register work immediately. Await only for Python dependencies; text results are strings, JSON results are parsed values.
+- Pending commands and operations expose session IDs from 1000 through 9999 when first reported as running. These are display labels derived from internal IDs and repeat every 9000 internal requests; use Python handles to await, inspect, or cancel commands. Commands finishing before their first reply do not expose an ID. Later output uses the same identity. A reply does not mean the source finished. Latest-cell sources are reported first, then older cells; sources within each cell follow registration order, without waiting for earlier sources to finish.
 
-Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner. image((await tools.view_image(path=...))["content"][0]) displays a returned image reference.
+Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner. image((await view_image(path=...))["content"][0]) displays a returned image reference.
 
 Examples
 
@@ -121,13 +143,13 @@ command("rg -n 'TODO' src")
 
 Search the web without awaiting or reprinting the result:
 ```python
-tools.web__run(search_query=[{"q": "Python asyncio TaskGroup documentation"}])
+web.run(search_query=[{"q": "Python asyncio TaskGroup documentation"}])
 ```
-Use the returned references in a later cell for tools.web__run(open=[...]).
+Use the returned references in a later cell for web.run(open=[...]).
 
 After editing a file, await only the dependencies:
 ```python
-Path("config.toml").write_text(updated_config, encoding="utf-8")
+Path("config.toml").write_text(updated_config)
 check = await command("cargo check")
 if check["exit_code"] == 0:
     command("cargo test")
@@ -147,6 +169,17 @@ write_stdin(job, "hello\n")
 After automatic completion, a later cell can expand retained output:
 ```python
 write_stdin(job, max_tokens=6000)
+```
+
+Keep a handle if you may want to stop a command:
+```python
+job = command("sleep 600")
+```
+Cancel it from a later cell; completion arrives automatically:
+```python
+job.cancel()
+# Only if subsequent code needs the command to have stopped:
+await job
 ```
 
 A live monitoring cell:
@@ -181,15 +214,9 @@ Details and limits
 Available tools:
 "#,
         );
-        for spec in others.iter().map(|t| t.spec()) {
-            description.push_str(&format!(
-                "tools.{}: {}\nArguments: {}\n",
-                spec.name.as_str(),
-                spec.description,
-                spec.input_schema
-            ));
-        }
+        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         let shared = Arc::new(Shared {
+            next_cell: AtomicU64::new(1),
             shell,
             others: others
                 .into_iter()
@@ -203,14 +230,46 @@ Available tools:
         let shell = shared.shell.clone();
         let runtime = tokio::runtime::Handle::current();
         let setup_runtime = runtime.clone();
-        let session = Session::new(move || {
-            unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
-                .map_err(|error| error.to_string())
-        })?;
+        let session = Session::new(
+            move || {
+                unsafe { setup_runtime.block_on(shell.enter_interpreter_thread()) }
+                    .map_err(|error| error.to_string())
+            },
+            json!(specs),
+        )?;
+        for spec in specs {
+            let name = spec.name.as_str();
+            if name == "spawn_engineer" {
+                continue;
+            }
+            if name == "web__run" {
+                description.push_str("web.run: standard OpenAI web run\n");
+                continue;
+            }
+            let callable = match name {
+                "ask_advisor" => "agents.spawn_new_advisor",
+                "message_agent" => "agents.message",
+                "interrupt_engineer" => "agents.cancel",
+                _ => name,
+            };
+            let mut schema = spec.input_schema;
+            if name == "ask_advisor" {
+                if let Some(message) = schema["properties"]
+                    .as_object_mut()
+                    .and_then(|properties| properties.remove("message"))
+                {
+                    schema["properties"]["msg"] = message;
+                }
+                schema["required"] = json!(["msg"]);
+            }
+            description.push_str(&format!(
+                "{}: {}\nArguments: {}\n",
+                callable, spec.description, schema
+            ));
+        }
         Ok(Self {
             session,
             shared,
-            next_cell: AtomicU64::new(1),
             spec: ToolSpec {
                 name: ToolName::try_from("exec").unwrap(),
                 tool_type: ToolType::Custom,
@@ -239,7 +298,7 @@ impl Tool for PythonTool {
         self.spec.clone()
     }
     fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession> {
-        let cell = self.next_cell.fetch_add(1, Ordering::Relaxed);
+        let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
@@ -337,7 +396,25 @@ fn register_call(
             let budget = args["max_tokens"].as_u64().unwrap_or(2000).clamp(1, 10000) as usize;
             let job = Arc::new(Job {
                 id: request,
+                name: {
+                    let mut name = args["cmd"]
+                        .as_str()
+                        .unwrap_or("command")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if name.len() > 20 {
+                        let mut end = 17;
+                        while !name.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        name.truncate(end);
+                        name.push_str("...");
+                    }
+                    name
+                },
                 state: Mutex::new(JobState {
+                    announced: false,
                     file: tempfile::tempfile().map_err(|e| e.to_string())?,
                     len: 0,
                     dropped: 0,
@@ -363,6 +440,17 @@ fn register_call(
     let operation = (name != "command").then(|| {
         Arc::new(Mutex::new(Operation {
             id: request,
+            name: match name.as_str() {
+                "web__run" => "web.run",
+                "spawn_engineer" => "agents.delegate_engineer",
+                "ask_advisor" => "agents.spawn_new_advisor",
+                "message_agent" => "agents.message",
+                "interrupt_engineer" => "agents.cancel",
+                other => other,
+            }
+            .to_owned(),
+            output: BoundedOutput::for_tokens(Some(10000)),
+            announced: false,
             finished: None,
         }))
     });
@@ -385,7 +473,9 @@ fn register_call(
         let work = async {
             match &job {
                 Ok(Some(job)) => run_command(&shared.shell, job, &args, &link).await,
-                Ok(None) => host_call(&shared, &name, args, &link).await,
+                Ok(None) => {
+                    host_call(&shared, &name, args, &link, operation.as_ref().unwrap()).await
+                }
                 Err(error) => Err(error.clone()),
             }
         };
@@ -403,7 +493,14 @@ fn register_call(
             };
             job.state.lock().unwrap().finished = Some((UnixMs::now(), summary));
         } else if let Err(error) = &result {
-            link.lock().unwrap().say(error, true);
+            operation
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .output
+                .push(error.as_bytes());
+            link.lock().unwrap().error = true;
         }
         {
             let mut cell = link.lock().unwrap();
@@ -474,6 +571,7 @@ async fn host_call(
     name: &str,
     args: Value,
     link: &Arc<Mutex<ExecState>>,
+    operation: &Arc<Mutex<Operation>>,
 ) -> Result<Value, String> {
     if name == "image" {
         let id = args["id"].as_u64().ok_or("Expected an image reference")?;
@@ -489,7 +587,7 @@ async fn host_call(
             return Err("Cell image limit reached".into());
         }
         cell.images.push(image);
-        cell.say("Image displayed", false);
+        operation.lock().unwrap().output.push(b"Image displayed");
         return Ok(Value::Null);
     }
     if matches!(name, "write_stdin" | "display" | "cancel_command") {
@@ -546,7 +644,11 @@ async fn host_call(
         state.cursor += bytes.len();
         let result = json!({"id":id,"output":String::from_utf8_lossy(&bytes),"offset":start,"next_offset":state.cursor,"retained_bytes":state.len,"dropped_bytes":state.dropped,"finished":state.finished.as_ref().map(|(_,v)|v)});
         drop(state);
-        link.lock().unwrap().say(&result.to_string(), false);
+        operation
+            .lock()
+            .unwrap()
+            .output
+            .push(result.to_string().as_bytes());
         return Ok(result);
     }
     let tool = shared
@@ -585,7 +687,11 @@ async fn host_call(
         }
     }
     if !result.output.is_empty() {
-        link.lock().unwrap().say(&result.output, false);
+        operation
+            .lock()
+            .unwrap()
+            .output
+            .push(result.output.as_bytes());
     }
     if !content.is_empty() {
         Ok(json!({"output":*result.output,"content":content}))
@@ -602,6 +708,10 @@ pub struct PythonExec {
     runtime: tokio::runtime::Handle,
 }
 impl PythonExec {
+    pub fn sequence(&self) -> u64 {
+        self.cell
+    }
+
     /// All Python activity and host operations have stopped; output may still
     /// need draining. Distinct from the submitted code's return.
     pub fn quiescent(&self) -> bool {
@@ -731,51 +841,97 @@ impl PythonCell {
         cell.since = None;
         cell.important = None;
         cell.completion = None;
-        cell.operations
-            .retain(|op| op.lock().unwrap().finished.is_none());
+        let mut sources = Vec::new();
+        let old = self.shared.next_cell.load(Ordering::Relaxed) > self.cell + 2;
+        cell.operations.retain(|op| {
+            let mut op = op.lock().unwrap();
+            if op.finished.is_some() {
+                let output = decode_output_lossy(
+                    std::mem::replace(&mut op.output, BoundedOutput::for_tokens(Some(10000)))
+                        .into_bytes(),
+                );
+                let mut parts = Vec::new();
+                if op.announced {
+                    parts.push(format!("Session ID: {}", session_id(op.id)));
+                }
+                parts.push(format!("Operation {} completed", op.name));
+                if !output.is_empty() {
+                    parts.push(format!("Output:\n{output}"));
+                }
+                sources.push((op.id, parts.join("\n")));
+                false
+            } else {
+                if !op.announced {
+                    op.announced = true;
+                    sources.push((
+                        op.id,
+                        format!(
+                            "Operation {} running with session ID {}",
+                            op.name,
+                            session_id(op.id)
+                        ),
+                    ));
+                }
+                true
+            }
+        });
         cell.jobs.retain(|job| {
             let mut state = job.state.lock().unwrap();
-            if !state.unsent.is_empty() {
-                chunks.push(format!(
-                    "Command {} output:\n{}",
-                    job.id,
-                    decode_output_lossy(
-                        std::mem::replace(
-                            &mut state.unsent,
-                            BoundedOutput::for_tokens(Some(job.budget))
-                        )
-                        .into_bytes()
-                    )
+            let has_output = !state.unsent.is_empty();
+            let finished = state.finished.clone();
+            let announce = finished.is_none() && !state.announced;
+            if !has_output && finished.is_none() && !announce {
+                return true;
+            }
+            let mut parts = Vec::new();
+            if let Some((_, summary)) = &finished {
+                if state.announced {
+                    parts.push(format!("Session ID: {}", session_id(job.id)));
+                }
+                if let Some(exit_code) = summary.get("exit_code") {
+                    parts.push(format!("Process exited with code {exit_code}"));
+                } else if let Some(error) = summary.get("error").and_then(Value::as_str) {
+                    parts.push(format!("Command failed: {error}"));
+                }
+            } else {
+                state.announced = true;
+                parts.push(format!(
+                    "Command running with session ID {}",
+                    session_id(job.id)
                 ));
+            }
+            if old {
+                parts.push(format!("Command: {}", job.name));
+            }
+            if has_output {
+                let output = decode_output_lossy(
+                    std::mem::replace(
+                        &mut state.unsent,
+                        BoundedOutput::for_tokens(Some(job.budget)),
+                    )
+                    .into_bytes(),
+                );
+                parts.push(format!("Output:\n{output}"));
             }
             state.since = None;
             state.important = None;
-            if let Some((_, summary)) = state.finished.clone() {
-                chunks.push(format!("Command completed: {summary}"));
+            sources.push((job.id, parts.join("\n")));
+            if finished.is_some() {
                 state.delivered = true;
                 false
             } else {
                 true
             }
         });
+        sources.sort_by_key(|(id, _)| *id);
+        chunks.extend(sources.into_iter().map(|(_, text)| text));
         if cell.closed() && !cell.delivered {
             cell.delivered = true;
             if chunks.is_empty() {
                 chunks.push("Execution completed.".into());
             }
-        } else if first {
-            if cell.jobs.is_empty() {
-                chunks.push("Execution is still running; output arrives automatically.".into());
-            } else {
-                chunks.push(format!(
-                    "Commands still running: {}. Output arrives automatically; do not rerun them.",
-                    cell.jobs
-                        .iter()
-                        .map(|job| job.id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
+        } else if first && chunks.is_empty() {
+            chunks.push("No output yet. Output and completion arrive automatically.".into());
         }
         if chunks.is_empty() {
             return None;
@@ -797,7 +953,8 @@ impl PythonCell {
 impl ToolSession for PythonCell {
     fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
         use crate::{PythonOperationFacts, PythonOutput, SourceFacts};
-        let mut sources = vec![(0, SourceFacts::PythonExec(self.facts()))];
+        // Keep the exec marker distinct from zero-based host request IDs.
+        let mut sources = vec![(u64::MAX, SourceFacts::PythonExec(self.facts()))];
         let cell = self.link.lock().unwrap();
         sources.extend(cell.jobs.iter().map(|job| {
             let state = job.state.lock().unwrap();
@@ -850,5 +1007,111 @@ impl Drop for PythonCell {
             self.cancel();
         }
         self.shared.cells.lock().unwrap().remove(&self.cell);
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_session_ids_stay_stable_and_old_previews_are_bounded() {
+        let tool = PythonTool::new(
+            ShellTools::in_directory(
+                std::time::Duration::from_secs(5),
+                "/tmp".into(),
+                rho_workspaces::PathOverrides::default(),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        let wake = Arc::new(Notify::new());
+        let mut cell = tool.run(
+            ToolCall {
+                id: "session-label-test".try_into().unwrap(),
+                name: "exec".try_into().unwrap(),
+                tool_type: ToolType::Custom,
+                arguments: "command('sleep 600 # ☃☃☃☃☃☃☃☃')".into(),
+            },
+            SourceWaker::new(wake.clone()),
+        );
+        let exec = cell.python_exec().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while exec.facts().returned.is_none() {
+                wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !exec.link.lock().unwrap().jobs[0]
+                .state
+                .lock()
+                .unwrap()
+                .announced
+        );
+        let first = cell.first_output();
+        let id = first
+            .output
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(id, session_id(0));
+        assert!(!first.output.contains("Command:"));
+        for call_id in ["newer-one", "newer-two"] {
+            let mut newer = tool.run(
+                ToolCall {
+                    id: call_id.try_into().unwrap(),
+                    name: "exec".try_into().unwrap(),
+                    tool_type: ToolType::Custom,
+                    arguments: "pass".into(),
+                },
+                SourceWaker::new(wake.clone()),
+            );
+            let exec = newer.python_exec().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !exec.quiescent() {
+                    wake.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            newer.first_output();
+        }
+        cell.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !exec.quiescent() {
+                wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        let completed = cell.more_output().unwrap();
+        let preview = completed
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("Command: "))
+            .unwrap();
+        assert!(preview.len() <= 20);
+        assert!(preview.ends_with("..."));
+        assert!(cell.done());
+        assert!(completed.output.contains(&format!("Session ID: {id}")));
+    }
+
+    #[test]
+    fn session_id_permutation_covers_the_domain_and_wraps() {
+        let mut ids = (0..9_000).map(session_id).collect::<Vec<_>>();
+        for internal in 0..9_000 {
+            assert_eq!(session_id(internal), session_id(internal + 9_000));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (1_000..10_000).collect::<Vec<_>>());
+        assert_eq!(session_id(u64::MAX), session_id(u64::MAX % 9_000));
+        assert_eq!(
+            (0..5).map(session_id).collect::<Vec<_>>(),
+            [1230, 2009, 5852, 6233, 8666],
+        );
     }
 }

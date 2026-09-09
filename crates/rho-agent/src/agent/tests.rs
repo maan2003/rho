@@ -1130,7 +1130,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
                             finished: Some(at), ..
                         },
                     ),
-                )) = sources.iter().find(|(id, _)| *id == 1)
+                )) = sources.iter().find(|(id, _)| *id == 0)
             {
                 break *at;
             }
@@ -1160,8 +1160,8 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         .collect();
     running.answer = ToolCallAnswer::Sent;
     let first = running.session.first_output();
-    assert!(first.output.contains("Command completed:"));
-    assert!(first.output.contains("Commands still running: 2."));
+    assert!(first.output.contains("Process exited with code"));
+    assert!(first.output.contains("Command running with session ID"));
     assert!(!first.output.contains("Python cell"));
     assert!(running.sources().all(|source| matches!(
         source,
@@ -1178,7 +1178,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
     let second_at = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let sources = running.session.sources();
-            if sources.iter().any(|(id, _)| *id == 3)
+            if sources.iter().any(|(id, _)| *id == 2)
                 && let Some((
                     _,
                     rho_agent_tools::SourceFacts::PythonOperation(
@@ -1186,7 +1186,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
                             finished: Some(at), ..
                         },
                     ),
-                )) = sources.iter().find(|(id, _)| *id == 2)
+                )) = sources.iter().find(|(id, _)| *id == 1)
             {
                 break *at;
             }
@@ -1233,7 +1233,7 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         "nothing to batch once every command ends"
     );
     let last = running.session.more_output().unwrap();
-    assert_eq!(last.output.matches("Command completed:").count(), 2);
+    assert_eq!(last.output.matches("Process exited with code").count(), 2);
     assert!(!last.output.contains("Python cell"));
     assert!(running.session.done());
 }
@@ -1360,4 +1360,49 @@ fn quiet_python_dispatch_does_not_bypass_operation_batching_when_output_arrives(
     };
     let scenario = ask(vec![exec, operation(Some(UnixMs(30_000))), operation(None)]);
     assert_eq!(scenario.recheck(UnixMs(30_000)), Some(UnixMs(40_000)));
+}
+
+#[tokio::test]
+async fn python_output_order_puts_latest_first_then_older_cells_in_execution_order() {
+    use rho_agent_tools::{PythonTool, SourceWaker, Tool};
+    use rho_tool_shell::ShellTools;
+    use rho_workspaces::PathOverrides;
+
+    let directory = tempfile::tempdir().unwrap();
+    let tool = PythonTool::new(
+        ShellTools::in_directory(
+            Duration::from_secs(5),
+            directory.path().to_str().unwrap().into(),
+            PathOverrides::default(),
+        ),
+        Vec::new(),
+    )
+    .unwrap();
+    let mut running = Vec::new();
+    // Deliberately oppose call-ID order. Some calls already have a reply:
+    // that must not move their updates behind an older unacknowledged call.
+    for id in ["z-oldest", "a-older", "m-latest"] {
+        let mut invocation = call(id);
+        invocation.arguments = "pass".into();
+        running.push(RunningTool {
+            session: tool.run(invocation.clone(), SourceWaker::new(Default::default())),
+            call: invocation,
+            started_at: UnixMs(0),
+            answer: if id == "z-oldest" {
+                ToolCallAnswer::Owed
+            } else {
+                ToolCallAnswer::Sent
+            },
+            answered_sources: Default::default(),
+        });
+    }
+    let latest = running[2].call.id.clone();
+    running.sort_by_key(|tool| tool.output_order(Some(&latest)));
+    assert_eq!(
+        running
+            .iter()
+            .map(|tool| tool.call.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-latest", "z-oldest", "a-older"],
+    );
 }

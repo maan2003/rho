@@ -700,6 +700,16 @@ struct RunningTool {
 }
 
 impl RunningTool {
+    fn output_order(&self, latest: Option<&ToolCallId>) -> (bool, u64) {
+        (
+            Some(&self.call.id) != latest,
+            self.session
+                .python_exec()
+                .map(|exec| exec.sequence())
+                .unwrap_or(0),
+        )
+    }
+
     fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
         self.session.sources().into_iter().map(|(id, facts)| {
             let answer = if self.answered_sources.contains(&id) {
@@ -1350,7 +1360,10 @@ impl Agent {
         // id: `REQ-provider-transcript-protocol`.
         let mut results: Vec<ToolResult> = std::mem::take(&mut self.wait_answers);
         let mut updates = Vec::new();
-        for tool in self.tools.values_mut() {
+        let latest = self.latest_python_exec.as_ref().map(|(id, _)| id);
+        let mut tools = self.tools.values_mut().collect::<Vec<_>>();
+        tools.sort_by_key(|tool| tool.output_order(latest));
+        for tool in tools {
             // Snapshot before draining: work registered later still owes its
             // first contribution, even if exec already has its protocol reply.
             tool.answered_sources = tool
@@ -1389,6 +1402,14 @@ impl Agent {
                         }));
                     }
                 }
+            }
+            if tool.session.python_exec().is_some() {
+                if !results.is_empty() {
+                    blocks.push(ContextBlock::ToolResults {
+                        results: std::mem::take(&mut results),
+                    });
+                }
+                blocks.append(&mut updates);
             }
         }
         // Asked after the drain, so whatever a tool said last has been taken:
