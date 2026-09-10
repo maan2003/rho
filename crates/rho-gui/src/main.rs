@@ -653,6 +653,7 @@ fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
         gpui::profiler::EditorTimingKind::SyncTree => "sync_tree",
         gpui::profiler::EditorTimingKind::SpliceInlays => "splice_inlays",
         gpui::profiler::EditorTimingKind::MultiBufferBufferScan => "multi_buffer_buffer_scan",
+        gpui::profiler::EditorTimingKind::HighlightedChunks => "highlighted_chunks",
     }
 }
 
