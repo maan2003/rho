@@ -1430,9 +1430,7 @@ impl TranscriptModel {
         // would cost the whole transcript on every page. A replaced document
         // excerpt re-resolves every anchor, so that one goes wide again.
         let changed_records = (!document_replaced).then_some(changed_records).flatten();
-        let decorated = changed_records
-            .clone()
-            .unwrap_or_else(|| 0..self.records.len());
+        let decorated = changed_records.clone().unwrap_or(0..self.records.len());
         let scope = changed_records.map(|_| {
             self.records[decorated.clone()]
                 .iter()
@@ -1586,7 +1584,6 @@ impl TranscriptModel {
                 scope.as_ref(),
                 visualization_cache,
                 visualization_client,
-                multi_buffer,
                 &editor,
                 cx,
             );
@@ -2146,11 +2143,10 @@ fn reconcile_visualizations<V: 'static>(
     scope: Option<&HashSet<text::BufferId>>,
     cache: &mut HashMap<String, Entity<Visualization>>,
     client: &VisualizationClient,
-    multi_buffer: &Entity<MultiBuffer>,
     editor: &Entity<Editor>,
     cx: &mut Context<V>,
 ) {
-    let snapshot = multi_buffer.read(cx).snapshot(cx);
+    let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
     let desired_keys = desired
         .iter()
         .filter_map(|desired| {
