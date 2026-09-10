@@ -8380,14 +8380,25 @@ impl Drop for EditorPrepaintGuard {
 struct PrepaintPasses {
     started: Instant,
     last: Instant,
-    marks: [(&'static str, Duration); Self::MAX],
+    /// Each mark's name, what it took, and the units it did that work in.
+    /// Zero units means the pass worked in the rows the frame drew, which
+    /// is all of them but shaping: shaping's unit is the layout cache
+    /// misses it paid for, and a pass over 39 rows that shaped none of them
+    /// has to be able to say so.
+    marks: [(&'static str, Duration, u64); Self::MAX],
     count: usize,
+    /// What the line layout cache did for this prepaint. Recorded on every
+    /// frame, not only on long ones: the question is whether a settled
+    /// frame reshapes rows nothing changed, and a settled frame is short.
+    shaping: gpui::ShapingCounts,
+    /// Time inside the platform text system on this prepaint's misses.
+    shaped: Duration,
 }
 
 impl PrepaintPasses {
     /// Marks a prepaint can hold. One more than it has passes, so a pass
     /// added without a slot added is a dropped mark and not a panic.
-    const MAX: usize = 15;
+    const MAX: usize = 16;
 
     /// The prepaint worth naming. The bound the user set is 4 ms on the whole
     /// draw, of which prepaint is one part beside paint and the present, so
@@ -8400,15 +8411,46 @@ impl PrepaintPasses {
         Self {
             started: now,
             last: now,
-            marks: [("", Duration::ZERO); Self::MAX],
+            marks: [("", Duration::ZERO, 0); Self::MAX],
             count: 0,
+            shaping: gpui::ShapingCounts::default(),
+            shaped: Duration::ZERO,
         }
     }
 
     fn mark(&mut self, pass: &'static str) {
         let now = Instant::now();
         if self.count < Self::MAX {
-            self.marks[self.count] = (pass, now.saturating_duration_since(self.last));
+            self.marks[self.count] = (pass, now.saturating_duration_since(self.last), 0);
+            self.count += 1;
+        }
+        self.last = now;
+    }
+
+    /// Marks the pass that just ended as two, a measured part and the rest.
+    ///
+    /// Shaping lines and building the highlighted chunks they are shaped
+    /// from happen in one pass and answer different questions: shaping that
+    /// repeats on a row nothing changed is a defeated layout cache, chunk
+    /// building that grows with the document is the syntax map. The shaping
+    /// half is timed inside the line layout cache, on its misses only, so
+    /// it is handed in here rather than measured again.
+    fn mark_split(
+        &mut self,
+        part: &'static str,
+        rest: &'static str,
+        took: Duration,
+        part_units: u64,
+    ) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last);
+        let took = took.min(elapsed);
+        if self.count < Self::MAX {
+            self.marks[self.count] = (part, took, part_units);
+            self.count += 1;
+        }
+        if self.count < Self::MAX {
+            self.marks[self.count] = (rest, elapsed - took, 0);
             self.count += 1;
         }
         self.last = now;
@@ -8435,17 +8477,34 @@ impl PrepaintPasses {
             end: ended,
             work_units: rows,
         });
+        // Always, and apart from the pass breakdown below, because the
+        // breakdown only prints on a long prepaint and a defeated layout
+        // cache shows itself on the short ones: a settled frame that
+        // reshapes every row it draws is the fault, and it never trips the
+        // 3 ms floor.
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("shape/misses"),
+            start: ended.checked_sub(self.shaped).unwrap_or(ended),
+            end: ended,
+            work_units: self.shaping.misses,
+        });
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("shape/reused"),
+            start: ended,
+            end: ended,
+            work_units: self.shaping.hits + self.shaping.carried,
+        });
         if ended.saturating_duration_since(self.started) < Self::LONG {
             return;
         }
         let mut start = self.started;
-        for (pass, took) in &self.marks[..self.count] {
+        for (pass, took, units) in &self.marks[..self.count] {
             let end = start + *took;
             gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
                 owner: gpui::profiler::MainThreadWorkKind::Other(pass),
                 start,
                 end,
-                work_units: rows,
+                work_units: if *units == 0 { rows } else { *units },
             });
             start = end;
         }
@@ -9166,6 +9225,7 @@ impl Element for EditorElement {
                         self.style.background,
                     );
 
+                    let shaping_before = gpui::shaping_counts();
                     let mut line_layouts = Self::layout_lines(
                         start_row..end_row,
                         &snapshot,
@@ -9176,7 +9236,15 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
-                    passes.mark("prepaint/shape_lines");
+                    let shaping = gpui::shaping_counts().since(shaping_before);
+                    passes.shaping = shaping;
+                    passes.shaped = Duration::from_nanos(shaping.shaped_nanos);
+                    passes.mark_split(
+                        "prepaint/shape_lines/shaped",
+                        "prepaint/shape_lines/chunks",
+                        Duration::from_nanos(shaping.shaped_nanos),
+                        shaping.misses,
+                    );
                     #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
                     self.editor.update(cx, |editor, _| {
                         editor.image_renderer_element_counts.clear();
