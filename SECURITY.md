@@ -744,6 +744,11 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   registration must run on the notebook event loop, not a worker thread.
   PyYAML and HTTPX are supplied from the Nix-pinned package closure; Rustls provides
   TLS and SQLite is compiled into the runtime.
+  A ten-second event-loop heartbeat and per-callback timing detect synchronous
+  blocking. After two minutes, tracing raises a timeout in the executing user
+  task or callback, including imported Python code, at a safe dispatch boundary.
+  Awaiting I/O and executor workers do not consume this blocking budget. Other
+  cells and pending work remain live; this does not cancel an entire cell's jobs.
   Python can exhaust memory, disable tracing, catch cancellation, or block in
   native computation. Cancellation of Python is best-effort; Rust command and
   nested-tool cancellation do not depend on Python cooperation.

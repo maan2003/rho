@@ -1,6 +1,7 @@
 """Host-driven notebook scheduler. No Python objects cross the host boundary."""
 import ast
 import asyncio
+import _asyncio
 import contextvars
 import json
 import pathlib
@@ -18,6 +19,38 @@ _requests = {}
 _cells = {}
 _sequence = 0
 _notebook_thread = threading.current_thread()
+_SYNC_TIMEOUT = 120
+_HEARTBEAT_INTERVAL = 10
+_task_dispatch = False
+
+
+def _heartbeat():
+    global _heartbeat_handle
+    _sync_watchdog(_SYNC_TIMEOUT)
+    _heartbeat_handle = _loop.call_later(
+        _HEARTBEAT_INTERVAL, _heartbeat, context=contextvars.Context())
+
+
+def _interruptible(frame):
+    # Only cross an explicit user-code dispatch boundary. In particular, a
+    # user's __repr__ called by runtime/asyncio bookkeeping is not safe to stop.
+    candidate = frame
+    task = asyncio.current_task()
+    coroutine = task.get_coro() if task is not None else None
+    task_frame = getattr(coroutine, 'cr_frame', getattr(coroutine, 'gi_frame', None))
+    while frame is not None:
+        code = frame.f_code
+        if code is _evaluate.__code__:
+            return frame is not candidate
+        if code is _handle_run.__code__:
+            return frame is not candidate and not _task_dispatch
+        module = frame.f_globals.get('__name__', '')
+        if code.co_filename == '<rho-runtime>' or module.split('.')[0] in ('asyncio', '_asyncio'):
+            return False
+        if frame is task_frame:
+            return True
+        frame = frame.f_back
+    return False
 
 
 def _format_error(exc):
@@ -37,7 +70,41 @@ def _trace(frame, event, arg):
             and (_cells.get(_cell.get(None), {}).get('cancelled', False)
                  or _cancel_requested(_cell.get(0), False))):
         raise asyncio.CancelledError()
+    if (frame.f_code.co_filename != '<rho-runtime>'
+            and _sync_watchdog()
+            and _cell.get(None) in _cells
+            and _interruptible(frame)):
+        # Consume this deadline before unwinding, so another ready cell cannot
+        # inherit it. Cancellation of workers remains independent of this timer.
+        _sync_watchdog(_SYNC_TIMEOUT)
+        raise TimeoutError('Cell interrupted after blocking the event loop for 2 minutes')
     return _trace
+
+
+_handle_run = asyncio.Handle._run
+
+
+def _run_handle(handle):
+    global _task_dispatch
+    if handle._loop is not _loop:
+        return _handle_run(handle)
+    previous = _task_dispatch
+    _sync_watchdog(_SYNC_TIMEOUT)
+    # Native task bookkeeping has no Python stack frames. Only its running
+    # coroutine's exact frame authorizes interruption, not Handle dispatch.
+    _task_dispatch = isinstance(
+        handle._callback, (_asyncio.TaskStepMethWrapper, _asyncio.TaskWakeupMethWrapper))
+    try:
+        return _handle_run(handle)
+    finally:
+        _task_dispatch = previous
+        _sync_watchdog(_SYNC_TIMEOUT)
+        # A trace exception may disable tracing. Re-arm at a protected dispatch
+        # boundary, including between callbacks in the same event-loop tick.
+        sys.settrace(_trace)
+
+
+asyncio.Handle._run = _run_handle
 
 
 def _task_done(task, cell):
@@ -369,6 +436,20 @@ sys.modules['__main__'] = _main
 _configure_tools(json.loads(_tool_config))
 
 
+async def _evaluate(cell, source):
+    _send('started', cell=cell)
+    try:
+        code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        result = eval(code, _namespace)
+        if isinstance(result, types.CoroutineType):
+            await result
+    except BaseException as exc:
+        _send('returned', cell=cell, error=_format_error(exc))
+        raise
+    else:
+        _send('returned', cell=cell, error=None)
+
+
 def _execute(cell, source):
     if len(_cells) >= 128 or cell in _cells:
         _send('finished', cell=cell, error='Notebook live cell limit reached or duplicate cell')
@@ -376,20 +457,8 @@ def _execute(cell, source):
     _cells[cell] = dict(root=None, tasks=set(), errors=[], error=None, cancelled=False, workers=set())
     context = contextvars.copy_context()
     context.run(_cell.set, cell)
-    async def evaluate():
-        _send('started', cell=cell)
-        try:
-            code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-            result = eval(code, _namespace)
-            if isinstance(result, types.CoroutineType):
-                await result
-        except BaseException as exc:
-            _send('returned', cell=cell, error=_format_error(exc))
-            raise
-        else:
-            _send('returned', cell=cell, error=None)
     try:
-        _cells[cell]['root'] = _loop.create_task(evaluate(), context=context)
+        _cells[cell]['root'] = _loop.create_task(_evaluate(cell, source), context=context)
     except BaseException as exc:
         del _cells[cell]
         _send('finished', cell=cell, error=_format_error(exc))
@@ -443,9 +512,11 @@ def _run():
     _loop.add_reader(_inbox_fd, _receive_ready)
     sys.settrace(_trace)
     threading.settrace(_trace)
+    _heartbeat()
     try:
         _loop.run_forever()
     finally:
+        _heartbeat_handle.cancel()
         for state in _cells.values():
             state['cancelled'] = True
         for task in asyncio.all_tasks(_loop):

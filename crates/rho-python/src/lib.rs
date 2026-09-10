@@ -730,6 +730,212 @@ with tempfile.TemporaryDirectory() as directory:
     }
 
     #[tokio::test]
+    async fn blocked_loop_timeout_interrupts_library_code_and_preserves_other_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("busy_library.py"),
+            "def spin():\n    while True:\n        pass\n",
+        )
+        .unwrap();
+        let path = serde_json::to_string(&dir.path().to_string_lossy()).unwrap();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: format!(
+                    r#"
+import sys, time
+sys.path.insert(0, {path})
+import busy_library
+await asyncio.to_thread(lambda: None)
+runtime = asyncio.get_running_loop().run_in_executor.__globals__
+assert runtime['_SYNC_TIMEOUT'] == 120
+assert runtime['_HEARTBEAT_INTERVAL'] == 10
+runtime['_HEARTBEAT_INTERVAL'] = 0.02
+runtime['_heartbeat_handle'].cancel()
+runtime['_heartbeat']()
+released = asyncio.Event()
+worker_released = __import__('threading').Event()
+def worker_body():
+    while not worker_released.wait(0.01):
+        pass
+async def worker():
+    await asyncio.to_thread(worker_body)
+    print('worker survived')
+asyncio.create_task(worker())
+runtime['_SYNC_TIMEOUT'] = 1
+notify('waiting')
+await released.wait()
+print('waiter survived')
+"#
+                ),
+            })
+            .unwrap();
+        let event = next(&mut rx).await;
+        assert!(
+            matches!(&event, Event::Text { text, .. } if text.trim() == "waiting"),
+            "{event:?}"
+        );
+
+        for (cell, source) in [
+            (2, "busy_library.spin()"),
+            (
+                3,
+                "exec(compile('while True:\\n    pass', '<dynamic>', 'exec'))",
+            ),
+            (4, "asyncio.get_running_loop().call_soon(busy_library.spin)"),
+            (
+                5,
+                "async def spin():\n    busy_library.spin()\nasyncio.create_task(spin())",
+            ),
+        ] {
+            session
+                .sender()
+                .send(Input::Execute {
+                    cell,
+                    source: source.into(),
+                })
+                .unwrap();
+            assert!(
+                matches!(next(&mut rx).await, Event::Finished { cell: finished, error: Some(error) }
+                    if finished == cell && error.contains("blocking the event loop for 2 minutes")),
+                "cell {cell} did not time out"
+            );
+        }
+
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 6,
+                source: "assert sys.gettrace() is not None\nreleased.set()\nworker_released.set()"
+                    .into(),
+            })
+            .unwrap();
+        let mut finished = HashSet::new();
+        let mut output = String::new();
+        while finished.len() < 2 {
+            match next(&mut rx).await {
+                Event::Finished { cell, error: None } => {
+                    finished.insert(cell);
+                }
+                Event::Text { text, .. } => output.push_str(&text),
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        assert_eq!(finished, HashSet::from([1, 6]));
+        assert!(output.contains("worker survived"), "{output}");
+        assert!(output.contains("waiter survived"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn blocked_loop_timeout_protects_bookkeeping_and_resets_between_callbacks() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import time
+runtime = asyncio.get_running_loop().run_in_executor.__globals__
+runtime['_SYNC_TIMEOUT'] = 0.1
+runtime['_HEARTBEAT_INTERVAL'] = 0.01
+runtime['_heartbeat_handle'].cancel()
+runtime['_heartbeat']()
+class SlowString:
+    def __str__(self):
+        until = time.monotonic() + 0.2
+        while time.monotonic() < until:
+            pass
+        return 'formatting survived'
+text(SlowString())
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut rx).await, Event::Text { text, .. }
+            if text.trim() == "formatting survived"));
+        // Unwinding/returning to user code after protected synchronous work
+        // may time out, but the runtime's output bookkeeping must stay intact.
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished { cell: 1, .. }
+        ));
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 2,
+                source: r#"
+loop = asyncio.get_running_loop()
+loop.call_soon(time.sleep, 0.2)
+loop.call_soon(notify, 'next callback survived')
+await asyncio.sleep(0.4)
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut rx).await, Event::Text { text, .. }
+            if text.trim() == "next callback survived"));
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished {
+                cell: 2,
+                error: None
+            }
+        ));
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 4,
+                source: r#"
+class InvalidYield:
+    def __repr__(self):
+        until = time.monotonic() + 0.2
+        while time.monotonic() < until:
+            pass
+        return 'invalid-yield'
+class InvalidAwaitable:
+    def __await__(self):
+        yield InvalidYield()
+async def invalid(after_wakeup):
+    if after_wakeup:
+        await asyncio.sleep(0.01)
+    await InvalidAwaitable()
+# Both native Task step and wakeup must protect result bookkeeping.
+results = await asyncio.gather(invalid(False), invalid(True), return_exceptions=True)
+assert all(isinstance(error, RuntimeError) and 'invalid-yield' in str(error)
+           for error in results), results
+"#
+                .into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished {
+                cell: 4,
+                error: None
+            }
+        ));
+        // Idle time and long awaits are not synchronous blocking.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 3,
+                source: "import sys\nawait asyncio.sleep(0.3)\nassert sys.gettrace() is not None"
+                    .into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut rx).await,
+            Event::Finished {
+                cell: 3,
+                error: None
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn cancels_python_loop_without_losing_notebook() {
         let (session, mut rx) = test_session(|| Ok(())).unwrap();
         session

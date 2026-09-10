@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rustpython_vm::function::{ArgIntoFloat, OptionalArg};
 use rustpython_vm::{Interpreter, PyResult, VirtualMachine};
 
 use crate::{CellId, Event, Input, MAX_MESSAGE_BYTES};
@@ -147,10 +148,35 @@ pub(super) fn spawn(
                                 }
                         },
                     );
+                    // Keep the trace hot path to one native call. Only the
+                    // notebook thread consumes this synchronous-work budget.
+                    let owner = std::thread::current().id();
+                    let deadline = Mutex::new(Instant::now());
+                    let watchdog = vm.new_function(
+                        "_sync_watchdog",
+                        move |reset: OptionalArg<ArgIntoFloat>,
+                              vm: &VirtualMachine|
+                              -> PyResult<bool> {
+                            if std::thread::current().id() != owner {
+                                return Ok(false);
+                            }
+                            let mut deadline = deadline.lock().unwrap();
+                            let now = Instant::now();
+                            if let OptionalArg::Present(seconds) = reset {
+                                let duration = Duration::try_from_secs_f64(seconds.into())
+                                    .map_err(|e| vm.new_value_error(e.to_string()))?;
+                                *deadline = now + duration;
+                                Ok(false)
+                            } else {
+                                Ok(now >= *deadline)
+                            }
+                        },
+                    );
                     for (name, function) in [
                         ("_emit", emit),
                         ("_receive", receive),
                         ("_cancel_requested", checkpoint),
+                        ("_sync_watchdog", watchdog),
                     ] {
                         scope
                             .globals
