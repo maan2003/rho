@@ -889,6 +889,21 @@ impl Connection {
     }
 }
 
+/// Whether `spawn` starts the supervisor that dials the target and keeps
+/// reconnecting. A test binary gets none: nothing in a test should reach a
+/// socket, and a supervisor that outlives the test's tokio runtime is
+/// polled while that runtime shuts down, which panics inside tokio's timer
+/// ("A Tokio 1.x context was found, but it is being shutdown").
+///
+/// `cfg!(test)` alone said this wrong: it is true only inside this crate's
+/// own tests, so every downstream test binary, rho-gui's suite among them,
+/// got a live supervisor dialing a socket that is not there.
+/// `test-support` is the feature those binaries turn on, so it is the one
+/// that answers here.
+pub fn supervises() -> bool {
+    !cfg!(test) && !cfg!(feature = "test-support")
+}
+
 /// Attaches one daemon. Its events join `events`, tagged with `host`, so
 /// several daemons feed the workspace through a single ordered stream.
 pub fn spawn(
@@ -903,7 +918,7 @@ pub fn spawn(
     let pending_command = Arc::new(Mutex::new(None));
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
-    let io_task = if cfg!(test) {
+    let io_task = if !supervises() {
         Tokio::spawn(cx, async {})
     } else {
         Tokio::spawn(

@@ -1038,6 +1038,23 @@ fn next_frame(cx: &mut TestAppContext, workspace: WindowHandle<Workspace>) {
     cx.run_until_parked();
 }
 
+/// No test dials anything. Every test workspace names a host, and
+/// `connection::spawn` read `cfg!(test)` to decide whether to start the
+/// supervisor behind it, true only inside rho-hosts' own tests, so this
+/// binary got a live supervisor dialing a socket that is not there and
+/// reconnecting on a timer. When a test ended, the App took its tokio
+/// runtime with it, and a supervisor still being polled panicked inside
+/// tokio's timer on a worker thread: "A Tokio 1.x context was found, but
+/// it is being shutdown". Under load the suite was slow enough for that
+/// window to open, which is why it was seen once and not again.
+#[test]
+fn a_test_host_connection_has_nothing_dialing_behind_it() {
+    assert!(
+        !rho_hosts::connection::supervises(),
+        "a test binary starts no host supervisor"
+    );
+}
+
 pub(super) fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     story::reset();
     cx.update(init_test_app);
