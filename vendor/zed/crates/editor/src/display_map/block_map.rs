@@ -894,10 +894,22 @@ impl BlockMap {
         // sits on whichever row the wrap put it on - past the widened end
         // if the end is in the middle of a line, which leaves the rebuilt
         // transforms a row longer than the text they describe.
-        let end_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row();
-        let end_row = wrap_snapshot
-            .next_row_boundary(WrapPoint::new(end_row, 0))
-            .unwrap_or(wrap_snapshot.max_point().row() + WrapRow(1));
+        //
+        // `next_row_boundary` is the wrong instrument for it: it reports the
+        // next *transform* boundary that begins a line, and an isomorphic
+        // transform covers every line that did not need wrapping, so from a
+        // row inside one it answers None however much document follows. The
+        // fallback then ran the elision to the last row, every elision
+        // reached every edit, and the widening below took each keystroke to
+        // the whole document. The line after the elision's last line is the
+        // same boundary and the tree finds it in log time.
+        let end_row = if end.row + 1 > buffer.max_point().row {
+            wrap_snapshot.max_point().row() + WrapRow(1)
+        } else {
+            wrap_snapshot
+                .make_wrap_point(Point::new(end.row + 1, 0), Bias::Left)
+                .row()
+        };
         Some(start_row..end_row)
     }
 
@@ -3854,6 +3866,70 @@ mod tests {
                 (3..4, BlockId::ExcerptBoundary(excerpt_start_anchors[1])), // path, header
                 (6..7, BlockId::ExcerptBoundary(excerpt_start_anchors[2])), // path, header
             ]
+        );
+    }
+
+    /// An elision covers its own lines and stops there, on a document whose
+    /// lines soft-wrap.
+    ///
+    /// The rows it names are what `sync` widens an edit to, so an elision
+    /// that runs to the last row makes every edit that touches it rebuild
+    /// the document. Reading it from a wrapped document is the whole point:
+    /// the end used to come from `next_row_boundary`, which finds the next
+    /// transform boundary rather than the next line, and inside a wrapped
+    /// run there is no such boundary to find.
+    #[gpui::test]
+    fn an_elision_ends_at_its_own_last_line_on_a_wrapped_document(cx: &mut gpui::TestAppContext) {
+        cx.update(init_test);
+
+        let text = "one two\nthree four\nfive six\nseven eight";
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(text, cx));
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot.clone());
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (_tab_map, tab_snapshot) = TabMap::new(fold_snapshot, 1.try_into().unwrap());
+        let font = test_font();
+        let font_size = px(14.);
+        let font_id = cx.update(|cx| cx.text_system().resolve_font(&font));
+        let wrap_width = cx.update(|cx| {
+            "one ".chars().fold(px(0.), |width, c| {
+                width
+                    + cx.text_system()
+                        .advance(font_id, font_size, c)
+                        .unwrap()
+                        .width
+            })
+        });
+        let (_wrap_map, wraps_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, font, font_size, Some(wrap_width), cx));
+        let mut block_map = BlockMap::new(wraps_snapshot.clone(), 1, 1);
+
+        let mut writer = block_map.write(wraps_snapshot.clone(), Default::default(), None);
+        writer.insert_elisions(vec![DisplayElisionProperties {
+            range: buffer_snapshot.anchor_before(Point::new(0, 0))
+                ..buffer_snapshot.anchor_after(Point::new(0, 7)),
+            tail_rows: 0,
+            height: Some(1),
+            style: BlockStyle::Flex,
+            render: Arc::new(|_| div().into_any()),
+            priority: 0,
+            type_tag: None,
+        }]);
+        drop(writer);
+
+        let elision = block_map.display_elisions[0].clone();
+        let rows = block_map
+            .elision_wrap_rows(&elision, &wraps_snapshot)
+            .expect("the elision covers rows");
+        let first_line_rows = wraps_snapshot
+            .make_wrap_point(Point::new(1, 0), Bias::Left)
+            .row();
+        assert_eq!(rows.start, WrapRow(0));
+        assert_eq!(rows.end, first_line_rows);
+        assert!(
+            rows.end < wraps_snapshot.max_point().row(),
+            "the elision covers the document, not one line: {rows:?} of {:?}",
+            wraps_snapshot.max_point().row()
         );
     }
 
