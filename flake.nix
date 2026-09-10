@@ -161,6 +161,9 @@
           paths = buildPaths;
         };
 
+        pythonPackages = pkgs.python3.withPackages (ps: [ ps.pyyaml ps.httpx ]);
+        pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
+
         guiNativeBuildInputs = [
           pkgs.clang
           pkgs.cmake
@@ -206,6 +209,7 @@
               nativeBuildInputs = guiNativeBuildInputs;
               buildInputs = guiBuildInputs;
               env.RUSTDOCFLAGS = "-D warnings";
+              env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
               env.RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
@@ -400,6 +404,7 @@
           ];
           NEXTEST_SHOW_PROGRESS = "none";
           RHO_LOG = "rho_agent=debug,info";
+          RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
           RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
           RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
           RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";

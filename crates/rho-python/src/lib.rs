@@ -1,6 +1,6 @@
 //! In-process Python notebook with synchronous Rust host callbacks.
 //!
-//! RustPython objects stay on the interpreter thread. Each execution carries a
+//! RustPython objects stay inside the interpreter. Each execution carries a
 //! shared Rust host handle; callbacks commit host state before Python
 //! continues. Asynchronous completions wake the interpreter, which resolves
 //! Python futures. This is ordinary, unsandboxed Python. A dedicated thread has
@@ -288,6 +288,339 @@ mod tests {
             .await
             .expect("runtime timed out")
             .expect("runtime stopped")
+    }
+
+    #[tokio::test]
+    async fn preinstalled_tls_provider_is_supported() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: "import ssl\nassert ssl.create_default_context().check_hostname".into(),
+            })
+            .unwrap();
+        loop {
+            match next(&mut rx).await {
+                Event::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                Event::Started { .. } | Event::Returned { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn urllib_and_httpx_verify_https_certificates() {
+        use std::io::{Read as _, Write as _};
+
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("ca.pem");
+        std::fs::write(&ca, certificate.cert.pem()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut requests = 0;
+            while requests < 4 && std::time::Instant::now() < deadline {
+                let (socket, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                requests += 1;
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let connection = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                let mut request = [0; 4096];
+                // The untrusted-client case intentionally fails its handshake.
+                if stream.read(&mut request).is_ok() {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+            assert_eq!(requests, 4);
+        });
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: format!(
+                    r#"
+import ssl, urllib.request, httpx
+url = 'https://localhost:{port}/'
+context = ssl.create_default_context(cafile={ca})
+assert urllib.request.urlopen(url, context=context, timeout=5).read() == b'ok'
+with httpx.Client(verify=context, trust_env=False) as client:
+    assert client.get(url).text == 'ok'
+async with httpx.AsyncClient(verify=context, trust_env=False) as client:
+    assert (await client.get(url)).text == 'ok'
+try:
+    urllib.request.urlopen(url, timeout=5)
+except urllib.error.URLError as error:
+    assert isinstance(error.reason, ssl.SSLCertVerificationError), repr(error.reason)
+else:
+    raise AssertionError('untrusted certificate accepted')
+"#,
+                    ca = serde_json::to_string(&ca.to_string_lossy()).unwrap()
+                ),
+            })
+            .unwrap();
+        loop {
+            match next(&mut rx).await {
+                Event::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                Event::Started { .. } | Event::Returned { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_cannot_consume_cell_cancellation_when_inbox_is_full() {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: format!(
+                    r#"
+import threading, sys, time
+sys.settrace(None)
+checkpoint = asyncio.get_running_loop().run_in_executor.__globals__['_cancel_requested']
+# Library code can inspect the checkpoint without user-bytecode tracing
+# raising before we can observe whether the read consumed the flag.
+exec(compile("def worker():\n    notify('worker ready')\n    while not checkpoint(1, False):\n        time.sleep(0.01)\n    assert checkpoint(1, False)\n    notify('worker stopped')\n", '<cancel-probe>', 'exec'))
+threading.Thread(target=worker).start()
+while not Path({release}).exists():
+    time.sleep(0.01)
+await asyncio.Event().wait()
+"#,
+                    release = serde_json::to_string(&release.to_string_lossy()).unwrap()
+                ),
+            })
+            .unwrap();
+        assert!(matches!(next(&mut rx).await,
+            Event::Text { text, .. } if text.contains("worker ready")));
+        let sender = session.session.sender();
+        while sender
+            .tx
+            .try_send(Input::Resolve {
+                request: u64::MAX,
+                value: Value::Null,
+                error: None,
+            })
+            .is_ok()
+        {}
+        sender.cancel(1);
+        loop {
+            if let Event::Text { text, .. } = next(&mut rx).await
+                && text.contains("worker stopped")
+            {
+                break;
+            }
+        }
+        let cancellation_retained = sender.cancelled.lock().unwrap().contains(&1);
+        // Always release the notebook, including when testing a broken checkpoint.
+        std::fs::write(release, "").unwrap();
+        assert!(cancellation_retained);
+        loop {
+            if let Event::Finished { error, .. } = next(&mut rx).await {
+                assert!(error.unwrap().contains("CancelledError"));
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_already_completed_executor_bookkeeping() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import concurrent.futures, contextvars
+loop = asyncio.get_running_loop()
+class ImmediateExecutor(concurrent.futures.Executor):
+    def submit(self, function, *args):
+        result = concurrent.futures.Future()
+        result.set_result(function(*args))
+        return result
+# Arrange inbox cancellation immediately before the completed worker's
+# cleanup callback, without depending on an OS-thread scheduling race.
+runtime = loop.run_in_executor.__globals__
+receive = runtime['_receive']
+def cancellation_message():
+    runtime['_receive'] = receive
+    return '[{"kind":"cancel","cell":1}]'
+runtime['_receive'] = cancellation_message
+loop.call_soon(runtime['_receive_ready'], context=contextvars.Context())
+loop.run_in_executor(ImmediateExecutor(), lambda: None)
+await asyncio.sleep(60)
+"#
+                .into(),
+            })
+            .unwrap();
+        loop {
+            match next(&mut rx).await {
+                Event::Finished { error, .. } => {
+                    assert!(error.unwrap().contains("CancelledError"));
+                    break;
+                }
+                Event::Started { .. } | Event::Returned { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn threads_and_cancelled_executor_awaits_keep_their_cell_alive() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import threading, time, contextvars
+def background():
+    time.sleep(0.1)
+    print('raw thread output')
+threading.Thread(target=background).start()
+user_context = contextvars.ContextVar('user_context', default='default')
+user_context.set('caller')
+def direct_executor_work():
+    assert user_context.get() == 'default'
+    print('direct executor output')
+await asyncio.get_running_loop().run_in_executor(None, direct_executor_work)
+def executor_work():
+    time.sleep(0.2)
+    print('executor output after cancelled await')
+task = asyncio.create_task(asyncio.to_thread(executor_work))
+await asyncio.sleep(0.05)
+task.cancel()
+try:
+    await task
+except asyncio.CancelledError:
+    pass
+"#
+                .into(),
+            })
+            .unwrap();
+        let mut output = String::new();
+        loop {
+            match next(&mut rx).await {
+                Event::Text { cell, text, .. } => {
+                    assert_eq!(cell, 1);
+                    output.push_str(&text);
+                }
+                Event::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                Event::Started { .. } | Event::Returned { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(output.contains("raw thread output"), "{output}");
+        assert!(output.contains("direct executor output"), "{output}");
+        assert!(
+            output.contains("executor output after cancelled await"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standard_libraries_and_bundled_packages_work() {
+        let (session, mut rx) = test_session(|| Ok(())).unwrap();
+        session
+            .sender()
+            .send(Input::Execute {
+                cell: 1,
+                source: r#"
+import ssl, sqlite3, yaml, httpx, pickle, threading, time
+context = ssl.create_default_context()
+assert context.verify_mode == ssl.CERT_REQUIRED
+assert context.check_hostname
+assert context.cert_store_stats()['x509'] > 0
+with sqlite3.connect(':memory:') as database:
+    database.execute('create table values_ (value text)')
+    database.execute('insert into values_ values (?)', ('雪',))
+    assert database.execute('select value from values_').fetchone() == ('雪',)
+assert yaml.safe_load('items: [one, two]') == {'items': ['one', 'two']}
+assert yaml.safe_load(yaml.safe_dump({'snow': '雪'})) == {'snow': '雪'}
+with httpx.Client(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={'path': request.url.path}))) as client:
+    assert client.get('https://test.invalid/example').json() == {'path': '/example'}
+async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json={'ok': True}))) as client:
+    assert (await client.get('https://test.invalid')).json() == {'ok': True}
+class Example:
+    pass
+assert isinstance(pickle.loads(pickle.dumps(Example())), Example)
+main_id = threading.get_ident()
+worker_id = await asyncio.to_thread(threading.get_ident)
+assert main_id != worker_id
+events = []
+async def tick():
+    await asyncio.sleep(0.02)
+    events.append('tick')
+async def work():
+    await asyncio.to_thread(time.sleep, 0.2)
+    events.append('work')
+await asyncio.gather(tick(), work())
+assert events == ['tick', 'work'], events
+"#
+                .into(),
+            })
+            .unwrap();
+        loop {
+            match next(&mut rx).await {
+                Event::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                Event::Started { .. } | Event::Returned { .. } => {}
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

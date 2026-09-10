@@ -127,6 +127,7 @@ pub fn python_instructions(specs: &[ToolSpec]) -> String {
 It runs a persistent Python notebook with top-level await. Globals are shared;
 live cells interleave at await. Use shell commands to inspect files and Python
 to manipulate their data.
+The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary imports.
 
 Work registers immediately; output arrives automatically. Put independent calls in the same cell to run them concurrently; await only when later Python statements depend on completion.
 - command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are optional. Awaiting it returns completion metadata (id, exit_code), not stdout.

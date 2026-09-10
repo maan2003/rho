@@ -1225,7 +1225,9 @@ impl BlockMap {
                 // because a block is rebuilt as a whole or not at all.
                 if cursor.end() > old_end
                     && *cursor.start() <= old_end
-                    && cursor.item().is_some_and(|transform| transform.block.is_none())
+                    && cursor
+                        .item()
+                        .is_some_and(|transform| transform.block.is_none())
                 {
                     let boundary = cursor.end();
                     match edits.peek() {

@@ -37,6 +37,7 @@ mod lazy;
 pub mod live;
 pub mod mirror;
 pub mod multi_agent_tools;
+mod papercut;
 pub mod pool;
 pub mod presentation;
 pub mod prompt;

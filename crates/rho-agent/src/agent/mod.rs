@@ -1953,6 +1953,13 @@ fn surface(
         // A rendering has no provider behind it; the spec is what it is for.
         None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
     });
+    others.push(match pool.upgrade() {
+        Some(pool) => Arc::new(crate::papercut::PapercutTool {
+            db: pool.db().clone(),
+            agent_id,
+        }),
+        None => Arc::new(SpecOnly(crate::papercut::PapercutTool::spec())),
+    });
     let code_mode = (cfg!(feature = "code-mode") && profile.code_mode).then_some(
         if matches!(
             role,

@@ -7,11 +7,17 @@ import pathlib
 import sys
 import types
 import inspect
+import threading
+import concurrent.futures
+
+sys.path.insert(0, _site_packages)
+sys.path.insert(0, '')
 
 _cell = contextvars.ContextVar('rho_cell')
 _requests = {}
 _cells = {}
 _sequence = 0
+_notebook_thread = threading.current_thread()
 
 
 def _format_error(exc):
@@ -27,7 +33,9 @@ def _format_error(exc):
 
 def _trace(frame, event, arg):
     # Interrupt user bytecode, never asyncio's task/selector bookkeeping.
-    if frame.f_code.co_filename.startswith('<rho-cell-') and _cancel_requested(_cell.get(0)):
+    if (frame.f_code.co_filename.startswith('<rho-cell-')
+            and (_cells.get(_cell.get(None), {}).get('cancelled', False)
+                 or _cancel_requested(_cell.get(0), False))):
         raise asyncio.CancelledError()
     return _trace
 
@@ -53,6 +61,34 @@ def _task_factory(loop, coroutine, context=None, **kwargs):
 
 
 class _NotebookLoop(asyncio.SelectorEventLoop):
+    def run_in_executor(self, executor, func, *args):
+        self._check_closed()
+        if executor is None:
+            self._check_default_executor()
+            if self._default_executor is None:
+                self._default_executor = concurrent.futures.ThreadPoolExecutor(
+                    thread_name_prefix='asyncio')
+            executor = self._default_executor
+        cell = _cell.get(None)
+        state = _cells.get(cell)
+        if state is not None:
+            state['workers'].add(worker := object())
+        try:
+            # Pool threads belong to the executor, not the cell that creates them.
+            if isinstance(executor, concurrent.futures.ThreadPoolExecutor):
+                future = contextvars.Context().run(
+                    executor.submit, _executor_call, cell, func, args)
+            else:
+                future = contextvars.Context().run(executor.submit, func, *args)
+        except BaseException:
+            if state is not None:
+                state['workers'].remove(worker)
+            raise
+        if state is not None:
+            future.add_done_callback(
+                lambda _: self.call_soon_threadsafe(_worker_done, cell, worker, context=contextvars.Context()))
+        return asyncio.wrap_future(future, loop=self)
+
     # The stdlib owns scheduling, futures, timers and I/O. This hook only
     # determines when the work attributed to a notebook cell has finished.
     def _run_once(self):
@@ -63,7 +99,7 @@ class _NotebookLoop(asyncio.SelectorEventLoop):
             active.update(handle._context.get(_cell) for handle in key.data
                           if handle is not None and not handle.cancelled())
         for cell, state in list(_cells.items()):
-            if state['tasks'] or cell in active:
+            if state['tasks'] or state['workers'] or cell in active:
                 continue
             root = state['root']
             if not root.done():
@@ -96,6 +132,57 @@ _loop.set_task_factory(_task_factory)
 _loop.set_exception_handler(_loop_error)
 
 
+def _executor_call(cell, func, args):
+    token = _cell.set(cell)
+    try:
+        return func(*args)
+    finally:
+        _cell.reset(token)
+
+
+def _worker_done(cell, worker):
+    _cells[cell]['workers'].remove(worker)
+
+
+_thread_start = threading.Thread.start
+_thread_bootstrap = threading.Thread._bootstrap_inner
+
+
+def _start_thread(thread, *args, **kwargs):
+    if not thread._initialized or thread._started.is_set():
+        return _thread_start(thread, *args, **kwargs)
+    cell = _cell.get(None)
+    state = _cells.get(cell)
+    if state is not None:
+        state['workers'].add(thread)
+        thread._rho_cell = cell
+        # Preserve normal explicit Thread(context=...) behavior.
+        if thread._context is None:
+            thread._context = contextvars.copy_context()
+    try:
+        return _thread_start(thread, *args, **kwargs)
+    except BaseException:
+        if state is not None:
+            state['workers'].remove(thread)
+            del thread._rho_cell
+        raise
+
+
+def _bootstrap_thread(thread):
+    cell = getattr(thread, '_rho_cell', None)
+    token = _cell.set(cell)
+    try:
+        return _thread_bootstrap(thread)
+    finally:
+        _cell.reset(token)
+        if cell is not None:
+            _loop.call_soon_threadsafe(_worker_done, cell, thread, context=contextvars.Context())
+
+
+threading.Thread.start = _start_thread
+threading.Thread._bootstrap_inner = _bootstrap_thread
+
+
 def _send(kind, **fields):
     _emit(json.dumps(dict(kind=kind, **fields)))
 
@@ -107,6 +194,8 @@ def _budget(value):
 
 
 def _request(name, arguments):
+    if threading.current_thread() is not _notebook_thread:
+        raise RuntimeError('Call host functions from the notebook event loop, not a worker thread')
     global _sequence
     if len(_requests) >= 1024:
         raise RuntimeError('Too many pending host requests')
@@ -273,6 +362,10 @@ def _configure_tools(specs):
     sys.modules['agents'] = agents
 
 
+_main = types.ModuleType('__main__')
+_main.__dict__.update(_namespace)
+_namespace = _main.__dict__
+sys.modules['__main__'] = _main
 _configure_tools(json.loads(_tool_config))
 
 
@@ -280,7 +373,7 @@ def _execute(cell, source):
     if len(_cells) >= 128 or cell in _cells:
         _send('finished', cell=cell, error='Notebook live cell limit reached or duplicate cell')
         return
-    _cells[cell] = dict(root=None, tasks=set(), errors=[], error=None, cancelled=False)
+    _cells[cell] = dict(root=None, tasks=set(), errors=[], error=None, cancelled=False, workers=set())
     context = contextvars.copy_context()
     context.run(_cell.set, cell)
     async def evaluate():
@@ -323,7 +416,7 @@ def _receive_ready():
                     future.set_result(message.get('value'))
         elif kind == 'cancel':
             cell = message['cell']
-            _cancel_requested(cell)
+            _cancel_requested(cell, True)
             state = _cells.get(cell)
             if state is None or state['cancelled']:
                 continue
@@ -349,8 +442,22 @@ def _receive_ready():
 def _run():
     _loop.add_reader(_inbox_fd, _receive_ready)
     sys.settrace(_trace)
+    threading.settrace(_trace)
     try:
         _loop.run_forever()
     finally:
+        for state in _cells.values():
+            state['cancelled'] = True
+        for task in asyncio.all_tasks(_loop):
+            task.cancel()
+        async def shutdown():
+            await asyncio.gather(*asyncio.all_tasks(_loop) - {asyncio.current_task()},
+                                 return_exceptions=True)
+            await _loop.shutdown_asyncgens()
+            await _loop.shutdown_default_executor()
+            while any(state['workers'] for state in _cells.values()):
+                await asyncio.sleep(0.01)
+        _loop.run_until_complete(shutdown())
         sys.settrace(None)
+        threading.settrace(None)
         _loop.close()

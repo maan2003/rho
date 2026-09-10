@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use rustpython_vm::{Interpreter, PyResult, VirtualMachine};
@@ -17,6 +17,20 @@ pub(super) fn spawn(
     wake: Arc<OwnedFd>,
     setup: impl FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
 ) -> Result<(), String> {
+    static TLS: OnceLock<Result<(), String>> = OnceLock::new();
+    TLS.get_or_init(|| {
+        use rustpython_stdlib::ssl::providers::CryptoExt;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        CryptoExt::set_ext(CryptoExt {
+            all_cipher_suites: None,
+            default_cipher_suites: None,
+            all_kx_groups: None,
+            any_supported_key: None,
+            ticketer: rustls::crypto::aws_lc_rs::Ticketer::new,
+        })
+        .map_err(|error| format!("initialize Python TLS: {error}"))
+    })
+    .clone()?;
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("rho-python".into())
@@ -121,9 +135,18 @@ pub(super) fn spawn(
                                 .map_err(|e| vm.new_runtime_error(e.to_string()))
                         },
                     );
-                    let checkpoint = vm.new_function("_cancel_requested", move |cell: u64| {
-                        shutdown.load(Ordering::Acquire) || cancelled.lock().unwrap().remove(&cell)
-                    });
+                    let checkpoint = vm.new_function(
+                        "_cancel_requested",
+                        move |cell: u64, acknowledge: bool| {
+                            let mut cancelled = cancelled.lock().unwrap();
+                            shutdown.load(Ordering::Acquire)
+                                || if acknowledge {
+                                    cancelled.remove(&cell)
+                                } else {
+                                    cancelled.contains(&cell)
+                                }
+                        },
+                    );
                     for (name, function) in [
                         ("_emit", emit),
                         ("_receive", receive),
@@ -137,6 +160,14 @@ pub(super) fn spawn(
                     scope
                         .globals
                         .set_item("_tool_config", vm.ctx.new_str(tools.to_string()).into(), vm)
+                        .map_err(|e| format_exception(vm, e))?;
+                    scope
+                        .globals
+                        .set_item(
+                            "_site_packages",
+                            vm.ctx.new_str(env!("RHO_PYTHON_SITE_PACKAGES")).into(),
+                            vm,
+                        )
                         .map_err(|e| format_exception(vm, e))?;
                     let source = include_str!("notebook.py");
                     let code = vm

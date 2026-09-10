@@ -695,6 +695,17 @@ is truncated before the closing fence. Discovery follows symlinks with cycle
 detection for roots/directories/files. Skill files are prompt input only; they
 do not restrict filesystem access or grant tools.
 
+## Papercut reports
+
+The native `papercut` tool appends model-authored reports to a separate local
+`papercuts` table, alongside the reporting agent id and timestamp. Descriptions
+must be nonempty and at most 16 KiB; there is no aggregate quota or automatic
+retention policy. Reports are opaque data, not instructions, and trigger no
+notification, external submission, or background work. Success is returned only
+after the database commit. Cancellation before acquiring the write lock leaves
+no report; once writing starts, the short transaction completes atomically.
+Tests cover validation, concurrent appends, and reopening the database.
+
 ## Python code mode (`rho-python`, `rho-agent-tools`)
 
 `eng-high` and `advisor-high` select Python by default. Other code-mode roles retain the
@@ -726,6 +737,13 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   wake its selector through an eventfd; cell context follows tasks and callbacks.
   Asyncio networking and subprocesses have ordinary unsandboxed Python access,
   not the managed lifecycle of `command()`. Native extension wheels are unsupported.
+  Real Python threads are enabled. Notebook-created threads inherit cell context
+  unless the caller supplies an explicit context; executor workers belong to
+  the pool, while each submitted job keeps its cell alive until actual completion.
+  Cancelling an asyncio future does not imply its thread has stopped. Host-function
+  registration must run on the notebook event loop, not a worker thread.
+  PyYAML and HTTPX are supplied from the Nix-pinned package closure; Rustls provides
+  TLS and SQLite is compiled into the runtime.
   Python can exhaust memory, disable tracing, catch cancellation, or block in
   native computation. Cancellation of Python is best-effort; Rust command and
   nested-tool cancellation do not depend on Python cooperation.

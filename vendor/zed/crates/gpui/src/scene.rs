@@ -85,8 +85,7 @@ pub struct Scene {
 /// `test` and `test-support` builds, which meant a harness measuring a
 /// frame's wall clock measured mostly this.
 #[cfg(any(test, feature = "test-support"))]
-static SCENE_RECORDERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SCENE_RECORDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Counts one recorder as attached. Paired with [`scene_recorder_detached`].
 #[cfg(any(test, feature = "test-support"))]
