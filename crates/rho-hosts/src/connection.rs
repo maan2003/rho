@@ -20,6 +20,35 @@ use rho_ui_proto::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+/// Set when the client is going away, before its tokio runtime is dropped.
+///
+/// A supervisor waiting out a reconnect delay is a task inside
+/// `tokio::time::sleep`, and a sleep still being polled when its runtime
+/// shuts down panics in tokio's timer ("A Tokio 1.x context was found, but
+/// it is being shutdown"). The supervisor has to end before the runtime
+/// does, so quit says so here and every supervisor wakes and stops.
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CLOSED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ends every host supervisor. Called from the app's quit hook, which runs
+/// while the runtime is still there; nothing waits for the supervisors,
+/// they are told and quit carries on.
+pub fn close() {
+    CLOSING.store(true, std::sync::atomic::Ordering::SeqCst);
+    CLOSED.notify_waiters();
+}
+
+fn closing() -> bool {
+    CLOSING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Puts the flag back, for a test that has just closed the world. Nothing
+/// reopens a real client: it is quitting.
+#[cfg(test)]
+fn reopen() {
+    CLOSING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -954,6 +983,9 @@ async fn supervise(
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut reconnecting = false;
     loop {
+        if closing() {
+            break;
+        }
         let mut connected = false;
         let result = run(
             target.clone(),
@@ -985,7 +1017,17 @@ async fn supervise(
         {
             break;
         }
-        tokio::time::sleep(delay).await;
+        // The waiter is made before the flag is read: a `close` between the
+        // two would otherwise notify nobody and leave this sleeping into
+        // the runtime's shutdown.
+        let closed = CLOSED.notified();
+        if closing() {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = closed => break,
+        }
         delay = next_reconnect_delay(delay);
         reconnecting = true;
     }
@@ -1814,6 +1856,76 @@ fn is_safe_remote_executable(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
         })
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A sink that takes everything and never says it is closed, so the
+    /// supervisor's own "nobody is listening" exit cannot be what ends the
+    /// loop here.
+    struct Listening;
+
+    impl crate::HostSink for Listening {
+        fn send(&self, _event: crate::HostEvent) -> Result<(), crate::SinkClosed> {
+            Ok(())
+        }
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+    }
+
+    /// Quit has to end the supervisor while the runtime is still there.
+    /// A supervisor waiting out its reconnect delay is inside
+    /// `tokio::time::sleep`, and a sleep polled after its runtime starts
+    /// shutting down panics in tokio's timer, which is what a real quit was
+    /// doing on a worker thread.
+    ///
+    /// The dial fails at once (nothing listens on the path), so the loop is
+    /// in the delay within a few milliseconds; `close` has to bring it out
+    /// well before the 500ms that delay would otherwise take.
+    #[test]
+    fn close_ends_a_supervisor_waiting_out_its_reconnect_delay() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("nothing.sock");
+
+        let events = EventSink {
+            host: crate::HostId(0),
+            events: Arc::new(Listening),
+        };
+        let (_command_tx, command_rx) = futures_mpsc::unbounded();
+        let supervisor = supervise(
+            crate::AttachTarget::Unix(socket),
+            events,
+            Arc::new(tokio::sync::Mutex::new(command_rx)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(ShellControlRequests::default())),
+        );
+
+        let ended = runtime.block_on(async {
+            let task = tokio::spawn(supervisor);
+            // Long enough for the failed dial and the events that follow it,
+            // short enough to be inside the 500ms delay.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            close();
+            tokio::time::timeout(std::time::Duration::from_millis(200), task).await
+        });
+        reopen();
+
+        assert!(
+            ended.is_ok(),
+            "the supervisor ends when quit closes it, rather than sleeping on"
+        );
+    }
 }
 
 #[cfg(test)]

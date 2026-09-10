@@ -14895,6 +14895,7 @@ dependencies = [
  "rho-rtc",
  "rho-ui-proto",
  "senax-encoder",
+ "tempfile",
  "tokio",
  "tracing",
 ]

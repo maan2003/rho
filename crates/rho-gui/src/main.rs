@@ -370,6 +370,10 @@ fn run() -> Result<()> {
                     finish_profiling(profiler);
                 }
                 rho_gui::telemetry::shutdown_passive_cpu_profile();
+                // Before the tokio runtime goes with the app: a host
+                // supervisor still waiting out a reconnect delay would be
+                // polled into the runtime's shutdown and panic there.
+                rho_hosts::connection::close();
                 rho_journal::flush();
                 // Closing rather than flushing: a mirror left open is a
                 // file redb finds unclean, and the next start rebuilds its
