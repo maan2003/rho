@@ -1665,7 +1665,6 @@ impl Workspace {
             self.send_to_host(host, message);
         }
         self.sync_tree_delta(host, &delta, window, cx);
-        self.carry_over_captures(host, window, cx);
         // Both halves are here only when the cells are: the seed of rho's
         // Slack cursors from the store's old ones runs at the first sync
         // that has a session, once ever, and is a marker read afterwards.

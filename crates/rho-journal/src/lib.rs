@@ -650,8 +650,11 @@ pub enum Event {
         method: CreateMethod,
         at_root: bool,
     },
-    /// One-shot on the first run of the build that deleted the inbox: the
-    /// capture items the user had written became notes at the root.
+    /// Retired: the carry-over it recorded ran once, on the first run of
+    /// the build that deleted the inbox, and that build is behind every
+    /// device. The variant stays because a journal already on disk decodes
+    /// by variant order, and taking one out of the middle would misread
+    /// every file that has one.
     CaptureCarryover {
         notes: u32,
         unreadable: u32,
