@@ -11,7 +11,7 @@ use editor::Editor;
 use gpui::{AppContext as _, TestAppContext};
 use rho_agents::transcript::elisions::{ElisionSpec, ElisionState, ElisionSync};
 
-use super::{history_elisions, init_test_app};
+use super::init_test_app;
 
 /// An elision belongs to its turn, not to its place in the list.
 #[gpui::test]
