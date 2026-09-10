@@ -181,6 +181,76 @@ fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
     copy_snapshot_from(&source, &paths.daemon_lock())
 }
 
+/// The name every debug copy carries, so a stray one says who made it.
+const SNAPSHOT_PREFIX: &str = "rho-debug-snapshot-";
+
+/// Where a copy of the store goes: beside the store itself, never the
+/// system temp directory. The copy is as big as the store, and
+/// `std::env::temp_dir()` may be a different and smaller disk; beside
+/// the store it is on a volume that already holds something that size.
+fn snapshot_dir(source: &Path) -> anyhow::Result<PathBuf> {
+    let dir = source
+        .parent()
+        .context("the rho db path has no directory")?
+        .join("debug-snapshots");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create debug snapshot directory {}", dir.display()))?;
+    report_leftover_snapshots(&dir);
+    Ok(dir)
+}
+
+/// Copies an earlier run left behind. `TempDir` removes its own on the
+/// way out, panic included, but nothing runs when the process is killed.
+/// One that is still here is a dead item, and a dead item is a question
+/// rather than a deletion: this names it and goes on, and the user is the
+/// one who decides it is rubbish. A copy another run is reading right now
+/// is named too, which is the same answer said early.
+fn leftover_snapshots(dir: &Path) -> Vec<(PathBuf, std::time::Duration)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut leftovers = Vec::new();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SNAPSHOT_PREFIX)
+        {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|data| data.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .unwrap_or_default();
+        leftovers.push((entry.path(), age));
+    }
+    leftovers.sort();
+    leftovers
+}
+
+fn report_leftover_snapshots(dir: &Path) {
+    for (path, age) in leftover_snapshots(dir) {
+        eprintln!(
+            "a debug db copy from an earlier run is still here: {} ({}); it is yours to delete",
+            path.display(),
+            describe_age(age)
+        );
+    }
+}
+
+fn describe_age(age: std::time::Duration) -> String {
+    let hours = age.as_secs_f64() / 3600.0;
+    if hours < 1.0 {
+        format!("{:.0} minutes old", age.as_secs_f64() / 60.0)
+    } else if hours < 48.0 {
+        format!("{hours:.1} hours old")
+    } else {
+        format!("{:.1} days old", hours / 24.0)
+    }
+}
+
 fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snapshot> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -199,7 +269,10 @@ fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snaps
         }
         return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
     }
-    let temp = tempfile::tempdir().context("create debug db snapshot tempdir")?;
+    let temp = tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempdir_in(snapshot_dir(source)?)
+        .context("create debug db snapshot directory")?;
     let snapshot = temp.path().join("rho.redb");
     std::fs::copy(source, &snapshot)
         .with_context(|| format!("copy rho db snapshot from {}", source.display()))?;
@@ -589,5 +662,59 @@ mod snapshot_tests {
         drop(lock);
         let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
         drop(RhoDb::open(&snapshot.path));
+    }
+
+    /// The copy lands beside the store, which is what keeps it off the
+    /// system temp directory and its own disk. (This test's own store is
+    /// under a temp directory, so "beside the store" is the whole of what
+    /// can be asserted here.)
+    #[test]
+    fn the_copy_is_taken_beside_the_store_and_is_gone_when_the_run_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rho.redb");
+        drop(RhoDb::open(&source));
+        let lock_path = directory.path().join("daemon.lock");
+
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        let held = snapshot.path.clone();
+        assert!(
+            held.starts_with(directory.path().join("debug-snapshots")),
+            "the copy is beside the store: {}",
+            held.display()
+        );
+
+        drop(snapshot);
+        assert!(
+            !held.exists(),
+            "the copy goes when the run that took it does"
+        );
+    }
+
+    /// What a killed run left behind is named, not removed. A copy the
+    /// tool did not take away is a dead item, and a dead item is the
+    /// user's to decide about.
+    #[test]
+    fn a_copy_from_an_earlier_run_is_named_and_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("debug-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let killed = dir.join(format!("{SNAPSHOT_PREFIX}killed"));
+        std::fs::create_dir(&killed).unwrap();
+        std::fs::write(killed.join("rho.redb"), b"x").unwrap();
+        let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        std::fs::File::open(&killed)
+            .unwrap()
+            .set_modified(two_days)
+            .unwrap();
+
+        let leftovers = leftover_snapshots(&dir);
+
+        assert_eq!(
+            leftovers.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![&killed],
+            "the copy is named"
+        );
+        assert!(leftovers[0].1.as_secs() >= 47 * 60 * 60, "with its age");
+        assert!(killed.exists(), "and it is still there afterwards");
     }
 }
