@@ -613,6 +613,16 @@ impl WrapMap {
         }));
     }
 
+    /// Applies the queued tab edits, or queues them further.
+    ///
+    /// While a background wrap is in flight this returns without doing any
+    /// work, so every sync behind it only adds to `pending_edits` and the
+    /// first flush after it pays for all of them in one span. That is a
+    /// coalescing cliff: measured runs carry 40 batches behind an open's
+    /// rewrap and 167 behind a jump to the top, and the span that drains
+    /// them is O(all the rows they name) with a 1 ms foreground block in
+    /// front of it. It has not cost a reader a frame yet - the drains
+    /// measured were 33 rows - so it is named here and left alone.
     #[ztracing::instrument(skip_all)]
     fn flush_edits(&mut self, cx: &mut Context<Self>) -> u64 {
         let mut walked_items = 0_u64;
