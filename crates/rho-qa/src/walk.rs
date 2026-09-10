@@ -33,10 +33,10 @@ const LARGE_TRANSCRIPT_DRIVE: &[WalkEvent] = &[
 /// forty-row chunk of history, so the run climbs the document a chunk at a
 /// time while the drawn screen stays the same size. What it pins is that
 /// composing a chunk costs the chunk and not the document: over eight pairs
-/// the composed window more than doubles, from 299 rows to 635, and every
-/// stage's walk holds flat - the multibuffer at 152 to 154 items for a
-/// 48-row chunk, the wrap map at 91. A stage that starts growing with
-/// `total_rows` here is a per-event O(document) on the reader's own path.
+/// the composed window more than doubles, from 296 rows to 632, and every
+/// stage's walk holds flat - the multibuffer at 42 to 44 items for a 48-row
+/// chunk, the wrap map at 90. A stage that starts growing with `total_rows`
+/// here is a per-event O(document) on the reader's own path.
 const HISTORY_PAGING_DRIVE: &[WalkEvent] = &[
     WalkEvent::ScrollToTop,
     WalkEvent::Idle,
