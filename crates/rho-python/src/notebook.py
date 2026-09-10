@@ -65,15 +65,18 @@ def _format_error(exc):
     return '\n'.join(lines)
 
 def _trace(frame, event, arg):
-    # Interrupt user bytecode, never asyncio's task/selector bookkeeping.
-    if (frame.f_code.co_filename.startswith('<rho-cell-')
+    filename = frame.f_code.co_filename
+    # These frames cannot be interrupted. Returning None on entry skips their
+    # line events; calls into user/library code still enter this global hook.
+    if event == 'call':
+        module = frame.f_globals.get('__name__', '')
+        if filename == '<rho-runtime>' or module.split('.')[0] in ('asyncio', '_asyncio'):
+            return None
+    if (filename.startswith('<rho-cell-')
             and (_cells.get(_cell.get(None), {}).get('cancelled', False)
                  or _cancel_requested(_cell.get(0), False))):
         raise asyncio.CancelledError()
-    if (frame.f_code.co_filename != '<rho-runtime>'
-            and _sync_watchdog()
-            and _cell.get(None) in _cells
-            and _interruptible(frame)):
+    if (_sync_watchdog() and _cell.get(None) in _cells and _interruptible(frame)):
         # Consume this deadline before unwinding, so another ready cell cannot
         # inherit it. Cancellation of workers remains independent of this timer.
         _sync_watchdog(_SYNC_TIMEOUT)

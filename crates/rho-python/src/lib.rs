@@ -319,7 +319,7 @@ mod tests {
 
         use rustls::pki_types::PrivatePkcs8KeyDer;
 
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let ca = directory.path().join("ca.pem");
         std::fs::write(&ca, certificate.cert.pem()).unwrap();
@@ -380,15 +380,17 @@ mod tests {
                 source: format!(
                     r#"
 import ssl, urllib.request, httpx
-url = 'https://localhost:{port}/'
+url = 'https://127.0.0.1:{port}/'
 context = ssl.create_default_context(cafile={ca})
-assert urllib.request.urlopen(url, context=context, timeout=5).read() == b'ok'
+opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({{}}), urllib.request.HTTPSHandler(context=context))
+assert opener.open(url, timeout=5).read() == b'ok'
 with httpx.Client(verify=context, trust_env=False) as client:
     assert client.get(url).text == 'ok'
 async with httpx.AsyncClient(verify=context, trust_env=False) as client:
     assert (await client.get(url)).text == 'ok'
 try:
-    urllib.request.urlopen(url, timeout=5)
+    urllib.request.build_opener(urllib.request.ProxyHandler({{}})).open(url, timeout=5)
 except urllib.error.URLError as error:
     assert isinstance(error.reason, ssl.SSLCertVerificationError), repr(error.reason)
 else:

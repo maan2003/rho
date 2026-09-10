@@ -722,7 +722,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mirror = DeskMirror::open(dir.path()).unwrap();
         let mut store = Store::new(DeviceId([7; 16]));
-        store.write(note(2), Property::Name("release notes".into()));
+        store
+            .write(note(2), Property::Name("release notes".into()))
+            .unwrap();
         let id = note(1);
 
         mirror.write_delta("desk", DAEMON, 1, store.snapshot(), Vec::new());
