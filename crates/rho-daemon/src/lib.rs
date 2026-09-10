@@ -479,12 +479,20 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
+    let pool = AgentPool::new(
+        db.clone(),
+        inference.clone(),
+        path_overrides,
+        state_dir,
+        claude.clone(),
+        user_environment.clone(),
+    )
+    .await;
     let services = Arc::new(
         Services::new(
             db,
             inference,
-            path_overrides,
-            state_dir,
+            pool,
             claude.clone(),
             user_environment,
             platform_secrets,
@@ -904,22 +912,12 @@ impl Services {
     async fn new(
         db: RhoDb,
         inference: Inference,
-        path_overrides: PathOverrides,
-        state_dir: camino::Utf8PathBuf,
+        pool: Arc<AgentPool>,
         claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
-        let pool = AgentPool::new(
-            db.clone(),
-            inference.clone(),
-            path_overrides,
-            state_dir,
-            claude.clone(),
-            user_environment.clone(),
-        )
-        .await;
         let machine_seed = db.read().machine_seed();
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
@@ -3793,11 +3791,11 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim, GitTransportBroker,
-        MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets, Services, claude_quota_history,
-        configure_octo_git_transport, hourly_global_usage_series, merge_hourly_agent_cost_bucket,
-        persist_gui_telemetry, prepare_image_content, quota_burn, quota_summaries,
-        start_runtime_sockets, validate_image_content,
+        AgentPool, AgentUsageModel, ClientMessage, DeskSession, GitProviderClaim,
+        GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES, PlatformSecrets, Services,
+        claude_quota_history, configure_octo_git_transport, hourly_global_usage_series,
+        merge_hourly_agent_cost_bucket, persist_gui_telemetry, prepare_image_content, quota_burn,
+        quota_summaries, start_runtime_sockets, validate_image_content,
     };
 
     #[test]
@@ -4530,17 +4528,27 @@ mod tests {
         let db = RhoDb::open(root.join("rho.redb"));
         db.write().await.init_agent_tables();
         let inference = rho_inference::Inference::new(db.clone()).await.unwrap();
+        // The test's own directory: nothing here reads the user's.
+        let claude = rho_claude::accounts::ClaudePaths::at(
+            camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
+        );
+        let user_environment = rho_workspaces::UserEnvironment::new(Default::default());
+        let pool = AgentPool::new(
+            db.clone(),
+            inference.clone(),
+            Default::default(),
+            camino::Utf8PathBuf::from_path_buf(root.join("state")).unwrap(),
+            claude.clone(),
+            user_environment.clone(),
+        )
+        .await;
         Arc::new(
             Services::new(
                 db,
                 inference,
-                Default::default(),
-                camino::Utf8PathBuf::from_path_buf(root.join("state")).unwrap(),
-                // The test's own directory: nothing here reads the user's.
-                rho_claude::accounts::ClaudePaths::at(
-                    camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
-                ),
-                rho_workspaces::UserEnvironment::new(Default::default()),
+                pool,
+                claude,
+                user_environment,
                 PlatformSecrets::default(),
                 root.join("octo.sock"),
             )

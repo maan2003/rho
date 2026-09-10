@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 
 use redb::TableDefinition;
-use rho_agent::db::AgentReadTxnExt as _;
 use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
 use rho_desk::cells::{
     BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
