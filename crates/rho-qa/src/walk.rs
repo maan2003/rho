@@ -129,7 +129,8 @@ const SHORT_TURN_OPEN_DRIVE: &[WalkEvent] = &[
 /// chunk to page in - `gg` touches 49 rows at 400 where it touched 6 at 40.
 const LARGE_TRANSCRIPT_TURNS: usize = 400;
 
-/// One step's walk written as `stage:count`, or `-` where it walked nothing.
+/// One step's walk written as `stage:count/microseconds`, or `-` where it
+/// walked nothing.
 ///
 /// Every number on the line counts the same unit: leaf items a stage's
 /// cursors crossed. `multibuffer:`, `fold:`, `tab:`, `wrap:`, `block:` and
@@ -146,13 +147,13 @@ const LARGE_TRANSCRIPT_TURNS: usize = 400;
 /// the largest cost on a step: 216 at 233 rows against 77 at 469, where the
 /// cursors' own share was 59 and 10 and the rest was fifty-nine parses
 /// coming home at once.
-fn stage_walks(walks: &[(&'static str, u64)]) -> String {
+fn stage_walks(walks: &[(&'static str, u64, u64)]) -> String {
     if walks.is_empty() {
         return "-".to_owned();
     }
     walks
         .iter()
-        .map(|(stage, walked)| format!("{stage}:{walked}"))
+        .map(|(stage, walked, micros)| format!("{stage}:{walked}/{micros}us"))
         .collect::<Vec<_>>()
         .join(",")
 }

@@ -146,7 +146,10 @@ pub struct WalkReport {
     /// stages that walked anything. A step's `walked_items` is the sum of
     /// every stage's, so a step that walks a document says nothing about
     /// which layer walked it until this is read.
-    pub step_stage_walks: Vec<Vec<(&'static str, u64)>>,
+    /// Beside each stage's items, the microseconds it spent: a stage that
+    /// walks a document cheaply and one that walks it dearly are the same
+    /// count and different faults.
+    pub step_stage_walks: Vec<Vec<(&'static str, u64, u64)>>,
     pub step_drawn_rows: Vec<u64>,
     pub step_total_rows: Vec<u64>,
     pub scene_hashes: Vec<u64>,
@@ -706,20 +709,28 @@ fn run_events_with_detached_host(
     })
 }
 
-/// One step's walk, split by the stage that did it.
-fn stage_walks(timings: &[gpui::profiler::EditorTiming]) -> Vec<(&'static str, u64)> {
-    let mut by_stage: Vec<(&'static str, u64)> = Vec::new();
+/// One step's walk, split by the stage that did it, with the time each
+/// stage took beside its items.
+fn stage_walks(timings: &[gpui::profiler::EditorTiming]) -> Vec<(&'static str, u64, u64)> {
+    let mut by_stage: Vec<(&'static str, u64, u64)> = Vec::new();
     for timing in timings {
         if timing.walked_items == 0 {
             continue;
         }
         let name = stage_name(timing.kind);
-        match by_stage.iter_mut().find(|(stage, _)| *stage == name) {
-            Some((_, walked)) => *walked += timing.walked_items,
-            None => by_stage.push((name, timing.walked_items)),
+        let micros = timing
+            .end
+            .saturating_duration_since(timing.start)
+            .as_micros() as u64;
+        match by_stage.iter_mut().find(|(stage, _, _)| *stage == name) {
+            Some((_, walked, spent)) => {
+                *walked += timing.walked_items;
+                *spent += micros;
+            }
+            None => by_stage.push((name, timing.walked_items, micros)),
         }
     }
-    by_stage.sort_by_key(|(_, walked)| std::cmp::Reverse(*walked));
+    by_stage.sort_by_key(|(_, walked, _)| std::cmp::Reverse(*walked));
     by_stage
 }
 
