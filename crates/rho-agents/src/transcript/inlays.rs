@@ -6,11 +6,13 @@
 //! reconciled against the desired list so the once-per-second duration tick
 //! never edits the buffer and unchanged inlays are never replaced.
 
+use std::collections::HashSet;
+
 use editor::{Editor, Inlay};
 use gpui::{Context, Entity};
 use language::InlayId;
 use multi_buffer::MultiBuffer;
-use text::Anchor;
+use text::{Anchor, BufferId};
 
 use crate::render::{InlayContent, format_running_duration};
 
@@ -59,9 +61,15 @@ impl InlayRecord {
 /// (position or text no longer wanted) are removed, missing ones inserted.
 /// `next_id` allocates from the model's shared counter — ids only need to
 /// be unique within each editor, so one counter serves all attachments.
+///
+/// `scope`, when given, names the buffers the desired list covers: inlays
+/// placed in any other buffer are left exactly as they are. That is what
+/// lets a caller that changed one chunk pass only that chunk's inlays
+/// without the rest of the document's being read as unwanted.
 pub fn reconcile_inlays<V: 'static>(
     desired: &[(Anchor, String)],
     placed: &mut Vec<PlacedInlay>,
+    scope: Option<&HashSet<BufferId>>,
     next_id: &mut usize,
     multi_buffer: &Entity<MultiBuffer>,
     editor: &Entity<Editor>,
@@ -70,6 +78,10 @@ pub fn reconcile_inlays<V: 'static>(
     let mut stale = Vec::new();
     let mut kept = Vec::new();
     for inlay in placed.drain(..) {
+        if scope.is_some_and(|scope| !scope.contains(&inlay.position.buffer_id)) {
+            kept.push(inlay);
+            continue;
+        }
         let wanted = desired
             .iter()
             .any(|(position, text)| *position == inlay.position && *text == inlay.text);

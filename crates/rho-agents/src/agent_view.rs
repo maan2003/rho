@@ -393,6 +393,12 @@ impl AgentModel {
         self.transcript.head_blocks()
     }
 
+    /// The blocks the editor shows for visualization refs, by block id:
+    /// per-attachment editor state the buffer text does not show.
+    pub fn visualization_blocks(&self) -> Vec<editor::display_map::CustomBlockId> {
+        self.transcript.visualization_blocks()
+    }
+
     /// The block the gap marker sits above, if the reader is being told
     /// that a middle is still on its way.
     pub fn gap_marker_block(&self) -> Option<usize> {

@@ -1,14 +1,16 @@
 //! End-to-end tests: synthetic protocol frames in, rendered editor state out.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use editor::display_map::{Block, DisplayPoint, DisplayRow};
+use editor::display_map::{Block, CustomBlockId, DisplayPoint, DisplayRow};
 use editor::{Copy, Editor, MoveRight, SelectionEffects};
 use gpui::{
     App, AppContext as _, Entity, Focusable as _, InputEvent as _, Modifiers, MouseButton,
     MouseDownEvent, MouseUpEvent, TestAppContext, TouchEvent, TouchId, TouchPhase, WindowHandle,
     point, px, size,
 };
+use language::InlayId;
 use rho_agents::state::{
     UiAgentState, UiAgentStatus, UiBlock, UiMessagePhase, UiTool, UiToolStatus,
 };
@@ -5248,6 +5250,135 @@ fn scrolling_into_history_composes_it(cx: &mut TestAppContext) {
     assert!(
         buffer_text(&workspace, cx).contains("turn 199 line one"),
         "the tail is still where it was"
+    );
+}
+
+/// Two hundred turns whose answers are all markdown tables, so every page
+/// of history composed carries virtual-tab inlays of its own.
+fn long_history_of_tables() -> UiAgentState {
+    let mut blocks = Vec::new();
+    for turn in 0..200 {
+        blocks.push(user(&format!("ask {turn}")));
+        blocks.push(assistant(
+            &format!("| Name | Outcome |\n| --- | --- |\n| turn {turn} | passed |\n"),
+            Some(UiMessagePhase::FinalAnswer),
+        ));
+    }
+    state(blocks, Vec::new())
+}
+
+/// Two hundred turns whose answers are all visualization refs, each its own
+/// ref, so every page of history composed carries blocks of its own.
+fn long_history_of_visualizations() -> UiAgentState {
+    let mut blocks = Vec::new();
+    for turn in 0..200 {
+        blocks.push(user(&format!("ask {turn}")));
+        blocks.push(assistant(
+            &format!("```visualization\nref={turn:032x} rows=2\n```"),
+            Some(UiMessagePhase::FinalAnswer),
+        ));
+    }
+    state(blocks, Vec::new())
+}
+
+fn inlay_ids(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> HashSet<InlayId> {
+    let editor = active_editor(workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            editor
+                .read(cx)
+                .all_inlays(cx)
+                .into_iter()
+                .map(|inlay| inlay.id)
+                .collect()
+        })
+        .expect("read the inlays the editor shows")
+}
+
+fn visualization_blocks(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+    agent_id: AgentId,
+) -> HashSet<CustomBlockId> {
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .agent_model_for_test(agent_id)
+                .read(cx)
+                .visualization_blocks()
+                .into_iter()
+                .collect()
+        })
+        .expect("read the visualization blocks the editor shows")
+}
+
+/// A page composes the records it renders and nothing else, so the inlays
+/// it brings are added and the ones already on screen keep their ids: they
+/// are never removed and placed again for a page they had no part in.
+#[gpui::test]
+fn a_page_adds_its_inlays_and_removes_none_elsewhere(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history_of_tables());
+    cx.run_until_parked();
+    let opened = inlay_ids(&workspace, cx);
+    assert!(
+        !opened.is_empty(),
+        "the tail's tables are aligned with virtual tabs"
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+            });
+        })
+        .expect("scroll to the top of what is composed");
+    cx.run_until_parked();
+
+    let after = inlay_ids(&workspace, cx);
+    assert!(
+        opened.is_subset(&after),
+        "a page must not disturb the inlays already placed: {opened:?} then {after:?}"
+    );
+    assert!(
+        after.len() > opened.len(),
+        "the page brings its own tables' inlays: {} then {}",
+        opened.len(),
+        after.len()
+    );
+}
+
+/// The same for visualizations: a page adds the blocks its own refs need
+/// and leaves every block already placed where it is.
+#[gpui::test]
+fn a_page_adds_its_visualizations_and_removes_none_elsewhere(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(&workspace, cx, agent(1), long_history_of_visualizations());
+    cx.run_until_parked();
+    let opened = visualization_blocks(&workspace, cx, agent(1));
+    assert!(!opened.is_empty(), "the tail's refs are blocks");
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+            });
+        })
+        .expect("scroll to the top of what is composed");
+    cx.run_until_parked();
+
+    let after = visualization_blocks(&workspace, cx, agent(1));
+    assert!(
+        opened.is_subset(&after),
+        "a page must not disturb the blocks already placed: {opened:?} then {after:?}"
+    );
+    assert!(
+        after.len() > opened.len(),
+        "the page brings its own refs' blocks: {} then {}",
+        opened.len(),
+        after.len()
     );
 }
 

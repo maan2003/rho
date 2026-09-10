@@ -363,7 +363,7 @@ impl TranscriptModel {
         self.refresh_elision_plans(self.uncomposed);
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
-        self.apply_to_attachments(now_ms, &history, &live, gutters_changed, cx);
+        self.apply_to_attachments(now_ms, &history, &live, gutters_changed, None, cx);
         self.warm_first_screen(cx);
         cx.notify();
     }
@@ -427,7 +427,7 @@ impl TranscriptModel {
         });
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
-        self.apply_to_attachments(now_ms, &history, &live, true, cx);
+        self.apply_to_attachments(now_ms, &history, &live, true, None, cx);
     }
 
     /// Applies a state change bounded by `summary`.
@@ -444,7 +444,7 @@ impl TranscriptModel {
             // Status alone can close the turn; the document tail follows,
             // and a replaced excerpt triggers the full re-apply inside.
             let empty = HashSet::new();
-            self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
+            self.apply_to_attachments(now_ms, &empty, &empty, false, None, cx);
             return;
         };
         self.remember_blocks(state, first_changed_block, agent_label);
@@ -530,7 +530,14 @@ impl TranscriptModel {
         self.turn_boundary = new_boundary;
 
         self.refresh_elision_plans(self.block_of(start));
-        self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
+        self.apply_to_attachments(
+            now_ms,
+            &changed_history,
+            &changed_live,
+            gutters_changed,
+            None,
+            cx,
+        );
         // A replaced buffer is a new one, and a new one is parsed only when
         // something asks. Without this the asking is the editor's, 50 ms
         // after the scroll its own change caused, so the markup the parse
@@ -870,7 +877,14 @@ impl TranscriptModel {
             (&changed, &empty)
         };
         self.refresh_elision_plans(block_index);
-        self.apply_to_attachments(now_ms, changed_history, changed_live, gutters_changed, cx);
+        self.apply_to_attachments(
+            now_ms,
+            changed_history,
+            changed_live,
+            gutters_changed,
+            None,
+            cx,
+        );
         cx.notify();
         true
     }
@@ -881,7 +895,7 @@ impl TranscriptModel {
             return;
         }
         let empty = HashSet::new();
-        self.apply_to_attachments(now_ms, &empty, &empty, false, cx);
+        self.apply_to_attachments(now_ms, &empty, &empty, false, None, cx);
         cx.notify();
     }
 
@@ -971,6 +985,22 @@ impl TranscriptModel {
             .first()
             .and_then(|attachment| attachment.gap_marker)
             .map(|(_, block)| block)
+    }
+
+    /// The visualization blocks the first attachment shows, by editor block
+    /// id. Placed decorations are per-attachment editor state that the
+    /// buffer text does not show, so this is how a test sees them.
+    pub fn visualization_blocks(&self) -> Vec<CustomBlockId> {
+        self.attachments
+            .first()
+            .map(|attachment| {
+                attachment
+                    .visualizations
+                    .iter()
+                    .map(|placed| placed.block_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Whether a block is composed anywhere: in the head a reader asked
@@ -1171,7 +1201,14 @@ impl TranscriptModel {
         let changed_history = classes_in(&self.records[added_records.start..boundary]);
         let changed_live = classes_in(&self.records[boundary..added_records.end]);
         self.refresh_elision_plans(range.start);
-        self.apply_to_attachments(now_ms, &changed_history, &changed_live, gutters_changed, cx);
+        self.apply_to_attachments(
+            now_ms,
+            &changed_history,
+            &changed_live,
+            gutters_changed,
+            Some(added_records),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1208,7 +1245,7 @@ impl TranscriptModel {
         self.compose_history(OPENING_ROWS, now_ms, cx);
         let history = classes_in(&self.records[..self.turn_boundary]);
         let live = classes_in(&self.records[self.turn_boundary..]);
-        self.apply_to_attachments(now_ms, &history, &live, true, cx);
+        self.apply_to_attachments(now_ms, &history, &live, true, None, cx);
         cx.notify();
     }
 
@@ -1380,12 +1417,28 @@ impl TranscriptModel {
         changed_history: &HashSet<StyleClass>,
         changed_live: &HashSet<StyleClass>,
         gutters_changed: bool,
+        changed_records: Option<Range<usize>>,
         cx: &mut Context<V>,
     ) {
         let document_replaced = self.update_document_excerpt(cx);
         if self.attachments.is_empty() {
             return;
         }
+        // A page changes the records it composed and nothing else, so its
+        // inlays and visualizations are reconciled inside the buffers those
+        // records live in: building the desired lists over every record
+        // would cost the whole transcript on every page. A replaced document
+        // excerpt re-resolves every anchor, so that one goes wide again.
+        let changed_records = (!document_replaced).then_some(changed_records).flatten();
+        let decorated = changed_records
+            .clone()
+            .unwrap_or_else(|| 0..self.records.len());
+        let scope = changed_records.map(|_| {
+            self.records[decorated.clone()]
+                .iter()
+                .map(|record| record.buffer.read(cx).remote_id())
+                .collect::<HashSet<_>>()
+        });
         let history_styles = region_styles(&self.records[..self.turn_boundary], changed_history);
         let live_styles = region_styles(&self.records[self.turn_boundary..], changed_live);
         let (full_history_styles, full_live_styles) = if document_replaced {
@@ -1404,23 +1457,25 @@ impl TranscriptModel {
                 .filter_map(|record| record.gutter.clone())
                 .collect::<Vec<_>>()
         });
-        let desired_inlays = self
-            .records
+        let desired_inlays = self.records[decorated.clone()]
             .iter()
             .flat_map(|record| record.inlays.iter())
             .filter_map(|inlay| inlay.desired(now_ms))
             .collect::<Vec<_>>();
-        let desired_visualizations = self
-            .records
+        let desired_visualizations = self.records[decorated]
             .iter()
             .flat_map(|record| record.visualizations.iter().cloned())
             .collect::<Vec<_>>();
-        let desired_visualization_ids = desired_visualizations
-            .iter()
-            .map(|visualization| visualization.id.as_str())
-            .collect::<HashSet<_>>();
-        self.visualization_cache
-            .retain(|id, _| desired_visualization_ids.contains(id.as_str()));
+        if scope.is_none() {
+            // Only a document-wide desired list says which views are dead;
+            // a scoped one names a chunk's and nothing about the rest.
+            let desired_visualization_ids = desired_visualizations
+                .iter()
+                .map(|visualization| visualization.id.as_str())
+                .collect::<HashSet<_>>();
+            self.visualization_cache
+                .retain(|id, _| desired_visualization_ids.contains(id.as_str()));
+        }
 
         // Where the gap is, for the row that says so: above the tail's
         // first block, which stays put while the head grows towards it.
@@ -1519,6 +1574,7 @@ impl TranscriptModel {
             inlays::reconcile_inlays(
                 &desired_inlays,
                 &mut attachment.inlays,
+                scope.as_ref(),
                 next_inlay_id,
                 multi_buffer,
                 &editor,
@@ -1527,6 +1583,7 @@ impl TranscriptModel {
             reconcile_visualizations(
                 &desired_visualizations,
                 &mut attachment.visualizations,
+                scope.as_ref(),
                 visualization_cache,
                 visualization_client,
                 multi_buffer,
@@ -2079,9 +2136,14 @@ fn styles_for_rendered(
         .collect()
 }
 
+/// Reconciles one editor's visualization blocks with the desired list.
+/// `scope`, when given, names the buffers the desired list covers: blocks
+/// placed in any other buffer are left where they are, so a caller that
+/// changed one chunk can pass that chunk's visualizations alone.
 fn reconcile_visualizations<V: 'static>(
     desired: &[VisualizationAnchor],
     placed: &mut Vec<PlacedVisualization>,
+    scope: Option<&HashSet<text::BufferId>>,
     cache: &mut HashMap<String, Entity<Visualization>>,
     client: &VisualizationClient,
     multi_buffer: &Entity<MultiBuffer>,
@@ -2097,6 +2159,9 @@ fn reconcile_visualizations<V: 'static>(
         .collect::<HashSet<_>>();
     let mut removed = collections::HashSet::default();
     placed.retain(|placed| {
+        if scope.is_some_and(|scope| !scope.contains(&placed.source_range.start.buffer_id)) {
+            return true;
+        }
         let keep = visualization_key(&placed.id, placed.rows, &placed.source_range, &snapshot)
             .is_some_and(|key| desired_keys.contains(&key));
         if !keep {
