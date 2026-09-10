@@ -65,6 +65,7 @@ fn a_spec_that_stops_resolving_still_unfolds_its_turn(cx: &mut TestAppContext) {
     let spec = cx.update(|cx| {
         let buffer = buffer.read(cx);
         ElisionSpec {
+            start_block: 0,
             range: buffer.anchor_before(10)..buffer.anchor_after(90),
             tool_count: 2,
             tail_rows: 1,

@@ -26,6 +26,7 @@ mod dashboard_cost;
 mod editor_shutdown;
 mod elision_block_geometry;
 mod elision_caret;
+mod elision_paging;
 mod elision_unfold;
 mod find_cost;
 mod fold_accounting_streaming;
@@ -203,18 +204,25 @@ fn an_elision_that_cannot_resolve_takes_no_crease(cx: &mut TestAppContext) {
     });
     let editor = window.root(cx).expect("editor");
 
-    let spec = |anchors: (text::Anchor, text::Anchor), tool_count: usize| ElisionSpec {
-        range: anchors.0..anchors.1,
-        tool_count,
-        tail_rows: 0,
+    let spec = |start_block: usize, anchors: (text::Anchor, text::Anchor), tool_count: usize| {
+        ElisionSpec {
+            start_block,
+            range: anchors.0..anchors.1,
+            tool_count,
+            tail_rows: 0,
+        }
     };
     let (first, unresolvable, last) = cx.update(|cx| {
         let buffer = buffer.read(cx);
         let elsewhere = elsewhere.read(cx);
         (
-            spec((buffer.anchor_before(7), buffer.anchor_after(21)), 2),
-            spec((elsewhere.anchor_before(0), elsewhere.anchor_after(3)), 3),
-            spec((buffer.anchor_before(35), buffer.anchor_after(49)), 4),
+            spec(0, (buffer.anchor_before(7), buffer.anchor_after(21)), 2),
+            spec(
+                3,
+                (elsewhere.anchor_before(0), elsewhere.anchor_after(3)),
+                3,
+            ),
+            spec(6, (buffer.anchor_before(35), buffer.anchor_after(49)), 4),
         )
     });
 

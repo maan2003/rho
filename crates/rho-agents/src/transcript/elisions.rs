@@ -27,6 +27,10 @@ use crate::state::UiBlock;
 /// What one elision looks like, independent of its editor identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ElisionSpec {
+    /// The block the elided run starts at, which is the turn it belongs to
+    /// and the only part of a spec that survives the document growing
+    /// around it. Plans never overlap, so no two specs share one.
+    pub start_block: usize,
     pub range: Range<Anchor>,
     pub tool_count: usize,
     pub tail_rows: u32,
@@ -83,6 +87,7 @@ impl ElisionSync {
             .iter()
             .filter_map(|plan| {
                 Some(ElisionSpec {
+                    start_block: plan.start_block,
                     range: plan_range(plan)?,
                     tool_count: plan.tool_count,
                     tail_rows: plan.tail_rows,
@@ -140,9 +145,17 @@ impl ElisionSync {
     }
 
     /// Reconciles one editor's display elisions with the model's specs,
-    /// diffed by position: the elision at index `i` is the one for spec
-    /// `i`, so a spec that changed shape updates the elision already there
-    /// rather than removing and re-inserting it.
+    /// paired by the turn each one elides, so a spec that changed shape
+    /// updates the elision already there rather than removing and
+    /// re-inserting it.
+    ///
+    /// The pairing used to be by position, and position does not survive
+    /// history arriving. A spec exists only while its anchors resolve, so
+    /// composing a page at the head makes several earlier plans resolve at
+    /// once and every spec after them shifts down the list. Positionally
+    /// that reads as every elision having changed shape, and one page
+    /// updated all sixty-one of them, which tells the block map most of
+    /// the document moved when nothing did.
     pub fn apply<V: 'static>(
         &self,
         state: &mut ElisionState,
@@ -152,50 +165,46 @@ impl ElisionSync {
     ) {
         let specs = self.specs.clone();
         let snapshot = multi_buffer.read(cx).snapshot(cx);
-        let mut removed_ids = state.active[specs.len().min(state.active.len())..]
-            .iter()
-            .map(|elision| elision.id)
-            .collect::<rustc_hash::FxHashSet<_>>();
+        let mut carried = state
+            .active
+            .drain(..)
+            .map(|elision| (elision.spec.start_block, elision))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        let mut removed_ids = rustc_hash::FxHashSet::default();
         let mut updates = Vec::new();
         let mut inserted_specs = Vec::new();
         let mut inserted_properties = Vec::new();
         let mut next_active = Vec::new();
 
-        for (index, spec) in specs.into_iter().enumerate() {
-            let existing = state.active.get(index);
-            if let Some(existing) = existing
-                && existing.spec == spec
-            {
-                next_active.push(ActiveElision {
-                    id: existing.id,
-                    spec,
-                });
-                continue;
-            }
+        for spec in specs {
             // A spec whose anchors do not resolve in this snapshot is not
             // recorded at all: a transcript still composing its history has
             // excerpts that are not in the buffer yet, and leaving the spec
             // out is what makes the next reconcile try it again.
-            let Some(properties) = elision_properties(&snapshot, &spec) else {
-                if let Some(existing) = existing {
-                    removed_ids.insert(existing.id);
-                }
-                continue;
-            };
-            match existing {
-                Some(existing) => {
-                    updates.push((existing.id, properties));
-                    next_active.push(ActiveElision {
-                        id: existing.id,
-                        spec,
-                    });
-                }
+            match carried.remove(&spec.start_block) {
+                Some(existing) if existing.spec == spec => next_active.push(existing),
+                Some(existing) => match elision_properties(&snapshot, &spec) {
+                    Some(properties) => {
+                        updates.push((existing.id, properties));
+                        next_active.push(ActiveElision {
+                            id: existing.id,
+                            spec,
+                        });
+                    }
+                    None => {
+                        removed_ids.insert(existing.id);
+                    }
+                },
                 None => {
-                    inserted_properties.push(properties);
-                    inserted_specs.push(spec);
+                    if let Some(properties) = elision_properties(&snapshot, &spec) {
+                        inserted_properties.push(properties);
+                        inserted_specs.push(spec);
+                    }
                 }
             }
         }
+
+        removed_ids.extend(carried.into_values().map(|elision| elision.id));
 
         if removed_ids.is_empty() && updates.is_empty() && inserted_properties.is_empty() {
             state.active = next_active;
