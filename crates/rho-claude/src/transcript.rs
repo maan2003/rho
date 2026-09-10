@@ -259,11 +259,12 @@ fn to_session_line(entry: &TranscriptEntry) -> Result<Option<SessionLine>> {
 }
 
 pub async fn read_session_messages_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
     options: SessionMessagesOptions,
 ) -> Result<Vec<SessionMessage>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(Vec::new());
     };
     read_session_messages(&transcript_path, options).await
@@ -272,10 +273,11 @@ pub async fn read_session_messages_by_id(
 /// Reads every recorded assistant usage snapshot, including forked and
 /// sidechain entries that are intentionally omitted from the visible chat.
 pub async fn read_session_usage_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Vec<SessionUsageSample>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(Vec::new());
     };
     let entries = read_transcript_entries(&transcript_path).await?;
@@ -343,23 +345,26 @@ fn merge_max_usage(base: &mut crate::protocol::TokenUsage, update: &crate::proto
 }
 
 pub async fn read_session_context_used_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Option<u64>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(None);
     };
     let entries = read_transcript_entries(&transcript_path).await?;
     Ok(latest_context_used(&entries))
 }
 
+/// Where a session's transcript is, under the `projects/` tree the caller
+/// names. The tree is passed in rather than resolved here: this crate does
+/// not decide which Claude configuration a process is running against.
 pub async fn find_session_transcript(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Option<Utf8PathBuf>> {
-    let Some(projects_dir) = claude_projects_dir() else {
-        return Ok(None);
-    };
+    let projects_dir = projects;
     let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
     let project_key = project_key(&cwd);
     let direct = projects_dir
@@ -399,13 +404,6 @@ pub async fn find_session_transcript(
 }
 
 const MAX_PROJECT_KEY_LEN: usize = 200;
-
-/// Every account shares one `projects/` tree, bind-mounted into each
-/// account directory, so the daemon reads transcripts from a single host
-/// path whatever account the agent runs on.
-fn claude_projects_dir() -> Option<Utf8PathBuf> {
-    Some(crate::accounts::config_home().ok()?.join("projects"))
-}
 
 async fn canonical_utf8(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let path = tokio::fs::canonicalize(path).await.ok()?;

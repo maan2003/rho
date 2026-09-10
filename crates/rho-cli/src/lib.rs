@@ -271,7 +271,7 @@ async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
             ClientMessage::SetClaudeAccount { name: name.clone() }
         }
         ClaudeAccountCommand::Login { name } => {
-            let dir = rho_claude::accounts::prepare(name)?;
+            let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
             eprintln!("rho: opening Claude on account {name} ({dir}); run /login");
             let status = std::process::Command::new("claude")
                 .env("CLAUDE_CONFIG_DIR", dir.as_str())

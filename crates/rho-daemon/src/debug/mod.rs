@@ -19,6 +19,14 @@ pub struct DebugArgs {
     #[arg(long = "db-path")]
     db_path: Option<PathBuf>,
 
+    /// The Claude config directory whose transcripts to read, with accounts
+    /// beside it as `<dir>-accounts`. Defaults to the user's. A database
+    /// from somewhere else wants the transcripts from that somewhere else:
+    /// name it, or the reading is of the user's transcripts under another
+    /// store's session ids.
+    #[arg(long = "claude-config-dir", value_name = "DIR")]
+    claude_config_dir: Option<camino::Utf8PathBuf>,
+
     #[command(subcommand)]
     command: DebugCommand,
 }
@@ -63,8 +71,13 @@ enum DebugCommand {
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
+    // Resolved once, here: the readers below are handed a path.
+    let claude = match args.claude_config_dir.clone() {
+        Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
+        None => rho_claude::accounts::ClaudePaths::from_env()?,
+    };
     match args.command {
-        DebugCommand::Agents => print_agents(args.db_path).await,
+        DebugCommand::Agents => print_agents(args.db_path, &claude).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
         DebugCommand::Rollback => rollback(args.db_path).await,
         DebugCommand::Savepoints => savepoints(args.db_path).await,
@@ -72,7 +85,7 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::Compact => compact(args.db_path),
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
-        DebugCommand::Context => print_context(args.db_path).await,
+        DebugCommand::Context => print_context(args.db_path, &claude).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
 }
@@ -283,7 +296,10 @@ fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snaps
     })
 }
 
-async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn print_agents(
+    db_path: Option<PathBuf>,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
 
     let db = RhoDb::open(&snapshot.path);
@@ -329,6 +345,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
                 match rho_claude::find_session_transcript(
+                    &claude.projects(),
                     session_id,
                     agent.primary_workdir().repo(),
                 )
@@ -344,7 +361,10 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn print_context(
+    db_path: Option<PathBuf>,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
@@ -390,15 +410,19 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
-                let transcript =
-                    rho_claude::find_session_transcript(session_id, agent.primary_workdir().repo())
-                        .await?;
+                let transcript = rho_claude::find_session_transcript(
+                    &claude.projects(),
+                    session_id,
+                    agent.primary_workdir().repo(),
+                )
+                .await?;
                 let Some(transcript) = transcript else {
                     writeln!(output, "  transcript: <missing>")?;
                     continue;
                 };
                 writeln!(output, "  transcript: {transcript}")?;
                 let messages = rho_claude::read_session_messages_by_id(
+                    &claude.projects(),
                     session_id,
                     agent.primary_workdir().repo(),
                     rho_claude::SessionMessagesOptions::default(),

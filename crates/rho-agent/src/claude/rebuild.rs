@@ -42,8 +42,10 @@ pub enum Outcome {
 }
 
 /// Rebuilds every copied Claude log; run before any agent loop starts,
-/// since a loop appends to the log it would rewrite.
-pub async fn rebuild_claude_logs(db: &RhoDb) -> Rebuilt {
+/// since a loop appends to the log it would rewrite. `projects` is the
+/// transcript tree to read, named by the daemon: this is the pass that
+/// rewrote a user's own transcripts when it was left to find them itself.
+pub async fn rebuild_claude_logs(db: &RhoDb, projects: &camino::Utf8Path) -> Rebuilt {
     {
         let mut write = db.write().await;
         write.init_agent_tables();
@@ -67,7 +69,7 @@ pub async fn rebuild_claude_logs(db: &RhoDb) -> Rebuilt {
         if rewind_target(&db.read().agent_event_records(agent_id).1).is_none() {
             continue;
         }
-        let lines = match rho_claude::find_session_transcript(session_id, &repo).await {
+        let lines = match rho_claude::find_session_transcript(projects, session_id, &repo).await {
             Ok(Some(path)) => match rho_claude::read_session_lines(&path).await {
                 Ok(lines) => Some(lines),
                 Err(error) => {
@@ -385,17 +387,21 @@ mod tests {
         ));
     }
 
-    /// Proof on a `cp` of a real database, never the live file:
-    /// `RHO_REBUILD_DB_COPY=<copy> cargo test -p rho-agent -- --ignored
-    /// rebuilds_a_copy`.
+    /// Proof on a `cp` of a real database, never the live file, and on a
+    /// transcript tree the run names rather than one found from `$HOME`:
+    /// `RHO_REBUILD_DB_COPY=<copy> RHO_REBUILD_PROJECTS=<projects>
+    /// cargo test -p rho-agent -- --ignored rebuilds_a_copy`.
     #[tokio::test]
     #[ignore]
     async fn rebuilds_a_copy_of_a_real_db() {
         let Ok(path) = std::env::var("RHO_REBUILD_DB_COPY") else {
             return;
         };
+        let Ok(projects) = std::env::var("RHO_REBUILD_PROJECTS") else {
+            return;
+        };
         let db = RhoDb::open(std::path::PathBuf::from(path));
-        let done = rebuild_claude_logs(&db).await;
+        let done = rebuild_claude_logs(&db, camino::Utf8Path::new(&projects)).await;
         for (agent_id, head) in db.read().list_agents() {
             if !matches!(head.config.runtime, AgentRuntime::Claude { .. }) {
                 continue;

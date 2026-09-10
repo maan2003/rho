@@ -49,6 +49,7 @@ impl ClaudeAgent {
     pub(crate) async fn create(
         db: RhoDb,
         inference: Inference,
+        claude: rho_claude::accounts::ClaudePaths,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         mode: SessionBinding,
@@ -113,6 +114,7 @@ impl ClaudeAgent {
             Self::new(
                 db,
                 inference,
+                claude,
                 agent_id,
                 Arc::new(Lazy::ready(view)),
                 model,
@@ -132,6 +134,7 @@ impl ClaudeAgent {
     pub(crate) async fn load(
         db: RhoDb,
         inference: Inference,
+        claude: rho_claude::accounts::ClaudePaths,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
@@ -158,6 +161,7 @@ impl ClaudeAgent {
             record.config.claude_rewind
         {
             let resumed = rho_claude::read_session_messages_by_id(
+                &claude.projects(),
                 rewind.session_id,
                 &primary_repo,
                 rho_claude::SessionMessagesOptions::default(),
@@ -187,6 +191,7 @@ impl ClaudeAgent {
                 write.set_agent_claude_rewind(agent_id, Some(rewind.clone()));
                 write.commit();
                 let source = rho_claude::read_session_messages_by_id(
+                    &claude.projects(),
                     rewind.source_session_id,
                     &primary_repo,
                     rho_claude::SessionMessagesOptions::default(),
@@ -210,11 +215,16 @@ impl ClaudeAgent {
             }
         } else {
             // A file for the session means it has been spoken to.
-            let start_mode =
-                match rho_claude::find_session_transcript(session_id, &primary_repo).await? {
-                    Some(_) => ClaudeStartMode::Resume,
-                    None => ClaudeStartMode::New,
-                };
+            let start_mode = match rho_claude::find_session_transcript(
+                &claude.projects(),
+                session_id,
+                &primary_repo,
+            )
+            .await?
+            {
+                Some(_) => ClaudeStartMode::Resume,
+                None => ClaudeStartMode::New,
+            };
             (session_id, start_mode, false)
         };
         let state = AgentState {
@@ -234,6 +244,7 @@ impl ClaudeAgent {
         Ok(Self::new(
             db,
             inference,
+            claude,
             agent_id,
             view,
             model,
@@ -254,6 +265,7 @@ impl ClaudeAgent {
     fn new(
         db: RhoDb,
         inference: Inference,
+        claude: rho_claude::accounts::ClaudePaths,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         model: Model,
@@ -286,6 +298,7 @@ impl ClaudeAgent {
         ));
         let loop_state = ClaudeLoop {
             db,
+            claude,
             presentation_session,
             agent_id,
             view,
@@ -473,6 +486,9 @@ enum ClaudeControl {
 
 struct ClaudeLoop {
     db: RhoDb,
+    /// The Claude configuration this agent runs against, handed down from
+    /// the daemon rather than resolved here.
+    claude: rho_claude::accounts::ClaudePaths,
     /// The agent's one persistent Luna session, shared by activity updates
     /// and turn reports so both keep one prompt prefix warm.
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
@@ -1116,6 +1132,7 @@ impl ClaudeLoop {
                     resume_at,
                 } => {
                     let source = rho_claude::read_session_messages_by_id(
+                        &self.claude.projects(),
                         source_session_id,
                         view.primary().repo(),
                         rho_claude::SessionMessagesOptions::default(),
@@ -1131,6 +1148,7 @@ impl ClaudeLoop {
             }
         } else {
             let messages = rho_claude::read_session_messages_by_id(
+                &self.claude.projects(),
                 self.session_id,
                 view.primary().repo(),
                 rho_claude::SessionMessagesOptions::default(),
@@ -1274,12 +1292,12 @@ impl ClaudeLoop {
         options: &mut rho_claude::ClaudeCodeOptions,
         account: &str,
     ) -> anyhow::Result<()> {
-        let config_home = rho_claude::accounts::config_home()?;
+        let config_home = self.claude.config_home().to_owned();
         // The namespace mounts these, and a missing mount source or target
         // there fails namespace creation rather than the spawn.
         std::fs::create_dir_all(config_home.join("projects"))
             .with_context(|| format!("create Claude config directory {config_home}"))?;
-        let account_dir = rho_claude::accounts::prepare(account)?;
+        let account_dir = self.claude.prepare(account)?;
         // Claude keeps `.claude.json` (the account itself, and its
         // credentials) in `$HOME`, not in the config directory, so no mount
         // over `~/.claude` alone could switch accounts. Naming the mount
@@ -1572,6 +1590,7 @@ impl ClaudeLoop {
         self.close_process().await;
         let view = Arc::clone(self.view.get().await?);
         let messages = rho_claude::read_session_messages_by_id(
+            &self.claude.projects(),
             self.session_id,
             view.primary().repo(),
             rho_claude::SessionMessagesOptions::default(),

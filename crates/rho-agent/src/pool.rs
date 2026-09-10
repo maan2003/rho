@@ -39,6 +39,10 @@ pub struct AgentPool {
     /// Where sandboxes are made, named by the daemon rather than resolved
     /// here: a library does not reach for the user's state directory.
     state_dir: camino::Utf8PathBuf,
+    /// The Claude configuration agents run against, named by the daemon for
+    /// the same reason as `state_dir`: a library that resolves `$HOME` puts
+    /// every caller on the user's live `~/.claude`.
+    claude: rho_claude::accounts::ClaudePaths,
     user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// Loaded agents, least recently used first. Touched by every load.
@@ -124,12 +128,13 @@ impl AgentPool {
         inference: Inference,
         path_overrides: PathOverrides,
         state_dir: camino::Utf8PathBuf,
+        claude: rho_claude::accounts::ClaudePaths,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare(&db).await;
         // The account agents run on has to exist before the first spawn.
         let account = db.read().claude_account();
-        if let Err(error) = rho_claude::accounts::bootstrap(&account) {
+        if let Err(error) = claude.bootstrap(&account) {
             panic!("Claude account {account} could not be prepared: {error:#}");
         }
         let pool = Arc::new(Self {
@@ -137,6 +142,7 @@ impl AgentPool {
             inference: inference.clone(),
             path_overrides,
             state_dir,
+            claude,
             user_environment,
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -475,6 +481,7 @@ impl AgentPool {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     self.inference.clone(),
+                    self.claude.clone(),
                     display_name,
                     start,
                     mode,
@@ -802,6 +809,7 @@ impl AgentPool {
                 let agent = ClaudeAgent::load(
                     self.db.clone(),
                     self.inference.clone(),
+                    self.claude.clone(),
                     agent_id,
                     view,
                     Arc::downgrade(self),

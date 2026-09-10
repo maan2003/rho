@@ -110,6 +110,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         inference,
         PathOverrides::default(),
         camino::Utf8PathBuf::try_from(temp.path().to_owned())?,
+        // An eval runs on its own directory, not on the user's Claude state.
+        rho_claude::accounts::ClaudePaths::at(camino::Utf8PathBuf::try_from(
+            temp.path().join("claude"),
+        )?),
         env,
     )
     .await;

@@ -319,6 +319,14 @@ pub struct DaemonArgs {
     /// Set ANTHROPIC_BASE_URL for Claude Code subprocesses.
     #[arg(long, value_name = "URL")]
     pub anthropic_base_url: Option<String>,
+    /// The Claude config directory to run against, with accounts beside it
+    /// as `<dir>-accounts`. Named outright by a rig, whose Claude state is
+    /// its own; without it the daemon uses the user's, `$CLAUDE_CONFIG_DIR`
+    /// or `~/.claude`. Deliberately not an `env =` argument: a daemon
+    /// pointed at a rig's state directory picked the user's transcripts up
+    /// out of the environment and rebuilt agent rows from them.
+    #[arg(long, value_name = "DIR")]
+    pub claude_config_dir: Option<camino::Utf8PathBuf>,
 }
 
 pub struct DaemonProfiler(Option<rho_profiling::CpuProfiler>);
@@ -393,9 +401,16 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     )
     .context("the state directory is not valid UTF-8")?;
     let db = RhoDb::open(db_path);
+    // Resolved once, here, and passed down from this point: nothing below
+    // reads `$HOME` or `$CLAUDE_CONFIG_DIR` for itself.
+    let claude = match args.claude_config_dir.clone() {
+        Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
+        None => rho_claude::accounts::ClaudePaths::from_env()?,
+    };
+    eprintln!("rho daemon: Claude configuration {}", claude.config_home());
     // One-off (7 Sep), before any agent loop can append: every Claude
     // log the file copier wrote is rebuilt from its session file.
-    let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db).await;
+    let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db, &claude.projects()).await;
     eprintln!(
         "rho daemon: rebuilt {} Claude logs from their session files, closed {} queues without one (one-off)",
         rebuilt.rebuilt, rebuilt.closed
@@ -437,6 +452,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             inference,
             path_overrides,
             state_dir,
+            claude.clone(),
             user_environment,
             platform_secrets,
             runtime.paths.octo_socket(),
@@ -447,10 +463,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // One probe per account: a subscription's headroom is the account's, and
     // agents move between accounts. The probe has no view to mount an
     // account into, so it names the account directory outright.
-    for account in rho_claude::accounts::list()? {
+    for account in claude.list()? {
         let quota_environment = services.user_environment.clone();
         let quota_path_overrides = quota_path_overrides.clone();
-        let account_dir = rho_claude::accounts::account_dir(&account)?;
+        let account_dir = claude.account_dir(&account)?;
         spawn_claude_quota_recorder(
             rho_claude_usage::spawn_poller(
                 move || {
@@ -844,6 +860,8 @@ struct Services {
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_workspaces::UserEnvironment,
+    /// The Claude configuration this daemon runs against, resolved in `run`.
+    claude: rho_claude::accounts::ClaudePaths,
     git_transport: GitTransportBroker,
     /// At most one GUI owns the voice session's microphone and playback.
     voice_lease: Arc<TokioMutex<()>>,
@@ -855,6 +873,7 @@ impl Services {
         inference: Inference,
         path_overrides: PathOverrides,
         state_dir: camino::Utf8PathBuf,
+        claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
@@ -864,6 +883,7 @@ impl Services {
             inference.clone(),
             path_overrides,
             state_dir,
+            claude.clone(),
             user_environment.clone(),
         )
         .await;
@@ -877,6 +897,7 @@ impl Services {
         let registry = Self {
             pool,
             db,
+            claude,
             desk_cells,
             desk_devices: Mutex::new(HashMap::new()),
             visualizations,
@@ -1908,9 +1929,12 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
         .saturating_sub(epoch_start.used_percent) as u16
 }
 
-fn claude_accounts_message(db: &RhoDb) -> anyhow::Result<ServerMessage> {
+fn claude_accounts_message(
+    db: &RhoDb,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<ServerMessage> {
     Ok(ServerMessage::ClaudeAccounts {
-        accounts: rho_claude::accounts::list()?,
+        accounts: claude.list()?,
         current: db.read().claude_account(),
     })
 }
@@ -2282,18 +2306,18 @@ async fn handle_message(
             Ok(Refresh::None)
         }
         ClientMessage::ClaudeAccounts => {
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db)?);
+            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
             Ok(Refresh::None)
         }
         ClientMessage::SetClaudeAccount { name } => {
             // The account has to be there before an agent tries to mount it;
             // a switch to a name with no directory would fail at the next
             // turn of every agent at once.
-            rho_claude::accounts::bootstrap(&name)?;
+            services.claude.bootstrap(&name)?;
             let mut write = services.db.write().await;
             write.set_claude_account(&name);
             write.commit();
-            let _ = outgoing_tx.send(claude_accounts_message(&services.db)?);
+            let _ = outgoing_tx.send(claude_accounts_message(&services.db, &services.claude)?);
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {
@@ -4423,6 +4447,10 @@ mod tests {
                 inference,
                 Default::default(),
                 camino::Utf8PathBuf::from_path_buf(root.join("state")).unwrap(),
+                // The test's own directory: nothing here reads the user's.
+                rho_claude::accounts::ClaudePaths::at(
+                    camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
+                ),
                 rho_workspaces::UserEnvironment::new(Default::default()),
                 PlatformSecrets::default(),
                 root.join("octo.sock"),

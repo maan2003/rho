@@ -404,6 +404,11 @@ fn up(args: UpArgs) -> Result<()> {
     let daemon = command(bin.daemon(), &root)
         .arg("--socket-path")
         .arg(&socket)
+        // Named outright, not left to the environment. A daemon that resolves
+        // its Claude directory from `$HOME` reads the user's transcripts the
+        // moment it is started any way but this one.
+        .arg("--claude-config-dir")
+        .arg(root.join("config").join("claude"))
         .args(["--openai-base-url", &model.openai_base_url])
         .args(["--anthropic-base-url", &model.anthropic_base_url])
         .stdout(log.try_clone()?)
@@ -1216,6 +1221,10 @@ async fn probe_async(name: &str) -> Result<()> {
 /// The rig's environment: its own XDG dirs and nothing of the user's. The
 /// state dir is the copied state, which is what makes the daemon run on the
 /// snapshot rather than on the user's store.
+///
+/// `CLAUDE_CONFIG_DIR` is here for the binaries that still read it (the `rho`
+/// CLI); the daemon is told its Claude directory by argument instead, so a
+/// rig daemon is sealed whether or not it inherits this environment.
 fn command(program: PathBuf, root: &Path) -> Command {
     let mut command = Command::new(program);
     command

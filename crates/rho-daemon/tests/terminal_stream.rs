@@ -30,6 +30,10 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
 
     tokio::spawn(rho_daemon::run(rho_daemon::DaemonArgs {
         socket_path: Some(socket_path.clone()),
+        // As with the state directory: the test's own, never the user's.
+        claude_config_dir: Some(
+            camino::Utf8PathBuf::from_path_buf(state_dir.path().join("claude")).unwrap(),
+        ),
         iroh: false,
         cpu_profile: None,
         openai_base_url: None,
