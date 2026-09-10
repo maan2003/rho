@@ -124,6 +124,37 @@ fn configure_octo_git_transport(environment: &mut Vec<(OsString, OsString)>) -> 
     Ok(())
 }
 
+/// Puts the directories this daemon was told to use into the environment its
+/// agents are spawned with.
+///
+/// `login_environment` starts from a cleared environment and a login shell,
+/// so what comes back is whatever that shell chose and none of what this
+/// daemon was named. An agent would then work in the XDG defaults under HOME
+/// and read a Claude config home nobody named, agreeing with the daemon only
+/// by luck. What the daemon resolved wins here; the two directories it has no
+/// say over are passed on as it was started with them, or left to the login
+/// shell when it was started without them.
+fn apply_daemon_directories(
+    environment: &mut Vec<(OsString, OsString)>,
+    state_dir: &camino::Utf8Path,
+    claude: &rho_claude::accounts::ClaudePaths,
+) {
+    // The state directory is `<XDG_STATE_HOME>/rho`.
+    if let Some(state_home) = state_dir.parent() {
+        set_environment_value(environment, "XDG_STATE_HOME", state_home.as_str());
+    }
+    set_environment_value(
+        environment,
+        "CLAUDE_CONFIG_DIR",
+        claude.config_home().as_str(),
+    );
+    for name in ["XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+        if let Some(value) = std::env::var_os(name) {
+            set_environment_value(environment, name, value);
+        }
+    }
+}
+
 fn set_environment_value(
     environment: &mut Vec<(OsString, OsString)>,
     name: &str,
@@ -365,6 +396,25 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // any code still depending on process cwd fails loudly.
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
+    let db_path = default_db_path()?;
+    // The state directory is resolved here, in the binary, and handed down.
+    // Nothing below this line asks `dirs` for it: a library that resolves the
+    // user's state directory reads the user's own files from a test.
+    let state_dir = camino::Utf8PathBuf::try_from(
+        db_path
+            .parent()
+            .context("the database path has no directory")?
+            .to_owned(),
+    )
+    .context("the state directory is not valid UTF-8")?;
+    // Resolved once, here, and passed down from this point: nothing below
+    // reads `$HOME` or `$CLAUDE_CONFIG_DIR` for itself.
+    let claude = match args.claude_config_dir.clone() {
+        Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
+        None => rho_claude::accounts::ClaudePaths::from_env()?,
+    };
+    eprintln!("rho daemon: Claude configuration {}", claude.config_home());
+
     let mut user_environment = login_environment()?;
     if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
         user_environment.push(("RHO_DIRENV_PATH_BEFORE".into(), path.into()));
@@ -387,27 +437,10 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         );
         set_environment_value(&mut user_environment, "ANTHROPIC_BASE_URL", endpoint);
     }
+    apply_daemon_directories(&mut user_environment, &state_dir, &claude);
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
-    let db_path = default_db_path()?;
-    // The state directory is resolved here, in the binary, and handed down.
-    // Nothing below this line asks `dirs` for it: a library that resolves the
-    // user's state directory reads the user's own files from a test.
-    let state_dir = camino::Utf8PathBuf::try_from(
-        db_path
-            .parent()
-            .context("the database path has no directory")?
-            .to_owned(),
-    )
-    .context("the state directory is not valid UTF-8")?;
     let db = RhoDb::open(db_path);
-    // Resolved once, here, and passed down from this point: nothing below
-    // reads `$HOME` or `$CLAUDE_CONFIG_DIR` for itself.
-    let claude = match args.claude_config_dir.clone() {
-        Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
-        None => rho_claude::accounts::ClaudePaths::from_env()?,
-    };
-    eprintln!("rho daemon: Claude configuration {}", claude.config_home());
     // One-off (7 Sep), before any agent loop can append: every Claude
     // log the file copier wrote is rebuilt from its session file.
     let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db, &claude.projects()).await;
@@ -3689,6 +3722,62 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let rest = path.strip_prefix("~").ok()?;
     let home = Utf8PathBuf::try_from(dirs::home_dir()?).ok()?;
     Some(home.join(rest))
+}
+
+#[cfg(test)]
+mod daemon_directory_tests {
+    use std::ffi::OsString;
+
+    use super::apply_daemon_directories;
+
+    /// The environment an agent gets says where this daemon works, not where
+    /// a login shell would have gone. A rig daemon's agent otherwise writes
+    /// under the rig's HOME by XDG default and reads a Claude config home
+    /// nobody named; the capture carries neither, and a stale value from the
+    /// login shell has to lose to the daemon's.
+    #[test]
+    fn the_daemon_names_the_directories_its_agents_work_in() {
+        let root = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(root.path()).unwrap();
+        let state_dir = root.join("state").join("rho");
+        let claude = rho_claude::accounts::ClaudePaths::at(root.join("config").join("claude"));
+
+        let mut environment: Vec<(OsString, OsString)> = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            // What a login shell left behind: the user's, not this daemon's.
+            ("XDG_STATE_HOME".into(), "/home/someone/.local/state".into()),
+        ];
+        apply_daemon_directories(&mut environment, &state_dir, &claude);
+
+        let value = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            value("XDG_STATE_HOME").as_deref(),
+            Some(root.join("state").as_str())
+        );
+        assert_eq!(
+            value("CLAUDE_CONFIG_DIR").as_deref(),
+            Some(root.join("config").join("claude").as_str())
+        );
+        assert_eq!(
+            value("PATH").as_deref(),
+            Some("/usr/bin"),
+            "the rest is left alone"
+        );
+        // The two the daemon has no say over: passed on as it was started
+        // with them, absent when it was started without them.
+        for name in ["XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+            assert_eq!(
+                value(name),
+                std::env::var_os(name).map(|value| value.to_string_lossy().into_owned()),
+                "{name} is this process's own"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

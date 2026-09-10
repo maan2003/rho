@@ -1039,10 +1039,7 @@ mod tests {
 
         let known = std::collections::BTreeMap::from([(id.clone(), body.version())]);
         assert!(
-            !store
-                .bodies_since(&known)
-                .iter()
-                .any(|body| body.id == id),
+            !store.bodies_since(&known).iter().any(|body| body.id == id),
             "a client holding every operation of a body is sent none of it"
         );
 
