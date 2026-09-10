@@ -3357,8 +3357,13 @@ impl EditorElement {
                 diagnostics: true,
             };
             let chunks = snapshot.highlighted_chunks(rows.clone(), language_aware, style);
+            let chunks = TimedChunks { inner: chunks };
             let first_row = rows.start;
-            LineWithInvisibles::from_chunks(
+            CHUNK_WORK.set((0, 0));
+            let mut guard = gpui::profiler::EditorTimingGuard::new(
+                gpui::profiler::EditorTimingKind::HighlightedChunks,
+            );
+            let lines = LineWithInvisibles::from_chunks(
                 chunks,
                 style,
                 MAX_LINE_LEN,
@@ -3370,7 +3375,12 @@ impl EditorElement {
                 bg_segments_per_row,
                 window,
                 cx,
-            )
+            );
+            let (nanos, count) = CHUNK_WORK.get();
+            guard.touched_rows(rows.len() as u64);
+            guard.walked_items(count);
+            guard.finish_with_elapsed(Duration::from_nanos(nanos));
+            lines
         }
     }
 
@@ -8377,6 +8387,37 @@ impl Drop for EditorPrepaintGuard {
 /// with the difference that these are *inside* a frame and that one is not —
 /// a reader that adds them to the between-frame total is counting the draw
 /// twice.
+thread_local! {
+    /// Nanoseconds inside the chunk iterator and chunks taken from it, for
+    /// the prepaint that is consuming it. Set to zero before the pass and
+    /// read after, because the iterator is moved into `from_chunks` and
+    /// cannot be asked afterwards.
+    static CHUNK_WORK: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Times the highlighted-chunk iterator so a prepaint can say what
+/// producing the chunks cost apart from shaping them.
+///
+/// The two are interleaved - a chunk is taken, appended to the line, and
+/// the line is shaped when it ends - so the only way to tell them apart is
+/// to time the iterator itself.
+struct TimedChunks<I> {
+    inner: I,
+}
+
+impl<I: Iterator> Iterator for TimedChunks<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        let started = Instant::now();
+        let item = self.inner.next();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        let (nanos, count) = CHUNK_WORK.get();
+        CHUNK_WORK.set((nanos + elapsed, count + u64::from(item.is_some())));
+        item
+    }
+}
+
 struct PrepaintPasses {
     started: Instant,
     last: Instant,

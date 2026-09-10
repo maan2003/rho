@@ -1000,6 +1000,11 @@ pub enum EditorTimingKind {
     /// report a change at once - a screenful of parses finishing together -
     /// and not with the size of the document.
     MultiBufferBufferScan = 11,
+    /// Producing the highlighted chunks a screen's rows are shaped from:
+    /// the syntax, diagnostic and inlay iterators walking the drawn range.
+    /// Counted apart from the shaping because the two are interleaved in
+    /// one prepaint pass and want opposite fixes.
+    HighlightedChunks = 12,
 }
 
 const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
@@ -1197,6 +1202,21 @@ fn editor_profile_tid() -> u64 {
         let mut hasher = DefaultHasher::new();
         std::thread::current().id().hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+impl EditorTimingGuard {
+    /// Records the span with a duration the caller measured rather than the
+    /// guard's own lifetime.
+    ///
+    /// For a stage whose work is interleaved with other work inside one
+    /// call - chunk building between shaping, say - where the guard's
+    /// lifetime would charge it for both.
+    pub fn finish_with_elapsed(mut self, elapsed: Duration) {
+        if let Some((mut timing, generation)) = self.0.take() {
+            timing.end = timing.start + elapsed;
+            record_editor_timing(timing, generation);
+        }
     }
 }
 

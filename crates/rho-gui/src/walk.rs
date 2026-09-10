@@ -748,6 +748,7 @@ fn stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
         SyncTree => "tree",
         SpliceInlays => "splice_inlays",
         MultiBufferBufferScan => "buffers",
+        HighlightedChunks => "chunks",
     }
 }
 
