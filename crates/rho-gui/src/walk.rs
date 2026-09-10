@@ -45,7 +45,8 @@ pub enum WalkEvent {
 ///
 /// The three shapes ask different questions of the same window. `Prose` is
 /// settled but not elided. `Tools` puts working output in every turn, which
-/// the elision policy folds, so the document carries one fold per turn.
+/// the elision policy hides, so the document carries one display elision
+/// per turn and its cost lands in the block map, not the fold map.
 /// `ShortTurns` makes each turn a line of question and a line of answer,
 /// which is the ordinary document and the one that composes the most
 /// buffers: a buffer is a run of blocks with the same markdown flag, an

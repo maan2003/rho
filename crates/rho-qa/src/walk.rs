@@ -62,9 +62,10 @@ const HISTORY_PAGING_DRIVE: &[WalkEvent] = &[
 /// The keystroke first, on the composed screen, then five pairs of a jump
 /// to the top and the idle that composes the next chunk of history - the
 /// same climb the paging run makes, over a document that hides most of
-/// itself. What it is here to read is the `fold:` count, which is elision's
-/// line in a step's walk: the paging run's document is concealed markup
-/// only, and markup's number is not elision's.
+/// itself. What it is here to read is the `block:` count, which is
+/// elision's line in a step's walk now that an elision is a display elision
+/// in the block map and not a fold: the paging run's document is concealed
+/// markup only, and markup's number is not elision's.
 ///
 /// A streamed chunk stands at each end of that climb, and it is the same
 /// event both times, so a reader of the gate can compare a step against
