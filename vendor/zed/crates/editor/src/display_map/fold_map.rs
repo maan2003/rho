@@ -1,7 +1,7 @@
 use crate::display_map::inlay_map::InlayChunk;
 
 use super::{
-    ElisionPolicy, Highlights,
+    Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
 use collections::{HashMap, HashSet};
@@ -232,17 +232,11 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
 pub(crate) struct FoldMapWriter<'a>(&'a mut FoldMap);
 
 pub(crate) trait FoldInput<T> {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy);
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder);
 }
 
 impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder) {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
-        (self.0, self.1, ElisionPolicy::Hidden)
-    }
-}
-
-impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder, ElisionPolicy) {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder) {
         self
     }
 }
@@ -257,7 +251,7 @@ impl FoldMapWriter<'_> {
         let mut folds = Vec::new();
         let snapshot = self.0.snapshot.inlay_snapshot.clone();
         for input in ranges.into_iter() {
-            let (range, fold_text, elision_policy) = input.into_parts();
+            let (range, fold_text) = input.into_parts();
             let buffer = &snapshot.buffer;
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
 
@@ -271,7 +265,6 @@ impl FoldMapWriter<'_> {
                 id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                 range: FoldRange(fold_range),
                 placeholder: fold_text,
-                elision_policy,
             });
 
             let inlay_range =
@@ -344,13 +337,13 @@ impl FoldMapWriter<'_> {
         let buffer = &snapshot.buffer;
         let mut desired = Vec::new();
         for input in ranges {
-            let (range, placeholder, elision_policy) = input.into_parts();
+            let (range, placeholder) = input.into_parts();
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
             if range.is_empty() {
                 continue;
             }
             let anchors = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-            desired.push((range, FoldRange(anchors), placeholder, elision_policy));
+            desired.push((range, FoldRange(anchors), placeholder));
         }
 
         let mut existing_by_range: HashMap<_, Vec<Fold>> = HashMap::default();
@@ -374,15 +367,12 @@ impl FoldMapWriter<'_> {
         drop(cursor);
 
         let mut edits = Vec::new();
-        for (range, anchors, placeholder, elision_policy) in desired {
+        for (range, anchors, placeholder) in desired {
             let key = (range.start, range.end);
             let existing = existing_by_range.get_mut(&key).and_then(|folds| {
                 folds
                     .iter()
-                    .position(|fold| {
-                        fold.elision_policy == elision_policy
-                            && fold.placeholder.equivalent_for_replacement(&placeholder)
-                    })
+                    .position(|fold| fold.placeholder.equivalent_for_replacement(&placeholder))
                     .map(|ix| folds.swap_remove(ix))
             });
             if let Some(existing) = existing {
@@ -392,7 +382,6 @@ impl FoldMapWriter<'_> {
                     id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                     range: anchors,
                     placeholder,
-                    elision_policy,
                 };
                 self.0.snapshot.fold_metadata_by_id.insert(
                     fold.id,
@@ -989,228 +978,78 @@ impl FoldMap {
                 })
                 .peekable();
 
-                // Round again when the folds emitted below reach past the
-                // end of the edit; see the overshoot at the end of the loop.
-                loop {
-                    while folds
-                        .peek()
-                        .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
-                    {
-                        let (fold, mut fold_range) = folds.next().unwrap();
-                        let sum = new_transforms.summary();
-
-                        // Historical anchors at the edit boundary can make the
-                        // intersection cursor include a fold already copied in full.
-                        if fold_range.end.0 <= sum.input.len {
-                            continue;
-                        }
-                        // A fold under `ElisionPolicy::Tail` is two
-                        // transforms, a placeholder over its head and the
-                        // visible tail after it, so the prefix copied above
-                        // can stop between them: the boundary it lands on
-                        // is inside the fold's range, and the fold the
-                        // cursor yields here is one whose head is already
-                        // in the tree. What is left of it is the tail,
-                        // which is text.
-                        //
-                        // Zed does not meet this because a fold there is
-                        // one transform whatever it holds, so no boundary
-                        // is ever inside one and a fold the cursor yields
-                        // is either wholly copied or wholly ahead.
-                        if fold_range.start.0 < sum.input.len {
-                            let text_summary = inlay_snapshot
-                                .text_summary_for_range(InlayOffset(sum.input.len)..fold_range.end);
-                            push_isomorphic(&mut new_transforms, text_summary);
-                            continue;
-                        }
-
-                        while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
-                            next_fold_range.start < fold_range.end
-                                || (next_fold_range.start == fold_range.end
-                                    && fold.elision_policy == ElisionPolicy::Hidden
-                                    && next_fold.elision_policy == ElisionPolicy::Hidden
-                                    && fold.placeholder.merge_adjacent
-                                    && next_fold.placeholder.merge_adjacent)
-                        }) {
-                            let (_, next_fold_range) = folds.next().unwrap();
-                            if next_fold_range.end > fold_range.end {
-                                fold_range.end = next_fold_range.end;
-                            }
-                        }
-
-                        if fold_range.start.0 > sum.input.len {
-                            let text_summary = inlay_snapshot.text_summary_for_range(
-                                InlayOffset(sum.input.len)..fold_range.start,
-                            );
-                            push_isomorphic(&mut new_transforms, text_summary);
-                        }
-
-                        let (placeholder_range, visible_tail_range) =
-                            elided_ranges(&inlay_snapshot, fold_range, fold.elision_policy);
-
-                        if let Some(fold_range) = placeholder_range {
-                            const ELLIPSIS: &str = "⋯";
-
-                            let placeholder_text: SharedString = fold
-                                .placeholder
-                                .collapsed_text
-                                .clone()
-                                .unwrap_or_else(|| ELLIPSIS.into());
-                            let chars_bitmap = placeholder_text
-                                .char_indices()
-                                .fold(0u128, |bitmap, (idx, _)| {
-                                    bitmap | 1u128.unbounded_shl(idx as u32)
-                                });
-
-                            let fold_id = fold.id;
-                            new_transforms.push(
-                                Transform {
-                                    summary: TransformSummary {
-                                        output: MBTextSummary::from(placeholder_text.as_ref()),
-                                        input: inlay_snapshot.text_summary_for_range(
-                                            fold_range.start..fold_range.end,
-                                        ),
-                                    },
-                                    placeholder: Some(TransformPlaceholder {
-                                        text: placeholder_text,
-                                        chars: chars_bitmap,
-                                        renderer: ChunkRenderer {
-                                            id: ChunkRendererId::Fold(fold.id),
-                                            render: Arc::new(move |cx| {
-                                                (fold.placeholder.render)(
-                                                    fold_id,
-                                                    fold.range.0.clone(),
-                                                    cx.context,
-                                                )
-                                            }),
-                                            constrain_width: fold.placeholder.constrain_width,
-                                            measured_width: self.snapshot.fold_width(&fold_id),
-                                        },
-                                    }),
-                                },
-                                (),
-                            );
-                        }
-
-                        if let Some(tail_range) = visible_tail_range {
-                            let text_summary = inlay_snapshot.text_summary_for_range(tail_range);
-                            push_isomorphic(&mut new_transforms, text_summary);
-                        }
-                    }
-
-                    // A fold that starts inside the edit can end well after it,
-                    // and it is emitted whole, so the tree can now describe
-                    // input the cursor has not walked past. Past the edit both
-                    // sides are the same text at a constant shift, so that
-                    // input sits the same distance ahead of the cursor in the
-                    // old tree. Leave the cursor where it is and the suffix
-                    // appended below repeats those bytes: the tree then claims
-                    // a longer document than the inlay snapshot under it, and
-                    // rows resolve to offsets that are not theirs.
-                    //
-                    // Zed does not meet this because a hidden fold covers the
-                    // same anchored range before and after, so stepping past
-                    // the old fold transform steps past the right amount.
-                    // `ElisionPolicy::Tail` is ours and splits one fold into a
-                    // placeholder over the head and a visible tail, by rows, so
-                    // the extent of what is emitted moves as the text under it
-                    // does and stops matching the old transform.
+                while folds
+                    .peek()
+                    .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
+                {
+                    let (fold, mut fold_range) = folds.next().unwrap();
                     let sum = new_transforms.summary();
-                    if sum.input.len <= edit.new.end.0 {
-                        break;
+
+                    // Historical anchors at the edit boundary can make the
+                    // intersection cursor include a fold already copied in full.
+                    if fold_range.end.0 <= sum.input.len {
+                        continue;
                     }
-                    // How much further the new tree reached than the
-                    // edit's end, and where in the old tree that is. Both
-                    // steps go through the buffer: `sum.input.len` and
-                    // `edit.new.end` are new-side inlay offsets and the
-                    // cursor stands in the old tree, and an inlay is bytes
-                    // one side has and the other does not, so adding a
-                    // new-side length to an old-side offset is only right
-                    // when no inlay lies between them. Buffer bytes past
-                    // the edit are the same bytes on both sides, so the
-                    // distance is measured there and laid off from the
-                    // cursor's own buffer position.
-                    let reached = inlay_snapshot.to_buffer_offset(InlayOffset(sum.input.len));
-                    let edit_end = inlay_snapshot.to_buffer_offset(edit.new.end);
-                    let overshoot = reached.0 - edit_end.0;
-                    let covered_buffer = MultiBufferOffset(
-                        old_inlay_snapshot.to_buffer_offset(*cursor.start()).0 + overshoot,
-                    );
-                    let covered = widen_end_over_inlays(&old_inlay_snapshot, covered_buffer);
-                    cursor.seek_forward(&covered, Bias::Right);
-                    if cursor.item().is_some_and(|item| !item.is_fold())
-                        && *cursor.start() != covered
-                    {
-                        // The new tree ends part way through a plain run of
-                        // text. A fold has no meaningful half, but text
-                        // does: emit the part of this transform the new
-                        // tree has not described yet, from the new
-                        // snapshot, and step past it. The edit is not
-                        // touched. Widening it to the end of this transform
-                        // instead - which is what this did before - makes
-                        // an edit that reaches the end of the document
-                        // whenever the run does, and an edit that size is
-                        // O(rows composed so far) on every batch that gets
-                        // here, which is the cost rule broken rather than
-                        // exceeded.
-                        let remainder =
-                            old_inlay_snapshot.to_buffer_offset(cursor.end()).0 - covered_buffer.0;
-                        let remainder_end = widen_end_over_inlays(
-                            &inlay_snapshot,
-                            MultiBufferOffset(reached.0 + remainder),
-                        );
-                        if remainder_end.0 > sum.input.len {
-                            let text_summary = inlay_snapshot
-                                .text_summary_for_range(InlayOffset(sum.input.len)..remainder_end);
-                            push_isomorphic(&mut new_transforms, text_summary);
+                    while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
+                        next_fold_range.start < fold_range.end
+                            || (next_fold_range.start == fold_range.end
+                                && fold.placeholder.merge_adjacent
+                                && next_fold.placeholder.merge_adjacent)
+                    }) {
+                        let (_, next_fold_range) = folds.next().unwrap();
+                        if next_fold_range.end > fold_range.end {
+                            fold_range.end = next_fold_range.end;
                         }
-                        // The edit has to name everything the new tree
-                        // re-described, or the maps above are never told
-                        // that part of their document changed - but that is
-                        // `covered`, the extent of what was re-described,
-                        // and not the end of the transform it landed in.
-                        if covered > edit.old.end {
-                            edit.old.end = covered;
-                        }
-                        cursor.next();
-                        delta += absorb_edits_behind_the_cursor(
-                            &mut edit,
-                            &mut cursor,
-                            &mut inlay_edits_iter,
-                            false,
-                        );
-                        edit.new.end = InlayOffset(MultiBufferOffset(
-                            ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
-                        ));
-                        break;
                     }
-                    if *cursor.start() == covered {
-                        // The old tree has a boundary where the new one now
-                        // ends - the usual case, since a fold ends at the
-                        // same anchor on both sides - and the suffix starts
-                        // there.
-                        let absorbed = absorb_edits_behind_the_cursor(
-                            &mut edit,
-                            &mut cursor,
-                            &mut inlay_edits_iter,
-                            true,
-                        );
-                        delta += absorbed;
-                        edit.new.end = InlayOffset(MultiBufferOffset(
-                            ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
-                        ));
-                        break;
+
+                    if fold_range.start.0 > sum.input.len {
+                        let text_summary = inlay_snapshot
+                            .text_summary_for_range(InlayOffset(sum.input.len)..fold_range.start);
+                        push_isomorphic(&mut new_transforms, text_summary);
                     }
-                    // An emitted fold always reaches an anchored fold end.
-                    // If the fold was retained, that anchor is also the end
-                    // of its old transform, so `covered` is a boundary. If it
-                    // is new, the old tree is plain there. An old fold that
-                    // encloses a shorter new fold was already taken whole by
-                    // the initial seek, so the shorter fold cannot overshoot
-                    // the widened edit. Those are all possible old-tree
-                    // shapes; landing inside an old fold would mean the two
-                    // trees disagree about a retained fold's end.
-                    unreachable!("emitted fold end landed inside an old fold transform");
+
+                    if fold_range.start < fold_range.end {
+                        const ELLIPSIS: &str = "⋯";
+
+                        let placeholder_text: SharedString = fold
+                            .placeholder
+                            .collapsed_text
+                            .clone()
+                            .unwrap_or_else(|| ELLIPSIS.into());
+                        let chars_bitmap = placeholder_text
+                            .char_indices()
+                            .fold(0u128, |bitmap, (idx, _)| {
+                                bitmap | 1u128.unbounded_shl(idx as u32)
+                            });
+
+                        let fold_id = fold.id;
+                        new_transforms.push(
+                            Transform {
+                                summary: TransformSummary {
+                                    output: MBTextSummary::from(placeholder_text.as_ref()),
+                                    input: inlay_snapshot
+                                        .text_summary_for_range(fold_range.start..fold_range.end),
+                                },
+                                placeholder: Some(TransformPlaceholder {
+                                    text: placeholder_text,
+                                    chars: chars_bitmap,
+                                    renderer: ChunkRenderer {
+                                        id: ChunkRendererId::Fold(fold.id),
+                                        render: Arc::new(move |cx| {
+                                            (fold.placeholder.render)(
+                                                fold_id,
+                                                fold.range.0.clone(),
+                                                cx.context,
+                                            )
+                                        }),
+                                        constrain_width: fold.placeholder.constrain_width,
+                                        measured_width: self.snapshot.fold_width(&fold_id),
+                                    },
+                                }),
+                            },
+                            (),
+                        );
+                    }
                 }
 
                 let sum = new_transforms.summary();
@@ -2125,61 +1964,6 @@ where
     absorbed
 }
 
-fn elided_ranges(
-    inlay_snapshot: &InlaySnapshot,
-    fold_range: Range<InlayOffset>,
-    elision_policy: ElisionPolicy,
-) -> (Option<Range<InlayOffset>>, Option<Range<InlayOffset>>) {
-    if fold_range.start >= fold_range.end {
-        return (None, None);
-    }
-
-    match elision_policy {
-        ElisionPolicy::Visible => (None, Some(fold_range)),
-        ElisionPolicy::Hidden => (Some(fold_range), None),
-        ElisionPolicy::Tail { rows } => {
-            if rows == 0 {
-                return (Some(fold_range), None);
-            }
-
-            let start_point = inlay_snapshot.to_point(fold_range.start);
-            let end_point = inlay_snapshot.to_point(fold_range.end);
-            let tail_start_row = end_point
-                .row()
-                .saturating_sub(rows.saturating_sub(1))
-                .max(start_point.row());
-            // The elided head stops at the end of the row above the tail,
-            // not at the tail's first column: the newline between them has
-            // to survive, or the tail's first row is not a row at all — it
-            // is drawn on the end of the placeholder's row, and a policy
-            // that promises `rows` visible rows delivers `rows - 1` of them
-            // plus a fragment.
-            let tail_start = if tail_start_row == 0 {
-                fold_range.start
-            } else {
-                inlay_snapshot
-                    .to_offset(InlayPoint(Point::new(
-                        tail_start_row - 1,
-                        inlay_snapshot.line_len(tail_start_row - 1),
-                    )))
-                    .max(fold_range.start)
-                    .min(fold_range.end)
-            };
-
-            if tail_start <= fold_range.start {
-                (None, Some(fold_range))
-            } else if tail_start >= fold_range.end {
-                (Some(fold_range), None)
-            } else {
-                (
-                    Some(fold_range.start..tail_start),
-                    Some(tail_start..fold_range.end),
-                )
-            }
-        }
-    }
-}
-
 fn intersecting_folds<'a>(
     inlay_snapshot: &'a InlaySnapshot,
     folds: &'a SumTree<Fold>,
@@ -2344,7 +2128,6 @@ pub struct Fold {
     pub id: FoldId,
     pub range: FoldRange,
     pub placeholder: FoldPlaceholder,
-    pub elision_policy: ElisionPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3170,28 +2953,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [kept_fold_id]
         );
-    }
-
-    #[gpui::test]
-    fn test_tail_elision(cx: &mut gpui::App) {
-        init_test(cx);
-        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\nfive", cx);
-        let buffer_snapshot = buffer.read(cx).snapshot(cx);
-        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
-        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
-
-        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
-        writer.fold(vec![(
-            Point::new(0, 0)..Point::new(4, 4),
-            FoldPlaceholder::test(),
-            ElisionPolicy::Tail { rows: 2 },
-        )]);
-
-        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
-        // The placeholder keeps its own row: the newline above the tail is
-        // outside the elided head, so "four" starts a row rather than
-        // running on from the fold.
-        assert_eq!(snapshot.text(), "⋯\nfour\nfive");
     }
 
     #[gpui::test]

@@ -9,11 +9,11 @@
 //! way round.
 //!
 //! This is that invariant as a test rather than as a rig session, written
-//! around the shape they named: `ElisionPolicy::Tail` computes its split on
-//! inlay points, two layers below wrap, so a tail boundary lands wherever it
-//! happens to fall inside a wrapped row. That is the default here and not a
-//! coincidence to be tuned for — every row in this document is long enough
-//! to wrap at the widths used.
+//! around the shape they named: a fold is computed on inlay points, two
+//! layers below wrap, so a fold boundary lands wherever it happens to fall
+//! inside a wrapped row. Both ends of the fold here are mid-line for that
+//! reason, and every row in this document is long enough to wrap at the
+//! widths used.
 //!
 //! The invariant is asserted, not one run's numbers: this test does not know
 //! what the right row count is and does not claim to. It knows only that one
@@ -21,19 +21,20 @@
 
 use gpui::{TestAppContext, px, size};
 
-/// A fold with a visible tail does not leave the wrap map shorter than the
-/// tab map it wrapped, at the width it was folded at or at a new one.
+/// A fold whose ends fall inside wrapped rows does not leave the wrap map
+/// shorter than the tab map it wrapped, at the width it was folded at or at
+/// a new one.
 ///
 /// The rewrap is half the test. A width change is what re-derives every
 /// wrap row over a fold boundary that has not moved, which is the moment
 /// the two layers have to agree again about a boundary neither of them
 /// chose.
 #[gpui::test]
-fn a_tail_fold_never_leaves_wrap_shorter_than_tab(cx: &mut TestAppContext) {
-    struct TailFoldInThisTest;
+fn a_mid_row_fold_never_leaves_wrap_shorter_than_tab(cx: &mut TestAppContext) {
+    struct FoldInThisTest;
 
     cx.update(crate::tests::init_test_app);
-    // Every row wraps several times at these widths, so a tail boundary
+    // Every row wraps several times at these widths, so a fold boundary
     // landing mid-wrapped-row is the ordinary case and not a contrivance.
     let long_line = "wrap me ".repeat(40);
     let body = (0..24)
@@ -54,8 +55,11 @@ fn a_tail_fold_never_leaves_wrap_shorter_than_tab(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_wrap_is_not_shorter_than_tab(&editor, cx, "before any fold");
 
-    let fold_start = body.find("6 ").expect("row six");
-    let fold_end = body.find("17 ").expect("row seventeen");
+    // Inside the rows rather than at their starts: a boundary at a line
+    // start is one wrap boundary as well, and the invariant is about the
+    // boundaries neither layer chose.
+    let fold_start = body.find("6 ").expect("row six") + 30;
+    let fold_end = body.find("17 ").expect("row seventeen") + 30;
     editor
         .update(cx, |editor, _, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -66,20 +70,19 @@ fn a_tail_fold_never_leaves_wrap_shorter_than_tab(cx: &mut TestAppContext) {
                     vec![
                         editor::display_map::Crease::simple(
                             range,
-                            editor::FoldPlaceholder::concealed(std::any::TypeId::of::<
-                                TailFoldInThisTest,
-                            >()),
-                        )
-                        .with_elision_policy(editor::display_map::ElisionPolicy::Tail { rows: 3 }),
+                            editor::FoldPlaceholder::concealed(
+                                std::any::TypeId::of::<FoldInThisTest>(),
+                            ),
+                        ),
                     ],
                     cx,
                 );
             });
             editor.display_snapshot(cx);
         })
-        .expect("fold the middle with a visible tail");
+        .expect("fold the middle");
     cx.run_until_parked();
-    assert_wrap_is_not_shorter_than_tab(&editor, cx, "with a tail fold");
+    assert_wrap_is_not_shorter_than_tab(&editor, cx, "with a mid-row fold");
 
     // A rewrap at each width, with the fold left exactly where it is. The
     // boundary does not move; what a row is does.

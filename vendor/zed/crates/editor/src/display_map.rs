@@ -824,7 +824,6 @@ impl DisplayMap {
                         fold.range.to_offset(other.buffer_snapshot()),
                         fold.placeholder.clone(),
                     )
-                    .with_elision_policy(fold.elision_policy)
                 })
                 .collect(),
             cx,
@@ -859,13 +858,10 @@ impl DisplayMap {
 
         let inline = creases.iter().filter_map(|crease| {
             if let Crease::Inline {
-                range,
-                placeholder,
-                elision_policy,
-                ..
+                range, placeholder, ..
             } = crease
             {
-                Some((range.clone(), placeholder.clone(), *elision_policy))
+                Some((range.clone(), placeholder.clone()))
             } else {
                 None
             }
@@ -965,11 +961,8 @@ impl DisplayMap {
 
         let inline = creases.into_iter().filter_map(|crease| match crease {
             Crease::Inline {
-                range,
-                placeholder,
-                elision_policy,
-                ..
-            } => Some((range, placeholder, elision_policy)),
+                range, placeholder, ..
+            } => Some((range, placeholder)),
             Crease::Block { .. } => None,
         });
         let (snapshot, edits) = fold_map.replace_folds_with_type(type_id, inline);
@@ -2829,14 +2822,12 @@ impl DisplaySnapshot {
                 Crease::Inline {
                     range,
                     placeholder,
-                    elision_policy,
                     render_toggle,
                     render_trailer,
                     metadata,
                 } => Some(Crease::Inline {
                     range: range.to_point(self.buffer_snapshot()),
                     placeholder: placeholder.clone(),
-                    elision_policy: *elision_policy,
                     render_toggle: render_toggle.clone(),
                     render_trailer: render_trailer.clone(),
                     metadata: metadata.clone(),
@@ -2926,7 +2917,6 @@ impl DisplaySnapshot {
             Some(Crease::Inline {
                 range: start..end,
                 placeholder: self.fold_placeholder.clone(),
-                elision_policy: ElisionPolicy::Hidden,
                 render_toggle: None,
                 render_trailer: None,
                 metadata: None,
