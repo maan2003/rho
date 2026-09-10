@@ -121,57 +121,75 @@ struct JobState {
 /// functions.
 pub fn python_instructions(specs: &[ToolSpec]) -> String {
     let mut description = String::from(
-        r#"## Python Code Mode
+        "## Python Code Mode
 
 `exec` is your only top-level tool. Issue at most one exec call per response.
 It runs a persistent Python notebook with top-level await. Globals are shared;
 live cells interleave at await. Use shell commands to inspect files and Python
 to manipulate their data.
-The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary imports.
+The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary \
+imports.
 
-Work registers immediately; output arrives automatically. Put independent calls in the same cell to run them concurrently; await only when later Python statements depend on completion.
-- command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are optional. Awaiting it returns completion metadata (id, exit_code), not stdout.
-- write_stdin(handle, chars='', max_tokens=2000) registers an input write and retained-output read. It waits for stdin readiness, not subsequent output; an empty page is valid. Await only if Python needs the returned page or write completion. display(handle) also reads a page.
-- handle.cancel() requests cancellation of a running command. Awaiting handle.cancel() waits only for the cancellation request to be handled; await handle to wait for the command to finish.
-- agents.spawn_new_advisor("...") starts an advisor consultation immediately. Include the question, relevant file paths, scope, and desired output in the string. Output arrives automatically; await only when code needs its result. Full guidance, examples, and argument schema are below when available.
-- Before delegating, call display(agents.delegate_engineer) to read its full guidance and arguments. display(callable) shows its documentation.
-- Host functions register work immediately. Await only for Python dependencies; text results are strings, JSON results are parsed values.
-- Pending commands and operations expose session IDs from 1000 through 9999 when first reported as running. These are display labels derived from internal IDs and repeat every 9000 internal requests; use Python handles to await, inspect, or cancel commands. Commands finishing before their first reply do not expose an ID. Later output uses the same identity. A reply does not mean the source finished. Latest-cell sources are reported first, then older cells; sources within each cell follow registration order, without waiting for earlier sources to finish.
+Work registers immediately; output arrives automatically. Put independent calls in the same cell \
+to run them concurrently; await only when later Python statements depend on completion.
+- command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are \
+optional. Awaiting it returns completion metadata (id, exit_code), not stdout.
+- write_stdin(handle, chars='', max_tokens=2000) registers an input write and retained-output \
+read. It waits for stdin readiness, not subsequent output; an empty page is valid. Await only \
+if Python needs the returned page or write completion. display(handle) also reads a page.
+- handle.cancel() requests cancellation of a running command. Awaiting handle.cancel() waits only \
+for the cancellation request to be handled; await handle to wait for the command to finish.
+- agents.spawn_new_advisor(\"...\") starts an advisor consultation immediately. Include the \
+question, relevant file paths, scope, and desired output in the string. Output arrives \
+automatically; await only when code needs its result. Full guidance, examples, and argument \
+schema are below when available.
+- Before delegating, call display(agents.delegate_engineer) to read its full guidance and \
+arguments. display(callable) shows its documentation.
+- Host functions register work immediately. Await only for Python dependencies; text results are \
+strings, JSON results are parsed values.
+- Pending commands and operations expose session IDs from 1000 through 9999 when first reported as \
+running. These are display labels derived from internal IDs and repeat every 9000 internal \
+requests; use Python handles to await, inspect, or cancel commands. Commands finishing before \
+their first reply do not expose an ID. Later output uses the same identity. A reply does not \
+mean the source finished. Latest-cell sources are reported first, then older cells; sources \
+within each cell follow registration order, without waiting for earlier sources to finish.
 
-Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner unless tool wakeups are disabled. image((await view_image(path=...))["content"][0]) displays a returned image reference.
+Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, \
+max_tokens=2000) is meaningful output that wakes sooner unless tool wakeups are disabled. \
+image((await view_image(path=...))[\"content\"][0]) displays a returned image reference.
 
 Examples
 
 Run independent inspections concurrently in one exec—no gather, await, or result-printing:
 ```python
-command("git diff --stat")
-command("rg -n 'TODO' src")
+command(\"git diff --stat\")
+command(\"rg -n 'TODO' src\")
 ```
 
 Search the web without awaiting or reprinting the result:
 ```python
-web.run(search_query=[{"q": "Python asyncio TaskGroup documentation"}])
+web.run(search_query=[{\"q\": \"Python asyncio TaskGroup documentation\"}])
 ```
 Use the returned references in a later cell for web.run(open=[...]).
 
 After editing a file, await only the dependencies:
 ```python
-Path("config.toml").write_text(updated_config)
-check = await command("cargo check")
-if check["exit_code"] == 0:
-    command("cargo test")
+Path(\"config.toml\").write_text(updated_config)
+check = await command(\"cargo check\")
+if check[\"exit_code\"] == 0:
+    command(\"cargo test\")
 ```
 
 Use Python directly to manipulate file data:
 ```python
-config = Path("config.toml")
-config.write_text(config.read_text().replace("retries = 2", "retries = 3"))
+config = Path(\"config.toml\")
+config.write_text(config.read_text().replace(\"retries = 2\", \"retries = 3\"))
 ```
 
 Send stdin without blocking the notebook:
 ```python
-job = command("python3 -c 'print(input())'", max_tokens=100)
-write_stdin(job, "hello\n")
+job = command(\"python3 -c 'print(input())'\", max_tokens=100)
+write_stdin(job, \"hello\\n\")
 ```
 After automatic completion, a later cell can expand retained output:
 ```python
@@ -180,7 +198,7 @@ write_stdin(job, max_tokens=6000)
 
 Keep a handle if you may want to stop a command:
 ```python
-job = command("sleep 600")
+job = command(\"sleep 600\")
 ```
 Cancel it from a later cell; completion arrives automatically:
 ```python
@@ -191,11 +209,11 @@ await job
 
 A live monitoring cell:
 ```python
-progress = {"checks": 0}
-while not Path("results.json").exists():
-    progress["checks"] += 1
+progress = {\"checks\": 0}
+while not Path(\"results.json\").exists():
+    progress[\"checks\"] += 1
     await asyncio.sleep(5)
-notify("Results are ready")
+notify(\"Results are ready\")
 ```
 Inspect its globals in a later cell without stopping it:
 ```python
@@ -204,8 +222,8 @@ text(progress)
 The default check-in interval is 120 seconds. Omit set_checkin unless you want
 a different interval or want to suppress tool wakeups. Set it alongside the work:
 ```python
-command("git diff --check")
-command("cargo test")
+command(\"git diff --check\")
+command(\"cargo test\")
 set_checkin(after_seconds=300)
 ```
 Then end the model turn. No separate exec is needed; this does not sleep or block Python.
@@ -215,19 +233,29 @@ may resume after its originating model turn has ended.
 Wait for an advisor answer without tool events waking you early:
 ```python
 set_checkin(after_seconds=300, wake_on_tools=False)
-agents.spawn_new_advisor("Review the current diff for correctness. Report concrete blockers only.")
+agents.spawn_new_advisor(\"Review the current diff for correctness. Report concrete blockers \
+only.\")
 ```
 The advisor's mail or a user message can wake you before the timer. Other work keeps running.
 
 Details and limits
-- Explicit output reads have a separate cursor starting at byte 0, so they can repeat automatic previews. Wait for command completion only if Python needs a complete final read.
-- Budgets are capped at 10000 tokens. Each command retains its first 8 MiB with explicit overflow counts. Up to 64 handles are retained; oldest completed, delivered handles may be evicted. Up to 32 image references are retained.
-- set_checkin(after_seconds=300, wake_on_tools=True) accepts 1..3600 seconds and overrides only this turn's default 120-second interval. By default, tool output and completion can wake earlier.
-- set_checkin(after_seconds=300, wake_on_tools=False) waits for the timer, user messages, or agent mail (such as an advisor answer). No tool event wakes early: this includes current and older commands, host operations, errors, notify(), and exec completion. Work continues and buffered output is delivered on the next wake. Old cells cannot change a newer turn's policy.
-- Python is in-process, not a sandbox. Cwd is private to the notebook; other process-global APIs retain normal semantics. Native extension packages are unsupported.
+- Explicit output reads have a separate cursor starting at byte 0, so they can repeat automatic \
+previews. Wait for command completion only if Python needs a complete final read.
+- Budgets are capped at 10000 tokens. Each command retains its first 8 MiB with explicit overflow \
+counts. Up to 64 handles are retained; oldest completed, delivered handles may be evicted. Up \
+to 32 image references are retained.
+- set_checkin(after_seconds=300, wake_on_tools=True) accepts 1..3600 seconds and overrides only \
+this turn's default 120-second interval. By default, tool output and completion can wake \
+earlier.
+- set_checkin(after_seconds=300, wake_on_tools=False) waits for the timer, user messages, or agent \
+mail (such as an advisor answer). No tool event wakes early: this includes current and older \
+commands, host operations, errors, notify(), and exec completion. Work continues and buffered \
+output is delivered on the next wake. Old cells cannot change a newer turn's policy.
+- Python is in-process, not a sandbox. Cwd is private to the notebook; other process-global APIs \
+retain normal semantics. Native extension packages are unsupported.
 
 Available tools:
-"#,
+",
     );
     for spec in specs {
         let name = spec.name.as_str();
