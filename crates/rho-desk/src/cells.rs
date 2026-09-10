@@ -441,21 +441,6 @@ pub struct AgentVerdict {
     pub newest: StoryPos,
 }
 
-/// The agent facts a verdict entry claims, read back out of its changes,
-/// so a checker can rebuild the same shape the writer built.
-pub fn agent_verdict(id: &Id, changes: &[FactChange]) -> Option<AgentVerdict> {
-    if !matches!(id, Id::Agent(_)) {
-        return None;
-    }
-    changes
-        .iter()
-        .filter(|change| &change.id == id)
-        .find_map(|change| match change.after.as_ref()? {
-            Property::AgentHandledThrough(pos) => Some(AgentVerdict { newest: *pos }),
-            _ => None,
-        })
-}
-
 pub fn verdict_changes(
     id: &Id,
     verdict: &Verdict,
