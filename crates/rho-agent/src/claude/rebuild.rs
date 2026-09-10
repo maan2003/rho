@@ -417,6 +417,7 @@ mod tests {
                     AgentEvent::Sent { .. } => "sent",
                     AgentEvent::Replied { .. } => "replied",
                     AgentEvent::Failed { .. } => "failed",
+                    AgentEvent::PythonStream { .. } => "python-stream",
                     AgentEvent::Turn { .. } => "turn",
                     AgentEvent::Presented { .. } => "presented",
                     AgentEvent::Wants { .. } => "wants",

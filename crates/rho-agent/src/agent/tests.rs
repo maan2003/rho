@@ -51,7 +51,7 @@ impl Ask {
     fn recheck(&self, now: UnixMs) -> Option<UnixMs> {
         match self.boundary(now) {
             Boundary::No { recheck } => recheck,
-            Boundary::Now | Boundary::AbortAndResend => None,
+            Boundary::Now | Boundary::AbortAndResend | Boundary::RetryExhausted => None,
         }
     }
 
@@ -1511,4 +1511,32 @@ fn checkin_can_suppress_all_tool_wakes_without_suppressing_timer_user_or_mail() 
             }
         }
     }
+}
+
+#[test]
+fn provider_retries_use_boundary_backoff_even_with_fresh_command_output() {
+    let mut schedule = ask(vec![SourceKind::Tool {
+        answer: ToolCallAnswer::Owed,
+        haste: ToolHaste::Ended { at: UnixMs(100) },
+    }]);
+    schedule.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Retry {
+            since: UnixMs(100),
+            failed_at: UnixMs(100),
+            attempts: 1,
+            error: Arc::from("overloaded"),
+        },
+    };
+    assert_eq!(schedule.recheck(UnixMs(100)), Some(UnixMs(1_100)));
+    assert_eq!(schedule.boundary(UnixMs(1_100)), Boundary::Now);
+    assert_eq!(
+        schedule.boundary(UnixMs(100 + 8 * 60 * 60 * 1000)),
+        Boundary::RetryExhausted
+    );
+    schedule.sources.push(SourceKind::User {
+        interrupt: false,
+        oldest_at: Some(UnixMs(101)),
+    });
+    assert_eq!(schedule.boundary(UnixMs(101)), Boundary::Now);
 }

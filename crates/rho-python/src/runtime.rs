@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -78,6 +78,8 @@ pub(super) fn spawn(
                             })?;
                             let cell = match &event {
                                 Event::Started { cell }
+                                | Event::UnitReady { cell, .. }
+                                | Event::UnitSettled { cell, .. }
                                 | Event::Returned { cell, .. }
                                 | Event::Call { cell, .. }
                                 | Event::Text { cell, .. }
@@ -172,8 +174,56 @@ pub(super) fn spawn(
                             }
                         },
                     );
+                    let compilers = Mutex::new(HashMap::<
+                        u64,
+                        rustpython_vm::compiler::StreamingCompiler,
+                    >::new());
+                    let stream_next = vm.new_function(
+                        "_stream_next",
+                        move |cell: u64,
+                              fragment: String,
+                              eof: bool,
+                              close: bool,
+                              vm: &VirtualMachine|
+                              -> PyResult {
+                            let mut compilers = compilers.lock().unwrap();
+                            if close {
+                                compilers.remove(&cell);
+                                return Ok(vm.ctx.none());
+                            }
+                            let compiler = compilers.entry(cell).or_insert_with(|| {
+                                rustpython_vm::compiler::StreamingCompiler::new(
+                                    format!("<rho-cell-{cell}>"),
+                                    rustpython_vm::compiler::CompileOpts {
+                                        allow_top_level_await: true,
+                                        ..vm.compile_opts()
+                                    },
+                                )
+                            });
+                            if !fragment.is_empty() {
+                                compiler.feed(&fragment);
+                            }
+                            if eof {
+                                compiler.finish();
+                            }
+                            match compiler
+                                .next_unit()
+                                .map_err(|error| vm.new_syntax_error(&error, None))?
+                            {
+                                Some(code) => Ok(vm
+                                    .ctx
+                                    .new_tuple(vec![
+                                        vm.ctx.new_int(compiler.compiled_bytes()).into(),
+                                        vm.ctx.new_code(code).into(),
+                                    ])
+                                    .into()),
+                                None => Ok(vm.ctx.none()),
+                            }
+                        },
+                    );
                     for (name, function) in [
                         ("_emit", emit),
+                        ("_stream_next", stream_next),
                         ("_receive", receive),
                         ("_cancel_requested", checkpoint),
                         ("_sync_watchdog", watchdog),

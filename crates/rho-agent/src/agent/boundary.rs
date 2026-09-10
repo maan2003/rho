@@ -133,13 +133,16 @@ pub(crate) enum Boundary {
     /// change by itself; `None` means only a new event can change it. Carrying
     /// it here means the loop cannot arm a timer that disagrees with the
     /// decision, because the decision handed it the timer.
-    No { recheck: Option<UnixMs> },
+    No {
+        recheck: Option<UnixMs>,
+    },
     /// Drain every source and send.
     Now,
     /// Throw away the in-flight request and send in its place. One action, not
     /// an abort followed by the ordinary question: somebody who interrupts has
     /// already said they are not waiting, so there is nothing left to weigh.
     AbortAndResend,
+    RetryExhausted,
 }
 
 /// Should the next request start now?
@@ -218,6 +221,39 @@ pub(crate) fn boundary(
             standing: Standing::Asked,
             ..
         } => return Boundary::Now,
+        Phase::Idle {
+            standing:
+                Standing::Retry {
+                    since,
+                    failed_at,
+                    attempts,
+                    ..
+                },
+            ..
+        } => {
+            if fresh_input_at.is_some_and(|at| at >= *failed_at) {
+                return Boundary::Now;
+            }
+            let expires = *since + Duration::from_secs(8 * 60 * 60);
+            if now >= expires {
+                return Boundary::RetryExhausted;
+            }
+            // Keep the provider's Fibonacci progression and 30-minute cap,
+            // but own the clock here so every retry uses a fresh source drain.
+            let (mut previous, mut current) = (1_u64, 1_u64);
+            for _ in 2..*attempts {
+                (previous, current) = (current, (previous + current).min(30 * 60));
+            }
+            let delay = Duration::from_secs(current);
+            let deadline = (*failed_at + delay).min(expires);
+            return if now >= deadline {
+                Boundary::Now
+            } else {
+                Boundary::No {
+                    recheck: Some(deadline),
+                }
+            };
+        }
         Phase::Idle { .. } => {}
     }
     /// Whether anything more is coming.

@@ -17,6 +17,7 @@ sys.path.insert(0, '')
 _cell = contextvars.ContextVar('rho_cell')
 _requests = {}
 _cells = {}
+_streams = {}
 _sequence = 0
 _notebook_thread = threading.current_thread()
 _SYNC_TIMEOUT = 120
@@ -442,21 +443,57 @@ _configure_tools(json.loads(_tool_config))
 async def _evaluate(cell, source):
     _send('started', cell=cell)
     try:
-        code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        result = eval(code, _namespace)
-        if isinstance(result, types.CoroutineType):
-            await result
+        if source is not None:
+            code = compile(source, f'<rho-cell-{cell}>', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+            result = eval(code, _namespace)
+            if isinstance(result, types.CoroutineType):
+                await result
+        else:
+            stream = _streams[cell]
+            eof = False
+            while not stream['stopped']:
+                fragment, stream['source'] = stream['source'], ''
+                eof = eof or stream['eof']
+                unit = _stream_next(cell, fragment, eof, False)
+                if unit is None:
+                    if eof:
+                        break
+                    stream['changed'].clear()
+                    await stream['changed'].wait()
+                    continue
+                end, code = unit
+                permit = stream['permit'] = _loop.create_future()
+                stream['end'] = end
+                _send('unit_ready', cell=cell, end=end)
+                if not await permit:
+                    break
+                try:
+                    result = eval(code, _namespace)
+                    if isinstance(result, types.CoroutineType):
+                        await result
+                except BaseException as exc:
+                    _send('unit_settled', cell=cell, end=end, error=_format_error(exc))
+                    raise
+                else:
+                    _send('unit_settled', cell=cell, end=end, error=None)
     except BaseException as exc:
         _send('returned', cell=cell, error=_format_error(exc))
         raise
     else:
         _send('returned', cell=cell, error=None)
+    finally:
+        if source is None:
+            _streams.pop(cell, None)
+            _stream_next(cell, '', False, True)
 
 
 def _execute(cell, source):
     if len(_cells) >= 128 or cell in _cells:
         _send('finished', cell=cell, error='Notebook live cell limit reached or duplicate cell')
         return
+    if source is None:
+        _streams[cell] = dict(source='', eof=False, stopped=False,
+                              changed=asyncio.Event(), permit=None, end=0)
     _cells[cell] = dict(root=None, tasks=set(), errors=[], error=None, cancelled=False, workers=set())
     context = contextvars.copy_context()
     context.run(_cell.set, cell)
@@ -475,6 +512,28 @@ def _receive_ready():
             return
         if kind == 'execute':
             _execute(message['cell'], message['source'])
+        elif kind == 'begin_stream':
+            _execute(message['cell'], None)
+        elif kind == 'stream_feed':
+            stream = _streams.get(message['cell'])
+            if stream is not None and not stream['stopped']:
+                stream['source'] += message['source']
+                stream['eof'] = message['eof']
+                stream['changed'].set()
+        elif kind == 'stream_permit':
+            stream = _streams.get(message['cell'])
+            if stream is not None and stream['end'] == message['end']:
+                permit = stream['permit']
+                if permit is not None and not permit.done():
+                    permit.set_result(not stream['stopped'])
+        elif kind == 'stream_stop':
+            stream = _streams.get(message['cell'])
+            if stream is not None:
+                stream['stopped'] = True
+                stream['changed'].set()
+                permit = stream['permit']
+                if permit is not None and not permit.done():
+                    permit.set_result(False)
         elif kind == 'resolve':
             future = _requests.pop(message['request'], None)
             if future is not None and not future.done():

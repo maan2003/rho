@@ -45,7 +45,15 @@ fn session_id(internal_id: u64) -> u32 {
     (1_000 + 100 * left + right) as u32
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PythonStreamProgress {
+    pub returned: bool,
+    pub ready: Option<usize>,
+    pub settled: Option<(usize, Option<String>)>,
+}
+
 struct ExecState {
+    stream: PythonStreamProgress,
     waker: SourceWaker,
     output: BoundedOutput,
     since: Option<UnixMs>,
@@ -347,8 +355,17 @@ impl Tool for PythonTool {
         self.spec.clone()
     }
     fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession> {
+        self.start(Some(call.arguments), waker)
+    }
+    fn start_stream(&self, waker: SourceWaker) -> Option<Box<dyn ToolSession>> {
+        Some(self.start(None, waker))
+    }
+}
+impl PythonTool {
+    fn start(&self, source: Option<String>, waker: SourceWaker) -> Box<dyn ToolSession> {
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
+            stream: PythonStreamProgress::default(),
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
             since: None,
@@ -381,11 +398,12 @@ impl Tool for PythonTool {
             sender: self.session.sender(),
             runtime: self.runtime.clone(),
         });
-        if let Err(error) = self
-            .session
-            .sender()
-            .execute(cell, call.arguments, exec.clone())
-        {
+        let sender = self.session.sender();
+        let result = match source {
+            Some(source) => sender.execute(cell, source, exec.clone()),
+            None => sender.stream(cell, exec.clone()),
+        };
+        if let Err(error) = result {
             self.shared.cells.lock().unwrap().remove(&cell);
             return Box::new(Finished::error(error));
         }
@@ -757,6 +775,38 @@ pub struct PythonExec {
     runtime: tokio::runtime::Handle,
 }
 impl PythonExec {
+    pub fn stream_progress(&self) -> PythonStreamProgress {
+        let state = self.link.lock().unwrap();
+        PythonStreamProgress {
+            returned: state.returned.is_some(),
+            ..state.stream.clone()
+        }
+    }
+
+    pub fn feed(&self, source: String, eof: bool) -> Result<(), String> {
+        self.sender.send(Input::StreamFeed {
+            cell: self.cell,
+            source,
+            eof,
+        })
+    }
+
+    pub fn permit(&self, end: usize) -> Result<(), String> {
+        self.sender.send(Input::StreamPermit {
+            cell: self.cell,
+            end,
+        })
+    }
+
+    /// Stop source admission, not the active unit or its managed commands.
+    pub fn stop_stream(&self) {
+        let sender = self.sender.clone();
+        let cell = self.cell;
+        self.runtime.spawn(async move {
+            let _ = sender.send_async(Input::StreamStop { cell }).await;
+        });
+    }
+
     pub fn sequence(&self) -> u64 {
         self.cell
     }
@@ -791,6 +841,16 @@ impl std::ops::Deref for PythonCell {
 impl rho_python::Execution for PythonExec {
     fn event(&self, event: Event) {
         match event {
+            Event::UnitReady { end, .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.stream.ready = Some(end);
+                state.waker.wake();
+            }
+            Event::UnitSettled { end, error, .. } => {
+                let mut state = self.link.lock().unwrap();
+                state.stream.settled = Some((end, error));
+                state.waker.wake();
+            }
             Event::Call {
                 request,
                 name,

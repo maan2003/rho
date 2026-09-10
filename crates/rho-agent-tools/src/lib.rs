@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 pub use code_mode::CodeModeTool;
 use futures::future::BoxFuture;
-pub use python::{PythonExec, PythonTool, python_instructions};
+pub use python::{PythonExec, PythonStreamProgress, PythonTool, python_instructions};
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs};
 use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;

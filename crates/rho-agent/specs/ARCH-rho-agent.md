@@ -53,7 +53,11 @@ Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A
 registry type would have been that map with pass-through methods, so there is
 not one. Direct and JavaScript tools keep their generic urgency facts and core
-`wait` tool. Python exposes one `exec` per model response. Its shared Rust execution
+`wait` tool. Python exposes one `exec` per model response. Complete top-level Python units may execute while the response streams, but only
+after durable agent admission. Provider failure stops admission without treating
+the suffix as EOF or replaying earlier units. Recoverable failures are facts for
+the normal boundary; retries rebuild input by draining every source, rather than
+resending a cached provider request. Its shared Rust execution
 handle and each host operation report distinct source facts; a provider reply
 does not mean that Python finished. Native callbacks synchronously update the
 handle from the interpreter thread, including its model-authored patience.

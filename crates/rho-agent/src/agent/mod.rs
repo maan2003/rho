@@ -13,6 +13,7 @@
 
 mod boundary;
 pub(crate) mod replay;
+mod streaming;
 #[cfg(test)]
 mod tests;
 
@@ -393,6 +394,10 @@ impl AgentHandle {
             mail: replayed.mail,
             tools: BTreeMap::new(),
             wait_answers: Vec::new(),
+            streams: BTreeMap::new(),
+            recovery_notes: replayed.recovery_notes,
+            recovery_blocks: replayed.recovery_blocks,
+            recovery_streams: replayed.recovery_streams,
             context_used: replayed.context_used,
             turn: None,
             latest_python_exec: None,
@@ -637,6 +642,12 @@ pub(crate) enum Standing {
     /// Somebody asked for a request the sources would not have made: a retry,
     /// or a compaction that ate the turn the model still owed a reply to.
     Asked,
+    Retry {
+        since: UnixMs,
+        failed_at: UnixMs,
+        attempts: u32,
+        error: Arc<str>,
+    },
     /// The user cancelled at `at`, and nothing has been asked since.
     Cancelled { at: UnixMs },
     /// The request in flight then failed for good, saying `error`.
@@ -652,7 +663,7 @@ impl Standing {
     /// queue rather than recorded, because the queue already says it.
     fn stopped(&self, fresh_input_at: Option<UnixMs>) -> bool {
         match self {
-            Self::Nothing | Self::Asked => false,
+            Self::Nothing | Self::Asked | Self::Retry { .. } => false,
             // A cancel empties the queues and a failed request had already
             // drained them, so anything dated at or after the stop is somebody
             // typing since. Anything older was already on its way.
@@ -731,16 +742,17 @@ impl RunningTool {
     }
 }
 
-/// The in-flight request. Provisional until it finishes: a failure drops the
-/// whole thing without touching history, and everything here goes with it.
+/// The in-flight provider response. Its streamed Python call may already have
+/// durable admission records and live work; abandoning the response preserves
+/// that call before the next boundary drains its output.
 #[derive(Clone, Default)]
 pub(crate) struct InFlight {
     pending: PendingInferenceResponse,
-    /// What each temporary failure said, latest last — so the count is how deep
-    /// into retrying this request is, and the last one is what it is retrying
-    /// *from*. Both belong to the request rather than to the agent: a retry
-    /// that eventually works leaves nothing behind to explain.
-    temporary_failures: Vec<Arc<str>>,
+    /// The prior attempt's failure, displayed while its fresh continuation
+    /// runs.
+    previous_failure: Option<Arc<str>>,
+    retry: Option<(UnixMs, u32)>,
+    stream: Option<ToolCallId>,
     /// This request compacted on behalf of work that still owes a reply, so a
     /// compaction must not be where the agent stops. A fact about *this*
     /// request, so a request that never finishes never has to unset it.
@@ -771,6 +783,10 @@ struct Agent {
     /// Replies to `wait` calls, written when the call is made and delivered
     /// with the next drain like any other result.
     wait_answers: Vec<ToolResult>,
+    streams: BTreeMap<ToolCallId, streaming::Stream>,
+    recovery_notes: Vec<String>,
+    recovery_blocks: Vec<ContextBlock>,
+    recovery_streams: Vec<ToolCallId>,
 
     context_used: Option<u64>,
     /// What the model's latest turn settled about being looked in on. `None`
@@ -813,13 +829,31 @@ impl Agent {
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
             let now = UnixMs::now();
-            let deadline = match boundary(&self.sources(), self.turn.as_ref(), &self.phase, now) {
+            let decision = boundary(&self.sources(), self.turn.as_ref(), &self.phase, now);
+            self.advance_streams(now, decision != Boundary::AbortAndResend)
+                .await;
+            let deadline = match decision {
                 Boundary::No { recheck } => recheck,
                 Boundary::AbortAndResend => {
-                    // Nothing to undo: what the model had said was provisional
-                    // and never reached history.
+                    // Stop admission and preserve any executed call before
+                    // draining fresh input into the replacement request.
+                    self.abandon_stream("User interrupted the response", now)
+                        .await;
                     self.session.abort();
                     self.start_request(now).await;
+                    None
+                }
+                Boundary::RetryExhausted => {
+                    let Phase::Idle {
+                        standing: Standing::Retry { error, .. },
+                        ..
+                    } = &self.phase
+                    else {
+                        unreachable!()
+                    };
+                    let error = format!("Provider retry window exhausted: {error}");
+                    self.fail(now, PendingInferenceResponse::default(), error)
+                        .await;
                     None
                 }
                 Boundary::Now => {
@@ -923,21 +957,39 @@ impl Agent {
                 match event {
                     InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
                     InferenceEvent::ContextItem { index, event } => {
-                        in_flight.pending.apply(index, event)
+                        in_flight.pending.apply(index, event);
+                        if let Err(error) = self.update_stream(now).await {
+                            let Phase::Requesting(in_flight) = &mut self.phase else {
+                                unreachable!()
+                            };
+                            let partial = std::mem::take(&mut in_flight.pending);
+                            self.session.abort();
+                            self.fail(now, partial, error).await;
+                        }
                     }
                     InferenceEvent::TemporaryFailure { error, .. } => {
-                        let error = error.to_string();
-                        in_flight.temporary_failures.push(Arc::from(error.as_str()));
-                        // The retry starts a fresh response; the partial one
-                        // goes to the log rather than nowhere.
+                        let (since, attempts) = in_flight.retry.unwrap_or((now, 0));
                         let partial = std::mem::take(&mut in_flight.pending);
+                        let error = error.to_string();
+                        self.abandon_stream(&error, now).await;
+                        self.recovery_notes.push(format!("Provider attempt failed: {error}. Continue from the current transcript; command output below is fresh."));
                         self.persist(AgentEvent::Failed {
                             partial,
-                            error: std::borrow::Cow::Borrowed(error.as_str()),
+                            error: Cow::Borrowed(&error),
                             retrying: true,
                             at: now,
                         })
                         .await;
+                        self.session.abort();
+                        self.phase = Phase::Idle {
+                            owed: Vec::new(),
+                            standing: Standing::Retry {
+                                since,
+                                failed_at: now,
+                                attempts: attempts + 1,
+                                error: Arc::from(error),
+                            },
+                        };
                     }
                     // Nothing to abort: the request is already over, and it
                     // is the agent that stops here rather than the request.
@@ -1026,6 +1078,8 @@ impl Agent {
                 // Ask every tool to wind down, then keep reading it: the core
                 // does not kill tools, so a tool still chooses its own last
                 // words.
+                self.abandon_stream("User cancelled the response", now)
+                    .await;
                 for tool in self.tools.values_mut() {
                     tool.session.cancel();
                 }
@@ -1072,6 +1126,7 @@ impl Agent {
     /// goes to the log first, so the reader keeps it and the turn's end
     /// follows its row.
     async fn fail(&mut self, now: UnixMs, partial: PendingInferenceResponse, error: String) {
+        self.abandon_stream(&error, now).await;
         self.persist(AgentEvent::Failed {
             partial,
             error: std::borrow::Cow::Borrowed(error.as_str()),
@@ -1202,6 +1257,11 @@ impl Agent {
         let (_, events) = self.db.read().agent_events(self.agent_id);
         let replayed = replay::replay(events);
         self.history = replayed.history;
+        self.recovery_notes = replayed.recovery_notes;
+        self.recovery_blocks = replayed.recovery_blocks;
+        self.recovery_streams = replayed.recovery_streams;
+        self.streams.clear();
+        self.latest_python_exec = None;
         self.user = replayed.user;
         self.mail = replayed.mail;
         self.context_used = replayed.context_used;
@@ -1314,11 +1374,29 @@ impl Agent {
             .collect::<Arc<[ToolSpec]>>();
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
+        let previous_failure = match &self.phase {
+            Phase::Idle {
+                standing: Standing::Retry { error, .. },
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        };
+        let retry = match &self.phase {
+            Phase::Idle {
+                standing:
+                    Standing::Retry {
+                        since, attempts, ..
+                    },
+                ..
+            } => Some((*since, *attempts)),
+            _ => None,
+        };
         let owed = match &mut self.phase {
             Phase::Idle { owed, .. } => std::mem::take(owed),
             Phase::Requesting(_) => Vec::new(),
         };
-        let mut blocks: Vec<ContextBlock> = Vec::new();
+        let mut blocks = std::mem::take(&mut self.recovery_blocks);
+        self.collect_stream_notes();
         if !owed.is_empty() {
             blocks.push(ContextBlock::ToolResults {
                 results: owed
@@ -1345,9 +1423,7 @@ impl Agent {
                     // The prose half of what the request owes the model;
                     // the empty results above are the other half.
                     text: "note: rho restarted. Every tool that was running is gone — foreground \
-                           and background alike — and nothing was recorded about what any of them \
-                           did. The empty tool results above are placeholders, not output. Re-run \
-                           anything you still need."
+                           and background alike — and their external side effects may remain. The empty tool results above are placeholders, not output. Consult streaming progress notes before deciding what is safe to repeat."
                         .to_owned(),
                 }],
             });
@@ -1453,6 +1529,20 @@ impl Agent {
             InputKind::Compaction => ContextBlock::CompactionTrigger,
         }));
 
+        for text in std::mem::take(&mut self.recovery_notes) {
+            let index = blocks
+                .iter()
+                .position(|block| matches!(block, ContextBlock::CompactionTrigger))
+                .unwrap_or(blocks.len());
+            blocks.insert(
+                index,
+                ContextBlock::UserMessage {
+                    sender: MessageSender::User,
+                    content: vec![ContentPart::Text { text }],
+                },
+            );
+        }
+
         // Automatic compaction is not an input — it is something the core does
         // while assembling a request. (A user-requested compaction *is* an
         // input, and arrives through the user queue.)
@@ -1501,13 +1591,16 @@ impl Agent {
         })
         .await;
         self.history.extend(blocks.into_iter().map(Arc::new));
-        self.session.request(InferenceRequest {
+        self.acknowledge_streams(now).await;
+        self.session.request_once(InferenceRequest {
             instructions,
             input: self.history.clone(),
             agent_id_labels: Default::default(),
             tools: tool_specs,
         });
         self.phase = Phase::Requesting(InFlight {
+            retry,
+            previous_failure,
             compaction_owes_reply: owes_reply,
             ..InFlight::default()
         });
@@ -1522,6 +1615,11 @@ impl Agent {
         usage: Option<rho_core::TokenUsage>,
         now: UnixMs,
     ) {
+        if let Err(error) = self.finish_stream(&items) {
+            self.fail(now, PendingInferenceResponse::default(), error)
+                .await;
+            return;
+        }
         let compacted = items
             .iter()
             .any(|item| matches!(item, InferenceResponseItem::Compaction { .. }));
@@ -1637,6 +1735,9 @@ impl Agent {
                     finished_at: now,
                     metadata: None,
                 });
+            } else if let Some(stream) = self.streams.get_mut(&call.id) {
+                stream.canonical = true;
+                self.latest_python_exec = Some((call.id.clone(), stream.exec.clone()));
             } else {
                 self.spawn_tool(call, now);
             }
@@ -1769,11 +1870,15 @@ impl Agent {
         let kind = match &self.phase {
             Phase::Requesting(in_flight) => AgentStateKind::ApiStreaming {
                 pending_response: in_flight.pending.clone(),
-                previous_attempt: in_flight.temporary_failures.last().map(|error| {
+                previous_attempt: in_flight.previous_failure.as_ref().map(|error| {
                     FailedInferenceResponse {
                         partial_response: PendingInferenceResponse::default(),
-                        attempt_count: NonZeroU64::new(in_flight.temporary_failures.len() as u64)
-                            .unwrap_or(NonZeroU64::MIN),
+                        attempt_count: NonZeroU64::new(
+                            in_flight
+                                .retry
+                                .map_or(0, |(_, attempts)| u64::from(attempts)),
+                        )
+                        .unwrap_or(NonZeroU64::MIN),
                         error: Arc::new(error.to_string()),
                     }
                 }),

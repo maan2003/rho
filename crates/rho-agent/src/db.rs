@@ -1600,6 +1600,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         | AgentEvent::Presented { .. }
         | AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
+        | AgentEvent::PythonStream { .. }
         | AgentEvent::Failed { .. }
         | AgentEvent::Created { .. }
         | AgentEvent::RoleChanged { .. }
@@ -1731,6 +1732,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::Cleared { .. }
         | AgentEvent::Wants { .. }
         | AgentEvent::Rewound { .. }
+        | AgentEvent::PythonStream { .. }
         | AgentEvent::Failed { .. }
         | AgentEvent::ClaudePresentationSource { .. }
         | AgentEvent::Transcript { .. } => {}

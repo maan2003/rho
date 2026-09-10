@@ -631,7 +631,9 @@ pub enum InferenceEvent {
         usage: Option<TokenUsage>,
         provider_response_id: Option<ProviderResponseId>,
     },
-    /// You should see RequestSent soon
+    /// Recoverable failure. With agent-owned retries the attempt is over;
+    /// the caller must rebuild context and schedule another request.
+    /// Other sessions may retry internally at `retrying_at`.
     TemporaryFailure {
         error: Arc<anyhow::Error>,
         retrying_at: Instant,
@@ -641,7 +643,7 @@ pub enum InferenceEvent {
     /// server has started sending tokens
     StreamingStarted,
     /// turn has failed due to some reason
-    /// you shouldn't retry, that is already done internally
+    /// Not automatically retryable.
     Failed {
         // TODO: specific error message if needed if future
         error: Arc<anyhow::Error>,

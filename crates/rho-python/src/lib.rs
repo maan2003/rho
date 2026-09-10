@@ -34,6 +34,21 @@ pub enum Input {
         cell: CellId,
         source: String,
     },
+    BeginStream {
+        cell: CellId,
+    },
+    StreamFeed {
+        cell: CellId,
+        source: String,
+        eof: bool,
+    },
+    StreamPermit {
+        cell: CellId,
+        end: usize,
+    },
+    StreamStop {
+        cell: CellId,
+    },
     Resolve {
         request: RequestId,
         value: Value,
@@ -50,6 +65,15 @@ pub enum Input {
 pub enum Event {
     Started {
         cell: CellId,
+    },
+    UnitReady {
+        cell: CellId,
+        end: usize,
+    },
+    UnitSettled {
+        cell: CellId,
+        end: usize,
+        error: Option<String>,
     },
     Returned {
         cell: CellId,
@@ -109,6 +133,16 @@ impl Sender {
     ) -> Result<(), String> {
         self.executions.lock().unwrap().insert(cell, exec);
         if let Err(error) = self.send(Input::Execute { cell, source }) {
+            self.executions.lock().unwrap().remove(&cell);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Start a cell that waits for source and durable per-unit admission.
+    pub fn stream(&self, cell: CellId, exec: Arc<dyn Execution>) -> Result<(), String> {
+        self.executions.lock().unwrap().insert(cell, exec);
+        if let Err(error) = self.send(Input::BeginStream { cell }) {
             self.executions.lock().unwrap().remove(&cell);
             return Err(error);
         }
@@ -260,6 +294,9 @@ mod tests {
                     source,
                     Arc::new(RecordedExecution(self.events.clone())),
                 ),
+                Input::BeginStream { cell } => self
+                    .sender
+                    .stream(cell, Arc::new(RecordedExecution(self.events.clone()))),
                 other => self.sender.send(other),
             }
         }
@@ -288,6 +325,173 @@ mod tests {
             .await
             .expect("runtime timed out")
             .expect("runtime stopped")
+    }
+
+    #[tokio::test]
+    async fn streaming_requires_each_permit_and_stop_does_not_finish_the_suffix() {
+        let (_session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = _session.sender();
+        sender.send(Input::BeginStream { cell: 1 }).unwrap();
+        let first = "seen = ['first']\n";
+        sender
+            .send(Input::StreamFeed {
+                cell: 1,
+                source: format!(
+                    "{first}seen.append('second')\nif True:\n    seen.append('suffix')\n"
+                ),
+                eof: false,
+            })
+            .unwrap();
+        assert!(
+            matches!(next(&mut events).await, Event::UnitReady { end, .. } if end == first.len())
+        );
+        // The ready unit has compiled, not executed.
+        sender
+            .send(Input::Execute {
+                cell: 2,
+                source: "assert 'seen' not in globals()".into(),
+            })
+            .unwrap();
+        loop {
+            if let Event::Finished { cell: 2, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+        sender
+            .send(Input::StreamPermit {
+                cell: 1,
+                end: first.len(),
+            })
+            .unwrap();
+        assert!(
+            matches!(next(&mut events).await, Event::UnitSettled { end, error: None, .. } if end == first.len())
+        );
+        assert!(matches!(next(&mut events).await, Event::UnitReady { .. }));
+        sender.send(Input::StreamStop { cell: 1 }).unwrap();
+        loop {
+            if let Event::Finished { cell: 1, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+        sender
+            .send(Input::Execute {
+                cell: 3,
+                source: "assert seen == ['first']".into(),
+            })
+            .unwrap();
+        loop {
+            if let Event::Finished { cell: 3, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_eof_closes_compounds_and_preserves_future_flags() {
+        let (session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = session.sender();
+        sender.send(Input::BeginStream { cell: 1 }).unwrap();
+        sender.send(Input::StreamFeed { cell: 1, source:
+            "from __future__ import annotations\nif True:\n    def f(x: Missing):\n        return x\n".into(),
+            eof: true,
+        }).unwrap();
+        loop {
+            match next(&mut events).await {
+                Event::UnitReady { end, .. } => {
+                    sender.send(Input::StreamPermit { cell: 1, end }).unwrap()
+                }
+                Event::Finished { cell: 1, error } => {
+                    assert!(error.is_none(), "{error:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        sender
+            .send(Input::Execute {
+                cell: 2,
+                source: "assert f.__annotations__['x'] == 'Missing'".into(),
+            })
+            .unwrap();
+        loop {
+            if let Event::Finished { cell: 2, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_loss_allows_admitted_await_to_settle_without_admitting_more() {
+        let (session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = session.sender();
+        sender
+            .send(Input::Execute {
+                cell: 1,
+                source: "import asyncio\ngate = asyncio.Event()\nseen = []".into(),
+            })
+            .unwrap();
+        loop {
+            if let Event::Finished { cell: 1, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
+        sender.send(Input::BeginStream { cell: 2 }).unwrap();
+        let first = "await gate.wait(); seen.append('settled')\n";
+        sender
+            .send(Input::StreamFeed {
+                cell: 2,
+                source: format!("{first}seen.append('wrong')\n"),
+                eof: false,
+            })
+            .unwrap();
+        loop {
+            if let Event::UnitReady { end, .. } = next(&mut events).await {
+                assert_eq!(end, first.len());
+                sender.send(Input::StreamPermit { cell: 2, end }).unwrap();
+                break;
+            }
+        }
+        sender.send(Input::StreamStop { cell: 2 }).unwrap();
+        sender
+            .send(Input::Execute {
+                cell: 3,
+                source: "gate.set()".into(),
+            })
+            .unwrap();
+        let mut settled = false;
+        loop {
+            match next(&mut events).await {
+                Event::UnitSettled {
+                    cell: 2,
+                    error: None,
+                    ..
+                } => settled = true,
+                Event::UnitReady { cell: 2, .. } => panic!("source after loss became runnable"),
+                Event::Finished { cell: 2, error } => {
+                    assert!(error.is_none(), "{error:?}");
+                    assert!(settled);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        sender
+            .send(Input::Execute {
+                cell: 4,
+                source: "assert seen == ['settled']".into(),
+            })
+            .unwrap();
+        loop {
+            if let Event::Finished { cell: 4, error } = next(&mut events).await {
+                assert!(error.is_none(), "{error:?}");
+                break;
+            }
+        }
     }
 
     #[tokio::test]

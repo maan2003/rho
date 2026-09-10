@@ -190,6 +190,33 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
+    /// Durable admission and settlement of streaming Python units.
+    PythonStream {
+        event: PythonStreamEvent,
+        at: UnixMs,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum PythonStreamEvent {
+    Opened {
+        item: rho_core::InferenceResponseItem,
+    },
+    Admitted {
+        call_id: rho_core::ToolCallId,
+        source: String,
+    },
+    Settled {
+        call_id: rho_core::ToolCallId,
+        end: u64,
+        error: Option<String>,
+    },
+    Closed {
+        call_id: rho_core::ToolCallId,
+    },
+    Acknowledged {
+        call_id: rho_core::ToolCallId,
+    },
 }
 
 impl AgentEvent<'_> {
@@ -650,6 +677,7 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Presented { .. }
             | AgentEvent::Wants { .. }
             | AgentEvent::Rewound { .. }
+            | AgentEvent::PythonStream { .. }
             | AgentEvent::Failed { .. }
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }

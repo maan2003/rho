@@ -190,7 +190,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         },
         AgentEvent::QueueCleared => MirrorEvent::QueueCleared { at: UnixMs(0) },
         AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
-        AgentEvent::RuntimeRebound { .. } => return None,
+        AgentEvent::RuntimeRebound { .. } | AgentEvent::PythonStream { .. } => return None,
         AgentEvent::ClaudePresentationSource {
             speaker, text, at, ..
         } => MirrorEvent::ClaudeMessage {

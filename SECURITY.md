@@ -782,6 +782,15 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   unless `wake_on_tools=False` suppresses tool deadlines for that turn. Suppression
   includes the execution itself, does not cancel work or discard buffered output,
   and does not disable the timer, user input, or agent mail.
+- Python source can execute complete top-level units before its provider response
+  finishes. The agent validates one stable, append-only custom `exec` identity,
+  bounds total source to 1 MiB, and persists admission before permitting each unit.
+  It persists settlement before permitting the next unit. Transport loss never
+  closes the compiler as EOF: unadmitted source is discarded, while an admitted
+  unit and its commands may continue. Retry requests pass through the ordinary
+  agent boundary, drain fresh output, and report completed versus uncertain
+  source rather than automatically replaying it. Admission records do not prove
+  side effects occurred; a crash between admission and settlement is uncertain.
 - Notebook state and live jobs are ephemeral and do not survive restart. The
   existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
   the JavaScript runtime for all other code-mode roles.

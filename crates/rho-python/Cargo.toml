@@ -7,9 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rustpython-vm = { git = "https://github.com/maan2003/RustPython.git", rev = "222faf4e3297bf3bff486f7adfbf1e5f50dfaa7d", default-features = false, features = ["compiler", "freeze-stdlib", "gc", "host_env"] }
-rustpython-stdlib = { git = "https://github.com/maan2003/RustPython.git", rev = "222faf4e3297bf3bff486f7adfbf1e5f50dfaa7d", default-features = false, features = ["compiler", "host_env", "ssl-rustls", "threading", "sqlite"] }
-rustpython-pylib = { git = "https://github.com/maan2003/RustPython.git", rev = "222faf4e3297bf3bff486f7adfbf1e5f50dfaa7d", features = ["freeze-stdlib"] }
+rustpython-vm = { git = "https://github.com/maan2003/RustPython.git", rev = "6a24102d66488cdd998522d2fa6e34ccac1a6387", default-features = false, features = ["compiler", "freeze-stdlib", "gc", "host_env"] }
+rustpython-stdlib = { git = "https://github.com/maan2003/RustPython.git", rev = "6a24102d66488cdd998522d2fa6e34ccac1a6387", default-features = false, features = ["compiler", "host_env", "ssl-rustls", "threading", "sqlite"] }
+rustpython-pylib = { git = "https://github.com/maan2003/RustPython.git", rev = "6a24102d66488cdd998522d2fa6e34ccac1a6387", features = ["freeze-stdlib"] }
 rustls.workspace = true
 libc.workspace = true
 serde.workspace = true

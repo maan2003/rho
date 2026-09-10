@@ -25,6 +25,7 @@ pub(crate) struct AntigravitySession {
     active: Option<tokio::task::JoinHandle<()>>,
     awaiting: Option<u64>,
     epochs: u64,
+    agent_retries: bool,
 }
 
 impl AntigravitySession {
@@ -38,6 +39,7 @@ impl AntigravitySession {
             active: None,
             awaiting: None,
             epochs: 0,
+            agent_retries: false,
         }
     }
 
@@ -66,13 +68,22 @@ impl AntigravitySession {
     }
 
     pub(crate) fn request(&mut self, request: InferenceRequest) {
+        self.start(request, false);
+    }
+
+    pub(crate) fn request_once(&mut self, request: InferenceRequest) {
+        self.start(request, true);
+    }
+
+    fn start(&mut self, request: InferenceRequest, agent_retries: bool) {
         self.abort();
+        self.agent_retries = agent_retries;
         self.epochs = self.epochs.saturating_add(1);
         let epoch = self.epochs;
         self.awaiting = Some(epoch);
         let events = self.events_tx.clone();
         self.active = Some(tokio::spawn(async move {
-            if let Err(error) = run_turn(epoch, &events, request).await {
+            if let Err(error) = run_turn(epoch, &events, request, agent_retries).await {
                 let _ = events.send((
                     epoch,
                     InferenceEvent::Failed {
@@ -102,7 +113,8 @@ impl AntigravitySession {
             if matches!(
                 event,
                 InferenceEvent::Finished { .. } | InferenceEvent::Failed { .. }
-            ) {
+            ) || (self.agent_retries && matches!(event, InferenceEvent::TemporaryFailure { .. }))
+            {
                 self.awaiting = None;
                 self.active = None;
             }
@@ -123,6 +135,7 @@ async fn run_turn(
     epoch: u64,
     events: &tokio::sync::mpsc::UnboundedSender<(u64, InferenceEvent)>,
     request: InferenceRequest,
+    agent_retries: bool,
 ) -> Result<()> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let started = Instant::now();
@@ -154,6 +167,9 @@ async fn run_turn(
                         retrying_at,
                     },
                 ));
+                if agent_retries {
+                    return Ok(());
+                }
                 tokio::time::sleep(delay).await;
             }
             Err(error) => anyhow::bail!(error.message),

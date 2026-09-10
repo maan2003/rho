@@ -107,6 +107,14 @@ impl InferenceSession {
         }
     }
 
+    /// Let the agent rebuild retry context through its ordinary boundary.
+    pub fn request_once(&mut self, request: InferenceRequest) {
+        match &mut self.inner {
+            SessionImpl::Responses(session) => session.request_once(request),
+            SessionImpl::Antigravity(session) => session.request_once(request),
+        }
+    }
+
     pub fn request(&mut self, request: InferenceRequest) {
         match &mut self.inner {
             SessionImpl::Responses(session) => session.request(request),

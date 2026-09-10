@@ -167,4 +167,9 @@ pub trait Tool: Send + Sync + 'static {
     /// Start the work. Call [`SourceWaker::wake`] whenever the status
     /// changes; the core will come and ask.
     fn run(&self, call: ToolCall, waker: SourceWaker) -> Box<dyn ToolSession>;
+
+    /// Python-only source stream; no source executes before an explicit permit.
+    fn start_stream(&self, _waker: SourceWaker) -> Option<Box<dyn ToolSession>> {
+        None
+    }
 }
