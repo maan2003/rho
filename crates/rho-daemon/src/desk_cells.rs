@@ -20,9 +20,6 @@ const BODIES: TableDefinition<Sen<Id>, Sen<BodySnapshot>> =
 const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
 const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
-/// The marker of the one-shot below, so it runs on a store once.
-const PARENTS_CONVERTED: TableDefinition<(), bool> =
-    TableDefinition::new("rho_desk_parent_labels_v1");
 
 /// The same two tables, read without trusting every row to decode. A newer
 /// build on another device can write a property or a verdict this one has
@@ -74,36 +71,6 @@ impl DeskCellStore {
     pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
         initialize(&mut write)?;
-        // A thing is placed by the labels it carries. The parents already
-        // in the store are the same statement in the old shape, so they are
-        // read once, written as labels, and cleared.
-        if write.open_table(PARENTS_CONVERTED).get(&()).is_none() {
-            let read = db.read();
-            let agent_titles = if read.has_table("agent_log") {
-                read.list_agents()
-                    .into_iter()
-                    .map(|(id, head)| (id, head.title().map(str::to_owned)))
-                    .collect()
-            } else {
-                std::collections::BTreeMap::new()
-            };
-            drop(read);
-            let mut meta = load_meta_from_write(&mut write)?;
-            let snapshot = read_snapshot_from_write(&mut write)?;
-            let bodies = write
-                .open_table(BODIES_READ)
-                .iter()
-                .map(|(_, body)| body.value().ok_or("Desk body was written by a newer build"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
-            let report = crate::desk_parent_labels::convert(&mut store, &bodies, &agent_titles)?;
-            let snapshot = store.snapshot();
-            persist_snapshot(&mut write, &snapshot, bodies)?;
-            meta.frontier = snapshot.version;
-            write.open_table(META).insert(&(), SenValue::owned(meta));
-            write.open_table(PARENTS_CONVERTED).insert(&(), &true);
-            tracing::info!("{}", report.line());
-        }
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -650,7 +617,6 @@ pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     write.open_table(CELLS);
     write.open_table(VERDICTS);
     write.open_table(BODIES);
-    write.open_table(PARENTS_CONVERTED);
     write.open_table(META).insert(&(), SenValue::owned(meta));
     Ok(())
 }
@@ -814,69 +780,6 @@ fn persist_snapshot(
     Ok(())
 }
 
-/// Throwaway counts over a copy of the user's store, for the questions the
-/// landing has to answer. Deleted with the conversion code.
-#[cfg(test)]
-mod copy_counts {
-    use rho_agent::db::AgentReadTxnExt;
-    use rho_db::RhoDb;
-
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "needs a copy of a real daemon store in RHO_PROOF_DB"]
-    async fn counts_what_the_store_holds_for_agents() {
-        let path = std::env::var("RHO_PROOF_DB").expect("RHO_PROOF_DB must name a copy");
-        let db = RhoDb::open(&path);
-        let snapshot = read_snapshot(&db.read()).expect("snapshot");
-        let store =
-            Store::from_snapshot(rho_desk::cells::DeviceId([0; 16]), snapshot).expect("store");
-
-        let mut deferred_agents = 0usize;
-        let mut noded_agents = std::collections::HashSet::new();
-        for (id, facts) in store.all_facts() {
-            let Id::Agent(agent_id) = id else { continue };
-            if facts.defer_until.is_some() {
-                deferred_agents += 1;
-            }
-            // What "has a store node" means for the dealer: the user's own
-            // filing, or a name, or a label.
-            if facts.parent.is_some()
-                || facts.filed
-                || facts.name.is_some()
-                || !facts.labels.is_empty()
-            {
-                noded_agents.insert(agent_id);
-            }
-        }
-
-        let week_ago = rho_core::UnixMs(
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64)
-                - 7 * 24 * 60 * 60 * 1000,
-        );
-        let (mut recent, mut recent_without_node) = (0usize, 0usize);
-        for (agent_id, head) in db.read().list_agents() {
-            let last = head.last_turn_ended.unwrap_or(head.config.created_at);
-            if last.0 < week_ago.0 {
-                continue;
-            }
-            recent += 1;
-            if !noded_agents.contains(&agent_id) {
-                recent_without_node += 1;
-            }
-        }
-        println!(
-            "store: {deferred_agents} agents carry defer_until, {} carry a node; \
-             {recent} agents had a turn in the last 7 days, {recent_without_node} of them \
-             have no node",
-            noded_agents.len()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rho_db::RhoDb;
@@ -1025,75 +928,6 @@ mod tests {
             Some(wake),
             "the snooze is the wake time, which is what holds the card down"
         );
-    }
-
-    /// The parent conversion runs on the store it is opened on, and the
-    /// marker means it runs once: a parent written after it has run is the
-    /// user's own and stays until rho itself takes it off.
-    #[tokio::test]
-    async fn parent_conversion_and_marker_commit_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(directory.path().join("rho.redb"));
-        let area = Id::Note(Uuid::random());
-        let thing = Id::Note(Uuid::random());
-        {
-            let mut write = db.write().await;
-            initialize(&mut write).unwrap();
-            let mut meta = load_meta_from_write(&mut write).unwrap();
-            let mut cells = Store::new(meta.daemon_device);
-            cells
-                .write(area.clone(), Property::Name("rho".into()))
-                .unwrap();
-            cells
-                .write(thing.clone(), Property::Parent(Some(area.clone())))
-                .unwrap();
-            persist_snapshot(&mut write, &cells.snapshot(), Vec::new()).unwrap();
-            meta.frontier = cells.version().clone();
-            write.open_table(META).insert(&(), SenValue::owned(meta));
-            write.commit();
-        }
-
-        let first = DeskCellStore::new(db.clone()).await.unwrap();
-        let snapshot = first.sync_since(&Version::new()).unwrap();
-        let converted = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
-        assert_eq!(converted.facts(&thing).parent, None);
-        let labels = converted
-            .facts(&thing)
-            .labels
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(labels.len(), 1, "the parent is now the label it stood for");
-        assert_eq!(converted.facts(&labels[0]).name.as_deref(), Some("rho"));
-        assert_eq!(
-            db.read()
-                .open_table(PARENTS_CONVERTED)
-                .get(&())
-                .map(|value| value.value()),
-            Some(true)
-        );
-
-        // A parent written after the conversion is not converted again.
-        let device = DeviceId([7; 16]);
-        let after = Id::Note(Uuid::random());
-        let version = next_version(&first);
-        first
-            .apply_mutation(
-                device,
-                CellMutation {
-                    stamp: Stamp { device, version },
-                    writes: vec![CellWrite {
-                        id: after.clone(),
-                        property: Property::Parent(Some(area.clone())),
-                    }],
-                    verdict: None,
-                },
-            )
-            .await
-            .unwrap();
-        let second = DeskCellStore::new(db.clone()).await.unwrap();
-        let snapshot = second.sync_since(&Version::new()).unwrap();
-        let reopened = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
-        assert_eq!(reopened.facts(&after).parent, Some(area));
     }
 
     /// Writes one note at the root the way a client does. A note is
@@ -1846,5 +1680,56 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    /// A store the conversion already ran on still opens and reads with the
+    /// conversion gone.
+    ///
+    /// The marker table is left on disk where the one-shot wrote it, and no
+    /// build after this one opens it. Nothing may trip over the rows it left
+    /// behind, on the first open or on a restart.
+    #[tokio::test]
+    async fn a_store_carrying_the_retired_conversion_marker_opens_and_reads() {
+        const MARKER: TableDefinition<(), bool> = TableDefinition::new("rho_desk_parent_labels_v1");
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("rho.redb"));
+        let label = Id::Label(Uuid::random());
+        let thing = Id::Note(Uuid::random());
+        {
+            let mut write = db.write().await;
+            initialize(&mut write).unwrap();
+            let mut meta = load_meta_from_write(&mut write).unwrap();
+            let mut cells = Store::new(meta.daemon_device);
+            cells
+                .write(label.clone(), Property::Name("rho".into()))
+                .unwrap();
+            cells
+                .write(
+                    thing.clone(),
+                    Property::Labeled {
+                        label: label.clone(),
+                        present: true,
+                    },
+                )
+                .unwrap();
+            persist_snapshot(&mut write, &cells.snapshot(), Vec::new()).unwrap();
+            meta.frontier = cells.version().clone();
+            write.open_table(META).insert(&(), SenValue::owned(meta));
+            // What the retired one-shot left: the marker, set.
+            write.open_table(MARKER).insert(&(), &true);
+            write.commit();
+        }
+
+        for open in 0..2 {
+            let store = DeskCellStore::new(db.clone()).await.unwrap();
+            let snapshot = store.sync_since(&Version::new()).unwrap();
+            let read = Store::from_snapshot(DeviceId([0; 16]), snapshot).unwrap();
+            assert_eq!(
+                read.facts(&thing).labels.into_iter().collect::<Vec<_>>(),
+                vec![label.clone()],
+                "open {open}: the label the conversion wrote is still what places the thing"
+            );
+            assert_eq!(read.facts(&label).name.as_deref(), Some("rho"));
+        }
     }
 }

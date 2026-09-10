@@ -219,6 +219,21 @@ flagged `shared`. A rig costs its divergence from the snapshot, not the
 snapshot. Deleting rigs to free space frees very little; retiring the
 snapshot is what frees the 43 GB, and only once no rig points into it.
 
+Three more things a run trips over, from the desk-parents deletion on 10 Sep.
+
+- **rho-daemon does not build outside the devshell.** `rho-python` reads
+  `RHO_PYTHON_SITE_PACKAGES` with `env!`, so a bare `cargo test -p rho-daemon`
+  fails to compile before it ever reaches the daemon. `direnv exec . cargo …`
+  is the fix, and it is the fix for every crate that pulls the daemon in.
+- **A fresh rig carries no conversion markers.** `user-2026-09-06` predates the
+  8 Sep parents conversion -- that is why it was the conversion's proof subject
+  -- so a rig cloned from it has no `rho_desk_parent_labels_v1`. A case about a
+  marker needs a rig a daemon of that day has already run on; clone that rig's
+  `rho.redb` into a throwaway of your own rather than running on someone else's.
+- **A store copy never goes in /tmp.** `/tmp` is the root pool, and three 45 GB
+  copies left there on 7 Sep took the volume to 6 GB free. Copies live under
+  `rho-rigs`, on the src volume, and go the moment the reading is done.
+
 ### R5. An instrument can be faithful and still blind
 
 The rule already here is to give the harness a question whose answer is known.

@@ -368,13 +368,14 @@ user typed, and the page exists when the browser opens it.
 
 ## Migration
 
-### Third conversion: the parents become labels
+### Third conversion: the parents become labels (historical)
 
 A thing is placed by the labels it carries and carries no parent
 (`DESK-DESIGN.md`). Rho stopped writing parents on the filing paths on
 8 Sep; this reads the parents already in the store and says the same thing
 as a label. One shot at daemon start behind the durable marker
-`rho_desk_parent_labels_v1`, and then the code goes (the standing rule).
+`rho_desk_parent_labels_v1`. The daemon ran it on 8 Sep and the code is
+gone (the standing rule); the marker row stays in the store, unread.
 
 For every non-label carrying a `Parent`: the label that parent stands for is
 minted or reused, named by the parent's `Name`, else the first line of its
