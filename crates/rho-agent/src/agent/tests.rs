@@ -1035,6 +1035,9 @@ async fn python_surface_has_exec_only_and_direct_surface_keeps_wait() {
     let view = rho_workspaces::View::new(vec![repo.user_checkout().await.unwrap()]).unwrap();
     for role in [
         AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Python,
+        },
+        AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         },
         AgentRole::Advisor {

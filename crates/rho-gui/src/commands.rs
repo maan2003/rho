@@ -94,6 +94,7 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
             "eng-mini",
             "eng-low",
             "eng-cheap",
+            "eng-py",
             "eng-high",
             "eng-ultra",
             "eng-alt",

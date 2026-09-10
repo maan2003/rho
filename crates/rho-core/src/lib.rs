@@ -123,6 +123,8 @@ pub enum EngineerIntelligence {
     Cheap,
     /// Reduced function-tool agent backed by Gemini through Antigravity.
     Gemini,
+    /// Sol-backed engineer using Python code mode.
+    Python,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

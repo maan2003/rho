@@ -2888,8 +2888,9 @@ impl Workspace {
                     EngineerIntelligence::Low
                     | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
+                    | EngineerIntelligence::Python
                     | EngineerIntelligence::High,
-            } => &["eng-low", "eng-cheap", "eng", "eng-high"],
+            } => &["eng-low", "eng-cheap", "eng", "eng-py", "eng-high"],
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra | EngineerIntelligence::Alt,
             } => &["eng-ultra", "eng-alt"],
@@ -2923,6 +2924,7 @@ impl Workspace {
                     "eng-low" => Some(EngineerIntelligence::Low),
                     "eng-cheap" => Some(EngineerIntelligence::Cheap),
                     "eng" => Some(EngineerIntelligence::Medium),
+                    "eng-py" => Some(EngineerIntelligence::Python),
                     "eng-high" => Some(EngineerIntelligence::High),
                     "eng-ultra" => Some(EngineerIntelligence::Ultra),
                     "eng-alt" => Some(EngineerIntelligence::Alt),
@@ -8758,6 +8760,7 @@ fn agent_role_label(config: AgentRole) -> String {
             EngineerIntelligence::Low => "eng-low",
             EngineerIntelligence::Cheap => "eng-cheap",
             EngineerIntelligence::Medium => "eng",
+            EngineerIntelligence::Python => "eng-py",
             EngineerIntelligence::High => "eng-high",
             EngineerIntelligence::Ultra => "eng-ultra",
             EngineerIntelligence::Alt => "eng-alt",

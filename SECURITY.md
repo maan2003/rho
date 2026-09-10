@@ -708,7 +708,7 @@ Tests cover validation, concurrent appends, and reopening the database.
 
 ## Python code mode (`rho-python`, `rho-agent-tools`)
 
-`eng-high` and `advisor-high` select Python by default. Other code-mode roles retain the
+`eng-py` (Sol), `eng-high`, and `advisor-high` select Python by default. Other code-mode roles retain the
 JavaScript runtime; roles with code mode disabled retain direct tools.
 
 - Model-authored Python runs in-process on a dedicated RustPython thread, with

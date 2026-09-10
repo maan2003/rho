@@ -19,6 +19,34 @@ fn astra_bindings_round_trip() {
 }
 
 #[test]
+fn python_sol_binding_preserves_role_and_model() {
+    let role = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::Python,
+    };
+    let binding = role.session_profile().unwrap();
+    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt56Sol));
+    assert_eq!(
+        binding.deep_config(),
+        AgentRole::default()
+            .session_profile()
+            .unwrap()
+            .deep_config()
+    );
+    assert!(binding.deep_config().unwrap().code_mode);
+    let mut encoded = bytes::BytesMut::new();
+    senax_encoder::encode_to(&binding, &mut encoded).unwrap();
+    let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+    assert_eq!(decoded, binding);
+    assert_eq!(decoded.agent_role(), role);
+    let mut encoded = bytes::BytesMut::new();
+    senax_encoder::encode_to(&role, &mut encoded).unwrap();
+    assert_eq!(
+        <AgentRole as senax_encoder::Decoder>::decode(&mut encoded).unwrap(),
+        role
+    );
+}
+
+#[test]
 fn legacy_high_engineer_binding_stays_on_sol() {
     let binding = SessionBinding::ResponsesSol(InferenceProfile {
         effort: ReasoningEffort::Xhigh,

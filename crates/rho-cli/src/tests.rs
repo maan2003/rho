@@ -138,6 +138,19 @@ fn record_visualization_parses() {
 }
 
 #[test]
+fn evaluation_accepts_python_sol_role() {
+    let args = Args::try_parse(
+        ["eval", "task", "--role", "eng-py"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(matches!(
+        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "eng-py"
+    ));
+}
+
+#[test]
 fn evaluation_defaults_to_astra_and_requires_a_prompt() {
     assert!(Args::try_parse(["eval".to_owned()].into_iter()).is_err());
     let args = Args::try_parse(
