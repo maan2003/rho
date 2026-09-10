@@ -176,10 +176,12 @@ def notify(value, *, max_tokens=2000):
     _send('text', cell=_cell.get(), text=_render(value, max_tokens) + '\n', max_tokens=max_tokens, important=True)
 
 
-def set_patience(seconds=300):
-    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 3600:
-        raise ValueError('seconds must be an integer from 1 through 3600')
-    _send('patience', cell=_cell.get(), seconds=seconds)
+def set_checkin(after_seconds=300, *, wake_on_tools=True):
+    if isinstance(after_seconds, bool) or not isinstance(after_seconds, int) or not 1 <= after_seconds <= 3600:
+        raise ValueError('after_seconds must be an integer from 1 through 3600')
+    if not isinstance(wake_on_tools, bool):
+        raise TypeError('wake_on_tools must be a bool')
+    _send('checkin', cell=_cell.get(), seconds=after_seconds, wake_on_tools=wake_on_tools)
 
 def image(reference):
     return _request('image', reference)
@@ -225,7 +227,7 @@ sys.stdout = sys.__stdout__ = _Output()
 sys.stderr = sys.__stderr__ = _Output()
 
 _namespace = dict(__name__='__main__', command=command, write_stdin=write_stdin,
-                  display=display, text=text, notify=notify, set_patience=set_patience,
+                  display=display, text=text, notify=notify, set_checkin=set_checkin,
                   web=web,
                   image=image, asyncio=asyncio, pathlib=pathlib, Path=pathlib.Path)
 

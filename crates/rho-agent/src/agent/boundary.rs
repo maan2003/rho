@@ -122,7 +122,7 @@ pub(crate) enum ModelAsked {
     /// An interval the model named for itself. Honoured with nothing running,
     /// because a model with nothing to do asking to be woken later is the whole
     /// point of it. Named through the direct `wait` tool or relayed by a
-    /// Python cell’s turn-local `set_patience` control.
+    /// Python cell’s turn-local `set_checkin` control.
     Wait(Duration),
 }
 
@@ -303,22 +303,28 @@ pub(crate) fn boundary(
     // Rule 2. Nothing here asks what is running: the model said whether to look
     // again, and a model that asked for nothing gets a quiet agent rather than
     // one that keeps offering it the same silence.
-    let python_patience = sources.iter().find_map(|source| match source {
+    let python_checkin = sources.iter().find_map(|source| match source {
         SourceKind::PythonExec {
             latest: true,
             facts,
             ..
-        } => facts.patience,
+        } => facts.checkin,
         _ => None,
     });
     let checkin = turn.and_then(|turn| match turn.asked {
         ModelAsked::Nothing => None,
-        ModelAsked::Calls => Some(turn.spoke_at + python_patience.unwrap_or(DEFAULT_WAIT)),
+        ModelAsked::Calls => {
+            Some(turn.spoke_at + python_checkin.map_or(DEFAULT_WAIT, |checkin| checkin.after))
+        }
         ModelAsked::Wait(asked) => Some(turn.spoke_at + asked),
     });
 
     let deadline = sources
         .iter()
+        .filter(|source| {
+            python_checkin.is_none_or(|checkin| checkin.wake_on_tools)
+                || matches!(source, SourceKind::User { .. } | SourceKind::Mail { .. })
+        })
         .filter_map(|source| match *source {
             // An empty queue names no moment, which is what makes it nothing to
             // send rather than a special case.
@@ -338,7 +344,7 @@ pub(crate) fn boundary(
                             // doesn't itself give the model anything new to act on.
                             done.failed
                                 || done.produced_output
-                                || (!done.dispatched && !done.set_patience)
+                                || (!done.dispatched && !done.set_checkin)
                         })
                         .map(|done| done.at + patience(TOOL_PATIENCE)),
                 )

@@ -63,7 +63,12 @@ pub struct PythonCompletion {
     pub failed: bool,
     pub produced_output: bool,
     pub dispatched: bool,
-    pub set_patience: bool,
+    pub set_checkin: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PythonCheckin {
+    pub after: std::time::Duration,
+    pub wake_on_tools: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PythonExecFacts {
@@ -71,7 +76,7 @@ pub struct PythonExecFacts {
     pub returned: Option<UnixMs>,
     pub completion: Option<PythonCompletion>,
     pub output: PythonOutput,
-    pub patience: Option<std::time::Duration>,
+    pub checkin: Option<PythonCheckin>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PythonOperationFacts {

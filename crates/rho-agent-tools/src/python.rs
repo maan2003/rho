@@ -60,7 +60,7 @@ struct ExecState {
     error: bool,
     delivered: bool,
     meaningful: bool,
-    patience: Option<u64>,
+    checkin: Option<crate::PythonCheckin>,
     jobs: Vec<Arc<Job>>,
     pending: usize,
     cancelled: tokio::sync::watch::Sender<bool>,
@@ -117,10 +117,16 @@ struct JobState {
     finished: Option<(UnixMs, Value)>,
     delivered: bool,
 }
-impl PythonTool {
-    pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
-        let mut description = String::from(
-            r#"Run raw Python in the persistent notebook.
+/// System-prompt guidance for the Python runtime and its available host
+/// functions.
+pub fn python_instructions(specs: &[ToolSpec]) -> String {
+    let mut description = String::from(
+        r#"## Python Code Mode
+
+`exec` is your only top-level tool. Issue at most one exec call per response.
+It runs a persistent Python notebook with top-level await. Globals are shared;
+live cells interleave at await. Use shell commands to inspect files and Python
+to manipulate their data.
 
 Work registers immediately; output arrives automatically. Put independent calls in the same cell to run them concurrently; await only when later Python statements depend on completion.
 - command(cmd, workdir=None, max_tokens=2000) returns a managed handle. Assignment and await are optional. Awaiting it returns completion metadata (id, exit_code), not stdout.
@@ -131,7 +137,7 @@ Work registers immediately; output arrives automatically. Put independent calls 
 - Host functions register work immediately. Await only for Python dependencies; text results are strings, JSON results are parsed values.
 - Pending commands and operations expose session IDs from 1000 through 9999 when first reported as running. These are display labels derived from internal IDs and repeat every 9000 internal requests; use Python handles to await, inspect, or cancel commands. Commands finishing before their first reply do not expose an ID. Later output uses the same identity. A reply does not mean the source finished. Latest-cell sources are reported first, then older cells; sources within each cell follow registration order, without waiting for earlier sources to finish.
 
-Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner. image((await view_image(path=...))["content"][0]) displays a returned image reference.
+Python output: print(...) and text(value, max_tokens=2000) are ordinary output; notify(value, max_tokens=2000) is meaningful output that wakes sooner unless tool wakeups are disabled. image((await view_image(path=...))["content"][0]) displays a returned image reference.
 
 Examples
 
@@ -194,26 +200,70 @@ Inspect its globals in a later cell without stopping it:
 ```python
 text(progress)
 ```
-The default check-in interval is 120 seconds. Omit set_patience unless you want
-a significantly shorter or longer interval. For a significantly longer interval, set it alongside the work:
+The default check-in interval is 120 seconds. Omit set_checkin unless you want
+a different interval or want to suppress tool wakeups. Set it alongside the work:
 ```python
 command("git diff --check")
 command("cargo test")
-set_patience(seconds=300)
+set_checkin(after_seconds=300)
 ```
 Then end the model turn. No separate exec is needed; this does not sleep or block Python.
-If the cell also awaits a dependency, set patience before that await; a suspended cell
+If the cell also awaits a dependency, call set_checkin before that await; a suspended cell
 may resume after its originating model turn has ended.
+
+Wait for an advisor answer without tool events waking you early:
+```python
+set_checkin(after_seconds=300, wake_on_tools=False)
+agents.spawn_new_advisor("Review the current diff for correctness. Report concrete blockers only.")
+```
+The advisor's mail or a user message can wake you before the timer. Other work keeps running.
 
 Details and limits
 - Explicit output reads have a separate cursor starting at byte 0, so they can repeat automatic previews. Wait for command completion only if Python needs a complete final read.
 - Budgets are capped at 10000 tokens. Each command retains its first 8 MiB with explicit overflow counts. Up to 64 handles are retained; oldest completed, delivered handles may be evicted. Up to 32 image references are retained.
-- set_patience accepts 1..3600 seconds and overrides only this turn's default 120-second interval. Meaningful events wake earlier; old cells cannot change a newer turn's patience.
+- set_checkin(after_seconds=300, wake_on_tools=True) accepts 1..3600 seconds and overrides only this turn's default 120-second interval. By default, tool output and completion can wake earlier.
+- set_checkin(after_seconds=300, wake_on_tools=False) waits for the timer, user messages, or agent mail (such as an advisor answer). No tool event wakes early: this includes current and older commands, host operations, errors, notify(), and exec completion. Work continues and buffered output is delivered on the next wake. Old cells cannot change a newer turn's policy.
 - Python is in-process, not a sandbox. Cwd is private to the notebook; other process-global APIs retain normal semantics. Native extension packages are unsupported.
 
 Available tools:
 "#,
-        );
+    );
+    for spec in specs {
+        let name = spec.name.as_str();
+        if name == "spawn_engineer" {
+            continue;
+        }
+        if name == "web__run" {
+            description.push_str("web.run: standard OpenAI web run\n");
+            continue;
+        }
+        let callable = match name {
+            "ask_advisor" => "agents.spawn_new_advisor",
+            "message_agent" => "agents.message",
+            "interrupt_engineer" => "agents.cancel",
+            _ => name,
+        };
+        let mut schema = spec.input_schema.clone();
+        if name == "ask_advisor" {
+            if let Some(message) = schema["properties"]
+                .as_object_mut()
+                .and_then(|properties| properties.remove("message"))
+            {
+                schema["properties"]["msg"] = message;
+            }
+            schema["required"] = json!(["msg"]);
+        }
+        description.push_str(&format!(
+            "{}: {}\nArguments: {}\n",
+            callable, spec.description, schema
+        ));
+    }
+    description.push('\n');
+    description
+}
+
+impl PythonTool {
+    pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         let shared = Arc::new(Shared {
             next_cell: AtomicU64::new(1),
@@ -237,43 +287,13 @@ Available tools:
             },
             json!(specs),
         )?;
-        for spec in specs {
-            let name = spec.name.as_str();
-            if name == "spawn_engineer" {
-                continue;
-            }
-            if name == "web__run" {
-                description.push_str("web.run: standard OpenAI web run\n");
-                continue;
-            }
-            let callable = match name {
-                "ask_advisor" => "agents.spawn_new_advisor",
-                "message_agent" => "agents.message",
-                "interrupt_engineer" => "agents.cancel",
-                _ => name,
-            };
-            let mut schema = spec.input_schema;
-            if name == "ask_advisor" {
-                if let Some(message) = schema["properties"]
-                    .as_object_mut()
-                    .and_then(|properties| properties.remove("message"))
-                {
-                    schema["properties"]["msg"] = message;
-                }
-                schema["required"] = json!(["msg"]);
-            }
-            description.push_str(&format!(
-                "{}: {}\nArguments: {}\n",
-                callable, spec.description, schema
-            ));
-        }
         Ok(Self {
             session,
             shared,
             spec: ToolSpec {
                 name: ToolName::try_from("exec").unwrap(),
                 tool_type: ToolType::Custom,
-                description,
+                description: "Execute Python in the persistent notebook.".into(),
                 input_schema: Value::Null,
                 format: Some(rho_core::ToolFormat::Text),
             },
@@ -314,7 +334,7 @@ impl Tool for PythonTool {
             error: false,
             delivered: false,
             meaningful: false,
-            patience: None,
+            checkin: None,
             jobs: Vec::new(),
             pending: 0,
             cancelled: tokio::sync::watch::channel(false).0,
@@ -728,7 +748,7 @@ impl PythonExec {
                 since: state.since,
                 notification: state.important,
             },
-            patience: state.patience.map(std::time::Duration::from_secs),
+            checkin: state.checkin,
         }
     }
 }
@@ -782,7 +802,7 @@ impl rho_python::Execution for PythonExec {
                     failed: error.is_some(),
                     produced_output: state.meaningful,
                     dispatched: state.dispatched,
-                    set_patience: state.patience.is_some(),
+                    set_checkin: state.checkin.is_some(),
                 });
                 state.returned_error = error;
                 state.waker.wake();
@@ -790,9 +810,16 @@ impl rho_python::Execution for PythonExec {
             Event::Text {
                 text, important, ..
             } => self.link.lock().unwrap().write(&text, important),
-            Event::Patience { seconds, .. } => {
+            Event::Checkin {
+                seconds,
+                wake_on_tools,
+                ..
+            } => {
                 let mut state = self.link.lock().unwrap();
-                state.patience = Some(seconds);
+                state.checkin = Some(crate::PythonCheckin {
+                    after: std::time::Duration::from_secs(seconds),
+                    wake_on_tools,
+                });
                 state.waker.wake();
             }
             Event::Finished { error, .. } => {

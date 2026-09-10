@@ -27,7 +27,7 @@ use crate::db::{
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
     AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
-    InputQueues, MessageDelivery, QueuedInput, StartWorkdir, TranscriptLine, system_prompt,
+    InputQueues, MessageDelivery, QueuedInput, StartWorkdir, TranscriptLine, prompt,
 };
 
 pub(crate) mod projection;
@@ -1287,7 +1287,7 @@ impl ClaudeLoop {
         // The value is the same for every account: only the mount underneath
         // it differs.
         options.set_env("CLAUDE_CONFIG_DIR", config_home.as_str());
-        let prompt = system_prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
+        let prompt = prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
         // Keep one source inode alive for the lifetime of the view namespace.
         // Unlinking a bind-mounted source makes the target pathname disappear
         // inside that namespace, so a rewrite has to reuse this file rather

@@ -997,10 +997,13 @@ fn patience_setter_completion_does_not_defeat_its_interval() {
                 failed: false,
                 produced_output: false,
                 dispatched: false,
-                set_patience: true,
+                set_checkin: true,
             }),
             output: Default::default(),
-            patience: Some(Duration::from_secs(300)),
+            checkin: Some(rho_agent_tools::PythonCheckin {
+                after: Duration::from_secs(300),
+                wake_on_tools: true,
+            }),
         },
     };
     let scenario = ask(vec![control.clone()]).waiting(300);
@@ -1047,7 +1050,33 @@ async fn python_surface_has_exec_only_and_direct_surface_keeps_wait() {
                 .collect::<Vec<_>>(),
             vec!["exec"]
         );
-        assert!(python.system_prompt.contains("## Python Code Mode"));
+        assert_eq!(
+            python.tools[0].description,
+            "Execute Python in the persistent notebook."
+        );
+        assert_eq!(
+            python.system_prompt.matches("## Python Code Mode").count(),
+            1
+        );
+        assert_eq!(
+            python
+                .system_prompt
+                .matches("Work registers immediately;")
+                .count(),
+            1
+        );
+        assert!(
+            python
+                .system_prompt
+                .contains("set_checkin(after_seconds=300")
+        );
+        assert!(python.system_prompt.contains("view_image:"));
+        assert!(
+            python
+                .system_prompt
+                .contains("web.run: standard OpenAI web run")
+        );
+        assert!(!python.system_prompt.contains("set_patience"));
         assert!(!python.system_prompt.contains("## JavaScript Code Mode"));
     }
     for role in [
@@ -1070,7 +1099,7 @@ async fn python_surface_has_exec_only_and_direct_surface_keeps_wait() {
         let javascript = render_agent_surface(view.clone(), role).unwrap();
         assert!(javascript.system_prompt.contains("## JavaScript Code Mode"));
         assert!(!javascript.system_prompt.contains("## Python Code Mode"));
-        assert!(!javascript.system_prompt.contains("set_patience"));
+        assert!(!javascript.system_prompt.contains("set_checkin"));
         assert_eq!(
             javascript
                 .tools
@@ -1248,7 +1277,7 @@ fn python_exec_pending_is_not_the_same_as_provider_reply_sent() {
             returned: None,
             completion: None,
             output: Default::default(),
-            patience: None,
+            checkin: None,
         },
     };
     let scenario = ask(vec![exec, ended_call(1_000)]);
@@ -1266,7 +1295,10 @@ fn only_current_python_exec_controls_checkin_and_old_monitor_does_not_delay() {
             returned: None,
             completion: None,
             output: Default::default(),
-            patience: Some(Duration::from_secs(3600)),
+            checkin: Some(rho_agent_tools::PythonCheckin {
+                after: Duration::from_secs(3600),
+                wake_on_tools: true,
+            }),
         },
     };
     let current = SourceKind::PythonExec {
@@ -1277,7 +1309,10 @@ fn only_current_python_exec_controls_checkin_and_old_monitor_does_not_delay() {
             returned: Some(UnixMs(1)),
             completion: None,
             output: Default::default(),
-            patience: Some(Duration::from_secs(300)),
+            checkin: Some(rho_agent_tools::PythonCheckin {
+                after: Duration::from_secs(300),
+                wake_on_tools: true,
+            }),
         },
     };
     assert_eq!(
@@ -1342,13 +1377,13 @@ fn quiet_python_dispatch_does_not_bypass_operation_batching_when_output_arrives(
                 failed: false,
                 produced_output: false,
                 dispatched: true,
-                set_patience: false,
+                set_checkin: false,
             }),
             output: rho_agent_tools::PythonOutput {
                 since: Some(UnixMs(30_000)),
                 notification: None,
             },
-            patience: None,
+            checkin: None,
         },
     };
     let operation = |finished| SourceKind::PythonOperation {
@@ -1405,4 +1440,72 @@ async fn python_output_order_puts_latest_first_then_older_cells_in_execution_ord
             .collect::<Vec<_>>(),
         ["m-latest", "z-oldest", "a-older"],
     );
+}
+
+#[test]
+fn checkin_can_suppress_all_tool_wakes_without_suppressing_timer_user_or_mail() {
+    use rho_agent_tools::{
+        PythonCheckin, PythonCompletion, PythonExecFacts, PythonOperationFacts, PythonOutput,
+    };
+    for returned in [None, Some(UnixMs(1))] {
+        for wake_on_tools in [false, true] {
+            let control = SourceKind::PythonExec {
+                latest: true,
+                answer: ToolCallAnswer::Owed,
+                facts: PythonExecFacts {
+                    started: true,
+                    returned,
+                    completion: returned.map(|at| PythonCompletion {
+                        at,
+                        failed: true,
+                        produced_output: true,
+                        dispatched: true,
+                        set_checkin: true,
+                    }),
+                    output: PythonOutput {
+                        since: Some(UnixMs(1)),
+                        notification: Some(UnixMs(1)),
+                    },
+                    checkin: Some(PythonCheckin {
+                        after: Duration::from_secs(600),
+                        wake_on_tools,
+                    }),
+                },
+            };
+            let sources = vec![
+                control,
+                SourceKind::PythonOperation {
+                    answer: ToolCallAnswer::Owed,
+                    facts: PythonOperationFacts {
+                        finished: Some(UnixMs(1)),
+                        output: PythonOutput {
+                            since: Some(UnixMs(1)),
+                            notification: Some(UnixMs(1)),
+                        },
+                    },
+                },
+                tool(ToolHaste::Eventually { since: UnixMs(1) }),
+                tool(ToolHaste::Soon { since: UnixMs(1) }),
+                ended_call(1),
+            ];
+            let scenario = ask(sources.clone());
+            if wake_on_tools {
+                assert_eq!(scenario.boundary(UnixMs(11_000)), Boundary::Now);
+            } else {
+                // Includes the 300s progress deadline and the exec's own failure.
+                assert_eq!(scenario.recheck(UnixMs(599_999)), Some(UnixMs(600_000)));
+                assert_eq!(scenario.boundary(UnixMs(600_000)), Boundary::Now);
+                for input in [pending_user(20_000), pending_mail(20_000, 20_000)] {
+                    let mut with_input = sources.clone();
+                    with_input.push(input);
+                    assert_eq!(ask(with_input).boundary(UnixMs(30_000)), Boundary::Now);
+                }
+                let mut next_turn = sources;
+                if let SourceKind::PythonExec { latest, .. } = &mut next_turn[0] {
+                    *latest = false;
+                }
+                assert_eq!(ask(next_turn).boundary(UnixMs(11_000)), Boundary::Now);
+            }
+        }
+    }
 }

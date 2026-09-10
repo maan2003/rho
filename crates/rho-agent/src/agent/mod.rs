@@ -53,8 +53,7 @@ use crate::pool::{AgentPool, AgentTurnCompleted};
 use crate::presentation::{self, Sidecar, SidecarMessage};
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
-    StartWorkdir, ToolPreview, assistant_text, final_answer_text, materialize_workdirs,
-    system_prompt,
+    StartWorkdir, ToolPreview, assistant_text, final_answer_text, materialize_workdirs, prompt,
 };
 
 // -- the one tool the core answers itself -----------------------------------
@@ -1968,9 +1967,15 @@ fn surface(
             rho_agent_tools::CodeMode::JavaScript
         },
     );
+    let instructions = prompt::prompt(
+        view.as_ref(),
+        multi_agent.as_ref(),
+        code_mode,
+        role,
+        &others.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
+    );
     let tools = rho_agent_tools::tools(shell, others, code_mode)
         .map_err(|error| anyhow::anyhow!("code mode failed to start: {error}"))?;
-    let instructions = system_prompt::prompt(view.as_ref(), multi_agent.as_ref(), code_mode, role);
     Ok(Surface {
         code_mode,
         view,
@@ -1991,7 +1996,7 @@ pub fn render_agent_surface(
     let binding = role.session_profile()?;
     if binding.claude_model().is_some() {
         return Ok(crate::RenderedAgentSurface {
-            system_prompt: system_prompt::claude_prompt(Some(view.as_ref()), None, role),
+            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role),
             tools: Arc::from([]),
         });
     }

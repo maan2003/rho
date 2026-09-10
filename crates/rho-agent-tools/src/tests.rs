@@ -34,7 +34,11 @@ async fn javascript_runtime_remains_selectable() {
 #[tokio::test]
 async fn python_tool_entries_use_the_callable_namespace() {
     let tool = crate::PythonTool::new(shell(), Vec::new()).unwrap();
-    let description = tool.spec().description;
+    assert_eq!(
+        tool.spec().description,
+        "Execute Python in the persistent notebook."
+    );
+    let description = crate::python_instructions(&[]);
     assert!(!description.contains("apply_patch"));
     assert!(description.contains("web.run(search_query="));
     assert!(description.contains("same cell to run them concurrently"));
@@ -447,12 +451,16 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
     assert!(!monitor.done());
 
     let mut idle = tools[0].run(
-        call("idle", "exec", json!("set_patience(300)")),
+        call("idle", "exec", json!("set_checkin(300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*idle, ended).await;
     assert_eq!(
-        idle.python_exec().unwrap().facts().patience,
+        idle.python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .map(|checkin| checkin.after),
         Some(Duration::from_secs(300))
     );
     assert!(
@@ -461,7 +469,7 @@ async fn python_monitor_remains_inspectable_and_notifies_on_its_original_call() 
             .facts()
             .completion
             .unwrap()
-            .set_patience
+            .set_checkin
     );
     idle.first_output();
 
@@ -508,12 +516,17 @@ async fn python_immediate_stdin_and_patience_controls() {
     );
     assert!(result.output.contains("hello"), "{}", result.output);
     let mut control = tools[0].run(
-        call("p2", "exec", json!("set_patience(seconds=300)")),
+        call("p2", "exec", json!("set_checkin(after_seconds=300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*control, ended).await;
     assert_eq!(
-        control.python_exec().unwrap().facts().patience,
+        control
+            .python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .map(|checkin| checkin.after),
         Some(Duration::from_secs(300))
     );
     assert!(
@@ -523,7 +536,7 @@ async fn python_immediate_stdin_and_patience_controls() {
             .facts()
             .completion
             .unwrap()
-            .set_patience
+            .set_checkin
     );
     assert_eq!(control.first_output().status, ToolOutputStatus::Success);
 }
@@ -659,25 +672,49 @@ async fn old_execution_keeps_its_own_patience_without_touching_new_execution() {
         call(
             "old",
             "exec",
-            json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_patience(3600)"),
+            json!("notify('waiting')\nawait asyncio.sleep(0.2)\nset_checkin(3600, wake_on_tools=False)"),
         ),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*old, |h| matches!(h, ToolHaste::Soon { .. })).await;
     old.first_output();
     let new = tools[0].run(
-        call("new", "exec", json!("set_patience(300)")),
+        call("new", "exec", json!("set_checkin(300)")),
         SourceWaker::new(wake.clone()),
     );
     until(&wake, &*new, ended).await;
     until(&wake, &*old, ended).await;
     assert_eq!(
-        old.python_exec().unwrap().facts().patience,
+        old.python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .map(|checkin| checkin.after),
         Some(Duration::from_secs(3600))
     );
     assert_eq!(
-        new.python_exec().unwrap().facts().patience,
+        new.python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .map(|checkin| checkin.after),
         Some(Duration::from_secs(300))
+    );
+    assert!(
+        !old.python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .unwrap()
+            .wake_on_tools
+    );
+    assert!(
+        new.python_exec()
+            .unwrap()
+            .facts()
+            .checkin
+            .unwrap()
+            .wake_on_tools
     );
     assert!(!old.more_output().unwrap().output.contains("ignored"));
 }
@@ -776,7 +813,7 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
     let tools = tools(shell(), Vec::new(), Some(crate::CodeMode::Python)).unwrap();
     let wake = Arc::new(Notify::new());
     let source = format!(
-        "set_patience(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
+        "set_checkin(300)\ncommand('echo registered')\nweb.run(unknown=True)\nPath({:?}).touch()\nawait asyncio.sleep(0.1)",
         marker.to_str().unwrap()
     );
     let mut cell = tools[0].run(
@@ -793,7 +830,10 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
     }
     let exec = cell.python_exec().unwrap();
     assert!(exec.facts().started);
-    assert_eq!(exec.facts().patience, Some(Duration::from_secs(300)));
+    assert_eq!(
+        exec.facts().checkin.map(|checkin| checkin.after),
+        Some(Duration::from_secs(300))
+    );
     assert_eq!(
         cell.sources().len(),
         3,
@@ -804,7 +844,10 @@ async fn python_host_state_is_committed_before_return_without_agent_polling() {
     cell.first_output();
     drop(cell);
     // State remains readable without a transcript session; no drained setter.
-    assert_eq!(exec.facts().patience, Some(Duration::from_secs(300)));
+    assert_eq!(
+        exec.facts().checkin.map(|checkin| checkin.after),
+        Some(Duration::from_secs(300))
+    );
 }
 
 #[tokio::test]
@@ -937,7 +980,7 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
             })
         }
     }
-    let others = [
+    let others: Vec<Arc<dyn crate::FutureTool>> = [
         "spawn_engineer",
         "interrupt_engineer",
         "message_agent",
@@ -953,8 +996,9 @@ async fn python_agents_api_exposes_docs_and_runs_advisor_without_await() {
         Arc::new(EchoTool(spec)) as Arc<dyn crate::FutureTool>
     })
     .collect();
+    let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
     let tool = crate::PythonTool::new(shell(), others).unwrap();
-    let description = tool.spec().description;
+    let description = crate::python_instructions(&specs);
     assert!(description.contains("display(agents.delegate_engineer)"));
     assert!(description.contains("agents.spawn_new_advisor: ask_advisor full documentation"));
     assert!(!description.contains("tools.ask_advisor"));
@@ -1070,4 +1114,51 @@ async fn python_announces_sources_once_in_registration_order_including_late_sour
         positions.windows(2).all(|pair| pair[0] < pair[1]),
         "{finished}"
     );
+}
+
+#[tokio::test]
+async fn checkin_policy_is_validated_and_does_not_discard_output() {
+    let tool = crate::PythonTool::new(shell(), Vec::new()).unwrap();
+    assert!(crate::python_instructions(&[]).contains("wake_on_tools=False"));
+    let wake = Arc::new(Notify::new());
+    let mut cell = tool.run(
+        call(
+            "checkin",
+            "exec",
+            json!(
+                r#"
+assert "set_patience" not in globals()
+for args in [
+    dict(after_seconds=True), dict(after_seconds=0), dict(after_seconds=3601),
+    dict(after_seconds=1.5), dict(wake_on_tools="false"), dict(wake_on_tools=0), dict(seconds=300),
+]:
+    try:
+        set_checkin(**args)
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError(args)
+set_checkin(after_seconds=300, wake_on_tools=False)
+notify("buffered notification")
+await command("printf buffered-command")
+"#
+            ),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*cell, ended).await;
+    assert_eq!(
+        cell.python_exec().unwrap().facts().checkin,
+        Some(crate::PythonCheckin {
+            after: Duration::from_secs(300),
+            wake_on_tools: false,
+        })
+    );
+    let output = cell.first_output();
+    assert_eq!(output.status, ToolOutputStatus::Success, "{output:?}");
+    assert!(
+        output.output.contains("buffered notification"),
+        "{output:?}"
+    );
+    assert!(output.output.contains("buffered-command"), "{output:?}");
 }

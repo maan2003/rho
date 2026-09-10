@@ -39,7 +39,7 @@ pub mod mirror;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod presentation;
-pub mod system_prompt;
+pub mod prompt;
 
 const PRESENTATION_SOURCE_TAIL_BYTES: usize = 12 * 1024;
 

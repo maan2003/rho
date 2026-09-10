@@ -749,13 +749,16 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
 - `notify` marks meaningful output; `text` and captured stdout/stderr mark
   ordinary progress. Standard streams expose no daemon file descriptors. Both
   become output on the originating call at the core's next request boundary;
-  neither starts inference directly. `set_patience` conveys a model-authored
-  one-turn interval, not a Python sleep or a tool-selected timeout. It updates
+  neither starts inference directly. `set_checkin` conveys a model-authored
+  one-turn interval and tool-wakeup policy, not a Python sleep or a tool-selected timeout. It updates
   its execution's shared Rust state synchronously. Only the execution from the
   latest model response controls check-ins; old settings need no mutation or
   stale-setter warnings. A quiet successful setter-only
   completion is not news that immediately defeats its own interval; failures,
-  command completion, and meaningful output retain normal wake/batching rules.
+  command completion, and meaningful output retain normal wake/batching rules
+  unless `wake_on_tools=False` suppresses tool deadlines for that turn. Suppression
+  includes the execution itself, does not cancel work or discard buffered output,
+  and does not disable the timer, user input, or agent mail.
 - Notebook state and live jobs are ephemeral and do not survive restart. The
   existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
   the JavaScript runtime for all other code-mode roles.

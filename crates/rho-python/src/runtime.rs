@@ -66,7 +66,7 @@ pub(super) fn spawn(
                                 | Event::Returned { cell, .. }
                                 | Event::Call { cell, .. }
                                 | Event::Text { cell, .. }
-                                | Event::Patience { cell, .. }
+                                | Event::Checkin { cell, .. }
                                 | Event::Finished { cell, .. } => *cell,
                                 Event::Stopped { .. } => {
                                     return Err(vm.new_value_error("invalid execution event"));

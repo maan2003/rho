@@ -67,9 +67,10 @@ pub enum Event {
         max_tokens: usize,
         important: bool,
     },
-    Patience {
+    Checkin {
         cell: CellId,
         seconds: u64,
+        wake_on_tools: bool,
     },
     Finished {
         cell: CellId,

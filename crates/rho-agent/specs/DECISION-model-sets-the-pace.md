@@ -13,7 +13,10 @@ A look-in lasts exactly one turn: the model is shown what its calls have once,
 and to be shown again it has to ask, by calling something or by naming an
 interval. A quiet successful call whose only effect is to name that interval
 must not wake the model merely to acknowledge the setter. Old suspended calls
-cannot change the pace of a newer turn.
+cannot change the pace of a newer turn. The model may disable tool-triggered
+wakeups for that turn, including output, notifications, failures, and execution
+completion. This does not suppress the timed check-in, user input, or agent mail;
+work continues and accumulated output is drained at the next request.
 
 ## Rationale
 

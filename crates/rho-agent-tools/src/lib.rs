@@ -18,14 +18,14 @@ use std::sync::{Arc, Mutex};
 
 pub use code_mode::CodeModeTool;
 use futures::future::BoxFuture;
-pub use python::{PythonExec, PythonTool};
+pub use python::{PythonExec, PythonTool, python_instructions};
 use rho_core::{ToolCall, ToolExecutionContext, ToolOutput, ToolOutputStatus, ToolSpec, UnixMs};
 use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;
 pub use shell::ShellTool;
 pub use tool::{
-    PythonCompletion, PythonExecFacts, PythonOperationFacts, PythonOutput, SourceFacts,
-    SourceWaker, Tool, ToolHaste, ToolSession,
+    PythonCheckin, PythonCompletion, PythonExecFacts, PythonOperationFacts, PythonOutput,
+    SourceFacts, SourceWaker, Tool, ToolHaste, ToolSession,
 };
 
 /// A tool whose whole answer is one future. Usable directly by the model or
