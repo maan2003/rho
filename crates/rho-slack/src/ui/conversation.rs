@@ -1356,6 +1356,8 @@ impl ConversationView {
             }
         }
         self.revision = revision;
+        // Resolving authors rewrites rows too; restore the reader's point after it.
+        self.settle_names(cx);
         // Back on the message it was on, if the redraw moved it off. The
         // reader chose that message; everything below is the surface's own
         // placing, and each of those is asked for.
@@ -1375,7 +1377,6 @@ impl ConversationView {
         self.place_dealt(window, cx);
         self.place_unread(window, cx);
         self.settle_images(cx);
-        self.settle_names(cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
         self.refresh_chip(cx);
