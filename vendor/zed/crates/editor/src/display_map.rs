@@ -1466,6 +1466,61 @@ impl DisplayMap {
         }
     }
 
+    /// Replaces a key's highlights inside one anchor range, leaving the
+    /// rest of the key's list alone.
+    ///
+    /// [`Self::highlight_text`] replaces a key's whole list, so a caller
+    /// that re-highlights one page of a document has to hand over every
+    /// range in the document to keep the others. This takes the page: the
+    /// existing ranges lying within `within` go, the new ones take their
+    /// place, and the list stays sorted without being sorted again. Cost
+    /// is a binary search and the ranges spliced, not the list.
+    ///
+    /// The style is the key's, as it is for `highlight_text`: the last
+    /// caller's style wins for every range under the key.
+    ///
+    /// The list is assumed sorted by start and non-overlapping, which is
+    /// what `highlight_text` leaves behind. A key whose ranges nest would
+    /// need a scan rather than the second binary search.
+    #[instrument(skip_all)]
+    pub fn highlight_text_in_range(
+        &mut self,
+        key: HighlightKey,
+        within: Range<Anchor>,
+        mut ranges: Vec<Range<Anchor>>,
+        style: HighlightStyle,
+        cx: &App,
+    ) {
+        let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        ranges.sort_by(|a, b| a.start.cmp(&b.start, &multi_buffer_snapshot));
+        match Arc::make_mut(&mut self.text_highlights).entry(key) {
+            Entry::Occupied(mut slot) => match Arc::get_mut(slot.get_mut()) {
+                Some((previous_style, previous_ranges)) => {
+                    *previous_style = style;
+                    splice_highlights_within(
+                        previous_ranges,
+                        &within,
+                        ranges,
+                        &multi_buffer_snapshot,
+                    );
+                }
+                None => {
+                    let mut previous_ranges = slot.get().1.clone();
+                    splice_highlights_within(
+                        &mut previous_ranges,
+                        &within,
+                        ranges,
+                        &multi_buffer_snapshot,
+                    );
+                    slot.insert(Arc::new((style, previous_ranges)));
+                }
+            },
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::new((style, ranges)));
+            }
+        }
+    }
+
     #[instrument(skip_all)]
     pub(crate) fn highlight_inlays(
         &mut self,
@@ -1668,6 +1723,24 @@ impl DisplayMap {
     pub fn invalidate_semantic_highlights(&mut self, buffer_id: BufferId) {
         Arc::make_mut(&mut self.semantic_token_highlights).remove(&buffer_id);
     }
+}
+
+/// Replaces the ranges lying within `within` with `ranges`, in place.
+///
+/// Both lists are sorted by start. The first bound is the first existing
+/// range starting at or after `within.start`; the second is the first one
+/// after it that reaches past `within.end`. A range straddling either end
+/// of `within` is not within it and stays.
+fn splice_highlights_within(
+    existing: &mut Vec<Range<Anchor>>,
+    within: &Range<Anchor>,
+    ranges: Vec<Range<Anchor>>,
+    snapshot: &MultiBufferSnapshot,
+) {
+    let start = existing.partition_point(|range| range.start.cmp(&within.start, snapshot).is_lt());
+    let end = start
+        + existing[start..].partition_point(|range| range.end.cmp(&within.end, snapshot).is_le());
+    existing.splice(start..end, ranges);
 }
 
 #[derive(Debug, Default)]
@@ -4817,6 +4890,112 @@ pub mod tests {
             ),
             None,
         );
+    }
+
+    /// Re-highlighting one page leaves the other pages' ranges standing.
+    ///
+    /// This is the whole point of the call: a caller with a highlight over
+    /// a long document and a page of it to redo hands over the page, not
+    /// the document.
+    #[gpui::test]
+    fn test_highlight_text_in_range_replaces_only_that_range(cx: &mut gpui::App) {
+        init_test(cx, &|_| {});
+        let text = "aaaa\nbbbb\ncccc\ndddd\neeee";
+        let buffer = MultiBuffer::build_simple(text, cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer.clone(),
+                font("Courier"),
+                px(16.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+
+        // One range on each of the five rows.
+        let row = |row: u32, start: u32, end: u32| {
+            snapshot.anchor_before(Point::new(row, start))
+                ..snapshot.anchor_after(Point::new(row, end))
+        };
+        let starts = |map: &DisplayMap| {
+            map.text_highlights
+                .get(&HighlightKey::Editor)
+                .expect("the key was highlighted")
+                .1
+                .iter()
+                .map(|range| range.start.to_point(&snapshot))
+                .collect::<Vec<_>>()
+        };
+
+        map.update(cx, |map, cx| {
+            map.highlight_text(
+                HighlightKey::Editor,
+                vec![
+                    row(0, 0, 1),
+                    row(1, 0, 1),
+                    row(2, 0, 1),
+                    row(3, 0, 1),
+                    row(4, 0, 1),
+                ],
+                gpui::red().to_rgb().into(),
+                false,
+                cx,
+            );
+        });
+
+        // Redo the middle row only, with two ranges where there was one.
+        map.update(cx, |map, cx| {
+            map.highlight_text_in_range(
+                HighlightKey::Editor,
+                snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 4)),
+                vec![row(2, 1, 2), row(2, 3, 4)],
+                gpui::red().to_rgb().into(),
+                cx,
+            );
+        });
+
+        map.update(cx, |map, _| {
+            assert_eq!(
+                starts(map),
+                vec![
+                    Point::new(0, 0),
+                    Point::new(1, 0),
+                    Point::new(2, 1),
+                    Point::new(2, 3),
+                    Point::new(3, 0),
+                    Point::new(4, 0),
+                ],
+                "the page's ranges are replaced, the rows around it stand, and the list stays sorted"
+            );
+        });
+
+        // A page with nothing new in it empties that page and only it.
+        map.update(cx, |map, cx| {
+            map.highlight_text_in_range(
+                HighlightKey::Editor,
+                snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 4)),
+                Vec::new(),
+                gpui::red().to_rgb().into(),
+                cx,
+            );
+        });
+
+        map.update(cx, |map, _| {
+            assert_eq!(
+                starts(map),
+                vec![
+                    Point::new(0, 0),
+                    Point::new(1, 0),
+                    Point::new(3, 0),
+                    Point::new(4, 0),
+                ],
+            );
+        });
     }
 
     #[test]
