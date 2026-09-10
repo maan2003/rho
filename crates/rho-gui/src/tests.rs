@@ -36,6 +36,7 @@ mod fold_widening_check;
 mod history;
 mod inlay_cost;
 mod minibuffer;
+mod prose_buffers;
 mod record_anchors;
 mod removing_a_turn_after_growth;
 mod running_turn_elapsed;
@@ -43,7 +44,6 @@ mod scene_walk;
 pub(super) mod story;
 mod syntax_parsed_in_frame;
 mod tool_output_not_drawn;
-mod turn_is_one_buffer;
 mod wrap_rows;
 mod wrap_under_tab;
 use rho_agents::HostId;
@@ -2471,11 +2471,11 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
         text.contains("Heading\n\nbold and code.\n"),
         "markup should not reach the screen: {text:?}"
     );
-    // The user's own markup renders like anyone else's: they are writing
-    // markdown too, and a turn is one buffer end to end.
+    // The reader's own words are not markdown: their asterisks are text
+    // and stay on screen exactly as they typed them.
     assert!(
-        text.contains("user markup renders") && !text.contains("**user markup renders**"),
-        "the user's markup was left on screen: {text:?}"
+        text.contains("**user markup renders**"),
+        "the reader's own words were read as markup: {text:?}"
     );
     let buffer = buffer_text(&workspace, cx);
     assert!(
@@ -5703,13 +5703,11 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
     );
 }
 
-/// A turn is one buffer, calls included, and a call's line is still not
-/// markup. The buffer parses as markdown so the model's prose renders, and
-/// what a call ran is held in a code span: the delimiters are concealed, so
-/// the row is the row it always was, and the punctuation inside it is the
-/// punctuation that was run.
+/// What a call ran and what the reader typed are shown as they are: no
+/// markdown grammar over either, so neither gets a delimiter on screen nor
+/// a highlight from a parser. Only the model's own words are markdown.
 #[gpui::test]
-fn a_call_shares_the_turns_buffer_and_keeps_its_punctuation(cx: &mut TestAppContext) {
+fn a_call_and_the_users_words_are_plain_text(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let ran = UiBlock::Tool(UiTool {
         id: "tool-1".to_owned(),
@@ -5730,7 +5728,7 @@ fn a_call_shares_the_turns_buffer_and_keeps_its_punctuation(cx: &mut TestAppCont
         state(
             Vec::new(),
             vec![
-                user("first request"),
+                user("**my** request"),
                 assistant(
                     "**first** assistant segment",
                     Some(UiMessagePhase::Commentary),
@@ -5745,39 +5743,60 @@ fn a_call_shares_the_turns_buffer_and_keeps_its_punctuation(cx: &mut TestAppCont
     );
     cx.run_until_parked();
 
-    let editor = active_editor(&workspace, cx);
-    workspace
-        .update(cx, |_, _, cx| {
-            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
-            let holding = buffers
-                .iter()
-                .filter(|buffer| buffer.read(cx).text().contains("assistant segment"))
-                .collect::<Vec<_>>();
-            assert_eq!(holding.len(), 1, "the turn is more than one buffer");
-            assert!(
-                holding[0].read(cx).text().contains("echo **bold**"),
-                "the call is in another buffer than the prose around it"
-            );
-            assert!(
-                holding[0].read(cx).language().is_some(),
-                "the turn's buffer must parse as markdown"
-            );
-        })
-        .expect("inspect transcript turn buffers");
-
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("$ echo **bold** and _under_"),
         "the call's own punctuation was read as markup: {text:?}"
     );
     assert!(
+        text.contains("**my** request"),
+        "the reader's own punctuation was read as markup: {text:?}"
+    );
+    assert!(
         !text.contains("`"),
-        "the code span's delimiters reached the screen: {text:?}"
+        "a delimiter reached the screen: {text:?}"
     );
     assert!(
         text.contains("first assistant segment") && !text.contains("**first**"),
         "the model's markdown stopped rendering: {text:?}"
     );
+
+    // Nothing parses those two rows, so no chunk in them carries a
+    // highlight, while the model's prose keeps the ones it had.
+    let call = syntax_highlights_for_text(&workspace, "echo **bold** and _under_", cx);
+    assert!(
+        call.iter().all(Option::is_none),
+        "a call's row is highlighted: {call:?}"
+    );
+    let typed = syntax_highlights_for_text(&workspace, "**my** request", cx);
+    assert!(
+        typed.iter().all(Option::is_none),
+        "the reader's own words are highlighted: {typed:?}"
+    );
+    let prose = syntax_highlights_for_text(&workspace, "**first**", cx);
+    assert!(
+        prose.iter().any(Option::is_some),
+        "the model's words lost their highlighting: {prose:?}"
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffers = editor.read(cx).buffer().read(cx).all_buffers();
+            for buffer in buffers {
+                let buffer = buffer.read(cx);
+                let plain = buffer.text().contains("echo **bold**")
+                    || buffer.text().contains("**my** request");
+                if plain {
+                    assert!(
+                        buffer.language().is_none(),
+                        "a call or the reader's words are in a parsed buffer: {:?}",
+                        buffer.text()
+                    );
+                }
+            }
+        })
+        .expect("inspect transcript buffers");
 }
 
 #[gpui::test]

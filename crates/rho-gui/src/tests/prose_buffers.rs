@@ -1,16 +1,13 @@
-//! A turn's prose is one buffer, across the user's own words.
+//! Which blocks share a buffer, now that only the model's words are
+//! markdown.
 //!
-//! Every buffer costs an excerpt to compose and a parse to draw, and the
-//! floor of opening a long transcript was the count of them. A turn used
-//! to be at least three — the question, the answer, and whatever the
-//! answer was split from — because the user's words were not markdown and
-//! the flag that picks a language also picked the boundary.
-//!
-//! They are one now, which is only allowed because two things that a
-//! buffer edge used to guarantee are guaranteed on their own: the user's
-//! markup is not concealed, because concealment is suppressed over their
-//! ranges, and a fence one turn leaves open cannot reach the next,
-//! because a block that leaves one open ends its chunk.
+//! Every buffer costs an excerpt to compose and a parse to draw, so the
+//! prose of one turn is kept together where it can be. It can be across
+//! the model's own blocks, which are all markdown; it cannot be across
+//! the reader's words or a call, because those are shown as they were
+//! written and a plain buffer is what shows them that way. A fence one
+//! turn leaves open still cannot reach the next, because a block that
+//! leaves one open ends its chunk.
 
 use gpui::TestAppContext;
 
@@ -37,9 +34,10 @@ fn buffers(workspace: &gpui::WindowHandle<super::Workspace>, cx: &mut TestAppCon
         .expect("count the buffers")
 }
 
-/// Two turns of question and answer: two buffers, not six.
+/// The model's own blocks share one buffer; the reader's words keep their
+/// own, because they are not parsed.
 #[gpui::test]
-fn a_turn_of_prose_is_one_buffer(cx: &mut TestAppContext) {
+fn the_models_blocks_share_a_buffer_and_the_readers_do_not(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -49,20 +47,19 @@ fn a_turn_of_prose_is_one_buffer(cx: &mut TestAppContext) {
             Vec::new(),
             vec![
                 user("first question"),
-                assistant("first answer", Some(UiMessagePhase::FinalAnswer)),
-                user("second question"),
-                assistant("second answer", Some(UiMessagePhase::FinalAnswer)),
+                assistant("first answer", Some(UiMessagePhase::Commentary)),
+                assistant("still answering", Some(UiMessagePhase::FinalAnswer)),
             ],
         ),
     );
 
     assert_eq!(
         buffers(&workspace, cx),
-        1,
-        "four blocks of prose are one chunk, so they are one buffer"
+        2,
+        "the reader's words and the model's two blocks are two buffers"
     );
     let text = display_text(&workspace, cx);
-    for said in ["first question", "first answer", "second question"] {
+    for said in ["first question", "first answer", "still answering"] {
         assert!(text.contains(said), "{said:?} is not drawn: {text:?}");
     }
 }
