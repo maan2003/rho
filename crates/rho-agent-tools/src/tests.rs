@@ -717,6 +717,39 @@ async fn top_level_return_does_not_finish_detached_python_activity() {
 }
 
 #[tokio::test]
+async fn a_silent_cell_says_nothing_when_an_older_cell_speaks_in_the_same_reply() {
+    let tool = python(shell(), Vec::new());
+    let wake = Arc::new(Notify::new());
+    let mut older = tool.run(
+        call("older", json!("command('echo late')")),
+        SourceWaker::new(wake.clone()),
+    );
+    until(&wake, &*older, Signal::Ended).await;
+    // The older cell's finished job is unreported when the newer cell is
+    // first answered, so "No output yet" would misdescribe the reply.
+    let mut newer = tool.run(
+        call("newer", json!("await asyncio.sleep(0.2)")),
+        SourceWaker::new(wake.clone()),
+    );
+    assert_eq!(newer.first_output().output.as_str(), "");
+    assert!(older.first_output().output.contains("late"));
+    assert!(older.done());
+    // With nothing older left to say, silence is the whole reply.
+    let mut newest = tool.run(
+        call("newest", json!("await asyncio.sleep(0.2)")),
+        SourceWaker::new(wake.clone()),
+    );
+    assert_eq!(
+        newest.first_output().output.as_str(),
+        "No output yet. Output and completion arrive automatically."
+    );
+    until(&wake, &*newer, Signal::Ended).await;
+    until(&wake, &*newest, Signal::Ended).await;
+    assert!(newer.more_output().is_none());
+    assert!(newest.more_output().is_none());
+}
+
+#[tokio::test]
 async fn operation_output_does_not_change_exec_return_facts() {
     struct ReleasedTool(Arc<Notify>);
     impl crate::FutureTool for ReleasedTool {

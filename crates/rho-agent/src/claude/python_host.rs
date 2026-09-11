@@ -225,11 +225,16 @@ impl Drained {
 }
 
 fn output_items(output: &ToolOutput, prefix: Option<&str>) -> Vec<Value> {
-    let mut items = vec![text_item(&format!(
-        "{}{}",
-        prefix.unwrap_or_default(),
-        output.output
-    ))];
+    // A cell that answered with nothing because older cells speak in the
+    // same reply gets no item of its own; the older cells' items follow.
+    let mut items = Vec::new();
+    if prefix.is_some() || !output.output.is_empty() {
+        items.push(text_item(&format!(
+            "{}{}",
+            prefix.unwrap_or_default(),
+            output.output
+        )));
+    }
     items.extend(output.images.iter().map(|image| {
         json!({
             "type": "image",

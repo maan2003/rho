@@ -116,6 +116,21 @@ impl ExecState {
                 .iter()
                 .all(|j| j.state.lock().unwrap().finished.is_some())
     }
+
+    /// Whether the next `render` would say anything: unsent output, a job or
+    /// operation not yet announced as running, or one that ended and has not
+    /// been reported. Jobs and operations leave the lists once reported.
+    fn has_news(&self) -> bool {
+        !self.output.is_empty()
+            || self.operations.iter().any(|op| {
+                let op = op.lock().unwrap();
+                op.finished.is_some() || !op.announced
+            })
+            || self.jobs.iter().any(|job| {
+                let state = job.state.lock().unwrap();
+                !state.unsent.is_empty() || state.finished.is_some() || !state.announced
+            })
+    }
 }
 struct Operation {
     id: u64,
@@ -998,6 +1013,18 @@ impl rho_python::Execution for PythonExec {
     }
 }
 impl PythonCell {
+    /// Whether any other live cell has something unsent, which the same
+    /// reply will carry after this cell's own answer.
+    fn others_have_news(&self) -> bool {
+        self.shared
+            .cells
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| **id != self.cell)
+            .any(|(_, state)| state.lock().unwrap().has_news())
+    }
+
     /// Everything unsent, in one block: the cell's own output first, then
     /// each job's. A job is announced as running the first time a reply goes
     /// out while it is, under a session ID its later pieces name again; a job
@@ -1113,15 +1140,19 @@ impl PythonCell {
             }
             // The call's one required answer, in the notebook's own words
             // (`DECISION-the-core-never-speaks-for-a-tool`): a silent cell
-            // whose work is over, or one whose work is still going.
-            chunks.push(
-                if closed {
-                    "No output."
-                } else {
-                    "No output yet. Output and completion arrive automatically."
-                }
-                .into(),
-            );
+            // whose work is over, or one whose work is still going. Unless an
+            // older cell speaks in the same reply: then the silence is not
+            // the news, and this cell adds nothing to it.
+            if !self.others_have_news() {
+                chunks.push(
+                    if closed {
+                        "No output."
+                    } else {
+                        "No output yet. Output and completion arrive automatically."
+                    }
+                    .into(),
+                );
+            }
         }
         let mut result = output(
             chunks.join("\n"),

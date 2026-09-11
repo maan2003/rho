@@ -1000,6 +1000,25 @@ fn latest_sources(running: &RunningTool) -> Vec<SourceKind> {
         .collect()
 }
 
+async fn until_jobs_registered(running: &RunningTool, wake: &Arc<Notify>, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let jobs = running
+                .session
+                .sources()
+                .into_iter()
+                .filter(|(_, facts)| matches!(facts, rho_agent_tools::SourceFacts::Job(_)))
+                .count();
+            if jobs >= count {
+                break;
+            }
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 async fn until_job_ends(
     running: &RunningTool,
     wake: &Arc<Notify>,
@@ -1039,6 +1058,9 @@ async fn python_commands_are_independent_boundary_sources_even_after_exec_answer
         started_at: UnixMs::now(),
         answer: ToolCallAnswer::Owed,
     };
+    // The cell registers its second command a moment after the first, which
+    // can end before then; the announcement below needs both on the books.
+    until_jobs_registered(&running, &wake, 2).await;
     let first_at = until_job_ends(&running, &wake, 0).await;
     let mut schedule = ask(latest_sources(&running));
     schedule.turn = None;
