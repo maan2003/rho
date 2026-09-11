@@ -15,7 +15,9 @@ use std::fs::{self};
 use std::io::ErrorKind;
 use std::io::Write as _;
 use std::os::fd::AsFd as _;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,6 +35,7 @@ use prefix_id::PrefixId;
 use prefix_id::PrefixIdDomain;
 use prefix_id::PrefixResolution;
 use rustix::fs::FlockOperation;
+use rustix::fs::RenameFlags;
 use rustix::ioctl::Opcode;
 use rustix::ioctl::Setter;
 use serde_json::json;
@@ -400,6 +403,30 @@ const SUBVOLUME_DELETE: Opcode = rustix::ioctl::opcode::write::<BcachefsSubvolum
 const SUBVOLUME_DELETE_V2: Opcode =
     rustix::ioctl::opcode::write::<BcachefsSubvolumeArgsV2>(0xbc, 30);
 
+#[derive(Debug)]
+struct BcachefsOperationError {
+    errno: rustix::io::Errno,
+    detail: String,
+}
+
+impl std::fmt::Display for BcachefsOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "bcachefs operation failed: {}", self.errno)?;
+        if !self.detail.is_empty() {
+            write!(formatter, ": {}", self.detail)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BcachefsOperationError {}
+
+impl BcachefsOperationError {
+    fn is_not_subvolume(&self) -> bool {
+        self.errno == rustix::io::Errno::NOENT && self.detail == "error=ENOENT_not_subvol"
+    }
+}
+
 /// Minimal implementation of the bcachefs subvolume UAPI. Keep this local:
 /// linking bcachefs-tools would also pull in its much larger libbcachefs C
 /// implementation, while managed workspaces need only these two ioctls.
@@ -436,21 +463,22 @@ fn bcachefs_subvolume<const V2: Opcode, const V1: Opcode>(path: &Path) -> Result
     match result {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::NOTTY) => {
-            unsafe { rustix::ioctl::ioctl(filesystem.as_fd(), Setter::<V1, _>::new(base)) }
-                .map_err(|error| user_error(format!("bcachefs operation failed: {error}")))
+            unsafe { rustix::ioctl::ioctl(filesystem.as_fd(), Setter::<V1, _>::new(base)) }.map_err(
+                |errno| {
+                    user_error(BcachefsOperationError {
+                        errno,
+                        detail: String::new(),
+                    })
+                },
+            )
         }
-        Err(error) => {
+        Err(errno) => {
             let end = message
                 .iter()
                 .position(|byte| *byte == 0)
                 .unwrap_or(message.len());
-            let detail = String::from_utf8_lossy(&message[..end]);
-            let detail = detail.trim();
-            Err(user_error(if detail.is_empty() {
-                format!("bcachefs operation failed: {error}")
-            } else {
-                format!("bcachefs operation failed: {error}: {detail}")
-            }))
+            let detail = String::from_utf8_lossy(&message[..end]).trim().to_owned();
+            Err(user_error(BcachefsOperationError { errno, detail }))
         }
     }
 }
@@ -461,6 +489,83 @@ fn create_subvolume(path: &Path) -> Result<(), CommandError> {
 }
 fn delete_subvolume(path: &Path) -> Result<(), CommandError> {
     bcachefs_subvolume::<SUBVOLUME_DELETE_V2, SUBVOLUME_DELETE>(path)
+}
+
+fn delete_gc_materialization(path: &Path) -> Result<(), CommandError> {
+    let before = fs::symlink_metadata(path).context(path)?;
+    match delete_subvolume(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .error
+                .downcast_ref::<BcachefsOperationError>()
+                .is_some_and(BcachefsOperationError::is_not_subvolume) =>
+        {
+            let after = fs::symlink_metadata(path).context(path)?;
+            if !after.is_dir() || (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+                return Err(error);
+            }
+
+            // Move the validated inode out of the stable path before recursive
+            // deletion. A concurrent replacement of the stable path can no
+            // longer redirect the recursion.
+            let parent_path = path.parent().unwrap();
+            let parent = File::open(parent_path).context(parent_path)?;
+            let file_name = path.file_name().unwrap();
+            let (quarantine_name, quarantine) = loop {
+                let name = format!(".jj-gc-{:016x}", rand::random::<u64>());
+                match rustix::fs::renameat_with(
+                    &parent,
+                    file_name,
+                    &parent,
+                    name.as_str(),
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {
+                        let quarantine =
+                            PathBuf::from(format!("/proc/self/fd/{}/{}", parent.as_raw_fd(), name));
+                        break (name, quarantine);
+                    }
+                    Err(rustix::io::Errno::EXIST) => continue,
+                    Err(errno) => {
+                        return Err(user_error(format!(
+                            "Failed to quarantine {} for deletion: {errno}",
+                            path.display()
+                        )));
+                    }
+                }
+            };
+            let restore = || {
+                rustix::fs::renameat_with(
+                    &parent,
+                    quarantine_name.as_str(),
+                    &parent,
+                    file_name,
+                    RenameFlags::NOREPLACE,
+                )
+            };
+            let quarantined = match fs::symlink_metadata(&quarantine) {
+                Ok(metadata) => metadata,
+                Err(metadata_error) => {
+                    let _ = restore();
+                    return Err(metadata_error).context(&quarantine)?;
+                }
+            };
+            if !quarantined.is_dir()
+                || (before.dev(), before.ino()) != (quarantined.dev(), quarantined.ino())
+            {
+                let _ = restore();
+                return Err(error);
+            }
+            if let Err(remove_error) = fs::remove_dir_all(&quarantine) {
+                // Preserve a retryable stable path after ordinary I/O failures.
+                let _ = restore();
+                return Err(remove_error).context(&quarantine)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn run_git(
@@ -659,13 +764,30 @@ async fn gc(ui: &mut Ui, command: &CommandHelper, args: &GcArgs) -> Result<(), C
             continue;
         };
         let expected_root = root_path(&repo_path, &id);
-        let (Ok(root), Ok(expected_root)) = (
-            dunce::canonicalize(root),
-            dunce::canonicalize(expected_root),
+        if root.file_name() != expected_root.file_name() {
+            continue;
+        }
+        let (Some(root_parent), Some(expected_parent)) = (root.parent(), expected_root.parent())
+        else {
+            continue;
+        };
+        let (Ok(root_parent), Ok(expected_parent)) = (
+            dunce::canonicalize(root_parent),
+            dunce::canonicalize(expected_parent),
         ) else {
             continue;
         };
-        if root != expected_root {
+        if root_parent != expected_parent {
+            continue;
+        }
+        // Canonicalize only the parent: following the final component could
+        // turn a restored symlink into permission to recursively delete its
+        // target.
+        let root = root_parent.join(root.file_name().unwrap());
+        let Ok(metadata) = fs::symlink_metadata(&root) else {
+            continue;
+        };
+        if !metadata.is_dir() {
             continue;
         }
         let lease_path = lock_path(&repo_path, &id);
@@ -692,8 +814,12 @@ async fn gc(ui: &mut Ui, command: &CommandHelper, args: &GcArgs) -> Result<(), C
             fs::remove_file(root.join(".git")).context(root.join(".git"))?;
             removed_git = true;
         }
+        // An rsync-style filesystem restore can preserve the checkout while
+        // losing its bcachefs subvolume identity. This root has already been
+        // snapshotted and is protected by the exclusive lease, so that one
+        // specific kernel response is safe to recover with ordinary removal.
+        delete_gc_materialization(&root)?;
         store.forget(&[&name])?;
-        delete_subvolume(&root)?;
         removed.push(format!("ws-{id}"));
     }
     if removed_git {
@@ -759,6 +885,24 @@ mod tests {
         assert_eq!(
             resolve_id(&repo, &format!("ws-{ambiguous}")).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn recognizes_bcachefs_not_subvolume_error() {
+        assert!(
+            BcachefsOperationError {
+                errno: rustix::io::Errno::NOENT,
+                detail: "error=ENOENT_not_subvol".to_owned(),
+            }
+            .is_not_subvolume()
+        );
+        assert!(
+            !BcachefsOperationError {
+                errno: rustix::io::Errno::NOENT,
+                detail: String::new(),
+            }
+            .is_not_subvolume()
         );
     }
 
