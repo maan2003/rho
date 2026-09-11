@@ -117,6 +117,9 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     }
     for (id, (mut item, source, completed)) in streams {
         recovery_streams.push(id.clone());
+        if source.is_empty() {
+            continue;
+        }
         if !canonical.contains(&id) {
             let InferenceResponseItem::ToolCall { arguments, .. } = &mut item else {
                 unreachable!()
@@ -129,7 +132,10 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
         }
         recovery_notes.push(format!(
             "Rho restarted: Python state and command handles are gone. {}",
-            super::streaming::progress_note(&id, &source, completed, source.len()).replace(
+            super::streaming::progress_note(
+                &id, &source, completed, source.len(),
+                "execution was interrupted by restart; these statements may have executed partially",
+            ).replace(
                 "existing command handles and their fresh output remain authoritative",
                 "external side effects may remain, but old command handles cannot be used"
             ),
@@ -334,6 +340,12 @@ mod tests {
                 })
                 .collect();
             let replayed = replay(events.clone());
+            if cut == 1 {
+                assert!(replayed.owed.is_empty());
+                assert!(replayed.recovery_blocks.is_empty());
+                assert!(replayed.recovery_notes.is_empty());
+                continue;
+            }
             assert_eq!(replayed.owed.len(), 1);
             assert_eq!(replayed.recovery_blocks.len(), 1);
             assert!(

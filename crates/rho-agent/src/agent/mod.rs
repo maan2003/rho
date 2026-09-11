@@ -837,8 +837,7 @@ impl Agent {
                 Boundary::AbortAndResend => {
                     // Stop admission and preserve any executed call before
                     // draining fresh input into the replacement request.
-                    self.abandon_stream("User interrupted the response", now)
-                        .await;
+                    self.abandon_stream(now).await;
                     self.session.abort();
                     self.start_request(now).await;
                     None
@@ -971,8 +970,7 @@ impl Agent {
                         let (since, attempts) = in_flight.retry.unwrap_or((now, 0));
                         let partial = std::mem::take(&mut in_flight.pending);
                         let error = error.to_string();
-                        self.abandon_stream(&error, now).await;
-                        self.recovery_notes.push(format!("Provider attempt failed: {error}. Continue from the current transcript; command output below is fresh."));
+                        let has_execution = self.abandon_stream(now).await;
                         self.persist(AgentEvent::Failed {
                             partial,
                             error: Cow::Borrowed(&error),
@@ -981,13 +979,25 @@ impl Agent {
                         })
                         .await;
                         self.session.abort();
+                        if has_execution {
+                            // Accepted Python is an ordinary model-issued exec,
+                            // not a transport retry that may bypass its sources.
+                            self.turn = Some(ModelTurn {
+                                spoke_at: now,
+                                asked: ModelAsked::Calls,
+                            });
+                        }
                         self.phase = Phase::Idle {
                             owed: Vec::new(),
-                            standing: Standing::Retry {
-                                since,
-                                failed_at: now,
-                                attempts: attempts + 1,
-                                error: Arc::from(error),
+                            standing: if has_execution {
+                                Standing::Nothing
+                            } else {
+                                Standing::Retry {
+                                    since,
+                                    failed_at: now,
+                                    attempts: attempts + 1,
+                                    error: Arc::from(error),
+                                }
                             },
                         };
                     }
@@ -1078,8 +1088,7 @@ impl Agent {
                 // Ask every tool to wind down, then keep reading it: the core
                 // does not kill tools, so a tool still chooses its own last
                 // words.
-                self.abandon_stream("User cancelled the response", now)
-                    .await;
+                self.abandon_stream(now).await;
                 for tool in self.tools.values_mut() {
                     tool.session.cancel();
                 }
@@ -1126,7 +1135,7 @@ impl Agent {
     /// goes to the log first, so the reader keeps it and the turn's end
     /// follows its row.
     async fn fail(&mut self, now: UnixMs, partial: PendingInferenceResponse, error: String) {
-        self.abandon_stream(&error, now).await;
+        self.abandon_stream(now).await;
         self.persist(AgentEvent::Failed {
             partial,
             error: std::borrow::Cow::Borrowed(error.as_str()),
@@ -1456,10 +1465,26 @@ impl Agent {
             match tool.answer {
                 ToolCallAnswer::Owed => {
                     tool.answer = ToolCallAnswer::Sent;
+                    let mut body = tool.session.first_output();
+                    if self
+                        .streams
+                        .get(&tool.call.id)
+                        .is_some_and(|stream| stream.interrupted)
+                    {
+                        let execution = if body.status == ToolOutputStatus::Cancelled {
+                            "Execution was cancelled."
+                        } else {
+                            "Execution was not cancelled."
+                        };
+                        body.output = Arc::new(format!(
+                            "Your response was interrupted while generating this tool call. {execution} Continue from the existing state without replaying this call.\n\n{}",
+                            body.output,
+                        ));
+                    }
                     results.push(ToolResult {
                         call_id: tool.call.id.clone(),
                         tool_type: tool.call.tool_type,
-                        body: tool.session.first_output(),
+                        body,
                         started_at: tool.started_at,
                         // A result carries `finished_at`, so answering a call
                         // that has already ended says both things at once.

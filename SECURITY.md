@@ -787,9 +787,11 @@ JavaScript runtime; roles with code mode disabled retain direct tools.
   bounds total source to 1 MiB, and persists admission before permitting each unit.
   It persists settlement before permitting the next unit. Transport loss never
   closes the compiler as EOF: unadmitted source is discarded, while an admitted
-  unit and its commands may continue. Retry requests pass through the ordinary
-  agent boundary, drain fresh output, and report completed versus uncertain
-  source rather than automatically replaying it. Admission records do not prove
+  unit and its commands continue as ordinary sources on the accepted `exec`
+  call. The next request respects their normal completion, batching, and check-in
+  rules rather than a forced retry deadline. Failures before admission retain
+  bounded backoff. Fresh context reports completed, running, or failed statements
+  rather than automatically replaying them. Admission records do not prove
   side effects occurred; a crash between admission and settlement is uncertain.
 - Notebook state and live jobs are ephemeral and do not survive restart. The
   existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains

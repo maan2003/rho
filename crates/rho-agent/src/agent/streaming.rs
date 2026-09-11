@@ -18,6 +18,7 @@ pub(super) struct Stream {
     closed: bool,
     pub canonical: bool,
     recovery: bool,
+    pub interrupted: bool,
 }
 
 fn call(item: &InferenceResponseItem) -> ToolCall {
@@ -51,11 +52,12 @@ pub(super) fn progress_note(
     source: &str,
     completed: usize,
     admitted: usize,
+    pending_status: &str,
 ) -> String {
     let id = id.as_str();
     format!(
         "Streaming Python call {id}: successfully evaluated UTF-8 source bytes 0..{completed}. \
-         Bytes {completed}..{admitted} were admitted and may have executed partially; do not replay them blindly. \
+         Bytes {completed}..{admitted}: {pending_status}. Do not replay admitted statements. \
          Source bytes after {admitted} were not admitted. Evaluation is not command completion: \
          existing command handles and their fresh output remain authoritative. Continue with new code.\n\
          Successfully evaluated source:\n```python\n{}\n```\n\
@@ -181,6 +183,7 @@ impl Agent {
                 closed: false,
                 canonical: false,
                 recovery: false,
+                interrupted: false,
             },
         );
         let Phase::Requesting(in_flight) = &mut self.phase else {
@@ -284,25 +287,36 @@ impl Agent {
         Ok(())
     }
 
-    pub(super) async fn abandon_stream(&mut self, reason: &str, now: UnixMs) {
+    pub(super) async fn abandon_stream(&mut self, now: UnixMs) -> bool {
         let Phase::Requesting(in_flight) = &mut self.phase else {
-            return;
+            return false;
         };
         let Some(id) = in_flight.stream.take() else {
-            return;
+            return false;
         };
         let stream = self.streams.get_mut(&id).unwrap();
         stream.stopped = true;
-        stream.recovery = true;
+        stream.interrupted = true;
         stream.exec.stop_stream();
+        if stream.admitted == 0 {
+            self.streams.remove(&id);
+            self.tools.remove(&id);
+            self.latest_python_exec = None;
+            self.persist(AgentEvent::PythonStream {
+                event: PythonStreamEvent::Acknowledged { call_id: id },
+                at: now,
+            })
+            .await;
+            return false;
+        }
         let mut item = stream.item.clone();
-        set_source(&mut item, stream.source.clone());
+        set_source(&mut item, stream.source[..stream.admitted].to_owned());
         stream.canonical = true;
         let block = ContextBlock::InferenceResponse {
             items: vec![item],
             provider_response_id: None,
         };
-        // Give the actual partially executed provider call its one place in
+        // Give the admitted, syntactically complete prefix its one place in
         // history before the normal boundary drains its result.
         self.persist(AgentEvent::Replied {
             blocks: Cow::Borrowed(std::slice::from_ref(&block)),
@@ -312,7 +326,7 @@ impl Agent {
         })
         .await;
         self.history.push(Arc::new(block));
-        self.recovery_notes.push(format!("Source stream ended before normal completion: {reason}. Unadmitted source was discarded, not treated as EOF."));
+        true
     }
 
     /// Called only after the boundary's Sent has committed its output and
@@ -339,12 +353,21 @@ impl Agent {
 
     pub(super) fn collect_stream_notes(&mut self) {
         for (id, stream) in &mut self.streams {
-            if stream.recovery || (stream.closed && stream.completed != stream.source.len()) {
+            if !stream.interrupted
+                && (stream.recovery || (stream.closed && stream.completed != stream.source.len()))
+            {
                 self.recovery_notes.push(progress_note(
                     id,
                     &stream.source,
                     stream.completed,
                     stream.admitted,
+                    if stream.completed == stream.admitted {
+                        "no outstanding admitted statement"
+                    } else if stream.settled < stream.admitted && !stream.closed {
+                        "admitted and still running or waiting to run"
+                    } else {
+                        "did not complete successfully; any side effects remain"
+                    },
                 ));
                 stream.recovery = false;
             }
@@ -571,7 +594,7 @@ mod tests {
         assert!(matches!(
             agent.phase,
             Phase::Idle {
-                standing: Standing::Retry { attempts: 1, .. },
+                standing: Standing::Nothing,
                 ..
             }
         ));
@@ -591,13 +614,14 @@ mod tests {
         );
         assert!(agent.history.iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
-        assert!(agent.history.iter().any(
-            |block| matches!(&**block, ContextBlock::UserMessage { content, .. }
-            if rho_core::text_content(content).contains("were not admitted"))
-        ));
-        assert!(
-            matches!(&agent.phase, Phase::Requesting(in_flight) if in_flight.retry.is_some_and(|(_, attempts)| attempts == 1))
-        );
+        assert!(agent.history.iter().any(|block| matches!(&**block,
+            ContextBlock::ToolResults { results } if results.iter().any(|result|
+                result.body.output.contains("Your response was interrupted while generating this tool call.")
+                && result.body.output.contains("fresh-output")))));
+        assert!(!agent.history.iter().any(|block| matches!(&**block,
+            ContextBlock::UserMessage { content, .. } if rho_core::text_content(content).contains("stream disconnected"))));
+        assert!(agent.recovery_notes.is_empty());
+        assert!(matches!(&agent.phase, Phase::Requesting(in_flight) if in_flight.retry.is_none()));
     }
     #[tokio::test]
     async fn changed_source_second_calls_and_oversized_streams_stop_without_replaying() {
@@ -688,11 +712,18 @@ mod tests {
             .advance_streams(UnixMs::now(), decision != Boundary::AbortAndResend)
             .await;
         assert_eq!(agent.streams.values().next().unwrap().admitted, 0);
-        agent.abandon_stream("interrupt", UnixMs::now()).await;
-        until(&mut agent, |agent| {
-            agent.streams.values().next().unwrap().closed
+        let exec = agent.streams.values().next().unwrap().exec.clone();
+        agent.abandon_stream(UnixMs::now()).await;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !exec.stream_progress().returned {
+                agent.wake.notified().await;
+            }
         })
-        .await;
+        .await
+        .unwrap();
+        assert!(agent.streams.is_empty());
+        assert!(agent.tools.is_empty());
+        assert!(agent.history.is_empty());
         assert!(!directory.path().join("wrong").exists());
     }
 
@@ -780,5 +811,141 @@ mod tests {
         assert!(agent.recovery_notes.is_empty());
         assert!(agent.recovery_streams.is_empty());
         assert!(agent.recovery_blocks.is_empty());
+    }
+    #[tokio::test]
+    async fn partial_exec_failure_uses_normal_command_waiting_and_checkin() {
+        for await_job in [false, true] {
+            for wake_on_tools in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut agent = agent(directory.path()).await;
+                let prefix = format!(
+                    "set_checkin(after_seconds=600, wake_on_tools={})\njob = command(\"while [ ! -e release ]; do sleep 0.01; done; printf released\")\n{}",
+                    if wake_on_tools { "True" } else { "False" },
+                    if await_job { "await job\n" } else { "" },
+                );
+                agent
+                    .handle(update("one", &format!("{prefix}unfinished = (")))
+                    .await;
+                until(&mut agent, |agent| {
+                    agent.streams.values().next().unwrap().admitted == prefix.len()
+                })
+                .await;
+                agent
+                    .handle(Event::Inference(InferenceEvent::TemporaryFailure {
+                        error: Arc::new(anyhow::anyhow!("stream disconnected")),
+                        retrying_at: std::time::Instant::now(),
+                    }))
+                    .await;
+                let turn = agent.turn.unwrap();
+                assert_eq!(turn.asked, ModelAsked::Calls);
+                assert!(matches!(
+                    agent.phase,
+                    Phase::Idle {
+                        standing: Standing::Nothing,
+                        ..
+                    }
+                ));
+                let ContextBlock::InferenceResponse { items, .. } =
+                    &**agent.history.last().unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(call(&items[0]).arguments, prefix);
+                assert_eq!(call(&items[0]).id.as_str(), "one");
+
+                if !await_job {
+                    until(&mut agent, |agent| {
+                        agent.streams.values().next().unwrap().closed
+                    })
+                    .await;
+                }
+                // Transport retry used to force a request after one second.
+                // Neither an unawaited command nor `await job` permits that.
+                assert_eq!(
+                    boundary(
+                        &agent.sources(),
+                        agent.turn.as_ref(),
+                        &agent.phase,
+                        turn.spoke_at + Duration::from_secs(1)
+                    ),
+                    Boundary::No {
+                        recheck: Some(turn.spoke_at + Duration::from_secs(600))
+                    },
+                );
+                if await_job {
+                    agent.collect_stream_notes();
+                    assert!(agent.recovery_notes.is_empty());
+                }
+                std::fs::write(directory.path().join("release"), "").unwrap();
+                until(&mut agent, |agent| {
+                    agent.streams.values().next().unwrap().closed
+                        && agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
+                            matches!(facts, rho_agent_tools::SourceFacts::PythonOperation(facts) if facts.finished.is_some())
+                        })
+                }).await;
+                assert_eq!(
+                    boundary(
+                        &agent.sources(),
+                        agent.turn.as_ref(),
+                        &agent.phase,
+                        UnixMs::now()
+                    ),
+                    if wake_on_tools {
+                        Boundary::Now
+                    } else {
+                        Boundary::No {
+                            recheck: Some(turn.spoke_at + Duration::from_secs(600)),
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_failure_before_admission_keeps_transport_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        agent.handle(update("one", "unfinished = (")).await;
+        agent
+            .handle(Event::Inference(InferenceEvent::TemporaryFailure {
+                error: Arc::new(anyhow::anyhow!("stream disconnected")),
+                retrying_at: std::time::Instant::now(),
+            }))
+            .await;
+        assert!(matches!(
+            agent.phase,
+            Phase::Idle {
+                standing: Standing::Retry { attempts: 1, .. },
+                ..
+            }
+        ));
+        assert!(agent.streams.is_empty());
+        assert!(agent.tools.is_empty());
+        assert!(agent.history.is_empty());
+        assert!(agent.recovery_notes.is_empty());
+        let (_, events) = agent.db.read().agent_events(agent.agent_id);
+        let recovered = replay::replay(events);
+        assert!(recovered.history.is_empty());
+        assert!(recovered.recovery_blocks.is_empty());
+        assert!(recovered.recovery_notes.is_empty());
+        let Phase::Idle {
+            standing: Standing::Retry { failed_at, .. },
+            ..
+        } = agent.phase
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            boundary(
+                &agent.sources(),
+                agent.turn.as_ref(),
+                &agent.phase,
+                failed_at
+            ),
+            Boundary::No {
+                recheck: Some(failed_at + Duration::from_secs(1))
+            },
+        );
     }
 }

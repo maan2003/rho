@@ -55,9 +55,11 @@ registry type would have been that map with pass-through methods, so there is
 not one. Direct and JavaScript tools keep their generic urgency facts and core
 `wait` tool. Python exposes one `exec` per model response. Complete top-level Python units may execute while the response streams, but only
 after durable agent admission. Provider failure stops admission without treating
-the suffix as EOF or replaying earlier units. Recoverable failures are facts for
-the normal boundary; retries rebuild input by draining every source, rather than
-resending a cached provider request. Its shared Rust execution
+the suffix as EOF or replaying earlier units. An admitted prefix becomes the
+original call's accepted source and ends the model turn normally; its cell and
+commands retain ordinary boundary waiting and check-in semantics. Only failures
+before admission use transport retry backoff. Continuations rebuild input by
+draining every source, rather than resending a cached provider request. Its shared Rust execution
 handle and each host operation report distinct source facts; a provider reply
 does not mean that Python finished. Native callbacks synchronously update the
 handle from the interpreter thread, including its model-authored patience.

@@ -102,11 +102,21 @@ unadmitted suffix, and retain the active unit and its commands. Never transparen
 replay admitted source. The original call must precede its one result in history,
 including across failure, a later successful attempt, and restart.
 
-Recoverable provider failures return to the agent's normal boundary with a bounded
-retry budget across attempts. Each new attempt drains all sources again, so current
-command output, mail, user input, and execution-progress notes accompany the
-continuation. Waiting for an admitted `await` must not block control handling or
-prevent reporting that its completion is still uncertain.
+Once any Python unit has been admitted, a recoverable provider failure ends the
+model turn with the accepted prefix as its original `exec` call. Its cell and
+commands are ordinary sources: completion, output batching, user input, mail, and
+the cell's check-in and tool-wakeup policy determine the next request exactly as
+after a completed model response. A transport retry deadline must not bypass
+those sources. A pending `await` remains running, not uncertain execution.
+
+Failures before any Python admission retain bounded transport-retry backoff and
+add no call, result, or recovery notice to model history, including after restart.
+For admitted code, the first tool result includes one concise annotation that the
+response was interrupted while generating the call, execution was not cancelled,
+and the call must not be replayed. Do not add separate user-role interruption
+messages, discarded-source explanations, or source-range reports. Ordinary tool
+output remains authoritative; restart recovery separately reports uncertainty
+about execution whose live state has been lost.
 
 Interpreter return and provider completion do not retire execution evidence.
 It remains recoverable until its progress or result has been durably delivered
