@@ -402,7 +402,7 @@ impl ShellTools {
                 "properties": {
                     "cmd": {
                         "type": "string",
-                        "description": "Command to run with bash -c"
+                        "description": "Command to run with bash -o pipefail -c"
                     },
                     "workdir": {
                         "type": "string",
@@ -604,7 +604,9 @@ impl ShellTools {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        command.args(["bash", "-c"]).arg(cmd);
+        // A pipeline reports its last failing stage, so `cargo test | tail`
+        // fails when the tests do rather than when `tail` does.
+        command.args(["bash", "-o", "pipefail", "-c"]).arg(cmd);
         command.kill_on_drop(true);
         let cwd = workdir.map(Utf8Path::new);
         match &self.exec {

@@ -50,6 +50,18 @@ async fn runs_shell_call() {
 }
 
 #[tokio::test]
+async fn a_pipeline_fails_when_any_stage_does() {
+    let result = test_tools(2)
+        .call_code_mode(shell_call(
+            json!({"cmd": "sh -c 'echo partial; exit 3' | cat"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result["exit_code"], 3, "pipefail reports the failing stage");
+    assert_eq!(result["output"], "partial\n");
+}
+
+#[tokio::test]
 async fn code_mode_receives_structured_exec_output() {
     let result = test_tools(2)
         .call_code_mode(shell_call(json!({"cmd": "printf hello"})))
