@@ -46,8 +46,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   agent-response subscription edges: terminal successes and failures are
   delivered to current subscribers as normal agent mail.
   Native agents expose a view-aware `view_image` tool. Image-producing nested
-  tools return opaque image items to code mode, where `image(item)` explicitly
-  appends one to the enclosing `exec` or `wait` result rather than implicitly
+  tools return opaque image items to the notebook, where `image(item)` explicitly
+  appends one to the enclosing `exec` result rather than implicitly
   adding every nested result to model context.
 - `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
@@ -56,7 +56,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
 - `rho-agent`'s runtime loop (`src/agent/`) is built around one decision,
   asked after every event: should the next request start now? Tools, peer
   mail and user input are pull-based sources it drains at that boundary; the
-  model paces its own check-ins with a core-owned `wait` tool. Its
+  model paces its own check-ins with the notebook's `set_checkin`. Its
   architecture and governing decisions are recorded under
   `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
   shape that loop consumes.
@@ -398,10 +398,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   quiet completed transcript session is reaped. Older executions retain their
   own settings but do not set the new response's pace.
   Python exposes only `exec` and accepts at most one call per model response.
-  Both Python and JavaScript/V8 (`rho-code-mode`) remain available: `eng-high`
-  and `advisor-high` use Python; other code-mode roles use JavaScript. Generic
-  tool scheduling and JavaScript's core `wait` remain separate from Python facts.
-  Direct tools are unchanged when code mode is disabled.
+  The notebook is the only tool surface for every native role: JavaScript code
+  mode, direct tools and the core `wait` tool are gone. A job is foreground or
+  background by which cell registered it, and each request's `Sent` event
+  records why it went out (`WakeFacts`).
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to
 set per-agent MCP environment, but the MCP server that exposes Rho multi-agent
@@ -450,7 +450,7 @@ detailed delegation and integration guidance lives in the
 use `ask_advisor` to create an advisory session. `message_agent` is
 an unrestricted bidirectional
 mail bus for any known role-prefixed handle, including Advisor context requests;
-an agent waits for mail with its loop's own `wait` tool. Each agent record
+an agent waits for mail with `set_checkin` inside its notebook. Each agent record
 stores whether it was created directly or by an Engineer so prompt ownership
 context is an immutable creation-time fact rather than inferred later. Advisors
 retain normal shell/patch capabilities plus messaging but cannot spawn or
@@ -461,8 +461,8 @@ acceptance channel. Native Rho acknowledges after its queued event is committed;
 Claude acknowledges after its process-local input queue accepts the message,
 which intentionally may be lost if the daemon restarts before Claude records
 it.
-The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning,
-fast mode, and direct tools instead of code mode. Engineers spawned by an
+The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning
+and fast mode. Engineers spawned by an
 `eng-mini` parent are also `eng-mini`; Engineers spawned by an `eng-alt`
 parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
 `advisor-cheap` Advisors; `advisor-cheap` uses GPT-5.6 Terra with xhigh

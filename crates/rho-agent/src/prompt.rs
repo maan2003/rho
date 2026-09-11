@@ -391,12 +391,11 @@ text](file:///absolute/path#L10-L20)` — never paste a raw `file://` URL as vis
 ";
 
 /// `multi_agent` is set for pooled agents, which get the multi-agent tools and
-/// the section explaining them. `code_mode` is set when the agent's tool
-/// surface uses the selected code-mode runtime.
+/// the section explaining them. The tool surface is always the Python
+/// notebook, and `host_specs` are the functions it exposes.
 pub fn prompt(
     view: &rho_workspaces::View,
     multi_agent: Option<&MultiAgentTools>,
-    code_mode: Option<rho_agent_tools::CodeMode>,
     role: AgentRole,
     host_specs: &[rho_core::ToolSpec],
 ) -> Arc<str> {
@@ -456,11 +455,7 @@ agent and the idle mechanism described above when blocked on a reply.
                  parent message; your final response is mailed to that Engineer."
             }
         };
-        let message_tool = match code_mode {
-            Some(rho_agent_tools::CodeMode::Python) => "agents.message",
-            Some(rho_agent_tools::CodeMode::JavaScript) => "tools.message_agent",
-            None => "message_agent",
-        };
+        let message_tool = "agents.message";
         format!(
             "## Team Context
 
@@ -483,16 +478,7 @@ request.
 "
         )
     });
-    let tool_results = if code_mode == Some(rho_agent_tools::CodeMode::Python) {
-        ""
-    } else {
-        TOOL_RESULTS_PROMPT
-    };
-    let code_mode = match code_mode {
-        Some(rho_agent_tools::CodeMode::Python) => rho_agent_tools::python_instructions(host_specs),
-        Some(rho_agent_tools::CodeMode::JavaScript) => JAVASCRIPT_CODE_MODE_PROMPT.to_owned(),
-        None => String::new(),
-    };
+    let code_mode = rho_agent_tools::python_instructions(host_specs);
     let role_prompt = match role {
         AgentRole::Engineer { .. } | AgentRole::Advisor { .. } => "",
     };
@@ -503,7 +489,7 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     let workspace = render_workspace_prompt(&workdirs);
-    format!("{base_prompt}{agents_md}{skills}{code_mode}{tool_results}{team_context}{role_prompt}{workspace}{environment}")
+    format!("{base_prompt}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{workspace}{environment}")
         .into()
 }
 
@@ -646,27 +632,6 @@ const ADVISOR_PROMPT: &str = "## Advisor
 You are an independent technical second opinion. Analyze the question deeply, \
 surface risks and tradeoffs, and recommend a path. You are advisory only: do \
 not implement changes.
-
-";
-
-const JAVASCRIPT_CODE_MODE_PROMPT: &str = "## JavaScript Code Mode
-
-`exec` runs JavaScript in a persistent REPL with top-level await. Call tools through
-`tools.NAME(...)`; use `text(value)` to display results and `image(item)` for images.
-Batch independent calls with `Promise.all`. See exec for the runtime API and schemas.
-Use the separate `wait` tool when there is nothing else to do.
-
-";
-
-const TOOL_RESULTS_PROMPT: &str = "## How tool results arrive
-
-Every tool call is answered with its finished result, however long it takes; you never \
-poll. A command that is still running when something else needs your attention is \
-answered with what it has printed so far and a session ID, and everything it prints later \
-arrives on that same call by itself. If you have nothing to do until something happens, \
-call `wait` with the number of seconds you can afford to be left alone: anything ending, a \
-user message or mail wakes you sooner, so a long interval costs nothing and a short one \
-costs a request.
 
 ";
 

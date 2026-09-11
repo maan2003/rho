@@ -141,7 +141,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             InputKind::Message { content } => message(source, content, *delivery, *at),
             InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
         },
-        AgentEvent::Sent { blocks, at } => MirrorEvent::Sent {
+        AgentEvent::Sent { blocks, at, .. } => MirrorEvent::Sent {
             results: blocks
                 .iter()
                 .flat_map(|block| match block {
@@ -460,6 +460,7 @@ mod tests {
                 }],
             }]),
             at: UnixMs(3),
+            wake: None,
         };
         let stripped = strip(&event).unwrap();
         assert_eq!(
@@ -489,6 +490,7 @@ mod tests {
                 at: UnixMs(2),
             })]),
             at: UnixMs(3),
+            wake: None,
         };
 
         assert_eq!(
@@ -546,6 +548,7 @@ mod tests {
                 text: "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion.".to_owned(),
             },
             at: UnixMs(1),
+            wake: None,
         };
         assert_eq!(strip(&summary), None);
         let spoken = AgentEvent::Transcript {
@@ -554,6 +557,7 @@ mod tests {
                 text: "This session is fine".to_owned(),
             },
             at: UnixMs(1),
+            wake: None,
         };
         assert!(strip(&spoken).is_some());
     }

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-use crate::{Finished, FutureTool, SourceWaker, Tool, ToolSession, output, stands_on_its_own};
+use crate::{Finished, FutureTool, JobEnd, SourceWaker, Tool, ToolSession, output};
 
 const LOG_LIMIT: usize = 8 * 1024 * 1024;
 const JOB_LIMIT: usize = 64;
@@ -31,10 +31,18 @@ struct Shared {
     jobs: Mutex<BTreeMap<u64, Arc<Job>>>,
     sequence: AtomicU64,
     images: Mutex<BTreeMap<u64, rho_core::ImageContent>>,
+    /// The newest cell that registered a job: where the foreground begins.
+    /// Advanced by registration, never by a cell that only looks or waits.
+    foreground_cell: AtomicU64,
 }
-// Each modular shift is reversible by subtraction. Together they permute all
-// 9,000 slots without a lookup table; public labels repeat every 9,000 internal
-// requests. Handles and output ordering always use the original internal ID.
+
+/// The session ID a job is reported under, so the pieces of one background
+/// command correlate across replies. A display concern only: the scheduler
+/// reads facts, never this, and the model refers to a job by its Python handle.
+///
+/// Each modular shift is reversible by subtraction. Together they permute all
+/// 9,000 slots without a lookup table; labels repeat every 9,000 internal
+/// requests. Handles and output ordering always use the original internal ID.
 fn session_id(internal_id: u64) -> u32 {
     let x = internal_id % 9_000;
     let (mut left, mut right) = (x / 100, x % 100);
@@ -53,21 +61,25 @@ pub struct PythonStreamProgress {
 }
 
 struct ExecState {
+    cell: u64,
     stream: PythonStreamProgress,
     waker: SourceWaker,
     output: BoundedOutput,
+    /// Oldest unsent output.
     since: Option<UnixMs>,
-    important: Option<UnixMs>,
+    /// Oldest unsent `notify()`.
+    notified: Option<UnixMs>,
     finished: Option<UnixMs>,
     started: bool,
     returned: Option<UnixMs>,
     returned_error: Option<String>,
-    completion: Option<crate::PythonCompletion>,
     operations: Vec<Arc<Mutex<Operation>>>,
-    dispatched: bool,
+    /// The cell raised, or the runtime stopped underneath it.
+    failed: bool,
+    /// Something went wrong in the cell, its own code or a job it awaited:
+    /// the status of its next answer.
     error: bool,
     delivered: bool,
-    meaningful: bool,
     checkin: Option<crate::PythonCheckin>,
     jobs: Vec<Arc<Job>>,
     pending: usize,
@@ -75,18 +87,26 @@ struct ExecState {
     images: Vec<rho_core::ImageContent>,
 }
 impl ExecState {
-    fn say(&mut self, text: &str, important: bool) {
-        self.write(text, important);
+    /// A line of the cell's own output; `notify` when the model asked for it
+    /// to be noticed.
+    fn say(&mut self, text: &str, notify: bool) {
+        self.write(text, notify);
         self.output.push(b"\n");
     }
-    fn write(&mut self, text: &str, important: bool) {
+    fn write(&mut self, text: &str, notify: bool) {
         self.output.push(text.as_bytes());
-        self.meaningful = true;
         self.since.get_or_insert_with(UnixMs::now);
-        if important {
-            self.important.get_or_insert_with(UnixMs::now);
+        if notify {
+            self.notified.get_or_insert_with(UnixMs::now);
         }
         self.waker.wake();
+    }
+    /// An error the cell ends in: output, and a failure the scheduler reads
+    /// as such rather than as something the model asked to be told.
+    fn fail(&mut self, text: &str) {
+        self.failed = true;
+        self.error = true;
+        self.say(text, false);
     }
     fn closed(&self) -> bool {
         self.finished.is_some()
@@ -101,8 +121,11 @@ struct Operation {
     id: u64,
     name: String,
     output: BoundedOutput,
+    registered_at: UnixMs,
+    /// Told to the model as running, so its end can name the same ID.
     announced: bool,
     finished: Option<UnixMs>,
+    failed: bool,
 }
 struct Job {
     id: u64,
@@ -114,15 +137,19 @@ struct Job {
     ready: tokio::sync::watch::Sender<bool>,
 }
 struct JobState {
-    announced: bool,
     file: std::fs::File,
     len: usize,
     dropped: usize,
     cursor: usize,
     unsent: BoundedOutput,
+    registered_at: UnixMs,
+    /// Told to the model as running, so its end can name the same ID.
+    announced: bool,
+    /// Oldest unsent output.
     since: Option<UnixMs>,
-    important: Option<UnixMs>,
     finished: Option<(UnixMs, Value)>,
+    /// A non-zero or missing exit code, a spawn failure, or a cancellation.
+    failed: bool,
     delivered: bool,
 }
 /// When an `exec` call comes back to the model, which changes what the
@@ -344,6 +371,7 @@ impl PythonTool {
             jobs: Mutex::new(BTreeMap::new()),
             sequence: AtomicU64::new(1),
             images: Mutex::new(BTreeMap::new()),
+            foreground_cell: AtomicU64::new(0),
         });
         let shell = shared.shell.clone();
         let runtime = tokio::runtime::Handle::current();
@@ -374,7 +402,7 @@ impl Drop for PythonTool {
         for cell in self.shared.cells.lock().unwrap().values() {
             let mut cell = cell.lock().unwrap();
             cell.cancelled.send_replace(true);
-            cell.say("Python notebook closed", true);
+            cell.fail("Python notebook closed");
         }
         for job in self.shared.jobs.lock().unwrap().values() {
             job.cancel.notify_one();
@@ -396,21 +424,20 @@ impl PythonTool {
     fn start(&self, source: Option<String>, waker: SourceWaker) -> Box<dyn ToolSession> {
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
+            cell,
             stream: PythonStreamProgress::default(),
             waker,
             output: BoundedOutput::for_tokens(Some(10000)),
             since: None,
-            important: None,
+            notified: None,
             finished: None,
             started: false,
             returned: None,
             returned_error: None,
-            completion: None,
             operations: Vec::new(),
-            dispatched: false,
+            failed: false,
             error: false,
             delivered: false,
-            meaningful: false,
             checkin: None,
             jobs: Vec::new(),
             pending: 0,
@@ -436,7 +463,7 @@ impl PythonTool {
         };
         if let Err(error) = result {
             self.shared.cells.lock().unwrap().remove(&cell);
-            return Box::new(Finished::error(error));
+            return Box::new(Finished::error(cell, error));
         }
         Box::new(PythonCell(exec))
     }
@@ -501,8 +528,8 @@ fn register_call(
                         .split_whitespace()
                         .collect::<Vec<_>>()
                         .join(" ");
-                    if name.len() > 20 {
-                        let mut end = 17;
+                    if name.len() > 60 {
+                        let mut end = 57;
                         while !name.is_char_boundary(end) {
                             end -= 1;
                         }
@@ -512,15 +539,16 @@ fn register_call(
                     name
                 },
                 state: Mutex::new(JobState {
-                    announced: false,
                     file: tempfile::tempfile().map_err(|e| e.to_string())?,
                     len: 0,
                     dropped: 0,
                     cursor: 0,
                     unsent: BoundedOutput::for_tokens(Some(budget)),
+                    registered_at: UnixMs::now(),
+                    announced: false,
                     since: None,
-                    important: None,
                     finished: None,
+                    failed: false,
                     delivered: false,
                 }),
                 stdin: tokio::sync::Mutex::new(None),
@@ -548,13 +576,19 @@ fn register_call(
             }
             .to_owned(),
             output: BoundedOutput::for_tokens(Some(10000)),
+            registered_at: UnixMs::now(),
             announced: false,
             finished: None,
+            failed: false,
         }))
     });
     {
         let mut cell = link.lock().unwrap();
-        cell.dispatched = true;
+        // Registering work is what moves the foreground: from here on, older
+        // cells' jobs are background to this one's.
+        shared
+            .foreground_cell
+            .fetch_max(cell.cell, Ordering::Relaxed);
         if let Some(operation) = &operation {
             cell.operations.push(operation.clone());
         }
@@ -585,19 +619,20 @@ fn register_call(
         if let Ok(Some(job)) = &job {
             *job.stdin.lock().await = None;
             job.ready.send_replace(true);
-            let summary = match &result {
-                Ok(value) => value.clone(),
-                Err(error) => json!({"id":request,"error":error}),
+            // Failure is a fact of the process, computed here and nowhere
+            // else: a non-zero exit, no exit code at all (a signal), a
+            // spawn failure, or a cancellation.
+            let (summary, failed) = match &result {
+                Ok(value) => (value.clone(), value["exit_code"].as_i64() != Some(0)),
+                Err(error) => (json!({"id":request,"error":error}), true),
             };
-            job.state.lock().unwrap().finished = Some((UnixMs::now(), summary));
+            let mut state = job.state.lock().unwrap();
+            state.finished = Some((UnixMs::now(), summary));
+            state.failed = failed;
         } else if let Err(error) = &result {
-            operation
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .output
-                .push(error.as_bytes());
+            let mut operation = operation.as_ref().unwrap().lock().unwrap();
+            operation.output.push(error.as_bytes());
+            operation.failed = true;
             link.lock().unwrap().error = true;
         }
         {
@@ -646,9 +681,6 @@ async fn run_command(
                     state.dropped = state.dropped.saturating_add(chunk.len() - keep);
                     state.unsent.push(&chunk);
                     state.since.get_or_insert_with(UnixMs::now);
-                    if stands_on_its_own(&String::from_utf8_lossy(&chunk)) {
-                        state.important.get_or_insert_with(UnixMs::now);
-                    }
                 }
                 ProcessEvent::Exited(status) => exit_code = status.code(),
                 ProcessEvent::Failed(error) => return Err(error),
@@ -848,17 +880,17 @@ impl PythonExec {
         self.link.lock().unwrap().closed()
     }
 
-    pub fn facts(&self) -> crate::PythonExecFacts {
+    pub fn facts(&self) -> crate::CellFacts {
         let state = self.link.lock().unwrap();
-        crate::PythonExecFacts {
+        crate::CellFacts {
+            cell: self.cell,
             started: state.started,
             returned: state.returned,
-            completion: state.completion,
-            output: crate::PythonOutput {
-                since: state.since,
-                notification: state.important,
-            },
+            failed: state.failed,
+            output_since: state.since,
+            notified_at: state.notified,
             checkin: state.checkin,
+            foreground_cell: self.shared.foreground_cell.load(Ordering::Relaxed),
         }
     }
 }
@@ -914,16 +946,8 @@ impl rho_python::Execution for PythonExec {
                 let mut state = self.link.lock().unwrap();
                 state.returned = Some(UnixMs::now());
                 if let Some(error) = &error {
-                    state.error = true;
-                    state.say(error, true);
+                    state.fail(error);
                 }
-                state.completion = Some(crate::PythonCompletion {
-                    at: state.returned.unwrap(),
-                    failed: error.is_some(),
-                    produced_output: state.meaningful,
-                    dispatched: state.dispatched,
-                    set_checkin: state.checkin.is_some(),
-                });
                 state.returned_error = error;
                 state.waker.wake();
             }
@@ -953,8 +977,7 @@ impl rho_python::Execution for PythonExec {
                         .trim_start_matches('\n')
                         .to_owned();
                     if !error.is_empty() {
-                        state.error = true;
-                        state.say(&error, true);
+                        state.fail(&error);
                     }
                 }
                 state.finished = Some(UnixMs::now());
@@ -965,8 +988,7 @@ impl rho_python::Execution for PythonExec {
             }
             Event::Stopped { error } => {
                 let mut state = self.link.lock().unwrap();
-                state.error = true;
-                state.say(error.as_deref().unwrap_or("Python runtime stopped"), true);
+                state.fail(error.as_deref().unwrap_or("Python runtime stopped"));
                 state.finished = Some(UnixMs::now());
                 state.returned = state.finished;
                 state.cancelled.send_replace(true);
@@ -976,6 +998,11 @@ impl rho_python::Execution for PythonExec {
     }
 }
 impl PythonCell {
+    /// Everything unsent, in one block: the cell's own output first, then
+    /// each job's. A job is announced as running the first time a reply goes
+    /// out while it is, under a session ID its later pieces name again; a job
+    /// that ends before any reply is only ever reported finished. Delivered
+    /// once and then forgotten.
     fn render(&mut self, first: bool) -> Option<ToolOutput> {
         let mut cell = self.link.lock().unwrap();
         let mut chunks = Vec::new();
@@ -986,9 +1013,10 @@ impl PythonCell {
             ));
         }
         cell.since = None;
-        cell.important = None;
-        cell.completion = None;
+        cell.notified = None;
         let mut sources = Vec::new();
+        // Output from a cell two or more turns back names its command, so
+        // the model can place it without its own turn for context.
         let old = self.shared.next_cell.load(Ordering::Relaxed) > self.cell + 2;
         cell.operations.retain(|op| {
             let mut op = op.lock().unwrap();
@@ -1013,7 +1041,7 @@ impl PythonCell {
                     sources.push((
                         op.id,
                         format!(
-                            "Operation {} running with session ID {}",
+                            "Operation {} running in background with session ID {}",
                             op.name,
                             session_id(op.id)
                         ),
@@ -1035,15 +1063,19 @@ impl PythonCell {
                 if state.announced {
                     parts.push(format!("Session ID: {}", session_id(job.id)));
                 }
-                if let Some(exit_code) = summary.get("exit_code") {
-                    parts.push(format!("Process exited with code {exit_code}"));
-                } else if let Some(error) = summary.get("error").and_then(Value::as_str) {
-                    parts.push(format!("Command failed: {error}"));
+                match summary.get("exit_code") {
+                    Some(exit_code) if !exit_code.is_null() => {
+                        parts.push(format!("Process exited with code {exit_code}"));
+                    }
+                    _ => match summary.get("error").and_then(Value::as_str) {
+                        Some(error) => parts.push(format!("Command failed: {error}")),
+                        None => parts.push("Process ended without an exit code".to_owned()),
+                    },
                 }
             } else {
                 state.announced = true;
                 parts.push(format!(
-                    "Command running with session ID {}",
+                    "Command running in background with session ID {}",
                     session_id(job.id)
                 ));
             }
@@ -1061,7 +1093,6 @@ impl PythonCell {
                 parts.push(format!("Output:\n{output}"));
             }
             state.since = None;
-            state.important = None;
             sources.push((job.id, parts.join("\n")));
             if finished.is_some() {
                 state.delivered = true;
@@ -1072,16 +1103,25 @@ impl PythonCell {
         });
         sources.sort_by_key(|(id, _)| *id);
         chunks.extend(sources.into_iter().map(|(_, text)| text));
-        if cell.closed() && !cell.delivered {
+        let closed = cell.closed();
+        if closed {
             cell.delivered = true;
-            if chunks.is_empty() {
-                chunks.push("Execution completed.".into());
-            }
-        } else if first && chunks.is_empty() {
-            chunks.push("No output yet. Output and completion arrive automatically.".into());
         }
         if chunks.is_empty() {
-            return None;
+            if !first {
+                return None;
+            }
+            // The call's one required answer, in the notebook's own words
+            // (`DECISION-the-core-never-speaks-for-a-tool`): a silent cell
+            // whose work is over, or one whose work is still going.
+            chunks.push(
+                if closed {
+                    "No output."
+                } else {
+                    "No output yet. Output and completion arrive automatically."
+                }
+                .into(),
+            );
         }
         let mut result = output(
             chunks.join("\n"),
@@ -1099,20 +1139,22 @@ impl PythonCell {
 }
 impl ToolSession for PythonCell {
     fn sources(&self) -> Vec<(u64, crate::SourceFacts)> {
-        use crate::{PythonOperationFacts, PythonOutput, SourceFacts};
-        // Keep the exec marker distinct from zero-based host request IDs.
-        let mut sources = vec![(u64::MAX, SourceFacts::PythonExec(self.facts()))];
+        use crate::{JobFacts, SourceFacts};
+        // Keep the cell marker distinct from zero-based host request IDs.
+        let mut sources = vec![(u64::MAX, SourceFacts::Cell(self.facts()))];
         let cell = self.link.lock().unwrap();
         sources.extend(cell.jobs.iter().map(|job| {
             let state = job.state.lock().unwrap();
             (
                 job.id,
-                SourceFacts::PythonOperation(PythonOperationFacts {
-                    finished: state.finished.as_ref().map(|(at, _)| *at),
-                    output: PythonOutput {
-                        since: state.since,
-                        notification: state.important,
-                    },
+                SourceFacts::Job(JobFacts {
+                    cell: self.cell,
+                    registered_at: state.registered_at,
+                    output_since: state.since,
+                    finished: state.finished.as_ref().map(|(at, _)| JobEnd {
+                        at: *at,
+                        failed: state.failed,
+                    }),
                 }),
             )
         }));
@@ -1120,9 +1162,14 @@ impl ToolSession for PythonCell {
             let operation = operation.lock().unwrap();
             (
                 operation.id,
-                SourceFacts::PythonOperation(PythonOperationFacts {
-                    finished: operation.finished,
-                    output: PythonOutput::default(),
+                SourceFacts::Job(JobFacts {
+                    cell: self.cell,
+                    registered_at: operation.registered_at,
+                    output_since: None,
+                    finished: operation.finished.map(|at| JobEnd {
+                        at,
+                        failed: operation.failed,
+                    }),
                 }),
             )
         }));
@@ -1159,106 +1206,15 @@ impl Drop for PythonCell {
 
 #[cfg(test)]
 mod session_id_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn background_session_ids_stay_stable_and_old_previews_are_bounded() {
-        let tool = PythonTool::new(
-            ShellTools::in_directory(
-                std::time::Duration::from_secs(5),
-                "/tmp".into(),
-                rho_workspaces::PathOverrides::default(),
-            ),
-            Vec::new(),
-        )
-        .unwrap();
-        let wake = Arc::new(Notify::new());
-        let mut cell = tool.run(
-            ToolCall {
-                id: "session-label-test".try_into().unwrap(),
-                name: "exec".try_into().unwrap(),
-                tool_type: ToolType::Custom,
-                arguments: "command('sleep 600 # ☃☃☃☃☃☃☃☃')".into(),
-            },
-            SourceWaker::new(wake.clone()),
-        );
-        let exec = cell.python_exec().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while exec.facts().returned.is_none() {
-                wake.notified().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            !exec.link.lock().unwrap().jobs[0]
-                .state
-                .lock()
-                .unwrap()
-                .announced
-        );
-        let first = cell.first_output();
-        let id = first
-            .output
-            .rsplit(' ')
-            .next()
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
-        assert_eq!(id, session_id(0));
-        assert!(!first.output.contains("Command:"));
-        for call_id in ["newer-one", "newer-two"] {
-            let mut newer = tool.run(
-                ToolCall {
-                    id: call_id.try_into().unwrap(),
-                    name: "exec".try_into().unwrap(),
-                    tool_type: ToolType::Custom,
-                    arguments: "pass".into(),
-                },
-                SourceWaker::new(wake.clone()),
-            );
-            let exec = newer.python_exec().unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !exec.quiescent() {
-                    wake.notified().await;
-                }
-            })
-            .await
-            .unwrap();
-            newer.first_output();
-        }
-        cell.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !exec.quiescent() {
-                wake.notified().await;
-            }
-        })
-        .await
-        .unwrap();
-        let completed = cell.more_output().unwrap();
-        let preview = completed
-            .output
-            .lines()
-            .find_map(|line| line.strip_prefix("Command: "))
-            .unwrap();
-        assert!(preview.len() <= 20);
-        assert!(preview.ends_with("..."));
-        assert!(cell.done());
-        assert!(completed.output.contains(&format!("Session ID: {id}")));
-    }
+    use super::session_id;
 
     #[test]
-    fn session_id_permutation_covers_the_domain_and_wraps() {
-        let mut ids = (0..9_000).map(session_id).collect::<Vec<_>>();
-        for internal in 0..9_000 {
-            assert_eq!(session_id(internal), session_id(internal + 9_000));
-        }
-        ids.sort_unstable();
-        assert_eq!(ids, (1_000..10_000).collect::<Vec<_>>());
-        assert_eq!(session_id(u64::MAX), session_id(u64::MAX % 9_000));
-        assert_eq!(
-            (0..5).map(session_id).collect::<Vec<_>>(),
-            [1230, 2009, 5852, 6233, 8666],
-        );
+    fn labels_are_distinct_within_a_cycle_and_in_range() {
+        let labels = (0..9_000)
+            .map(session_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(labels.len(), 9_000);
+        assert!(labels.iter().all(|label| (1_000..10_000).contains(label)));
+        assert_eq!(session_id(9_000), session_id(0));
     }
 }

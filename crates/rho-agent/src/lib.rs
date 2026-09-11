@@ -28,7 +28,7 @@ use crate::db::{
 
 pub mod agent;
 mod claude;
-pub use agent::{AgentHandle, WAIT_TOOL_NAME, render_agent_surface};
+pub use agent::{AgentHandle, render_agent_surface};
 pub use claude::rebuild;
 
 pub mod db;
@@ -74,6 +74,10 @@ pub enum AgentEvent<'a> {
         blocks: Cow<'a, [ContextBlock]>,
         #[senax(default)]
         at: UnixMs,
+        /// Why the request went out when it did; absent on rows from before
+        /// the scheduler recorded it.
+        #[senax(default)]
+        wake: Option<WakeFacts>,
     },
     /// The model answered, and the request is over.
     Replied {
@@ -140,6 +144,11 @@ pub enum AgentEvent<'a> {
         uuid: uuid::Uuid,
         line: TranscriptLine,
         at: UnixMs,
+        /// On a row the notebook produced (an exec call's results, or a
+        /// message of output injected into an idle model): why the notebook
+        /// spoke when it did.
+        #[senax(default)]
+        wake: Option<WakeFacts>,
     },
 
     // -- the runtimes' shared config log --------------------------------------
@@ -195,6 +204,82 @@ pub enum AgentEvent<'a> {
         event: PythonStreamEvent,
         at: UnixMs,
     },
+}
+
+/// Why a request went out when it did: the scheduler's reading of its
+/// sources at the boundary (`agent/boundary.rs`), recorded with the request
+/// so the pace of a session can be judged from its log.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct WakeFacts {
+    /// The candidate whose deadline came first.
+    pub trigger: WakeTrigger,
+    /// Every event pending at the boundary, all of which the request carries.
+    pub events: Vec<WakeEvent>,
+    /// Jobs and cells still running that the model was watching...
+    pub foreground_running: u64,
+    /// ...and ones it had moved on from.
+    pub background_running: u64,
+    /// The latest cell asked not to be woken by the notebook.
+    pub tools_suppressed: bool,
+    /// When the model's check-in was due, if its turn had one.
+    pub checkin_at: Option<UnixMs>,
+}
+
+impl WakeFacts {
+    /// A request an interrupt forced: nothing was weighed.
+    pub fn interrupt() -> Self {
+        Self {
+            trigger: WakeTrigger::Interrupt,
+            events: Vec::new(),
+            foreground_running: 0,
+            background_running: 0,
+            tools_suppressed: false,
+            checkin_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum WakeTrigger {
+    /// The user's message threw away an in-flight request.
+    Interrupt,
+    /// A request somebody asked for outright: a retry, a compaction.
+    Asked,
+    /// A failed request's own clock.
+    Retry,
+    User,
+    Mail,
+    /// A cell's `notify()`.
+    Notify,
+    /// A job ended, or a cell returned with output.
+    Finished,
+    /// The model's check-in came due.
+    Checkin,
+}
+
+/// One pending event as the scheduler saw it.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct WakeEvent {
+    pub cell: u64,
+    /// The job's registration time, or `u64::MAX` for the cell itself.
+    pub source: u64,
+    pub kind: WakeKind,
+    pub foreground: bool,
+    /// When the tool recorded it.
+    pub occurred_at: UnixMs,
+    /// When the scheduler first saw it while able to act: where its
+    /// patience was measured from.
+    pub seen_at: UnixMs,
+    /// When it would have sent on its own; `None` for an event content to
+    /// wait for the foreground or the check-in.
+    pub deadline: Option<UnixMs>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+pub enum WakeKind {
+    Notify,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -718,6 +803,7 @@ mod encoding_tests {
             AgentEvent::Sent {
                 blocks: Cow::Owned(vec![ContextBlock::CompactionTrigger]),
                 at: UnixMs(9),
+                wake: None,
             },
             AgentEvent::Replied {
                 blocks: Cow::Owned(Vec::new()),
@@ -766,6 +852,7 @@ mod encoding_tests {
                     context_used: Some(4321),
                 },
                 at: UnixMs(17),
+                wake: None,
             },
         ];
         for event in events {

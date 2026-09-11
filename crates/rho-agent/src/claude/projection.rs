@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rho_claude::protocol::{
@@ -137,17 +138,29 @@ impl ClaudeStreamItem {
     }
 }
 
-/// The row an `assistant` event of the stream becomes: one finished
-/// content block, with the message's id, usage, uuid and time. `None`
-/// for a block a reader never sees (thinking only, empty).
+/// What the projection remembers from one line to the next.
 ///
 /// `usage_told` is the id of the API message whose usage a row already
 /// carries: every block's event repeats the message's usage, and a
 /// reader counts a request once.
+///
+/// `calls_made` is when each open call was made, by id. Claude's log
+/// stamps lines, not tool runs, so a result's span is from the assistant
+/// line that made the call to the user line that answered it; without
+/// this a result carried no times and the transcript drew no duration.
+#[derive(Debug, Default)]
+pub(super) struct Projection {
+    usage_told: Option<String>,
+    calls_made: HashMap<String, UnixMs>,
+}
+
+/// The row an `assistant` event of the stream becomes: one finished
+/// content block, with the message's id, usage, uuid and time. `None`
+/// for a block a reader never sees (thinking only, empty).
 pub(super) fn assistant_row(
     message: &AssistantMessage,
     usage_model: crate::db::AgentUsageModel,
-    usage_told: &mut Option<String>,
+    projection: &mut Projection,
 ) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
     let mut text = String::new();
     let mut calls = Vec::new();
@@ -168,13 +181,17 @@ pub(super) fn assistant_row(
     let usage = message.message.usage.as_ref();
     let context_used = usage.map(TokenUsage::context_total);
     let usage = match (usage, &message.message.id) {
-        (Some(usage), Some(id)) if usage_told.as_deref() != Some(id.as_str()) => {
-            *usage_told = Some(id.clone());
+        (Some(usage), Some(id)) if projection.usage_told.as_deref() != Some(id.as_str()) => {
+            projection.usage_told = Some(id.clone());
             Some(usage_bucket(usage, usage_model))
         }
         (Some(usage), None) => Some(usage_bucket(usage, usage_model)),
         _ => None,
     };
+    let at = line_time(message.timestamp.as_deref());
+    for call in &calls {
+        projection.calls_made.insert(call.id.clone(), at);
+    }
     Ok(Some((
         row_uuid(message.uuid.as_deref()),
         TranscriptLine::Assistant {
@@ -183,7 +200,7 @@ pub(super) fn assistant_row(
             usage,
             context_used,
         },
-        line_time(message.timestamp.as_deref()),
+        at,
     )))
 }
 
@@ -193,10 +210,12 @@ pub(super) fn assistant_row(
 /// person said.
 pub(super) fn user_row(
     message: &UserOutputMessage,
+    projection: &mut Projection,
 ) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
     let Some(body) = &message.message else {
         return Ok(None);
     };
+    let at = line_time(message.timestamp.as_deref());
     let mut text = String::new();
     let mut results = Vec::new();
     for content in &body.content {
@@ -215,12 +234,16 @@ pub(super) fn user_row(
                 tool_use_id,
                 content,
                 is_error.unwrap_or(false),
+                // A result whose call this projection never saw (a log
+                // read from its middle) spans nothing rather than
+                // everything since the epoch.
+                projection.calls_made.remove(tool_use_id).unwrap_or(at),
+                at,
             )?),
             OutputContent::Other => {}
         }
     }
     let uuid = row_uuid(message.uuid.as_deref());
-    let at = line_time(message.timestamp.as_deref());
     if !results.is_empty() {
         return Ok(Some((uuid, TranscriptLine::ToolResults { results }, at)));
     }
@@ -295,7 +318,13 @@ fn usage_bucket(
     }
 }
 
-fn tool_result(tool_use_id: &str, content: &Value, is_error: bool) -> anyhow::Result<ToolResult> {
+fn tool_result(
+    tool_use_id: &str,
+    content: &Value,
+    is_error: bool,
+    started_at: UnixMs,
+    finished_at: UnixMs,
+) -> anyhow::Result<ToolResult> {
     let output = match content {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
@@ -319,8 +348,8 @@ fn tool_result(tool_use_id: &str, content: &Value, is_error: bool) -> anyhow::Re
                 ToolOutputStatus::Success
             },
         },
-        started_at: UnixMs(0),
-        finished_at: UnixMs(0),
+        started_at,
+        finished_at,
         metadata: None,
     })
 }
@@ -361,23 +390,60 @@ mod tests {
     }
 
     fn user_line(message: Value) -> Option<TranscriptLine> {
-        user_row(&user(message)).unwrap().map(|(_, line, _)| line)
+        user_row(&user(message), &mut Projection::default())
+            .unwrap()
+            .map(|(_, line, _)| line)
     }
 
     fn assistant_line(message: Value) -> Option<TranscriptLine> {
         assistant_row(
             &assistant(message),
             crate::db::AgentUsageModel::OPUS,
-            &mut None,
+            &mut Projection::default(),
         )
         .unwrap()
         .map(|(_, line, _)| line)
     }
 
+    /// The log stamps lines, so a result's span is from the line that made
+    /// the call to the line that answered it. A result whose call was not
+    /// seen spans nothing.
+    #[test]
+    fn a_result_spans_its_call_line_to_its_own() {
+        let mut projection = Projection::default();
+        let call = assistant(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+        ]}));
+        let (_, _, called_at) =
+            assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut projection)
+                .unwrap()
+                .unwrap();
+        let mut answer: UserOutputMessage = user(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a\n"},
+            {"type": "tool_result", "tool_use_id": "toolu_unseen", "content": "b\n"},
+        ]}));
+        answer.timestamp = Some("2026-09-06T10:00:04.500Z".to_owned());
+        let (_, line, answered_at) = user_row(&answer, &mut projection).unwrap().unwrap();
+        let TranscriptLine::ToolResults { results } = line else {
+            panic!("expected results");
+        };
+        assert_eq!(answered_at, UnixMs(called_at.0 + 3_500));
+        assert_eq!(results[0].started_at, called_at);
+        assert_eq!(results[0].finished_at, answered_at);
+        assert_eq!(results[1].started_at, answered_at);
+        assert_eq!(results[1].finished_at, answered_at);
+        assert!(
+            projection.calls_made.is_empty(),
+            "an answered call is forgotten"
+        );
+    }
+
     #[test]
     fn a_persons_text_is_a_user_line_with_the_streams_time() {
         let message = user(json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}));
-        let (uuid, line, at) = user_row(&message).unwrap().unwrap();
+        let (uuid, line, at) = user_row(&message, &mut Projection::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
         assert_eq!(
             line,
@@ -443,7 +509,7 @@ mod tests {
                 {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "a.rs"}},
             ]}),
         );
-        let mut told = None;
+        let mut told = Projection::default();
         let (_, first, _) = assistant_row(&text, crate::db::AgentUsageModel::OPUS, &mut told)
             .unwrap()
             .unwrap();

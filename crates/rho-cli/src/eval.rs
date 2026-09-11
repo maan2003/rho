@@ -153,7 +153,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         _ => None,
     };
     emit(
-        json!({"type":"start", "role":args.role, "model":model, "code_mode": match args.role.as_str() { "eng-high" | "eng-py" => "python", "eng-low" | "eng" | "eng-cheap" => "javascript", _ => unreachable!() }, "workdir":workdir}),
+        json!({"type":"start", "role":args.role, "model":model, "code_mode": "python", "workdir":workdir}),
     )?;
     agent.send_user_message(prompt, MessageDelivery::Immediate);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);

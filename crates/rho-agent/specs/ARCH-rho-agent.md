@@ -11,11 +11,11 @@ dropped. `AgentHandle` is the only outside view: commands in over an unbounded
 channel, state out as a published `AgentState`.
 
 Everything that produces transcript blocks is a **source**: the user queue, the
-mail queue, each called tool, and each host operation launched inside Python. Command
-sources are independently scheduled and retain their own first-drain state, even
-when their output travels on one shared `exec` call. A source accumulates on its
-own and reports plain facts — when something arrived, whether a call has been answered,
-whether a tool has ended. It chooses no durations and starts no requests
+mail queue, each called cell, and each job (a command or a host operation) a
+cell registered. Jobs are independently scheduled sources even when their
+output travels on one shared `exec` call. A source accumulates on its own and
+reports plain facts — when something arrived, whether a job has ended and how,
+which cell the foreground is. It chooses no durations and starts no requests
 ([DECISION-pull-based-sources](DECISION-pull-based-sources.md)).
 
 Being a source is a role, not a module. The two queues are plain vectors on the
@@ -54,8 +54,10 @@ is answered, and an idle model woken, exactly when the decision says so.
 Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A
 registry type would have been that map with pass-through methods, so there is
-not one. Direct and JavaScript tools keep their generic urgency facts and core
-`wait` tool. Python exposes one `exec` per model response. Complete top-level Python units may execute while the response streams, but only
+not one. The Python notebook is the whole surface: one `exec` per model
+response, and nothing else to call. Why each request went out is recorded with
+it as `WakeFacts`, on `Sent` natively and on the Claude `Transcript` row the
+notebook produced. Complete top-level Python units may execute while the response streams, but only
 after durable agent admission. Provider failure stops admission without treating
 the suffix as EOF or replaying earlier units. An admitted prefix becomes the
 original call's accepted source and ends the model turn normally; its cell and

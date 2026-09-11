@@ -18,18 +18,17 @@ mod streaming;
 mod tests;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use rho_agent_tools::{FutureTool, SourceWaker, Tool, ToolHaste, ToolSession};
+use rho_agent_tools::{FutureTool, SourceWaker, Tool, ToolSession};
 use rho_core::{
     AgentId, ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
     MessageDelivery, MessageSender, PendingInferenceResponse, ProviderResponseId, ToolCall,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolType, ToolUpdate,
-    UnixMs,
+    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolSpec, ToolUpdate, UnixMs,
 };
 use rho_db::RhoDb;
 use rho_inference::config::{InferenceModel, InferenceProfile};
@@ -37,11 +36,9 @@ use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
 use rho_workspaces::View;
-use serde::Deserialize;
-use serde_json::json;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use self::boundary::{Boundary, ModelAsked, ModelTurn, SourceKind, boundary};
+use self::boundary::{Boundary, ModelAsked, ModelTurn, Observations, SourceKind, boundary};
 use crate::db::{
     AgentEventPos, AgentHead, AgentPresentationUpdate, AgentProfileWriteTxnExt as _,
     AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
@@ -57,88 +54,13 @@ use crate::{
     StartWorkdir, ToolPreview, assistant_text, final_answer_text, materialize_workdirs, prompt,
 };
 
-// -- the one tool the core answers itself -----------------------------------
-
-/// The model's way of naming how long to be left alone. It is the only call
-/// whose argument the core reads, because `boundary` is the only thing it is
-/// for: `DECISION-model-sets-the-pace`. No session is spawned for it; the
-/// answer is written at the next drain, whenever the boundary comes.
-pub const WAIT_TOOL_NAME: &str = "wait";
-/// Longer than this and the model has stopped pacing and started sleeping.
-const MAX_WAIT: Duration = Duration::from_secs(3600);
-
-pub(crate) fn wait_tool_spec() -> ToolSpec {
-    ToolSpec {
-        name: ToolName::try_from(WAIT_TOOL_NAME).expect("a valid tool name"),
-        tool_type: ToolType::Function,
-        description: "Ask to be left alone for a while. Anything a running call ends with, a \
-                      user message, or mail wakes you sooner, so a long interval costs nothing \
-                      and a short one costs a request: prefer this over polling. Returns with \
-                      whatever your other calls have to show by then."
-            .to_owned(),
-        input_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["seconds"],
-            "properties": {
-                "seconds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_WAIT.as_secs(),
-                    "description": "How long to wait if nothing happens first."
-                }
-            }
-        }),
-        format: None,
-    }
-}
-
-/// What a `wait` call asked for, and what to tell the model in reply. No
-/// interval means the call could not be read, and the reply says so.
-fn read_wait(arguments: &str) -> (Option<Duration>, ToolOutput) {
-    #[derive(Deserialize)]
-    struct Args {
-        seconds: u64,
-    }
-    let reply = |status, text: String| ToolOutput {
-        full_output: None,
-        images: Arc::new(Vec::new()),
-        output: Arc::new(text),
-        status,
-    };
-    match serde_json::from_str::<Args>(arguments) {
-        Ok(Args { seconds }) if seconds > 0 => {
-            let interval = Duration::from_secs(seconds).min(MAX_WAIT);
-            (
-                Some(interval),
-                reply(
-                    ToolOutputStatus::Success,
-                    format!("Waited up to {}s.", interval.as_secs()),
-                ),
-            )
-        }
-        _ => (
-            None,
-            reply(
-                ToolOutputStatus::Error,
-                "wait takes {\"seconds\": N} with N at least 1".to_owned(),
-            ),
-        ),
-    }
-}
-
-/// What the model's calls say about being looked in on: the longest interval
-/// any `wait` among them named, or only that there were calls.
+/// Whether the model's turn made a call it is waiting on. Only the notebook
+/// says anything about pacing, through `set_checkin` inside the call.
 fn asked_of(calls: &[ToolCall]) -> ModelAsked {
-    let longest = calls
-        .iter()
-        .filter(|call| call.name.as_str() == WAIT_TOOL_NAME)
-        .filter_map(|call| read_wait(&call.arguments).0)
-        .max();
-    match longest {
-        Some(interval) => ModelAsked::Wait(interval),
-        None if calls.is_empty() => ModelAsked::Nothing,
-        None => ModelAsked::Calls,
+    if calls.is_empty() {
+        ModelAsked::Nothing
+    } else {
+        ModelAsked::Calls
     }
 }
 
@@ -165,7 +87,6 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
-    code_mode: Option<rho_agent_tools::CodeMode>,
     view: Arc<View>,
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
     instructions: Arc<str>,
@@ -393,7 +314,7 @@ impl AgentHandle {
             user: replayed.user,
             mail: replayed.mail,
             tools: BTreeMap::new(),
-            wait_answers: Vec::new(),
+            observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: replayed.recovery_notes,
             recovery_blocks: replayed.recovery_blocks,
@@ -685,13 +606,10 @@ pub(crate) enum ToolCallAnswer {
     Sent,
 }
 
-fn validate_tool_calls(
-    mode: Option<rho_agent_tools::CodeMode>,
-    calls: &[ToolCall],
-) -> Result<(), &'static str> {
-    if mode == Some(rho_agent_tools::CodeMode::Python)
-        && (calls.len() > 1 || calls.iter().any(|call| call.name.as_str() != "exec"))
-    {
+/// The notebook takes one cell per model response, and there is nothing else
+/// to call.
+fn validate_tool_calls(calls: &[ToolCall]) -> Result<(), &'static str> {
+    if calls.len() > 1 || calls.iter().any(|call| call.name.as_str() != "exec") {
         Err("Python mode permits at most one exec call per model response; no calls were executed")
     } else {
         Ok(())
@@ -706,7 +624,6 @@ struct RunningTool {
     started_at: UnixMs,
     session: Box<dyn ToolSession>,
     answer: ToolCallAnswer,
-    answered_sources: HashSet<u64>,
 }
 
 impl RunningTool {
@@ -721,24 +638,16 @@ impl RunningTool {
     }
 
     fn sources(&self) -> impl Iterator<Item = SourceKind> + '_ {
-        self.session.sources().into_iter().map(|(id, facts)| {
-            let answer = if self.answered_sources.contains(&id) {
-                ToolCallAnswer::Sent
-            } else {
-                ToolCallAnswer::Owed
-            };
-            match facts {
-                rho_agent_tools::SourceFacts::Tool(haste) => SourceKind::Tool { answer, haste },
-                rho_agent_tools::SourceFacts::PythonExec(facts) => SourceKind::PythonExec {
-                    answer,
+        self.session
+            .sources()
+            .into_iter()
+            .map(|(_, facts)| match facts {
+                rho_agent_tools::SourceFacts::Cell(facts) => SourceKind::Cell {
                     facts,
                     latest: false,
                 },
-                rho_agent_tools::SourceFacts::PythonOperation(facts) => {
-                    SourceKind::PythonOperation { answer, facts }
-                }
-            }
-        })
+                rho_agent_tools::SourceFacts::Job(facts) => SourceKind::Job { facts },
+            })
     }
 }
 
@@ -780,9 +689,9 @@ struct Agent {
     mail: Vec<MailItem>,
     /// One entry per call the model has made and nothing has answered.
     tools: BTreeMap<ToolCallId, RunningTool>,
-    /// Replies to `wait` calls, written when the call is made and delivered
-    /// with the next drain like any other result.
-    wait_answers: Vec<ToolResult>,
+    /// When each pending event was first seen: the clocks the boundary's
+    /// patiences run on.
+    observations: Observations,
     streams: BTreeMap<ToolCallId, streaming::Stream>,
     recovery_notes: Vec<String>,
     recovery_blocks: Vec<ContextBlock>,
@@ -829,9 +738,18 @@ impl Agent {
             // timer — so the timer and the rule behind it cannot drift apart —
             // or it says to send, and a request in flight is never waited for.
             let now = UnixMs::now();
-            let decision = boundary(&self.sources(), self.turn.as_ref(), &self.phase, now);
-            self.advance_streams(now, decision != Boundary::AbortAndResend)
-                .await;
+            // An idle agent settles its streams first, so the cell facts the
+            // decision reads are the ones an admitted statement produced.
+            // In flight, admission waits on the decision: a statement is not
+            // admitted into a request about to be thrown away.
+            if matches!(self.phase, Phase::Idle { .. }) {
+                self.advance_streams(now, true).await;
+            }
+            let decision = self.decide(now);
+            if matches!(self.phase, Phase::Requesting(_)) {
+                self.advance_streams(now, decision != Boundary::AbortAndResend)
+                    .await;
+            }
             let deadline = match decision {
                 Boundary::No { recheck } => recheck,
                 Boundary::AbortAndResend => {
@@ -839,7 +757,8 @@ impl Agent {
                     // draining fresh input into the replacement request.
                     self.abandon_stream(now).await;
                     self.session.abort();
-                    self.start_request(now).await;
+                    self.start_request(now, Some(crate::WakeFacts::interrupt()))
+                        .await;
                     None
                 }
                 Boundary::RetryExhausted => {
@@ -855,8 +774,8 @@ impl Agent {
                         .await;
                     None
                 }
-                Boundary::Now => {
-                    self.start_request(now).await;
+                Boundary::Now { wake } => {
+                    self.start_request(now, Some(wake)).await;
                     None
                 }
             };
@@ -891,6 +810,18 @@ impl Agent {
         }
     }
 
+    /// The one question, asked of everything the loop knows.
+    fn decide(&mut self, now: UnixMs) -> Boundary {
+        let sources = self.sources();
+        boundary(
+            &sources,
+            self.turn.as_ref(),
+            &self.phase,
+            &mut self.observations,
+            now,
+        )
+    }
+
     /// Every source, in whatever state it is in — nothing is filtered out for
     /// having nothing to say, because deciding that is the decision's job, and
     /// an empty queue is a fact it reads.
@@ -919,21 +850,16 @@ impl Agent {
                 .as_ref()
                 .is_some_and(|(id, _)| *id == tool.call.id);
             sources.extend(tool.sources().map(|source| match source {
-                SourceKind::PythonExec { answer, facts, .. } => SourceKind::PythonExec {
-                    answer,
-                    facts,
-                    latest,
-                },
+                SourceKind::Cell { facts, .. } => SourceKind::Cell { facts, latest },
                 other => other,
             }));
         }
         // A quiet completed exec may leave the transcript session, but its
-        // patience remains authoritative for this model turn.
+        // check-in remains authoritative for this model turn.
         if let Some((id, exec)) = &self.latest_python_exec
             && !self.tools.contains_key(id)
         {
-            sources.push(SourceKind::PythonExec {
-                answer: ToolCallAnswer::Sent,
+            sources.push(SourceKind::Cell {
                 facts: exec.facts(),
                 latest: true,
             });
@@ -1279,7 +1205,7 @@ impl Agent {
             standing: Standing::Nothing,
         };
         self.turn = None;
-        self.wait_answers.clear();
+        self.observations.clear();
         self.session.abort();
         // A rewind is told, not undone: the last title and activity still
         // stand.
@@ -1357,7 +1283,7 @@ impl Agent {
 
     // -- acting on it -------------------------------------------------------
 
-    async fn start_request(&mut self, now: UnixMs) {
+    async fn start_request(&mut self, now: UnixMs, wake: Option<crate::WakeFacts>) {
         // Tools and instructions come from the workdirs, which are only
         // opened now: a load never fails on them, a turn may.
         let surface = match self.surface.get().await {
@@ -1377,9 +1303,6 @@ impl Agent {
             .tools
             .values()
             .map(|tool| tool.spec())
-            .chain(
-                (surface.code_mode != Some(rho_agent_tools::CodeMode::Python)).then(wait_tool_spec),
-            )
             .collect::<Arc<[ToolSpec]>>();
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
@@ -1443,25 +1366,17 @@ impl Agent {
         // first contribution becomes its `ToolResult` and every later one a
         // `ToolUpdate`, because a provider accepts exactly one result per call
         // id: `REQ-provider-transcript-protocol`.
-        let mut results: Vec<ToolResult> = std::mem::take(&mut self.wait_answers);
+        let mut results: Vec<ToolResult> = Vec::new();
         let mut updates = Vec::new();
         let latest = self.latest_python_exec.as_ref().map(|(id, _)| id);
         let mut tools = self.tools.values_mut().collect::<Vec<_>>();
         tools.sort_by_key(|tool| tool.output_order(latest));
         for tool in tools {
-            // Snapshot before draining: work registered later still owes its
-            // first contribution, even if exec already has its protocol reply.
-            tool.answered_sources = tool
-                .session
-                .sources()
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
             // Whatever the tool is reporting: a request that leaves one call
             // unanswered is rejected whole, so the first drain after a call is
             // made answers it and the tool says what it has, even if that is
-            // nothing yet. `ToolHaste` is a hint for `boundary` and is not
-            // read here, nor is `done`, which is asked below.
+            // nothing yet. The facts are for `boundary` and are not read
+            // here, nor is `done`, which is asked below.
             match tool.answer {
                 ToolCallAnswer::Owed => {
                     tool.answer = ToolCallAnswer::Sent;
@@ -1518,6 +1433,9 @@ impl Agent {
         // is choosing not to want another. Nothing to record — a reaped call is
         // one the transcript has finished talking about.
         self.tools.retain(|_, tool| !tool.session.done());
+        // Everything pending went into this request; the next event's clock
+        // starts fresh.
+        self.observations.clear();
         if !results.is_empty() {
             blocks.push(ContextBlock::ToolResults { results });
         }
@@ -1613,6 +1531,7 @@ impl Agent {
         self.persist(AgentEvent::Sent {
             blocks: Cow::Borrowed(&blocks),
             at: now,
+            wake,
         })
         .await;
         self.history.extend(blocks.into_iter().map(Arc::new));
@@ -1676,10 +1595,7 @@ impl Agent {
                 _ => None,
             })
             .collect();
-        if let Err(error) = validate_tool_calls(
-            self.surface.get_if_ready().and_then(|s| s.code_mode),
-            &calls,
-        ) {
+        if let Err(error) = validate_tool_calls(&calls) {
             self.fail(now, PendingInferenceResponse::default(), error.into())
                 .await;
             return;
@@ -1739,28 +1655,14 @@ impl Agent {
         };
 
         // A turn that issues no calls buys no further look-in: whatever is
-        // still running speaks for itself. A `wait` among the calls names the
-        // interval instead.
+        // still running speaks for itself.
         self.latest_python_exec = None;
         self.turn = Some(ModelTurn {
             spoke_at: now,
             asked: asked_of(&calls),
         });
         for call in calls {
-            if call.name.as_str() == WAIT_TOOL_NAME {
-                // Answered here, not run: there is nothing to run. The reply
-                // reaches the model with the next drain, which is when the
-                // wait is over by definition.
-                let (_, body) = read_wait(&call.arguments);
-                self.wait_answers.push(ToolResult {
-                    call_id: call.id,
-                    tool_type: call.tool_type,
-                    body,
-                    started_at: now,
-                    finished_at: now,
-                    metadata: None,
-                });
-            } else if let Some(stream) = self.streams.get_mut(&call.id) {
+            if let Some(stream) = self.streams.get_mut(&call.id) {
                 stream.canonical = true;
                 self.latest_python_exec = Some((call.id.clone(), stream.exec.clone()));
             } else {
@@ -1823,8 +1725,20 @@ impl Agent {
 
         impl ToolSession for BornExited {
             fn sources(&self) -> Vec<(u64, rho_agent_tools::SourceFacts)> {
-                let haste = ToolHaste::Ended { at: self.at };
-                vec![(0, rho_agent_tools::SourceFacts::Tool(haste))]
+                // A cell that failed on arrival: an error the model reads.
+                vec![(
+                    u64::MAX,
+                    rho_agent_tools::SourceFacts::Cell(rho_agent_tools::CellFacts {
+                        cell: u64::MAX,
+                        started: true,
+                        returned: Some(self.at),
+                        failed: true,
+                        output_since: Some(self.at),
+                        notified_at: None,
+                        checkin: None,
+                        foreground_cell: 0,
+                    }),
+                )]
             }
             fn done(&self) -> bool {
                 true
@@ -1867,7 +1781,6 @@ impl Agent {
                 call,
                 session,
                 answer: ToolCallAnswer::Owed,
-                answered_sources: Default::default(),
             },
         );
     }
@@ -1885,13 +1798,6 @@ impl Agent {
     /// What a reader sees, built from the loop's own state. `deadline` is
     /// when the decision said to look again, if it can change by itself.
     fn status(&self, deadline: Option<UnixMs>) -> AgentStatus {
-        let waiting = match self.turn {
-            Some(ModelTurn {
-                spoke_at,
-                asked: ModelAsked::Wait(interval),
-            }) => Some(UnixMs(spoke_at.0 + interval.as_millis() as u64)),
-            _ => None,
-        };
         let kind = match &self.phase {
             Phase::Requesting(in_flight) => AgentStateKind::ApiStreaming {
                 pending_response: in_flight.pending.clone(),
@@ -1932,7 +1838,6 @@ impl Agent {
                     .tools
                     .values()
                     .any(|tool| tool.answer == ToolCallAnswer::Owed)
-                    || waiting.is_some_and(|until| deadline.is_some_and(|at| at <= until))
                     || deadline.is_some() =>
             {
                 AgentStateKind::ToolCalling {
@@ -1951,7 +1856,9 @@ impl Agent {
                         })
                         .collect(),
                     results: Vec::new(),
-                    waiting,
+                    // Nothing names an interval any more; the check-in is the
+                    // notebook's and is not shown here.
+                    waiting: None,
                 }
             }
             Phase::Idle { .. } => AgentStateKind::Idle,
@@ -2057,36 +1964,22 @@ fn surface(
         .upgrade()
         .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
     let (shell, others) = host_tools(&view, role, agent_id, inference, multi_agent.as_ref(), pool);
-    let code_mode = (cfg!(feature = "code-mode") && profile.code_mode).then_some(
-        if matches!(
-            role,
-            AgentRole::Engineer {
-                intelligence: EngineerIntelligence::High | EngineerIntelligence::Python
-            } | AgentRole::Advisor {
-                intelligence: crate::db::AdvisorIntelligence::High
-            }
-        ) {
-            rho_agent_tools::CodeMode::Python
-        } else {
-            rho_agent_tools::CodeMode::JavaScript
-        },
-    );
+    // The notebook is the whole surface, whatever the profile once said about
+    // code modes: every role runs Python.
+    let _ = profile;
     let instructions = prompt::prompt(
         view.as_ref(),
         multi_agent.as_ref(),
-        code_mode,
         role,
         &others.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     );
-    let tools = rho_agent_tools::tools(shell, others, code_mode)
-        .map_err(|error| anyhow::anyhow!("code mode failed to start: {error}"))?;
+    let tool: Arc<dyn Tool> = Arc::new(
+        rho_agent_tools::PythonTool::new(shell, others)
+            .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
+    );
     Ok(Surface {
-        code_mode,
         view,
-        tools: tools
-            .into_iter()
-            .map(|tool| (tool.spec().name, tool))
-            .collect(),
+        tools: BTreeMap::from([(tool.spec().name, tool)]),
         instructions,
     })
 }
@@ -2189,14 +2082,7 @@ pub fn render_agent_surface(
     )?;
     Ok(crate::RenderedAgentSurface {
         system_prompt: surface.instructions,
-        tools: surface
-            .tools
-            .values()
-            .map(|tool| tool.spec())
-            .chain(
-                (surface.code_mode != Some(rho_agent_tools::CodeMode::Python)).then(wait_tool_spec),
-            )
-            .collect(),
+        tools: surface.tools.values().map(|tool| tool.spec()).collect(),
     })
 }
 

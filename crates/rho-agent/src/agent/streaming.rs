@@ -69,11 +69,6 @@ pub(super) fn progress_note(
 
 impl Agent {
     pub(super) async fn update_stream(&mut self, now: UnixMs) -> Result<(), String> {
-        if self.surface.get_if_ready().and_then(|s| s.code_mode)
-            != Some(rho_agent_tools::CodeMode::Python)
-        {
-            return Ok(());
-        }
         let Phase::Requesting(in_flight) = &self.phase else {
             return Ok(());
         };
@@ -165,7 +160,6 @@ impl Agent {
                 started_at: now,
                 session,
                 answer: ToolCallAnswer::Owed,
-                answered_sources: Default::default(),
             },
         );
         self.latest_python_exec = Some((incoming.id.clone(), exec.clone()));
@@ -377,7 +371,7 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::{AppendString, ContextItemEvent, ProviderResponseItemId};
+    use rho_core::{AppendString, ContextItemEvent, ProviderResponseItemId, ToolType};
     use rho_inference::OpenAiResponsesProviderData;
 
     use super::*;
@@ -432,7 +426,6 @@ mod tests {
             .unwrap(),
         );
         let surface = Surface {
-            code_mode: Some(rho_agent_tools::CodeMode::Python),
             view: view.clone(),
             instructions: Arc::from("test"),
             tools: BTreeMap::from([(tool.spec().name, tool)]),
@@ -457,7 +450,7 @@ mod tests {
             user: Vec::new(),
             mail: Vec::new(),
             tools: BTreeMap::new(),
-            wait_answers: Vec::new(),
+            observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: Vec::new(),
             recovery_blocks: Vec::new(),
@@ -528,9 +521,12 @@ mod tests {
         let cell = agent.latest_python_exec.as_ref().unwrap().1.sequence();
         // The response is still in flight, but the command is already running.
         assert!(matches!(agent.phase, Phase::Requesting(_)));
-        until(&mut agent, |agent| agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-            matches!(facts, rho_agent_tools::SourceFacts::PythonOperation(facts) if facts.finished.is_some())
-        )).await;
+        until(&mut agent, |agent| {
+            agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)|
+            matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
+        )
+        })
+        .await;
         assert_eq!(
             std::fs::read_to_string(directory.path().join("marker")).unwrap(),
             "x"
@@ -562,7 +558,7 @@ mod tests {
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert!(recovered.recovery_notes[0].contains("successfully evaluated"));
-        agent.start_request(UnixMs::now()).await;
+        agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
         assert!(agent.history.iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
@@ -600,12 +596,12 @@ mod tests {
         ));
         until(&mut agent, |agent| agent.streams.values().next().unwrap().closed
             && agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)|
-                matches!(facts, rho_agent_tools::SourceFacts::PythonOperation(facts) if facts.finished.is_some())
+                matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
             )).await;
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert!(recovered.recovery_notes[0].contains(&format!("bytes 0..{}", prefix.len())));
-        agent.start_request(UnixMs::now()).await;
+        agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
         assert!(!directory.path().join("wrong").exists());
         assert_eq!(
@@ -701,12 +697,7 @@ mod tests {
             delivery: MessageDelivery::Immediate,
             at: UnixMs::now(),
         });
-        let decision = boundary(
-            &agent.sources(),
-            agent.turn.as_ref(),
-            &agent.phase,
-            UnixMs::now(),
-        );
+        let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
         agent
             .advance_streams(UnixMs::now(), decision != Boundary::AbortAndResend)
@@ -749,7 +740,7 @@ mod tests {
                 provider_response_id: None,
             }))
             .await;
-        agent.start_request(UnixMs::now()).await;
+        agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
         assert_eq!(
             agent.streams.len(),
@@ -862,12 +853,7 @@ mod tests {
                 // Transport retry used to force a request after one second.
                 // Neither an unawaited command nor `await job` permits that.
                 assert_eq!(
-                    boundary(
-                        &agent.sources(),
-                        agent.turn.as_ref(),
-                        &agent.phase,
-                        turn.spoke_at + Duration::from_secs(1)
-                    ),
+                    agent.decide(turn.spoke_at + Duration::from_secs(1)),
                     Boundary::No {
                         recheck: Some(turn.spoke_at + Duration::from_secs(600))
                     },
@@ -880,24 +866,20 @@ mod tests {
                 until(&mut agent, |agent| {
                     agent.streams.values().next().unwrap().closed
                         && agent.tools.values().next().unwrap().session.sources().iter().any(|(_, facts)| {
-                            matches!(facts, rho_agent_tools::SourceFacts::PythonOperation(facts) if facts.finished.is_some())
+                            matches!(facts, rho_agent_tools::SourceFacts::Job(facts) if facts.finished.is_some())
                         })
                 }).await;
-                assert_eq!(
-                    boundary(
-                        &agent.sources(),
-                        agent.turn.as_ref(),
-                        &agent.phase,
-                        UnixMs::now()
-                    ),
-                    if wake_on_tools {
-                        Boundary::Now
-                    } else {
+                let decision = agent.decide(UnixMs::now());
+                if wake_on_tools {
+                    assert!(decision.is_now(), "{decision:?}");
+                } else {
+                    assert_eq!(
+                        decision,
                         Boundary::No {
                             recheck: Some(turn.spoke_at + Duration::from_secs(600)),
                         }
-                    },
-                );
+                    );
+                }
             }
         }
     }
@@ -937,12 +919,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(
-            boundary(
-                &agent.sources(),
-                agent.turn.as_ref(),
-                &agent.phase,
-                failed_at
-            ),
+            agent.decide(failed_at),
             Boundary::No {
                 recheck: Some(failed_at + Duration::from_secs(1))
             },

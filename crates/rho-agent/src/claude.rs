@@ -34,7 +34,7 @@ pub(crate) mod projection;
 pub(crate) mod python_host;
 pub mod rebuild;
 
-use projection::{ClaudeStreamItem, assistant_row, compacted_row, user_row};
+use projection::{ClaudeStreamItem, Projection, assistant_row, compacted_row, user_row};
 
 use crate::lazy::Lazy;
 
@@ -319,6 +319,7 @@ impl ClaudeAgent {
             claude_account: None,
             python_mode,
             python: None,
+            python_wake: None,
             python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
@@ -338,7 +339,7 @@ impl ClaudeAgent {
             role,
             presentation: ClaudePresentationState::default(),
             last_presentation_source,
-            usage_told: None,
+            projection: Projection::default(),
         };
         tokio::spawn(loop_state.run());
         Self {
@@ -526,6 +527,9 @@ struct ClaudeLoop {
     /// The notebook, once the first spawn has built it. Outlives the
     /// process: cells keep running across a respawn.
     python: Option<python_host::PythonHost>,
+    /// Why the notebook last spoke, until the transcript row it produced
+    /// arrives to carry it.
+    python_wake: Option<crate::WakeFacts>,
     /// When the boundary said to ask it again, if it can change by itself.
     python_recheck: Option<rho_core::UnixMs>,
     pending_response: PendingInferenceResponse,
@@ -555,9 +559,9 @@ struct ClaudeLoop {
     role: crate::db::AgentRole,
     presentation: ClaudePresentationState,
     last_presentation_source: Option<AgentEventPos>,
-    /// The API message whose usage a row already carries: every block's
-    /// event repeats it, and a reader counts a request once.
-    usage_told: Option<String>,
+    /// What the projection of Claude's log keeps from one line to the
+    /// next: usage already told, calls awaiting their result's times.
+    projection: Projection,
 }
 
 #[derive(Default)]
@@ -1454,7 +1458,7 @@ impl ClaudeLoop {
                 if message.parent_tool_use_id.is_some() {
                     return;
                 }
-                match assistant_row(&message, self.state.usage_provider, &mut self.usage_told) {
+                match assistant_row(&message, self.state.usage_provider, &mut self.projection) {
                     Ok(Some((uuid, line, at))) => self.tell_line(uuid, line, at).await,
                     Ok(None) => {}
                     Err(error) => eprintln!(
@@ -1472,7 +1476,7 @@ impl ClaudeLoop {
                 if message.parent_tool_use_id.is_some() || message.is_synthetic.unwrap_or(false) {
                     return;
                 }
-                match user_row(&message) {
+                match user_row(&message, &mut self.projection) {
                     Ok(Some((uuid, line, at))) => self.tell_line(uuid, line, at).await,
                     Ok(None) => {}
                     Err(error) => eprintln!(
@@ -1669,15 +1673,27 @@ impl ClaudeLoop {
         };
         let now = rho_core::UnixMs::now();
         let oldest_user = self.state.queued_inputs.iter().map(|input| input.at).min();
-        match host.decide(oldest_user, now) {
+        // The model can be reached through an open call, or as an idle
+        // process that takes a message. Otherwise it is mid-turn, and the
+        // notebook waits for its next call.
+        let idle = matches!(self.state.kind, AgentStateKind::Idle)
+            && self.process.is_some()
+            && self.queued_turns.is_empty()
+            && !self.pending_rewind;
+        let available = host.has_pending() || idle;
+        match host.decide(available, oldest_user, now) {
             crate::agent::boundary::Boundary::No { recheck } => {
                 self.python_recheck = recheck;
             }
-            crate::agent::boundary::Boundary::Now
-            | crate::agent::boundary::Boundary::AbortAndResend
+            crate::agent::boundary::Boundary::AbortAndResend
             | crate::agent::boundary::Boundary::RetryExhausted => {
                 self.python_recheck = None;
+            }
+            crate::agent::boundary::Boundary::Now { wake } => {
+                self.python_recheck = None;
                 if let Some((pending, drained)) = host.answer_pending() {
+                    // Recorded on the transcript row the results become.
+                    self.python_wake = Some(wake);
                     let reply = serde_json::json!({
                         "mcp_response": {
                             "jsonrpc": "2.0",
@@ -1686,15 +1702,12 @@ impl ClaudeLoop {
                         },
                     });
                     self.respond_control(&pending.request_id, Ok(reply)).await;
-                } else if matches!(self.state.kind, AgentStateKind::Idle)
-                    && self.process.is_some()
-                    && self.queued_turns.is_empty()
-                    && !self.pending_rewind
-                {
+                } else if idle {
                     let drained = host.drain_idle();
                     if drained.is_empty() {
                         return;
                     }
+                    self.python_wake = Some(wake);
                     let mut content = vec![ContentPart::Text {
                         text: "Output from Python cells that were still running when your last \
                                turn ended:"
@@ -1801,6 +1814,15 @@ impl ClaudeLoop {
     /// One row of the conversation, from the stream: appended, and what
     /// it says of the context and of who spoke carried on.
     async fn tell_line(&mut self, uuid: Uuid, line: TranscriptLine, at: rho_core::UnixMs) {
+        // The notebook's reason for speaking rides on the row it produced:
+        // an exec call's results, or the message of output an idle model
+        // was woken with.
+        let wake = match &line {
+            TranscriptLine::ToolResults { .. } | TranscriptLine::User { .. } => {
+                self.python_wake.take()
+            }
+            TranscriptLine::Assistant { .. } | TranscriptLine::Compacted { .. } => None,
+        };
         let reported = match &line {
             TranscriptLine::Assistant { context_used, .. }
             | TranscriptLine::Compacted { context_used } => *context_used,
@@ -1811,8 +1833,15 @@ impl ClaudeLoop {
             TranscriptLine::User { .. } | TranscriptLine::Assistant { .. }
         );
         let mut write = self.db.write().await;
-        let pos =
-            write.append_agent_event(self.agent_id, &AgentEvent::Transcript { uuid, line, at });
+        let pos = write.append_agent_event(
+            self.agent_id,
+            &AgentEvent::Transcript {
+                uuid,
+                line,
+                at,
+                wake,
+            },
+        );
         write.commit();
         if reported.is_some() {
             self.state.context_used = reported;

@@ -4,13 +4,13 @@
 //! through its control channel, and the loop hands those here. A
 //! `tools/call` of `exec` starts a cell and holds the reply until
 //! [`boundary`] — the one decision that opens a native agent's next request
-//! — says the model should look: the cell returned, its output stands on its
-//! own, a check-in came due, or a user message is waiting. Everything older
-//! cells have said since the model last looked rides along with that reply.
-//! With no call open, the same decision says when an idle model is woken
-//! with a message instead. Nothing here decides anything of its own.
+//! — says the model should look: a job ended, the cell notified, a check-in
+//! came due, or a user message is waiting. Everything older cells have said
+//! since the model last looked rides along with that reply. With no call
+//! open, the same decision says when an idle model is woken with a message
+//! instead. Nothing here decides anything of its own.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +22,8 @@ use rho_core::{
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
-use crate::agent::boundary::{Boundary, ModelAsked, ModelTurn, SourceKind, boundary};
-use crate::agent::{Phase, Standing, ToolCallAnswer};
+use crate::agent::boundary::{Boundary, ModelAsked, ModelTurn, Observations, SourceKind, boundary};
+use crate::agent::{InFlight, Phase, Standing, ToolCallAnswer};
 
 /// The server's name in Claude Code, which is where the model's tool name
 /// `mcp__py__exec` comes from: Claude Code offers no other naming.
@@ -168,7 +168,6 @@ pub(crate) struct PendingExec {
 struct Cell {
     session: Box<dyn ToolSession>,
     answer: ToolCallAnswer,
-    answered_sources: HashSet<u64>,
 }
 
 /// One notebook, its cells, and the exec call (if any) the CLI is waiting on.
@@ -186,6 +185,8 @@ pub(crate) struct PythonHost {
     latest: Option<(u64, Arc<PythonExec>)>,
     /// What the model's latest turn settled: an open call, or prose.
     turn: Option<ModelTurn>,
+    /// When each pending event was first seen by a decision that could act.
+    observations: Observations,
     /// Whether the user stopped the agent since anything was asked of it:
     /// a cancelled cell's last words must not wake the model the user just
     /// silenced, as natively (`DECISION-stopped-agents-wait-for-fresh-input`).
@@ -250,6 +251,7 @@ impl PythonHost {
             pending: None,
             latest: None,
             turn: None,
+            observations: Observations::default(),
             standing: Standing::Nothing,
         }
     }
@@ -304,7 +306,6 @@ impl PythonHost {
             Cell {
                 session,
                 answer: ToolCallAnswer::Owed,
-                answered_sources: HashSet::new(),
             },
         );
         self.pending = Some(PendingExec {
@@ -349,30 +350,22 @@ impl PythonHost {
         ];
         for (id, cell) in &self.cells {
             let latest = self.latest.as_ref().is_some_and(|(latest, _)| latest == id);
-            sources.extend(cell.session.sources().into_iter().map(|(source, facts)| {
-                let answer = if cell.answered_sources.contains(&source) {
-                    ToolCallAnswer::Sent
-                } else {
-                    ToolCallAnswer::Owed
-                };
-                match facts {
-                    rho_agent_tools::SourceFacts::Tool(haste) => SourceKind::Tool { answer, haste },
-                    rho_agent_tools::SourceFacts::PythonExec(facts) => SourceKind::PythonExec {
-                        answer,
-                        facts,
-                        latest,
-                    },
-                    rho_agent_tools::SourceFacts::PythonOperation(facts) => {
-                        SourceKind::PythonOperation { answer, facts }
-                    }
-                }
-            }));
+            sources.extend(
+                cell.session
+                    .sources()
+                    .into_iter()
+                    .map(|(_, facts)| match facts {
+                        rho_agent_tools::SourceFacts::Cell(facts) => {
+                            SourceKind::Cell { facts, latest }
+                        }
+                        rho_agent_tools::SourceFacts::Job(facts) => SourceKind::Job { facts },
+                    }),
+            );
         }
         if let Some((id, exec)) = &self.latest
             && !self.cells.contains_key(id)
         {
-            sources.push(SourceKind::PythonExec {
-                answer: ToolCallAnswer::Sent,
+            sources.push(SourceKind::Cell {
                 facts: exec.facts(),
                 latest: true,
             });
@@ -380,15 +373,35 @@ impl PythonHost {
         sources
     }
 
-    /// Should the model look now?
-    pub(crate) fn decide(&self, user_oldest_at: Option<UnixMs>, now: UnixMs) -> Boundary {
+    /// Whether an exec call is open, waiting on the boundary.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Should the model look now? `available` says whether it could: an exec
+    /// call is open, or the model is idle and can be sent a message. A model
+    /// in the middle of a turn with no call open is a request in flight, as
+    /// the boundary sees it: nothing is decided, and no event's clock starts
+    /// until the model can be reached.
+    pub(crate) fn decide(
+        &mut self,
+        available: bool,
+        user_oldest_at: Option<UnixMs>,
+        now: UnixMs,
+    ) -> Boundary {
+        let phase = if available {
+            Phase::Idle {
+                owed: Vec::new(),
+                standing: self.standing.clone(),
+            }
+        } else {
+            Phase::Requesting(InFlight::default())
+        };
         boundary(
             &self.sources(user_oldest_at),
             self.turn.as_ref(),
-            &Phase::Idle {
-                owed: Vec::new(),
-                standing: self.standing.clone(),
-            },
+            &phase,
+            &mut self.observations,
             now,
         )
     }
@@ -407,8 +420,7 @@ impl PythonHost {
 
     /// Every cell's contribution, the open call's cell first, as the native
     /// drain does it: a first contribution answers the call and every later
-    /// one is an update. Snapshots each cell's sources before draining, so
-    /// work registered later still owes its first word.
+    /// one is an update.
     fn drain(&mut self, own: Option<u64>) -> Drained {
         let mut drained = Drained {
             own: None,
@@ -418,12 +430,6 @@ impl PythonHost {
         order.sort_by_key(|id| Some(*id) != own);
         for id in order {
             let cell = self.cells.get_mut(&id).expect("listed above");
-            cell.answered_sources = cell
-                .session
-                .sources()
-                .into_iter()
-                .map(|(source, _)| source)
-                .collect();
             match cell.answer {
                 ToolCallAnswer::Owed => {
                     cell.answer = ToolCallAnswer::Sent;
@@ -443,6 +449,8 @@ impl PythonHost {
         }
         // Asked after the drain, so whatever a cell said last has been taken.
         self.cells.retain(|_, cell| !cell.session.done());
+        // Everything pending went out; the next event's clock starts fresh.
+        self.observations.clear();
         drained
     }
 

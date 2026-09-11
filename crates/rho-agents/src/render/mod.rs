@@ -580,9 +580,12 @@ pub fn format_running_duration(started_at_ms: u64, now_ms: u64) -> String {
 /// Label for a tool call, with the style class for its verb.
 ///
 /// Shell-like tools (Codex `shell`/`shell_command`, Claude `Bash`) render as
-/// `$ command`. Claude's file tools render as `read/write/edit path` so the
-/// transcript shows the touched file instead of raw JSON arguments. Argument
-/// extraction tolerates the partial JSON seen while arguments stream.
+/// `$ command`. Code-mode cells (the native `exec` tool and Claude Code's
+/// `mcp__py__exec`) render as the source itself, with no tool name in front:
+/// the code is what the reader came for, and "exec" says nothing it does not.
+/// Claude's file tools render as `read/write/edit path` so the transcript
+/// shows the touched file instead of raw JSON arguments. Argument extraction
+/// tolerates the partial JSON seen while arguments stream.
 pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
     match name {
         "shell" | "shell_command" | "Bash" => {
@@ -594,6 +597,7 @@ pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
             };
             (label, StyleClass::ToolShell)
         }
+        "exec" | "mcp__py__exec" => (exec_source_label(arguments), StyleClass::ToolShell),
         "Read" | "Write" | "Edit" => {
             let verb = name.to_ascii_lowercase();
             let label = match streaming_json_text_field(arguments, "file_path") {
@@ -605,6 +609,17 @@ pub(crate) fn tool_label(name: &str, arguments: &str) -> (String, StyleClass) {
         _ if arguments.is_empty() => (name.to_owned(), StyleClass::ToolName),
         _ => (format!("{name} {arguments}"), StyleClass::ToolName),
     }
+}
+
+/// The source of a code-mode cell. The native `exec` tool sends the source
+/// as its whole argument string; Claude Code's `mcp__py__exec` wraps it as
+/// `{"source": ...}`. Trailing blank lines are dropped so the status marker
+/// lands after the last line of code rather than on a line of its own.
+fn exec_source_label(arguments: &str) -> String {
+    let source = streaming_json_text_field(arguments, "source")
+        .or_else(|| (!arguments.trim_start().starts_with('{')).then(|| arguments.to_owned()))
+        .unwrap_or_default();
+    source.trim_end().to_owned()
 }
 
 fn shell_command_argument_label(arguments: &str) -> String {
@@ -770,6 +785,36 @@ mod tests {
         assert_eq!(
             tool_label("Bash", r#"{"desc"#),
             ("$".to_owned(), StyleClass::ToolShell)
+        );
+    }
+
+    #[test]
+    fn native_exec_renders_its_source_without_the_tool_name() {
+        let code = "x = 1\nprint(x)\n";
+        assert_eq!(
+            tool_label("exec", code),
+            ("x = 1\nprint(x)".to_owned(), StyleClass::ToolShell)
+        );
+        assert_eq!(
+            tool_label("exec", ""),
+            (String::new(), StyleClass::ToolShell)
+        );
+    }
+
+    #[test]
+    fn claude_code_py_exec_renders_its_source_without_the_tool_name() {
+        assert_eq!(
+            tool_label("mcp__py__exec", r#"{"source":"print(1)\n"}"#),
+            ("print(1)".to_owned(), StyleClass::ToolShell)
+        );
+        // Streaming partial JSON still resolves the source field.
+        assert_eq!(
+            tool_label("mcp__py__exec", r#"{"source":"comm"#),
+            ("comm".to_owned(), StyleClass::ToolShell)
+        );
+        assert_eq!(
+            tool_label("mcp__py__exec", r#"{"sou"#),
+            (String::new(), StyleClass::ToolShell)
         );
     }
 

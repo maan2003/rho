@@ -1,93 +1,81 @@
-//! Tools, and what they report about themselves.
+//! What the Python notebook reports about itself, and the shape of a tool.
 //!
-//! A tool is not a future that resolves once. It is a source that produces
-//! output over its lifetime, possibly for hours, and no tool declares itself a
-//! background job: a background job is simply a call that outlived the window
-//! the model gave it. `DECISION-model-sets-the-pace`.
+//! A cell is not a future that resolves once. It is a source that produces
+//! output over its lifetime, possibly for hours, and the commands it starts
+//! outlive it. Nothing here decides anything: a cell and a job report facts,
+//! and what any fact is worth is `boundary`'s to say
+//! (`DECISION-boundary-is-the-only-decision`).
 //!
-//! Because the core pulls, a tool holds its own output until asked, and answers
-//! at that moment in whatever shape it judges best.
+//! Because the core pulls, a cell holds its own output until asked, and
+//! answers at that moment in whatever shape it judges best.
 //! `DECISION-pull-based-sources`.
-//!
-//! The core can cancel work. Python callbacks update shared execution facts
-//! synchronously; the boundary reads patience from the latest execution.
 
 use std::sync::Arc;
 
 use rho_core::{ToolCall, ToolOutput, ToolSpec, UnixMs};
 use tokio::sync::Notify;
 
-/// How much of a hurry a tool's unsent output is in, and since when.
-///
-/// A hint for `boundary` and nothing else — it is not the tool's state, and
-/// nothing outside the decision may read it. Whether a call has been answered
-/// is the core's own bookkeeping and whether a tool can be forgotten is
-/// [`ToolSession::done`]; neither is here, so neither can be inferred from a
-/// hint the tool is free to revise.
-///
-/// One enum rather than one for working-or-not and another for what is unsent,
-/// because no question the decision asks is answered by half of it — and
-/// because two would spell pairs that cannot happen: output is not still
-/// mid-thought once whatever was writing it has stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolHaste {
-    /// None: the model has seen everything said so far.
-    None,
-    /// Holding output mid-thought. Worth sending eventually — half a build log
-    /// beats none — but worth less than the whole, so it is the most patient
-    /// thing the core knows about.
-    Eventually { since: UnixMs },
-    /// Holding output that stands on its own: this much matters now, whatever
-    /// else the tool goes on to say. The one thing a working tool can say about
-    /// its own urgency, and it buys exactly one thing: it stops waiting for the
-    /// rest of the call. It still cannot interrupt a request in flight.
-    ///
-    /// `since` is when it became worth sending, not when it started arriving.
-    Soon { since: UnixMs },
-    /// The work finished at `at`, so whatever is unsent is final and waiting
-    /// buys nothing. Says nothing about whether anything is left to say — that
-    /// is [`ToolSession::done`], and a tool may well report this while it still
-    /// has a summary to give.
-    Ended { at: UnixMs },
-}
-
-/// Python reports execution and output facts, not generic tool urgency.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PythonOutput {
-    pub since: Option<UnixMs>,
-    pub notification: Option<UnixMs>,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PythonCompletion {
-    pub at: UnixMs,
-    pub failed: bool,
-    pub produced_output: bool,
-    pub dispatched: bool,
-    pub set_checkin: bool,
-}
+/// What a cell's `set_checkin` asked for: how long the model is left alone,
+/// and whether the notebook may wake it sooner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PythonCheckin {
     pub after: std::time::Duration,
     pub wake_on_tools: bool,
 }
+
+/// One cell, as the scheduler reads it. Every field is an observation the
+/// notebook made; none is a verdict.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PythonExecFacts {
+pub struct CellFacts {
+    /// The cell's number in the notebook: later cells have larger numbers.
+    pub cell: u64,
+    /// The interpreter has begun the cell.
     pub started: bool,
+    /// The cell's top-level code returned (or raised) at this instant. Its
+    /// jobs may still be running.
     pub returned: Option<UnixMs>,
-    pub completion: Option<PythonCompletion>,
-    pub output: PythonOutput,
+    /// The cell raised, or the runtime stopped underneath it: what it holds
+    /// ends in an error the model has not seen.
+    pub failed: bool,
+    /// The oldest unsent print or text output, if any.
+    pub output_since: Option<UnixMs>,
+    /// The oldest unsent explicit `notify()`, if any. Only the model's own
+    /// call sets this; generated error text never does.
+    pub notified_at: Option<UnixMs>,
     pub checkin: Option<PythonCheckin>,
+    /// Notebook-wide: the newest cell that registered any job, or 0 before
+    /// any did. Cells from it onward are the foreground; older cells are
+    /// background work the model has moved on from. A cell that registers
+    /// nothing (a bare check-in) does not advance it.
+    pub foreground_cell: u64,
 }
+
+/// One job a cell registered: a managed command, or a host operation such
+/// as a web search or an advisor consultation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PythonOperationFacts {
-    pub finished: Option<UnixMs>,
-    pub output: PythonOutput,
+pub struct JobFacts {
+    /// The cell that registered it.
+    pub cell: u64,
+    pub registered_at: UnixMs,
+    /// The oldest unsent output, if any.
+    pub output_since: Option<UnixMs>,
+    pub finished: Option<JobEnd>,
 }
+
+/// How a job ended, as the notebook saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobEnd {
+    pub at: UnixMs,
+    /// A non-zero or missing exit code, a spawn failure, a cancellation, or
+    /// a host operation that returned an error, whether or not the cell went
+    /// on to catch it.
+    pub failed: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceFacts {
-    Tool(ToolHaste),
-    PythonExec(PythonExecFacts),
-    PythonOperation(PythonOperationFacts),
+    Cell(CellFacts),
+    Job(JobFacts),
 }
 
 /// Tell the core that something changed.
@@ -122,8 +110,7 @@ impl SourceWaker {
 /// the core to sort out, so the required one cannot be missing.
 pub trait ToolSession: Send {
     /// Independently scheduled sources. IDs are stable and never reused within
-    /// an invocation; the core tracks their drains separately from protocol
-    /// replies.
+    /// an invocation.
     fn sources(&self) -> Vec<(u64, SourceFacts)>;
 
     fn python_exec(&self) -> Option<Arc<crate::PythonExec>> {
@@ -133,23 +120,20 @@ pub trait ToolSession: Send {
     /// Whether the core can forget this call: nothing left to say, ever.
     ///
     /// Asked after output has been collected, so the last thing a tool says is
-    /// always taken. A tool that has stopped working but still owes a summary
-    /// answers `false` here while reporting [`ToolHaste::Ended`].
+    /// always taken.
     fn done(&self) -> bool;
 
     /// The call's one answer, taken the first time the core has anything to say
-    /// about the call at all — because it is holding output, or because it
-    /// ended.
+    /// about the call at all.
     ///
-    /// Required, and asked for exactly once. A tool that ends without producing
-    /// anything says so in its own words here; nobody else can, and an empty
-    /// success invented by the core reads as a command that ran quietly.
+    /// Required, and asked for exactly once. A tool that has nothing yet says
+    /// so in its own words here; nobody else can, and an empty success
+    /// invented by the core reads as a cell that ran quietly.
     fn first_output(&mut self) -> ToolOutput;
 
-    /// Everything since, in whatever shape the tool judges best — a tail, a
-    /// summary, a diff, an exit status. Called only at a request boundary, so
-    /// a long-lived tool decides how to represent minutes of activity in one
-    /// block.
+    /// Everything since, in whatever shape the tool judges best. Called only
+    /// at a request boundary, so a long-lived tool decides how to represent
+    /// minutes of activity in one block.
     ///
     /// Returning `None` means "nothing new".
     fn more_output(&mut self) -> Option<ToolOutput>;

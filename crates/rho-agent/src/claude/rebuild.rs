@@ -17,7 +17,7 @@ use rho_core::UnixMs;
 use rho_db::RhoDb;
 use uuid::Uuid;
 
-use super::projection::{assistant_row, compacted_row, line_time, user_row};
+use super::projection::{Projection, assistant_row, compacted_row, line_time, user_row};
 use crate::db::{
     AgentEventPos, AgentId, AgentReadTxnExt as _, AgentRuntime, AgentUsageModel,
     AgentWriteTxnExt as _,
@@ -115,7 +115,15 @@ async fn rebuild_agent(db: &RhoDb, agent_id: AgentId, lines: Option<&[SessionLin
     } else {
         write.rewind_agent(now, agent_id, to);
         for (uuid, line, at) in rows {
-            write.append_agent_event(agent_id, &AgentEvent::Transcript { uuid, line, at });
+            write.append_agent_event(
+                agent_id,
+                &AgentEvent::Transcript {
+                    uuid,
+                    line,
+                    at,
+                    wake: None,
+                },
+            );
         }
         Outcome::Rebuilt
     };
@@ -173,7 +181,7 @@ fn queue_open(records: &[(AgentEventPos, AgentEvent<'static>)]) -> bool {
 /// left off: the usage tables and every reader's fold already counted
 /// the rows being rewound, and a rewind does not uncount.
 fn rebuilt_rows(lines: &[SessionLine]) -> Vec<(Uuid, TranscriptLine, UnixMs)> {
-    let mut usage_told = None;
+    let mut projection = Projection::default();
     let mut rows = Vec::new();
     for line in lines {
         let row = match line {
@@ -181,7 +189,7 @@ fn rebuilt_rows(lines: &[SessionLine]) -> Vec<(Uuid, TranscriptLine, UnixMs)> {
                 if message.parent_tool_use_id.is_some() {
                     continue;
                 }
-                assistant_row(message, AgentUsageModel::UNKNOWN, &mut usage_told)
+                assistant_row(message, AgentUsageModel::UNKNOWN, &mut projection)
             }
             SessionLine::User(message) => {
                 if message.parent_tool_use_id.is_some()
@@ -190,7 +198,7 @@ fn rebuilt_rows(lines: &[SessionLine]) -> Vec<(Uuid, TranscriptLine, UnixMs)> {
                 {
                     continue;
                 }
-                user_row(message)
+                user_row(message, &mut projection)
             }
             SessionLine::Compacted {
                 uuid,
@@ -327,6 +335,7 @@ mod tests {
                         text: "hi".to_owned(),
                     },
                     at: UnixMs(3),
+                    wake: None,
                 },
             );
             write.append_agent_event(agent_id, &AgentEvent::QueueCleared);

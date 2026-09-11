@@ -280,6 +280,7 @@ mod tests {
                     content: text_parts("go"),
                 }]),
                 at: rho_core::UnixMs(0),
+                wake: None,
             },
             AgentEvent::Replied {
                 blocks: Cow::Owned(vec![ContextBlock::InferenceResponse {
@@ -374,6 +375,7 @@ mod tests {
             events.push(AgentEvent::Sent {
                 blocks: Cow::Owned(blocks),
                 at: rho_core::UnixMs(1),
+                wake: None,
             });
             let twice = replay(events);
             assert!(twice.owed.is_empty());
