@@ -237,6 +237,9 @@ pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-ultra" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         }),
+        "eng-ultra-py" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::UltraPython,
+        }),
         "eng-alt" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         }),
@@ -244,7 +247,7 @@ pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
             intelligence: EngineerIntelligence::Gemini,
         }),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-py, eng-high, eng-ultra, eng-alt, or eng-gemini"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-py, eng-high, eng-ultra, eng-ultra-py, eng-alt, or eng-gemini"
         )),
     }
 }
@@ -277,6 +280,10 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
         } => "eng-ultra",
         AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
+            ..
+        } => "eng-ultra-py",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::UltraPython,
             ..
         } => "eng-alt",
         AgentRole::Engineer {

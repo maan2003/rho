@@ -479,6 +479,12 @@ pub enum SessionBinding {
     /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
     AdvisorAstra(InferenceProfile),
     ResponsesSolPython(InferenceProfile),
+    /// Claude Fable engineer whose only tool is Rho's Python notebook, served
+    /// to Claude Code in-process over MCP. Appended for persisted
+    /// compatibility.
+    ClaudeFablePython {
+        effort: ClaudeEffort,
+    },
 }
 
 /// `SessionBinding` as rows wrote it while the PM role existed. The
@@ -501,6 +507,7 @@ enum StoredSessionBinding {
     ResponsesAstra(InferenceProfile),
     AdvisorAstra(InferenceProfile),
     ResponsesSolPython(InferenceProfile),
+    ClaudeFablePython { effort: ClaudeEffort },
 }
 
 impl senax_encoder::Decoder for SessionBinding {
@@ -524,6 +531,7 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
             Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
             Stored::ResponsesSolPython(config) => Self::ResponsesSolPython(config),
+            Stored::ClaudeFablePython { effort } => Self::ClaudeFablePython { effort },
         })
     }
 }
@@ -571,6 +579,11 @@ impl AgentRoleSessionProfile for AgentRole {
                 intelligence: EngineerIntelligence::Alt,
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
+            },
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::UltraPython,
+            } => SessionBinding::ClaudeFablePython {
+                effort: ClaudeEffort::High,
             },
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Gemini,
@@ -621,6 +634,7 @@ impl SessionBinding {
         let intelligence = match self {
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
             Self::ResponsesSolPython(_) => EngineerIntelligence::Python,
+            Self::ClaudeFablePython { .. } => EngineerIntelligence::UltraPython,
             Self::AntigravityFlashLow(_) => EngineerIntelligence::Gemini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
@@ -671,7 +685,10 @@ impl SessionBinding {
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
             Self::AntigravityFlashLow(config) => Some(config),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
+            Self::ClaudeFable { .. }
+            | Self::ClaudeFablePython { .. }
+            | Self::ClaudeOpus { .. }
+            | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
@@ -685,13 +702,18 @@ impl SessionBinding {
             Self::ResponsesTerra(_) | Self::AdvisorTerra(_) => Some(InferenceModel::Gpt56Terra),
             Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
             Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
-            Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
+            Self::ClaudeFable { .. }
+            | Self::ClaudeFablePython { .. }
+            | Self::ClaudeOpus { .. }
+            | Self::ClaudeAdvisor { .. } => None,
         }
     }
 
     pub fn claude_model(self) -> Option<rho_claude::Model> {
         match self {
-            Self::ClaudeFable { .. } | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
+            Self::ClaudeFable { .. }
+            | Self::ClaudeFablePython { .. }
+            | Self::ClaudeAdvisor { .. } => Some(rho_claude::Model::Fable),
             Self::ClaudeOpus { .. } => Some(rho_claude::Model::Opus),
             Self::ResponsesGpt55(_)
             | Self::ResponsesSol(_)
@@ -708,9 +730,9 @@ impl SessionBinding {
 
     pub fn claude_effort(self) -> Option<rho_claude::Effort> {
         match self {
-            Self::ClaudeFable { effort } | Self::ClaudeAdvisor { effort } => {
-                Some(effort.to_claude_effort())
-            }
+            Self::ClaudeFable { effort }
+            | Self::ClaudeFablePython { effort }
+            | Self::ClaudeAdvisor { effort } => Some(effort.to_claude_effort()),
             Self::ClaudeOpus { effort } => Some(effort.to_claude_effort()),
             Self::ResponsesGpt55(_)
             | Self::ResponsesSol(_)
@@ -723,6 +745,14 @@ impl SessionBinding {
             | Self::AdvisorTerra(_) => None,
             Self::AntigravityFlashLow(_) => None,
         }
+    }
+}
+
+impl SessionBinding {
+    /// Whether this Claude session runs with Rho's Python notebook as its
+    /// only tool, served in-process over MCP, instead of Claude's built-ins.
+    pub fn claude_python(self) -> bool {
+        matches!(self, Self::ClaudeFablePython { .. })
     }
 }
 

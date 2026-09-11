@@ -507,10 +507,15 @@ request.
         .into()
 }
 
+/// The `CLAUDE.md` an agent on the Claude runtime gets. `python_hosts` is
+/// the host functions of the Rho Python notebook when that notebook is the
+/// agent's only tool (served to Claude Code over MCP), and `None` when the
+/// agent runs with Claude's own tools.
 pub fn claude_prompt(
     view: Option<&rho_workspaces::View>,
     multi_agent: Option<&MultiAgentTools>,
     role: AgentRole,
+    python_hosts: Option<&[rho_core::ToolSpec]>,
 ) -> Arc<str> {
     let team = multi_agent.map_or_else(String::new, |tools| {
         let identity = match tools.parent() {
@@ -531,6 +536,12 @@ pub fn claude_prompt(
         AgentRole::Engineer { .. } => "",
         AgentRole::Advisor { .. } => ADVISOR_PROMPT,
     };
+    let python = python_hosts.map_or_else(String::new, |specs| {
+        format!(
+            "{CLAUDE_PYTHON_PROMPT}{}",
+            rho_agent_tools::python_instructions_for(specs, rho_agent_tools::ExecReturn::Blocking)
+        )
+    });
     let workspace = view
         .filter(|_| role.is_engineer() || matches!(role, AgentRole::Advisor { .. }))
         .map_or_else(String::new, |view| {
@@ -544,8 +555,28 @@ pub fn claude_prompt(
                 .collect::<Vec<_>>();
             render_workspace_prompt(&workdirs)
         });
-    format!("{team}{role_prompt}{workspace}").into()
+    format!("{team}{role_prompt}{python}{workspace}").into()
 }
+
+/// How the Rho Python notebook differs from a native tool when Claude Code
+/// reaches it over MCP: one blocking call, and Claude's own tools gone.
+const CLAUDE_PYTHON_PROMPT: &str = "## Your Tools
+
+Claude Code's built-in tools (Bash, Read, Edit, Write, Glob, Grep, Agent, and the rest) are \
+disabled. Your only tool is `mcp__py__exec`, Rho's persistent Python notebook; it takes one \
+argument, `source`, the Python to run. Run shell commands with `command(...)`, and read and \
+edit files from Python (`pathlib.Path` reads and writes, or shell tools such as `sed`). One \
+cell can chain many commands and edits, so prefer one cell that does a whole step over several \
+calls.
+
+An exec call stays open until the cell has something worth reporting: it returned, it produced \
+output that stands on its own, a check-in came due, or a user message arrived. It then returns \
+with the output so far. Cells keep running after the call returns; whatever they say later is \
+attached to your next exec result, and if you end your turn while cells are still running, \
+their output reaches you as a message. To wait inside a cell, call `set_checkin` rather than \
+sleeping: the call returns when the check-in fires without blocking Python.
+
+";
 
 /// One workdir as the prompt renders it: the agent-visible path and the kind
 /// of checkout mounted there.

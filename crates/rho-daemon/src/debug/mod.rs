@@ -64,8 +64,8 @@ enum DebugCommand {
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-py, eng-high,
-        /// eng-ultra, eng-alt, eng-gemini, pm, advisor, advisor-cheap,
-        /// or advisor-high.
+        /// eng-ultra, eng-ultra-py, eng-alt, eng-gemini, pm, advisor,
+        /// advisor-cheap, or advisor-high.
         role: String,
     },
 }
@@ -156,6 +156,9 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-ultra" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Ultra,
         },
+        "eng-ultra-py" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::UltraPython,
+        },
         "eng-alt" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         },
@@ -172,7 +175,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-py, eng-high, eng-ultra, eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-py, eng-high, eng-ultra, eng-ultra-py, eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high"
         ),
     })
 }
@@ -613,6 +616,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 EngineerIntelligence::Python => "python",
                 EngineerIntelligence::High => "high",
                 EngineerIntelligence::Ultra => "ultra",
+                EngineerIntelligence::UltraPython => "ultra-python",
                 EngineerIntelligence::Alt => "alt",
                 EngineerIntelligence::Gemini => "gemini",
             };

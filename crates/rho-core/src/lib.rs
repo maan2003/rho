@@ -125,6 +125,9 @@ pub enum EngineerIntelligence {
     Gemini,
     /// Sol-backed engineer using Python code mode.
     Python,
+    /// Claude Fable engineer whose only tool is Rho's Python notebook, served
+    /// to Claude Code in-process over MCP.
+    UltraPython,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

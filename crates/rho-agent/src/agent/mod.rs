@@ -11,7 +11,7 @@
 //!
 //! `specs/ARCH-rho-agent.md` has the shape and the invariants.
 
-mod boundary;
+pub(crate) mod boundary;
 pub(crate) mod replay;
 mod streaming;
 #[cfg(test)]
@@ -2053,44 +2053,10 @@ fn surface(
     parent: Option<AgentId>,
     pool: &std::sync::Weak<AgentPool>,
 ) -> anyhow::Result<Surface> {
-    let shell = ShellTools::new(
-        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-        Arc::clone(&view),
-    )
-    .with_env("RHO_AGENT_ID", agent_id.encoded());
     let multi_agent = pool
         .upgrade()
         .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
-    let mut others: Vec<Arc<dyn FutureTool>> = vec![Arc::new(ImageTool(
-        crate::image_tool::ImageTools::new(Arc::clone(&view)),
-    ))];
-    if let Some(multi_agent) = &multi_agent {
-        others.extend(
-            multi_agent_tools::agent_tool_specs(role)
-                .into_iter()
-                .map(|spec| {
-                    Arc::new(AgentTool {
-                        tools: multi_agent.clone(),
-                        spec,
-                    }) as Arc<dyn FutureTool>
-                }),
-        );
-    }
-    others.push(match inference {
-        Some(inference) => Arc::new(WebSearchTools::new(
-            inference.clone(),
-            agent_id.encoded().to_owned(),
-        )),
-        // A rendering has no provider behind it; the spec is what it is for.
-        None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
-    });
-    others.push(match pool.upgrade() {
-        Some(pool) => Arc::new(crate::papercut::PapercutTool {
-            db: pool.db().clone(),
-            agent_id,
-        }),
-        None => Arc::new(SpecOnly(crate::papercut::PapercutTool::spec())),
-    });
+    let (shell, others) = host_tools(&view, role, agent_id, inference, multi_agent.as_ref(), pool);
     let code_mode = (cfg!(feature = "code-mode") && profile.code_mode).then_some(
         if matches!(
             role,
@@ -2125,6 +2091,58 @@ fn surface(
     })
 }
 
+/// What every runtime's tools are built from: the shell, and the host
+/// functions Rho answers itself (images, collaboration, web search,
+/// papercuts). The native runtime lists them beside the shell or behind a
+/// code-mode `exec`; the Claude runtime serves them through its Python
+/// notebook. `inference` and `pool` may be absent for a rendering, which
+/// gets specs that cannot be called.
+pub(crate) fn host_tools(
+    view: &Arc<View>,
+    role: AgentRole,
+    agent_id: AgentId,
+    inference: Option<&Inference>,
+    multi_agent: Option<&MultiAgentTools>,
+    pool: &std::sync::Weak<AgentPool>,
+) -> (ShellTools, Vec<Arc<dyn FutureTool>>) {
+    let shell = ShellTools::new(
+        std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        Arc::clone(view),
+    )
+    .with_env("RHO_AGENT_ID", agent_id.encoded());
+    let mut others: Vec<Arc<dyn FutureTool>> = vec![Arc::new(ImageTool(
+        crate::image_tool::ImageTools::new(Arc::clone(view)),
+    ))];
+    if let Some(multi_agent) = multi_agent {
+        others.extend(
+            multi_agent_tools::agent_tool_specs(role)
+                .into_iter()
+                .map(|spec| {
+                    Arc::new(AgentTool {
+                        tools: multi_agent.clone(),
+                        spec,
+                    }) as Arc<dyn FutureTool>
+                }),
+        );
+    }
+    others.push(match inference {
+        Some(inference) => Arc::new(WebSearchTools::new(
+            inference.clone(),
+            agent_id.encoded().to_owned(),
+        )),
+        // A rendering has no provider behind it; the spec is what it is for.
+        None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
+    });
+    others.push(match pool.upgrade() {
+        Some(pool) => Arc::new(crate::papercut::PapercutTool {
+            db: pool.db().clone(),
+            agent_id,
+        }),
+        None => Arc::new(SpecOnly(crate::papercut::PapercutTool::spec())),
+    });
+    (shell, others)
+}
+
 /// The model-facing surface of a role, for a reader: the prompt and the tool
 /// specs a new agent of that role would get, without a pool behind them.
 pub fn render_agent_surface(
@@ -2132,9 +2150,26 @@ pub fn render_agent_surface(
     role: AgentRole,
 ) -> anyhow::Result<crate::RenderedAgentSurface> {
     let binding = role.session_profile()?;
+    if binding.claude_python() {
+        let placeholder = AgentId::from_counter(1, &crate::db::AgentIdDomain(0))
+            .expect("counter 1 is within prefix-id capacity");
+        let (_, others) = host_tools(
+            &view,
+            role,
+            placeholder,
+            None,
+            None,
+            &std::sync::Weak::new(),
+        );
+        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
+        return Ok(crate::RenderedAgentSurface {
+            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role, Some(&specs)),
+            tools: Arc::from([crate::claude::python_host::exec_spec()]),
+        });
+    }
     if binding.claude_model().is_some() {
         return Ok(crate::RenderedAgentSurface {
-            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role),
+            system_prompt: prompt::claude_prompt(Some(view.as_ref()), None, role, None),
             tools: Arc::from([]),
         });
     }

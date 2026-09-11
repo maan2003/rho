@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
-use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
+use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, SdkMcpServer, Session};
 use rho_core::{ContentPart, ContextItemEvent, PendingInferenceResponse};
 use rho_db::RhoDb;
 use rho_inference::Inference;
@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub(crate) mod projection;
+pub(crate) mod python_host;
 pub mod rebuild;
 
 use projection::{ClaudeStreamItem, assistant_row, compacted_row, user_row};
@@ -90,6 +91,7 @@ impl ClaudeAgent {
             parent,
         );
         write.commit();
+        let python_mode = mode.claude_python();
 
         let pool_events = pool.clone();
         let multi_agent = pool
@@ -127,6 +129,7 @@ impl ClaudeAgent {
                 pool_events,
                 role,
                 head,
+                python_mode,
             ),
         ))
     }
@@ -153,6 +156,7 @@ impl ClaudeAgent {
             record.config.binding.claude_effort().ok_or_else(|| {
                 anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
             })?;
+        let python_mode = record.config.binding.claude_python();
         let primary_repo = record.primary_workdir().repo().to_owned();
         // The transcript's rows come from the file when the loop starts
         // (`sync_transcript`); a load reads the file only to settle a
@@ -258,6 +262,7 @@ impl ClaudeAgent {
             pool_events,
             record.config.role,
             head,
+            python_mode,
         ))
     }
 
@@ -278,6 +283,7 @@ impl ClaudeAgent {
         pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
         head: crate::db::AgentHead,
+        python_mode: bool,
     ) -> Self {
         let status = Arc::new(RwLock::new(AgentStatus {
             kind: state.kind.clone(),
@@ -294,11 +300,12 @@ impl ClaudeAgent {
                 .map(|source| source.through)
         };
         let presentation_session = Arc::new(tokio::sync::Mutex::new(
-            crate::presentation::Session::new(inference),
+            crate::presentation::Session::new(inference.clone()),
         ));
         let loop_state = ClaudeLoop {
             db,
             claude,
+            inference,
             presentation_session,
             agent_id,
             view,
@@ -308,7 +315,11 @@ impl ClaudeAgent {
             start_mode,
             process: None,
             claude_prompt_path: None,
+            claude_settings_path: None,
             claude_account: None,
+            python_mode,
+            python: None,
+            python_recheck: None,
             pending_response: PendingInferenceResponse::default(),
             stream_items: BTreeMap::new(),
             queued_turns: VecDeque::new(),
@@ -489,6 +500,7 @@ struct ClaudeLoop {
     /// The Claude configuration this agent runs against, handed down from
     /// the daemon rather than resolved here.
     claude: rho_claude::accounts::ClaudePaths,
+    inference: Inference,
     /// The agent's one persistent Luna session, shared by activity updates
     /// and turn reports so both keep one prompt prefix warm.
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
@@ -502,9 +514,20 @@ struct ClaudeLoop {
     start_mode: ClaudeStartMode,
     process: Option<ClaudeCode>,
     claude_prompt_path: Option<tempfile::TempPath>,
+    /// The generated `settings.json` of a Python-mode agent, kept alive for
+    /// the same reason as the prompt.
+    claude_settings_path: Option<tempfile::TempPath>,
     /// The account the running process was spawned on, so a switch is
     /// noticed at the next turn.
     claude_account: Option<String>,
+    /// Whether this agent's only tool is Rho's Python notebook, served to
+    /// Claude Code in-process over MCP.
+    python_mode: bool,
+    /// The notebook, once the first spawn has built it. Outlives the
+    /// process: cells keep running across a respawn.
+    python: Option<python_host::PythonHost>,
+    /// When the boundary said to ask it again, if it can change by itself.
+    python_recheck: Option<rho_core::UnixMs>,
     pending_response: PendingInferenceResponse,
     stream_items: BTreeMap<usize, ClaudeStreamItem>,
     queued_turns: VecDeque<ClaudeTurn>,
@@ -565,6 +588,8 @@ impl ClaudeLoop {
             let initial_kind = self.state.kind.clone();
             let initial_execution_generation = self.execution_generation;
             if self.process.is_some() {
+                let notify = self.python.as_ref().map(|host| host.notify());
+                let recheck = self.python_recheck;
                 let event = {
                     let process = self.process.as_mut().expect("checked above");
                     let control_rx = &mut self.control_rx;
@@ -572,9 +597,11 @@ impl ClaudeLoop {
                         biased;
                         control = control_rx.recv() => ClaudeLoopEvent::Control(control),
                         event = process.next_event() => ClaudeLoopEvent::Protocol(Box::new(event)),
+                        _ = python_wake(notify.as_deref(), recheck) => ClaudeLoopEvent::PythonWake,
                     }
                 };
                 match event {
+                    ClaudeLoopEvent::PythonWake => {}
                     ClaudeLoopEvent::Control(Some(control)) => self.handle_control(control).await,
                     ClaudeLoopEvent::Control(None) => {
                         if self.pending_rewind {
@@ -588,6 +615,7 @@ impl ClaudeLoop {
                         Ok(Some(event)) => self.handle_event(event).await,
                         Ok(None) => {
                             self.process = None;
+                            self.forget_pending_exec();
                             self.recover_pending_rewind().await;
                             // Unechoed sends died with the process; a stale
                             // entry here would pin every later turn end in
@@ -608,12 +636,16 @@ impl ClaudeLoop {
                         }
                         Err(error) => {
                             self.process = None;
+                            self.forget_pending_exec();
                             self.recover_pending_rewind().await;
                             self.queued_turns.clear();
                             self.fail(error).await;
                         }
                     },
                 }
+                // Every event may have changed what the notebook's cells
+                // have to say or whether the model can hear it; ask once.
+                self.python_tick().await;
             } else {
                 let Some(control) = self.control_rx.recv().await else {
                     return;
@@ -655,6 +687,9 @@ impl ClaudeLoop {
                 accepted,
             } => {
                 self.cancelling = false;
+                if let Some(host) = &mut self.python {
+                    host.user_spoke();
+                }
                 let busy = self.state.kind.is_working();
                 if !busy {
                     self.execution_generation = self.execution_generation.wrapping_add(1);
@@ -736,6 +771,7 @@ impl ClaudeLoop {
                 self.state.queued_inputs.clear();
                 self.queued_turns.clear();
                 self.cancelling = busy;
+                self.cancel_python().await;
                 if busy && self.process.is_some() {
                     let result =
                         tokio::time::timeout(Duration::from_secs(30), self.soft_cancel(&queued))
@@ -901,6 +937,7 @@ impl ClaudeLoop {
     }
 
     async fn close_process(&mut self) {
+        self.forget_pending_exec();
         if let Some(process) = self.process.take() {
             let _ = process.close().await;
         }
@@ -1270,6 +1307,17 @@ impl ClaudeLoop {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
             options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
+        if self.python_mode {
+            self.ensure_python(&view)?;
+            // Tool search would defer the one tool behind a lookup; the deny
+            // list in the generated settings removes ToolSearch too. The
+            // timeout is the CLI's ceiling on an open exec call.
+            options.set_env("ENABLE_TOOL_SEARCH", "false");
+            options.set_env(
+                "MCP_TOOL_TIMEOUT",
+                python_host::EXEC_TIMEOUT.as_millis().to_string(),
+            );
+        }
         self.configure_claude_home(&view, &mut options, &account)
             .await?;
         let mut command = options.command().await?;
@@ -1278,6 +1326,41 @@ impl ClaudeLoop {
         if !self.pending_rewind {
             self.start_mode = ClaudeStartMode::Resume;
         }
+        if self.python.is_some() {
+            let request_id = self
+                .process
+                .as_mut()
+                .expect("spawned above")
+                .initialize_sdk_mcp(&[SdkMcpServer {
+                    name: python_host::SERVER_NAME.to_owned(),
+                    timeout: Some(python_host::EXEC_TIMEOUT),
+                }])
+                .await?;
+            self.await_control_response(request_id, "Claude Code rejected the Python MCP server")
+                .await
+                .context("register the Python notebook with Claude Code")?;
+        }
+        Ok(())
+    }
+
+    /// Builds the notebook on the first spawn. It lives as long as the
+    /// loop: a respawned CLI finds the same globals and running cells.
+    fn ensure_python(&mut self, view: &Arc<rho_workspaces::View>) -> anyhow::Result<()> {
+        if self.python.is_some() {
+            return Ok(());
+        }
+        let (shell, others) = crate::agent::host_tools(
+            view,
+            self.role,
+            self.agent_id,
+            Some(&self.inference),
+            self.multi_agent.as_ref(),
+            &self.pool_events,
+        );
+        let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
+        let tool = rho_agent_tools::PythonTool::new(shell, others)
+            .map_err(|error| anyhow::anyhow!("Python notebook failed to start: {error}"))?;
+        self.python = Some(python_host::PythonHost::new(tool, specs));
         Ok(())
     }
 
@@ -1305,17 +1388,50 @@ impl ClaudeLoop {
         // The value is the same for every account: only the mount underneath
         // it differs.
         options.set_env("CLAUDE_CONFIG_DIR", config_home.as_str());
-        let prompt = prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
+        let prompt = prompt::claude_prompt(
+            Some(view),
+            self.multi_agent.as_ref(),
+            self.role,
+            self.python.as_ref().map(|host| host.host_specs()),
+        );
         // Keep one source inode alive for the lifetime of the view namespace.
         // Unlinking a bind-mounted source makes the target pathname disappear
         // inside that namespace, so a rewrite has to reuse this file rather
         // than replace it.
-        let source = write_claude_prompt_source(&mut self.claude_prompt_path, &prompt)?;
+        let source = write_generated_source(
+            &mut self.claude_prompt_path,
+            "rho-claude-prompt-",
+            ".md",
+            &prompt,
+        )?;
+        // A Python-mode agent runs on the account's own settings with every
+        // Claude tool denied, so the notebook is all the model has. The
+        // generated file covers the account's `settings.json`.
+        let settings = if self.python_mode {
+            let base = self.claude.account_settings(account)?;
+            let settings = rho_claude::settings::deny_all_but_own_tools(
+                &base,
+                &[rho_claude::accounts::MCP_SERVER_NAME],
+            );
+            let text = serde_json::to_string_pretty(&settings)?;
+            Some(
+                write_generated_source(
+                    &mut self.claude_settings_path,
+                    "rho-claude-settings-",
+                    ".json",
+                    &text,
+                )?
+                .into_std_path_buf(),
+            )
+        } else {
+            None
+        };
         view.set_claude_home(rho_workspaces::ns::ClaudeHome {
             account: account_dir.into_std_path_buf(),
             shared_projects: config_home.join("projects").into_std_path_buf(),
             config_home: config_home.into_std_path_buf(),
             prompt: source.into_std_path_buf(),
+            settings,
         })
         .await?;
         self.claude_account = Some(account.to_owned());
@@ -1328,6 +1444,9 @@ impl ClaudeLoop {
                 self.handle_system_message(message).await;
             }
             rho_claude::ClaudeEvent::ControlResponse(_) => {}
+            rho_claude::ClaudeEvent::ControlRequest(message) => {
+                self.handle_control_request(message).await;
+            }
             // One content block, finished: its row, then the live tail
             // lets go of the streamed copy. A subagent's blocks are its
             // own.
@@ -1365,6 +1484,25 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::Result(message) => {
                 let successful = !message.is_error;
+                if let Some(host) = &mut self.python {
+                    host.turn_ended(rho_core::UnixMs::now());
+                    // A turn that ends with a call still open is the CLI
+                    // having given up on it (its timeout, or an abort);
+                    // answer it anyway so the notebook takes the next one.
+                    if let Some(pending) = host.take_pending() {
+                        let reply = serde_json::json!({
+                            "mcp_response": {
+                                "jsonrpc": "2.0",
+                                "id": pending.rpc_id,
+                                "result": {
+                                    "content": [{ "type": "text", "text": "the call was abandoned before the cell reported" }],
+                                    "isError": true,
+                                },
+                            },
+                        });
+                        self.respond_control(&pending.request_id, Ok(reply)).await;
+                    }
+                }
                 if self.cancelling {
                     self.pending_response = PendingInferenceResponse::default();
                     self.stream_items.clear();
@@ -1465,6 +1603,151 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::Other => {}
         }
+    }
+
+    /// A request from the CLI: with the notebook registered, its MCP
+    /// traffic. The handshake and listing are answered here; an exec call
+    /// is answered when the boundary says so, from `python_tick`.
+    async fn handle_control_request(
+        &mut self,
+        message: rho_claude::protocol::ControlRequestMessage,
+    ) {
+        use rho_claude::protocol::ControlRequest;
+        let request_id = message.request_id;
+        let reply = match message.request {
+            ControlRequest::McpMessage {
+                server_name,
+                message: rpc,
+            } if server_name == python_host::SERVER_NAME => match python_host::handle_rpc(&rpc) {
+                python_host::Rpc::Reply(value) => Ok(serde_json::json!({ "mcp_response": value })),
+                python_host::Rpc::Ignore => Ok(serde_json::json!({})),
+                python_host::Rpc::Exec { id, source } => match self.python.as_mut() {
+                    Some(host) => {
+                        match host.exec(request_id.clone(), id, source, rho_core::UnixMs::now()) {
+                            Some(refused) => Ok(serde_json::json!({ "mcp_response": refused })),
+                            None => return,
+                        }
+                    }
+                    None => Err("the Python notebook is not running".to_owned()),
+                },
+            },
+            ControlRequest::McpMessage { server_name, .. } => {
+                Err(format!("unknown MCP server {server_name}"))
+            }
+            ControlRequest::Other => Err("unsupported control request".to_owned()),
+        };
+        self.respond_control(&request_id, reply).await;
+    }
+
+    async fn respond_control(
+        &mut self,
+        request_id: &str,
+        reply: Result<serde_json::Value, String>,
+    ) {
+        let Some(process) = self.process.as_mut() else {
+            return;
+        };
+        let result = match reply {
+            Ok(value) => process.respond_control(request_id, value).await,
+            Err(error) => process.respond_control_error(request_id, &error).await,
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "rho-agent: Claude control response of {} failed: {error:#}",
+                self.agent_id.encoded()
+            );
+        }
+    }
+
+    /// Asks the boundary whether the model should hear from the notebook,
+    /// and acts on the answer: an open exec call returns with everything
+    /// waiting, or an idle model is woken with it as a message. A working
+    /// model with no call open hears it at its next call or turn end.
+    async fn python_tick(&mut self) {
+        let Some(host) = self.python.as_mut() else {
+            return;
+        };
+        let now = rho_core::UnixMs::now();
+        let oldest_user = self.state.queued_inputs.iter().map(|input| input.at).min();
+        match host.decide(oldest_user, now) {
+            crate::agent::boundary::Boundary::No { recheck } => {
+                self.python_recheck = recheck;
+            }
+            crate::agent::boundary::Boundary::Now
+            | crate::agent::boundary::Boundary::AbortAndResend
+            | crate::agent::boundary::Boundary::RetryExhausted => {
+                self.python_recheck = None;
+                if let Some((pending, drained)) = host.answer_pending() {
+                    let reply = serde_json::json!({
+                        "mcp_response": {
+                            "jsonrpc": "2.0",
+                            "id": pending.rpc_id,
+                            "result": drained.into_mcp_result(),
+                        },
+                    });
+                    self.respond_control(&pending.request_id, Ok(reply)).await;
+                } else if matches!(self.state.kind, AgentStateKind::Idle)
+                    && self.process.is_some()
+                    && self.queued_turns.is_empty()
+                    && !self.pending_rewind
+                {
+                    let drained = host.drain_idle();
+                    if drained.is_empty() {
+                        return;
+                    }
+                    let mut content = vec![ContentPart::Text {
+                        text: "Output from Python cells that were still running when your last \
+                               turn ended:"
+                            .to_owned(),
+                    }];
+                    for output in drained.own.into_iter().chain(drained.updates) {
+                        content.push(ContentPart::Text {
+                            text: (*output.output).clone(),
+                        });
+                        content.extend(output.images.iter().map(|image| ContentPart::Image {
+                            media_type: image.media_type.clone(),
+                            data: image.data.clone(),
+                        }));
+                    }
+                    self.handle_control(ClaudeControl::UserMessage {
+                        content,
+                        uuid: Uuid::new_v4().to_string(),
+                        accepted: None,
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Stops the notebook's cells and answers an open exec call as
+    /// cancelled, ahead of the interrupt that abandons it on the CLI's side.
+    async fn cancel_python(&mut self) {
+        let Some(host) = self.python.as_mut() else {
+            return;
+        };
+        if let Some(pending) = host.cancel(rho_core::UnixMs::now()) {
+            let reply = serde_json::json!({
+                "mcp_response": {
+                    "jsonrpc": "2.0",
+                    "id": pending.rpc_id,
+                    "result": {
+                        "content": [{ "type": "text", "text": "cancelled by the user" }],
+                        "isError": true,
+                    },
+                },
+            });
+            self.respond_control(&pending.request_id, Ok(reply)).await;
+        }
+    }
+
+    /// The process that was waiting on an exec call is gone; the cells run
+    /// on and say what they have to the next one.
+    fn forget_pending_exec(&mut self) {
+        if let Some(host) = self.python.as_mut() {
+            host.take_pending();
+        }
+        self.python_recheck = None;
     }
 
     async fn handle_command_lifecycle(
@@ -1825,7 +2108,29 @@ impl ClaudeLoop {
     }
 }
 
+/// Wakes when a notebook cell has something new, or when the boundary said
+/// to ask it again. Never, for an agent without a notebook.
+async fn python_wake(notify: Option<&tokio::sync::Notify>, recheck: Option<rho_core::UnixMs>) {
+    let Some(notify) = notify else {
+        return std::future::pending().await;
+    };
+    let timer = async move {
+        match recheck {
+            Some(at) => {
+                let wait = at.0.saturating_sub(rho_core::UnixMs::now().0);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = notify.notified() => {}
+        _ = timer => {}
+    }
+}
+
 enum ClaudeLoopEvent {
+    PythonWake,
     Control(Option<ClaudeControl>),
     Protocol(Box<anyhow::Result<Option<rho_claude::ClaudeEvent>>>),
 }
@@ -1892,35 +2197,38 @@ fn is_compact_command(content: &[ContentPart]) -> bool {
     }
 }
 
-fn write_claude_prompt_source(
+/// Writes a generated file that a view namespace bind-mounts, reusing the
+/// tempfile in `path` when there is one: the mount follows the inode.
+fn write_generated_source(
     path: &mut Option<tempfile::TempPath>,
-    prompt: &str,
+    prefix: &str,
+    suffix: &str,
+    contents: &str,
 ) -> anyhow::Result<Utf8PathBuf> {
     let (mut file, source) = if let Some(path) = path.as_ref() {
         let source = Utf8PathBuf::try_from(path.to_path_buf())
-            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
+            .context("generated Claude tempfile path is not valid UTF-8")?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
             .open(path)
-            .context("reopen generated Claude prompt tempfile")?;
+            .context("reopen generated Claude tempfile")?;
         (file, source)
     } else {
         let source_file = tempfile::Builder::new()
-            .prefix("rho-claude-prompt-")
-            .suffix(".md")
+            .prefix(prefix)
+            .suffix(suffix)
             .tempfile()
-            .context("create generated Claude prompt tempfile")?;
+            .context("create generated Claude tempfile")?;
         let source = Utf8PathBuf::try_from(source_file.path().to_owned())
-            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
+            .context("generated Claude tempfile path is not valid UTF-8")?;
         let (file, temp_path) = source_file.into_parts();
         *path = Some(temp_path);
         (file, source)
     };
-    file.write_all(prompt.as_bytes())
-        .context("write generated Claude prompt tempfile")?;
-    file.flush()
-        .context("flush generated Claude prompt tempfile")?;
+    file.write_all(contents.as_bytes())
+        .context("write generated Claude tempfile")?;
+    file.flush().context("flush generated Claude tempfile")?;
     Ok(source)
 }
 
@@ -1931,8 +2239,9 @@ mod tests {
     #[test]
     fn rewrites_claude_prompt_without_replacing_bind_source() {
         let mut path = None;
-        let first = write_claude_prompt_source(&mut path, "ultra").unwrap();
-        let second = write_claude_prompt_source(&mut path, "alt").unwrap();
+        let first =
+            write_generated_source(&mut path, "rho-claude-prompt-", ".md", "ultra").unwrap();
+        let second = write_generated_source(&mut path, "rho-claude-prompt-", ".md", "alt").unwrap();
 
         assert_eq!(second, first);
         assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");

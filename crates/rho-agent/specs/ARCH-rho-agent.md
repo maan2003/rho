@@ -47,7 +47,9 @@ The loop depends on `boundary`, the tools it has been given, `Store`, and an
 `rho-inference` session. Nothing depends on `boundary`, and `boundary` reaches
 nothing: no store, no provider, no task, no clock but the instant it is handed.
 It is handed every source's facts at once and reads them together; no source
-knows about another, or about the clock.
+knows about another, or about the clock. The Claude runtime asks the same
+`boundary` for its Python-notebook agents: an open `exec` call from Claude Code
+is answered, and an idle model woken, exactly when the decision says so.
 
 Tools come from the caller as a list of `Tool` implementations, keyed on the way
 in by the name the model calls them by; a call in flight is a `ToolSession`. A

@@ -412,6 +412,23 @@ daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
+The `eng-ultra-py` role gives a Claude Fable agent Rho's Python notebook as its
+only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to
+Claude Code as an in-process MCP server (`py`, tool `exec`, so the model sees
+`mcp__py__exec`) over the same stdin/stdout control protocol: the loop sends the
+`initialize` control request naming the server, answers the CLI's `mcp_message`
+control requests, and holds each `tools/call` open until the native `boundary`
+decision — fed the notebook's own `PythonExec`/`PythonOperation` sources and
+the CLI's queued user input — says the model should look. Older cells' later
+output rides along with the next exec reply; an idle model is woken with it as
+a message. Claude's own tools are removed by a generated `settings.json`
+(the account's settings plus a hand-maintained `permissions.deny` list of every
+CLI tool, `ToolSearch` included, with `ENABLE_TOOL_SEARCH=false` set on the
+process) that the view namespace bind-mounts over the account's file, the same
+way the generated `CLAUDE.md` is. The notebook's host functions (images,
+collaboration, web search, papercuts) are the ones a native Python-mode agent
+gets, built by the same `host_tools` constructor.
+
 Claude turn cancellation uses Claude Code's streaming control protocol and
 keeps a healthy child process alive; queued Rho-authored messages are cancelled
 by UUID, with a bounded fallback that fully terminates the child before another

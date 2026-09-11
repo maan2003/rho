@@ -8803,6 +8803,7 @@ fn agent_role_label(config: AgentRole) -> String {
             EngineerIntelligence::Python => "eng-py",
             EngineerIntelligence::High => "eng-high",
             EngineerIntelligence::Ultra => "eng-ultra",
+            EngineerIntelligence::UltraPython => "eng-ultra-py",
             EngineerIntelligence::Alt => "eng-alt",
             EngineerIntelligence::Gemini => "eng-gemini",
         },

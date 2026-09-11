@@ -80,6 +80,9 @@ pub struct ClaudeHome {
     /// The agent's generated `CLAUDE.md`. Per agent, not per account: two
     /// agents on one account each need their own working set in it.
     pub prompt: PathBuf,
+    /// A generated `settings.json` covering the account's own, for agents
+    /// whose Claude runs with a different tool set than the account's default.
+    pub settings: Option<PathBuf>,
 }
 
 /// Creates the mount namespace for one agent view: a copy of the daemon's
@@ -126,7 +129,8 @@ pub fn create_view_ns(
 /// Gives this namespace one account's Claude config at the ordinary
 /// `~/.claude`: the account directory covers it, the shared transcript tree
 /// is put back on top of the account's own `projects/`, and the agent's
-/// generated prompt covers the account's `CLAUDE.md`.
+/// generated prompt covers the account's `CLAUDE.md` (and its generated
+/// settings the account's `settings.json`, when it has any).
 fn mount_claude_home(home: &ClaudeHome) -> anyhow::Result<()> {
     // The shared tree must be cloned before the account covers the path it
     // lives under, or the source would resolve inside the account.
@@ -150,6 +154,10 @@ fn mount_claude_home(home: &ClaudeHome) -> anyhow::Result<()> {
     .context("mount shared Claude transcripts")?;
     rustix::mount::mount_bind(&home.prompt, home.config_home.join("CLAUDE.md"))
         .context("mount generated CLAUDE.md")?;
+    if let Some(settings) = &home.settings {
+        rustix::mount::mount_bind(settings, home.config_home.join("settings.json"))
+            .context("mount generated settings.json")?;
+    }
     Ok(())
 }
 

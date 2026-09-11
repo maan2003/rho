@@ -376,6 +376,21 @@ fn agent_role_resolves_opinionated_bindings() {
             effort: ClaudeEffort::Medium
         }
     );
+    let python = profile(EngineerIntelligence::UltraPython);
+    assert_eq!(
+        python,
+        SessionBinding::ClaudeFablePython {
+            effort: ClaudeEffort::High
+        }
+    );
+    assert!(python.claude_python());
+    assert_eq!(python.claude_model(), Some(rho_claude::Model::Fable));
+    assert_eq!(
+        python.agent_role(),
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::UltraPython
+        }
+    );
     assert!(matches!(
         profile(EngineerIntelligence::Gemini),
         SessionBinding::AntigravityFlashLow(InferenceProfile {

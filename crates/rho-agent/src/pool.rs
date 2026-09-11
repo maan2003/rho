@@ -476,6 +476,7 @@ impl AgentPool {
                 (agent_id, RunningAgent::Rho(agent))
             }
             SessionBinding::ClaudeFable { .. }
+            | SessionBinding::ClaudeFablePython { .. }
             | SessionBinding::ClaudeOpus { .. }
             | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(

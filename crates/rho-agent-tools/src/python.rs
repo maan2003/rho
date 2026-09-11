@@ -125,14 +125,41 @@ struct JobState {
     finished: Option<(UnixMs, Value)>,
     delivered: bool,
 }
+/// When an `exec` call comes back to the model, which changes what the
+/// guidance about waiting has to say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecReturn {
+    /// Rho's native runtime: the call is answered at the next request
+    /// boundary, so the model ends its turn to wait.
+    AtTurnEnd,
+    /// A host that holds the call open, such as Claude Code's MCP tool call:
+    /// the call returns when that same boundary would have answered it.
+    Blocking,
+}
+
+/// System-prompt guidance for the Python runtime and its available host
+/// functions, for the native runtime.
+pub fn python_instructions(specs: &[ToolSpec]) -> String {
+    python_instructions_for(specs, ExecReturn::AtTurnEnd)
+}
+
 /// System-prompt guidance for the Python runtime and its available host
 /// functions.
-pub fn python_instructions(specs: &[ToolSpec]) -> String {
-    let mut description = String::from(
-        "## Python Code Mode
-
-`exec` is your only top-level tool. Issue at most one exec call per response.
-It runs a persistent Python notebook with top-level await. Globals are shared;
+pub fn python_instructions_for(specs: &[ToolSpec], returns: ExecReturn) -> String {
+    let (opening, after_checkin) = match returns {
+        ExecReturn::AtTurnEnd => (
+            "`exec` is your only top-level tool. Issue at most one exec call per response.",
+            "Then end the model turn. No separate exec is needed; this does not sleep or block Python.",
+        ),
+        ExecReturn::Blocking => (
+            "`exec` (`mcp__py__exec`) is your only tool. Make one exec call at a time.",
+            "The exec call then returns when the check-in fires, or sooner if something worth \
+reporting happens; this does not sleep or block Python.",
+        ),
+    };
+    let mut description = format!("## Python Code Mode\n\n{opening}\n");
+    description.push_str(
+        "It runs a persistent Python notebook with top-level await. Globals are shared;
 live cells interleave at await. Use shell commands to inspect files and Python
 to manipulate their data.
 The Python standard library, PyYAML (`yaml`), and HTTPX (`httpx`) are available through ordinary \
@@ -234,7 +261,11 @@ command(\"git diff --check\")
 command(\"cargo test\")
 set_checkin(after_seconds=300)
 ```
-Then end the model turn. No separate exec is needed; this does not sleep or block Python.
+",
+    );
+    description.push_str(after_checkin);
+    description.push_str(
+        "
 If the cell also awaits a dependency, call set_checkin before that await; a suspended cell
 may resume after its originating model turn has ended.
 

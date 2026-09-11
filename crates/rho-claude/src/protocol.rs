@@ -147,6 +147,7 @@ impl InputContent {
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
     CommandLifecycle(CommandLifecycleMessage),
+    ControlRequest(ControlRequestMessage),
     ControlResponse(ControlResponseMessage),
     RateLimitEvent(RateLimitEvent),
     Result(ResultMessage),
@@ -174,6 +175,25 @@ pub struct RateLimitInfo {
 pub struct CommandLifecycleMessage {
     pub command_uuid: String,
     pub state: String,
+}
+
+/// A request the CLI makes of the process driving it. With an SDK-hosted
+/// MCP server registered, every JSON-RPC message for that server arrives
+/// this way and is answered through a `control_response` carrying the same
+/// `request_id`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ControlRequestMessage {
+    pub request_id: String,
+    pub request: ControlRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum ControlRequest {
+    /// A JSON-RPC message for the SDK-hosted MCP server `server_name`.
+    McpMessage { server_name: String, message: Value },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

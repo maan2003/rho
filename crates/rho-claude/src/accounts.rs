@@ -139,7 +139,20 @@ impl ClaudePaths {
             }
         }
         ensure_mcp_server(&dir)?;
+        ensure_settings_target(&dir)?;
         Ok(dir)
+    }
+
+    /// The account's own `settings.json`, as the base a generated settings
+    /// file starts from. Missing reads as empty.
+    pub fn account_settings(&self, name: &str) -> Result<serde_json::Value> {
+        let path = self.account_dir(name)?.join(SETTINGS_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse Claude settings {path}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+            Err(error) => Err(error).with_context(|| format!("read {path}")),
+        }
     }
 
     /// Makes sure the account agents run on exists, so that "every Claude
@@ -160,7 +173,31 @@ impl ClaudePaths {
 }
 
 /// Rho's own MCP server, under the name Claude records it by.
-const MCP_SERVER_NAME: &str = "rho";
+pub const MCP_SERVER_NAME: &str = "rho";
+
+/// The account's settings file, which a generated one may cover.
+pub const SETTINGS_FILE: &str = "settings.json";
+
+/// Makes sure the account has a `settings.json` for a generated settings
+/// file to be bound over. An empty object changes nothing for Claude.
+fn ensure_settings_target(dir: &Utf8Path) -> Result<()> {
+    let path = dir.join(SETTINGS_FILE);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(b"{}\n")
+                .with_context(|| format!("write Claude settings mount target {path}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("create Claude settings mount target {path}"))
+        }
+    }
+}
 
 /// Registers Rho's MCP server in the account, if it is not there already.
 ///
