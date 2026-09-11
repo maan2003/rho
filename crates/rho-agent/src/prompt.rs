@@ -478,7 +478,7 @@ request.
 "
         )
     });
-    let code_mode = rho_agent_tools::python_instructions(host_specs);
+    let python = rho_agent_tools::python_instructions(host_specs);
     let role_prompt = match role {
         AgentRole::Engineer { .. } | AgentRole::Advisor { .. } => "",
     };
@@ -489,7 +489,7 @@ request.
     };
     let environment = render_environment_prompt(&workdirs);
     let workspace = render_workspace_prompt(&workdirs);
-    format!("{base_prompt}{agents_md}{skills}{code_mode}{team_context}{role_prompt}{workspace}{environment}")
+    format!("{base_prompt}{agents_md}{skills}{python}{team_context}{role_prompt}{workspace}{environment}")
         .into()
 }
 

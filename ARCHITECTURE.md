@@ -412,8 +412,8 @@ daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
 
-The `eng-ultra-py` role gives a Claude Fable agent Rho's Python notebook as its
-only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to
+The Claude engineer roles (`eng-ultra`, `eng-alt`) give the agent Rho's Python
+notebook as its only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to
 Claude Code as an in-process MCP server (`py`, tool `exec`, so the model sees
 `mcp__py__exec`) over the same stdin/stdout control protocol: the loop sends the
 `initialize` control request naming the server, answers the CLI's `mcp_message`

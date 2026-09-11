@@ -259,7 +259,6 @@ fn serializes_configured_reasoning_context() {
         InferenceProfile {
             effort: ReasoningEffort::High,
             fast_mode: false,
-            code_mode: false,
         },
         InferenceModel::Gpt55,
         PromptCacheKey::from_bytes(*b"testkey0"),
@@ -791,7 +790,6 @@ fn astra_responses_lite_moves_tools_and_instructions_into_input() {
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: false,
         },
         InferenceModel::Gpt6Astra,
         PromptCacheKey::from_bytes(*b"testkey0"),
@@ -839,7 +837,6 @@ fn responses_lite_previous_response_skips_developer_prefix() {
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: false,
         },
         InferenceModel::Gpt56Sol,
         PromptCacheKey::from_bytes(*b"testkey0"),

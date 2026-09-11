@@ -391,7 +391,7 @@ mod tests {
         let workspace = repo.user_checkout().await.unwrap();
         let view = View::new(vec![workspace.clone()]).unwrap();
         let role = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Python,
+            intelligence: EngineerIntelligence::Medium,
         };
         let binding = role.session_profile().unwrap();
         let profile = binding.deep_config().unwrap();

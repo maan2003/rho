@@ -281,7 +281,6 @@ fn test_inference_service_with(
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: false,
         },
         InferenceModel::Gpt55,
         prompt_cache_key,

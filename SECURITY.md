@@ -708,8 +708,9 @@ Tests cover validation, concurrent appends, and reopening the database.
 
 ## Python code mode (`rho-python`, `rho-agent-tools`)
 
-`eng-py` (Sol), `eng-high`, and `advisor-high` select Python by default. Other code-mode roles retain the
-JavaScript runtime; roles with code mode disabled retain direct tools.
+Every role works in the Python notebook: native agents have it as their only
+tool, and Claude engineers get it as an in-process MCP server with Claude's
+own tools denied.
 
 - Model-authored Python runs in-process on a dedicated RustPython thread, with
   persistent globals and cooperative top-level-await cells. The crate boundary

@@ -112,7 +112,7 @@ enum StoredAgentWorkflow {
     PrFriendly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum EngineerIntelligence {
     Low,
     Medium,
@@ -123,11 +123,40 @@ pub enum EngineerIntelligence {
     Cheap,
     /// Reduced function-tool agent backed by Gemini through Antigravity.
     Gemini,
-    /// Sol-backed engineer using Python code mode.
+}
+
+/// The intelligence as rows wrote it while `eng-py` and `eng-ultra-py`
+/// existed. Every engineer has the Python notebook now, so those fold into
+/// the same model without the suffix.
+#[allow(dead_code)]
+#[derive(Decode)]
+enum StoredEngineerIntelligence {
+    Low,
+    Medium,
+    High,
+    Ultra,
+    Mini,
+    Alt,
+    Cheap,
+    Gemini,
     Python,
-    /// Claude Fable engineer whose only tool is Rho's Python notebook, served
-    /// to Claude Code in-process over MCP.
     UltraPython,
+}
+
+impl senax_encoder::Decoder for EngineerIntelligence {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        use StoredEngineerIntelligence as Stored;
+        Ok(match Stored::decode(reader)? {
+            Stored::Low => Self::Low,
+            Stored::Medium | Stored::Python => Self::Medium,
+            Stored::High => Self::High,
+            Stored::Ultra | Stored::UltraPython => Self::Ultra,
+            Stored::Mini => Self::Mini,
+            Stored::Alt => Self::Alt,
+            Stored::Cheap => Self::Cheap,
+            Stored::Gemini => Self::Gemini,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -764,6 +793,32 @@ mod tests {
         let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
         assert_eq!(decoded.output.as_str(), "done");
         assert!(decoded.full_output.is_none());
+    }
+
+    #[test]
+    fn python_intelligences_fold_into_their_models() {
+        #[derive(Encode)]
+        #[allow(dead_code)]
+        enum LegacyEngineerIntelligence {
+            Python,
+            UltraPython,
+        }
+        for (legacy, expected) in [
+            (
+                LegacyEngineerIntelligence::Python,
+                EngineerIntelligence::Medium,
+            ),
+            (
+                LegacyEngineerIntelligence::UltraPython,
+                EngineerIntelligence::Ultra,
+            ),
+        ] {
+            let mut encoded = bytes::BytesMut::new();
+            senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
+            let decoded =
+                <EngineerIntelligence as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]

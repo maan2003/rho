@@ -138,15 +138,15 @@ fn record_visualization_parses() {
 }
 
 #[test]
-fn evaluation_accepts_python_sol_role() {
+fn evaluation_accepts_sol_role() {
     let args = Args::try_parse(
-        ["eval", "task", "--role", "eng-py"]
+        ["eval", "task", "--role", "eng"]
             .into_iter()
             .map(str::to_owned),
     )
     .unwrap();
     assert!(matches!(
-        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "eng-py"
+        args.command, Command::Eval(eval::EvalArgs { role, .. }) if role == "eng"
     ));
 }
 

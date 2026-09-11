@@ -1113,13 +1113,12 @@ impl Agent {
                 EngineerIntelligence::Low
                     | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
-                    | EngineerIntelligence::Python
                     | EngineerIntelligence::High
             )
         };
         anyhow::ensure!(
             switchable(requested),
-            "this agent can switch only between eng-low, eng-cheap, eng, eng-py, and eng-high"
+            "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
         );
         let current = self.head.read().expect("poison").config.role;
         let role = match current {
@@ -1129,7 +1128,7 @@ impl Agent {
                 }
             }
             _ => anyhow::bail!(
-                "this agent can switch only between eng-low, eng-cheap, eng, eng-py, and eng-high"
+                "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
             ),
         };
         if role == current {

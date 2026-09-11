@@ -454,7 +454,6 @@ impl AgentPool {
         let (agent_id, agent) = match mode {
             SessionBinding::ResponsesGpt55(_)
             | SessionBinding::ResponsesSol(_)
-            | SessionBinding::ResponsesSolPython(_)
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
             | SessionBinding::ResponsesAstra(_)
@@ -476,7 +475,6 @@ impl AgentPool {
                 (agent_id, RunningAgent::Rho(agent))
             }
             SessionBinding::ClaudeFable { .. }
-            | SessionBinding::ClaudeFablePython { .. }
             | SessionBinding::ClaudeOpus { .. }
             | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(

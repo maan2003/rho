@@ -23,9 +23,9 @@ pub(crate) struct EvalArgs {
     pub prompt: Option<String>,
     #[arg(long)]
     pub prompt_file: Option<PathBuf>,
-    /// Native engineer role. eng-high selects GPT-6 Astra with Python code
-    /// mode; eng-py selects GPT-5.6 Sol with the same Python tool surface.
-    #[arg(long, default_value = "eng-high", value_parser = ["eng-high", "eng-py", "eng", "eng-cheap", "eng-low"])]
+    /// Native engineer role. eng-high selects GPT-6 Astra; every role works
+    /// in the Python notebook.
+    #[arg(long, default_value = "eng-high", value_parser = ["eng-high", "eng", "eng-cheap", "eng-low"])]
     pub role: String,
     /// Use this LIVE working directory. Defaults to an empty temporary
     /// directory.
@@ -121,7 +121,6 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         intelligence: match args.role.as_str() {
             "eng-high" => EngineerIntelligence::High,
             "eng" => EngineerIntelligence::Medium,
-            "eng-py" => EngineerIntelligence::Python,
             "eng-cheap" => EngineerIntelligence::Cheap,
             "eng-low" => EngineerIntelligence::Low,
             _ => unreachable!("clap validates evaluation roles"),
@@ -152,9 +151,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
         _ => None,
     };
-    emit(
-        json!({"type":"start", "role":args.role, "model":model, "code_mode": "python", "workdir":workdir}),
-    )?;
+    emit(json!({"type":"start", "role":args.role, "model":model, "workdir":workdir}))?;
     agent.send_user_message(prompt, MessageDelivery::Immediate);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(args.timeout);
     let mut requests = 0;

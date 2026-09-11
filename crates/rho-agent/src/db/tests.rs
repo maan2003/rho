@@ -19,31 +19,36 @@ fn astra_bindings_round_trip() {
 }
 
 #[test]
-fn python_sol_binding_preserves_role_and_model() {
-    let role = AgentRole::Engineer {
-        intelligence: EngineerIntelligence::Python,
+fn python_suffixed_bindings_fold_into_their_models() {
+    #[derive(Encode)]
+    #[allow(dead_code)]
+    enum LegacySessionBinding {
+        ResponsesSolPython(InferenceProfile),
+        ClaudeFablePython { effort: ClaudeEffort },
+    }
+    let profile = InferenceProfile {
+        effort: ReasoningEffort::Medium,
+        fast_mode: false,
     };
-    let binding = role.session_profile().unwrap();
-    assert_eq!(binding.deep_model(), Some(InferenceModel::Gpt56Sol));
-    assert_eq!(
-        binding.deep_config(),
-        AgentRole::default()
-            .session_profile()
-            .unwrap()
-            .deep_config()
-    );
-    assert!(binding.deep_config().unwrap().code_mode);
-    let mut encoded = bytes::BytesMut::new();
-    senax_encoder::encode_to(&binding, &mut encoded).unwrap();
-    let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
-    assert_eq!(decoded, binding);
-    assert_eq!(decoded.agent_role(), role);
-    let mut encoded = bytes::BytesMut::new();
-    senax_encoder::encode_to(&role, &mut encoded).unwrap();
-    assert_eq!(
-        <AgentRole as senax_encoder::Decoder>::decode(&mut encoded).unwrap(),
-        role
-    );
+    for (legacy, expected) in [
+        (
+            LegacySessionBinding::ResponsesSolPython(profile),
+            SessionBinding::ResponsesSol(profile),
+        ),
+        (
+            LegacySessionBinding::ClaudeFablePython {
+                effort: ClaudeEffort::High,
+            },
+            SessionBinding::ClaudeFable {
+                effort: ClaudeEffort::High,
+            },
+        ),
+    ] {
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
+        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded, expected);
+    }
 }
 
 #[test]
@@ -51,7 +56,6 @@ fn legacy_high_engineer_binding_stays_on_sol() {
     let binding = SessionBinding::ResponsesSol(InferenceProfile {
         effort: ReasoningEffort::Xhigh,
         fast_mode: false,
-        code_mode: true,
     });
     let mut encoded = bytes::BytesMut::new();
     senax_encoder::encode_to(&binding, &mut encoded).unwrap();
@@ -324,7 +328,6 @@ fn agent_role_resolves_opinionated_bindings() {
         SessionBinding::ResponsesLuna(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: true,
-            code_mode: false,
         })
     ));
     assert!(matches!(
@@ -338,7 +341,6 @@ fn agent_role_resolves_opinionated_bindings() {
         profile(EngineerIntelligence::Cheap),
         SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::High,
-            code_mode: true,
             ..
         })
     ));
@@ -356,14 +358,6 @@ fn agent_role_resolves_opinionated_bindings() {
             ..
         })
     ));
-    for intelligence in [
-        EngineerIntelligence::Low,
-        EngineerIntelligence::Cheap,
-        EngineerIntelligence::Medium,
-        EngineerIntelligence::High,
-    ] {
-        assert!(profile(intelligence).deep_config().unwrap().code_mode);
-    }
     assert_eq!(
         profile(EngineerIntelligence::Ultra),
         SessionBinding::ClaudeFable {
@@ -376,27 +370,17 @@ fn agent_role_resolves_opinionated_bindings() {
             effort: ClaudeEffort::Medium
         }
     );
-    let python = profile(EngineerIntelligence::UltraPython);
-    assert_eq!(
-        python,
-        SessionBinding::ClaudeFablePython {
-            effort: ClaudeEffort::High
-        }
-    );
-    assert!(python.claude_python());
-    assert_eq!(python.claude_model(), Some(rho_claude::Model::Fable));
-    assert_eq!(
-        python.agent_role(),
-        AgentRole::Engineer {
-            intelligence: EngineerIntelligence::UltraPython
-        }
-    );
+    for intelligence in [EngineerIntelligence::Ultra, EngineerIntelligence::Alt] {
+        assert!(
+            profile(intelligence).claude_python(),
+            "every Claude engineer works in the Python notebook"
+        );
+    }
     assert!(matches!(
         profile(EngineerIntelligence::Gemini),
         SessionBinding::AntigravityFlashLow(InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: false,
         })
     ));
     assert_eq!(
@@ -412,7 +396,6 @@ fn agent_role_resolves_opinionated_bindings() {
         SessionBinding::AdvisorAstra(InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: true,
         })
     ));
     assert!(matches!(
@@ -436,7 +419,6 @@ fn agent_role_resolves_opinionated_bindings() {
         SessionBinding::AdvisorTerra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
-            code_mode: true,
         })
     ));
 }
