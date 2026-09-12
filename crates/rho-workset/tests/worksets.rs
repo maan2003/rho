@@ -118,26 +118,10 @@ async fn worksets_clone_through_the_store_server() {
         "the first clone's own edits are untouched"
     );
 
-    // A second jj workspace beside the clone, on a new change atop its @.
-    let beside = second_workset.add_workspace(&second, "@").await.unwrap();
-    assert_eq!(beside, second_workset.root().join("project-2"));
-    assert_eq!(
-        std::fs::read_to_string(beside.join("file.txt")).unwrap(),
-        "three\n"
-    );
-    assert_eq!(
-        rho_workset::resolve_repo_root(beside.as_std_path()).unwrap(),
-        second
-    );
-    assert_eq!(
-        second_workset.repos().unwrap(),
-        vec!["project", "project-2"]
-    );
-
     // Diff snapshots read the working copy against its parent.
-    std::fs::write(beside.join("new.txt"), "hello\n").unwrap();
+    std::fs::write(second.join("new.txt"), "hello\n").unwrap();
     let snapshot = second_workset
-        .diff_snapshot(&beside, None, &[])
+        .diff_snapshot(&second, None, &[])
         .await
         .unwrap()
         .expect("first snapshot");
@@ -145,7 +129,7 @@ async fn worksets_clone_through_the_store_server() {
     assert_eq!(snapshot.files[0].path, "new.txt");
     assert!(
         second_workset
-            .diff_snapshot(&beside, Some(&snapshot.commit_id), &[])
+            .diff_snapshot(&second, Some(&snapshot.commit_id), &[])
             .await
             .unwrap()
             .is_none()
@@ -168,7 +152,7 @@ async fn worksets_clone_through_the_store_server() {
     drop(root);
     let root = open_worksets(temp.path(), &jj_bin).await;
     let reopened = root.open_workset(&second_id).await.unwrap();
-    assert_eq!(reopened.repos().unwrap(), vec!["project", "project-2"]);
+    assert_eq!(reopened.repos().unwrap(), vec!["project"]);
     let again = reopened
         .clone_repo(remote_url, Some("again"))
         .await

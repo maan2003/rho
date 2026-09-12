@@ -96,16 +96,6 @@ pub struct AgentTurnReported {
     pub report: crate::db::TurnReport,
 }
 
-/// Where a spawned child works, inside its parent's workset.
-pub struct SpawnWorkdir {
-    /// A directory in the parent's workset, as the parent sees it (absolute,
-    /// or relative to the parent's working directory).
-    pub path: Utf8PathBuf,
-    /// With a revset, the child gets its own jj workspace of the repository
-    /// containing `path`, on a new change atop the revset.
-    pub revset: Option<String>,
-}
-
 impl AgentPool {
     /// Opens the pool over `db`, initializing the agent tables.
     pub async fn new(
@@ -510,15 +500,16 @@ impl AgentPool {
         Ok((agent_id, agent))
     }
 
-    /// Create a child agent for `parent` in the parent's workset and mail it
-    /// its task. Returns once the child has accepted that task. An empty
-    /// `workdirs` puts the child in the parent's working directory.
+    /// Create a child agent for `parent` in the parent's workset, in the
+    /// parent's working directory, and mail it its task. Returns once the
+    /// child has accepted that task. A parent that wants the child elsewhere
+    /// (its own jj workspace or git worktree, say) makes that directory first
+    /// and says so in the prompt.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
         task_name: String,
         prompt: String,
-        workdirs: Vec<SpawnWorkdir>,
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
@@ -528,49 +519,15 @@ impl AgentPool {
         };
         let WorkspaceInfo::Workset {
             workset,
-            cwd: parent_cwd,
+            cwd,
             mode,
             origin,
         } = parent_place
         else {
             anyhow::bail!("this agent predates worksets and cannot spawn children");
         };
-        anyhow::ensure!(
-            workdirs.len() <= 1,
-            "a child works in one directory of your workset: pass at most one workdirs entry"
-        );
         let workset = self.worksets.open_workset(&workset).await?;
         let mode = Mode::from_workset_mode(mode);
-        let cwd = match workdirs.into_iter().next() {
-            None => parent_cwd,
-            Some(entry) => {
-                let requested = if entry.path.is_absolute() {
-                    entry.path
-                } else {
-                    parent_cwd.join(entry.path)
-                };
-                let host = workset.host_path(&requested)?;
-                anyhow::ensure!(
-                    host.is_dir(),
-                    "no such directory in your workset: {requested}"
-                );
-                match entry.revset {
-                    None => requested,
-                    Some(revset) => {
-                        let (root, is_jj) = rho_workset::resolve_workdir_root(host.as_std_path())?;
-                        anyhow::ensure!(
-                            is_jj,
-                            "a revset needs a jj repository, and {requested} is not in one"
-                        );
-                        let added = workset.add_workspace(&root, &revset).await?;
-                        let relative = added
-                            .strip_prefix(workset.root())
-                            .context("new workspace is outside the workset")?;
-                        camino::Utf8Path::new(rho_workset::MOUNT_ROOT).join(relative)
-                    }
-                }
-            }
-        };
         let view = workset.enter(mode, &cwd)?;
         let start = StartPlace::new(view, origin);
         let config = child_role(parent_role, config);

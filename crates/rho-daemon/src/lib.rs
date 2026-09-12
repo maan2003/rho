@@ -1122,30 +1122,16 @@ impl Services {
             anyhow::bail!("Advisors may only message agents");
         }
         match request {
-            McpAgentToolRequest::SpawnEngineer {
-                task_name,
-                prompt,
-                workdirs,
-            } => {
+            McpAgentToolRequest::SpawnEngineer { task_name, prompt } => {
                 if prompt.trim().is_empty() {
                     anyhow::bail!("prompt must not be empty");
                 }
-                let workdirs = rho_agent::multi_agent_tools::parse_spawn_workdirs(
-                    workdirs
-                        .into_iter()
-                        .map(|entry| rho_agent::multi_agent_tools::SpawnWorkdirArgs {
-                            repo: entry.repo,
-                            revset: entry.revset,
-                        })
-                        .collect(),
-                )?;
                 let child_id = self
                     .pool
                     .spawn_child(
                         self_agent_id,
                         task_name.clone(),
                         prompt,
-                        workdirs,
                         AgentRole::default(),
                     )
                     .await?;
@@ -1202,7 +1188,6 @@ impl Services {
                         self_agent_id,
                         "advisor".to_owned(),
                         message,
-                        Vec::new(),
                         AgentRole::Advisor {
                             intelligence: rho_agent::db::AdvisorIntelligence::Medium,
                         },

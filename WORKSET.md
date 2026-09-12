@@ -27,9 +27,10 @@ network. `Worksets::discard_workset` deletes the workset directory;
 stores are shared and never removed.
 
 Several agents can work in one workset: a child agent joins its parent's
-workset, in the parent's directory or in its own jj workspace beside it
-(`Workset::add_workspace`, which the pool runs for a child spawned with a
-revset). Every agent's record is a workset id, a working directory as the
+workset in the parent's directory. A parent that wants a child in a
+checkout of its own makes one itself first — a jj workspace, a git
+worktree, whatever it likes — and tells the child where to work; the
+daemon only ever does the initial clone. Every agent's record is a workset id, a working directory as the
 agent sees it, and a mode; loading
 `AGENTS.md`-style context is a function of that directory (the jj
 workspace containing it), not of a "primary" repository. The daemon runs

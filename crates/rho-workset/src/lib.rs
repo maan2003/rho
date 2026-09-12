@@ -463,48 +463,6 @@ impl Workset {
         Namespace::new(self.clone(), mode, cwd)
     }
 
-    /// Adds a jj workspace of the repository containing `base` (a host
-    /// directory inside the workset), on a new change atop `revset`
-    /// evaluated in `base`'s workspace. Returns the new workspace directory.
-    pub async fn add_workspace(
-        &self,
-        base: &Utf8Path,
-        revset: &str,
-    ) -> anyhow::Result<Utf8PathBuf> {
-        let owner = self.owner()?;
-        anyhow::ensure!(
-            base.starts_with(&self.0.root),
-            "{base} is outside workset {}",
-            self.id()
-        );
-        let (workspace_root, is_jj) = resolve_workdir_root(base.as_std_path())?;
-        anyhow::ensure!(is_jj, "{base} is not inside a jj repository");
-        let repo_root = resolve_repo_root(workspace_root.as_std_path())?;
-        let repo_name = repo_root
-            .file_name()
-            .context("repository root has no name")?
-            .to_owned();
-        let _guard = self.0.operation_lock.lock().await;
-        let (name, target) = (2..1000)
-            .map(|n| format!("{repo_name}-{n}"))
-            .map(|name| {
-                let target = self.0.root.join(&name);
-                (name, target)
-            })
-            .find(|(_, target)| !target.exists())
-            .context("no free workspace name")?;
-        let mut command = owner.command("jj");
-        command
-            .current_dir(base)
-            .args(["workspace", "add", "--name", &name, "-r", revset])
-            .arg(&target);
-        if let Err(error) = run(command, "add jj workspace").await {
-            let _ = std::fs::remove_dir_all(&target);
-            return Err(error);
-        }
-        Ok(target)
-    }
-
     /// Starts a new change atop `revset` in the repository at `checkout`
     /// (a host directory inside the workset).
     pub async fn new_change(&self, checkout: &Utf8Path, revset: &str) -> anyhow::Result<()> {

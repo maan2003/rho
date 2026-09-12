@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use rho_agent::multi_agent_tools;
-use rho_ui_proto::{AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage};
+use rho_ui_proto::{AgentId, ClientMessage, McpAgentToolRequest, ServerMessage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -126,14 +126,6 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
             Ok(McpAgentToolRequest::SpawnEngineer {
                 task_name: args.task_name,
                 prompt: args.prompt,
-                workdirs: args
-                    .workdirs
-                    .into_iter()
-                    .map(|entry| McpSpawnWorkdir {
-                        repo: entry.repo,
-                        revset: entry.revset,
-                    })
-                    .collect(),
             })
         }
         multi_agent_tools::MESSAGE_AGENT_TOOL_NAME => {
@@ -176,8 +168,6 @@ struct ToolCallParams {
 struct SpawnArgs {
     task_name: String,
     prompt: String,
-    #[serde(default)]
-    workdirs: Vec<multi_agent_tools::SpawnWorkdirArgs>,
 }
 
 #[derive(Deserialize)]

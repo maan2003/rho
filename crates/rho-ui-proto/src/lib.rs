@@ -498,12 +498,10 @@ pub enum PrCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum McpAgentToolRequest {
+    /// A child in the spawning agent's workset and working directory.
     SpawnEngineer {
         task_name: String,
         prompt: String,
-        /// The child's working set, primary first; empty forks the spawning
-        /// agent's whole working set.
-        workdirs: Vec<McpSpawnWorkdir>,
     },
     MessageAgent {
         agent_id: String,
@@ -519,14 +517,6 @@ pub enum McpAgentToolRequest {
         advisor_id: String,
         message: String,
     },
-}
-
-/// One spawn `workdirs` entry, passed through as the tool surface received
-/// it; the daemon validates and parses it.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct McpSpawnWorkdir {
-    pub repo: String,
-    pub revset: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

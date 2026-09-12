@@ -12,14 +12,13 @@
 
 use std::sync::Arc;
 
-use camino::Utf8PathBuf;
 use rho_core::{ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
-use crate::pool::{AgentPool, SpawnWorkdir};
+use crate::pool::AgentPool;
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
 /// pool for spawning, mail routing, and id resolution. `Agent::create` and
@@ -118,7 +117,10 @@ fn spawn_engineer_spec() -> ToolSpec {
                       work; otherwise continue locally. The prompt must be self-contained and \
                       task-focused: the child already receives repo guidance, skills, tools, and \
                       workspace instructions, so do not restate generic process rules. The \
-                      child's turn results arrive later as agent mail."
+                      child starts in your working directory and shares it with you; for \
+                      concurrent edits, make it a checkout of its own first (a jj workspace \
+                      or git worktree in your workset) and tell it where to work in the \
+                      prompt. The child's turn results arrive later as agent mail."
             .to_owned(),
         input_schema: json!({
             "type": "object",
@@ -133,33 +135,6 @@ fn spawn_engineer_spec() -> ToolSpec {
                     "type": "string",
                     "description": "Complete, self-contained task for the sub-agent."
                 },
-                "workdirs": {
-                    "type": "array",
-                    "maxItems": 1,
-                    "description": "Where the child works: at most one entry. Omit for the \
-                                    default, your working directory, which the child then \
-                                    shares with you. Give a directory to start it elsewhere \
-                                    in your workset, and a revset to give it its own jj \
-                                    workspace of that repository (safe for concurrent edits).",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["repo"],
-                        "properties": {
-                            "repo": {
-                                "type": "string",
-                                "description": "A directory in your workset, absolute or \
-                                                relative to your working directory."
-                            },
-                            "revset": {
-                                "type": "string",
-                                "description": "jj revset the child's own workspace starts \
-                                                from, for example `@`. Without it the child \
-                                                works in the directory as it is."
-                            }
-                        }
-                    }
-                }
             }
         }),
         format: None,
@@ -338,7 +313,6 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
             tools.self_id,
             "advisor".to_owned(),
             args.message,
-            Vec::new(),
             AgentRole::Advisor {
                 intelligence: advisor_intelligence,
             },
@@ -363,33 +337,6 @@ fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligen
 struct SpawnArgs {
     task_name: String,
     prompt: String,
-    #[serde(default)]
-    workdirs: Vec<SpawnWorkdirArgs>,
-}
-
-/// One `workdirs` entry as the spawn tools accept it; shared with the MCP
-/// agent-tool surface so both parse identically.
-#[derive(Deserialize)]
-pub struct SpawnWorkdirArgs {
-    pub repo: String,
-    pub revset: Option<String>,
-}
-
-/// Parses tool-surface workdir entries into pool spawn entries.
-pub fn parse_spawn_workdirs(entries: Vec<SpawnWorkdirArgs>) -> anyhow::Result<Vec<SpawnWorkdir>> {
-    entries
-        .into_iter()
-        .map(|entry| {
-            anyhow::ensure!(
-                !entry.repo.trim().is_empty(),
-                "workdirs.repo must not be empty"
-            );
-            Ok(SpawnWorkdir {
-                path: Utf8PathBuf::from(entry.repo),
-                revset: entry.revset,
-            })
-        })
-        .collect()
 }
 
 pub fn parse_spawn_role(role: &str) -> anyhow::Result<AgentRole> {
@@ -402,12 +349,11 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
     if args.prompt.trim().is_empty() {
         anyhow::bail!("prompt must not be empty");
     }
-    let workdirs = parse_spawn_workdirs(args.workdirs)?;
     let task_name = args.task_name.clone();
     let config = AgentRole::default();
     let pool = tools.pool()?;
     let child_id = pool
-        .spawn_child(tools.self_id, args.task_name, args.prompt, workdirs, config)
+        .spawn_child(tools.self_id, args.task_name, args.prompt, config)
         .await?;
     let child_record = pool.db().read().get_agent(child_id);
     let workspace_note = format!(" It works in {}.", child_record.primary_workdir().repo());

@@ -109,8 +109,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
 8. **Every checkout is a colocated git repository.** The main clone
    already is: `jj git clone` colocates by default and the clone store
    supplies objects through git alternates. Secondary jj workspaces
-   (`jj workspace add`, which Rho runs for a child agent) must be
-   colocated too, as git worktrees of the main clone: a `.git` file
+   (`jj workspace add`, which agents run for themselves when they want a
+   child in its own checkout) must be colocated too, as git worktrees of the main clone: a `.git` file
    pointing at `<main>/.git/worktrees/<name>`, with `HEAD`, `commondir`
    and `gitdir` written there. Rho's jj fork already does exactly this
    for managed workspaces (`create_git_worktree` in
@@ -118,9 +118,9 @@ security boundary (see `WORKSET.md`); it is a distribution.
    --no-checkout` followed by `git read-tree HEAD`), which is what the
    previous Rho architecture used. The redesign switched
    `Workset::add_workspace` to plain `jj workspace add`, which does not
-   colocate, so that worktree step has to move into `jj workspace add`
-   itself, applied whenever the main workspace is colocated. Then an
-   agent's own `jj workspace add` gets it too. The rest is already in
+   colocate, and the daemon no longer adds workspaces at all: agents
+   do. So that worktree step has to move into `jj workspace add`
+   itself, applied whenever the main workspace is colocated. The rest is already in
    place: jj recognises such a worktree as colocated and syncs both
    ways per workspace, exactly as in the main workspace. Verified by
    hand on a store-backed clone: `jj new` moves the worktree's git HEAD
