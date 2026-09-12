@@ -712,11 +712,9 @@ behind you; what is there when you start is the starting state you were given.
     }
     if place.git {
         out.push_str(
-            "This repository is a git checkout with `origin` as its remote. Commit a change once \
-             it is complete (`git commit`), and fold a follow-up into the commit you just made \
-             with `git commit --amend`. Work still in progress can stay uncommitted in the \
-             working tree. Other checkouts of the repository have their own branches; leave \
-             commits you did not create alone unless the task is to work on them.\n\n",
+            "This repository is a git checkout; `origin` is the real remote. Other checkouts \
+             of it in the workset have their own branches: leave commits you did not create \
+             alone unless the task is to work on them.\n\n",
         );
     }
     if place.spawned {

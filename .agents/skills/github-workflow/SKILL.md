@@ -5,15 +5,15 @@ description: Deliver code through GitHub pull requests, including pushes, review
 
 # GitHub workflow
 
-Use git for repository operations and `rho pr` for GitHub operations. Carry
-this workflow through from completed local changes to a pull request with a
-terminal CI result; creating the pull request alone is not completion.
+Use `rho pr` for GitHub operations. Carry this workflow through from
+completed local changes to a pull request with a terminal CI result; creating
+the pull request alone is not completion.
 
 ## Model interface to GitHub
 
-Use normal `git` commands for local history and pushes. An Octo remote
-may route those pushes through `git-remote-octo` internally, but never invoke
-the helper or Octo API directly. Token-backed pushes are confined to
+Pushes go through `origin` as usual. An Octo remote may route them through
+`git-remote-octo` internally, but never invoke the helper or Octo API
+directly. Token-backed pushes are confined to
 `refs/heads/rho/*`; other refs require explicit local SSH approval and are not
 part of the normal agent workflow.
 
@@ -53,9 +53,9 @@ milestones to their parent, and the PM relays them to the user-facing surface.
 
 ## Submit the change
 
-1. Verify the implementation and inspect `git status`, `git diff`, and `git log`.
-2. Identify the intended change. Do not push incidental working-copy changes.
-3. Check whether the work already has a pull request. If it does, update its
+1. Verify the implementation and identify the intended change. Do not push
+   incidental working-tree changes.
+2. Check whether the work already has a pull request. If it does, update its
    existing branch rather than creating a duplicate PR. Otherwise push it below
    the unattended agent branch namespace:
 
@@ -63,7 +63,7 @@ milestones to their parent, and the PM relays them to the user-facing surface.
 git push origin HEAD:refs/heads/rho/CHANGE_NAME
 ```
 
-4. When no PR exists yet, create it:
+3. When no PR exists yet, create it:
 
 ```bash
 rho pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
