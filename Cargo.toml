@@ -22,6 +22,9 @@ members = [
   "crates/rho-fake-model",
   "crates/rho-fake-slack",
   "crates/rho-files",
+  "crates/rho-git/client",
+  "crates/rho-git/proto",
+  "crates/rho-git/server",
   "crates/rho-gui",
   "crates/rho-hosts",
   "crates/rho-image",
@@ -130,6 +133,9 @@ rho-desk = { path = "crates/rho-desk" }
 rho-fake-model = { path = "crates/rho-fake-model" }
 rho-fake-slack = { path = "crates/rho-fake-slack" }
 rho-files = { path = "crates/rho-files" }
+rho-git-client = { path = "crates/rho-git/client" }
+rho-git-proto = { path = "crates/rho-git/proto" }
+rho-git-server = { path = "crates/rho-git/server" }
 rho-image = { path = "crates/rho-image" }
 rho-inference = { path = "crates/rho-inference" }
 rho-iroh-auth = { path = "crates/rho-iroh-auth" }

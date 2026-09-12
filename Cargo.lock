@@ -14467,6 +14467,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-git-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rho-git-proto",
+ "rho-git-server",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "rho-git-proto"
+version = "0.1.0"
+
+[[package]]
+name = "rho-git-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rho-git-proto",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rho-gui"
 version = "0.1.0"
 dependencies = [
