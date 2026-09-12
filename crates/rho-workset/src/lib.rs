@@ -515,7 +515,7 @@ impl Workset {
 
     /// A live diff of the checkout containing `checkout` against its base.
     ///
-    /// TODO: the jj-based reader is gone; reimplement this over git.
+    /// TODO: not ported to git yet.
     pub async fn diff_snapshot(
         &self,
         checkout: &Utf8Path,
@@ -529,7 +529,7 @@ impl Workset {
 
     /// Base-side contents for paths of an earlier diff snapshot.
     ///
-    /// TODO: the jj-based reader is gone; reimplement this over git.
+    /// TODO: not ported to git yet.
     pub async fn diff_base_contents(
         &self,
         checkout: &Utf8Path,

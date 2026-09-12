@@ -5,13 +5,13 @@ description: Deliver code through GitHub pull requests, including pushes, review
 
 # GitHub workflow
 
-Use Jujutsu for repository operations and `rho pr` for GitHub operations. Carry
+Use git for repository operations and `rho pr` for GitHub operations. Carry
 this workflow through from completed local changes to a pull request with a
 terminal CI result; creating the pull request alone is not completion.
 
 ## Model interface to GitHub
 
-Use normal `jj` or `git` commands for local history and pushes. An Octo remote
+Use normal `git` commands for local history and pushes. An Octo remote
 may route those pushes through `git-remote-octo` internally, but never invoke
 the helper or Octo API directly. Token-backed pushes are confined to
 `refs/heads/rho/*`; other refs require explicit local SSH approval and are not
@@ -53,14 +53,14 @@ milestones to their parent, and the PM relays them to the user-facing surface.
 
 ## Submit the change
 
-1. Verify the implementation and inspect `jj status`, `jj diff`, and `jj log`.
+1. Verify the implementation and inspect `git status`, `git diff`, and `git log`.
 2. Identify the intended change. Do not push incidental working-copy changes.
 3. Check whether the work already has a pull request. If it does, update its
    existing branch rather than creating a duplicate PR. Otherwise push it below
    the unattended agent branch namespace:
 
 ```bash
-jj git push --remote origin --named rho/CHANGE_NAME=REVSET
+git push origin HEAD:refs/heads/rho/CHANGE_NAME
 ```
 
 4. When no PR exists yet, create it:
@@ -69,7 +69,7 @@ jj git push --remote origin --named rho/CHANGE_NAME=REVSET
 rho pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
 ```
 
-For a stacked pull request, pass its parent bookmark with `--base`. Never push a
+For a stacked pull request, pass its parent branch with `--base`. Never push a
 normal branch or tag through Octo.
 
 The default bot allowlist contains the Codex review connector. To trust another

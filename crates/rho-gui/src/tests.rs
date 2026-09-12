@@ -10572,7 +10572,7 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
                 workspace,
                 HostId::default(),
                 ConnEvent::ServerError(
-                    "create managed jj workspace: no such repository".to_owned(),
+                    "create workspace: no such repository".to_owned(),
                 ),
                 window,
                 cx,
