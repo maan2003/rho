@@ -579,12 +579,14 @@ pub struct FailedInferenceResponse {
 /// process the agent runs.
 pub type View = rho_workset::Namespace;
 
-/// Where a new agent starts: a view of a workset, and the record of it.
-/// `owned_workset` names a workset this creation made, which the pool
-/// discards if the creation fails.
+/// Where a new agent starts: its view, the workspace record describing
+/// it, and the workset this creation made for it, which the pool discards
+/// if the creation fails. The view may still be being placed (cloned and
+/// entered) when the agent is created: creation returns at once and the
+/// agent's first command waits for the placing.
 #[derive(Clone)]
 pub struct StartPlace {
-    pub view: Arc<View>,
+    pub(crate) view: Arc<lazy::Lazy<Arc<View>>>,
     pub info: WorkspaceInfo,
     pub owned_workset: Option<String>,
 }
@@ -600,15 +602,32 @@ impl StartPlace {
             origin,
         };
         Self {
-            view,
+            view: Arc::new(lazy::Lazy::ready(view)),
             info,
             owned_workset: None,
         }
     }
 
-    /// Marks the view's workset as made by this creation.
+    /// A start whose view `place` makes on first use (and again on the
+    /// next use if it failed): the workset named by `info` exists, the
+    /// checkout in it may not yet.
+    pub fn pending<F, Fut>(info: WorkspaceInfo, place: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<View>>> + Send + 'static,
+    {
+        Self {
+            view: Arc::new(lazy::Lazy::new(place)),
+            info,
+            owned_workset: None,
+        }
+    }
+
+    /// Marks the workset as made by this creation.
     pub fn owning_workset(mut self) -> Self {
-        self.owned_workset = Some(self.view.workset().id().to_owned());
+        if let WorkspaceInfo::Workset { workset, .. } = &self.info {
+            self.owned_workset = Some(workset.clone());
+        }
         self
     }
 }

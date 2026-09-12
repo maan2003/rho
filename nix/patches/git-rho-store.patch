@@ -1,0 +1,209 @@
+diff -Nur a/builtin/clone.c b/builtin/clone.c
+--- a/builtin/clone.c	2026-09-12 16:38:50.272575873 +0000
++++ b/builtin/clone.c	2026-09-12 16:38:50.281575945 +0000
+@@ -23,6 +23,7 @@
+ #include "lockfile.h"
+ #include "parse-options.h"
+ #include "refs.h"
++#include "rho-store.h"
+ #include "refspec.h"
+ #include "object-file.h"
+ #include "odb.h"
+@@ -876,6 +877,7 @@
+ 	const char *repo_name, *repo, *work_tree, *git_dir;
+ 	char *repo_to_free = NULL;
+ 	char *path = NULL, *dir, *display_repo = NULL;
++	char *mirror = NULL;
+ 	int dest_exists, real_dest_exists = 0;
+ 	const struct ref *refs, *remote_head;
+ 	struct ref *remote_head_points_at = NULL;
+@@ -1342,7 +1344,13 @@
+ 	if (option_local > 0 && !is_local)
+ 		warning(_("--local is ignored"));
+ 
+-	transport = transport_get(remote, path ? path : remote->url.v[0]);
++	if (!path) {
++		mirror = rho_store_mirror(remote->url.v[0]);
++		if (mirror)
++			rho_store_borrow(the_repository->objects, mirror);
++	}
++	transport = transport_get(remote, mirror ? mirror :
++				  path ? path : remote->url.v[0]);
+ 	transport_set_verbosity(transport, option_verbosity, option_progress);
+ 	transport->family = family;
+ 	transport->cloning = 1;
+diff -Nur a/builtin/fetch.c b/builtin/fetch.c
+--- a/builtin/fetch.c	2026-09-12 16:38:50.268575842 +0000
++++ b/builtin/fetch.c	2026-09-12 16:38:50.280575937 +0000
+@@ -12,6 +12,7 @@
+ #include "environment.h"
+ #include "hex.h"
+ #include "refs.h"
++#include "rho-store.h"
+ #include "refspec.h"
+ #include "object-name.h"
+ #include "odb.h"
+@@ -1575,8 +1576,11 @@
+ 					   struct list_objects_filter_options *filter_options)
+ {
+ 	struct transport *transport;
++	char *mirror = rho_store_mirror(remote->url.nr ? remote->url.v[0] : NULL);
+ 
+-	transport = transport_get(remote, NULL);
++	if (mirror)
++		rho_store_borrow(the_repository->objects, mirror);
++	transport = transport_get(remote, mirror);
+ 	transport_set_verbosity(transport, verbosity, progress);
+ 	transport->family = family;
+ 	if (upload_pack)
+diff -Nur a/Makefile b/Makefile
+--- a/Makefile	2026-09-12 16:38:50.258575762 +0000
++++ b/Makefile	2026-09-12 16:38:50.278575921 +0000
+@@ -1300,6 +1300,7 @@
+ LIB_OBJS += reset.o
+ LIB_OBJS += resolve-undo.o
+ LIB_OBJS += revision.o
++LIB_OBJS += rho-store.o
+ LIB_OBJS += run-command.o
+ LIB_OBJS += send-pack.o
+ LIB_OBJS += sequencer.o
+diff -Nur a/rho-store.c b/rho-store.c
+--- a/rho-store.c	1970-01-01 00:00:00.000000000 +0000
++++ b/rho-store.c	2026-09-12 16:38:50.276575905 +0000
+@@ -0,0 +1,105 @@
++#include "git-compat-util.h"
++#include "rho-store.h"
++#include "gettext.h"
++#include "odb.h"
++#include "odb/source.h"
++#include "strbuf.h"
++#include "wrapper.h"
++#include <sys/socket.h>
++#include <sys/un.h>
++
++/* Anything git would read without a network: paths and file:// URLs. */
++static int rho_store_is_local(const char *url)
++{
++	if (!url || !*url)
++		return 1;
++	if (url[0] == '/' || url[0] == '.' || url[0] == '~')
++		return 1;
++	if (starts_with(url, "file://"))
++		return 1;
++	/* Neither a scheme nor an scp-style host: a relative path. */
++	if (!strstr(url, "://") && !strchr(url, ':'))
++		return 1;
++	return 0;
++}
++
++char *rho_store_mirror(const char *url)
++{
++	const char *socket_path = getenv("RHO_GIT_STORE_SOCKET");
++	struct sockaddr_un addr;
++	struct strbuf line = STRBUF_INIT;
++	const char *rest;
++	char *mirror = NULL;
++	int fd;
++
++	if (!socket_path || !*socket_path || rho_store_is_local(url))
++		return NULL;
++	if (strlen(socket_path) >= sizeof(addr.sun_path)) {
++		warning(_("rho git store: socket path too long: %s"), socket_path);
++		return NULL;
++	}
++	fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	if (fd < 0) {
++		warning_errno(_("rho git store: cannot make a socket"));
++		return NULL;
++	}
++	memset(&addr, 0, sizeof(addr));
++	addr.sun_family = AF_UNIX;
++	memcpy(addr.sun_path, socket_path, strlen(socket_path) + 1);
++	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++		warning_errno(_("rho git store: cannot connect to %s; using the network"),
++			      socket_path);
++		close(fd);
++		return NULL;
++	}
++	strbuf_addf(&line, "refresh %s\n", url);
++	if (write_in_full(fd, line.buf, line.len) < 0) {
++		warning_errno(_("rho git store: cannot send request; using the network"));
++		close(fd);
++		strbuf_release(&line);
++		return NULL;
++	}
++	shutdown(fd, SHUT_WR);
++	strbuf_reset(&line);
++	if (strbuf_read(&line, fd, 0) < 0) {
++		warning_errno(_("rho git store: cannot read reply; using the network"));
++		close(fd);
++		strbuf_release(&line);
++		return NULL;
++	}
++	close(fd);
++	strbuf_trim_trailing_newline(&line);
++	if (skip_prefix(line.buf, "ok ", &rest) && *rest)
++		mirror = xstrdup(rest);
++	else if (skip_prefix(line.buf, "error ", &rest))
++		warning(_("rho git store: %s; using the network"), rest);
++	else
++		warning(_("rho git store: unexpected reply '%s'; using the network"),
++			line.buf);
++	strbuf_release(&line);
++	return mirror;
++}
++
++void rho_store_borrow(struct object_database *odb, const char *mirror)
++{
++	struct strbuf objects = STRBUF_INIT;
++	struct strbuf path = STRBUF_INIT;
++	struct strbuf listed = STRBUF_INIT;
++	int found = 0;
++
++	strbuf_addf(&objects, "%s/objects", mirror);
++	strbuf_addf(&path, "%s/info/alternates", odb->sources->path);
++	if (strbuf_read_file(&listed, path.buf, 0) >= 0) {
++		struct string_list lines = STRING_LIST_INIT_NODUP;
++		string_list_split_in_place(&lines, listed.buf, "\n", -1);
++		for (size_t i = 0; i < lines.nr; i++)
++			if (!strcmp(lines.items[i].string, objects.buf))
++				found = 1;
++		string_list_clear(&lines, 0);
++	}
++	if (!found)
++		odb_add_to_alternates_file(odb, objects.buf);
++	strbuf_release(&objects);
++	strbuf_release(&path);
++	strbuf_release(&listed);
++}
+diff -Nur a/rho-store.h b/rho-store.h
+--- a/rho-store.h	1970-01-01 00:00:00.000000000 +0000
++++ b/rho-store.h	2026-09-12 16:38:50.275575897 +0000
+@@ -0,0 +1,27 @@
++#ifndef RHO_STORE_H
++#define RHO_STORE_H
++
++/*
++ * Rho's mirror store (rho's CLONES.md). When RHO_GIT_STORE_SOCKET names the
++ * keeper's unix socket, a fetch or clone of a remote URL asks the keeper
++ * for a fetched local mirror of that URL, borrows the mirror's objects
++ * through the repository's alternates, and reads the refs and objects from
++ * the mirror instead of the network. Push is untouched: it never comes
++ * through here. Without the variable, or when the keeper cannot serve the
++ * URL, git behaves exactly as unpatched (after a warning in the latter
++ * case).
++ */
++
++struct object_database;
++
++/*
++ * The mirror's git directory for `url`, or NULL when there is no store,
++ * `url` is a local path, or the keeper declined. The string lives as long
++ * as the process: transports keep the pointer.
++ */
++char *rho_store_mirror(const char *url);
++
++/* Adds `mirror`'s objects to `odb`'s alternates unless already listed. */
++void rho_store_borrow(struct object_database *odb, const char *mirror);
++
++#endif /* RHO_STORE_H */

@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rho_workset::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
@@ -23,11 +24,25 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// Runs the workset root's `git` wrapper in `dir` with the store wired in
-/// exactly as for an agent.
+/// A `source` checkout with one commit on `main`, cloned bare to
+/// `remote.git`. Returns `(source, remote)`.
+pub fn setup_remote(temp: &Path) -> (PathBuf, PathBuf) {
+    let source = temp.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-q", "-b", "main"]);
+    std::fs::write(source.join("file.txt"), "one\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "one"]);
+    let remote = temp.join("remote.git");
+    git(temp, &["clone", "-q", "--bare", "source", "remote.git"]);
+    (source, remote)
+}
+
+/// Runs Rho's git (`store_bin`) in `dir` with the store wired in exactly
+/// as for an agent.
 pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
-    let wrapper = root.store_bin().expect("wrapper installed").join("git");
-    let mut command = root.command(wrapper.as_str());
+    let git = root.store_bin().expect("patched git known").join("git");
+    let mut command = root.command(git.as_str());
     command.current_dir(dir).args(args);
     let output = command.output().await.unwrap();
     assert!(
@@ -38,89 +53,31 @@ pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// Builds the `rho-git` wrapper and returns its path.
-pub fn wrapper_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("RHO_GIT_WRAPPER") {
-        return path.into();
-    }
-    let output = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "rho-git-client",
-            "--bin",
-            "rho-git",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "build rho-git: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .find_map(|message| {
-            if message.get("reason")?.as_str()? == "compiler-artifact"
-                && message.get("target")?.get("name")?.as_str()? == "rho-git"
-            {
-                Some(PathBuf::from(message.get("executable")?.as_str()?))
-            } else {
-                None
-            }
-        })
-        .expect("cargo did not report the rho-git executable")
+/// Whether `RHO_GIT` names Rho's patched git; tests of the agent's git
+/// skip their store assertions without it.
+pub fn patched_git_known() -> bool {
+    std::env::var_os("RHO_GIT").is_some_and(|path| Path::new(&path).is_file())
 }
 
-/// A source repository with one commit (`file.txt` = "one") and a bare
-/// clone of it acting as the remote. Returns `(source, remote)`.
-pub fn setup_remote(temp: &Path) -> (PathBuf, PathBuf) {
-    let source = temp.join("source");
-    let remote = temp.join("remote.git");
-    std::fs::create_dir(&source).unwrap();
-    git(&source, &["init", "-b", "main"]);
-    std::fs::write(source.join("file.txt"), "one\n").unwrap();
-    git(&source, &["add", "."]);
-    git(&source, &["commit", "-m", "initial"]);
-    git(
-        temp,
-        &[
-            "clone",
-            "--bare",
-            source.to_str().unwrap(),
-            remote.to_str().unwrap(),
-        ],
-    );
-    (source, remote)
-}
-
+/// The user environment the tests hand the daemon: the process's, without
+/// the store variables a surrounding view may have set.
 pub fn environment() -> UserEnvironment {
     UserEnvironment::new(
         std::env::vars_os()
-            .filter(|(name, _)| name != rho_workset::SOCKET_ENV && name != rho_workset::GIT_ENV)
+            .filter(|(name, _)| name != "RHO_GIT_STORE_SOCKET")
             .collect(),
     )
 }
 
-/// Opens a state root under `temp` with a keeper that never debounces, so
-/// every clone sees the remote's current state. `wrapper` is installed as
-/// the root's `git`.
-pub async fn open_worksets(temp: &Path, wrapper: &Path) -> Arc<Worksets> {
-    // SAFETY: tests using this run on one thread when they call it (a
-    // current-thread runtime, or main before the runtime starts).
-    unsafe { std::env::set_var("RHO_GIT_WRAPPER", wrapper) };
+/// A worksets root at `temp/root` with the keeper running, fetching on
+/// every request.
+pub async fn open_worksets(temp: &Path) -> Arc<Worksets> {
     Worksets::open(
         temp.join("root"),
         environment(),
         PathOverrides::default(),
         StoreService::Serve(StoreRefresh {
-            interval: Duration::from_secs(3600),
             debounce: Duration::ZERO,
-            ..StoreRefresh::default()
         }),
     )
     .await
@@ -137,4 +94,55 @@ pub fn only_store(temp: &Path) -> PathBuf {
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 1, "{entries:?}");
     entries.pop().unwrap()
+}
+
+/// A `git daemon` serving every repository under `base` over `git://`,
+/// pushes included, so URLs are remote ones and the store is consulted:
+/// the patched git leaves local paths alone.
+pub struct GitDaemon {
+    child: Child,
+    pub port: u16,
+}
+
+impl GitDaemon {
+    pub fn start(base: &Path) -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", base.display()),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "git daemon did not come up");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { child, port }
+    }
+
+    /// The URL of `<base>/<name>`.
+    pub fn url(&self, name: &str) -> String {
+        format!("git://127.0.0.1:{}/{name}", self.port)
+    }
+}
+
+impl Drop for GitDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

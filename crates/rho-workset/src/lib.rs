@@ -6,9 +6,9 @@
 //! `git clone`, which is instant because every clone is born from the
 //! daemon's mirror store (`CLONES.md`). The store root is owned by the
 //! keeper (`rho-git-server`) running inside the daemon; the `git` agents
-//! see is the store's client (`rho-git`), and the daemon's own clones go
-//! through the same keeper in-process. Nothing but the keeper writes a
-//! mirror.
+//! see is Rho's patched git, which asks the keeper itself on every fetch
+//! and clone, and the daemon's own clones go through the same keeper
+//! in-process. Nothing but the keeper writes a mirror.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -26,7 +26,7 @@ pub mod layout;
 
 pub use layout::*;
 pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
-pub use rho_git_proto::{GIT_ENV, SOCKET_ENV};
+pub use rho_git_proto::{GIT_ENV, SOCKET_ENV, repo_name};
 pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
     WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
@@ -125,8 +125,8 @@ pub struct Worksets {
     adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
 }
 
-/// The running keeper: its socket, the real git it and the wrapper run,
-/// and the directory holding the `git` wrapper agents see.
+/// The running keeper: its socket, the git it and the daemon's clones run,
+/// and the directory of Rho's patched git, which agents see as `git`.
 #[derive(Debug)]
 struct StoreHandle {
     keeper: Arc<MirrorStore>,
@@ -210,25 +210,18 @@ impl Worksets {
         self.store.as_ref().map(|store| store.socket.clone())
     }
 
-    /// The directory holding the `git` wrapper, when the keeper runs and
-    /// the wrapper was found; agents get it first on their PATH.
+    /// The directory of Rho's patched git (`RHO_GIT`), when the keeper runs
+    /// and the build knows one; agents get it first on their PATH.
     pub fn store_bin(&self) -> Option<Utf8PathBuf> {
         self.store.as_ref().and_then(|store| store.bin.clone())
     }
 
-    /// Environment that points the `git` wrapper at the keeper and at the
-    /// real git.
+    /// Environment that points the agent's git at the keeper.
     pub fn store_environment(&self) -> Vec<(OsString, OsString)> {
-        let Some(store) = &self.store else {
-            return Vec::new();
-        };
-        let mut environment = vec![(SOCKET_ENV.into(), store.socket.clone().into_os_string())];
-        // Only a /nix/store git exists in the view; elsewhere the wrapper
-        // finds git on its PATH.
-        if store.git.starts_with("/nix/store") {
-            environment.push((GIT_ENV.into(), store.git.clone().into_os_string()));
+        match &self.store {
+            Some(store) => vec![(SOCKET_ENV.into(), store.socket.clone().into_os_string())],
+            None => Vec::new(),
         }
-        environment
     }
 
     /// Adopts an existing host directory as a workset for the lifetime of
@@ -353,7 +346,8 @@ fn base_command(
 }
 
 /// The environment the keeper runs git with: the user's, with the PATH
-/// overrides applied.
+/// overrides applied and no store socket, so a patched git never asks the
+/// keeper for the mirror it is fetching.
 fn keeper_environment(
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
@@ -361,6 +355,7 @@ fn keeper_environment(
     environment
         .0
         .iter()
+        .filter(|(name, _)| name != SOCKET_ENV)
         .map(|(name, value)| {
             if name == "PATH" {
                 (name.clone(), path_overrides.add_to(value))
@@ -371,18 +366,19 @@ fn keeper_environment(
         .collect()
 }
 
-/// Starts the keeper: installs the wrapper, binds the socket, serves it and
-/// keeps every mirror fresh in the background.
+/// Starts the keeper: binds the socket and serves it.
 fn start_store(
     root: &Utf8Path,
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
     refresh: StoreRefresh,
 ) -> anyhow::Result<StoreHandle> {
-    let bin = root.join("bin");
-    let wrapper = bin.join("git");
-    let git = real_git(environment, path_overrides, wrapper.as_std_path())?;
-    let bin = install_wrapper(&bin)?;
+    let agent_git = agent_git();
+    let git = real_git(environment, path_overrides, agent_git.as_deref())?;
+    let bin = agent_git
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|dir| Utf8PathBuf::from_path_buf(dir.to_owned()).ok());
     let keeper = MirrorStore::new(
         root.join("stores").into_std_path_buf(),
         git.clone(),
@@ -400,61 +396,57 @@ fn start_store(
             }
         }
     });
-    let refresh_loop = keeper.spawn_refresh_loop();
     Ok(StoreHandle {
         keeper,
         socket,
         git,
         bin,
-        tasks: vec![serve, refresh_loop],
+        tasks: vec![serve],
     })
 }
 
-/// The real git: the first on the user's PATH (overrides applied) that is
-/// not the wrapper, or on the daemon's own PATH, canonicalized so a
-/// `/nix/store` git is named as such.
+/// Rho's patched git for agents: `RHO_GIT` in the environment, else the
+/// one this build was made with. A build without one warns and leaves
+/// agents the plain git on their PATH, which never consults the store.
+fn agent_git() -> Option<PathBuf> {
+    let configured = std::env::var_os(GIT_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| option_env!("RHO_GIT").map(PathBuf::from));
+    match configured {
+        Some(path) if path.is_file() => Some(path),
+        Some(path) => {
+            eprintln!(
+                "git store: {GIT_ENV}={} is not a file; agents get plain git",
+                path.display()
+            );
+            None
+        }
+        None => {
+            eprintln!("git store: {GIT_ENV} is not set; agents get plain git and no mirrors");
+            None
+        }
+    }
+}
+
+/// The git the keeper fetches with and the daemon clones with: the first
+/// on the user's PATH (overrides applied), else on the daemon's own PATH,
+/// else the patched git, canonicalized so a `/nix/store` git is named as
+/// such.
 fn real_git(
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
-    wrapper: &Path,
+    fallback: Option<&Path>,
 ) -> anyhow::Result<PathBuf> {
     let user_path = environment
         .get("PATH")
         .map(|path| path_overrides.add_to(path));
-    let git = rho_git_client::Git::find_on_path(user_path.as_deref(), Some(wrapper))
-        .or_else(|| rho_git_client::Git::find_on_path(None, Some(wrapper)))
+    let git = rho_git_client::Git::find_on_path(user_path.as_deref())
+        .or_else(|| rho_git_client::Git::find_on_path(None))
+        .map(|git| git.executable().to_owned())
+        .or_else(|| fallback.map(Path::to_owned))
         .context("git is not on PATH; the mirror store needs it")?;
-    let executable = git.executable();
-    Ok(executable
-        .canonicalize()
-        .unwrap_or_else(|_| executable.to_owned()))
-}
-
-/// Installs a private copy of the `git` wrapper (`rho-git`) as `<bin>/git`.
-/// The wrapper comes from `RHO_GIT_WRAPPER` or sits beside this executable;
-/// a build without one gets a warning and plain git.
-fn install_wrapper(bin: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
-    let source = match std::env::var_os("RHO_GIT_WRAPPER") {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => std::env::current_exe()
-            .context("locate own executable")?
-            .with_file_name("rho-git"),
-    };
-    if !source.is_file() {
-        eprintln!(
-            "git store: wrapper not found at {}; agents get plain git (set RHO_GIT_WRAPPER)",
-            source.display()
-        );
-        return Ok(None);
-    }
-    std::fs::create_dir_all(bin).with_context(|| format!("create {bin}"))?;
-    let staged = bin.join(".git.tmp");
-    std::fs::copy(&source, &staged)
-        .with_context(|| format!("copy {} to {staged}", source.display()))?;
-    // A copy, renamed into place: agents mid-exec keep the old inode and the
-    // bind mount of `bin` sees the new file at once.
-    std::fs::rename(&staged, bin.join("git")).with_context(|| format!("install {bin}/git"))?;
-    Ok(Some(bin.to_owned()))
+    Ok(git.canonicalize().unwrap_or(git))
 }
 
 /// A handle to one workset's host-frame `src` directory.

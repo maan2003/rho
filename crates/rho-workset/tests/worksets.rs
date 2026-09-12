@@ -1,18 +1,23 @@
 use camino::Utf8Path;
 
 mod common;
-use common::{git, only_store, open_worksets, setup_remote, store_git, wrapper_binary};
+use common::{
+    GitDaemon, git, only_store, open_worksets, patched_git_known, setup_remote, store_git,
+};
 
 #[tokio::test]
 async fn worksets_clone_through_the_mirror_store() {
-    let wrapper = wrapper_binary();
     let temp = tempfile::tempdir().unwrap();
     let (source, remote) = setup_remote(temp.path());
-    let root = open_worksets(temp.path(), &wrapper).await;
+    let daemon = GitDaemon::start(temp.path());
+    let root = open_worksets(temp.path()).await;
     let socket = root.store_socket().expect("keeper running");
     assert!(socket.exists());
-    assert!(root.store_bin().unwrap().join("git").is_file());
-    let remote_url = remote.to_str().unwrap();
+    if patched_git_known() {
+        assert!(root.store_bin().unwrap().join("git").is_file());
+    }
+    let remote_url = daemon.url("remote.git");
+    let remote_url = remote_url.as_str();
 
     // The first clone initializes the mirror and is born on the default
     // branch, borrowing the mirror's objects.
@@ -79,11 +84,11 @@ async fn worksets_clone_through_the_mirror_store() {
     );
 
     // The remote moves on: a new clone in another workset is born on the
-    // new commit, and the old clone fetches it through the wrapper without
-    // a new pack of its own.
+    // new commit, and the old clone fetches it through the store (with
+    // Rho's git) without a new pack of its own.
     std::fs::write(source.join("file.txt"), "three\n").unwrap();
     git(&source, &["commit", "-am", "second"]);
-    git(&source, &["push", remote_url, "main"]);
+    git(&source, &["push", remote.to_str().unwrap(), "main"]);
     let new_main = git(&source, &["rev-parse", "main"]);
     let second_workset = root.create().await.unwrap();
     let second = second_workset
@@ -95,19 +100,23 @@ async fn worksets_clone_through_the_mirror_store() {
         std::fs::read_to_string(second.join("file.txt")).unwrap(),
         "three\n"
     );
-    store_git(&root, project.as_std_path(), &["fetch", "-q"]).await;
-    assert_eq!(
-        git(project.as_std_path(), &["rev-parse", "origin/main"]),
-        new_main
-    );
-    assert!(
-        project
-            .join(".git/objects/pack")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_none()
-    );
+    if patched_git_known() {
+        store_git(&root, project.as_std_path(), &["fetch", "-q"]).await;
+        assert_eq!(
+            git(project.as_std_path(), &["rev-parse", "origin/main"]),
+            new_main
+        );
+        assert!(
+            project
+                .join(".git/objects/pack")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    } else {
+        eprintln!("RHO_GIT is not set: skipping the agent-side fetch");
+    }
     assert_eq!(
         std::fs::read_to_string(project.join("file.txt")).unwrap(),
         "two\n",
@@ -157,7 +166,7 @@ async fn worksets_clone_through_the_mirror_store() {
     let second_id = second_workset.id().to_owned();
     drop(second_workset);
     drop(root);
-    let root = open_worksets(temp.path(), &wrapper).await;
+    let root = open_worksets(temp.path()).await;
     let reopened = root.open_workset(&second_id).await.unwrap();
     assert_eq!(reopened.repos().unwrap(), vec!["project"]);
     let again = reopened

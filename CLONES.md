@@ -7,14 +7,19 @@ freedom to fetch, push, gc without asking anyone. Naively that is a
 round trip per clone. The mirror store is the primitive that removes
 both costs without changing what a clone *is*.
 
-It is three small crates under `crates/rho-git/`:
+It is three small crates under `crates/rho-git/` and one patch to git:
 
 - `rho-git-proto`: the one-line socket protocol, URL normalization and
   the store key.
 - `rho-git-server`: the **keeper**, `MirrorStore`. The daemon runs it
   in-process; it is the only writer of the store root.
-- `rho-git-client`: the client library (`Store`, `clone_from_mirror`)
-  and the `rho-git` binary, which the agent's view installs as `git`.
+- `rho-git-client`: the daemon's client library (`Store`,
+  `clone_from_mirror`, `ensure_alternate`) and the end-to-end tests of
+  the patched git against a live keeper.
+- `nix/patches/git-rho-store.patch`: Rho's git. Its `clone` and `fetch`
+  ask the keeper for the mirror themselves, so every path into a fetch
+  is covered by construction. The flake builds it as `rhoGit`; the
+  daemon learns its path from `RHO_GIT` at build or run time.
 
 ## It is a cache, not a workflow
 
@@ -26,42 +31,38 @@ git fetch                                  # served from the local mirror
 git push                                   # to the real remote, as always
 ```
 
-The wrapper handles three commands when `RHO_GIT_STORE_SOCKET` names a
-keeper, and `exec`s the real git (`RHO_GIT`, or the next `git` on PATH)
-for everything else, arguments untouched:
+Rho's git is git 2.55 with one small patch (`rho-store.c`, ~150
+lines, and two call sites). When `RHO_GIT_STORE_SOCKET` names a keeper,
+`git clone` and `git fetch` of a remote URL do three things before they
+open the transport:
 
-- `git clone <url> [dir]` asks the keeper to *ensure* the URL's mirror
-  and births the clone from it. Options that shape a clone (`--depth`,
-  `--branch`, `--bare`, `--mirror`, `--reference`, `--filter`, ...) go
-  to the real git unchanged: the store serves the common case, not
-  every case.
-- `git fetch ...` and `git pull ...` work out which URL git would read
-  (a named remote's URL, a literal URL or path, else the current branch's
-  upstream remote or `origin`), ask the keeper to *refresh* that mirror,
-  add the mirror to the clone's alternates if it is new there, then run
-  the real git with `url.<mirror>.insteadOf=<url>` so the fetch reads
-  the mirror. Refspecs and options pass through. So a second remote
-  (`git remote add upstream ...; git fetch upstream`) gets a mirror of
-  its own on first fetch and the clone borrows from both. `--all` and
-  `--multiple` refresh every remote named and pass one rewrite per
-  remote: git fetches them in child processes of the real git, which
-  read the rewrites from the environment. The rewrite is a per-process
-  `-c` option; nothing is written to the clone's config or the store,
-  only the alternates line.
-- `git subtree add|pull --prefix=<dir> <repository> <ref>` is routed the
-  same way, from outside: `git subtree` is a script, and git puts its
-  own exec path first on the script's PATH, so the script's nested
-  `git fetch` is the real git. The `insteadOf` the wrapper passes reaches
-  it through the environment, and the mirror is in the alternates before
-  the script starts.
+1. Send `refresh <url>` to the keeper over the socket, and get the
+   mirror's bare git directory back.
+2. Add `<mirror>/objects` to the clone's `objects/info/alternates` if it
+   is not listed yet, so the fetch counts the mirror's objects as local.
+3. Open the transport on the mirror's path instead of the URL. The
+   refspecs, options and the remote's recorded URL are untouched: the
+   fetch reads the mirror but records it as a fetch from the remote.
 
-If the keeper cannot be reached the wrapper says so on stderr and runs
-the real git against the network. Without the socket variable it is
-plain git.
+That is the whole mechanism, and it sits below every command that
+fetches: `pull`, `fetch --all` and `--multiple`, `git subtree add|pull`,
+submodule updates and `clone --recurse-submodules`, and any script that
+runs `git fetch` in a child process. A second remote (`git remote add
+upstream ...; git fetch upstream`) gets a mirror of its own on first
+fetch and the clone borrows from both. Options that shape a clone
+(`--depth`, `--filter`, `--branch`, `--mirror`, ...) still work: git
+reads the mirror and cuts what it needs from it. Push is untouched.
+Local URLs (paths and `file://`) never consult the store: there is no
+network to save.
+
+If the keeper cannot be reached git says so on stderr (`rho git store:
+...; using the network`) and fetches from the real remote. Without the
+socket variable it is plain git.
 
 The daemon's own clones (`Workset::clone_repo`, for a new agent's
-starting repository) call the keeper directly and birth the clone the
-same way, so an agent's `git clone` and the daemon's are the same thing.
+starting repository) use `rho-git-client` to ask the keeper and birth
+the clone from the mirror the same way, so an agent's `git clone` and
+the daemon's are the same thing.
 
 ## Constraints, then design
 
@@ -75,8 +76,8 @@ Two constraints drive everything:
 From these, share the minimum: only git's object bytes are shared, and
 through the mechanism git has for borrowing them. Everything else —
 refs, remotes, config, working tree — is per-clone private state,
-exactly as in a clone on its own machine. Nothing in git is patched,
-guarded, or banned.
+exactly as in a clone on its own machine. Nothing in git is guarded or
+banned; the patch changes where a fetch reads from, not what it does.
 
 ### Shared artifact: git object bytes (alternates)
 
@@ -128,13 +129,15 @@ git with the user's environment, so credential helpers, ssh and
 
 The keeper serializes work per mirror: one `tokio` mutex per URL, so
 concurrent requests for one URL share a single fetch. A mirror fetched
-within the *debounce* window (30 s by default) is served as is; a
-background loop refetches each *interval* (60 s) every *active* mirror:
-one requested at least *active_after* times (5) within *idle* (3 days;
-the store's `used` file keeps the last few request times). A mirror
-asked for once, or not lately, stays as it is, and every request fetches
-what it needs itself. There is no file locking: the daemon is one
-process, and git takes its own locks inside a mirror.
+within the *debounce* window (30 s by default) is served as is;
+otherwise every request fetches what it needs itself, and that fetch is
+delta-sized (well under a second against GitHub for a warm mirror).
+There is no background refresh: a mirror nobody asks for costs nothing,
+and a new agent's clone is born on whatever the mirror's last request
+fetched, at most the debounce old. The daemon hides that fetch behind
+the agent's start (`Lazy` in `rho-agent`), so the client sees the agent
+at once. There is no file locking: the daemon is one process, and git
+takes its own locks inside a mirror.
 
 The protocol is one line each way on a unix socket, so a client needs
 nothing but a socket:
@@ -178,8 +181,9 @@ commits live in its own odb until pushed.
 
 ## What this design deliberately does not have
 
-- No git patches, no banned commands. The wrapper intercepts three
-  subcommands and passes everything else through, `exec`-transparent.
+- No banned commands and no wrapper. One patch redirects where a fetch
+  reads from; everything else is git as shipped.
+- No background fetching. A request fetches, a debounce bounds how often.
 - No shared mutable state: a clone's remotes, config, refs are its own.
   `git gc`, `git worktree`, rebase — all per-clone, all safe.
 - No clone registry in the store, no relative-pointer contract: a clone
@@ -192,6 +196,6 @@ commits live in its own odb until pushed.
 | Cost | When | Why it's fine |
 |---|---|---|
 | Full fetch of the repo | mirror init, once | O(repo), one-time, off the clone path |
-| Mirror refresh | every ensure past the debounce, and every interval while in use | delta-sized, off the clone path |
+| Mirror refresh | every request past the debounce | delta-sized; hidden behind the agent's start |
 | Per-ref work at clone birth | every clone | local refs copy, no object transfer |
 | Store growth | as history grows | O(repo), append-only |

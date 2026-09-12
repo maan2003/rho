@@ -19,7 +19,7 @@ use anyhow::{Context as _, bail, ensure};
 pub const MOUNT_ROOT: &str = "/src";
 
 /// What a namespace mounts: the workset directory at the visible root, and
-/// the mirror store root, its keeper's socket and the `git` wrapper at
+/// the mirror store root, its keeper's socket and Rho's git at
 /// their host paths, so the absolute paths clones record (alternates) and
 /// the environment names hold inside.
 #[derive(Clone, Debug)]
@@ -30,7 +30,7 @@ pub struct Mounts {
     pub store_root: PathBuf,
     /// The keeper's socket, mounted at its own host path.
     pub store_socket: Option<PathBuf>,
-    /// The directory holding the `git` wrapper, mounted read-only at its
+    /// The directory of Rho's patched git, mounted read-only at its
     /// own host path.
     pub store_bin: Option<PathBuf>,
 }
@@ -416,7 +416,7 @@ fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Res
 }
 
 /// Mounts a validated workset below `root` in the current mount namespace:
-/// the workset directory at [`MOUNT_ROOT`], the store root and the wrapper
+/// the workset directory at [`MOUNT_ROOT`], the store root and Rho's git
 /// directory read-only at their host paths, and the socket at its host path.
 pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
     validate_mounts(set)?;

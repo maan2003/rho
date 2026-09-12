@@ -1,5 +1,5 @@
 //! The mirror keeper: one bare git mirror per remote URL under a root,
-//! kept fetched, served over a unix socket. The daemon runs it in-process
+//! fetched on request, served over a unix socket. The daemon runs it in-process
 //! and is the root's only writer; everything else — the daemon's own
 //! clones and the `git` wrapper agents run — is a client that reads a
 //! mirror and never touches the network (`CLONES.md`).
@@ -14,11 +14,6 @@
 //!                     refspecs behaves exactly like one from the remote.
 //! <root>/<key>/url    the remote URL; written last, so its presence means
 //!                     the mirror is complete
-//! <root>/<key>/used   unix times of the last few requests for this mirror,
-//!                     one per line; the background loop only refetches a
-//!                     mirror requested `active_after` times within `idle`,
-//!                     so a one-off command never starts it, and a request
-//!                     always fetches what it needs itself
 //! ```
 //!
 //! **The mirror never prunes objects.** Clones borrow them through
@@ -37,24 +32,19 @@ use rho_git_proto::{Request, Response, store_key};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixListener;
 
-/// How the keeper keeps mirrors fresh: a mirror fetched within `debounce`
-/// is served as is, and every mirror requested at least `active_after`
-/// times within `idle` is refetched each `interval` in the background.
+/// How the keeper serves a mirror: one fetched within `debounce` is
+/// served as is, so concurrent and back-to-back requests share a fetch.
+/// There is no background fetching: every request fetches what it needs,
+/// and a mirror nobody asks for costs nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refresh {
-    pub interval: Duration,
     pub debounce: Duration,
-    pub idle: Duration,
-    pub active_after: usize,
 }
 
 impl Default for Refresh {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
             debounce: Duration::from_secs(30),
-            idle: Duration::from_secs(3 * 24 * 3600),
-            active_after: 5,
         }
     }
 }
@@ -124,25 +114,8 @@ impl MirrorStore {
 
     /// The mirror for `url`, initialized if missing and fetched unless it
     /// was fetched within the debounce window. Concurrent requests for one
-    /// URL wait on the same lock and share one fetch. This is a request:
-    /// it marks the mirror used, so the background loop keeps it fresh.
+    /// URL wait on the same lock and share one fetch.
     pub async fn ensure(&self, url: &str) -> anyhow::Result<PathBuf> {
-        let mirror = self.fetch(url).await?;
-        let mut requests = self.requests(url);
-        requests.push(unix_now());
-        let keep = requests
-            .len()
-            .saturating_sub(self.refresh.active_after.max(1));
-        let text: String = requests[keep..]
-            .iter()
-            .map(|at| format!("{at}\n"))
-            .collect();
-        std::fs::write(self.store_dir(url).join("used"), text)
-            .with_context(|| format!("mark {} used", self.store_dir(url).display()))?;
-        Ok(mirror)
-    }
-
-    async fn fetch(&self, url: &str) -> anyhow::Result<PathBuf> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "empty remote URL");
         let entry = self.entry(url);
@@ -158,27 +131,6 @@ impl MirrorStore {
             *last = Some(Instant::now());
         }
         Ok(store.join("git"))
-    }
-
-    /// Unix times of the last `active_after` requests for `url`'s mirror,
-    /// oldest first.
-    pub fn requests(&self, url: &str) -> Vec<u64> {
-        std::fs::read_to_string(self.store_dir(url).join("used"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.trim().parse().ok())
-            .collect()
-    }
-
-    /// Whether the background loop keeps `url`'s mirror fresh: requested
-    /// `active_after` times, all within `idle`.
-    pub fn is_active(&self, url: &str) -> bool {
-        let requests = self.requests(url);
-        let window = self.refresh.idle.as_secs();
-        requests.len() >= self.refresh.active_after.max(1)
-            && requests
-                .iter()
-                .all(|at| unix_now().saturating_sub(*at) < window)
     }
 
     /// Initializes `url`'s store in a staging directory and renames it into
@@ -321,44 +273,6 @@ impl MirrorStore {
         Ok(stores)
     }
 
-    /// Fetches every active mirror under the root (`is_active`) that is
-    /// due, returning the failures. Meant for the background loop: a
-    /// mirror asked for once, or not lately, stays as it is until the next
-    /// request fetches it.
-    pub async fn refresh_all(&self) -> Vec<(PathBuf, anyhow::Error)> {
-        let stores = match self.list() {
-            Ok(stores) => stores,
-            Err(error) => return vec![(self.root.clone(), error.into())],
-        };
-        let mut failures = Vec::new();
-        for (dir, url) in stores {
-            if !self.is_active(&url) {
-                continue;
-            }
-            if let Err(error) = self.fetch(&url).await {
-                failures.push((dir, error));
-            }
-        }
-        failures
-    }
-
-    /// Runs `refresh_all` every `interval` for as long as the task lives.
-    pub fn spawn_refresh_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let store = Arc::clone(self);
-        let interval = self.refresh.interval;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                for (dir, error) in store.refresh_all().await {
-                    eprintln!(
-                        "git store: background fetch of {} failed: {error:#}",
-                        dir.display()
-                    );
-                }
-            }
-        })
-    }
-
     /// Answers one protocol line.
     pub async fn handle_request(&self, line: &str) -> String {
         let response = match Request::decode(line) {
@@ -407,11 +321,4 @@ impl MirrorStore {
             });
         }
     }
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0)
 }

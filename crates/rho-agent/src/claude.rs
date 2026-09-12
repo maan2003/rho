@@ -43,6 +43,9 @@ pub struct ClaudeAgent {
     status: Arc<RwLock<AgentStatus>>,
     control: mpsc::UnboundedSender<ClaudeControl>,
     head: Arc<RwLock<crate::db::AgentHead>>,
+    /// The agent's place, materialized on first use: a new agent's clone
+    /// may still be in flight when a terminal or shell asks for it.
+    view: Arc<Lazy<Arc<crate::View>>>,
 }
 
 impl ClaudeAgent {
@@ -106,7 +109,7 @@ impl ClaudeAgent {
                 inference,
                 claude,
                 agent_id,
-                Arc::new(Lazy::ready(view)),
+                view,
                 model,
                 effort,
                 session_id,
@@ -296,7 +299,7 @@ impl ClaudeAgent {
             inference,
             presentation_session,
             agent_id,
-            view,
+            view: Arc::clone(&view),
             model,
             effort,
             session_id,
@@ -334,7 +337,13 @@ impl ClaudeAgent {
             status,
             control,
             head,
+            view,
         }
+    }
+
+    /// The agent's view, ready once its place is.
+    pub async fn view(&self) -> anyhow::Result<Arc<crate::View>> {
+        Ok(Arc::clone(self.view.get().await?))
     }
 
     pub fn status(&self) -> AgentStatus {

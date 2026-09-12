@@ -1061,27 +1061,38 @@ impl Services {
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
+                // The agent exists at once; its workset is placed (cloned
+                // from the mirror store, checked out, entered) by its first
+                // command, and again by the next one if that failed. The
+                // checkout's name is known before the clone, so the record
+                // is complete from the start.
                 let origin = expand_home(&repo).unwrap_or(repo);
+                let name = rho_workset::repo_name(origin.as_str())
+                    .with_context(|| format!("no repository name in {origin}"))?;
                 let worksets = self.pool.worksets();
                 let workset = worksets.create().await?;
+                let cwd = visible_path(&workset, &workset.root().join(&name))?;
+                let info = WorkspaceInfo::Workset {
+                    workset: workset.id().to_owned(),
+                    cwd: cwd.clone(),
+                    mode: self.workset_mode,
+                    origin: Some(origin.clone()),
+                };
                 let mode = rho_workset::Mode::from_workset_mode(self.workset_mode);
-                let placed = async {
-                    let checkout = workset.clone_repo(origin.as_str(), None).await?;
-                    workset.checkout(&checkout, &revset).await?;
-                    let cwd = visible_path(&workset, &checkout)?;
-                    let view = workset.enter(mode, &cwd)?;
-                    anyhow::Ok(rho_agent::StartPlace::new(view, Some(origin)).owning_workset())
-                }
-                .await;
-                match placed {
-                    Ok(start) => start,
-                    Err(error) => {
-                        if let Err(discard) = worksets.discard_workset(workset.id()).await {
-                            eprintln!("rho daemon: discard workset {}: {discard:#}", workset.id());
-                        }
-                        return Err(error);
+                rho_agent::StartPlace::pending(info, move || {
+                    let workset = workset.clone();
+                    let origin = origin.clone();
+                    let name = name.clone();
+                    let revset = revset.clone();
+                    let cwd = cwd.clone();
+                    let mode = mode.clone();
+                    async move {
+                        let checkout = workset.clone_repo(origin.as_str(), Some(&name)).await?;
+                        workset.checkout(&checkout, &revset).await?;
+                        workset.enter(mode, &cwd)
                     }
-                }
+                })
+                .owning_workset()
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 let view = self.pool.materialize_view(&info).await?;
@@ -2849,13 +2860,11 @@ where
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
     let agent_id = services.resolve_display_agent_id(agent).await?;
-    let record = services.load(agent_id).await?.1.head();
+    let running = services.load(agent_id).await?.1;
+    let record = running.head();
     shell::ensure_supported_workdirs(&record.config.workdirs)?;
-    let view = services
-        .pool
-        .materialize_view(record.primary_workdir())
-        .await
-        .context("materialize agent view")?;
+    // The agent's own view: a new agent's clone may still be in flight.
+    let view = running.view().await.context("materialize agent view")?;
     services
         .shells
         .start(
@@ -3200,13 +3209,11 @@ async fn terminal_attach(
             .attach(agent_id, terminal_id, cols, rows)
             .await;
     }
-    let record = services.load(agent_id).await?.1.head();
+    let running = services.load(agent_id).await?.1;
+    let record = running.head();
     shell::ensure_supported_workdirs(&record.config.workdirs)?;
-    let view = services
-        .pool
-        .materialize_view(record.primary_workdir())
-        .await
-        .context("materialize agent view")?;
+    // The agent's own view: a new agent's clone may still be in flight.
+    let view = running.view().await.context("materialize agent view")?;
     let shell = services
         .user_environment
         .get("SHELL")

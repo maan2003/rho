@@ -803,6 +803,15 @@ impl RunningAgent {
         }
     }
 
+    /// The agent's view, ready once its place is: a new agent's clone may
+    /// still be in flight.
+    pub async fn view(&self) -> anyhow::Result<Arc<View>> {
+        match self {
+            Self::Rho(agent) => agent.view().await,
+            Self::Claude(agent) => agent.view().await,
+        }
+    }
+
     pub fn status(&self) -> AgentStatus {
         match self {
             Self::Rho(agent) => agent.status(),

@@ -33,7 +33,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    keeps the user's own config free to be as personal as they like.
 
 2. **The userland is a declared program list.** Rho names the tools an
-   agent gets (coreutils, bash, git behind Rho's `git` wrapper, direnv, nix, ripgrep,
+   agent gets (coreutils, bash, Rho's patched git, direnv, nix, ripgrep,
    fd, just, python3, uv, node, …) and presents them as one directory
    mounted at `/usr`, with `/bin` pointing at it and `PATH=/usr/bin`. A
    nix build of Rho produces that directory as a `buildEnv`; a
@@ -106,17 +106,16 @@ security boundary (see `WORKSET.md`); it is a distribution.
    tmux and zoxide are not part of the distro.
 
 8. **Every checkout is a plain git repository, and `git` is git.** The
-   `git` on the agent's PATH is Rho's wrapper (`rho-git`,
-   `CLONES.md`): `git clone` births the clone from the daemon's mirror
-   store through git alternates and leaves an ordinary repository with
-   `origin` at the real remote; `git fetch` and `git pull` read the
-   refreshed mirror of whatever remote or URL they name, and a clone
-   fetching from a new remote borrows that mirror too; every other
-   command is the real git, `exec`ed
-   with its arguments untouched. Further checkouts are `git worktree
-   add`, which agents run for themselves when they want a child in its
-   own checkout. There is no second VCS in the view and no daemon-side
-   notion of a change: the model works with git alone.
+   `git` on the agent's PATH is Rho's git: stock git with one patch
+   (`CLONES.md`) under which `clone` and `fetch` of a remote URL read
+   the daemon's mirror store through git alternates and leave an
+   ordinary repository with `origin` at the real remote. Everything
+   that fetches, from `pull` to `subtree` to submodules, goes through
+   that one path; every other command is untouched. Further checkouts
+   are `git worktree add`, which agents run for themselves when they
+   want a child in its own checkout. There is no second VCS in the view
+   and no daemon-side notion of a change: the model works with git
+   alone.
    *Why:* one tool the model knows well beats two it confuses. Nix treats a directory without `.git`
    as a `path:` flake and copies the whole tree, ignored files included,
    into the store on every evaluation; with `.git` it fetches only
@@ -157,7 +156,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 | `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `gitconfig`, `rho/direnv/`, `bashrc`, `profile` |
 | `/home/agent` | empty tmpfs; `~/.cache` is the shared persistent cache; `~/.claude` is the Claude home stack |
 | `/src` | the workset, read-write |
-| `<state>/stores`, `<state>/bin`, `<state>/store.sock` | at host paths: mirrors and the `git` wrapper read-only, the keeper's socket |
+| `<state>/stores`, `<state>/bin`, `<state>/store.sock` | at host paths: mirrors and Rho's git read-only, the keeper's socket |
 | `<state>/worksets/<id>/state` | at its host path, read-write: direnv layout and GC roots |
 | `/proc`, `/dev`, `/tmp` | as today |
 

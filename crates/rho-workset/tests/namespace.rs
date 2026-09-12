@@ -10,7 +10,7 @@ use camino::Utf8Path;
 use rho_workset::{ClaudeHome, MAX_BOUNDED_READ, Mode};
 
 mod common;
-use common::{only_store, open_worksets, setup_remote, wrapper_binary};
+use common::{GitDaemon, only_store, open_worksets, patched_git_known, setup_remote};
 
 fn main() {
     let unshare = Command::new("unshare").args(["-U", "true"]).status();
@@ -18,16 +18,13 @@ fn main() {
         eprintln!("skipping namespace test: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    // Build the wrapper before entering the user namespace so cargo runs as
-    // the host user.
-    let wrapper = wrapper_binary();
     // SAFETY: no threads exist yet.
     unsafe { rho_workset::init_daemon_namespace() }.unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(run(wrapper));
+    runtime.block_on(run());
 }
 
 fn host_binary(name: &str) -> PathBuf {
@@ -39,15 +36,14 @@ fn host_binary(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} not on PATH"))
 }
 
-async fn run(wrapper: PathBuf) {
+async fn run() {
     let temp = tempfile::tempdir().unwrap();
-    let (_source, remote) = setup_remote(temp.path());
-    let root = open_worksets(temp.path(), &wrapper).await;
+    let (_source, _remote) = setup_remote(temp.path());
+    let daemon = GitDaemon::start(temp.path());
+    let remote = daemon.url("remote.git");
+    let root = open_worksets(temp.path()).await;
     let workset = root.create().await.unwrap();
-    let checkout = workset
-        .clone_repo(remote.to_str().unwrap(), Some("project"))
-        .await
-        .unwrap();
+    let checkout = workset.clone_repo(&remote, Some("project")).await.unwrap();
     let outside = temp.path().join("outside.txt");
     std::fs::write(&outside, "secret\n").unwrap();
     std::os::unix::fs::symlink(&outside, checkout.join("escape")).unwrap();
@@ -138,11 +134,28 @@ async fn run(wrapper: PathBuf) {
         checkout.join("x")
     );
 
-    // Inside the namespace `git` is the wrapper: the agent clones through
+    // Inside the namespace `git` is Rho's git: the agent clones through
     // the keeper, works in the clone, fetches from the mirror, and cannot
-    // write the store or the wrapper. The command starts in /src.
+    // write the store or the git directory. The command starts in /src.
+    // Without a patched git known (`RHO_GIT`) the clone is plain.
     let sh = host_binary("sh");
     let store = only_store(temp.path());
+    let with_store = if patched_git_known() {
+        format!(
+            r#"
+test "$(command -v git)" = {bin}/git
+git clone -q -- {remote} second
+test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
+git -C /src/second fetch -q
+if touch {bin}/x 2>/dev/null; then echo "git dir is writable"; exit 1; fi
+"#,
+            bin = root.store_bin().unwrap(),
+            store = store.display(),
+        )
+    } else {
+        eprintln!("RHO_GIT is not set: the in-view clone is plain git");
+        format!("git clone -q -- {remote} second\n")
+    };
     let script = format!(
         r#"
 set -eu
@@ -150,22 +163,16 @@ test "$PWD" = /src
 test -d /src/project
 test "$RHO_GIT_STORE_SOCKET" = {socket}
 test -S "$RHO_GIT_STORE_SOCKET"
-test "$(command -v git)" = {bin}/git
-git clone -q -- {remote} second
+{with_store}
 test -f /src/second/file.txt
-test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
-git -C /src/second fetch -q
 git -C /src/second log -1 --format=%H origin/main >/dev/null
 touch /src/second/written
 if touch {store}/mirror 2>/dev/null; then echo "store is writable"; exit 1; fi
 if mkdir {stores}/x 2>/dev/null; then echo "store root is writable"; exit 1; fi
-if touch {bin}/x 2>/dev/null; then echo "wrapper dir is writable"; exit 1; fi
 test ! -e /src/.stores
 "#,
         stores = root.store_root(),
         socket = root.store_socket().unwrap(),
-        bin = root.store_bin().unwrap(),
-        remote = remote.display(),
         store = store.display(),
     );
     let mut command = tokio::process::Command::new(&sh);

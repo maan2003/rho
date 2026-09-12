@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -47,4 +49,66 @@ pub fn push_commit(source: &Path, content: &str) -> String {
     git(source, &["commit", "-q", "-am", content]);
     git(source, &["push", "-q", "origin", "main"]);
     git(source, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// Rho's patched git (`RHO_GIT`), or `None` when the environment does not
+/// name one: the tests that need it then skip.
+pub fn patched_git() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("RHO_GIT")?);
+    if path.is_file() {
+        Some(path)
+    } else {
+        eprintln!("RHO_GIT={} is not a file", path.display());
+        None
+    }
+}
+
+/// A `git daemon` serving every repository under `base` over `git://`,
+/// pushes included, so URLs are remote ones and the store is consulted.
+pub struct GitDaemon {
+    child: Child,
+    pub port: u16,
+}
+
+impl GitDaemon {
+    pub fn start(base: &Path) -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = Command::new("git")
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--listen=127.0.0.1",
+                &format!("--port={port}"),
+                "--export-all",
+                "--enable=receive-pack",
+                &format!("--base-path={}", base.display()),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "git daemon did not come up");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { child, port }
+    }
+
+    /// The URL of `<base>/<name>`.
+    pub fn url(&self, name: &str) -> String {
+        format!("git://127.0.0.1:{}/{name}", self.port)
+    }
+}
+
+impl Drop for GitDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

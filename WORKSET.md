@@ -13,20 +13,20 @@ no separate record of its contents.
 ~/.local/state/rho/
   stores/            # mirror store root (CLONES.md), URL-keyed
   store.sock         # the mirror keeper's socket
-  bin/git            # the `git` wrapper (rho-git) agents run
   worksets/<id>/src  # one directory per workset
 ```
 
-`Worksets::open` creates the root, installs the wrapper and starts the
-mirror keeper (`rho-git-server`) in-process on the socket. The keeper
-is the only writer of `stores/`: it initializes a mirror on first
-request, refetches every mirror in the background so new clones are
-born on the remote's current state, and serves the same mirror to
-concurrent requests under one lock. Everything else — the daemon's own
-`Workset::clone_repo`, an agent's `git clone` and `git fetch` through
-the wrapper — is a client that reads a mirror and never touches the
-network. `Worksets::discard_workset` deletes the workset directory;
-mirrors are shared and never removed.
+`Worksets::open` creates the root and starts the mirror keeper
+(`rho-git-server`) in-process on the socket. The keeper is the only
+writer of `stores/`: it initializes a mirror on first request, refetches
+it on later requests (debounced, never in the background), and serves
+the same mirror to concurrent requests under one lock. Everything else —
+the daemon's own `Workset::clone_repo`, an agent's `git clone` and `git
+fetch` through Rho's patched git — is a client that reads a mirror.
+Agents get that git first on their PATH; the daemon finds it through
+`RHO_GIT` (baked in by the nix build, or set in the environment) and
+mounts its directory read-only into the view. `Worksets::discard_workset`
+deletes the workset directory; mirrors are shared and never removed.
 
 Several agents can work in one workset: a child agent joins its parent's
 workset in the parent's directory. A parent that wants a child in a
@@ -72,7 +72,7 @@ a plain directory or file except a handful of real mounts:
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
 - `/src`: the workset directory, read-write. The command starts here.
-- The mirror store root and the wrapper directory, read-only, and the
+- The mirror store root and Rho's git directory, read-only, and the
   keeper's socket, at the same absolute paths they have on the host.
   Clones record the store by absolute path (git alternates), so the
   path must not change between the daemon's frame and the agent's.
@@ -82,10 +82,10 @@ a plain directory or file except a handful of real mounts:
   build adds nothing.
 
 The environment is an explicit allowlist (PATH filtered to `/nix/store`
-entries with the wrapper directory first, TERM, plus HOME/USER/LOGNAME)
-and `RHO_GIT_STORE_SOCKET` / `RHO_GIT` pointing the wrapper at the
-keeper and the real git; variables the caller sets on the command
-survive in both modes, and inherited fds are closed on exec.
+entries with Rho's git directory first, TERM, plus HOME/USER/LOGNAME)
+and `RHO_GIT_STORE_SOCKET` pointing git at the keeper; variables the
+caller sets on the command survive in both modes, and inherited fds are
+closed on exec.
 
 `Namespace::set_claude_home` mounts an agent's Claude Code home over its
 `~/.claude` inside the live namespace: the per-account state directory,

@@ -129,6 +129,9 @@ pub struct AgentHandle {
     /// The record as the loop keeps it: read here instead of folding the
     /// log again for every mail, tool call, or shell.
     head: Arc<RwLock<AgentHead>>,
+    /// The agent's place, materialized on first use: a new agent's clone
+    /// may still be in flight when a terminal or shell asks for it.
+    view: Arc<Lazy<Arc<View>>>,
 }
 
 impl AgentHandle {
@@ -180,7 +183,7 @@ impl AgentHandle {
             role,
             prompt_cache_key,
             agent_id,
-            Arc::new(Lazy::ready(view)),
+            view,
             parent,
             pool,
             replay::Replayed::default(),
@@ -266,7 +269,7 @@ impl AgentHandle {
         };
         let sidecar = Sidecar::new(inference.clone(), last_source);
         let surface_inputs = SurfaceInputs {
-            view,
+            view: Arc::clone(&view),
             agent_id,
             inference,
             parent,
@@ -324,7 +327,13 @@ impl AgentHandle {
             control,
             status,
             head,
+            view,
         }
+    }
+
+    /// The agent's view, ready once its place is.
+    pub async fn view(&self) -> anyhow::Result<Arc<View>> {
+        Ok(Arc::clone(self.view.get().await?))
     }
 
     pub fn status(&self) -> AgentStatus {

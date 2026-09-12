@@ -77,7 +77,7 @@ pub struct Namespace {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store_environment: Vec<(OsString, OsString)>,
-    /// The directory holding the `git` wrapper, first on the agent's PATH.
+    /// The directory of Rho's patched git, first on the agent's PATH.
     store_bin: Option<Utf8PathBuf>,
     view_path: Option<OsString>,
     state: tokio::sync::Mutex<NsState>,

@@ -47,10 +47,18 @@
         # take mold from nixpkgs itself, without the overlay, so it is the
         # wrapped mold and keeps the -rpath flags nix adds.
         moldLinker = nixpkgs.legacyPackages.${system}.mold;
-        octoGit = pkgs.git.overrideAttrs (old: {
+        # Rho's git: the Octo unix-socket transport for git-remote-octo, and
+        # the mirror store hook (CLONES.md) that makes every fetch and clone
+        # of a remote URL read a local mirror when RHO_GIT_STORE_SOCKET is
+        # set. Agents get this git in the view.
+        rhoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ./nix/patches/git-http-unix-socket.patch
+            ./nix/patches/git-rho-store.patch
           ];
+          # git's own test suite is long and does not exercise the patches;
+          # rho's rho-git-client tests do.
+          doInstallCheck = false;
         });
         findutils = pkgs.rustPlatform.buildRustPackage {
           pname = "findutils";
@@ -211,7 +219,8 @@
               env.RUSTDOCFLAGS = "-D warnings";
               env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
-              env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
+              env.OCTO_REMOTE_HTTP = "${rhoGit}/libexec/git-core/git-remote-http";
+              env.RHO_GIT = "${rhoGit}/bin/git";
               env.RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
               env.RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
               env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
@@ -274,7 +283,7 @@
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p rho-git-client";
+            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. The patched noq crates are dependencies of iroh,
@@ -394,7 +403,7 @@
             ;
         };
 
-        legacyPackages = multiBuild;
+        legacyPackages = multiBuild // { inherit rhoGit; };
 
         devShells = flakeboxLib.mkShells {
           channel = "latest";
@@ -403,6 +412,7 @@
           ];
           NEXTEST_SHOW_PROGRESS = "none";
           RHO_LOG = "rho_agent=debug,info";
+          RHO_GIT = "${rhoGit}/bin/git";
           RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
           RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
           RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
