@@ -6,6 +6,7 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
+  "crates/rho-agent-distro",
   "crates/rho-agent-tools",
   "crates/rho-agents",
   "crates/rho-browser",
@@ -114,6 +115,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
+rho-agent-distro = { path = "crates/rho-agent-distro" }
 rho-agents = { path = "crates/rho-agents" }
 rho-browser = { path = "crates/rho-browser" }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }

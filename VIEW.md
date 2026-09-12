@@ -175,8 +175,8 @@ Variables the caller sets on a command survive, as today.
 The distro is its own crate, `rho-agent-distro`, and the boundary is
 image versus runtime:
 
-- `rho-agent-distro` builds an **image**: a directory tree on disk plus
-  an environment manifest. It resolves the program list into `usr/`,
+- `rho-agent-distro` builds an **image** in a caller-provided directory on
+  tmpfs: a directory tree plus an environment manifest. It resolves the program list into `usr/`,
   writes every generated `/etc` file (nix.conf, gitconfig, the direnv
   configuration and `direnvrc`, bashrc and profile) and lists the
   variables. It knows nothing about namespaces or mounts, so it is
@@ -188,6 +188,12 @@ image versus runtime:
   per agent (the workset at `/src`, the store, the Claude home, the
   working directory). The `/etc` generation and PATH filtering in its
   `layout.rs` today move to the distro crate.
+
+The image builder is implemented in `crates/rho-agent-distro`. A future Nix
+derivation can put the declared programs on `PATH` and invoke its binary in
+the build step with a staging directory plus the nix-direnv and CA-certificate
+package paths. At runtime the daemon calls the same builder with a freshly
+mounted tmpfs directory.
 
 Three things change at three different times — the image at build
 time, the daemon-level pieces at daemon start, the agent-level pieces
