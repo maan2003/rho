@@ -274,7 +274,7 @@
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p jj-cli";
+            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p rho-git-client";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. The patched noq crates are dependencies of iroh,
@@ -310,7 +310,6 @@
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               env.RHO_DIRENV_PATH_BEFORE = "${findutils}/bin";
               postInstall = ''
-                install -Dm755 target/release/jj $out/bin/jj
                 mkdir -p $out/share/rho/skills
                 cp -r ${./.agents/skills/github-workflow} $out/share/rho/skills/github-workflow
                 cp -r ${./.agents/skills/delegate-engineering} \

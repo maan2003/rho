@@ -58,7 +58,6 @@ members = [
 ]
 exclude = [
   "vendor/brush",
-  "vendor/jj",
   "vendor/noq",
   "vendor/zed",
 ]
@@ -95,8 +94,6 @@ futures = "0.3"
 futures-util = "0.3"
 imara-diff = "0.2.0"
 iroh = { version = "1.0.2", default-features = false }
-jj-cli = { path = "vendor/jj/cli" }
-jj-lib = { path = "vendor/jj/lib" }
 json-stream = { path = "crates/json-stream" }
 libc = "0.2"
 libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }

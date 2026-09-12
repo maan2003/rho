@@ -16,10 +16,9 @@ behavior, while `.jjsubtree.toml` records the upstream baseline used by
 - Edit subtree code directly when it is the correct ownership layer. Do not
   add a Rho-side adapter, copy, or override merely because the implementation
   lives under `vendor/`.
-- This is especially important for `vendor/zed` and `vendor/jj`: editor/GPUI
-  behavior belongs in Zed, and repository/workspace semantics may belong in
-  jj. The same principle applies to Brush, iroh, noq, Senax, and future
-  subtrees.
+- This is especially important for `vendor/zed`: editor/GPUI behavior
+  belongs in Zed. The same principle applies to Brush, iroh, noq, Senax, and
+  future subtrees.
 - Keep Rho-specific changes focused and suitable for carrying across an
   upstream update. Avoid unrelated cleanup in a subtree.
 
