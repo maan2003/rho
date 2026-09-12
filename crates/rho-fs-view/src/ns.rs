@@ -77,9 +77,6 @@ pub struct Namespace {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store_environment: Vec<(OsString, OsString)>,
-    /// The directory of Rho's patched git, first on the agent's PATH.
-    store_bin: Option<Utf8PathBuf>,
-    view_path: Option<OsString>,
     state: tokio::sync::Mutex<NsState>,
 }
 
@@ -116,13 +113,8 @@ impl Namespace {
             workset.id()
         );
         let store_environment = owner.store_environment();
-        let store_bin = owner.store_bin();
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
-        let view_path = matches!(&mode, Mode::View { .. })
-            .then(|| filtered_view_path(&environment, &path_overrides))
-            .transpose()?
-            .flatten();
         Ok(Arc::new(Self {
             workset,
             mode,
@@ -131,8 +123,6 @@ impl Namespace {
             environment,
             path_overrides,
             store_environment,
-            store_bin,
-            view_path,
             state: tokio::sync::Mutex::new(NsState::default()),
         }))
     }
@@ -190,7 +180,6 @@ impl Namespace {
                 src: self.src.as_std_path().to_owned(),
                 store_root: owner.store_root().into_std_path_buf(),
                 store_socket: owner.store_socket().map(Utf8PathBuf::into_std_path_buf),
-                store_bin: owner.store_bin().map(Utf8PathBuf::into_std_path_buf),
             };
             // Own the temporary directory in the caller's host-root frame. If
             // it were created and dropped after pivot_root, cleanup would
@@ -397,22 +386,36 @@ impl Namespace {
         command.env_clear();
         match &self.mode {
             Mode::View { .. } => {
+                // The agent's own nix profile first, then the base userland
+                // (VIEW.md). Nothing of the host's PATH.
+                let home = crate::AGENT_HOME;
                 if let Some(value) = self.environment.get("TERM") {
                     command.env("TERM", value);
                 }
-                if let Some(path) = &self.view_path {
-                    command.env("PATH", path);
-                }
                 command
-                    .env("HOME", "/home/agent")
+                    .env(
+                        "PATH",
+                        format!("{home}/.nix-profile/bin:{}/bin", crate::AGENT_BASE),
+                    )
+                    .env("HOME", home)
                     .env("USER", "agent")
-                    .env("LOGNAME", "agent");
+                    .env("LOGNAME", "agent")
+                    .env("LANG", "C.UTF-8")
+                    .env("XDG_CACHE_HOME", format!("{home}/.cache"))
+                    .env("XDG_CONFIG_HOME", format!("{home}/.config"))
+                    .env("XDG_STATE_HOME", format!("{home}/.local/state"));
+                if Path::new(crate::layout::NIX_DAEMON_SOCKET).exists() {
+                    command.env("NIX_REMOTE", "daemon");
+                }
             }
             Mode::Exposed => {
+                // The user's environment, with Rho's git ahead of theirs.
                 command.envs(self.environment.0.iter().map(|(name, value)| (name, value)));
-                if let Some(path) = self.environment.get("PATH") {
-                    command.env("PATH", self.path_overrides.add_to(path));
-                }
+                let path = self
+                    .environment
+                    .get("PATH")
+                    .map(|path| self.path_overrides.add_to(path));
+                command.env("PATH", prepend_path(&crate::git_dir(), path.as_deref()));
             }
         }
         command.envs(
@@ -420,14 +423,6 @@ impl Namespace {
                 .iter()
                 .map(|(name, value)| (name, value)),
         );
-        if let Some(bin) = &self.store_bin {
-            let path = command
-                .as_std()
-                .get_envs()
-                .find_map(|(name, value)| (name == "PATH").then_some(value.map(OsStr::to_owned)))
-                .flatten();
-            command.env("PATH", prepend_path(bin.as_std_path(), path.as_deref()));
-        }
         for (name, value) in overrides {
             match value {
                 Some(value) => command.env(name, value),
@@ -533,32 +528,6 @@ fn prepend_path(bin: &Path, path: Option<&OsStr>) -> OsString {
         .unwrap_or_default();
     std::env::join_paths(std::iter::once(bin.to_owned()).chain(rest))
         .unwrap_or_else(|_| bin.as_os_str().to_owned())
-}
-
-fn filtered_view_path(
-    environment: &UserEnvironment,
-    overrides: &PathOverrides,
-) -> anyhow::Result<Option<OsString>> {
-    let Some(path) = environment.get("PATH") else {
-        return Ok(None);
-    };
-    let mut entries = Vec::new();
-    for entry in std::env::split_paths(&overrides.add_to(path)) {
-        let resolved = if entry.starts_with("/nix/store") {
-            entry
-        } else {
-            match entry.canonicalize() {
-                Ok(resolved) if resolved.starts_with("/nix/store") => resolved,
-                _ => continue,
-            }
-        };
-        if resolved.is_dir() && !entries.contains(&resolved) {
-            entries.push(resolved);
-        }
-    }
-    Ok(Some(
-        std::env::join_paths(entries).context("join filtered view PATH")?,
-    ))
 }
 
 /// The working directory a command starts in: `requested` as a visible

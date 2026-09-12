@@ -28,14 +28,31 @@ pub use layout::*;
 pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
 pub use rho_git_proto::{SOCKET_ENV, repo_name};
 
-/// Rho's patched git (`nix/patches/git-rho-store.patch`), fixed at build
-/// time: the keeper fetches with it, the daemon clones with it, and agents
-/// see it as `git`. Without the store socket in its environment it is
-/// plain git.
-pub const GIT: &str = env!(
-    "RHO_GIT",
-    "RHO_GIT must name Rho's patched git at build time"
+/// The agent's base userland (`VIEW.md`): a nix `buildEnv` fixed at build
+/// time whose `bin/` is the agent's PATH, after the agent's own nix
+/// profile. It holds Rho's patched git, the CA bundle and the pinned
+/// flake registry.
+pub const AGENT_BASE: &str = env!(
+    "RHO_AGENT_BASE",
+    "RHO_AGENT_BASE must name the agent base (flake.nix agentBase) at build time"
 );
+
+/// Rho's patched git (`nix/patches/git-rho-store.patch`): the keeper
+/// fetches with it, the daemon clones with it, and agents see it as `git`.
+/// Without the store socket in its environment it is plain git.
+pub const GIT: &str = concat!(env!("RHO_AGENT_BASE"), "/bin/git");
+
+/// The agent's home inside the view.
+pub const AGENT_HOME: &str = "/home/agent";
+
+/// The directory Rho's git really lives in, for exposed mode, whose PATH
+/// is the user's own with this first.
+pub fn git_dir() -> PathBuf {
+    std::fs::canonicalize(GIT)
+        .ok()
+        .and_then(|git| git.parent().map(Path::to_owned))
+        .unwrap_or_else(|| Path::new(AGENT_BASE).join("bin"))
+}
 pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
     WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
@@ -214,17 +231,6 @@ impl Worksets {
     /// The keeper's socket, when one runs.
     pub fn store_socket(&self) -> Option<Utf8PathBuf> {
         self.store.as_ref().map(|store| store.socket.clone())
-    }
-
-    /// The directory of Rho's patched git (`GIT`), when the keeper runs;
-    /// agents get it first on their PATH.
-    pub fn store_bin(&self) -> Option<Utf8PathBuf> {
-        self.store.as_ref().map(|_| {
-            Utf8Path::new(GIT)
-                .parent()
-                .expect("git has a directory")
-                .to_owned()
-        })
     }
 
     /// Environment that points the agent's git at the keeper.

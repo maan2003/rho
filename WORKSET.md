@@ -23,9 +23,9 @@ it on later requests (debounced, never in the background), and serves
 the same mirror to concurrent requests under one lock. Everything else —
 the daemon's own `Workset::clone_repo`, an agent's `git clone` and `git
 fetch` through Rho's patched git — is a client that reads a mirror.
-Agents get that git first on their PATH; the daemon finds it through
-`RHO_GIT` at build time (the flake sets it for nix and dev-shell builds) and
-mounts its directory read-only into the view. `Worksets::discard_workset`
+That git is part of the agent base (`VIEW.md`), the `buildEnv` whose
+path the daemon bakes in at build time (`RHO_AGENT_BASE`, set by the
+flake for nix and dev-shell builds). `Worksets::discard_workset`
 deletes the workset directory; mirrors are shared and never removed.
 
 Several agents can work in one workset: a child agent joins its parent's
@@ -72,8 +72,8 @@ a plain directory or file except a handful of real mounts:
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
 - `/src`: the workset directory, read-write. The command starts here.
-- The mirror store root and Rho's git directory, read-only, and the
-  keeper's socket, at the same absolute paths they have on the host.
+- The mirror store root, read-only, and the keeper's socket, at the
+  same absolute paths they have on the host.
   Clones record the store by absolute path (git alternates), so the
   path must not change between the daemon's frame and the agent's.
 - The directory holding the daemon's own executable, read-only at its
@@ -81,11 +81,13 @@ a plain directory or file except a handful of real mounts:
   then launch its sibling sidecars (`rho-shell`, `rho-pager`). A nix
   build adds nothing.
 
-The environment is an explicit allowlist (PATH filtered to `/nix/store`
-entries with Rho's git directory first, TERM, plus HOME/USER/LOGNAME)
-and `RHO_GIT_STORE_SOCKET` pointing git at the keeper; variables the
-caller sets on the command survive in both modes, and inherited fds are
-closed on exec.
+The environment is an explicit allowlist: PATH is the agent's nix
+profile then the base (`VIEW.md`), plus TERM, HOME/USER/LOGNAME, LANG,
+the XDG directories, `NIX_REMOTE=daemon` when the host has a nix daemon
+and `RHO_GIT_STORE_SOCKET` pointing git at the keeper. Exposed mode
+passes the user's environment through with Rho's git first on PATH.
+Variables the caller sets on the command survive in both modes, and
+inherited fds are closed on exec.
 
 `Namespace::set_claude_home` mounts an agent's Claude Code home over its
 `~/.claude` inside the live namespace: the per-account state directory,

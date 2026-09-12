@@ -3,8 +3,8 @@
 //! need no client: the `git` in their view is Rho's patched git
 //! (`nix/patches/git-rho-store.patch`), which asks the keeper itself on every
 //! fetch and clone of a remote URL when `RHO_GIT_STORE_SOCKET` is set. The
-//! end-to-end tests in `tests/` drive that git (the build's `RHO_GIT`)
-//! against a live keeper.
+//! end-to-end tests in `tests/` drive that git (from the build's
+//! `RHO_AGENT_BASE`) against a live keeper.
 //!
 //! A clone born here is an ordinary git repository whose `origin` is the
 //! real remote URL, so `git remote -v`, `git push` and any tooling see

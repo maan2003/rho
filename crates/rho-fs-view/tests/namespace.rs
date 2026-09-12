@@ -141,13 +141,19 @@ async fn run() {
     let store = only_store(temp.path());
     let with_store = format!(
         r#"
-test "$(command -v git)" = {bin}/git
+test "$(command -v git)" = {base}/bin/git
+test "$(command -v env)" = {base}/bin/env
+/bin/sh -c true
+/usr/bin/env true
+test -f /etc/ssl/certs/ca-certificates.crt
+test -f /etc/nix/registry.json
+test "$XDG_STATE_HOME" = /home/agent/.local/state
 git clone -q -- {remote} second
 test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
 git -C /src/second fetch -q
-if touch {bin}/x 2>/dev/null; then echo "git dir is writable"; exit 1; fi
+if touch {base}/bin/x 2>/dev/null; then echo "base is writable"; exit 1; fi
 "#,
-        bin = root.store_bin().unwrap(),
+        base = rho_fs_view::AGENT_BASE,
         store = store.display(),
     );
     let script = format!(

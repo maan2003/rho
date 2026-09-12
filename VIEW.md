@@ -32,18 +32,23 @@ security boundary (see `WORKSET.md`); it is a distribution.
    reading the generator, not by diffing two users' laptops. It also
    keeps the user's own config free to be as personal as they like.
 
-2. **The userland is a declared program list.** Rho names the tools an
-   agent gets (coreutils, bash, Rho's patched git, direnv, nix, ripgrep,
-   fd, just, python3, uv, node, …) and presents them as one directory
-   mounted at `/usr`, with `/bin` pointing at it and `PATH=/usr/bin`. A
-   nix build of Rho produces that directory as a `buildEnv`; a
-   cargo-built daemon assembles the same set at start by resolving each
-   name on the host and symlinking the store paths into a tmpfs.
-   *Why:* today PATH is the daemon's login shell PATH filtered to store
-   entries, which is a heuristic over the user's profile. A list is
-   explicit, the same for everyone, and gives `/bin/sh` and
-   `/usr/bin/env` — which build scripts, `just` and every shebang
-   need — for free.
+2. **The userland is a base plus a profile, both nix.** Rho names the
+   tools every agent gets (coreutils, bash, Rho's patched git, direnv,
+   nix, ripgrep, fd, just, python3, uv, node, …) as one `buildEnv` in
+   the flake, `agentBase`, whose path is baked into the daemon at build
+   time (`RHO_AGENT_BASE`). Anything else an agent wants it installs
+   itself with `nix profile add nixpkgs#…` into a profile in its
+   home, which is first on PATH:
+   `PATH=/home/agent/.nix-profile/bin:<base>/bin`. The profile lives on
+   the home tmpfs and evaporates with the agent; reinstalling is one
+   command. There is no `/usr` tree: `/bin/sh` and `/usr/bin/env`, the
+   two paths scripts hardcode, are symlinks into the base and that is
+   all. `nixpkgs` in the agent's flake registry is pinned to the
+   revision Rho is built from, so installs share the base's closure and
+   never ask what is newest.
+   *Why:* an explicit list is the same for everyone and reproducible;
+   a profile lets an agent add a tool without anyone editing the list;
+   and nothing is built at runtime, on tmpfs or anywhere else.
 
 3. **The project environment comes from the repository, evaluated by
    direnv under Rho's configuration.** `.envrc` is the contract; direnv
@@ -150,59 +155,49 @@ security boundary (see `WORKSET.md`); it is a distribution.
 
 | Path | Contents |
 | --- | --- |
-| `/usr` (`/bin` → `/usr/bin`) | the declared userland, read-only |
+| `<base>` | the agent base, a store path already under `/nix/store` |
 | `/nix/store` | host store, read-only |
 | `/nix/var/nix/daemon-socket` | host nix daemon socket |
 | `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `gitconfig`, `rho/direnv/`, `bashrc`, `profile` |
 | `/home/agent` | empty tmpfs; `~/.cache` is the shared persistent cache; `~/.claude` is the Claude home stack |
 | `/src` | the workset, read-write |
-| `<state>/stores`, `<state>/bin`, `<state>/store.sock` | at host paths: mirrors and Rho's git read-only, the keeper's socket |
+| `<state>/stores`, `<state>/store.sock` | at host paths: mirrors read-only, the keeper's socket |
+| `/nix/var/nix/daemon-socket/socket` | the nix daemon, when the host has one (`NIX_REMOTE=daemon`) |
+| `/bin/sh`, `/usr/bin/env` | symlinks into the base |
 | `<state>/worksets/<id>/state` | at its host path, read-write: direnv layout and GC roots |
 | `/proc`, `/dev`, `/tmp` | as today |
 
 ## Environment
 
-`PATH=/usr/bin`; `HOME`, `USER`, `LOGNAME`; `TERM`, `TZ`, `COLORTERM`;
-`LANG=C.UTF-8`; `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`;
-`NIX_REMOTE=daemon`; `DIRENV_CONFIG=/etc/rho/direnv`;
+Today: `PATH=/home/agent/.nix-profile/bin:<base>/bin`; `HOME`, `USER`,
+`LOGNAME`; `TERM`; `LANG=C.UTF-8`; `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME` under the home; `NIX_REMOTE=daemon` when the host has
+a nix daemon; `RHO_GIT_STORE_SOCKET`. Variables the caller sets on a
+command survive.
+Still to come: `TZ`, `COLORTERM`; `DIRENV_CONFIG=/etc/rho/direnv`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*`, `GIT_COMMITTER_*`;
-`RHO_GIT_STORE_SOCKET`; `INSIDE_AGENT=1`;
-`CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the shared cache.
-Variables the caller sets on a command survive, as today.
+`INSIDE_AGENT=1`; `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the
+shared cache.
 
 ## Where it lives
 
-The distro is its own crate, `rho-agent-distro`, and the boundary is
-image versus runtime:
+All of it is `rho-fs-view`, in two places:
 
-- `rho-agent-distro` builds an **image** in a caller-provided directory on
-  tmpfs: a directory tree plus an environment manifest. It resolves the program list into `usr/`,
-  writes every generated `/etc` file (nix.conf, gitconfig, the direnv
-  configuration and `direnvrc`, bashrc and profile) and lists the
-  variables. It knows nothing about namespaces or mounts, so it is
-  tested with plain file assertions, and a nix build of Rho can run it
-  as a derivation step to produce the static part of the image.
-- `rho-fs-view` is the **runtime**: it takes an image and mounts it,
-  then adds what only the running daemon knows (passwd with the real
-  uid, resolv.conf, the user's identity, state-root paths) and what is
-  per agent (the workset at `/src`, the store, the Claude home, the
-  working directory). The `/etc` generation and PATH filtering in its
-  `layout.rs` today move to the distro crate.
+- `flake.nix` declares the base: `agentBase`, a `buildEnv` of the
+  program list plus the CA bundle and the pinned registry. The nix build
+  and the dev shell both hand its path to the daemon as
+  `RHO_AGENT_BASE`, read with `env!` so a daemon cannot be built without
+  one.
+- `layout.rs` builds the view per agent: the root tmpfs, the two shebang
+  links, the generated `/etc` (passwd with the real uid, resolv.conf and
+  localtime from the host, the CA bundle and registry from the base,
+  nix.conf), the home with its XDG directories, and the mounts (`/src`,
+  the store, the sockets). `ns.rs` sets the environment above.
 
-The image builder is implemented in `crates/rho-agent-distro`. A future Nix
-derivation can put the declared programs on `PATH` and invoke its binary in
-the build step with a staging directory plus the nix-direnv and CA-certificate
-package paths. At runtime the daemon calls the same builder with a freshly
-mounted tmpfs directory.
-
-Three things change at three different times — the image at build
-time, the daemon-level pieces at daemon start, the agent-level pieces
-per agent — and keeping them in separate layers is what keeps the image
-reproducible.
+Nothing is assembled at daemon start and nothing is persisted: the
+base is a store path, and the rest is a few files per agent.
 
 ## Later, enabled by this layout
 
 - Evaluate `.envrc` in the background right after a clone, so the first
   agent command does not pay for the evaluation.
-- Pin the flake registry Rho was built with, so `nix run nixpkgs#…`
-  is offline-friendly and deterministic.

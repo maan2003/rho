@@ -60,6 +60,38 @@
           # rho's rho-git-client tests do.
           doInstallCheck = false;
         });
+
+        # The agent's base userland: one store path whose bin/ is the
+        # agent's PATH (VIEW.md). Agents add to it with `nix profile`.
+        agentRegistry = pkgs.writeTextDir "etc/nix/registry.json" (builtins.toJSON {
+          version = 2;
+          flakes = [{
+            from = { type = "indirect"; id = "nixpkgs"; };
+            to = {
+              type = "path";
+              path = nixpkgs.outPath;
+              inherit (nixpkgs) narHash lastModified;
+            } // (if nixpkgs ? rev then { inherit (nixpkgs) rev; } else { });
+            exact = true;
+          }];
+        });
+        agentBase = pkgs.buildEnv {
+          name = "rho-agent-base";
+          # NixOS's core and default system packages (nixos/modules/config/
+          # system-path.nix), minus what has no meaning in a view (acl,
+          # attr, libcap, mkpasswd, su, libc) and with findutils replaced by
+          # Rho's fork (find with deny roots); then Rho's own list (VIEW.md).
+          paths = [ rhoGit findutils ] ++ (with pkgs; [
+            bashInteractive bzip2 coreutils-full cpio curl diffutils gawk
+            getent getconf gnugrep gnupatch gnused gnutar gzip xz less
+            ncurses netcat procps time util-linux which zstd
+            perl rsync strace
+            openssh
+            direnv nix-direnv nix
+            ripgrep fd just python3 uv nodejs
+            cacert agentRegistry
+          ]);
+        };
         findutils = pkgs.rustPlatform.buildRustPackage {
           pname = "findutils";
           version = "0.9.2";
@@ -220,7 +252,7 @@
               env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${rhoGit}/libexec/git-core/git-remote-http";
-              env.RHO_GIT = "${rhoGit}/bin/git";
+              env.RHO_AGENT_BASE = "${agentBase}";
               env.RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
               env.RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
               env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
@@ -403,7 +435,7 @@
             ;
         };
 
-        legacyPackages = multiBuild // { inherit rhoGit; };
+        legacyPackages = multiBuild // { inherit rhoGit agentBase; };
 
         devShells = flakeboxLib.mkShells {
           channel = "latest";
@@ -412,7 +444,7 @@
           ];
           NEXTEST_SHOW_PROGRESS = "none";
           RHO_LOG = "rho_agent=debug,info";
-          RHO_GIT = "${rhoGit}/bin/git";
+          RHO_AGENT_BASE = "${agentBase}";
           RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
           RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
           RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";

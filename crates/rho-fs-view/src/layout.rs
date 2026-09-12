@@ -19,9 +19,9 @@ use anyhow::{Context as _, bail, ensure};
 pub const MOUNT_ROOT: &str = "/src";
 
 /// What a namespace mounts: the workset directory at the visible root, and
-/// the mirror store root, its keeper's socket and Rho's git at
-/// their host paths, so the absolute paths clones record (alternates) and
-/// the environment names hold inside.
+/// the mirror store root and its keeper's socket at their host paths, so
+/// the absolute paths clones record (alternates) and the environment
+/// names hold inside.
 #[derive(Clone, Debug)]
 pub struct Mounts {
     /// The workset directory, mounted read-write at the visible root.
@@ -30,27 +30,25 @@ pub struct Mounts {
     pub store_root: PathBuf,
     /// The keeper's socket, mounted at its own host path.
     pub store_socket: Option<PathBuf>,
-    /// The directory of Rho's patched git, mounted read-only at its
-    /// own host path.
-    pub store_bin: Option<PathBuf>,
 }
+
+/// The nix daemon's socket; bound into the view when the host has one, and
+/// `NIX_REMOTE=daemon` then points the agent's nix at it.
+pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
 /// Host-derived files captured before the namespace is constructed.
 #[derive(Clone, Debug)]
 pub struct HostEtc {
     pub resolv_conf: Vec<u8>,
-    pub ssl_cert_file: Option<PathBuf>,
     pub localtime: Option<PathBuf>,
 }
 
 impl HostEtc {
     pub fn discover() -> anyhow::Result<Self> {
         let resolv_conf = fs::read("/etc/resolv.conf").context("read host /etc/resolv.conf")?;
-        let ssl_cert_file = resolve_store_path("/etc/ssl/certs/ca-certificates.crt")?;
         let localtime = resolve_store_path("/etc/localtime")?;
         Ok(Self {
             resolv_conf,
-            ssl_cert_file,
             localtime,
         })
     }
@@ -78,6 +76,9 @@ pub struct FsViewConfig {
     pub home_skeleton: Option<PathBuf>,
     pub mounts: Mounts,
     pub host_etc: HostEtc,
+    /// The base userland (`crate::AGENT_BASE`): shebang targets, the CA
+    /// bundle and the flake registry come from it.
+    pub base: PathBuf,
     /// The directory holding this process's own executable when it lies
     /// outside `/nix/store` (a cargo build), bound read-only at its host
     /// path so a development daemon can launch its sibling sidecars.
@@ -90,6 +91,7 @@ impl FsViewConfig {
             home_skeleton: None,
             mounts,
             host_etc: HostEtc::discover()?,
+            base: PathBuf::from(crate::AGENT_BASE),
             own_binaries: own_binaries_dir()?,
         })
     }
@@ -172,15 +174,11 @@ fn validate_mounts(set: &Mounts) -> anyhow::Result<()> {
         "workset directory is missing: {}",
         set.src.display()
     );
-    for (what, path) in [("store root", &set.store_root)]
-        .into_iter()
-        .chain(
-            set.store_socket
-                .iter()
-                .map(|socket| ("store socket", socket)),
-        )
-        .chain(set.store_bin.iter().map(|bin| ("store bin", bin)))
-    {
+    for (what, path) in [("store root", &set.store_root)].into_iter().chain(
+        set.store_socket
+            .iter()
+            .map(|socket| ("store socket", socket)),
+    ) {
         ensure!(
             path.is_absolute(),
             "{what} must be an absolute path: {}",
@@ -253,6 +251,8 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     for dir in [
         "nix/store",
         "etc",
+        "bin",
+        "usr/bin",
         "home/agent",
         "tmp",
         "proc",
@@ -263,6 +263,18 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(root.join(dir)).with_context(|| format!("create /{dir}"))?;
     }
     bind(Path::new("/nix/store"), &root.join("nix/store"), true)?;
+    // The nix daemon's socket, so `nix` in the view builds through it.
+    let nix_socket = Path::new(NIX_DAEMON_SOCKET);
+    if nix_socket.exists() {
+        let target = host_path_in(root, nix_socket);
+        fs::create_dir_all(target.parent().expect("socket has a directory"))?;
+        fs::File::create(&target).context("create nix daemon socket mount point")?;
+        bind(nix_socket, &target, false)?;
+    }
+    // Shebang targets: the two paths scripts hardcode. Everything else on
+    // PATH comes from the base and the agent's profile.
+    symlink(config.base.join("bin/sh"), root.join("bin/sh")).context("link /bin/sh")?;
+    symlink(config.base.join("bin/env"), root.join("usr/bin/env")).context("link /usr/bin/env")?;
     if let Some(dir) = &config.own_binaries {
         let target = host_path_in(root, dir);
         fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
@@ -276,6 +288,12 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     fs::set_permissions(root.join("home/agent"), fs::Permissions::from_mode(0o700))?;
     if let Some(skeleton) = &config.home_skeleton {
         copy_tree(skeleton, &root.join("home/agent"))?;
+    }
+    // The XDG directories the environment names; some tools fail rather
+    // than create them.
+    for dir in [".config", ".local/state", ".local/share"] {
+        fs::create_dir_all(root.join("home/agent").join(dir))
+            .with_context(|| format!("create ~/{dir}"))?;
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
@@ -302,12 +320,24 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         etc.join("nsswitch.conf"),
         "passwd: files\ngroup: files\nhosts: files dns\n",
     )?;
-    if let Some(cert) = &config.host_etc.ssl_cert_file {
+    let ca_bundle = config.base.join("etc/ssl/certs/ca-bundle.crt");
+    if ca_bundle.exists() {
         fs::create_dir_all(etc.join("ssl/certs"))?;
-        symlink(cert, etc.join("ssl/certs/ca-certificates.crt"))?;
+        symlink(ca_bundle, etc.join("ssl/certs/ca-certificates.crt"))?;
     }
     if let Some(localtime) = &config.host_etc.localtime {
         symlink(localtime, etc.join("localtime"))?;
+    }
+    fs::create_dir_all(etc.join("nix"))?;
+    fs::write(
+        etc.join("nix/nix.conf"),
+        "experimental-features = nix-command flakes\n",
+    )?;
+    // `nixpkgs` pinned to the revision Rho is built from, so installs
+    // share the base's closure and need no lookup of what is newest.
+    let registry = config.base.join("etc/nix/registry.json");
+    if registry.exists() {
+        symlink(registry, etc.join("nix/registry.json"))?;
     }
     Ok(())
 }
@@ -416,8 +446,8 @@ fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Res
 }
 
 /// Mounts a validated workset below `root` in the current mount namespace:
-/// the workset directory at [`MOUNT_ROOT`], the store root and Rho's git
-/// directory read-only at their host paths, and the socket at its host path.
+/// the workset directory at [`MOUNT_ROOT`], the store root read-only at its
+/// host path, and the socket at its host path.
 pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
     validate_mounts(set)?;
     bind(&set.src, &mount_root(root), false)?;
@@ -434,11 +464,6 @@ pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
                 .with_context(|| format!("create socket mount point {}", target.display()))?;
         }
         bind(socket, &target, false)?;
-    }
-    if let Some(bin) = &set.store_bin {
-        let target = host_path_in(root, bin);
-        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-        bind(bin, &target, true)?;
     }
     Ok(())
 }

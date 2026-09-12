@@ -51,11 +51,14 @@ pub fn push_commit(source: &Path, content: &str) -> String {
     git(source, &["rev-parse", "HEAD"]).trim().to_owned()
 }
 
-/// Rho's patched git, the one this build was made with.
+/// Rho's patched git, from the agent base this build was made with.
 pub fn patched_git() -> PathBuf {
-    PathBuf::from(env!(
-        "RHO_GIT",
-        "RHO_GIT must name Rho's patched git at build time"
+    PathBuf::from(concat!(
+        env!(
+            "RHO_AGENT_BASE",
+            "RHO_AGENT_BASE must name the agent base at build time"
+        ),
+        "/bin/git"
     ))
 }
 

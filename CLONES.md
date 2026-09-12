@@ -20,7 +20,7 @@ It is three small crates under `crates/rho-git/` and one patch to git:
 - `nix/patches/git-rho-store.patch`: Rho's git. Its `clone` and `fetch`
   ask the keeper for the mirror themselves, so every path into a fetch
   is covered by construction. The flake builds it as `rhoGit`; the
-  daemon bakes its path in at build time (`RHO_GIT` in the flake).
+  daemon reaches it through the agent base (`RHO_AGENT_BASE`, VIEW.md).
 
 ## It is a cache, not a workflow
 
