@@ -115,8 +115,8 @@ async fn worksets_clone_through_the_mirror_store() {
         "the first clone's own edits are untouched"
     );
 
-    // Checking out a revision detaches or follows a branch as git does; an
-    // empty revision is the clone as born.
+    // Checking out a revision always detaches, a branch name included; an
+    // empty revision detaches where the clone was born.
     let first_commit = git(&source, &["rev-parse", "main~1"]);
     second_workset
         .checkout(&second, &first_commit)
@@ -127,11 +127,13 @@ async fn worksets_clone_through_the_mirror_store() {
         first_commit
     );
     second_workset.checkout(&second, "main").await.unwrap();
+    assert_eq!(git(second.as_std_path(), &["branch", "--show-current"]), "");
     assert_eq!(
-        git(second.as_std_path(), &["branch", "--show-current"]),
-        "main"
+        git(second.as_std_path(), &["rev-parse", "HEAD"]),
+        git(&source, &["rev-parse", "main"])
     );
     second_workset.checkout(&second, "").await.unwrap();
+    assert_eq!(git(second.as_std_path(), &["branch", "--show-current"]), "");
     assert!(second_workset.checkout(&second, "nope").await.is_err());
     assert!(second_workset.checkout(&second, "--orphan").await.is_err());
 

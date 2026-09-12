@@ -525,20 +525,21 @@ impl Workset {
 
     /// Checks out `rev` (a branch, tag or commit, as `git checkout` takes
     /// it) in the repository at `checkout`, a host directory inside the
-    /// workset. An empty `rev` leaves the clone as born, on the remote's
-    /// default branch.
+    /// workset, always detached: an agent starts on a commit, and any
+    /// branch is one it makes itself. An empty `rev` detaches where the
+    /// clone was born, the remote's default branch.
     pub async fn checkout(&self, checkout: &Utf8Path, rev: &str) -> anyhow::Result<()> {
         let rev = rev.trim();
-        if rev.is_empty() {
-            return Ok(());
-        }
         anyhow::ensure!(!rev.starts_with('-'), "not a revision: {rev}");
         let owner = self.owner()?;
         let _guard = self.0.operation_lock.lock().await;
         let mut command = owner.command("git");
         command
             .current_dir(checkout)
-            .args(["checkout", "--quiet", rev]);
+            .args(["checkout", "--quiet", "--detach"]);
+        if !rev.is_empty() {
+            command.arg(rev);
+        }
         run(command, &format!("check out {rev}")).await
     }
 
