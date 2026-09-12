@@ -69,13 +69,13 @@ impl ClaudeAgent {
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let crate::StartPlace { view, info, .. } = start;
+        let crate::StartPlace { view, place, .. } = start;
         let session_id = Uuid::new_v4();
         write.create_agent(
             UnixMillis::now(),
             agent_id,
             display_name,
-            vec![info],
+            place,
             role,
             mode,
             AgentRuntime::Claude { session_id },
@@ -148,7 +148,7 @@ impl ClaudeAgent {
                 anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
             })?;
         let python_mode = record.config.binding.claude_python();
-        let primary_repo = record.primary_workdir().repo().to_owned();
+        let primary_repo = record.place().cwd.clone();
         // The transcript's rows come from the file when the loop starts
         // (`sync_transcript`); a load reads the file only to settle a
         // rewind that was cut short.

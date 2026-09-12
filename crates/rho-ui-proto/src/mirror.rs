@@ -13,7 +13,7 @@ use camino::Utf8PathBuf;
 use rho_core::{AgentId, AgentRole, MessageDelivery, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::WorkspaceInfo;
+use crate::Place;
 
 /// A position in one agent's log: dense, starting at zero with the
 /// agent's creation, never reused. A rewind is told at a new position
@@ -183,7 +183,7 @@ pub enum MirrorEvent {
     Created {
         role: AgentRole,
         runtime: RuntimeKind,
-        workdirs: Vec<WorkspaceInfo>,
+        place: Place,
         spawned_by: SpawnedBy,
         spawn_name: Option<String>,
         parent: Option<AgentId>,
@@ -198,13 +198,10 @@ pub enum MirrorEvent {
         model: Option<String>,
         at: UnixMs,
     },
-    WorkdirAdded {
-        workdir: WorkspaceInfo,
-        at: UnixMs,
-    },
-    /// The first workdir replaced by a workset (`rho debug migrate-agent`).
-    WorkdirMigrated {
-        workdir: WorkspaceInfo,
+    /// Something Rho has to tell the agent, carried by its next user
+    /// message: what a migration did to its place, say.
+    Notice {
+        text: String,
         at: UnixMs,
     },
     /// The person or another agent spoke. Queued until a later `Sent`
@@ -292,8 +289,7 @@ impl MirrorEvent {
         match self {
             Self::Created { at, .. }
             | Self::RoleChanged { at, .. }
-            | Self::WorkdirAdded { at, .. }
-            | Self::WorkdirMigrated { at, .. }
+            | Self::Notice { at, .. }
             | Self::Message { at, .. }
             | Self::CompactionRequested { at }
             | Self::QueueCleared { at }

@@ -17,7 +17,7 @@ use rho_core::{
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
-pub use rho_fs_view::{WorksetMode, WorkspaceInfo};
+pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::db::{
@@ -171,7 +171,7 @@ pub enum AgentEvent<'a> {
         role: AgentRole,
         binding: SessionBinding,
         runtime: AgentRuntime,
-        workdirs: Vec<WorkspaceInfo>,
+        place: Place,
         spawned_by: AgentSpawnedBy,
         spawn_name: Option<String>,
         created_at: rho_core::UnixMs,
@@ -186,15 +186,16 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
+    /// Written by nothing since worksets; read so a log that has one
+    /// still folds (it changes nothing).
     WorkdirAdded {
-        workdir: WorkspaceInfo,
         #[senax(default)]
         at: UnixMs,
     },
-    /// The agent's first workdir replaced by a workset, by `rho debug
-    /// migrate-agent`: an agent that predates worksets moved into one.
-    WorkdirMigrated {
-        workdir: WorkspaceInfo,
+    /// Something Rho has to tell the agent, carried ahead of its next user
+    /// message and then done: what a migration did to its place, say.
+    Notice {
+        text: Cow<'a, str>,
         #[senax(default)]
         at: UnixMs,
     },
@@ -594,7 +595,7 @@ pub type View = rho_fs_view::Namespace;
 #[derive(Clone)]
 pub struct StartPlace {
     pub(crate) view: Arc<lazy::Lazy<Arc<View>>>,
-    pub info: WorkspaceInfo,
+    pub place: Place,
     pub owned_workset: Option<String>,
 }
 
@@ -602,7 +603,7 @@ impl StartPlace {
     /// A start in `view`; `origin` is what was cloned to make its workset,
     /// when this creation cloned it.
     pub fn new(view: Arc<View>, origin: Option<camino::Utf8PathBuf>) -> Self {
-        let info = WorkspaceInfo::Workset {
+        let place = Place {
             workset: view.workset().id().to_owned(),
             cwd: view.cwd().to_owned(),
             mode: view.workset_mode(),
@@ -610,31 +611,29 @@ impl StartPlace {
         };
         Self {
             view: Arc::new(lazy::Lazy::ready(view)),
-            info,
+            place,
             owned_workset: None,
         }
     }
 
     /// A start whose view `place` makes on first use (and again on the
-    /// next use if it failed): the workset named by `info` exists, the
+    /// next use if it failed): the workset the place names exists, the
     /// checkout in it may not yet.
-    pub fn pending<F, Fut>(info: WorkspaceInfo, place: F) -> Self
+    pub fn pending<F, Fut>(place: Place, view: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = anyhow::Result<Arc<View>>> + Send + 'static,
     {
         Self {
-            view: Arc::new(lazy::Lazy::new(place)),
-            info,
+            view: Arc::new(lazy::Lazy::new(view)),
+            place,
             owned_workset: None,
         }
     }
 
     /// Marks the workset as made by this creation.
     pub fn owning_workset(mut self) -> Self {
-        if let WorkspaceInfo::Workset { workset, .. } = &self.info {
-            self.owned_workset = Some(workset.clone());
-        }
+        self.owned_workset = Some(self.place.workset.clone());
         self
     }
 }
@@ -754,7 +753,7 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
             | AgentEvent::WorkdirAdded { .. }
-            | AgentEvent::WorkdirMigrated { .. }
+            | AgentEvent::Notice { .. }
             | AgentEvent::RuntimeRebound { .. } => None,
         })
         .collect()

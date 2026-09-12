@@ -73,9 +73,12 @@ mod tests {
         MirrorEvent::Created {
             role: rho_ui_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
-                repo: "/repo".into(),
-            }],
+            place: rho_ui_proto::Place {
+                workset: "0123456789ab".into(),
+                cwd: "/src/repo".into(),
+                mode: Default::default(),
+                origin: None,
+            },
             spawned_by: SpawnedBy::Direct,
             spawn_name: None,
             parent: None,

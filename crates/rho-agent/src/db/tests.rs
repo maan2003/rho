@@ -1,6 +1,6 @@
 use rho_core::{ContentPart, UnixMs};
 use rho_db::RhoDb;
-use rho_fs_view::WorkspaceInfo;
+use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
 
 use super::*;
@@ -106,7 +106,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         UnixMs(1),
         agent_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesSol(InferenceProfile::default()),
         AgentRuntime::Rho {
@@ -132,7 +132,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         UnixMs(1),
         claude_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ClaudeFable {
             effort: ClaudeEffort::High,
@@ -154,7 +154,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         UnixMs(1),
         opus_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ClaudeOpus {
             effort: ClaudeEffort::Medium,
@@ -176,7 +176,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         UnixMs(1),
         terra_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesTerra(InferenceProfile::default()),
         AgentRuntime::Rho {
@@ -196,7 +196,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         UnixMs(1),
         luna_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesLuna(InferenceProfile::default()),
         AgentRuntime::Rho {
@@ -455,8 +455,8 @@ fn event_text(event: &AgentEvent<'_>) -> String {
 }
 
 /// Tests exercise agent records only; any workspace info will do.
-pub(crate) fn test_workspace() -> WorkspaceInfo {
-    WorkspaceInfo::Workset {
+pub(crate) fn test_workspace() -> Place {
+    Place {
         workset: "0123456789ab".into(),
         cwd: "/src/rho".into(),
         mode: Default::default(),
@@ -484,7 +484,7 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
         UnixMs(1),
         agent_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         AgentRuntime::Claude {
@@ -524,7 +524,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         UnixMs(1),
         pm,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         AgentRole::default().session_profile().unwrap(),
         test_agent_runtime(),
@@ -535,7 +535,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         UnixMs(2),
         engineer,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         AgentRole::default().session_profile().unwrap(),
         test_agent_runtime(),
@@ -601,7 +601,7 @@ async fn agent_ids_allocate_before_records_exist() {
         UnixMs(2),
         agent_id,
         None,
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
@@ -610,10 +610,7 @@ async fn agent_ids_allocate_before_records_exist() {
     write.commit();
 
     let read = db.read();
-    assert_eq!(
-        read.get_agent(agent_id).config.workdirs,
-        vec![test_workspace()]
-    );
+    assert_eq!(read.get_agent(agent_id).config.place, test_workspace());
     assert_eq!(read.list_agents().len(), 1);
 }
 
@@ -649,7 +646,7 @@ fn create(
         UnixMs(1),
         agent_id,
         spawn_name.map(str::to_owned),
-        vec![test_workspace()],
+        test_workspace(),
         AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),

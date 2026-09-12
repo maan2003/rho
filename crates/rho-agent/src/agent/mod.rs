@@ -161,12 +161,12 @@ impl AgentHandle {
         // One transaction spans agent id allocation and the record write.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let StartPlace { view, info, .. } = start;
+        let StartPlace { view, place, .. } = start;
         write.create_agent(
             UnixMillis::now(),
             agent_id,
             display_name,
-            vec![info],
+            place,
             role,
             mode,
             AgentRuntime::Rho { prompt_cache_key },

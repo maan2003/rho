@@ -1,153 +1,102 @@
-//! Moving an agent that predates worksets into one, on the running
-//! daemon: the mirror store, the octo transport and the database are all
-//! the daemon's, so this is where a clone of the agent's repository can be
-//! made and its record appended to.
+//! One-off (13 Sep), the daemon's half of `rho-agent`'s move of agents
+//! from before worksets: the store's migration gives each such agent an
+//! empty workset by id, and the directory that id names is made here,
+//! where the state root is known. Remove with that migration.
 
-use anyhow::Context as _;
-use rho_agent::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
-use rho_fs_view::{WorksetMode, WorkspaceInfo};
+use std::sync::Arc;
 
-use crate::Services;
+use rho_agent::AgentEvent;
+use rho_agent::db::{AgentEventPos, AgentReadTxnExt as _};
+use rho_db::RhoDb;
+use rho_fs_view::Worksets;
 
-/// Runs a command to completion for its trimmed stdout.
-async fn output(mut command: tokio::process::Command) -> anyhow::Result<String> {
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("run {:?}", command.as_std()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{:?} failed ({}): {}",
-        command.as_std(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+/// Makes the directory of every agent's workset that has none. Returns
+/// how many were made; a second run makes none.
+pub(crate) async fn create_missing_worksets(
+    db: &RhoDb,
+    worksets: &Arc<Worksets>,
+) -> anyhow::Result<usize> {
+    // One row per agent, not a fold of every log: the place is in the
+    // creation and a migration is the only thing that changes it.
+    let worksets_named: Vec<String> = {
+        let read = db.read();
+        read.list_agent_ids()
+            .into_iter()
+            .filter_map(
+                |agent_id| match read.agent_event(agent_id, AgentEventPos::ZERO)? {
+                    AgentEvent::Created { place, .. } => Some(place.workset),
+                    _ => None,
+                },
+            )
+            .collect()
+    };
+    let mut made = 0;
+    for workset in worksets_named {
+        if worksets.ensure_workset(&workset).await? {
+            made += 1;
+        }
+    }
+    Ok(made)
 }
 
-/// Clones the repository's origin into a new workset, fetches the old jj
-/// workspace's commits from the shared git store without materializing
-/// anything, checks out the working copy's parent (detached) with the
-/// working copy's changes staged, appends a `WorkdirMigrated` event that
-/// replaces the agent's first workdir, and drops the loaded agent so its
-/// next load reads the new place. The old workspace is left as it is.
-/// Returns what was done, for a person.
-pub(crate) async fn migrate_agent(
-    services: &Services,
-    agent: &str,
-    origin: Option<String>,
-    mode: WorksetMode,
-) -> anyhow::Result<String> {
-    let agent_id = services.resolve_display_agent_id(agent).await?;
-    let head = services.db.read().get_agent(agent_id);
-    let (repo, workspace) = match head.config.workdirs.first() {
-        Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }) => {
-            (repo.clone(), format!("ws-{}", id.encoded()))
+#[cfg(test)]
+mod tests {
+    use rho_agent::AgentEvent;
+    use rho_agent::db::{
+        AgentRole, AgentRuntime, AgentSpawnedBy, AgentWriteTxnExt as _, SessionBinding,
+    };
+    use rho_core::UnixMs;
+    use rho_fs_view::{Place, WorksetMode};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_place_without_a_directory_gets_one_once() {
+        let root = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(root.path().join("rho.redb"));
+        {
+            let mut write = db.write().await;
+            write.init_agent_tables();
+            write.commit();
         }
-        Some(WorkspaceInfo::Workset { workset, .. }) => {
-            anyhow::bail!("{agent} is already in workset {workset}")
+        let worksets = Worksets::open(
+            root.path().join("state"),
+            rho_fs_view::UserEnvironment::new(Default::default()),
+            Default::default(),
+            rho_fs_view::StoreService::None,
+        )
+        .await
+        .unwrap();
+        {
+            let mut write = db.write().await;
+            let agent_id = write.alloc_agent_id();
+            write.append_agent_event(
+                agent_id,
+                &AgentEvent::Created {
+                    role: AgentRole::default(),
+                    binding: SessionBinding::ClaudeFable {
+                        effort: rho_agent::db::ClaudeEffort::High,
+                    },
+                    runtime: AgentRuntime::Claude {
+                        session_id: uuid::Uuid::new_v4(),
+                    },
+                    place: Place {
+                        workset: "0123456789ab".into(),
+                        cwd: "/src".into(),
+                        mode: WorksetMode::Exposed,
+                        origin: None,
+                    },
+                    spawned_by: AgentSpawnedBy::Direct,
+                    spawn_name: None,
+                    created_at: UnixMs(1),
+                    parent: None,
+                },
+            );
+            write.commit();
         }
-        Some(WorkspaceInfo::UserCheckout { repo }) => {
-            anyhow::bail!("{agent} works in the user's own checkout {repo}; nothing to migrate")
-        }
-        None => anyhow::bail!("{agent} has no working directory"),
-    };
-    let worksets = services.pool.worksets();
-
-    // The old workspace's commits, read from the repository without
-    // materializing (or snapshotting) any checkout.
-    let jj = |args: &[&str]| {
-        let mut command = worksets.command("jj");
-        command
-            .arg("-R")
-            .arg(&repo)
-            .arg("--ignore-working-copy")
-            .args(args);
-        command
-    };
-    let log =
-        |revset: String, template: &str| jj(&["log", "--no-graph", "-r", &revset, "-T", template]);
-    let tip = output(log(format!("{workspace}@"), "commit_id")).await?;
-    let base = output(log(format!("{workspace}@-"), "commit_id")).await?;
-    anyhow::ensure!(
-        tip.len() == 40 && base.len() == 40,
-        "{workspace} in {repo} does not resolve to one working-copy commit and one parent"
-    );
-    let empty = output(log(format!("{workspace}@"), r#"if(empty, "1", "0")"#)).await? == "1";
-    let description = output(log(format!("{workspace}@"), "description")).await?;
-    let git_dir = output(jj(&["git", "root"])).await?;
-    let origin = match origin {
-        Some(origin) => origin,
-        None => output(jj(&["git", "remote", "list"]))
-            .await?
-            .lines()
-            .find_map(|line| line.strip_prefix("origin "))
-            .map(|url| url.trim().to_owned())
-            .with_context(|| format!("{repo} has no origin remote; pass --origin"))?,
-    };
-    let name = repo
-        .file_name()
-        .with_context(|| format!("{repo} has no name"))?
-        .to_owned();
-
-    let workset = worksets.create().await?;
-    let checkout = workset.clone_repo(&origin, Some(&name)).await?;
-    let git = |args: &[&str]| {
-        let mut command = worksets.command(rho_fs_view::GIT);
-        command.current_dir(&checkout).args(args);
-        command
-    };
-    // Every commit the workspace had, straight from the shared git store:
-    // the working copy is a commit there too, and the parent comes with it.
-    output(git(&[
-        "-c",
-        "uploadpack.allowAnySHA1InWant=true",
-        "fetch",
-        "-q",
-        &git_dir,
-        &tip,
-    ]))
-    .await?;
-    output(git(&["checkout", "-q", "--detach", &base])).await?;
-    if !empty {
-        // Tip's tree in the index and working tree, HEAD at the parent:
-        // the working copy's changes, staged.
-        output(git(&["reset", "-q", "--hard", &tip])).await?;
-        output(git(&["reset", "-q", "--soft", &base])).await?;
+        assert!(worksets.open_workset("0123456789ab").await.is_err());
+        assert_eq!(create_missing_worksets(&db, &worksets).await.unwrap(), 1);
+        assert!(worksets.open_workset("0123456789ab").await.is_ok());
+        assert_eq!(create_missing_worksets(&db, &worksets).await.unwrap(), 0);
     }
-
-    let info = WorkspaceInfo::Workset {
-        workset: workset.id().to_owned(),
-        cwd: camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT).join(&name),
-        mode,
-        origin: Some(camino::Utf8PathBuf::from(&origin)),
-    };
-    let mut write = services.db.write().await;
-    write.append_agent_event(
-        agent_id,
-        &rho_agent::AgentEvent::WorkdirMigrated {
-            workdir: info,
-            at: rho_core::UnixMs::now(),
-        },
-    );
-    write.commit();
-    let unloaded = services.pool.unload(agent_id).await;
-
-    let mut report = format!(
-        "{agent}: {workspace} in {repo} -> workset {} at {checkout}\n  origin {origin}\n  mode {mode:?}\n  checked out {base}\n",
-        workset.id()
-    );
-    if !empty {
-        report.push_str(&format!("  working copy {tip} staged on top\n"));
-    }
-    if !description.trim().is_empty() {
-        report.push_str(&format!(
-            "  the working copy's description was not carried over:\n    {}\n",
-            description.trim().replace('\n', "\n    ")
-        ));
-    }
-    if unloaded {
-        report.push_str("  the loaded agent was dropped; reselect it to load the new place\n");
-    }
-    Ok(report)
 }

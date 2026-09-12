@@ -631,31 +631,27 @@ impl AgentMap {
 
     /// The directory the agent works in, as the agent sees it.
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
-        self.agent_workspace(agent_id)
-            .map(|workspace| workspace.repo().to_owned())
+        self.agent_place(agent_id).map(|place| place.cwd.clone())
     }
     /// What the agent's workset was cloned from: the thing a new agent
     /// started "like this one" clones again.
     pub fn agent_origin(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
-        self.agent_workspace(agent_id)
-            .and_then(|workspace| workspace.origin())
-            .map(ToOwned::to_owned)
+        self.agent_place(agent_id)
+            .and_then(|place| place.origin.clone())
     }
-    /// Every agent is created with at least one workdir, so an agent with
-    /// none is a creation that arrived malformed rather than an ordinary
-    /// state, and it reads as no workspace at all.
-    pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
+    /// Where the agent works.
+    pub fn agent_place(&self, agent_id: AgentId) -> Option<&rho_ui_proto::Place> {
         self.agent_identity(agent_id)
-            .and_then(|identity| identity.workspace())
+            .map(|identity| &identity.place)
+    }
+    /// The agent's place as a request names it (opening its files, its
+    /// diff, joining it).
+    pub fn agent_workspace(&self, agent_id: AgentId) -> Option<rho_ui_proto::WorkspaceInfo> {
+        self.agent_place(agent_id).map(|place| place.clone().into())
     }
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
-        let workspace = self.agent_workspace(agent_id)?;
-        if let Some(workset) = workspace.workset() {
-            return Some(format!("ws-{workset}"));
-        }
-        workspace
-            .workspace_id()
-            .map(|id| format!("ws-{}", id.encoded()))
+        self.agent_place(agent_id)
+            .map(|place| format!("ws-{}", place.workset))
     }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
         self.agent_identity(agent_id).map(|identity| identity.role)
@@ -861,9 +857,12 @@ mod tests {
         MirrorEvent::Created {
             role: rho_ui_proto::AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
-                repo: "/repo".into(),
-            }],
+            place: rho_ui_proto::Place {
+                workset: "0123456789ab".into(),
+                cwd: "/src/repo".into(),
+                mode: Default::default(),
+                origin: None,
+            },
             spawned_by: SpawnedBy::Direct,
             spawn_name: None,
             parent,

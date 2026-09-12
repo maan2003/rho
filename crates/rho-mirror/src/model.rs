@@ -464,7 +464,12 @@ mod tests {
             event: MirrorEvent::Created {
                 role: AgentRole::default(),
                 runtime: RuntimeKind::Claude,
-                workdirs: Vec::new(),
+                place: rho_ui_proto::Place {
+                    workset: "0123456789ab".into(),
+                    cwd: "/src/repo".into(),
+                    mode: Default::default(),
+                    origin: None,
+                },
                 spawned_by: SpawnedBy::Direct,
                 spawn_name: None,
                 parent: None,

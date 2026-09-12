@@ -42,17 +42,17 @@ one `Worksets` for its state root and hands the pool a `Workset` per
 agent; a directory outside the root can be adopted for one process
 (`Worksets::adopt`), which is how tests and `rho eval` work in place.
 
-Agents recorded before worksets (`WorkspaceInfo::Workspace`, a jj
-managed workspace) still load: their transcripts read, but they cannot
-run. `rho debug migrate-agent <agent>` asks the running daemon to move
-one into a workset: a clone of the repository's origin through the mirror
-store (the daemon's, since `octo://` remotes need its transport), checked
-out (detached) at the old workspace's parent commit with the working
-copy's changes staged, recorded as a `WorkdirMigrated` event at the tail
-of the agent's log, after which the loaded agent is dropped so its next
-load reads the new place. The agent is exposed unless `--mode view` says
-otherwise, since a jj workspace on the host was. The old workspace is
-left as it is.
+Every agent's record names one place: its workset, its working
+directory there, and its mode. Agents recorded before worksets (a jj
+managed workspace, or the user's own checkout) were moved into one by a
+one-hop migration of the store (`rho-agent/src/db/places.rs`): each got
+an empty workset, exposed since a checkout on the host was, and a
+`Notice` at the tail of its log saying where its old checkout is and how
+to bring its work over, which its next user message carries. Nothing is
+copied; the agent does the clone and the fetch itself, and the old
+workspace is left as it is. The daemon makes the directories those
+worksets name at startup (`rho-daemon/src/migrate.rs`). Both are to be
+removed once the databases of interest have run them.
 
 `Workset::enter(mode, cwd)` is one agent's `Namespace` over the
 directory: its mount namespace is built on the first command (so loading

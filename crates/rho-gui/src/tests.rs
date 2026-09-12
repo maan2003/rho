@@ -4030,7 +4030,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_ui_proto::WorkspaceInfo;
+    use rho_ui_proto::Place;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -4042,12 +4042,12 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
                 ready_with(
                     vec![story::UiAgentHead {
                         spawn_name: Some("worker".to_owned()),
-                        workdirs: vec![WorkspaceInfo::Workset {
+                        place: Place {
                             workset: "0123456789ab".to_owned(),
                             cwd: "/src/rho".into(),
                             mode: Default::default(),
                             origin: Some("/tmp/rho".into()),
-                        }],
+                        },
                         ..ui_head(agent_id)
                     }],
                     100,
@@ -7557,9 +7557,12 @@ fn ui_head(agent_id: AgentId) -> story::UiAgentHead {
         story_pos: story::UiStoryPos(0),
         role: rho_ui_proto::AgentRole::default(),
         runtime_kind: story::UiRuntimeKind::Rho,
-        workdirs: vec![rho_ui_proto::WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        }],
+        place: rho_ui_proto::Place {
+            workset: "0123456789ab".into(),
+            cwd: "/src/tmp".into(),
+            mode: Default::default(),
+            origin: None,
+        },
         spawned_by: story::UiSpawnedBy::Direct,
         parent: None,
         spawn_name: None,

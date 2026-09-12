@@ -146,20 +146,12 @@ pub fn parse_start(
         }
         // An agent's change lives in its own clone, which a fresh clone
         // cannot see: work with it by joining it.
-        (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workset { .. })) => {
+        (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workset(_))) => {
             return Err(format!(
                 "`{target}` is an agent: Shift-Tab to Join mode to work in its directory, \
                  or base on a git revision like `origin/main`"
             ));
         }
-        (
-            StartFieldMode::NewOn,
-            _,
-            Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-        ) => StartMode::NewOn {
-            repo,
-            revset: format!("{}@", id.encoded()),
-        },
         // An agent in the user's checkout works on the user's own change.
         (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
             StartMode::NewOn {

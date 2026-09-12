@@ -11,7 +11,7 @@ use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use rho_fs_view::WorkspaceInfo;
+use rho_fs_view::Place;
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 pub use rho_ui_proto::mirror::{AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome};
@@ -55,7 +55,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "3ac1e7d4";
+const CURRENT_AGENT_DB_FORMAT: &str = places::TO;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,7 +64,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: places::FROM,
+    to: places::TO,
+    migrate: places::run,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -331,12 +335,8 @@ pub struct AgentConfig {
     pub role: AgentRole,
     pub(crate) binding: SessionBinding,
     pub runtime: AgentRuntime,
-    /// The agent's working set: where it works, primary workdir first.
-    /// Fixed at spawn - never removed or reordered, because accumulated
-    /// model context assumes the entries stay valid. Managed workspace ids
-    /// are repository-local, allocated by the VCS of the time; joined agents
-    /// retain the owning agent's id for that repository.
-    pub workdirs: Vec<WorkspaceInfo>,
+    /// Where the agent works. Fixed at creation, but for a migration.
+    pub place: Place,
     pub spawned_by: AgentSpawnedBy,
     /// The name the spawner gave. A generated title is never made for an
     /// agent that has one, and it always beats a generated title.
@@ -366,6 +366,8 @@ pub struct AgentHead {
     /// Sticky: once engaged, the agent's turn ends are the user's court even
     /// for a sub-agent, so it gets turn reports like a root.
     pub user_interacted: bool,
+    /// What a `Notice` said, until a user message has carried it.
+    pub pending_notice: Option<String>,
     pub last_turn_ended: Option<UnixMillis>,
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
@@ -385,9 +387,8 @@ impl AgentHead {
         self.config.role
     }
 
-    /// The primary workdir (entry 0): default cwd, prompt header, UI label.
-    pub fn primary_workdir(&self) -> &WorkspaceInfo {
-        self.config.primary_workdir()
+    pub fn place(&self) -> &Place {
+        &self.config.place
     }
 
     /// The agent's name for a reader: what the spawner called it, else what
@@ -401,11 +402,9 @@ impl AgentHead {
 }
 
 impl AgentConfig {
-    /// The primary workdir (entry 0): default cwd, prompt header, UI label.
-    pub fn primary_workdir(&self) -> &WorkspaceInfo {
-        self.workdirs
-            .first()
-            .expect("agent has at least one workdir")
+    /// Where the agent works: default cwd, prompt header, UI label.
+    pub fn place(&self) -> &Place {
+        &self.place
     }
 }
 
@@ -867,7 +866,7 @@ pub(crate) trait AgentProfileWriteTxnExt {
         now: UnixMillis,
         agent_id: AgentId,
         spawn_name: Option<String>,
-        workdirs: Vec<WorkspaceInfo>,
+        place: Place,
         role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
@@ -883,13 +882,12 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         now: UnixMillis,
         agent_id: AgentId,
         spawn_name: Option<String>,
-        workdirs: Vec<WorkspaceInfo>,
+        place: Place,
         role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
     ) {
-        assert!(!workdirs.is_empty(), "agent needs at least one workdir");
         let spawned_by = parent_agent.map_or(AgentSpawnedBy::Direct, |parent| {
             match agent_head_write(self, parent)
                 .expect("parent agent must exist")
@@ -904,7 +902,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             role,
             binding: mode,
             runtime,
-            workdirs,
+            place,
             spawned_by,
             spawn_name,
             created_at: now,
@@ -1534,6 +1532,7 @@ fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) ->
                     turn_running: false,
                     parent: *parent,
                     user_interacted: false,
+                    pending_notice: None,
                     last_turn_ended: None,
                     next: pos.next(),
                 });
@@ -1605,7 +1604,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         | AgentEvent::Created { .. }
         | AgentEvent::RoleChanged { .. }
         | AgentEvent::WorkdirAdded { .. }
-        | AgentEvent::WorkdirMigrated { .. }
+        | AgentEvent::Notice { .. }
         | AgentEvent::RuntimeRebound { .. } => 0,
     }
 }
@@ -1639,7 +1638,7 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
         role,
         binding,
         runtime,
-        workdirs,
+        place,
         spawned_by,
         spawn_name,
         created_at,
@@ -1652,7 +1651,7 @@ fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
         role: *role,
         binding: *binding,
         runtime: runtime.clone(),
-        workdirs: workdirs.clone(),
+        place: place.clone(),
         spawned_by: *spawned_by,
         spawn_name: spawn_name.clone(),
         created_at: *created_at,
@@ -1684,11 +1683,8 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.config.binding = *binding;
             }
         }
-        AgentEvent::WorkdirAdded { workdir, .. } => head.config.workdirs.push(workdir.clone()),
-        AgentEvent::WorkdirMigrated { workdir, .. } => match head.config.workdirs.first_mut() {
-            Some(primary) => *primary = workdir.clone(),
-            None => head.config.workdirs.push(workdir.clone()),
-        },
+        AgentEvent::WorkdirAdded { .. } => {}
+        AgentEvent::Notice { text, .. } => head.pending_notice = Some(text.to_string()),
         AgentEvent::RuntimeRebound { change, .. } => match change {
             crate::RuntimeChange::ClaudeRewindPending(rewind) => {
                 head.config.claude_rewind = rewind.clone();
@@ -1729,7 +1725,10 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         | AgentEvent::Transcript {
             line: crate::TranscriptLine::User { .. },
             ..
-        } => head.user_interacted = true,
+        } => {
+            head.user_interacted = true;
+            head.pending_notice = None;
+        }
         AgentEvent::Accepted(_)
         | AgentEvent::Sent { .. }
         | AgentEvent::Replied { .. }
@@ -1915,6 +1914,8 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }
+
+mod places;
 
 #[cfg(test)]
 pub(crate) mod tests;

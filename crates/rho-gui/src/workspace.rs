@@ -2595,9 +2595,7 @@ impl Workspace {
         let agent = self.registry.agent_by_label(target);
         StartBase {
             host: agent.and_then(|agent_id| self.host_of(agent_id)),
-            workspace: agent
-                .and_then(|agent_id| self.registry.agent_workspace(agent_id))
-                .cloned(),
+            workspace: agent.and_then(|agent_id| self.registry.agent_workspace(agent_id)),
         }
     }
 
@@ -3315,7 +3313,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
+        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
             self.notice_on(
                 None,
                 "open: agent has no workspace",
@@ -3510,7 +3508,7 @@ impl Workspace {
         if !self.require_agent_online(agent_id, cx) {
             return;
         }
-        let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
+        let Some(workspace) = self.registry.agent_workspace(agent_id) else {
             self.notice_on(
                 None,
                 "diff: agent has no workspace",

@@ -356,7 +356,7 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
         .spawn_child(tools.self_id, args.task_name, args.prompt, config)
         .await?;
     let child_record = pool.db().read().get_agent(child_id);
-    let workspace_note = format!(" It works in {}.", child_record.primary_workdir().repo());
+    let workspace_note = format!(" It works in {}.", child_record.place().cwd);
     let child_id = format!("eng-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \

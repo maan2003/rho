@@ -29,7 +29,7 @@ use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; a daemon with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v2");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v3");
 /// Which host an agent was heard from, so a host's rows can go together.
 const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v1");
 /// One agent's mirror, ordered by position, agent first: a range read
@@ -44,8 +44,9 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// v2: tool calls carry the arguments the model sent. v1 kept only the one
 /// field a label names, so a code-mode `exec` call — whose arguments are
 /// JavaScript, not JSON — stored nothing at all.
+/// v3: `Created` names one place instead of a list of workdirs.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
-    TableDefinition::new("gui_mirror_events_v2");
+    TableDefinition::new("gui_mirror_events_v3");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
@@ -71,14 +72,17 @@ impl RecordedTypeName for VerdictName {
 }
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 5] = [
+const RETIRED_TABLES: [&str; 7] = [
     "gui_agent_head_v1",
     "gui_agent_story_v1",
     "gui_agent_attention_v1",
-    // The story's v1 rows and the cursor that counted them. Deleted rather
-    // than migrated: the daemon has the raw log and the client re-derives.
+    // The story's v1 and v2 rows and the cursors that counted them.
+    // Deleted rather than migrated: the daemon has the raw log and the
+    // client re-derives.
     "gui_mirror_events_v1",
     "gui_mirror_host_v1",
+    "gui_mirror_events_v2",
+    "gui_mirror_host_v2",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -628,7 +632,12 @@ mod tests {
             MirrorEvent::Created {
                 role: Default::default(),
                 runtime: RuntimeKind::Rho,
-                workdirs: Vec::new(),
+                place: rho_ui_proto::Place {
+                    workset: "0123456789ab".into(),
+                    cwd: "/src/repo".into(),
+                    mode: Default::default(),
+                    origin: None,
+                },
                 spawned_by: SpawnedBy::Direct,
                 spawn_name: Some("the deploy".to_owned()),
                 parent: None,

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use rho_core::{MessageDelivery, UnixMs};
 use rho_hosts::connection::ConnEvent;
 use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, PresentationField, Seq, TurnEdge};
-use rho_ui_proto::{AgentId, AgentRole, WorkspaceInfo};
+use rho_ui_proto::{AgentId, AgentRole, Place};
 
 pub type UiRuntimeKind = rho_ui_proto::mirror::RuntimeKind;
 pub type UiSpawnedBy = rho_ui_proto::mirror::SpawnedBy;
@@ -26,7 +26,7 @@ pub struct UiAgentHead {
     pub story_pos: UiStoryPos,
     pub role: AgentRole,
     pub runtime_kind: UiRuntimeKind,
-    pub workdirs: Vec<WorkspaceInfo>,
+    pub place: Place,
     pub spawned_by: UiSpawnedBy,
     pub parent: Option<AgentId>,
     pub spawn_name: Option<String>,
@@ -151,7 +151,7 @@ pub fn head_entries(head: UiAgentHead) -> Vec<LogEntry> {
     let mut events = vec![MirrorEvent::Created {
         role: head.role,
         runtime: head.runtime_kind,
-        workdirs: head.workdirs,
+        place: head.place,
         spawned_by: head.spawned_by,
         spawn_name: head.spawn_name,
         parent: head.parent,

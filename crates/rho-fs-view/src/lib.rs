@@ -55,7 +55,7 @@ pub fn git_dir() -> PathBuf {
 }
 pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
-    WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
+    Place, WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
     WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
 
@@ -297,6 +297,19 @@ impl Worksets {
             }
         }
         anyhow::bail!("could not allocate a unique workset id")
+    }
+
+    /// Makes the directory of a workset named by id, if it is missing:
+    /// for a record that named a workset before anything made one.
+    /// Returns whether it was made.
+    pub async fn ensure_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<bool> {
+        validate_name(workset_id)?;
+        let src = self.root.join("worksets").join(workset_id).join("src");
+        if src.is_dir() {
+            return Ok(false);
+        }
+        std::fs::create_dir_all(&src).with_context(|| format!("create workset {workset_id}"))?;
+        Ok(true)
     }
 
     pub async fn open_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<Workset> {

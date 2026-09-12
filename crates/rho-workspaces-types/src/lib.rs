@@ -1,61 +1,31 @@
 //! Data types shared by workspace implementations and protocol clients.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use prefix_id::{PrefixId, PrefixIdDomain};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-pub type WorkspaceId = PrefixId<WorkspaceIdDomain>;
-
-fn workspace_handle(id: WorkspaceId) -> String {
-    format!("ws-{}", id.encoded())
+/// An agent's place: the workset it works in and its working directory
+/// there as it sees it (`/src/<repo>/...`), how it sees the filesystem,
+/// and what was cloned to make the workset when its creation cloned it.
+/// Stored inline on the agent record; there is no workset table.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub struct Place {
+    pub workset: String,
+    pub cwd: Utf8PathBuf,
+    #[senax(default)]
+    pub mode: WorksetMode,
+    #[senax(default)]
+    pub origin: Option<Utf8PathBuf>,
 }
 
-/// Prefix-id family for repository-local managed-workspace ids.
-///
-/// Historical: the VCS of the time owned the per-repository seed and
-/// counter. Rho persists the encoded id so old records still decode and
-/// does not allocate production ids itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WorkspaceIdDomain(pub u64);
-
-impl PrefixIdDomain for WorkspaceIdDomain {
-    const KIND: &'static str = "managed-workspace-id";
-
-    fn machine_seed(&self) -> u64 {
-        self.0
-    }
-}
-
-/// Where an agent works, stored inline on the agent record. Self-contained:
-/// there is no separate workspace table.
+/// Where a request names work: a place in a workset, or the user's own
+/// checkout of a repository (a request only; no agent lives there).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceInfo {
-    /// The user's own checkout: the agent works directly at the repo path,
-    /// no separate checkout and no namespace.
-    UserCheckout { repo: Utf8PathBuf },
-    /// A managed workspace of an earlier version, which persisted its own
-    /// checkout path; Rho stores only the repository-local id. Historical:
-    /// no longer created.
-    Workspace {
+    /// The user's own checkout: the repository path itself.
+    UserCheckout {
         repo: Utf8PathBuf,
-        #[senax(rename = "name")]
-        id: WorkspaceId,
     },
-    /// A managed workspace whose original VCS metadata is masked from
-    /// child commands and replaced by a synthetic Git baseline. Historical:
-    /// no longer created.
-    Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
-    /// A place in a workset: the workset's id and the agent's working
-    /// directory as it sees it (`/src/<repo>/...`). `origin` is what was
-    /// cloned to make the workset, when this agent's creation cloned it.
-    Workset {
-        workset: String,
-        cwd: Utf8PathBuf,
-        #[senax(default)]
-        mode: WorksetMode,
-        #[senax(default)]
-        origin: Option<Utf8PathBuf>,
-    },
+    Workset(Place),
 }
 
 /// How an agent in a workset sees the filesystem.
@@ -68,56 +38,45 @@ pub enum WorksetMode {
     Exposed,
 }
 
+impl From<Place> for WorkspaceInfo {
+    fn from(place: Place) -> Self {
+        Self::Workset(place)
+    }
+}
+
 impl WorkspaceInfo {
-    /// The directory the agent works in: a repository root for the
-    /// historical variants, the working directory for a workset.
+    /// The directory the agent works in: the repository root for the
+    /// user's checkout, the working directory for a place.
     pub fn repo(&self) -> &Utf8Path {
         match self {
-            Self::UserCheckout { repo }
-            | Self::Workspace { repo, .. }
-            | Self::Sandbox { repo, .. } => repo,
-            Self::Workset { cwd, .. } => cwd,
+            Self::UserCheckout { repo } => repo,
+            Self::Workset(place) => &place.cwd,
         }
     }
 
-    /// The workset this agent works in.
-    pub fn workset(&self) -> Option<&str> {
+    pub fn place(&self) -> Option<&Place> {
         match self {
-            Self::Workset { workset, .. } => Some(workset),
-            _ => None,
+            Self::Workset(place) => Some(place),
+            Self::UserCheckout { .. } => None,
         }
     }
 
-    /// What was cloned to start this agent's workset, when known.
+    /// The workset this names, if a place.
+    pub fn workset(&self) -> Option<&str> {
+        self.place().map(|place| place.workset.as_str())
+    }
+
+    /// What was cloned to make the place's workset, when known; the
+    /// repository itself for the user's checkout.
     pub fn origin(&self) -> Option<&Utf8Path> {
         match self {
-            Self::Workset { origin, .. } => origin.as_deref(),
-            Self::UserCheckout { repo }
-            | Self::Workspace { repo, .. }
-            | Self::Sandbox { repo, .. } => Some(repo),
+            Self::Workset(place) => place.origin.as_deref(),
+            Self::UserCheckout { repo } => Some(repo),
         }
     }
 
     pub fn is_user_checkout(&self) -> bool {
         matches!(self, Self::UserCheckout { .. })
-    }
-
-    pub fn workspace_id(&self) -> Option<WorkspaceId> {
-        match self {
-            Self::UserCheckout { .. } | Self::Workset { .. } => None,
-            Self::Workspace { id, .. } | Self::Sandbox { id, .. } => Some(*id),
-        }
-    }
-
-    pub fn workspace_handle(&self) -> Option<String> {
-        match self {
-            Self::Workspace { id, .. } => Some(workspace_handle(*id)),
-            Self::UserCheckout { .. } | Self::Sandbox { .. } | Self::Workset { .. } => None,
-        }
-    }
-
-    pub fn is_sandbox(&self) -> bool {
-        matches!(self, Self::Sandbox { .. })
     }
 }
 

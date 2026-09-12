@@ -8,7 +8,6 @@ use rho_agent::db::{
     AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
 };
 use rho_db::RhoDb;
-use rho_fs_view::WorkspaceInfo;
 use rho_inference::Inference;
 
 use crate::default_db_path;
@@ -63,25 +62,6 @@ enum DebugCommand {
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
-    /// Ask the running daemon to move an agent that predates worksets
-    /// into one: clone its repository's origin, check out the old jj
-    /// workspace's parent commit (detached) with the working copy's
-    /// changes staged on top, and record the new place at the tail of the
-    /// agent's log. The old workspace is left as it is.
-    MigrateAgent {
-        /// The agent, as `eng-xxxx` or a bare id prefix.
-        agent: String,
-        /// What to clone; the repository's `origin` remote by default.
-        #[arg(long)]
-        origin: Option<String>,
-        /// How the agent sees the filesystem from now on. Exposed by
-        /// default: that is what a jj workspace on the host was.
-        #[arg(long, value_enum, default_value_t = crate::WorksetModeArg::Exposed)]
-        mode: crate::WorksetModeArg,
-        /// The daemon's socket; the usual one by default.
-        #[arg(long)]
-        socket_path: Option<PathBuf>,
-    },
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high,
@@ -107,12 +87,6 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
         DebugCommand::Context => print_context(args.db_path, &claude).await,
-        DebugCommand::MigrateAgent {
-            agent,
-            origin,
-            mode,
-            socket_path,
-        } => migrate_agent(socket_path, agent, origin, mode.into()).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
 }
@@ -364,17 +338,7 @@ async fn print_agents(
             agent.next,
             read.agent_events(agent_id).1.len()
         )?;
-        writeln!(
-            output,
-            "  workdirs: {}",
-            agent
-                .config
-                .workdirs
-                .iter()
-                .map(workspace_name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )?;
+        writeln!(output, "  place: {}", place_name(agent.place()))?;
         match agent.config.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
                 writeln!(output, "  runtime: rho")?;
@@ -386,7 +350,7 @@ async fn print_agents(
                 match rho_claude::find_session_transcript(
                     &claude.projects(),
                     session_id,
-                    agent.primary_workdir().repo(),
+                    &agent.place().cwd,
                 )
                 .await?
                 {
@@ -452,7 +416,7 @@ async fn print_context(
                 let transcript = rho_claude::find_session_transcript(
                     &claude.projects(),
                     session_id,
-                    agent.primary_workdir().repo(),
+                    &agent.place().cwd,
                 )
                 .await?;
                 let Some(transcript) = transcript else {
@@ -463,7 +427,7 @@ async fn print_context(
                 let messages = rho_claude::read_session_messages_by_id(
                     &claude.projects(),
                     session_id,
-                    agent.primary_workdir().repo(),
+                    &agent.place().cwd,
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;
@@ -632,34 +596,6 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sends the migration to the daemon and prints its account of it.
-async fn migrate_agent(
-    socket_path: Option<PathBuf>,
-    agent: String,
-    origin: Option<String>,
-    mode: rho_fs_view::WorksetMode,
-) -> anyhow::Result<()> {
-    let paths = rho_ui_proto::RuntimePaths::resolve(socket_path)?;
-    let mut client = rho_ui_proto::client::Client::connect(paths.socket())
-        .await
-        .with_context(|| format!("connect to rho daemon at {}", paths.socket().display()))?;
-    client
-        .send(&rho_ui_proto::ClientMessage::MigrateAgent {
-            agent,
-            origin,
-            mode,
-        })
-        .await?;
-    match client.recv().await? {
-        rho_ui_proto::ServerMessage::AgentMigrated { report } => {
-            print!("{report}");
-            Ok(())
-        }
-        rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected reply: {other:?}"),
-    }
-}
-
 fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
@@ -687,17 +623,8 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
     }
 }
 
-fn workspace_name(workspace: &WorkspaceInfo) -> String {
-    match workspace {
-        WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
-        WorkspaceInfo::Workspace { repo, id } => {
-            format!("workspace ws-{} in {repo}", id.encoded())
-        }
-        WorkspaceInfo::Sandbox { repo, id } => {
-            format!("sandbox ws-{} from {repo}", id.encoded())
-        }
-        WorkspaceInfo::Workset { workset, cwd, .. } => format!("{cwd} in workset {workset}"),
-    }
+fn place_name(place: &rho_fs_view::Place) -> String {
+    format!("{} in workset {}", place.cwd, place.workset)
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             role,
             binding,
             runtime,
-            workdirs,
+            place,
             spawned_by: by,
             spawn_name,
             created_at,
@@ -257,7 +257,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
         } => MirrorEvent::Created {
             role: *role,
             runtime: runtime_kind(runtime),
-            workdirs: workdirs.clone(),
+            place: place.clone(),
             spawned_by: spawned_by(*by),
             spawn_name: spawn_name.clone(),
             parent: *parent,
@@ -280,12 +280,12 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             }),
             at: *at,
         },
-        AgentEvent::WorkdirAdded { workdir, at } => MirrorEvent::WorkdirAdded {
-            workdir: workdir.clone(),
+        AgentEvent::WorkdirAdded { at } => MirrorEvent::Notice {
+            text: String::new(),
             at: *at,
         },
-        AgentEvent::WorkdirMigrated { workdir, at } => MirrorEvent::WorkdirMigrated {
-            workdir: workdir.clone(),
+        AgentEvent::Notice { text, at } => MirrorEvent::Notice {
+            text: text.to_string(),
             at: *at,
         },
         AgentEvent::Turn { edge, at } => MirrorEvent::Turn {

@@ -12,7 +12,7 @@ use rho_ui_proto::mirror::{
     AgentPos, AgentWant, MirrorEvent, PresentationField, RuntimeKind, SpawnedBy, Speaker,
     ToolOutcome, ToolStatus, TurnEdge, TurnOutcome,
 };
-use rho_ui_proto::{AgentUsageBucket, WorkspaceInfo};
+use rho_ui_proto::{AgentUsageBucket, Place};
 
 use crate::HostId;
 use crate::state::{UiAgentState, UiAgentStatus, UiAgentUsage, UiBlock, UiTool, UiToolStatus};
@@ -87,20 +87,13 @@ pub struct AgentIdentity {
     pub agent_id: AgentId,
     pub role: AgentRole,
     pub runtime: RuntimeKind,
-    pub workdirs: Vec<WorkspaceInfo>,
+    pub place: Place,
     pub spawned_by: SpawnedBy,
     pub spawn_name: Option<String>,
     pub parent: Option<AgentId>,
     /// The model its binding names, for pricing.
     pub model: String,
     pub created_at: UnixMs,
-}
-
-impl AgentIdentity {
-    /// The primary workdir; every agent is created with at least one.
-    pub fn workspace(&self) -> Option<&WorkspaceInfo> {
-        self.workdirs.first()
-    }
 }
 
 /// Which fold made a stored digest. Bump when `Digest::tell` changes
@@ -222,8 +215,7 @@ impl Digest {
             | MirrorEvent::ClaudeMessage { .. }
             | MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
-            | MirrorEvent::WorkdirAdded { .. }
-            | MirrorEvent::WorkdirMigrated { .. }
+            | MirrorEvent::Notice { .. }
             | MirrorEvent::CompactionRequested { .. }
             | MirrorEvent::QueueCleared { .. }
             | MirrorEvent::Sent { .. }
@@ -265,7 +257,7 @@ impl MirroredAgent {
         let MirrorEvent::Created {
             role,
             runtime,
-            workdirs,
+            place,
             spawned_by,
             spawn_name,
             parent,
@@ -283,7 +275,7 @@ impl MirroredAgent {
                 agent_id,
                 role: *role,
                 runtime: *runtime,
-                workdirs: workdirs.clone(),
+                place: place.clone(),
                 spawned_by: *spawned_by,
                 spawn_name: spawn_name.clone(),
                 parent: *parent,
@@ -312,23 +304,11 @@ impl MirroredAgent {
         if !self.digest.tell(pos, event) {
             return false;
         }
-        match event {
-            MirrorEvent::RoleChanged { role, model, .. } => {
-                self.identity.role = *role;
-                if let Some(model) = model {
-                    self.identity.model = model.clone();
-                }
+        if let MirrorEvent::RoleChanged { role, model, .. } = event {
+            self.identity.role = *role;
+            if let Some(model) = model {
+                self.identity.model = model.clone();
             }
-            MirrorEvent::WorkdirAdded { workdir, .. } => {
-                self.identity.workdirs.push(workdir.clone());
-            }
-            MirrorEvent::WorkdirMigrated { workdir, .. } => {
-                match self.identity.workdirs.first_mut() {
-                    Some(primary) => *primary = workdir.clone(),
-                    None => self.identity.workdirs.push(workdir.clone()),
-                }
-            }
-            _ => {}
         }
         true
     }
@@ -669,8 +649,7 @@ impl TranscriptFold {
             }
             MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
-            | MirrorEvent::WorkdirAdded { .. }
-            | MirrorEvent::WorkdirMigrated { .. }
+            | MirrorEvent::Notice { .. }
             | MirrorEvent::Presented { .. }
             | MirrorEvent::Wants { .. } => {}
         }
@@ -724,6 +703,15 @@ mod tests {
     use rho_ui_proto::mirror::{ToolCallLine, ToolLine, ToolOutcome, Usage};
 
     use super::*;
+
+    pub(crate) fn test_place() -> Place {
+        Place {
+            workset: "0123456789ab".into(),
+            cwd: "/src/repo".into(),
+            mode: Default::default(),
+            origin: None,
+        }
+    }
 
     fn told(events: Vec<MirrorEvent>) -> UiAgentState {
         transcript(
@@ -1232,9 +1220,7 @@ mod tests {
         let created = MirrorEvent::Created {
             role: AgentRole::default(),
             runtime: RuntimeKind::Rho,
-            workdirs: vec![WorkspaceInfo::UserCheckout {
-                repo: "/repo".into(),
-            }],
+            place: test_place(),
             spawned_by: SpawnedBy::Direct,
             spawn_name: None,
             parent: None,

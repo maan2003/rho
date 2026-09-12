@@ -54,10 +54,10 @@ table: a generated title or activity is a story event
 
 ### Creation is the first event
 
-`AgentEvent::Created { role, runtime, workdirs, spawned_by, spawn_name,
-created_at }` is the first raw event of every agent; `RoleChanged`,
-`WorkdirAdded`, `RuntimeRebound` (a Claude rewind landing on a new
-session) follow as they happen. The head's config is the fold. A spawn
+`AgentEvent::Created { role, runtime, place, spawned_by, spawn_name,
+created_at }` is the first raw event of every agent; `RoleChanged` and
+`RuntimeRebound` (a Claude rewind landing on a new session) follow as
+they happen. The head's config is the fold. A spawn
 name stays in the creation event so no title is generated for it, as
 today. `parent_agent` is not here: a parent is the store's `Parent`
 fact, written by the client that spawned the agent (the daemon still
@@ -68,7 +68,7 @@ stores it only as `spawned_by`).
 
 | record field | goes to |
 | --- | --- |
-| role, runtime, workdirs, spawned_by, created_at, binding | `Created` and the config events |
+| role, runtime, place, spawned_by, created_at, binding | `Created` and the config events |
 | display_name | `Created.spawn_name` (it was also what `RenameAgent` wrote, so no agent loses its name; a given name still beats a generated title; the store's `Name` overrides both) |
 | labels, parent_agent | already store facts (`Labeled`, `Parent`); dropped |
 | generated_title, activity | story events; head caches the latest |
@@ -91,7 +91,7 @@ only then does the daemon drop the tables.
 One enum, `StoryEvent`, every variant typed, no strings but the ones a
 person wrote or the model said:
 
-- `Created { role, runtime_kind, workdirs, spawned_by, spawn_name, at }`
+- `Created { role, runtime_kind, place, spawned_by, spawn_name, at }`
 - `UserMessage { text, at }`, `AgentMail { from: AgentId, text, at }`
 - `TurnStarted { at }`, `TurnEnded { at, outcome: Completed | Cancelled | Errored { message } }`
 - `Reply { text, at }` — the agent's visible message text, whole, once the turn wrote it

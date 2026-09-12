@@ -21,7 +21,7 @@ use crate::db::{
     AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, StartPlace, View, WorkspaceInfo};
+use crate::{AgentStatus, MessageDelivery, Place, StartPlace, View};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -408,18 +408,6 @@ impl AgentPool {
         }
     }
 
-    /// Drops a loaded agent so its next load folds its log afresh: for a
-    /// record changed under it, such as a migrated workdir. Handles others
-    /// still hold keep the old loop until they let go.
-    pub async fn unload(&self, agent_id: AgentId) -> bool {
-        let removed = self.agents.lock().await.remove(&agent_id).is_some();
-        self.recent
-            .lock()
-            .expect("poison")
-            .retain(|id| *id != agent_id);
-        removed
-    }
-
     pub async fn create(
         self: &Arc<Self>,
         config: AgentRole,
@@ -527,17 +515,14 @@ impl AgentPool {
         self.enforce_spawn_limits(parent).await?;
         let (parent_place, parent_role) = {
             let record = self.load(parent).await?.1.head();
-            (record.primary_workdir().clone(), record.config.role)
+            (record.place().clone(), record.config.role)
         };
-        let WorkspaceInfo::Workset {
+        let Place {
             workset,
             cwd,
             mode,
             origin,
-        } = parent_place
-        else {
-            anyhow::bail!("this agent predates worksets and cannot spawn children");
-        };
+        } = parent_place;
         let workset = self.worksets.open_workset(&workset).await?;
         let mode = Mode::from_workset_mode(mode);
         let view = workset.enter(mode, &cwd)?;
@@ -664,40 +649,28 @@ impl AgentPool {
     /// working directory on the host.
     pub async fn open_workset(
         &self,
-        info: &WorkspaceInfo,
+        place: &Place,
     ) -> anyhow::Result<(Workset, Mode, Utf8PathBuf)> {
-        let WorkspaceInfo::Workset {
-            workset, cwd, mode, ..
-        } = info
-        else {
-            anyhow::bail!(
-                "this agent predates worksets; its transcript is readable but it cannot run"
-            );
-        };
-        let workset = self.worksets.open_workset(workset).await?;
-        let mode = Mode::from_workset_mode(*mode);
-        let host_cwd = workset.host_path(cwd)?;
+        let workset = self.worksets.open_workset(&place.workset).await?;
+        let mode = Mode::from_workset_mode(place.mode);
+        let host_cwd = workset.host_path(&place.cwd)?;
         Ok((workset, mode, host_cwd))
     }
 
     /// Materializes an agent's persisted place into a live view.
-    pub async fn materialize_view(&self, info: &WorkspaceInfo) -> anyhow::Result<Arc<View>> {
-        let (workset, mode, _) = self.open_workset(info).await?;
-        workset.enter(mode, info.repo())
+    pub async fn materialize_view(&self, place: &Place) -> anyhow::Result<Arc<View>> {
+        let (workset, mode, _) = self.open_workset(place).await?;
+        workset.enter(mode, &place.cwd)
     }
 
-    fn lazy_view(
-        self: &Arc<Self>,
-        _agent_id: AgentId,
-        info: WorkspaceInfo,
-    ) -> Arc<Lazy<Arc<View>>> {
+    fn lazy_view(self: &Arc<Self>, _agent_id: AgentId, place: Place) -> Arc<Lazy<Arc<View>>> {
         let pool = Arc::downgrade(self);
         Arc::new(Lazy::new(move || {
             let pool = pool.clone();
-            let info = info.clone();
+            let place = place.clone();
             async move {
                 let pool = pool.upgrade().context("agent pool dropped")?;
-                pool.materialize_view(&info).await
+                pool.materialize_view(&place).await
             }
         }))
     }
@@ -725,7 +698,7 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.primary_workdir().clone());
+        let view = self.lazy_view(agent_id, record.place().clone());
         let agent = match record.config.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(
                 AgentHandle::load(

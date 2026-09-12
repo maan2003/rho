@@ -416,7 +416,7 @@ mod tests {
             UnixMillis::now(),
             id,
             None,
-            vec![crate::StartPlace::new(Arc::clone(&view), None).info],
+            crate::StartPlace::new(Arc::clone(&view), None).place,
             role,
             binding,
             AgentRuntime::Rho {

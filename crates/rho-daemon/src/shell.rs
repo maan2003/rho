@@ -40,19 +40,6 @@ const OMITTED: &str = "[... older shell output omitted ...]\n";
 const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
 
-/// Only agents in worksets can run: older records name checkouts this
-/// daemon no longer manages, and their transcripts are all that is left.
-pub fn ensure_supported_workdirs(workdirs: &[rho_fs_view::WorkspaceInfo]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        matches!(
-            workdirs.first(),
-            Some(rho_fs_view::WorkspaceInfo::Workset { .. })
-        ),
-        "this agent predates worksets; its transcript is readable but it cannot run"
-    );
-    Ok(())
-}
-
 pub struct ShellSpawn {
     pub view: Arc<rho_fs_view::Namespace>,
     /// Shell sidecar launched through the agent View.
@@ -1700,22 +1687,6 @@ async fn write_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pre_workset_workdirs_are_refused() {
-        let checkout = rho_fs_view::WorkspaceInfo::UserCheckout {
-            repo: camino::Utf8PathBuf::from("/repo"),
-        };
-        assert!(ensure_supported_workdirs(&[checkout]).is_err());
-        assert!(ensure_supported_workdirs(&[]).is_err());
-        let place = rho_fs_view::WorkspaceInfo::Workset {
-            workset: "0123456789ab".to_owned(),
-            cwd: camino::Utf8PathBuf::from("/src/repo"),
-            mode: Default::default(),
-            origin: None,
-        };
-        assert!(ensure_supported_workdirs(&[place]).is_ok());
-    }
 
     #[test]
     fn abnormal_exit_clears_paused_pagers_from_final_state() {

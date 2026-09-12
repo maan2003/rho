@@ -19,8 +19,8 @@ use rho_inference::Inference;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, QuotaPoint, QuotaSeries, QuotaSummary,
-    ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
+    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, Place, QuotaPoint, QuotaSeries,
+    QuotaSummary, ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
@@ -521,6 +521,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .await?
         }
     };
+    // One-off (13 Sep), before any agent loads: the worksets the store's
+    // migration named for agents from before worksets get their directories.
+    match migrate::create_missing_worksets(&db, &worksets).await {
+        Ok(0) => {}
+        Ok(made) => eprintln!("rho daemon: made {made} empty worksets for moved agents (one-off)"),
+        Err(error) => eprintln!("rho daemon: making worksets for moved agents failed: {error:#}"),
+    }
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;
@@ -675,7 +682,6 @@ async fn run_iroh_listener(
                                 | ClientMessage::GitTransportRequest { .. }
                                 | ClientMessage::GitTransportProvide { .. }
                                 | ClientMessage::GitTransportQuery { .. }
-                                | ClientMessage::MigrateAgent { .. }
                         );
                         let control = if !dedicated {
                             anyhow::ensure!(
@@ -1074,14 +1080,14 @@ impl Services {
                 let worksets = self.pool.worksets();
                 let workset = worksets.create().await?;
                 let cwd = visible_path(&workset, &workset.root().join(&name))?;
-                let info = WorkspaceInfo::Workset {
+                let place = Place {
                     workset: workset.id().to_owned(),
                     cwd: cwd.clone(),
                     mode: self.workset_mode,
                     origin: Some(origin.clone()),
                 };
                 let mode = rho_fs_view::Mode::from_workset_mode(self.workset_mode);
-                rho_agent::StartPlace::pending(info, move || {
+                rho_agent::StartPlace::pending(place, move || {
                     let workset = workset.clone();
                     let origin = origin.clone();
                     let name = name.clone();
@@ -1097,8 +1103,12 @@ impl Services {
                 .owning_workset()
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                let view = self.pool.materialize_view(&info).await?;
-                rho_agent::StartPlace::new(view, info.origin().map(ToOwned::to_owned))
+                let place = info
+                    .place()
+                    .context("agents no longer work in the user's own checkout")?
+                    .clone();
+                let view = self.pool.materialize_view(&place).await?;
+                rho_agent::StartPlace::new(view, place.origin.clone())
             }
             StartMode::Join(JoinTarget::User { .. }) => {
                 anyhow::bail!(
@@ -1322,22 +1332,6 @@ where
             &ServerMessage::GitTransportPolicy { pat_available },
         )
         .await?;
-        return Ok(());
-    }
-    if let ClientMessage::MigrateAgent {
-        agent,
-        origin,
-        mode,
-    } = first
-    {
-        let reply = match migrate::migrate_agent(&services, &agent, origin, mode).await {
-            Ok(report) => ServerMessage::AgentMigrated { report },
-            Err(error) => ServerMessage::Error {
-                message: format!("{error:#}"),
-            },
-        };
-        let mut writer = writer;
-        write_frame(&mut writer, &reply).await?;
         return Ok(());
     }
 
@@ -2602,6 +2596,11 @@ async fn handle_message(
         } => {
             prepare_image_content(&mut content).await?;
             let (_, agent, _) = services.load(agent_id).await?;
+            // What Rho has to tell the agent goes ahead of the person's
+            // words, once.
+            if let Some(text) = agent.head().pending_notice {
+                content.insert(0, rho_core::ContentPart::Text { text });
+            }
             agent.send_user_content_accepted(content, delivery).await?;
             Ok(Refresh::None)
         }
@@ -2705,8 +2704,7 @@ async fn handle_message(
         | ClientMessage::ShellAttach { .. }
         | ClientMessage::GitTransportRequest { .. }
         | ClientMessage::GitTransportProvide { .. }
-        | ClientMessage::GitTransportQuery { .. }
-        | ClientMessage::MigrateAgent { .. } => {
+        | ClientMessage::GitTransportQuery { .. } => {
             anyhow::bail!("channel messages must be the first frame on a dedicated stream")
         }
     }
@@ -2880,8 +2878,6 @@ where
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
     let agent_id = services.resolve_display_agent_id(agent).await?;
     let running = services.load(agent_id).await?.1;
-    let record = running.head();
-    shell::ensure_supported_workdirs(&record.config.workdirs)?;
     // The agent's own view: a new agent's clone may still be in flight.
     let view = running.view().await.context("materialize agent view")?;
     services
@@ -3229,8 +3225,6 @@ async fn terminal_attach(
             .await;
     }
     let running = services.load(agent_id).await?.1;
-    let record = running.head();
-    shell::ensure_supported_workdirs(&record.config.workdirs)?;
     // The agent's own view: a new agent's clone may still be in flight.
     let view = running.view().await.context("materialize agent view")?;
     let shell = services
@@ -3621,7 +3615,10 @@ async fn open_checkout(
     services: &Services,
     workspace: &WorkspaceInfo,
 ) -> anyhow::Result<(rho_fs_view::Workset, Utf8PathBuf)> {
-    let (workset, _, host_cwd) = services.pool.open_workset(workspace).await?;
+    let place = workspace
+        .place()
+        .context("agents no longer work in the user's own checkout")?;
+    let (workset, _, host_cwd) = services.pool.open_workset(place).await?;
     let (root, _) = rho_fs_view::resolve_workdir_root(host_cwd.as_std_path())?;
     Ok((workset, root))
 }

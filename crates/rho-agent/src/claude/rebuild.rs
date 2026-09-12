@@ -56,11 +56,9 @@ pub async fn rebuild_claude_logs(db: &RhoDb, projects: &camino::Utf8Path) -> Reb
         .list_agents()
         .into_iter()
         .filter_map(|(agent_id, head)| match head.config.runtime {
-            AgentRuntime::Claude { session_id } => Some((
-                agent_id,
-                session_id,
-                head.primary_workdir().repo().to_owned(),
-            )),
+            AgentRuntime::Claude { session_id } => {
+                Some((agent_id, session_id, head.place().cwd.clone()))
+            }
             AgentRuntime::Rho { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -251,12 +249,12 @@ mod tests {
             UnixMs(1),
             agent_id,
             None,
-            vec![crate::WorkspaceInfo::Workset {
+            crate::Place {
                 workset: format!("{counter:012x}"),
                 cwd: "/src/rho".into(),
                 mode: Default::default(),
                 origin: None,
-            }],
+            },
             AgentRole::default(),
             SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::High,
@@ -432,7 +430,7 @@ mod tests {
                     AgentEvent::Created { .. } => "created",
                     AgentEvent::RoleChanged { .. } => "role",
                     AgentEvent::WorkdirAdded { .. } => "workdir",
-                    AgentEvent::WorkdirMigrated { .. } => "migrated",
+                    AgentEvent::Notice { .. } => "notice",
                     AgentEvent::RuntimeRebound { .. } => "rebound",
                 };
                 *kinds.entry(kind).or_default() += 1;

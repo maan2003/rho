@@ -74,7 +74,7 @@ changes.
 - Loaded agents in an LRU of 100. Touch on any command, mail, focus.
   Evict only when settled: idle, empty queue, no owed calls, not in any
   client's live set. Eviction drops the loop; the log is the truth.
-- The loop keeps its `AgentHead` (config, role, parent, workdirs) in
+- The loop keeps its `AgentHead` (config, role, parent, place) in
   memory, updated by its own rows. Hot paths (`mcp_agent_tool`,
   mail, shell, terminal, `resolve_display_agent_id`) load the agent
   and read that. `get_agent` remains only inside `load`.

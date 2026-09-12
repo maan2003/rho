@@ -11,9 +11,8 @@ pub use rho_core::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
 };
 pub use rho_workspaces_types::{
-    WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
-    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId,
-    WorkspaceIdDomain, WorkspaceInfo,
+    Place, WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
+    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -342,16 +341,6 @@ pub enum ClientMessage {
     /// choose PAT-backed GitHub HTTP or client-held SSH before negotiation.
     GitTransportQuery {
         host: String,
-    },
-    /// One-shot request on a fresh local stream: move an agent that
-    /// predates worksets into one (`rho debug migrate-agent`). Answered
-    /// with `AgentMigrated` or `Error`.
-    MigrateAgent {
-        /// The agent, as `eng-xxxx` or a bare id prefix.
-        agent: String,
-        /// What to clone; the repository's `origin` remote by default.
-        origin: Option<String>,
-        mode: WorksetMode,
     },
     /// Starts the daemon-owned Comint-style shell for an agent. This travels
     /// on the main UI control stream; attachment is a separate stream.
@@ -683,10 +672,6 @@ pub enum ServerMessage {
     },
     GitTransportPolicy {
         pat_available: bool,
-    },
-    /// `MigrateAgent` done; what was done, for a person.
-    AgentMigrated {
-        report: String,
     },
     /// An approval race completed or expired. Deliberately carries no result
     /// or winner information.
