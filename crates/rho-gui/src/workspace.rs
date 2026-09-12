@@ -657,13 +657,13 @@ impl Workspace {
     /// The workdirs this daemon offers: the labels in its store that carry
     /// a `Project`.
     fn refresh_workdirs(&mut self, host: HostId) {
-        let projects = self
+        let repositories = self
             .desk_cells
-            .projects(host)
+            .repositories(host)
             .into_iter()
-            .map(|(name, project)| (name, project.path))
+            .map(|(name, repository)| (name, repository.url.into()))
             .collect();
-        self.hosts.set_workdirs(host, projects);
+        self.hosts.set_workdirs(host, repositories);
     }
 
     fn apply_ready(&mut self, host: HostId, machine_seed: u64, agent_counter: u64) -> bool {
@@ -3233,6 +3233,14 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
+        // A project is a label carrying the URL the daemon clones. A path
+        // would have the daemon read the user's checkout, which it no
+        // longer does.
+        if !rho_agents::create::is_repository_url(&path) {
+            let message = format!("a project is a repository URL, not a path: `{path}`");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            return;
+        }
         let workdir = match rho_agents::create::resolve_workdir(&self.hosts, &path) {
             Ok(workdir) => workdir,
             Err(message) => {
@@ -3240,10 +3248,9 @@ impl Workspace {
                 return;
             }
         };
-        // A project is a label carrying what the daemon clones: a
-        // repository URL, or a path on the daemon's machine. The name the
-        // user gave is the label's path, else the repository's own name;
-        // the description was the daemon's and has no fact to live in.
+        // The name the user gave is the label's path, else the
+        // repository's own name; the description was the daemon's and has
+        // no fact to live in.
         let _ = description;
         let path_name = name.unwrap_or_else(|| {
             workdir
@@ -3252,13 +3259,11 @@ impl Workspace {
                 .map(|name| name.strip_suffix(".git").unwrap_or(name).to_owned())
                 .unwrap_or_else(|| workdir.path.to_string())
         });
-        let seed = self.registry.host_machine_seed(workdir.host);
-        let Some(writes) = self.desk_cells.project_writes(
+        let Some(writes) = self.desk_cells.repository_writes(
             workdir.host,
             &path_name,
-            Some(rho_desk::cells::Project {
-                host: seed,
-                path: workdir.path,
+            Some(rho_desk::cells::Repository {
+                url: workdir.path.to_string(),
             }),
         ) else {
             return;
@@ -3289,7 +3294,8 @@ impl Workspace {
                 else {
                     return;
                 };
-                let Some(writes) = self.desk_cells.project_writes(workdir.host, &name, None) else {
+                let Some(writes) = self.desk_cells.repository_writes(workdir.host, &name, None)
+                else {
                     return;
                 };
                 self.apply_desk_writes(workdir.host, writes, None, window, cx);
@@ -7731,18 +7737,10 @@ impl Workspace {
     /// area (or the area itself when it is an agent node). The caller
     /// falls back to the host's only workdir.
     fn area_workdir(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<HostPath> {
-        if let Some(project) = self.desk_cells.inherited_workdir(host, &node_id) {
-            // A label's project names its own machine, which is usually
-            // the one the area is on and need not be.
-            let host = self
-                .registry
-                .hosts()
-                .map(|(id, _)| id)
-                .find(|id| self.registry.host_machine_seed(*id) == project.host)
-                .unwrap_or(host);
+        if let Some(repository) = self.desk_cells.inherited_workdir(host, &node_id) {
             return Some(HostPath {
                 host,
-                path: project.path,
+                path: repository.url.into(),
             });
         }
         let agent_id = self.desk_cells.nearest_agent(host, &node_id)?;

@@ -269,31 +269,6 @@ impl DeskCellStore {
     /// The workdirs the user has filed as projects: the labels that carry
     /// a `Project`, name and path. Iris routes by these; the daemon's old
     /// `projects` table is gone.
-    pub(crate) fn projects(&self) -> Vec<(camino::Utf8PathBuf, String)> {
-        let read = self.db.read();
-        let meta = read.open_table(META);
-        let Some(daemon_device) = meta
-            .get(&())
-            .map(|meta| meta.value().as_ref().daemon_device)
-        else {
-            return Vec::new();
-        };
-        let Ok(snapshot) = read_snapshot(&read) else {
-            return Vec::new();
-        };
-        let Ok(store) = Store::from_snapshot(daemon_device, snapshot) else {
-            return Vec::new();
-        };
-        let mut projects = store
-            .all_facts()
-            .into_iter()
-            .filter(|(id, _)| matches!(id, Id::Label(_)))
-            .filter_map(|(_, facts)| Some((facts.project?.path, facts.name?)))
-            .collect::<Vec<_>>();
-        projects.sort_by(|left, right| left.1.cmp(&right.1));
-        projects
-    }
-
     /// Files a set of agents under one note, for a rig fixture: Home ranks
     /// agents through the note they sit under, so seeded agents nobody
     /// filed would never reach the queue.

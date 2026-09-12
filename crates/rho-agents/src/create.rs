@@ -36,6 +36,12 @@ pub struct StartBase {
     pub workspace: Option<WorkspaceInfo>,
 }
 
+/// Whether text names a repository to clone rather than a place on a
+/// machine: a URL scheme, or scp-style `git@host:path`.
+pub fn is_repository_url(argument: &str) -> bool {
+    argument.contains("://") || argument.starts_with("git@")
+}
+
 /// Resolves a workdir argument to a directory on a specific daemon. A
 /// registered project name resolves to its registration; anything else is
 /// a raw daemon-side path, which may name its host as `fern:/src/rho`.
@@ -49,7 +55,7 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
     // A Windows-style drive letter is not a thing on a daemon host, so a
     // colon before any separator is unambiguously a host prefix. A URL
     // (`https://…`, `git@host:path`) is what the daemon clones, not a host.
-    let is_url = argument.contains("://") || argument.starts_with("git@");
+    let is_url = is_repository_url(argument);
     if !is_url
         && let Some((name, path)) = argument.split_once(':')
         && !name.contains('/')

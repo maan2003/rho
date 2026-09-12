@@ -5,7 +5,7 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_agents::{Attention, HostId};
 use rho_desk::cells::{
-    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Project, Property, PropertyKey,
+    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, Repository,
     SlackTs, SlackUnit, Snapshot, Stamp, State, Store, StoryPos, Timestamp, TimestampPrecision,
     Uuid, Verdict, VerdictEvent, Version,
 };
@@ -1824,16 +1824,16 @@ impl DeskCells {
 
     /// `w`: the label the path names stands for this workdir, minted if
     /// the path is new. A registered project is exactly this.
-    pub fn project_writes(
+    pub fn repository_writes(
         &mut self,
         host: HostId,
         path: &str,
-        project: Option<Project>,
+        repository: Option<Repository>,
     ) -> Option<Vec<CellWrite>> {
         let (label, mut writes) = self.label_path_writes(host, path)?;
         writes.push(CellWrite {
             id: label,
-            property: Property::Project(project),
+            property: Property::Repository(repository),
         });
         Some(writes)
     }
@@ -2126,66 +2126,54 @@ impl DeskCells {
         })
     }
 
-    /// The workdir a new thing filed under `id` inherits: the thing's own
-    /// file, else the nearest ancestor with one. A cycle is shown at the
-    /// root rather than repaired, so the walk stops at the depth no real
-    /// tree reaches.
-    pub fn inherited_file_path(&self, host: HostId, id: &Id) -> Option<camino::Utf8PathBuf> {
-        self.inherited_workdir(host, id).map(|project| project.path)
-    }
-
-    /// The workdir a new thing under `id` inherits, walking the same
-    /// ancestry: the thing's own file, then the projects of the labels it
-    /// carries, then its parent's. A label with a project is what a
-    /// project is, so a thing made in one is made in that workdir.
-    pub fn inherited_workdir(&self, host: HostId, id: &Id) -> Option<Project> {
+    /// The repository a new thing under `id` inherits, walking the
+    /// ancestry: the thing's own, then the labels it carries, then its
+    /// parent's. A label with a repository is what a project is, so a
+    /// thing made in one is made in that repository. A cycle is shown at
+    /// the root rather than repaired, so the walk stops at the depth no
+    /// real tree reaches.
+    pub fn inherited_workdir(&self, host: HostId, id: &Id) -> Option<Repository> {
         let nodes = self.nodes(host);
-        let seed = self.hosts.get(&host).map(|desk| desk.sources.host);
         let mut cursor = Some(id.clone());
         for _ in 0..MAX_ANCESTRY {
             let id = cursor?;
-            if let Some(path) = self.file_path(host, &id) {
-                return Some(Project {
-                    host: seed.unwrap_or_default(),
-                    path,
-                });
-            }
             let node = nodes.iter().find(|node| node.id == id)?;
-            if let Some(project) = self.project(host, &id) {
-                return Some(project);
+            if let Some(repository) = self.repository(host, &id) {
+                return Some(repository);
             }
-            if let Some(project) = node
+            if let Some(repository) = node
                 .labels
                 .iter()
-                .find_map(|label| self.project(host, label))
+                .find_map(|label| self.repository(host, label))
             {
-                return Some(project);
+                return Some(repository);
             }
             cursor = node.parent.clone();
         }
         None
     }
 
-    /// Every label that stands for a workdir, by name. This is what a
-    /// registered project is now: a label carrying a `Project`.
-    pub fn projects(&self, host: HostId) -> Vec<(String, Project)> {
+    /// Every label that stands for a repository, by name. This is what a
+    /// registered project is: a label carrying a `Repository`. Labels
+    /// with only a `LegacyProject` path are not projects any more.
+    pub fn repositories(&self, host: HostId) -> Vec<(String, Repository)> {
         let Some(desk) = self.hosts.get(&host) else {
             return Vec::new();
         };
-        let mut projects = desk
+        let mut repositories = desk
             .view
             .all_facts()
             .into_iter()
             .filter(|(id, _)| matches!(id, Id::Label(_)))
-            .filter_map(|(_, facts)| Some((facts.name?, facts.project?)))
+            .filter_map(|(_, facts)| Some((facts.name?, facts.repository?)))
             .collect::<Vec<_>>();
-        projects.sort_by(|left, right| left.0.cmp(&right.0));
-        projects
+        repositories.sort_by(|left, right| left.0.cmp(&right.0));
+        repositories
     }
 
-    /// The workdir a label stands for, if it stands for one.
-    pub fn project(&self, host: HostId, id: &Id) -> Option<Project> {
-        self.facts(host, id)?.project
+    /// The repository a label stands for, if it stands for one.
+    pub fn repository(&self, host: HostId, id: &Id) -> Option<Repository> {
+        self.facts(host, id)?.repository
     }
 
     /// The agent that owns an area: the thing itself when it is an agent,

@@ -7695,16 +7695,15 @@ impl DeskFixture {
     /// A registered project: a label that names a workdir. Projects live
     /// in the store rather than on the wire, so this is where a test says
     /// one exists.
-    fn project(&mut self, name: &str, path: &str) -> rho_desk::cells::Id {
+    fn project(&mut self, name: &str, url: &str) -> rho_desk::cells::Id {
         self.next_node += 1;
         let id = rho_desk::cells::Id::Label(Self::uuid(self.next_node));
         self.file(id.clone(), None);
         self.set(id.clone(), rho_desk::cells::Property::Name(name.to_owned()));
         self.set(
             id.clone(),
-            rho_desk::cells::Property::Project(Some(rho_desk::cells::Project {
-                host: 0,
-                path: path.into(),
+            rho_desk::cells::Property::Repository(Some(rho_desk::cells::Repository {
+                url: url.to_owned(),
             })),
         );
         id
@@ -8947,7 +8946,7 @@ fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppConte
     // The one registered project is the workdir the draft inherits, and
     // the label the thing in context carries is the area offered first: an
     // area is a label now, and a thing carries no parent.
-    let area = desk.project("rho", "/tmp/rho-test-repo");
+    let area = desk.project("rho", "https://example.test/rho-test-repo.git");
     let context = desk.due_note(None, "the area in view");
     desk.labelled(context.clone(), area.clone());
     let workspace = test_workspace(cx);
@@ -9985,7 +9984,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
 /// row in between, so the path a new agent inherits is the label's own.
 #[gpui::test]
 fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContext) {
-    use rho_desk::cells::{Id, Project, Property, Uuid};
+    use rho_desk::cells::{Id, Property, Repository, Uuid};
 
     let mut desk = DeskFixture::new();
     let label = Id::Label(Uuid([7; 16]));
@@ -9993,9 +9992,8 @@ fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContex
     desk.set(label.clone(), Property::Name("rho".to_owned()));
     desk.set(
         label.clone(),
-        Property::Project(Some(Project {
-            host: 0,
-            path: "/src/rho".into(),
+        Property::Repository(Some(Repository {
+            url: "https://example.test/rho.git".to_owned(),
         })),
     );
     let area = desk.note(None, "Verdict agent");
@@ -10022,14 +10020,14 @@ fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContex
                 workspace
                     .area_workdir_for_test(HostId::default(), area.clone())
                     .map(|workdir| workdir.path.to_string()),
-                Some("/src/rho".to_owned()),
-                "the label the area carries names the workdir"
+                Some("https://example.test/rho.git".to_owned()),
+                "the label the area carries names the repository"
             );
             assert_eq!(
                 workspace
                     .area_workdir_for_test(HostId::default(), under.clone())
                     .map(|workdir| workdir.path.to_string()),
-                Some("/src/rho".to_owned()),
+                Some("https://example.test/rho.git".to_owned()),
                 "and it carries down the ancestry like any other inheritance"
             );
         })
@@ -10571,9 +10569,7 @@ fn a_refused_creation_shows_its_cause_on_the_draft(cx: &mut TestAppContext) {
             story::feed(
                 workspace,
                 HostId::default(),
-                ConnEvent::ServerError(
-                    "create workspace: no such repository".to_owned(),
-                ),
+                ConnEvent::ServerError("create workspace: no such repository".to_owned()),
                 window,
                 cx,
             );

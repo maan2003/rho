@@ -142,13 +142,22 @@ impl SlackTs {
     }
 }
 
-/// A workdir, named directly. There is no project id and no project row:
-/// a label with one of these is what a project is, so the path a thing
-/// inherits is the path itself rather than a hop through another thing.
+/// Historical: a workdir as a path on one machine, from when agents
+/// worked in the user's checkouts. Nothing writes this and nothing starts
+/// an agent from it; it is read so old labels still say what they meant.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
-pub struct Project {
+pub struct LegacyProject {
     pub host: u64,
     pub path: Utf8PathBuf,
+}
+
+/// A repository, by the URL the daemon clones. There is no project id and
+/// no project row: a label with one of these is what a project is, so
+/// what a thing inherits is the URL itself rather than a hop through
+/// another thing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
+pub struct Repository {
+    pub url: String,
 }
 
 /// What the user can claim about a thing. The claim is the variant and its
@@ -170,9 +179,10 @@ pub enum Property {
     },
     /// A label's own name.
     Name(String),
-    /// The workdir a label stands for. Written as `None` to take it off,
-    /// so undo has a state to put back.
-    Project(Option<Project>),
+    /// Historical: the path a label stood for. Keeps its stored name and
+    /// place (cells are decoded by variant order); see `LegacyProject`.
+    #[senax(rename = "Project")]
+    LegacyProject(Option<LegacyProject>),
     State(State),
     DeferUntil(Option<Timestamp>),
     Deadline(Option<Timestamp>),
@@ -194,6 +204,9 @@ pub enum Property {
     SlackSnoozedAt(SlackTs),
     Deleted(bool),
     CreatedAt(Timestamp),
+    /// The repository a label stands for. Written as `None` to take it
+    /// off, so undo has a state to put back.
+    Repository(Option<Repository>),
 }
 
 /// What makes a fact the same fact. For one-per-subject properties that is
@@ -205,7 +218,8 @@ pub enum PropertyKey {
     About,
     Labeled(Id),
     Name,
-    Project,
+    #[senax(rename = "Project")]
+    LegacyProject,
     State,
     DeferUntil,
     Deadline,
@@ -216,6 +230,7 @@ pub enum PropertyKey {
     SlackSnoozedAt,
     Deleted,
     CreatedAt,
+    Repository,
 }
 
 /// How many claims of one property a subject may hold at once.
@@ -241,7 +256,8 @@ impl Property {
             Property::About(_) => PropertyKey::About,
             Property::Labeled { label, .. } => PropertyKey::Labeled(label.clone()),
             Property::Name(_) => PropertyKey::Name,
-            Property::Project(_) => PropertyKey::Project,
+            Property::LegacyProject(_) => PropertyKey::LegacyProject,
+            Property::Repository(_) => PropertyKey::Repository,
             Property::State(_) => PropertyKey::State,
             Property::DeferUntil(_) => PropertyKey::DeferUntil,
             Property::Deadline(_) => PropertyKey::Deadline,
@@ -297,7 +313,8 @@ impl PropertyKey {
     pub fn unwritten(&self) -> Option<Property> {
         match self {
             PropertyKey::Parent => Some(Property::Parent(None)),
-            PropertyKey::Project => Some(Property::Project(None)),
+            PropertyKey::LegacyProject => Some(Property::LegacyProject(None)),
+            PropertyKey::Repository => Some(Property::Repository(None)),
             PropertyKey::Labeled(label) => Some(Property::Labeled {
                 label: label.clone(),
                 present: false,
@@ -417,10 +434,12 @@ impl BodySnapshot {
             .iter()
             .map(|operation| operation.timestamp())
             .collect::<BTreeSet<_>>();
-        self.operations
-            .extend(delta.operations.into_iter().filter(|operation| {
-                !held.contains(&operation.timestamp())
-            }));
+        self.operations.extend(
+            delta
+                .operations
+                .into_iter()
+                .filter(|operation| !held.contains(&operation.timestamp())),
+        );
         let held = self
             .transactions
             .iter()
@@ -765,8 +784,10 @@ pub struct Facts {
     pub about: Option<Id>,
     pub labels: BTreeSet<Id>,
     pub name: Option<String>,
-    /// The workdir this thing stands for, which only a label carries.
-    pub project: Option<Project>,
+    /// Historical: the path this label stood for.
+    pub legacy_project: Option<LegacyProject>,
+    /// The repository this thing stands for, which only a label carries.
+    pub repository: Option<Repository>,
     pub state: State,
     pub defer_until: Option<Timestamp>,
     pub deadline: Option<Timestamp>,
@@ -787,7 +808,8 @@ impl Facts {
             || self.about.is_some()
             || !self.labels.is_empty()
             || self.name.is_some()
-            || self.project.is_some()
+            || self.legacy_project.is_some()
+            || self.repository.is_some()
             || self.state != State::Open
             || self.defer_until.is_some()
             || self.deadline.is_some()
@@ -1094,7 +1116,8 @@ impl Store {
                 }
                 Property::Labeled { .. } => {}
                 Property::Name(name) => facts.name = Some(name.clone()),
-                Property::Project(project) => facts.project = project.clone(),
+                Property::LegacyProject(project) => facts.legacy_project = project.clone(),
+                Property::Repository(repository) => facts.repository = repository.clone(),
                 Property::State(state) => facts.state = *state,
                 Property::DeferUntil(at) => facts.defer_until = *at,
                 Property::Deadline(at) => facts.deadline = *at,
