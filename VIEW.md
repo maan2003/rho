@@ -121,9 +121,13 @@ security boundary (see `WORKSET.md`); it is a distribution.
    colocate, so that worktree step has to move into `jj workspace add`
    itself, applied whenever the main workspace is colocated. Then an
    agent's own `jj workspace add` gets it too. The rest is already in
-   place: jj recognises such a worktree as colocated, imports and
-   exports HEAD per workspace, and resets the worktree's index
-   (verified by hand on a store-backed clone).
+   place: jj recognises such a worktree as colocated and syncs both
+   ways per workspace, exactly as in the main workspace. Verified by
+   hand on a store-backed clone: `jj new` moves the worktree's git HEAD
+   and index; a `git commit` in the worktree is imported as the new
+   working-copy parent on the next jj command; `git branch` becomes a
+   bookmark; `git switch` to a branch is detached again on export. No
+   git hooks or command blocking are needed.
    *Why:* tools read git, not jj. Nix treats a directory without `.git`
    as a `path:` flake and copies the whole tree, ignored files included,
    into the store on every evaluation; with `.git` it fetches only
