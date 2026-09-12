@@ -1,9 +1,10 @@
-//! A live jj diff rendered with Zed's editor primitives.
+//! A live diff rendered with Zed's editor primitives.
 //!
-//! jj owns the persistent repository snapshot and immutable parent text. Zed
-//! owns current-side buffers, including unsaved edits and external-file
-//! conflict state. The [`DiffView`] observes one [`DiffModel`], so manifest
-//! refreshes reconcile the existing surface instead of replacing editors.
+//! The daemon owns the persistent repository snapshot and immutable parent
+//! text. Zed owns current-side buffers, including unsaved edits and
+//! external-file conflict state. The [`DiffView`] observes one [`DiffModel`],
+//! so manifest refreshes reconcile the existing surface instead of replacing
+//! editors.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -331,7 +332,7 @@ impl DiffModel {
         &self.status
     }
 
-    /// A semantic barrier: persist a fresh jj snapshot of this workspace and
+    /// A semantic barrier: persist a fresh snapshot of this workspace and
     /// its descendants, returning only a new manifest revision.
     pub fn refresh_now(&mut self, cx: &mut Context<Self>) {
         self.stale = true;
@@ -674,7 +675,7 @@ impl DiffView {
 }
 
 /// Sorted repository paths for every dirty buffer already owned by the shared
-/// remote workspace. These paths are unioned into the jj manifest so
+/// remote workspace. These paths are unioned into the manifest so
 /// unsaved-only edits appear and survive reconciliation.
 pub fn dirty_paths(remote: &RemoteProject, cx: &App) -> Vec<Utf8PathBuf> {
     let mut paths = remote
@@ -740,7 +741,7 @@ fn build_editor(
 
 fn diff_path_key(path: &Utf8Path) -> PathKey {
     let path = RelPath::from_unix_str(path.as_str())
-        .expect("jj repository paths are valid relative paths")
+        .expect("repository paths are valid relative paths")
         .into_arc();
     // All entries share a prefix so lexical repository path determines order;
     // unlike a manifest index, this key remains stable across refreshes.
@@ -751,7 +752,7 @@ fn status_text(prepared: &PreparedDiff) -> String {
     let short = &prepared.snapshot.commit_id[..prepared.snapshot.commit_id.len().min(12)];
     let count = prepared.snapshot.files.len();
     let noun = if count == 1 { "file" } else { "files" };
-    let mut parts = vec![format!("Changes · {count} {noun} · jj {short}")];
+    let mut parts = vec![format!("Changes · {count} {noun} · {short}")];
     if prepared.omitted != 0 {
         parts.push(format!("{} non-text/oversized omitted", prepared.omitted));
     }

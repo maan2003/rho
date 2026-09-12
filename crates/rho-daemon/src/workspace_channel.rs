@@ -452,8 +452,8 @@ fn watcher_event_requires_rescan(kind: &notify::EventKind) -> bool {
     )
 }
 
-/// jj and colocated Git administration are not workspace-file edits. In
-/// particular, a diff's own jj snapshot must not schedule another diff refresh.
+/// Git administration is not a workspace-file edit: nothing under `.git`
+/// schedules a diff refresh.
 fn is_workspace_metadata_path(path: &Utf8Path) -> bool {
     path.as_str()
         .split('/')
@@ -461,7 +461,7 @@ fn is_workspace_metadata_path(path: &Utf8Path) -> bool {
 }
 
 fn is_workspace_metadata_name(name: &std::ffi::OsStr) -> bool {
-    matches!(name.to_str(), Some(".jj" | ".git"))
+    name == ".git"
 }
 
 pub(super) fn drain_changes(
@@ -747,7 +747,7 @@ mod tests {
     fn directory_tree_watches_each_directory_non_recursively() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
-        std::fs::create_dir_all(root.path().join(".jj/repo")).unwrap();
+        std::fs::create_dir_all(root.path().join(".git/objects")).unwrap();
         let mut watcher = notify::RecommendedWatcher::new(
             |_| {},
             Config::default().with_event_kinds(EventKindMask::CORE),
@@ -766,7 +766,7 @@ mod tests {
         assert!(
             !watched
                 .iter()
-                .any(|(path, _)| path.starts_with(root.path().join(".jj")))
+                .any(|(path, _)| path.starts_with(root.path().join(".git")))
         );
     }
 
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn watcher_ignores_vcs_metadata_paths() {
         assert!(is_workspace_metadata_path(Utf8Path::new(
-            ".jj/repo/op_heads"
+            ".git/refs/heads/main"
         )));
         assert!(is_workspace_metadata_path(Utf8Path::new(
             "nested/.git/index"

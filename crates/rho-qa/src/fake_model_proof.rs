@@ -636,12 +636,12 @@ fn write_synthetic_auth(state: &Path) -> Result<()> {
 }
 
 fn init_workspace(path: &Path) -> Result<()> {
-    let status = Command::new("jj")
-        .args(["git", "init", "--colocate"])
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
         .arg(path)
         .status()
-        .context("run jj git init")?;
-    ensure!(status.success(), "jj git init failed");
+        .context("run git init")?;
+    ensure!(status.success(), "git init failed");
     Ok(())
 }
 
@@ -727,13 +727,13 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn tree_commit() -> Result<String> {
-    let output = Command::new("jj")
-        .args(["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
         .output()
         .context("read proof tree commit")?;
     ensure!(
         output.status.success(),
-        "jj could not read proof tree commit"
+        "git could not read proof tree commit"
     );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }

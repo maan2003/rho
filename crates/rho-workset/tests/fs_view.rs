@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 mod common;
-use common::{git, jj_binary};
+use common::git;
 
 fn run(mut command: Command) -> Output {
     let debug = format!("{command:?}");
@@ -30,29 +30,19 @@ fn namespace_setup_available() -> bool {
     true
 }
 
-/// Creates a bare remote, a state root whose `stores/` holds one store, and
-/// a workset directory holding a "project" clone made through that store.
+/// Creates a bare remote, a state root whose `stores/` holds one (fake)
+/// store directory, and a workset directory holding a "project" clone.
 /// Returns (state root, workset dir, store dir).
-fn build_fixture(temp: &Path, jj: &Path) -> (PathBuf, PathBuf, PathBuf) {
+fn build_fixture(temp: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let (_source, remote) = common::setup_remote(temp);
     let state = temp.join("state");
     let stores = state.join("stores");
     let src = temp.join("src");
-    std::fs::create_dir_all(&stores).unwrap();
+    let store = stores.join("remote-0");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("mirror"), "").unwrap();
     std::fs::create_dir_all(&src).unwrap();
-    let mut clone = Command::new(jj);
-    clone
-        .env("JJ_STORE", &stores)
-        .current_dir(&src)
-        .args(["git", "clone", "--"])
-        .arg(&remote)
-        .arg("project");
-    run(clone);
-    let store = std::fs::read_dir(&stores)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap();
+    git(&src, &["clone", "-q", remote.to_str().unwrap(), "project"]);
     (state, src, store)
 }
 
@@ -63,13 +53,11 @@ fn workset_and_generated_root_work_in_the_view() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let jj = jj_binary();
-    let (state, src, store) = build_fixture(temp.path(), &jj);
+    let (state, src, store) = build_fixture(temp.path());
     let skeleton = temp.path().join("skeleton");
     std::fs::create_dir(&skeleton).unwrap();
     std::fs::write(skeleton.join("seeded"), "seed\n").unwrap();
     std::os::unix::fs::symlink("/nix/store", skeleton.join("store-link")).unwrap();
-    std::fs::copy(&jj, skeleton.join("jj")).unwrap();
 
     let shell = Path::new("/bin/sh").canonicalize().unwrap();
     let git_bin = Path::new("/run/current-system/sw/bin/git")
@@ -99,9 +87,8 @@ test -L /etc/ssl/certs/ca-certificates.crt
 grep -q ' / / .* - tmpfs ' /proc/self/mountinfo
 grep ' /nix/store ' /proc/self/mountinfo | grep -q ' ro[, ]'
 {git} -C /src/project status --short
-{jj} -R /src/project st >/dev/null
 {unshare} -Ur true
-test ! -w {store}/clone-store
+test ! -w {store}/mirror
 touch /src/project/writable
 test ! -e {temp}/source
 "#,
@@ -109,7 +96,6 @@ test ! -e {temp}/source
         store = store.display(),
         temp = temp.path().display(),
         git = git_bin.display(),
-        jj = "/home/agent/jj",
         unshare = unshare.display(),
     );
     let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
@@ -149,8 +135,7 @@ fn exposed_mode_mounts_the_workset_over_the_host_src_stub() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let jj = jj_binary();
-    let (state, src, store) = build_fixture(temp.path(), &jj);
+    let (state, src, store) = build_fixture(temp.path());
 
     let script = format!(
         r#"
@@ -161,14 +146,12 @@ test "$HOME" = {home}
 test -d {temp}
 test "$RHO_FS_VIEW_TEST_ENV" = kept
 git -C /src/project status --short
-{jj} -R /src/project st >/dev/null
-test ! -w {store}/clone-store
+test ! -w {store}/mirror
 touch /src/project/writable
 "#,
         home = std::env::var("HOME").unwrap(),
         temp = temp.path().display(),
         store = store.display(),
-        jj = jj.display(),
     );
     let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
     view.env("RHO_FS_VIEW_TEST_ENV", "kept")

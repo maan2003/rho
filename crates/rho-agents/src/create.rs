@@ -12,16 +12,16 @@ use rho_ui_proto::{AgentRole, EngineerIntelligence, JoinTarget, StartMode, Works
 
 /// The user-facing name for selecting the first available conventional base.
 pub const DEFAULT_START: &str = "auto";
-/// The jj revset represented by [`DEFAULT_START`].
-pub const AUTO_BASE_REVSET: &str =
-    r#"coalesce(bookmarks(exact:"main"), bookmarks(exact:"master"), trunk())"#;
+/// The git revision represented by [`DEFAULT_START`]: none, so the agent
+/// starts where a fresh clone is born, on the remote's default branch.
+pub const AUTO_BASE_REV: &str = "";
 pub const DEFAULT_ROLE: &str = "eng";
 
 /// How the start field's target is interpreted; cycled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartFieldMode {
-    /// A fresh clone with a new change on top of the target revset.
+    /// A fresh clone with the target revision checked out.
     NewOn,
     /// The same directory as the target agent.
     Join,
@@ -134,14 +134,16 @@ pub fn parse_start(
     let workspace = base.workspace;
     let start = match (mode, target, workspace) {
         (StartFieldMode::NewOn, "", _) => {
-            return Err("pick a base: a revset like `@-` or an agent label".to_owned());
+            return Err(
+                "pick a base: a git revision like `origin/main` or an agent label".to_owned(),
+            );
         }
         // An agent's change lives in its own clone, which a fresh clone
         // cannot see: work with it by joining it.
         (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workset { .. })) => {
             return Err(format!(
                 "`{target}` is an agent: Shift-Tab to Join mode to work in its directory, \
-                 or base on a revset like `@-`"
+                 or base on a git revision like `origin/main`"
             ));
         }
         (
@@ -161,9 +163,11 @@ pub fn parse_start(
         }
         (StartFieldMode::NewOn, _, None) => {
             if target.eq_ignore_ascii_case("user") {
-                return Err("`user` is a join target; base on a revset like `@-`, \
+                return Err(
+                    "`user` is a join target; base on a git revision like `origin/main`, \
                      or Shift-Tab to Join mode"
-                    .to_owned());
+                        .to_owned(),
+                );
             }
             if target
                 .strip_prefix('@')
@@ -174,7 +178,7 @@ pub fn parse_start(
             StartMode::NewOn {
                 repo: require_workdir()?.path,
                 revset: if target.eq_ignore_ascii_case(DEFAULT_START) {
-                    AUTO_BASE_REVSET
+                    AUTO_BASE_REV
                 } else {
                     target
                 }
@@ -318,10 +322,10 @@ mod tests {
         assert!(refusal.contains("an agent cannot start from a base on another host"));
     }
 
-    /// The default start is a name, not a revset; what goes on the wire is
-    /// the revset it stands for.
+    /// The default start is a name, not a revision; what goes on the wire is
+    /// the revision it stands for.
     #[test]
-    fn the_default_base_goes_out_as_its_revset() {
+    fn the_default_base_goes_out_as_its_revision() {
         let hosts = Hosts::new(std::sync::Arc::new(rho_hosts::DroppedSink));
         let (host, start) = parse_start(
             &hosts,
@@ -340,7 +344,7 @@ mod tests {
             start,
             StartMode::NewOn {
                 repo: Utf8PathBuf::from("/src/rho"),
-                revset: AUTO_BASE_REVSET.to_owned(),
+                revset: AUTO_BASE_REV.to_owned(),
             }
         );
     }

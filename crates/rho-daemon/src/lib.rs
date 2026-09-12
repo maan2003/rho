@@ -495,9 +495,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
     };
     let quota_path_overrides = path_overrides.clone();
-    // The clone store server keeps every store fetched so new agents start
-    // on the remote's latest state; without it (no jj on PATH, say) jj
-    // clients initialize stores themselves and nothing refreshes them.
+    // The mirror keeper keeps every mirror fetched so new agents start on
+    // the remote's latest state; without it (no git on PATH, say) agents
+    // get plain git and nothing is shared.
     let worksets = match rho_workset::Worksets::open(
         &state_dir,
         user_environment.clone(),
@@ -1067,7 +1067,7 @@ impl Services {
                 let mode = rho_workset::Mode::from_workset_mode(self.workset_mode);
                 let placed = async {
                     let checkout = workset.clone_repo(origin.as_str(), None).await?;
-                    workset.new_change(&checkout, &revset).await?;
+                    workset.checkout(&checkout, &revset).await?;
                     let cwd = visible_path(&workset, &checkout)?;
                     let view = workset.enter(mode, &cwd)?;
                     anyhow::Ok(rho_agent::StartPlace::new(view, Some(origin)).owning_workset())
@@ -1454,7 +1454,7 @@ where
             Ok(Refresh::None) => {}
             Err(error) => {
                 // The whole chain, not just the outermost context: a new
-                // agent that failed said "create managed jj workspace" and
+                // agent that failed said "create managed workspace" and
                 // kept the reason to itself, which is not something a
                 // reader can act on.
                 let _ = outgoing_tx.send(ServerMessage::Error {
@@ -3041,9 +3041,9 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
     anyhow::bail!("could not allocate a unique GUI telemetry filename")
 }
 
-/// Persists one jj working-copy snapshot and serves its bounded parent-side
+/// Serves one working-copy diff snapshot and its bounded parent-side
 /// manifest on a dedicated stream, avoiding control-session head-of-line
-/// blocking.
+/// blocking. (Taking the snapshot itself is a TODO in `rho-workset`.)
 async fn serve_diff_snapshot<W>(
     services: Arc<Services>,
     mut writer: W,
@@ -3360,7 +3360,7 @@ where
                 // A watcher cannot report changes made before its directory
                 // registration completed. Treat that window like overflow; the
                 // GUI already reconciles it by reloading open buffers and
-                // scheduling a fresh jj semantic barrier.
+                // scheduling a fresh semantic barrier.
                 rho_ui_proto::write_frame_limited(
                     &mut writer,
                     &WorkspaceServerFrame::Changed {
@@ -3528,9 +3528,9 @@ fn detail_update(update: &rho_core::ToolUpdate) -> rho_ui_proto::mirror::DetailR
     }
 }
 
-/// Repo roots must be absolute (the daemon's cwd is meaningless by design)
-/// jj repo roots: agents work in daemon-created jj workspaces, so both
-/// workdir registration and agent creation take repos. A leading `~` expands
+/// Repo roots must be absolute (the daemon's cwd is meaningless by design):
+/// agents start on daemon-made clones, so both workdir registration and
+/// agent creation take repos. A leading `~` expands
 /// to the daemon's home: clients may run on another machine, so path
 /// interpretation belongs here.
 const MAX_INPUT_IMAGES: usize = 20;
@@ -3589,7 +3589,7 @@ async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()
     validate_image_content(content)
 }
 
-/// The workset behind an agent's place and the root of the jj workspace
+/// The workset behind an agent's place and the root of the git checkout
 /// (or plain directory) its working directory is in, on the host.
 async fn open_checkout(
     services: &Services,

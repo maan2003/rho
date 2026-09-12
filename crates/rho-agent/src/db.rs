@@ -334,8 +334,8 @@ pub struct AgentConfig {
     /// The agent's working set: where it works, primary workdir first.
     /// Fixed at spawn - never removed or reordered, because accumulated
     /// model context assumes the entries stay valid. Managed workspace ids
-    /// are repository-local and allocated by jj; joined agents retain the
-    /// owning agent's id for that repository.
+    /// are repository-local, allocated by the VCS of the time; joined agents
+    /// retain the owning agent's id for that repository.
     pub workdirs: Vec<WorkspaceInfo>,
     pub spawned_by: AgentSpawnedBy,
     /// The name the spawner gave. A generated title is never made for an

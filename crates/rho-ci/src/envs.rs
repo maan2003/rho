@@ -22,7 +22,7 @@ pub const SELFCI_CANDIDATE_DIR: &str = "SELFCI_CANDIDATE_DIR";
 /// Candidate commit id.
 pub const SELFCI_CANDIDATE_COMMIT_ID: &str = "SELFCI_CANDIDATE_COMMIT_ID";
 
-/// Candidate jj change id.
+/// Candidate change id.
 pub const SELFCI_CANDIDATE_CHANGE_ID: &str = "SELFCI_CANDIDATE_CHANGE_ID";
 
 /// Candidate as the submitter named it (display string).

@@ -1071,7 +1071,6 @@ impl Session {
             .env_remove("NO_COLOR")
             .env("PAGER", &spawn.pager_program)
             .env("GIT_PAGER", &spawn.pager_program)
-            .env("JJ_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
         spawn.view.prepare_command(&mut command, None).await?;

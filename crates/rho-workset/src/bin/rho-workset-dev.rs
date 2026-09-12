@@ -1,6 +1,7 @@
 //! Development runner: enters a workset namespace the way the daemon does
 //! and runs one command in it. `--src` is adopted as the workset; `--state`
-//! is a state root (its `stores/` is the clone store, no server runs).
+//! is a state root (its `stores/` is the mirror store; no keeper runs, so
+//! `git` inside is the plain one).
 
 use std::ffi::OsString;
 use std::path::PathBuf;

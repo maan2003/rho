@@ -3,28 +3,31 @@
 //! A workset is one plain directory an agent uses as its working place,
 //! presented at `/src` inside the agent's namespace. The daemon does not
 //! interpret its contents: the agent clones what it needs with ordinary
-//! `jj git clone`, which is instant because every clone is served from the
-//! daemon's clone-store root (`CLONES.md`). The store root is owned by a
-//! `jj store serve` process the daemon runs; agents and the daemon alike
-//! reach it through one unix socket and never write a store themselves.
+//! `git clone`, which is instant because every clone is born from the
+//! daemon's mirror store (`CLONES.md`). The store root is owned by the
+//! keeper (`rho-git-server`) running inside the daemon; the `git` agents
+//! see is the store's client (`rho-git`), and the daemon's own clones go
+//! through the same keeper in-process. Nothing but the keeper writes a
+//! mirror.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use rho_git_server::MirrorStore;
 use tokio::sync::Mutex;
 
-mod diff;
 mod ns;
 
 pub mod layout;
 
 pub use layout::*;
 pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
+pub use rho_git_proto::{GIT_ENV, SOCKET_ENV};
+pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
     WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
     WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
@@ -100,48 +103,50 @@ impl UserEnvironment {
     }
 }
 
-/// How the store server keeps stores fresh: every store is refetched each
-/// `interval`, and a store fetched within `debounce` is served as is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StoreRefresh {
-    pub interval: Duration,
-    pub debounce: Duration,
-}
-
-impl Default for StoreRefresh {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(60),
-            debounce: Duration::from_secs(30),
-        }
-    }
-}
-
-/// Whether a state root runs the store server. Without one, jj clients
-/// initialize and fetch stores themselves (`JJ_STORE` only) and nothing
-/// keeps them fresh in the background.
+/// Whether a state root runs the mirror keeper. Without one, the `git`
+/// agents see is the plain one: clones and fetches go to the network and
+/// nothing is shared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreService {
     Serve(StoreRefresh),
     None,
 }
 
-/// The daemon-wide owner of one state root: the clone-store root, its
-/// server, and every workset directory.
+/// The daemon-wide owner of one state root: the mirror store, its keeper,
+/// and every workset directory.
 #[derive(Debug)]
 pub struct Worksets {
     root: Utf8PathBuf,
     environment: UserEnvironment,
     path_overrides: PathOverrides,
-    server: Mutex<Option<tokio::process::Child>>,
+    store: Option<StoreHandle>,
     worksets: Mutex<BTreeMap<String, Weak<WorksetInner>>>,
     /// Host directories adopted as worksets for this process's lifetime.
     adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
 }
 
+/// The running keeper: its socket, the real git it and the wrapper run,
+/// and the directory holding the `git` wrapper agents see.
+#[derive(Debug)]
+struct StoreHandle {
+    keeper: Arc<MirrorStore>,
+    socket: Utf8PathBuf,
+    git: PathBuf,
+    bin: Option<Utf8PathBuf>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for StoreHandle {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 impl Worksets {
     /// Opens (creating if needed) the state root and, when asked, starts
-    /// its store server, returning once the server accepts connections.
+    /// the mirror keeper on its socket.
     pub async fn open(
         root: impl AsRef<Path>,
         environment: UserEnvironment,
@@ -150,12 +155,12 @@ impl Worksets {
     ) -> anyhow::Result<Arc<Self>> {
         let root = absolute_utf8(root.as_ref())?;
         std::fs::create_dir_all(root.join("stores"))
-            .with_context(|| format!("create clone-store root at {root}"))?;
+            .with_context(|| format!("create mirror store root at {root}"))?;
         std::fs::create_dir_all(root.join("worksets"))
             .with_context(|| format!("create workset root at {root}"))?;
-        let server = match service {
+        let store = match service {
             StoreService::Serve(refresh) => {
-                Some(spawn_store_server(&root, &environment, &path_overrides, refresh).await?)
+                Some(start_store(&root, &environment, &path_overrides, refresh)?)
             }
             StoreService::None => None,
         };
@@ -163,7 +168,7 @@ impl Worksets {
             root,
             environment,
             path_overrides,
-            server: Mutex::new(server),
+            store,
             worksets: Mutex::new(BTreeMap::new()),
             adopted: std::sync::Mutex::new(BTreeMap::new()),
         }))
@@ -177,7 +182,7 @@ impl Worksets {
         Ok(state.join("rho"))
     }
 
-    /// Opens the default root with a store server.
+    /// Opens the default root with the keeper running.
     pub async fn open_default(
         environment: UserEnvironment,
         path_overrides: PathOverrides,
@@ -195,40 +200,35 @@ impl Worksets {
         &self.root
     }
 
-    /// The clone-store root (`git.clone-store`); read-only for everyone but
-    /// the server.
+    /// The mirror store root; read-only for everyone but the keeper.
     pub fn store_root(&self) -> Utf8PathBuf {
         self.root.join("stores")
     }
 
-    /// The store server's socket (`git.clone-store-socket`), when one runs.
+    /// The keeper's socket, when one runs.
     pub fn store_socket(&self) -> Option<Utf8PathBuf> {
-        self.server
-            .try_lock()
-            .map(|server| server.is_some())
-            .unwrap_or(true)
-            .then(|| self.root.join("store.sock"))
+        self.store.as_ref().map(|store| store.socket.clone())
     }
 
-    /// Environment that points jj at the store root and its server.
+    /// The directory holding the `git` wrapper, when the keeper runs and
+    /// the wrapper was found; agents get it first on their PATH.
+    pub fn store_bin(&self) -> Option<Utf8PathBuf> {
+        self.store.as_ref().and_then(|store| store.bin.clone())
+    }
+
+    /// Environment that points the `git` wrapper at the keeper and at the
+    /// real git.
     pub fn store_environment(&self) -> Vec<(OsString, OsString)> {
-        let mut environment = vec![("JJ_STORE".into(), self.store_root().into_os_string())];
-        if let Some(socket) = self.store_socket() {
-            environment.push(("JJ_STORE_SOCKET".into(), socket.into_os_string()));
+        let Some(store) = &self.store else {
+            return Vec::new();
+        };
+        let mut environment = vec![(SOCKET_ENV.into(), store.socket.clone().into_os_string())];
+        // Only a /nix/store git exists in the view; elsewhere the wrapper
+        // finds git on its PATH.
+        if store.git.starts_with("/nix/store") {
+            environment.push((GIT_ENV.into(), store.git.clone().into_os_string()));
         }
         environment
-    }
-
-    /// Whether the store server is still running.
-    pub async fn server_alive(&self) -> bool {
-        matches!(
-            self.server
-                .lock()
-                .await
-                .as_mut()
-                .map(|server| server.try_wait()),
-            Some(Ok(None))
-        )
     }
 
     /// Adopts an existing host directory as a workset for the lifetime of
@@ -309,7 +309,7 @@ impl Worksets {
     }
 
     /// Removes a workset directory and everything the agent put in it.
-    /// Stores are untouched: clones only borrow from them. Idempotent.
+    /// Mirrors are untouched: clones only borrow from them. Idempotent.
     pub async fn discard_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<()> {
         validate_name(workset_id)?;
         let live = self
@@ -330,8 +330,8 @@ impl Worksets {
         }
     }
 
-    /// A daemon-side command with the user's environment, the jj override,
-    /// and the store server wired in.
+    /// A daemon-side command with the user's environment and the store
+    /// wired in.
     pub fn command(&self, program: &str) -> tokio::process::Command {
         let mut command = base_command(program, &self.environment, &self.path_overrides);
         command.envs(self.store_environment());
@@ -344,17 +344,7 @@ fn base_command(
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
 ) -> tokio::process::Command {
-    let executable = if program == "jj" {
-        environment
-            .get("RHO_JJ")
-            .unwrap_or_else(|| OsStr::new(program))
-    } else {
-        OsStr::new(program)
-    };
-    let mut command = tokio::process::Command::new(executable);
-    if program == "jj" {
-        command.args(["--config", "git.write-change-id-header=true"]);
-    }
+    let mut command = tokio::process::Command::new(program);
     environment.apply(&mut command);
     if let Some(path) = environment.get("PATH") {
         command.env("PATH", path_overrides.add_to(path));
@@ -362,68 +352,109 @@ fn base_command(
     command
 }
 
-async fn spawn_store_server(
+/// The environment the keeper runs git with: the user's, with the PATH
+/// overrides applied.
+fn keeper_environment(
+    environment: &UserEnvironment,
+    path_overrides: &PathOverrides,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .0
+        .iter()
+        .map(|(name, value)| {
+            if name == "PATH" {
+                (name.clone(), path_overrides.add_to(value))
+            } else {
+                (name.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+/// Starts the keeper: installs the wrapper, binds the socket, serves it and
+/// keeps every mirror fresh in the background.
+fn start_store(
     root: &Utf8Path,
     environment: &UserEnvironment,
     path_overrides: &PathOverrides,
     refresh: StoreRefresh,
-) -> anyhow::Result<tokio::process::Child> {
+) -> anyhow::Result<StoreHandle> {
+    let bin = root.join("bin");
+    let wrapper = bin.join("git");
+    let git = real_git(environment, path_overrides, wrapper.as_std_path())?;
+    let bin = install_wrapper(&bin)?;
+    let keeper = MirrorStore::new(
+        root.join("stores").into_std_path_buf(),
+        git.clone(),
+        keeper_environment(environment, path_overrides),
+        refresh.debounce,
+    );
     let socket = root.join("store.sock");
-    let mut command = base_command("jj", environment, path_overrides);
-    command
-        .arg("--config")
-        .arg(format!(
-            "git.clone-store={}",
-            toml_string(root.join("stores").as_str())
-        ))
-        .args(["store", "serve", "--socket"])
-        .arg(&socket)
-        .arg("--interval")
-        .arg(refresh.interval.as_secs().to_string())
-        .arg("--debounce")
-        .arg(refresh.debounce.as_secs().to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().context("start clone store server")?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-            // The server's stderr is its log; keep it from blocking on a
-            // full pipe now that startup is over.
-            if let Some(stderr) = child.stderr.take() {
-                tokio::spawn(async move {
-                    use tokio::io::AsyncBufReadExt as _;
-                    let mut lines = tokio::io::BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        eprintln!("store server: {line}");
-                    }
-                });
+    let listener = MirrorStore::bind(socket.as_std_path())
+        .with_context(|| format!("bind mirror store socket {socket}"))?;
+    let serve = tokio::spawn({
+        let keeper = Arc::clone(&keeper);
+        async move {
+            if let Err(error) = keeper.serve(listener).await {
+                eprintln!("git store: socket server stopped: {error:#}");
             }
-            return Ok(child);
         }
-        if let Some(status) = child.try_wait()? {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                use tokio::io::AsyncReadExt as _;
-                let _ = pipe.read_to_string(&mut stderr).await;
-            }
-            anyhow::bail!(
-                "clone store server exited during startup ({status}): {}",
-                stderr.trim()
-            );
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "clone store server did not open {socket}"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    });
+    let refresh_loop = keeper.spawn_refresh_loop(refresh.interval);
+    Ok(StoreHandle {
+        keeper,
+        socket,
+        git,
+        bin,
+        tasks: vec![serve, refresh_loop],
+    })
 }
 
-fn toml_string(value: &str) -> String {
-    format!("{value:?}")
+/// The real git: the first on the user's PATH (overrides applied) that is
+/// not the wrapper, or on the daemon's own PATH, canonicalized so a
+/// `/nix/store` git is named as such.
+fn real_git(
+    environment: &UserEnvironment,
+    path_overrides: &PathOverrides,
+    wrapper: &Path,
+) -> anyhow::Result<PathBuf> {
+    let user_path = environment
+        .get("PATH")
+        .map(|path| path_overrides.add_to(path));
+    let git = rho_git_client::Git::find_on_path(user_path.as_deref(), Some(wrapper))
+        .or_else(|| rho_git_client::Git::find_on_path(None, Some(wrapper)))
+        .context("git is not on PATH; the mirror store needs it")?;
+    let executable = git.executable();
+    Ok(executable
+        .canonicalize()
+        .unwrap_or_else(|_| executable.to_owned()))
+}
+
+/// Installs a private copy of the `git` wrapper (`rho-git`) as `<bin>/git`.
+/// The wrapper comes from `RHO_GIT_WRAPPER` or sits beside this executable;
+/// a build without one gets a warning and plain git.
+fn install_wrapper(bin: &Utf8Path) -> anyhow::Result<Option<Utf8PathBuf>> {
+    let source = match std::env::var_os("RHO_GIT_WRAPPER") {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => std::env::current_exe()
+            .context("locate own executable")?
+            .with_file_name("rho-git"),
+    };
+    if !source.is_file() {
+        eprintln!(
+            "git store: wrapper not found at {}; agents get plain git (set RHO_GIT_WRAPPER)",
+            source.display()
+        );
+        return Ok(None);
+    }
+    std::fs::create_dir_all(bin).with_context(|| format!("create {bin}"))?;
+    let staged = bin.join(".git.tmp");
+    std::fs::copy(&source, &staged)
+        .with_context(|| format!("copy {} to {staged}", source.display()))?;
+    // A copy, renamed into place: agents mid-exec keep the old inode and the
+    // bind mount of `bin` sees the new file at once.
+    std::fs::rename(&staged, bin.join("git")).with_context(|| format!("install {bin}/git"))?;
+    Ok(Some(bin.to_owned()))
 }
 
 /// A handle to one workset's host-frame `src` directory.
@@ -463,144 +494,58 @@ impl Workset {
         Namespace::new(self.clone(), mode, cwd)
     }
 
-    /// Starts a new change atop `revset` in the repository at `checkout`
-    /// (a host directory inside the workset).
-    pub async fn new_change(&self, checkout: &Utf8Path, revset: &str) -> anyhow::Result<()> {
+    /// Checks out `rev` (a branch, tag or commit, as `git checkout` takes
+    /// it) in the repository at `checkout`, a host directory inside the
+    /// workset. An empty `rev` leaves the clone as born, on the remote's
+    /// default branch.
+    pub async fn checkout(&self, checkout: &Utf8Path, rev: &str) -> anyhow::Result<()> {
+        let rev = rev.trim();
+        if rev.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(!rev.starts_with('-'), "not a revision: {rev}");
         let owner = self.owner()?;
         let _guard = self.0.operation_lock.lock().await;
-        let mut command = owner.command("jj");
-        command.current_dir(checkout).args(["new", revset]);
-        run(command, "start change at requested revset").await
+        let mut command = owner.command("git");
+        command
+            .current_dir(checkout)
+            .args(["checkout", "--quiet", rev]);
+        run(command, &format!("check out {rev}")).await
     }
 
-    /// Snapshots the jj workspace containing `checkout` (a host directory
-    /// inside the workset) and reads its working-copy commit against the
-    /// merged parent tree through `jj-lib`. `None` when the commit is still
-    /// `known_commit_id`.
+    /// A live diff of the checkout containing `checkout` against its base.
+    ///
+    /// TODO: the jj-based reader is gone; reimplement this over git.
     pub async fn diff_snapshot(
         &self,
         checkout: &Utf8Path,
-        known_commit_id: Option<&str>,
-        include_paths: &[Utf8PathBuf],
+        _known_commit_id: Option<&str>,
+        _include_paths: &[Utf8PathBuf],
     ) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
-        anyhow::ensure!(
-            include_paths.len() <= 2_048,
-            "too many live diff paths: {}",
-            include_paths.len()
-        );
-        anyhow::ensure!(
-            include_paths
-                .iter()
-                .try_fold(0_usize, |total, path| total
-                    .checked_add(path.as_str().len()))
-                .is_some_and(|total| total <= 1024 * 1024),
-            "live diff paths exceed the 1 MiB path budget"
-        );
-        let (checkout, is_jj) = resolve_workdir_root(checkout.as_std_path())?;
-        anyhow::ensure!(is_jj, "diff view requires a jj repository: {checkout}");
-        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        let permit = DIFF_READERS
-            .acquire()
-            .await
-            .context("diff readers closed")?;
-        let known_commit_id = known_commit_id.map(str::to_owned);
-        let include_paths = include_paths.to_vec();
-        let environment = self.jj_environment()?;
-        let inner = Arc::clone(&self.0);
-        tokio::task::spawn_blocking(move || {
-            // jj-lib's repository/index graph is intentionally !Send. Keep
-            // every jj value and future on this one blocking worker; only the
-            // fully-owned wire DTO crosses back to Tokio.
-            let _permit = permit;
-            let _guard = inner.operation_lock.blocking_lock();
-            futures::executor::block_on(async {
-                let epoch = jj_cli::cli_util::snapshot_workspace_descendants_at_with_environment(
-                    checkout.as_std_path(),
-                    environment,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
-                let captured = diff::capture(epoch).await?;
-                if known_commit_id.as_deref() == Some(captured.commit_id_hex().as_str()) {
-                    return Ok(None);
-                }
-                diff::load(captured, &include_paths).await.map(Some)
-            })
-        })
-        .await
-        .context("jj diff reader panicked")?
+        let (checkout, is_git) = resolve_workdir_root(checkout.as_std_path())?;
+        anyhow::ensure!(is_git, "diff view requires a git repository: {checkout}");
+        anyhow::bail!("the diff view is not available yet for git checkouts")
     }
 
-    /// Materializes bounded parent-side content from a previously returned
-    /// immutable jj operation. This never snapshots the live working copy.
+    /// Base-side contents for paths of an earlier diff snapshot.
+    ///
+    /// TODO: the jj-based reader is gone; reimplement this over git.
     pub async fn diff_base_contents(
         &self,
         checkout: &Utf8Path,
-        operation_id: &str,
-        commit_id: &str,
-        paths: &[Utf8PathBuf],
+        _operation_id: &str,
+        _commit_id: &str,
+        _paths: &[Utf8PathBuf],
     ) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
-        anyhow::ensure!(
-            paths.len() <= 64,
-            "too many deferred diff paths: {}",
-            paths.len()
-        );
-        anyhow::ensure!(
-            paths
-                .iter()
-                .try_fold(0_usize, |total, path| total
-                    .checked_add(path.as_str().len()))
-                .is_some_and(|total| total <= 1024 * 1024),
-            "deferred diff paths exceed the 1 MiB path budget"
-        );
-        let (checkout, is_jj) = resolve_workdir_root(checkout.as_std_path())?;
-        anyhow::ensure!(is_jj, "diff view requires a jj repository: {checkout}");
-        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        let permit = DIFF_READERS
-            .acquire()
-            .await
-            .context("diff readers closed")?;
-        let operation_id = operation_id.to_owned();
-        let commit_id = commit_id.to_owned();
-        let paths = paths.to_vec();
-        let environment = self.jj_environment()?;
-        let inner = Arc::clone(&self.0);
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _guard = inner.operation_lock.blocking_lock();
-            futures::executor::block_on(async {
-                let epoch = jj_cli::cli_util::workspace_snapshot_at_operation_with_environment(
-                    checkout.as_std_path(),
-                    &operation_id,
-                    environment,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
-                let captured = diff::capture(epoch).await?;
-                anyhow::ensure!(
-                    captured.commit_id_hex() == commit_id,
-                    "diff snapshot revision is no longer available"
-                );
-                diff::load_base_contents(captured, &paths).await
-            })
-        })
-        .await
-        .context("jj deferred diff reader panicked")?
+        let (checkout, is_git) = resolve_workdir_root(checkout.as_std_path())?;
+        anyhow::ensure!(is_git, "diff view requires a git repository: {checkout}");
+        anyhow::bail!("the diff view is not available yet for git checkouts")
     }
 
-    /// The environment in-process jj readers see: the user's, plus the
-    /// store variables.
-    fn jj_environment(&self) -> anyhow::Result<Vec<(OsString, OsString)>> {
-        let owner = self.owner()?;
-        let mut environment = owner.environment.0.iter().cloned().collect::<Vec<_>>();
-        environment.extend(owner.store_environment());
-        Ok(environment)
-    }
-
-    /// Clones `remote_url` into `<root>/<name>` through the store server,
-    /// exactly as the agent would with `jj git clone`. `name` defaults to
-    /// the repository name in the URL. An existing clone of that name is
-    /// returned as is.
+    /// Clones `remote_url` into `<root>/<name>` from the mirror store,
+    /// exactly as the agent's `git clone` would (or with plain git when no
+    /// keeper runs). `name` defaults to the repository name in the URL. An
+    /// existing clone of that name is returned as is.
     pub async fn clone_repo(
         &self,
         remote_url: &str,
@@ -608,38 +553,55 @@ impl Workset {
     ) -> anyhow::Result<Utf8PathBuf> {
         let name = match name {
             Some(name) => name.to_owned(),
-            None => repo_name(remote_url)?,
+            None => rho_git_proto::repo_name(remote_url)
+                .with_context(|| format!("remote URL has no repository name: {remote_url:?}"))?,
         };
         validate_name(&name)?;
         let owner = self.owner()?;
         let _guard = self.0.operation_lock.lock().await;
         let target = self.0.root.join(&name);
-        if target.join(".jj").is_dir() {
+        if is_git_checkout(target.as_std_path()) {
             return Ok(target);
         }
         anyhow::ensure!(
             !target.exists(),
-            "{target} exists and is not a jj repository"
+            "{target} exists and is not a git repository"
         );
-        let mut command = owner.command("jj");
-        command
-            .current_dir(&self.0.root)
-            .args(["git", "clone", "--", remote_url, &name]);
-        if let Err(error) = run(command, "clone repository").await {
+        let cloned = match &owner.store {
+            Some(store) => {
+                let mirror = store.keeper.ensure(remote_url).await?;
+                let git = rho_git_client::Git::new(&store.git);
+                let url = remote_url.to_owned();
+                let dest = target.clone();
+                tokio::task::spawn_blocking(move || {
+                    rho_git_client::clone_from_mirror(&git, &mirror, &url, dest.as_std_path())
+                })
+                .await
+                .context("clone worker panicked")?
+            }
+            None => {
+                let mut command = owner.command("git");
+                command
+                    .current_dir(&self.0.root)
+                    .args(["clone", "--quiet", "--", remote_url, &name]);
+                run(command, "clone repository").await
+            }
+        };
+        if let Err(error) = cloned {
             let _ = std::fs::remove_dir_all(&target);
             return Err(error);
         }
         Ok(target)
     }
 
-    /// Names of the top-level jj repositories in the workset.
+    /// Names of the top-level git checkouts in the workset.
     pub fn repos(&self) -> anyhow::Result<Vec<String>> {
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&self.0.root)
             .with_context(|| format!("list workset {}", self.0.root))?
         {
             let entry = entry?;
-            if entry.path().join(".jj").is_dir()
+            if is_git_checkout(&entry.path())
                 && let Ok(name) = entry.file_name().into_string()
             {
                 names.push(name);
@@ -654,20 +616,6 @@ impl Workset {
     pub fn host_path(&self, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
         let relative = visible_relative(layout::MOUNT_ROOT, visible)?;
         Ok(self.0.root.join(relative))
-    }
-
-    /// Records pending working-copy changes in every top-level repository.
-    pub async fn snapshot(&self) -> anyhow::Result<()> {
-        let owner = self.owner()?;
-        let _guard = self.0.operation_lock.lock().await;
-        for name in self.repos()? {
-            let mut command = owner.command("jj");
-            command
-                .current_dir(self.0.root.join(&name))
-                .args(["util", "snapshot"]);
-            run(command, &format!("snapshot {name}")).await?;
-        }
-        Ok(())
     }
 }
 
@@ -692,66 +640,15 @@ pub(crate) fn visible_relative<'a>(
     }
 }
 
-/// The repository name jj would derive for a clone of `url`.
-fn repo_name(url: &str) -> anyhow::Result<String> {
-    let trimmed = url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let name = trimmed
-        .rsplit(['/', ':'])
-        .find(|part| !part.is_empty())
-        .context("remote URL has no repository name")?;
-    Ok(name.to_owned())
+/// Whether `path` is the root of a git checkout: a `.git` directory, or the
+/// `.git` file of a worktree.
+fn is_git_checkout(path: &Path) -> bool {
+    path.join(".git").exists()
 }
 
-/// The root of the jj repository whose workspace `path` is (following a
-/// secondary workspace's pointer to its origin).
-pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
-    anyhow::ensure!(
-        path.is_absolute(),
-        "repo path must be absolute: {}",
-        path.display()
-    );
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("repo does not exist: {}", path.display()))?;
-    let path = Utf8PathBuf::try_from(path).context("repo path is not valid UTF-8")?;
-    anyhow::ensure!(
-        path.join(".jj").is_dir(),
-        "not a jj repository root: {path}"
-    );
-    let pointer = path.join(".jj").join("repo");
-    if pointer.is_file() {
-        // A secondary workspace: the pointer names `<origin>/.jj/repo`.
-        let target = Utf8PathBuf::from(
-            std::fs::read_to_string(&pointer)
-                .with_context(|| format!("read {pointer}"))?
-                .trim(),
-        );
-        let target = if target.is_absolute() {
-            target
-        } else {
-            path.join(".jj").join(target)
-        };
-        let origin = target
-            .parent()
-            .and_then(Utf8Path::parent)
-            .with_context(|| format!("malformed repo pointer in {pointer}"))?
-            .to_owned();
-        anyhow::ensure!(
-            origin.join(".jj").is_dir(),
-            "workspace points at a missing repo: {origin}",
-        );
-        let origin = origin
-            .canonicalize_utf8()
-            .with_context(|| format!("canonicalize repo root {origin}"))?;
-        return Ok(origin);
-    }
-    Ok(path)
-}
-
-/// Walks up from `path` to the containing jj workspace root when there is
+/// Walks up from `path` to the containing git checkout root when there is
 /// one, otherwise canonicalizes the plain directory. Returns the root and
-/// whether it is a jj workspace.
+/// whether it is a git checkout.
 pub fn resolve_workdir_root(path: &Path) -> anyhow::Result<(Utf8PathBuf, bool)> {
     anyhow::ensure!(
         path.is_absolute(),
@@ -768,7 +665,7 @@ pub fn resolve_workdir_root(path: &Path) -> anyhow::Result<(Utf8PathBuf, bool)> 
     );
     let mut cursor: &Utf8Path = &canonical;
     loop {
-        if cursor.join(".jj").is_dir() {
+        if is_git_checkout(cursor.as_std_path()) {
             return Ok((cursor.to_owned(), true));
         }
         match cursor.parent() {
@@ -825,17 +722,6 @@ async fn run(mut command: tokio::process::Command, action: &str) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn repo_names_follow_the_url() {
-        assert_eq!(
-            repo_name("https://github.com/org/repo.git").unwrap(),
-            "repo"
-        );
-        assert_eq!(repo_name("git@github.com:org/repo").unwrap(), "repo");
-        assert_eq!(repo_name("/tmp/remote.git/").unwrap(), "remote");
-        assert!(repo_name("").is_err());
-    }
 
     #[test]
     fn visible_paths_stay_below_the_root() {

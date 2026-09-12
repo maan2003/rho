@@ -365,7 +365,7 @@ pub enum ClientMessage {
         request_id: u64,
         agent: String,
     },
-    /// One-shot request on a fresh stream for a persistent jj snapshot and
+    /// One-shot request on a fresh stream for a persistent diff snapshot and
     /// parent-side diff manifest. Current-side text remains in Zed buffers.
     /// The daemon replies with
     /// [`ServerMessage::DiffSnapshot`] or [`ServerMessage::DiffRefused`] and
@@ -373,7 +373,7 @@ pub enum ClientMessage {
     DiffSnapshot {
         workspace: WorkspaceInfo,
         known_commit_id: Option<String>,
-        /// Dirty Zed buffers whose paths may not yet exist in jj's disk
+        /// Dirty Zed buffers whose paths may not yet exist in the daemon's disk
         /// snapshot. The daemon supplies their immutable parent side.
         include_paths: Vec<Utf8PathBuf>,
     },

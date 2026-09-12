@@ -10,10 +10,11 @@ fn workspace_handle(id: WorkspaceId) -> String {
     format!("ws-{}", id.encoded())
 }
 
-/// Prefix-id family for repository-local jj-managed workspace ids.
+/// Prefix-id family for repository-local managed-workspace ids.
 ///
-/// jj owns the actual per-repository seed and counter. Rho persists the
-/// resulting encoded id and does not allocate production ids itself.
+/// Historical: the VCS of the time owned the per-repository seed and
+/// counter. Rho persists the encoded id so old records still decode and
+/// does not allocate production ids itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceIdDomain(pub u64);
 
@@ -32,14 +33,15 @@ pub enum WorkspaceInfo {
     /// The user's own checkout: the agent works directly at the repo path,
     /// no separate checkout and no namespace.
     UserCheckout { repo: Utf8PathBuf },
-    /// A stable jj-managed workspace. jj selects and persists its checkout
-    /// path; Rho stores only the repository-local id.
+    /// A managed workspace of an earlier version, which persisted its own
+    /// checkout path; Rho stores only the repository-local id. Historical:
+    /// no longer created.
     Workspace {
         repo: Utf8PathBuf,
         #[senax(rename = "name")]
         id: WorkspaceId,
     },
-    /// A jj-managed workspace whose original VCS metadata is masked from
+    /// A managed workspace whose original VCS metadata is masked from
     /// child commands and replaced by a synthetic Git baseline. Historical:
     /// no longer created.
     Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
@@ -121,7 +123,7 @@ impl WorkspaceInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct WorkspaceDiffSnapshot {
-    /// Exact jj operation from which the manifest was materialized.
+    /// Exact VCS operation from which the manifest was materialized.
     pub operation_id: String,
     /// Immutable working-copy commit the snapshot describes.
     pub commit_id: String,

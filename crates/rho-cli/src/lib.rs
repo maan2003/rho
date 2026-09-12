@@ -1,7 +1,7 @@
 //! The `rho` command: daemon launcher and utility subcommands.
 //!
 //! Interactive use lives in rho-gui; this binary hosts the daemon itself
-//! plus the terminal-friendly plumbing around it — auth, land, PR and debug
+//! plus the terminal-friendly plumbing around it — auth, PR and debug
 //! tools.
 
 use std::io;
@@ -16,7 +16,6 @@ use rho_ui_proto::client::Client as UiClient;
 use rho_ui_proto::{ClientMessage, ServerMessage};
 
 mod eval;
-mod land;
 mod pr;
 mod visualization;
 mod wayland;
@@ -39,18 +38,6 @@ pub fn main() -> Result<()> {
                 libc::SIG_DFL
             },
         );
-    }
-    if let Command::Land(land) = &args.command
-        && let Some(socket_path) = &land.socket_path
-    {
-        let socket_path = rho_ui_proto::RuntimePaths::new(Some(socket_path))?
-            .socket()
-            .to_owned();
-        // SAFETY: no runtime or other thread exists; jj may invoke
-        // git-remote-octo, which must follow this CLI's daemon.
-        unsafe {
-            std::env::set_var(rho_ui_proto::RuntimePaths::SOCKET_ENV, socket_path);
-        }
     }
     if let Command::Daemon(mut daemon_args) = args.command {
         // SAFETY: top of main, before the runtime — no threads exist yet and
@@ -93,7 +80,6 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
-        Command::Land(args) => land::run(args).await,
         Command::Pr(args) => pr::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
@@ -181,7 +167,6 @@ enum Command {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    Land(LandArgs),
     Pr(PrArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
@@ -209,7 +194,6 @@ enum CliCommand {
     /// provider.
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
-    Land(LandArgs),
     Pr(PrArgs),
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
@@ -364,15 +348,6 @@ pub(crate) enum PrCliCommand {
 }
 
 #[derive(Clone, clap::Args)]
-pub(crate) struct LandArgs {
-    /// Checkout path to land from (defaults to the current directory).
-    #[arg(default_value = ".")]
-    path: PathBuf,
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
-}
-
-#[derive(Clone, clap::Args)]
 struct ProtocolLogArgs {
     path: std::path::PathBuf,
 }
@@ -391,7 +366,6 @@ impl Args {
             CliCommand::Debug(args) => Command::Debug(args),
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
-            CliCommand::Land(args) => Command::Land(args),
             CliCommand::Pr(args) => Command::Pr(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),

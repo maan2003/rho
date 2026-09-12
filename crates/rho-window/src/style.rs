@@ -215,7 +215,7 @@ pub fn attachment_block(anchor: Anchor, attachments: &[ContentPart]) -> BlockPro
 pub fn refusal_block(anchor: Anchor, message: String) -> BlockProperties<Anchor> {
     BlockProperties {
         placement: BlockPlacement::Below(anchor),
-        // Measured, not one line: the whole cause is the point, and a jj
+        // Measured, not one line: the whole cause is the point, and a VCS
         // failure is longer than the frame is wide. A starting height is
         // what turns the measuring on — `Block::has_height` is
         // `height.is_some()`, and a block without one is never measured,

@@ -182,18 +182,14 @@ fn prompt_token(prompt: &str) -> anyhow::Result<String> {
 }
 
 fn resolve_repo() -> anyhow::Result<(String, String)> {
-    let output = std::process::Command::new("jj")
-        .args(["git", "remote", "list"])
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
         .output()
-        .context("failed to run jj")?;
-    anyhow::ensure!(output.status.success(), "jj git remote list failed");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let remote = stdout
-        .lines()
-        .find(|line| line.starts_with("origin"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .context("origin remote not found")?;
-    parse_github_remote(remote)
+        .context("failed to run git")?;
+    anyhow::ensure!(output.status.success(), "origin remote not found");
+    let remote = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    anyhow::ensure!(!remote.is_empty(), "origin remote not found");
+    parse_github_remote(&remote)
 }
 
 fn parse_github_remote(remote: &str) -> anyhow::Result<(String, String)> {
@@ -213,22 +209,42 @@ fn parse_github_remote(remote: &str) -> anyhow::Result<(String, String)> {
     Ok((owner.to_owned(), repo.to_owned()))
 }
 
+/// The remote's default branch: what `origin/HEAD` names, or `main` /
+/// `master` when the clone never recorded one.
 fn resolve_default_base_branch() -> anyhow::Result<String> {
-    let output = std::process::Command::new("jj")
+    let output = std::process::Command::new("git")
         .args([
-            "log",
-            "-r",
-            "trunk()",
-            "--no-graph",
-            "-T",
-            "bookmarks.first().name()",
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
         ])
         .output()
-        .context("failed to run jj")?;
-    anyhow::ensure!(output.status.success(), "jj log -r trunk() failed");
-    let bookmark = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    anyhow::ensure!(!bookmark.is_empty(), "no bookmark found for trunk()");
-    Ok(bookmark)
+        .context("failed to run git")?;
+    if output.status.success() {
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if let Some(branch) = head
+            .strip_prefix("origin/")
+            .filter(|branch| !branch.is_empty())
+        {
+            return Ok(branch.to_owned());
+        }
+    }
+    for branch in ["main", "master"] {
+        let exists = std::process::Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/origin/{branch}"),
+            ])
+            .output()
+            .context("failed to run git")?;
+        if exists.status.success() {
+            return Ok(branch.to_owned());
+        }
+    }
+    anyhow::bail!("cannot tell origin's default branch; pass --base")
 }
 
 fn extract_logs(

@@ -90,8 +90,8 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
     };
     let env = UserEnvironment::new(std::env::vars_os().collect());
-    // An eval adopts its directory as a workset seen in view mode; the
-    // store has no server, so jj clients initialize stores themselves.
+    // An eval adopts its directory as a workset seen in view mode; no
+    // mirror keeper runs, so `git` inside is the plain one.
     let worksets = Worksets::open(
         temp.path().join("state"),
         env,

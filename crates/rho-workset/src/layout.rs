@@ -19,16 +19,20 @@ use anyhow::{Context as _, bail, ensure};
 pub const MOUNT_ROOT: &str = "/src";
 
 /// What a namespace mounts: the workset directory at the visible root, and
-/// the clone-store root plus its server socket at their host paths, so the
-/// absolute paths clones record (alternates, `JJ_STORE`) hold inside.
+/// the mirror store root, its keeper's socket and the `git` wrapper at
+/// their host paths, so the absolute paths clones record (alternates) and
+/// the environment names hold inside.
 #[derive(Clone, Debug)]
 pub struct Mounts {
     /// The workset directory, mounted read-write at the visible root.
     pub src: PathBuf,
-    /// The clone-store root, mounted read-only at its own host path.
+    /// The mirror store root, mounted read-only at its own host path.
     pub store_root: PathBuf,
-    /// The store server's socket, mounted at its own host path.
+    /// The keeper's socket, mounted at its own host path.
     pub store_socket: Option<PathBuf>,
+    /// The directory holding the `git` wrapper, mounted read-only at its
+    /// own host path.
+    pub store_bin: Option<PathBuf>,
 }
 
 /// Host-derived files captured before the namespace is constructed.
@@ -168,11 +172,15 @@ fn validate_mounts(set: &Mounts) -> anyhow::Result<()> {
         "workset directory is missing: {}",
         set.src.display()
     );
-    for (what, path) in [("store root", &set.store_root)].into_iter().chain(
-        set.store_socket
-            .iter()
-            .map(|socket| ("store socket", socket)),
-    ) {
+    for (what, path) in [("store root", &set.store_root)]
+        .into_iter()
+        .chain(
+            set.store_socket
+                .iter()
+                .map(|socket| ("store socket", socket)),
+        )
+        .chain(set.store_bin.iter().map(|bin| ("store bin", bin)))
+    {
         ensure!(
             path.is_absolute(),
             "{what} must be an absolute path: {}",
@@ -408,8 +416,8 @@ fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Res
 }
 
 /// Mounts a validated workset below `root` in the current mount namespace:
-/// the workset directory at [`MOUNT_ROOT`], the store root read-only at its
-/// host path, and the store socket at its host path.
+/// the workset directory at [`MOUNT_ROOT`], the store root and the wrapper
+/// directory read-only at their host paths, and the socket at its host path.
 pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
     validate_mounts(set)?;
     bind(&set.src, &mount_root(root), false)?;
@@ -426,6 +434,11 @@ pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
                 .with_context(|| format!("create socket mount point {}", target.display()))?;
         }
         bind(socket, &target, false)?;
+    }
+    if let Some(bin) = &set.store_bin {
+        let target = host_path_in(root, bin);
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        bind(bin, &target, true)?;
     }
     Ok(())
 }

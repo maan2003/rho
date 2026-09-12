@@ -7,7 +7,7 @@
 //! Runs a repo's `.config/selfci/` CI jobs against a caller-provided
 //! candidate checkout. None of selfci's VCS machinery — revision
 //! resolution, test merges, workdir cloning, or the merge-queue daemon —
-//! is vendored; `rho land` owns the jj prepare/rebase/publish flow.
+//! is vendored; the landing flow around it is being redesigned.
 //!
 //! What is preserved, byte-for-byte where it matters, is the repo-facing
 //! contract: the `.config/selfci/ci.yaml` format ([`config`]), the

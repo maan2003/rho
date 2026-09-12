@@ -1129,10 +1129,10 @@ async fn probe_async(name: &str) -> Result<()> {
     let root = rig_root(name)?;
     let socket = root.join("run/rho/rho.sock");
     let workspace = root.join("workspace");
-    if !workspace.join(".jj").exists() {
+    if !workspace.join(".git").exists() {
         fs::create_dir_all(&workspace)?;
-        let status = Command::new("jj")
-            .args(["git", "init", "--colocate"])
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
             .arg(&workspace)
             .status()
             .context("initialize the rig probe workspace")?;

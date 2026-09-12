@@ -330,24 +330,15 @@ fn hostname() -> String {
 }
 
 /// The commit of the tree this binary was run from, so a snapshot says which
-/// rho took it. jj first, git after; neither is required.
+/// rho took it. Git is not required.
 pub fn tree_commit() -> Option<String> {
-    let jj = std::process::Command::new("jj")
-        .args(["log", "-r", "@", "--no-graph", "-T", "commit_id.short()"])
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|id| !id.is_empty());
-    jj.or_else(|| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|id| !id.is_empty())
-    })
+        .filter(|id| !id.is_empty())
 }
 
 pub fn human(bytes: u64) -> String {

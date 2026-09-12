@@ -86,7 +86,6 @@ pub(crate) struct MailItem {
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
-    view: Arc<View>,
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
     instructions: Arc<str>,
 }
@@ -1665,9 +1664,8 @@ impl Agent {
         };
 
         // A reply with no calls is the model handing back: whoever is
-        // subscribed to this agent's answers gets it as mail, the sidecar
-        // classifies it, and the checkout's state is committed so the user's
-        // jj view follows the agent's work.
+        // subscribed to this agent's answers gets it as mail and the sidecar
+        // classifies it.
         if let Some(final_text) = final_text
             && !compacted
         {
@@ -1685,14 +1683,6 @@ impl Agent {
                 self.agent_id,
                 &final_text,
             );
-            if let Some(surface) = self.surface.get_if_ready() {
-                let view = Arc::clone(&surface.view);
-                tokio::spawn(async move {
-                    if let Err(error) = view.snapshot().await {
-                        eprintln!("rho-agent: snapshot failed: {error:#}");
-                    }
-                });
-            }
         }
     }
 
@@ -1962,7 +1952,6 @@ fn surface(
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
     );
     Ok(Surface {
-        view,
         tools: BTreeMap::from([(tool.spec().name, tool)]),
         instructions,
     })

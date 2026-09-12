@@ -438,7 +438,6 @@ mod tests {
             .unwrap(),
         );
         let surface = Surface {
-            view: view.clone(),
             instructions: Arc::from("test"),
             tools: BTreeMap::from([(tool.spec().name, tool)]),
         };

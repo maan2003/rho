@@ -342,7 +342,7 @@ history, and the occasional justified experiment. Prefer `rg` for searching and 
 `sed`/`head`/`cat` reads over broad file reads.
 - For current-change reviews, inspect the repository's current diff first and read surrounding \
 files only when the diff leaves a specific uncertainty. Follow repository guidance about \
-whether to use jj, Git, or another VCS.
+how to use Git or another VCS.
 - For recent-history questions, start with the narrowest relevant log or show command before \
 reading whole files.
 - Use web search only when local information is insufficient or a current authoritative external \
@@ -555,8 +555,8 @@ struct WorksetPrompt {
     root: String,
     /// The agent's working directory as it sees it.
     cwd: String,
-    /// Whether the working directory is inside a jj repository.
-    jj: bool,
+    /// Whether the working directory is inside a git checkout.
+    git: bool,
     /// Whether the filesystem outside the workset is a disposable view.
     view: bool,
     /// Whether another agent started this one, and so may share its
@@ -566,14 +566,14 @@ struct WorksetPrompt {
 
 impl WorksetPrompt {
     fn of(view: &crate::View, multi_agent: Option<&MultiAgentTools>) -> Self {
-        let jj = view
+        let git = view
             .context_roots()
-            .map(|(_, host_root)| host_root.join(".jj").is_dir())
+            .map(|(_, host_root)| host_root.join(".git").exists())
             .unwrap_or(false);
         Self {
             root: view.visible_root().to_string(),
             cwd: view.cwd().to_string(),
-            jj,
+            git,
             view: matches!(view.mode(), rho_workset::Mode::View { .. }),
             spawned: multi_agent.is_some_and(|tools| tools.parent().is_some()),
         }
@@ -697,9 +697,9 @@ fn render_workspace_prompt(place: &WorksetPrompt) -> String {
 
 Your workset is the directory {root}: a place that is yours, holding the repositories you work \
 in. Your working directory is {cwd}. Clone further repositories into the workset with \
-`jj git clone <url>` (fast: clones are served from a local store), and add jj workspaces of a \
-repository with `jj workspace add`. Nothing in the workset is cleaned up behind you; what is \
-there when you start is the starting state you were given.
+`git clone <url>` (fast: clones are born from a local mirror, and `git fetch` reads it), and \
+add checkouts of a repository with `git worktree add`. Nothing in the workset is cleaned up \
+behind you; what is there when you start is the starting state you were given.
 
 "
     );
@@ -710,14 +710,13 @@ there when you start is the starting state you were given.
              inside the workset.\n\n",
         );
     }
-    if place.jj {
+    if place.git {
         out.push_str(
-            "This repository uses jj. Your working copy is the commit named `@`; jj records your \
-             edits into it as you work, so keeping them takes no extra step. Record a change once \
-             it is complete: `jj commit -m '<message>'` for new work, or `jj squash -u` to fold a \
-             follow-up into the change you just made. Work still in progress can stay in the \
-             working copy. Other workspaces have their own working-copy commits; leave commits \
-             you did not create alone unless the task is to work on them.\n\n",
+            "This repository is a git checkout with `origin` as its remote. Commit a change once \
+             it is complete (`git commit`), and fold a follow-up into the commit you just made \
+             with `git commit --amend`. Work still in progress can stay uncommitted in the \
+             working tree. Other checkouts of the repository have their own branches; leave \
+             commits you did not create alone unless the task is to work on them.\n\n",
         );
     }
     if place.spawned {
@@ -772,11 +771,11 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
-    fn place(jj: bool, view: bool, spawned: bool) -> WorksetPrompt {
+    fn place(git: bool, view: bool, spawned: bool) -> WorksetPrompt {
         WorksetPrompt {
             root: "/src".to_owned(),
             cwd: "/src/repo".to_owned(),
-            jj,
+            git,
             view,
             spawned,
         }
@@ -788,9 +787,9 @@ mod tests {
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("Your workset is the directory /src"));
         assert!(prompt.contains("Your working directory is /src/repo"));
-        assert!(prompt.contains("jj git clone <url>"));
-        assert!(prompt.contains("commit named `@`"));
-        assert!(prompt.contains("keeping them takes no extra step"));
+        assert!(prompt.contains("git clone <url>"));
+        assert!(prompt.contains("git worktree add"));
+        assert!(prompt.contains("This repository is a git checkout"));
         assert!(prompt.contains("starting state you were given"));
         assert!(prompt.contains("leave commits you did not create alone"));
         assert!(prompt.contains("disposable environment"));
@@ -799,9 +798,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_prompt_omits_jj_and_view_sections_when_absent() {
+    fn workspace_prompt_omits_git_and_view_sections_when_absent() {
         let prompt = render_workspace_prompt(&place(false, false, true));
-        assert!(!prompt.contains("This repository uses jj"));
+        assert!(!prompt.contains("This repository is a git checkout"));
         assert!(!prompt.contains("disposable environment"));
         assert!(prompt.contains("agent that started you"));
     }
@@ -837,6 +836,6 @@ mod tests {
         let prompt = render_environment_prompt(&place(true, true, false));
         assert!(prompt.contains("Working directory: /src/repo"));
         assert!(prompt.contains("Your workset is /src"));
-        assert!(!prompt.contains("jj workspace id"));
+        assert!(!prompt.contains("workspace id"));
     }
 }

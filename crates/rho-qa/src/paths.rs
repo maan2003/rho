@@ -47,7 +47,7 @@ fn home() -> Result<PathBuf> {
 /// - `gui-telemetry`: output of a run, not input to one. A rig writes its own.
 /// - `sandboxes`: bubblewrap scaffolding — bind-mount masks and empty
 ///   `run`/`tmp` dirs, all of it left over from July and unused since. The
-///   workspaces agents are created into are jj workspaces in the user's own
+///   workspaces agents were created into were checkouts in the user's own
 ///   source tree, which a rig must not touch; creation cases run against the
 ///   fixture repo instead.
 pub const SNAPSHOT_CONTENTS: &[&str] = &[

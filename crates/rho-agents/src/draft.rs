@@ -31,7 +31,7 @@ const MODE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
 
-pub use crate::create::{AUTO_BASE_REVSET, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
+pub use crate::create::{AUTO_BASE_REV, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
 
 impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {

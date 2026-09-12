@@ -4792,7 +4792,7 @@ impl Workspace {
         opened
     }
 
-    /// Persists the agent's jj working-copy snapshot, then projects its
+    /// Persists the agent's working-copy snapshot, then projects its
     /// parent-side manifest over the workspace's shared live buffers.
     /// Reopening refreshes the existing shared model.
     fn open_diff_surface(
@@ -8543,7 +8543,7 @@ impl Workspace {
     }
 
     /// Hidden surfaces stay alive as editor buffers, but they must not turn
-    /// worktree events into jj manifest traffic. Only the visible diff may
+    /// worktree events into manifest traffic. Only the visible diff may
     /// refresh.
     fn sync_diff_visibility(&self, surface_visible: bool, cx: &mut Context<Self>) {
         let visible = if surface_visible {

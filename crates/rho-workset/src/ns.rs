@@ -77,6 +77,8 @@ pub struct Namespace {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store_environment: Vec<(OsString, OsString)>,
+    /// The directory holding the `git` wrapper, first on the agent's PATH.
+    store_bin: Option<Utf8PathBuf>,
     view_path: Option<OsString>,
     state: tokio::sync::Mutex<NsState>,
 }
@@ -114,6 +116,7 @@ impl Namespace {
             workset.id()
         );
         let store_environment = owner.store_environment();
+        let store_bin = owner.store_bin();
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
         let view_path = matches!(&mode, Mode::View { .. })
@@ -128,6 +131,7 @@ impl Namespace {
             environment,
             path_overrides,
             store_environment,
+            store_bin,
             view_path,
             state: tokio::sync::Mutex::new(NsState::default()),
         }))
@@ -162,7 +166,7 @@ impl Namespace {
             .join(self.cwd.strip_prefix(MOUNT_ROOT).unwrap_or(&self.cwd))
     }
 
-    /// The repository the agent works in: the jj workspace containing its
+    /// The repository the agent works in: the git checkout containing its
     /// working directory (or the directory itself), as `(visible, host)`.
     pub fn context_roots(&self) -> anyhow::Result<(Utf8PathBuf, Utf8PathBuf)> {
         let host_cwd = self.host_cwd();
@@ -186,6 +190,7 @@ impl Namespace {
                 src: self.src.as_std_path().to_owned(),
                 store_root: owner.store_root().into_std_path_buf(),
                 store_socket: owner.store_socket().map(Utf8PathBuf::into_std_path_buf),
+                store_bin: owner.store_bin().map(Utf8PathBuf::into_std_path_buf),
             };
             // Own the temporary directory in the caller's host-root frame. If
             // it were created and dropped after pivot_root, cleanup would
@@ -415,6 +420,14 @@ impl Namespace {
                 .iter()
                 .map(|(name, value)| (name, value)),
         );
+        if let Some(bin) = &self.store_bin {
+            let path = command
+                .as_std()
+                .get_envs()
+                .find_map(|(name, value)| (name == "PATH").then_some(value.map(OsStr::to_owned)))
+                .flatten();
+            command.env("PATH", prepend_path(bin.as_std_path(), path.as_deref()));
+        }
         for (name, value) in overrides {
             match value {
                 Some(value) => command.env(name, value),
@@ -486,11 +499,6 @@ impl Namespace {
     pub fn resolve_host_path_checked(&self, path: &Path) -> anyhow::Result<PathBuf> {
         Ok(self.src.as_std_path().join(self.src_relative(path)?))
     }
-
-    /// Records pending working-copy changes in the workset's repositories.
-    pub async fn snapshot(&self) -> anyhow::Result<()> {
-        self.workset.snapshot().await
-    }
 }
 
 /// Namespace-mutating work must run on a dedicated thread that exits. No
@@ -512,6 +520,19 @@ where
     receiver
         .await
         .with_context(|| format!("{name} thread panicked"))?
+}
+
+/// `PATH` with `bin` first (and not repeated later).
+fn prepend_path(bin: &Path, path: Option<&OsStr>) -> OsString {
+    let rest = path
+        .map(|path| {
+            std::env::split_paths(path)
+                .filter(|entry| entry != bin)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    std::env::join_paths(std::iter::once(bin.to_owned()).chain(rest))
+        .unwrap_or_else(|_| bin.as_os_str().to_owned())
 }
 
 fn filtered_view_path(

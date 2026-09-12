@@ -86,13 +86,13 @@ async fn run() -> anyhow::Result<()> {
 
     let result = tools
         .call(shell_call(
-            "echo agent > file.txt && jj st && jj log --no-graph -r @ -T description",
+            "echo agent > file.txt && git status --short && git log --oneline -1",
         ))
         .await;
-    println!("write + jj inside the view:\n{}", result.output);
+    println!("write + git inside the view:\n{}", result.output);
     assert!(
         result.output.contains("Process exited with code 0"),
-        "jj should work inside the view"
+        "git should work inside the view"
     );
     assert_eq!(
         std::fs::read_to_string(checkout.join("file.txt"))?,

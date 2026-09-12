@@ -107,10 +107,10 @@ async fn shell_end_to_end_over_registry() {
 
     first
         .submit
-        .send("printf 'pager-env-%s-%s-%s' \"$PAGER\" \"$GIT_PAGER\" \"$JJ_PAGER\"".to_owned())
+        .send("printf 'pager-env-%s-%s' \"$PAGER\" \"$GIT_PAGER\"".to_owned())
         .await
         .unwrap();
-    wait_for_text(&mut first, &mut first_state, "pager-env-cat-cat-cat").await;
+    wait_for_text(&mut first, &mut first_state, "pager-env-cat-cat").await;
 
     // Brush owns one persistent evaluator, including variables, functions,
     // working directory, startup configuration, and prompt hooks.

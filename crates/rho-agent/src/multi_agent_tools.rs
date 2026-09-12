@@ -118,8 +118,8 @@ fn spawn_engineer_spec() -> ToolSpec {
                       task-focused: the child already receives repo guidance, skills, tools, and \
                       workspace instructions, so do not restate generic process rules. The \
                       child starts in your working directory and shares it with you; for \
-                      concurrent edits, make it a checkout of its own first (a jj workspace \
-                      or git worktree in your workset) and tell it where to work in the \
+                      concurrent edits, make it a checkout of its own first (a git worktree \
+                      in your workset) and tell it where to work in the \
                       prompt. The child's turn results arrive later as agent mail."
             .to_owned(),
         input_schema: json!({

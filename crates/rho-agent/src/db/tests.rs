@@ -592,7 +592,7 @@ async fn agent_ids_allocate_before_records_exist() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    // Only the second allocation gets a record, as when the first jj
+    // Only the second allocation gets a record, as when the first
     // checkout fails.
     let leaked_id = write.alloc_agent_id();
     let agent_id = write.alloc_agent_id();

@@ -36,17 +36,12 @@ fn main() -> anyhow::Result<()> {
 
 async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> anyhow::Result<()> {
     let socket_path = state_dir.join("rho.sock");
-    // The agent starts on a clone of this repository, made with jj. The
-    // clone takes its name from the path, so it cannot be the dot-prefixed
-    // temporary directory itself.
+    // The agent starts on a clone of this repository. The clone takes its
+    // name from the path, so it cannot be the dot-prefixed temporary
+    // directory itself.
     let repo_temp = tempfile::tempdir()?;
     let repo_dir = repo_temp.path().join("repo");
     std::fs::create_dir(&repo_dir)?;
-    let jj_version = std::process::Command::new("jj").arg("--version").output();
-    if !jj_version.is_ok_and(|output| output.status.success()) {
-        eprintln!("skipping: jj unavailable");
-        return Ok(());
-    }
     for args in [
         vec!["init", "-q", "-b", "main"],
         vec![

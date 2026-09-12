@@ -503,7 +503,7 @@ impl AgentPool {
     /// Create a child agent for `parent` in the parent's workset, in the
     /// parent's working directory, and mail it its task. Returns once the
     /// child has accepted that task. A parent that wants the child elsewhere
-    /// (its own jj workspace or git worktree, say) makes that directory first
+    /// (its own git worktree, say) makes that directory first
     /// and says so in the prompt.
     pub async fn spawn_child(
         self: &Arc<Self>,

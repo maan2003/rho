@@ -1523,14 +1523,6 @@ impl ClaudeLoop {
                         self.stream_items.clear();
                         self.set_streaming_kind();
                     }
-                    if let Some(view) = self.view.get_if_ready() {
-                        let view = Arc::clone(view);
-                        tokio::spawn(async move {
-                            if let Err(error) = view.snapshot().await {
-                                eprintln!("rho-agent Claude snapshot failed: {error:#}");
-                            }
-                        });
-                    }
                 }
                 if self.pending_rewind
                     && successful

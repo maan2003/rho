@@ -55,7 +55,7 @@ pub enum CheckEvent {
 
 pub struct CheckOptions<'a> {
     /// The job to run. Callers read it from the repo's *base* revision
-    /// (e.g. `jj file show -r <base> .config/selfci/ci.yaml`), not the
+    /// (e.g. `git show <base>:.config/selfci/ci.yaml`), not the
     /// candidate: a candidate must not rewrite its own checks.
     pub job: &'a config::JobConfig,
     /// Checkout of the candidate; jobs run with this as their cwd.

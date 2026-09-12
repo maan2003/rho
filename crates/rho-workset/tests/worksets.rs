@@ -1,18 +1,21 @@
 use camino::Utf8Path;
 
 mod common;
-use common::{git, jj, jj_binary, only_store, open_worksets, setup_remote};
+use common::{git, only_store, open_worksets, setup_remote, store_git, wrapper_binary};
 
 #[tokio::test]
-async fn worksets_clone_through_the_store_server() {
-    let jj_bin = jj_binary();
+async fn worksets_clone_through_the_mirror_store() {
+    let wrapper = wrapper_binary();
     let temp = tempfile::tempdir().unwrap();
     let (source, remote) = setup_remote(temp.path());
-    let root = open_worksets(temp.path(), &jj_bin).await;
-    assert!(root.server_alive().await);
+    let root = open_worksets(temp.path(), &wrapper).await;
+    let socket = root.store_socket().expect("keeper running");
+    assert!(socket.exists());
+    assert!(root.store_bin().unwrap().join("git").is_file());
     let remote_url = remote.to_str().unwrap();
 
-    // The first clone initializes the store and is born on the default branch.
+    // The first clone initializes the mirror and is born on the default
+    // branch, borrowing the mirror's objects.
     let first_workset = root.create().await.unwrap();
     let project = first_workset
         .clone_repo(remote_url, Some("project"))
@@ -24,34 +27,31 @@ async fn worksets_clone_through_the_store_server() {
         "one\n"
     );
     assert_eq!(
-        jj(
-            &root,
-            project.as_std_path(),
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
-        )
-        .await,
+        git(project.as_std_path(), &["rev-parse", "HEAD"]),
         git(&source, &["rev-parse", "main"])
     );
+    assert_eq!(
+        git(project.as_std_path(), &["branch", "--show-current"]),
+        "main"
+    );
+    assert_eq!(
+        git(
+            project.as_std_path(),
+            &["config", "--get", "remote.origin.url"]
+        ),
+        remote_url
+    );
     let store = only_store(temp.path());
-    let git_target = std::fs::read_to_string(project.join(".jj/repo/store/git_target")).unwrap();
-    let git_dir = project.join(".jj/repo/store").join(git_target.trim());
-    let alternates = std::fs::read_to_string(git_dir.join("objects/info/alternates")).unwrap();
+    let alternates = std::fs::read_to_string(project.join(".git/objects/info/alternates")).unwrap();
     assert_eq!(
         alternates.trim(),
         store.join("git/objects").to_str().unwrap()
     );
-    // Committed work carries a change-id header.
     std::fs::write(project.join("file.txt"), "two\n").unwrap();
-    let commit = jj(
-        &root,
-        project.as_std_path(),
-        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
-    )
-    .await;
-    assert!(git(project.as_std_path(), &["cat-file", "commit", &commit]).contains("change-id "));
+    git(project.as_std_path(), &["commit", "-qam", "two"]);
 
     // Cloning again is idempotent; a default name comes from the URL; the
-    // store is shared.
+    // mirror is shared.
     assert_eq!(
         first_workset
             .clone_repo(remote_url, Some("project"))
@@ -79,7 +79,8 @@ async fn worksets_clone_through_the_store_server() {
     );
 
     // The remote moves on: a new clone in another workset is born on the
-    // new commit, and the old clone fetches it without network access.
+    // new commit, and the old clone fetches it through the wrapper without
+    // a new pack of its own.
     std::fs::write(source.join("file.txt"), "three\n").unwrap();
     git(&source, &["commit", "-am", "second"]);
     git(&source, &["push", remote_url, "main"]);
@@ -89,28 +90,23 @@ async fn worksets_clone_through_the_store_server() {
         .clone_repo(remote_url, Some("project"))
         .await
         .unwrap();
-    assert_eq!(
-        jj(
-            &root,
-            second.as_std_path(),
-            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
-        )
-        .await,
-        new_main
-    );
+    assert_eq!(git(second.as_std_path(), &["rev-parse", "HEAD"]), new_main);
     assert_eq!(
         std::fs::read_to_string(second.join("file.txt")).unwrap(),
         "three\n"
     );
-    jj(&root, project.as_std_path(), &["git", "fetch"]).await;
+    store_git(&root, project.as_std_path(), &["fetch", "-q"]).await;
     assert_eq!(
-        jj(
-            &root,
-            project.as_std_path(),
-            &["log", "-r", "main@origin", "--no-graph", "-T", "commit_id"]
-        )
-        .await,
+        git(project.as_std_path(), &["rev-parse", "origin/main"]),
         new_main
+    );
+    assert!(
+        project
+            .join(".git/objects/pack")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
     );
     assert_eq!(
         std::fs::read_to_string(project.join("file.txt")).unwrap(),
@@ -118,21 +114,32 @@ async fn worksets_clone_through_the_store_server() {
         "the first clone's own edits are untouched"
     );
 
-    // Diff snapshots read the working copy against its parent.
-    std::fs::write(second.join("new.txt"), "hello\n").unwrap();
-    let snapshot = second_workset
-        .diff_snapshot(&second, None, &[])
+    // Checking out a revision detaches or follows a branch as git does; an
+    // empty revision is the clone as born.
+    let first_commit = git(&source, &["rev-parse", "main~1"]);
+    second_workset
+        .checkout(&second, &first_commit)
         .await
-        .unwrap()
-        .expect("first snapshot");
-    assert_eq!(snapshot.files.len(), 1);
-    assert_eq!(snapshot.files[0].path, "new.txt");
+        .unwrap();
+    assert_eq!(
+        git(second.as_std_path(), &["rev-parse", "HEAD"]),
+        first_commit
+    );
+    second_workset.checkout(&second, "main").await.unwrap();
+    assert_eq!(
+        git(second.as_std_path(), &["branch", "--show-current"]),
+        "main"
+    );
+    second_workset.checkout(&second, "").await.unwrap();
+    assert!(second_workset.checkout(&second, "nope").await.is_err());
+    assert!(second_workset.checkout(&second, "--orphan").await.is_err());
+
+    // The diff view is not ported yet; it fails rather than lies.
     assert!(
         second_workset
-            .diff_snapshot(&second, Some(&snapshot.commit_id), &[])
+            .diff_snapshot(&second, None, &[])
             .await
-            .unwrap()
-            .is_none()
+            .is_err()
     );
 
     // Discard removes the directory and nothing else; it is idempotent.
@@ -146,11 +153,11 @@ async fn worksets_clone_through_the_store_server() {
     root.discard_workset(&first_id).await.unwrap();
     assert_eq!(root.list().unwrap(), vec![second_workset.id().to_owned()]);
 
-    // A restarted daemon replaces the server and reopens worksets.
+    // A restarted daemon replaces the keeper and reopens worksets.
     let second_id = second_workset.id().to_owned();
     drop(second_workset);
     drop(root);
-    let root = open_worksets(temp.path(), &jj_bin).await;
+    let root = open_worksets(temp.path(), &wrapper).await;
     let reopened = root.open_workset(&second_id).await.unwrap();
     assert_eq!(reopened.repos().unwrap(), vec!["project"]);
     let again = reopened
