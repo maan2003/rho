@@ -112,12 +112,18 @@ security boundary (see `WORKSET.md`); it is a distribution.
    (`jj workspace add`, which Rho runs for a child agent) must be
    colocated too, as git worktrees of the main clone: a `.git` file
    pointing at `<main>/.git/worktrees/<name>`, with `HEAD`, `commondir`
-   and `gitdir` written there. Rho's jj fork should do this in
-   `jj workspace add` whenever the main workspace is colocated, so that
-   an agent's own `jj workspace add` gets it too. The vendored jj
-   already implements the other half: it recognises such a worktree as
-   colocated, imports and exports HEAD per workspace, and resets the
-   worktree's index (verified by hand on a store-backed clone).
+   and `gitdir` written there. Rho's jj fork already does exactly this
+   for managed workspaces (`create_git_worktree` in
+   `cli/src/commands/workspace/managed.rs`: `git worktree add --detach
+   --no-checkout` followed by `git read-tree HEAD`), which is what the
+   previous Rho architecture used. The redesign switched
+   `Workset::add_workspace` to plain `jj workspace add`, which does not
+   colocate, so that worktree step has to move into `jj workspace add`
+   itself, applied whenever the main workspace is colocated. Then an
+   agent's own `jj workspace add` gets it too. The rest is already in
+   place: jj recognises such a worktree as colocated, imports and
+   exports HEAD per workspace, and resets the worktree's index
+   (verified by hand on a store-backed clone).
    *Why:* tools read git, not jj. Nix treats a directory without `.git`
    as a `path:` flake and copies the whole tree, ignored files included,
    into the store on every evaluation; with `.git` it fetches only
