@@ -172,6 +172,30 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the shared cache.
 Variables the caller sets on a command survive, as today.
 
+## Where it lives
+
+The distro is its own crate, `rho-agent-distro`, and the boundary is
+image versus runtime:
+
+- `rho-agent-distro` builds an **image**: a directory tree on disk plus
+  an environment manifest. It resolves the program list into `usr/`,
+  writes every generated `/etc` file (nix.conf, jj config, the direnv
+  configuration and `direnvrc`, bashrc and profile) and lists the
+  variables. It knows nothing about namespaces or mounts, so it is
+  tested with plain file assertions, and a nix build of Rho can run it
+  as a derivation step to produce the static part of the image.
+- `rho-workset` is the **runtime**: it takes an image and mounts it,
+  then adds what only the running daemon knows (passwd with the real
+  uid, resolv.conf, the user's identity, state-root paths) and what is
+  per agent (the workset at `/src`, the store, the Claude home, the
+  working directory). The `/etc` generation and PATH filtering in its
+  `layout.rs` today move to the distro crate.
+
+Three things change at three different times — the image at build
+time, the daemon-level pieces at daemon start, the agent-level pieces
+per agent — and keeping them in separate layers is what keeps the image
+reproducible.
+
 ## Later, enabled by this layout
 
 - Evaluate `.envrc` in the background right after a clone, so the first
