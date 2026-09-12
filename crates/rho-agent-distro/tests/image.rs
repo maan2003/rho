@@ -180,6 +180,33 @@ fn rejects_colliding_program_files() {
 }
 
 #[test]
+fn skips_nix_support_metadata() {
+    let temporary = tempfile::tempdir().unwrap();
+    let first = package(
+        temporary.path(),
+        "one",
+        &[
+            "bin/env",
+            "bin/bash",
+            "nix-support/setup-hook",
+            "share/nix-direnv/direnvrc",
+            "etc/ssl/certs/ca-bundle.crt",
+        ],
+    );
+    let second = package(
+        temporary.path(),
+        "two",
+        &["bin/two", "nix-support/setup-hook"],
+    );
+    let root = temporary.path().join("image");
+    fs::create_dir(&root).unwrap();
+
+    build_image(&root, &[first, second]).unwrap();
+    assert!(root.join("usr/bin/two").exists());
+    assert!(!root.join("usr/nix-support").exists());
+}
+
+#[test]
 fn accepts_identical_duplicate_links() {
     let temporary = tempfile::tempdir().unwrap();
     let package = package(

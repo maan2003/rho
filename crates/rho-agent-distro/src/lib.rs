@@ -186,6 +186,11 @@ fn join_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
     entries.sort_by_key(fs::DirEntry::file_name);
 
     for entry in entries {
+        // Build-time metadata (setup hooks, propagated inputs); nearly
+        // every package has one and none belongs in a userland.
+        if entry.file_name() == "nix-support" {
+            continue;
+        }
         let from = entry.path();
         let to = target.join(entry.file_name());
         let metadata = fs::symlink_metadata(&from)?;
