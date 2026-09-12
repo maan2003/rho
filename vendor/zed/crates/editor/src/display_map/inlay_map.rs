@@ -2,8 +2,11 @@
 //! into the rest of the [`DisplayMap`][super::DisplayMap]. Much of the documentation for this
 //! module generalizes to other layers.
 //!
-//! The core of this module is the [`InlayMap`] struct, which maintains a vec of [`Inlay`]s, and
-//! [`InlaySnapshot`], which holds a sum tree of [`Transform`]s.
+//! The core of this module is the [`InlayMap`] struct, which composes the source
+//! [`ConcealMap`] with a vec of [`Inlay`]s, and [`InlaySnapshot`], which holds
+//! their flattened sum tree of [`Transform`]s. Flattening preserves the
+//! `source -> concealment -> inlay` order without making downstream layers
+//! traverse two trees.
 
 use crate::{
     ChunkRenderer, HighlightStyles,
@@ -26,7 +29,10 @@ use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::{ChunkBitmaps, Patch};
 use ui::{ActiveTheme, IntoElement as _, ParentElement as _, Styled as _, div};
 
-use super::{Highlights, custom_highlights::CustomHighlightsChunks, fold_map::ChunkRendererId};
+use super::{
+    Highlights, conceal_map::ConcealMap, custom_highlights::CustomHighlightsChunks,
+    fold_map::ChunkRendererId,
+};
 
 /// Decides where the [`Inlay`]s should be displayed.
 ///
@@ -34,6 +40,7 @@ use super::{Highlights, custom_highlights::CustomHighlightsChunks, fold_map::Chu
 pub struct InlayMap {
     snapshot: InlaySnapshot,
     inlays: Vec<Inlay>,
+    concealments: ConcealMap,
 }
 
 #[derive(Clone)]
@@ -41,6 +48,11 @@ pub struct InlaySnapshot {
     pub buffer: MultiBufferSnapshot,
     transforms: SumTree<Transform>,
     pub version: usize,
+    /// How many inlays the map holds. Kept here because the transform tree
+    /// has no O(1) length and a frame that wants to divide its cost by the
+    /// map's size cannot afford to walk it. `splice` is the only thing that
+    /// changes the inlay set, so this is set there and nowhere else.
+    inlay_count: usize,
 }
 
 impl std::ops::Deref for InlaySnapshot {
@@ -54,6 +66,7 @@ impl std::ops::Deref for InlaySnapshot {
 #[derive(Clone, Debug)]
 enum Transform {
     Isomorphic(MBTextSummary),
+    Concealed(MBTextSummary),
     Inlay(Inlay),
 }
 
@@ -66,6 +79,10 @@ impl sum_tree::Item for Transform {
             Transform::Isomorphic(summary) => TransformSummary {
                 input: *summary,
                 output: *summary,
+            },
+            Transform::Concealed(summary) => TransformSummary {
+                input: *summary,
+                output: MBTextSummary::default(),
             },
             Transform::Inlay(inlay) => TransformSummary {
                 input: MBTextSummary::default(),
@@ -81,12 +98,6 @@ struct TransformSummary {
     input: MBTextSummary,
     /// Summary of the text after inlays have been applied.
     output: MBTextSummary,
-}
-
-impl TransformSummary {
-    fn has_inlays(&self) -> bool {
-        self.input.len != self.output.len
-    }
 }
 
 impl sum_tree::ContextLessSummary for TransformSummary {
@@ -232,6 +243,7 @@ pub struct InlayChunks<'a> {
     inlay_chunk: Option<ChunkBitmaps<'a>>,
     output_offset: InlayOffset,
     max_output_offset: InlayOffset,
+    max_buffer_offset: MultiBufferOffset,
     highlight_styles: HighlightStyles,
     highlights: Highlights<'a>,
     snapshot: &'a InlaySnapshot,
@@ -249,8 +261,13 @@ impl InlayChunks<'_> {
     pub fn seek(&mut self, new_range: Range<InlayOffset>) {
         self.transforms.seek(&new_range.start, Bias::Right);
 
-        let buffer_range = self.snapshot.to_buffer_offset(new_range.start)
-            ..self.snapshot.to_buffer_offset(new_range.end);
+        let buffer_range = self
+            .snapshot
+            .to_buffer_offset_after_concealment(new_range.start)
+            ..self
+                .snapshot
+                .to_buffer_offset_after_concealment(new_range.end);
+        self.max_buffer_offset = buffer_range.end;
         self.buffer_chunks.seek(buffer_range);
         self.inlay_chunks = None;
         self.buffer_chunk = None;
@@ -273,6 +290,14 @@ impl<'a> Iterator for InlayChunks<'a> {
         }
 
         let chunk = match self.transforms.item()? {
+            Transform::Concealed(_) => {
+                let concealed_end = self.transforms.end().1;
+                self.buffer_chunks
+                    .seek(concealed_end..self.max_buffer_offset);
+                self.buffer_chunk = None;
+                self.transforms.next();
+                return self.next();
+            }
             Transform::Isomorphic(_) => {
                 let chunk = self
                     .buffer_chunk
@@ -403,6 +428,24 @@ impl<'a> Iterator for InlayChunks<'a> {
                         }
                         self.highlight_styles.inlay_hint
                     }
+                    InlayId::Image(_) => {
+                        if let InlayContent::Image { image, .. } = &inlay.content {
+                            let image = image.clone();
+                            renderer = Some(ChunkRenderer {
+                                id: ChunkRendererId::Inlay(inlay.id),
+                                render: Arc::new(move |_| {
+                                    div()
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .child(gpui::img(image.clone()).size_full())
+                                        .into_any_element()
+                                }),
+                                constrain_width: true,
+                                measured_width: None,
+                            });
+                        }
+                        self.highlight_styles.inlay_hint
+                    }
                 };
                 let next_inlay_highlight_endpoint;
                 let offset_in_inlay = self.output_offset - self.transforms.start().0;
@@ -527,6 +570,12 @@ impl Iterator for InlayBufferRows<'_> {
         } else {
             match self.transforms.item()? {
                 Transform::Inlay(_) => Default::default(),
+                Transform::Concealed(_) => {
+                    let row = MultiBufferRow(self.transforms.end().1.row);
+                    self.buffer_rows.seek(row);
+                    self.transforms.next();
+                    return self.next();
+                }
                 Transform::Isomorphic(_) => self.buffer_rows.next().unwrap(),
             }
         };
@@ -560,12 +609,14 @@ impl InlayMap {
             ),
             buffer,
             version,
+            inlay_count: 0,
         };
 
         (
             Self {
                 snapshot: snapshot.clone(),
                 inlays: Vec::new(),
+                concealments: ConcealMap::default(),
             },
             snapshot,
         )
@@ -579,19 +630,28 @@ impl InlayMap {
     ) -> (InlaySnapshot, Vec<InlayEdit>) {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::InlayMapSync);
-        let snapshot = &mut self.snapshot;
-
         if buffer_edits.is_empty()
-            && snapshot.buffer.trailing_excerpt_update_count()
+            && self.snapshot.buffer.trailing_excerpt_update_count()
                 != buffer_snapshot.trailing_excerpt_update_count()
         {
             buffer_edits.push(Edit {
-                old: snapshot.buffer.len()..snapshot.buffer.len(),
+                old: self.snapshot.buffer.len()..self.snapshot.buffer.len(),
                 new: buffer_snapshot.len()..buffer_snapshot.len(),
             });
         }
 
         if profile.is_enabled() {
+            let touched_rows = buffer_edits
+                .iter()
+                .map(|edit| {
+                    let old_start = self.snapshot.buffer.offset_to_point(edit.old.start).row;
+                    let old_end = self.snapshot.buffer.offset_to_point(edit.old.end).row;
+                    let new_start = buffer_snapshot.offset_to_point(edit.new.start).row;
+                    let new_end = buffer_snapshot.offset_to_point(edit.new.end).row;
+                    u64::from((old_end - old_start).max(new_end - new_start) + 1)
+                })
+                .sum();
+            profile.touched_rows(touched_rows);
             let input_start = buffer_edits
                 .iter()
                 .map(|edit| buffer_snapshot.offset_to_point(edit.new.start).row)
@@ -609,7 +669,7 @@ impl InlayMap {
             };
             profile.input(buffer_edits.len(), input_start, input_rows);
             profile.state(
-                u64::from(snapshot.buffer.max_point().row + 1),
+                u64::from(self.snapshot.buffer.max_point().row + 1),
                 u64::from(buffer_snapshot.max_point().row + 1),
                 0,
                 u64::from(!self.inlays.is_empty()),
@@ -617,140 +677,207 @@ impl InlayMap {
         }
 
         let result = if buffer_edits.is_empty() {
-            if snapshot.buffer.edit_count() != buffer_snapshot.edit_count()
-                || snapshot.buffer.non_text_state_update_count()
+            if self.snapshot.buffer.edit_count() != buffer_snapshot.edit_count()
+                || self.snapshot.buffer.non_text_state_update_count()
                     != buffer_snapshot.non_text_state_update_count()
-                || snapshot.buffer.trailing_excerpt_update_count()
+                || self.snapshot.buffer.trailing_excerpt_update_count()
                     != buffer_snapshot.trailing_excerpt_update_count()
             {
-                snapshot.version += 1;
+                self.snapshot.version += 1;
             }
 
-            snapshot.buffer = buffer_snapshot;
-            (snapshot.clone(), Vec::new())
-        } else if self.inlays.is_empty() && !snapshot.transforms.summary().has_inlays() {
-            // Fast path: without inlays, the InlayMap is a passthrough, so rebuild a single
-            // isomorphic transform and forward buffer edits as inlay edits verbatim.
-            let mut new_transforms = SumTree::default();
-            push_isomorphic(&mut new_transforms, buffer_snapshot.text_summary());
-            if new_transforms.is_empty() {
-                new_transforms.push(Transform::Isomorphic(Default::default()), ());
-            }
-
-            let mut inlay_edits = Patch::default();
-            for buffer_edit in &buffer_edits {
-                inlay_edits.push(Edit {
-                    old: InlayOffset(buffer_edit.old.start)..InlayOffset(buffer_edit.old.end),
-                    new: InlayOffset(buffer_edit.new.start)..InlayOffset(buffer_edit.new.end),
-                });
-            }
-
-            snapshot.transforms = new_transforms;
-            snapshot.version += 1;
-            snapshot.buffer = buffer_snapshot;
-            snapshot.check_invariants();
-
-            (snapshot.clone(), inlay_edits.into_inner())
+            self.snapshot.buffer = buffer_snapshot;
+            (self.snapshot.clone(), Vec::new())
         } else {
-            let mut inlay_edits = Patch::default();
-            let mut new_transforms = SumTree::default();
-            let mut cursor = snapshot
-                .transforms
-                .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
-            let mut buffer_edits_iter = buffer_edits.iter().peekable();
-            while let Some(buffer_edit) = buffer_edits_iter.next() {
-                new_transforms.append(cursor.slice(&buffer_edit.old.start, Bias::Left), ());
-                if let Some(Transform::Isomorphic(transform)) = cursor.item()
-                    && cursor.end().0 == buffer_edit.old.start
-                {
-                    push_isomorphic(&mut new_transforms, *transform);
-                    cursor.next();
-                }
-
-                // Remove all the inlays and transforms contained by the edit.
-                let old_start = cursor.start().1 + (buffer_edit.old.start - cursor.start().0);
-                cursor.seek(&buffer_edit.old.end, Bias::Right);
-                let old_end = cursor.start().1 + (buffer_edit.old.end - cursor.start().0);
-
-                // Push the unchanged prefix.
-                let prefix_start = new_transforms.summary().input.len;
-                let prefix_end = buffer_edit.new.start;
-                push_isomorphic(
-                    &mut new_transforms,
-                    buffer_snapshot.text_summary_for_range(prefix_start..prefix_end),
-                );
-                let new_start = InlayOffset(new_transforms.summary().output.len);
-
-                let start_ix = match self.inlays.binary_search_by(|probe| {
-                    probe
-                        .position
-                        .to_offset(&buffer_snapshot)
-                        .cmp(&buffer_edit.new.start)
-                        .then(std::cmp::Ordering::Greater)
-                }) {
-                    Ok(ix) | Err(ix) => ix,
-                };
-
-                for inlay in &self.inlays[start_ix..] {
-                    if !inlay.position.is_valid(&buffer_snapshot) {
-                        continue;
-                    }
-                    let buffer_offset = inlay.position.to_offset(&buffer_snapshot);
-                    if buffer_offset > buffer_edit.new.end {
-                        break;
-                    }
-
-                    let prefix_start = new_transforms.summary().input.len;
-                    let prefix_end = buffer_offset;
-                    push_isomorphic(
-                        &mut new_transforms,
-                        buffer_snapshot.text_summary_for_range(prefix_start..prefix_end),
-                    );
-
-                    new_transforms.push(Transform::Inlay(inlay.clone()), ());
-                }
-
-                // Apply the rest of the edit.
-                let transform_start = new_transforms.summary().input.len;
-                push_isomorphic(
-                    &mut new_transforms,
-                    buffer_snapshot.text_summary_for_range(transform_start..buffer_edit.new.end),
-                );
-                let new_end = InlayOffset(new_transforms.summary().output.len);
+            let mut inlay_edits = Vec::with_capacity(buffer_edits.len());
+            let mut walked_items = 0_u64;
+            for buffer_edit in &buffer_edits {
+                let (old_start, old_end) =
+                    if buffer_edit.old.is_empty() && !buffer_edit.new.is_empty() {
+                        let span = self
+                            .snapshot
+                            .output_span_for_buffer_offset(buffer_edit.old.start);
+                        (span.start, span.end)
+                    } else if !buffer_edit.old.is_empty() && buffer_edit.new.is_empty() {
+                        (
+                            self.snapshot
+                                .output_span_for_buffer_offset(buffer_edit.old.start)
+                                .start,
+                            self.snapshot
+                                .output_span_for_buffer_offset(buffer_edit.old.end)
+                                .end,
+                        )
+                    } else {
+                        (
+                            self.snapshot.to_inlay_offset(buffer_edit.old.start),
+                            self.snapshot.to_inlay_offset(buffer_edit.old.end),
+                        )
+                    };
                 inlay_edits.push(Edit {
                     old: old_start..old_end,
-                    new: new_start..new_end,
+                    new: InlayOffset::default()..InlayOffset::default(),
                 });
+            }
 
-                // If the next edit doesn't intersect the current isomorphic transform, then
-                // we can push its remainder.
-                if buffer_edits_iter
-                    .peek()
-                    .is_none_or(|edit| edit.old.start >= cursor.end().0)
-                {
-                    let transform_start = new_transforms.summary().input.len;
-                    let transform_end =
-                        buffer_edit.new.end + (cursor.end().0 - buffer_edit.old.end);
-                    push_isomorphic(
-                        &mut new_transforms,
-                        buffer_snapshot.text_summary_for_range(transform_start..transform_end),
-                    );
-                    cursor.next();
+            let mut invalidated_inlays = Vec::new();
+            let buffer_changed = self.snapshot.buffer.edit_count() != buffer_snapshot.edit_count()
+                || self.snapshot.buffer.non_text_state_update_count()
+                    != buffer_snapshot.non_text_state_update_count()
+                || self.snapshot.buffer.trailing_excerpt_update_count()
+                    != buffer_snapshot.trailing_excerpt_update_count();
+            if buffer_changed {
+                for buffer_edit in &buffer_edits {
+                    let first = self.inlays.partition_point(|inlay| {
+                        inlay.position.to_offset(&self.snapshot.buffer) < buffer_edit.old.start
+                    });
+                    let end = self.inlays[first..].partition_point(|inlay| {
+                        inlay.position.to_offset(&self.snapshot.buffer) <= buffer_edit.old.end
+                    }) + first;
+                    for inlay in self.inlays[first..end]
+                        .iter()
+                        .filter(|inlay| !inlay.position.is_valid(&buffer_snapshot))
+                    {
+                        let old_offset = inlay.position.to_offset(&self.snapshot.buffer);
+                        let mut cursor = self
+                            .snapshot
+                            .transforms
+                            .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
+                        cursor.seek(&old_offset, Bias::Left);
+                        while let Some(transform) = cursor.item() {
+                            if cursor.start().0 > old_offset {
+                                break;
+                            }
+                            if let Transform::Inlay(old_inlay) = transform
+                                && old_inlay.id == inlay.id
+                            {
+                                invalidated_inlays
+                                    .push((cursor.start().1..cursor.end().1, old_offset));
+                                break;
+                            }
+                            cursor.next();
+                        }
+                        if profile.is_enabled() {
+                            walked_items = walked_items.saturating_add(cursor.walked_items());
+                        }
+                    }
                 }
             }
 
-            new_transforms.append(cursor.suffix(), ());
-            if new_transforms.is_empty() {
-                new_transforms.push(Transform::Isomorphic(Default::default()), ());
+            let old_rebuild_start = buffer_edits.iter().map(|edit| edit.old.start).min();
+            let new_rebuild_start = buffer_edits.iter().map(|edit| edit.new.start).min();
+            let preserved_prefix = (old_rebuild_start == new_rebuild_start).then(|| {
+                let rebuild_start = old_rebuild_start.unwrap();
+                let mut cursor = self.snapshot.transforms.cursor::<MultiBufferOffset>(());
+                let prefix = cursor.slice(&rebuild_start, Bias::Left);
+                if profile.is_enabled() {
+                    walked_items = walked_items.saturating_add(cursor.walked_items());
+                }
+                prefix
+            });
+            self.snapshot.buffer = buffer_snapshot;
+            if let (Some(mut transforms), Some(rebuild_start)) =
+                (preserved_prefix, new_rebuild_start)
+            {
+                self.concealments
+                    .sync_from(rebuild_start, &self.snapshot.buffer);
+                let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                // A concealment that *ends* where the rebuild starts has to be
+                // rebuilt with it. The prefix is sliced with `Bias::Left`, so a
+                // transform ending exactly here is left out of it, and
+                // `append_transforms_from` skips concealments ending at or
+                // before its start -- between the two the concealed text comes
+                // back as ordinary text, and the delimiter the reader was never
+                // meant to see appears. An inlay at a concealment's edge is the
+                // ordinary way to arrive here: splicing one rebuilds from its
+                // offset, which is exactly the concealment's end.
+                let rebuild_start = concealments
+                    .iter()
+                    .find(|range| range.start < rebuild_start && rebuild_start <= range.end)
+                    .map_or(rebuild_start, |range| range.start);
+                let prefix_end = transforms.summary().input.len;
+                push_isomorphic(
+                    &mut transforms,
+                    self.snapshot
+                        .buffer
+                        .text_summary_for_range(prefix_end..rebuild_start),
+                );
+                let rebuilt_items = append_transforms_from(
+                    &mut transforms,
+                    &self.snapshot.buffer,
+                    &self.inlays,
+                    &concealments,
+                    rebuild_start,
+                );
+                if profile.is_enabled() {
+                    walked_items = walked_items.saturating_add(rebuilt_items);
+                }
+                if transforms.is_empty() {
+                    transforms.push(Transform::Isomorphic(Default::default()), ());
+                }
+                self.snapshot.transforms = transforms;
+            } else {
+                self.concealments.sync(&self.snapshot.buffer);
+                let concealments = self.concealments.ranges(&self.snapshot.buffer);
+                if profile.is_enabled() {
+                    walked_items = walked_items
+                        .saturating_add(self.inlays.len() as u64)
+                        .saturating_add(concealments.len() as u64);
+                }
+                self.snapshot.transforms =
+                    build_transforms(&self.snapshot.buffer, &self.inlays, &concealments);
             }
+            self.snapshot.version += 1;
 
-            drop(cursor);
-            snapshot.transforms = new_transforms;
-            snapshot.version += 1;
-            snapshot.buffer = buffer_snapshot;
-            snapshot.check_invariants();
-
-            (snapshot.clone(), inlay_edits.into_inner())
+            for (inlay_edit, buffer_edit) in inlay_edits.iter_mut().zip(&buffer_edits) {
+                let (new_start, new_end) = if buffer_changed
+                    && buffer_edit.old.is_empty()
+                    && !buffer_edit.new.is_empty()
+                {
+                    (
+                        self.snapshot
+                            .output_span_for_buffer_offset(buffer_edit.new.start)
+                            .start,
+                        self.snapshot
+                            .output_span_for_buffer_offset(buffer_edit.new.end)
+                            .end,
+                    )
+                } else if buffer_changed
+                    && !buffer_edit.old.is_empty()
+                    && buffer_edit.new.is_empty()
+                {
+                    let span = self
+                        .snapshot
+                        .output_span_for_buffer_offset(buffer_edit.new.start);
+                    (span.start, span.end)
+                } else {
+                    (
+                        self.snapshot.to_inlay_offset(buffer_edit.new.start),
+                        self.snapshot.to_inlay_offset(buffer_edit.new.end),
+                    )
+                };
+                inlay_edit.new = new_start..new_end;
+            }
+            for (old, old_offset) in invalidated_inlays {
+                if let Some((edit, _)) =
+                    inlay_edits
+                        .iter_mut()
+                        .zip(&buffer_edits)
+                        .find(|(_, buffer_edit)| {
+                            buffer_edit.old.start <= old_offset && old_offset <= buffer_edit.old.end
+                        })
+                {
+                    edit.old.start = edit.old.start.min(old.start);
+                    edit.old.end = edit.old.end.max(old.end);
+                }
+            }
+            self.snapshot.check_invariants();
+            profile.walked_items(walked_items);
+            inlay_edits.sort_unstable_by_key(|edit| (edit.old.start, edit.old.end));
+            let mut patch = Patch::default();
+            for edit in inlay_edits {
+                patch.push_maybe_empty(edit);
+            }
+            (self.snapshot.clone(), patch.into_inner())
         };
 
         if profile.is_enabled() {
@@ -776,12 +903,95 @@ impl InlayMap {
         result
     }
 
+    /// Replaces syntax-derived concealments without routing them through the
+    /// user-fold subsystem. Concealments are composed before inlays in the
+    /// transform tree, and the returned edit only invalidates the changed
+    /// visible span.
+    pub fn replace_concealments(
+        &mut self,
+        ranges: Vec<Range<MultiBufferOffset>>,
+    ) -> (InlaySnapshot, Vec<InlayEdit>) {
+        let normalized = normalize_concealments(ranges);
+
+        let old_ranges = self.concealments.ranges(&self.snapshot.buffer);
+        if old_ranges == normalized {
+            return (self.snapshot.clone(), Vec::new());
+        }
+
+        let common_prefix = old_ranges
+            .iter()
+            .zip(&normalized)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let common_suffix = old_ranges[common_prefix..]
+            .iter()
+            .rev()
+            .zip(normalized[common_prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let old_changed = &old_ranges[common_prefix..old_ranges.len() - common_suffix];
+        let new_changed = &normalized[common_prefix..normalized.len() - common_suffix];
+        let source_start = old_changed
+            .first()
+            .map(|range| range.start)
+            .into_iter()
+            .chain(new_changed.first().map(|range| range.start))
+            .min()
+            .unwrap();
+        // The rebuild below re-emits everything from `source_start` to the end
+        // of the buffer, and what it emits there is not always what was there
+        // before: whether an inlay is suppressed depends on the concealment
+        // it falls in, so a concealment changing here can move an inlay that
+        // sits past `source_end`. An edit that stopped at `source_end` would
+        // then under-report the change, and the maps below would keep a
+        // transform tree whose length no longer matches this snapshot --
+        // which is the assertion `FoldMap::read` trips on. The edit says what
+        // was rebuilt: from the first changed offset to the end.
+        let old = self.snapshot.to_inlay_offset(source_start)..self.snapshot.len();
+
+        self.concealments.replace(normalized, &self.snapshot.buffer);
+        let mut cursor = self.snapshot.transforms.cursor::<MultiBufferOffset>(());
+        let mut transforms = cursor.slice(&source_start, Bias::Left);
+        let prefix_end = transforms.summary().input.len;
+        push_isomorphic(
+            &mut transforms,
+            self.snapshot
+                .buffer
+                .text_summary_for_range(prefix_end..source_start),
+        );
+        append_transforms_from(
+            &mut transforms,
+            &self.snapshot.buffer,
+            &self.inlays,
+            &self.concealments.ranges(&self.snapshot.buffer),
+            source_start,
+        );
+        drop(cursor);
+        if transforms.is_empty() {
+            transforms.push(Transform::Isomorphic(Default::default()), ());
+        }
+        self.snapshot.transforms = transforms;
+        self.snapshot.version += 1;
+        let new = self.snapshot.to_inlay_offset(source_start)..self.snapshot.len();
+        self.snapshot.check_invariants();
+
+        (self.snapshot.clone(), vec![Edit { old, new }])
+    }
+
+    pub fn concealments_match(&self, ranges: Vec<Range<MultiBufferOffset>>) -> bool {
+        self.concealments
+            .matches(&normalize_concealments(ranges), &self.snapshot.buffer)
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn splice(
         &mut self,
         to_remove: &[InlayId],
         to_insert: Vec<Inlay>,
     ) -> (InlaySnapshot, Vec<InlayEdit>) {
+        let mut timing =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::SpliceInlays);
+        let old_snapshot = self.snapshot.clone();
         let snapshot = &mut self.snapshot;
         let mut edits = BTreeSet::new();
 
@@ -815,15 +1025,40 @@ impl InlayMap {
             edits.insert(offset);
         }
 
-        let buffer_edits = edits
-            .into_iter()
+        snapshot.inlay_count = self.inlays.len();
+        let affected_offsets = edits.into_iter().collect::<Vec<_>>();
+        // What this splice is to be divided by. `transforms` is the number
+        // of inlays in the map rather than a count of the transform tree's
+        // nodes: the tree has no O(1) length and walking it to count would
+        // cost more than the measurement is worth, while the two are
+        // proportional and it is the inlays the cost is actually in. The
+        // span is the whole affected range and `affected_offsets` the
+        // distinct points inside it, which is the number `splice` pays for
+        // twice over — a wide span over few offsets is cheap.
+        timing.spliced(
+            self.inlays.len() as u64,
+            affected_offsets.first().map_or(0, |offset| offset.0 as u64)
+                ..affected_offsets.last().map_or(0, |offset| offset.0 as u64),
+            affected_offsets.len() as u64,
+        );
+        let buffer_edits = affected_offsets
+            .iter()
+            .copied()
             .map(|offset| Edit {
                 old: offset..offset,
                 new: offset..offset,
             })
             .collect();
         let buffer_snapshot = snapshot.buffer.clone();
-        let (snapshot, edits) = self.sync(buffer_snapshot, buffer_edits);
+        let (snapshot, _) = self.sync(buffer_snapshot, buffer_edits);
+        let mut edits = Patch::default();
+        for offset in affected_offsets {
+            edits.push_maybe_empty(Edit {
+                old: old_snapshot.output_span_for_buffer_offset(offset),
+                new: snapshot.output_span_for_buffer_offset(offset),
+            });
+        }
+        let edits = edits.into_inner();
         (snapshot, edits)
     }
 
@@ -902,6 +1137,94 @@ impl InlayMap {
 }
 
 impl InlaySnapshot {
+    /// How many inlays are in the map. O(1).
+    pub fn inlay_count(&self) -> usize {
+        self.inlay_count
+    }
+
+    /// The inlay offsets a buffer offset maps to, including any inlays that
+    /// sit exactly on it.
+    ///
+    /// Seeks rather than walks. `transforms` is a `SumTree` and every other
+    /// method here reaches into it with a cursor; this one iterated the whole
+    /// tree, and it is called twice for every affected offset by
+    /// `InlayMap::splice`, so a splice cost the offsets times the transforms.
+    /// On a document with a few thousand transforms that is most of the main
+    /// thread: three telemetry reports from the user had 45%, 48% and 56% of
+    /// all main-thread samples inside this function, every one of them
+    /// reached through `splice`.
+    ///
+    /// The transforms are ordered by input offset, so the ones that touch
+    /// `target` are contiguous: seek to the first and walk forward while the
+    /// input start is still at or before it. The body is what it always was.
+    fn output_span_for_buffer_offset(&self, target: MultiBufferOffset) -> Range<InlayOffset> {
+        let mut cursor = self
+            .transforms
+            .cursor::<Dimensions<MultiBufferOffset, InlayOffset>>(());
+        cursor.seek(&target, Bias::Left);
+        // A seek can land past transforms that still touch `target` — an
+        // inlay at `target` has no input width at all, so it neither
+        // contains the offset nor is sought to. Step back while the item
+        // still starts at or after `target`; the run is the inlays sitting on
+        // one offset, and it ends at the transform before them.
+        while cursor.start().0 >= target && cursor.prev_item().is_some() {
+            cursor.prev();
+        }
+        let mut span = None;
+        while let Some(transform) = cursor.item() {
+            let input = cursor.start().0;
+            let output = cursor.start().1.0;
+            if input > target {
+                break;
+            }
+            match transform {
+                Transform::Isomorphic(summary) => {
+                    let end = input + summary.len;
+                    if target <= end {
+                        let position = InlayOffset(output + (target - input));
+                        span.get_or_insert(position..position);
+                    }
+                }
+                Transform::Concealed(summary) => {
+                    let end = input + summary.len;
+                    if target <= end {
+                        let position = InlayOffset(output);
+                        span.get_or_insert(position..position);
+                    }
+                }
+                Transform::Inlay(inlay) => {
+                    let len = MultiBufferOffset(inlay.text().len());
+                    if input == target {
+                        let range = span.get_or_insert(InlayOffset(output)..InlayOffset(output));
+                        range.start = cmp::min(range.start, InlayOffset(output));
+                        range.end = cmp::max(range.end, InlayOffset(output + len));
+                    }
+                }
+            }
+            cursor.next();
+        }
+        span.unwrap_or_else(|| {
+            let end = InlayOffset(self.transforms.summary().output.len);
+            end..end
+        })
+    }
+
+    pub fn concealed_ranges(&self) -> Vec<Range<MultiBufferOffset>> {
+        let mut input_offset = MultiBufferOffset(0);
+        let mut ranges = Vec::new();
+        for transform in self.transforms.iter() {
+            match transform {
+                Transform::Isomorphic(summary) => input_offset += summary.len,
+                Transform::Concealed(summary) => {
+                    ranges.push(input_offset..input_offset + summary.len);
+                    input_offset += summary.len;
+                }
+                Transform::Inlay(_) => {}
+            }
+        }
+        ranges
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn to_point(&self, offset: InlayOffset) -> InlayPoint {
         let (start, _, item) = self.transforms.find::<Dimensions<
@@ -922,6 +1245,7 @@ impl InlaySnapshot {
                 let overshoot = inlay.text().offset_to_point(overshoot);
                 InlayPoint(start.1.0 + overshoot)
             }
+            Some(Transform::Concealed(_)) => start.1,
             None => self.max_point(),
         }
     }
@@ -954,6 +1278,7 @@ impl InlaySnapshot {
                 let overshoot = inlay.text().point_to_offset(overshoot);
                 InlayOffset(start.1.0 + overshoot)
             }
+            Some(Transform::Concealed(_)) => start.1,
             None => self.len(),
         }
     }
@@ -968,6 +1293,7 @@ impl InlaySnapshot {
                 start.1 + overshoot
             }
             Some(Transform::Inlay(_)) => start.1,
+            Some(Transform::Concealed(_)) => start.1,
             None => self.buffer.max_point(),
         }
     }
@@ -982,6 +1308,23 @@ impl InlaySnapshot {
                 start.1 + overshoot
             }
             Some(Transform::Inlay(_)) => start.1,
+            Some(Transform::Concealed(_)) => start.1,
+            None => self.buffer.len(),
+        }
+    }
+
+    /// Maps an output offset to the source position after a zero-width
+    /// concealment at that offset. Chunk ranges use this for both bounds so
+    /// their source iterator agrees with the transform cursor when it steps
+    /// across concealed input.
+    fn to_buffer_offset_after_concealment(&self, offset: InlayOffset) -> MultiBufferOffset {
+        let (start, _, item) = self
+            .transforms
+            .find::<Dimensions<InlayOffset, MultiBufferOffset>, _>((), &offset, Bias::Right);
+        match item {
+            Some(Transform::Isomorphic(_)) => start.1 + (offset - start.0),
+            Some(Transform::Inlay(_)) => start.1,
+            Some(Transform::Concealed(summary)) => start.1 + summary.len,
             None => self.buffer.len(),
         }
     }
@@ -1016,6 +1359,7 @@ impl InlaySnapshot {
                         return cursor.start().1;
                     }
                 }
+                Some(Transform::Concealed(_)) => return cursor.start().1,
                 None => {
                     return self.len();
                 }
@@ -1067,7 +1411,7 @@ impl InlaySnapshot {
                             return None;
                         }
                     }
-                    Transform::Inlay(_) => cursor.next(),
+                    Transform::Inlay(_) | Transform::Concealed(_) => cursor.next(),
                 }
             }
         })
@@ -1169,6 +1513,15 @@ impl InlaySnapshot {
                         point = cursor.start().0;
                     }
                 }
+                Some(Transform::Concealed(_)) => {
+                    if bias == Bias::Left {
+                        point = cursor.start().0;
+                        cursor.prev();
+                    } else {
+                        cursor.next();
+                        point = cursor.start().0;
+                    }
+                }
                 None => {
                     bias = bias.invert();
                     if bias == Bias::Left {
@@ -1227,6 +1580,7 @@ impl InlaySnapshot {
                 );
                 cursor.next();
             }
+            Some(Transform::Concealed(_)) => cursor.next(),
             None => {}
         }
 
@@ -1248,6 +1602,7 @@ impl InlaySnapshot {
                     let prefix_end = overshoot;
                     summary += inlay.text().cursor(0).summary::<TextSummary>(prefix_end);
                 }
+                Some(Transform::Concealed(_)) => {}
                 None => {}
             }
         }
@@ -1306,7 +1661,9 @@ impl InlaySnapshot {
             .cursor::<Dimensions<InlayOffset, MultiBufferOffset>>(());
         cursor.seek(&range.start, Bias::Right);
 
-        let buffer_range = self.to_buffer_offset(range.start)..self.to_buffer_offset(range.end);
+        let buffer_range = self.to_buffer_offset_after_concealment(range.start)
+            ..self.to_buffer_offset_after_concealment(range.end);
+        let max_buffer_offset = buffer_range.end;
         let buffer_chunks = CustomHighlightsChunks::new(
             buffer_range,
             language_aware,
@@ -1323,6 +1680,7 @@ impl InlaySnapshot {
             buffer_chunk: None,
             output_offset: range.start,
             max_output_offset: range.end,
+            max_buffer_offset,
             highlight_styles: highlights.styles,
             highlights,
             snapshot: self,
@@ -1371,6 +1729,10 @@ pub struct InlayPointCursor<'transforms> {
 }
 
 impl InlayPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn map(&mut self, point: Point, bias: Bias) -> InlayPoint {
         let cursor = &mut self.cursor;
@@ -1403,6 +1765,7 @@ impl InlayPointCursor<'_> {
                         return cursor.start().1;
                     }
                 }
+                Some(Transform::Concealed(_)) => return cursor.start().1,
                 None => {
                     return InlayPoint(self.transforms.summary().output.lines);
                 }
@@ -1472,7 +1835,7 @@ impl BufferOffsetToInlayPointCursor<'_> {
                     }
                     cursor.next();
                 }
-                Some(Transform::Inlay(_)) => cursor.next(),
+                Some(Transform::Inlay(_) | Transform::Concealed(_)) => cursor.next(),
                 None => break,
             }
         }
@@ -1500,12 +1863,122 @@ fn push_isomorphic(sum_tree: &mut SumTree<Transform>, summary: MBTextSummary) {
     }
 }
 
+fn build_transforms(
+    buffer: &MultiBufferSnapshot,
+    inlays: &[Inlay],
+    concealments: &[Range<MultiBufferOffset>],
+) -> SumTree<Transform> {
+    let mut transforms = SumTree::default();
+    append_transforms_from(
+        &mut transforms,
+        buffer,
+        inlays,
+        concealments,
+        MultiBufferOffset(0),
+    );
+    if transforms.is_empty() {
+        transforms.push(Transform::Isomorphic(Default::default()), ());
+    }
+    transforms
+}
+
+fn append_transforms_from(
+    transforms: &mut SumTree<Transform>,
+    buffer: &MultiBufferSnapshot,
+    inlays: &[Inlay],
+    concealments: &[Range<MultiBufferOffset>],
+    start: MultiBufferOffset,
+) -> u64 {
+    // Anchors remain ordered after edits, including when a deletion collapses
+    // several of them onto one offset. Search their resolved offsets so every
+    // inlay now touching `start` stays in the rebuilt suffix.
+    let first_inlay_ix = inlays.partition_point(|inlay| inlay.position.to_offset(buffer) < start);
+    let candidate_inlays = &inlays[first_inlay_ix..];
+    let valid_inlays = candidate_inlays
+        .iter()
+        .filter(|inlay| inlay.position.is_valid(buffer))
+        .map(|inlay| (inlay.position.to_offset(buffer), inlay))
+        .collect::<Vec<_>>();
+    let first_concealment_ix = concealments.partition_point(|range| range.end <= start);
+    let candidate_concealments = &concealments[first_concealment_ix..];
+    let mut inlay_ix = 0;
+    let mut source_offset = start;
+
+    for concealed in candidate_concealments {
+        while let Some(&(offset, inlay)) = valid_inlays.get(inlay_ix) {
+            if offset > concealed.start {
+                break;
+            }
+            push_isomorphic(
+                transforms,
+                buffer.text_summary_for_range(source_offset..offset),
+            );
+            transforms.push(Transform::Inlay(inlay.clone()), ());
+            source_offset = offset;
+            inlay_ix += 1;
+        }
+
+        let concealed_start = concealed.start.max(source_offset);
+        push_isomorphic(
+            transforms,
+            buffer.text_summary_for_range(source_offset..concealed_start),
+        );
+        transforms.push(
+            Transform::Concealed(buffer.text_summary_for_range(concealed_start..concealed.end)),
+            (),
+        );
+        source_offset = concealed.end;
+
+        // Inlays strictly inside hidden source syntax are suppressed. Inlays
+        // at either boundary remain visible and are handled by the surrounding
+        // iterations.
+        while valid_inlays
+            .get(inlay_ix)
+            .is_some_and(|(offset, _)| *offset < concealed.end)
+        {
+            inlay_ix += 1;
+        }
+    }
+
+    for &(offset, inlay) in &valid_inlays[inlay_ix..] {
+        push_isomorphic(
+            transforms,
+            buffer.text_summary_for_range(source_offset..offset),
+        );
+        transforms.push(Transform::Inlay(inlay.clone()), ());
+        source_offset = offset;
+    }
+    push_isomorphic(
+        transforms,
+        buffer.text_summary_for_range(source_offset..buffer.len()),
+    );
+    (candidate_inlays.len() + candidate_concealments.len()) as u64
+}
+
+fn normalize_concealments(
+    mut ranges: Vec<Range<MultiBufferOffset>>,
+) -> Vec<Range<MultiBufferOffset>> {
+    ranges.retain(|range| range.start < range.end);
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut normalized: Vec<Range<MultiBufferOffset>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = normalized.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = cmp::max(previous.end, range.end);
+        } else {
+            normalized.push(range);
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         MultiBuffer,
-        display_map::{HighlightKey, InlayHighlights},
+        display_map::{FoldMap, HighlightKey, InlayHighlights, TabMap},
         hover_links::InlayHighlight,
     };
     use collections::HashMap;
@@ -1945,6 +2418,176 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(inlay_snapshot.text(), "abxJKLyDzefghi");
+    }
+
+    #[gpui::test]
+    fn test_concealments_precede_inlays(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple("## a\tX", cx);
+        let buffer_edits = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let (mut map, _) = InlayMap::new(snapshot.clone());
+
+        let (snapshot, edits) =
+            map.replace_concealments(vec![MultiBufferOffset(0)..MultiBufferOffset(3)]);
+        assert_eq!(snapshot.text(), "a\tX");
+        for start in 0..=snapshot.len().0.0 {
+            for end in start..=snapshot.len().0.0 {
+                let actual = snapshot
+                    .chunks(
+                        InlayOffset(MultiBufferOffset(start))..InlayOffset(MultiBufferOffset(end)),
+                        LanguageAwareStyling {
+                            tree_sitter: false,
+                            diagnostics: false,
+                        },
+                        Highlights::default(),
+                    )
+                    .map(|chunk| chunk.chunk.text)
+                    .collect::<String>();
+                assert_eq!(actual, &snapshot.text()[start..end]);
+            }
+        }
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            snapshot.to_inlay_offset(MultiBufferOffset(1)),
+            InlayOffset(MultiBufferOffset(0))
+        );
+        assert_eq!(
+            snapshot.to_inlay_offset(MultiBufferOffset(2)),
+            InlayOffset(MultiBufferOffset(0))
+        );
+
+        let (_, fold_snapshot) = FoldMap::new(snapshot.clone());
+        let (_, tab_snapshot) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        assert_eq!(tab_snapshot.text(), "a   X");
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(MultiBufferOffset(6)..MultiBufferOffset(6), "!")],
+                None,
+                cx,
+            )
+        });
+        let (snapshot, _) = map.sync(
+            buffer.read(cx).snapshot(cx),
+            buffer_edits.consume().into_inner(),
+        );
+        assert_eq!(snapshot.text(), "a\tX!");
+
+        let (snapshot, _) = map.splice(
+            &[],
+            vec![
+                Inlay::mock_hint(
+                    0,
+                    snapshot.buffer.anchor_before(MultiBufferOffset(1)),
+                    "hidden",
+                ),
+                Inlay::mock_hint(
+                    1,
+                    snapshot.buffer.anchor_before(MultiBufferOffset(3)),
+                    "visible",
+                ),
+            ],
+        );
+        assert_eq!(snapshot.text(), "visiblea\tX!");
+    }
+
+    /// An inlay is often placed exactly where concealed text ends -- a
+    /// duration drawn after a quoted command, say. Splicing it rebuilds the
+    /// transforms from its own offset, and the concealment ending there must
+    /// come through the rebuild: the prefix is sliced short of it and the
+    /// rebuild used to skip it, which put the concealed delimiter back on
+    /// screen.
+    #[gpui::test]
+    fn an_inlay_at_a_concealments_edge_does_not_uncover_it(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple("a`b`c", cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let (mut map, _) = InlayMap::new(snapshot.clone());
+
+        let (concealed, _) = map.replace_concealments(vec![
+            MultiBufferOffset(1)..MultiBufferOffset(2),
+            MultiBufferOffset(3)..MultiBufferOffset(4),
+        ]);
+        assert_eq!(concealed.text(), "abc");
+
+        let (spliced, _) = map.splice(
+            &[],
+            vec![Inlay::mock_hint(
+                0,
+                snapshot.anchor_before(MultiBufferOffset(4)),
+                " 5s",
+            )],
+        );
+        assert_eq!(spliced.text(), "ab 5sc");
+    }
+
+    /// What `replace_concealments` returns has to account for every byte it
+    /// changed. It rebuilds to the end of the buffer, and what it emits there
+    /// can differ -- an inlay's visibility follows the concealment it falls
+    /// in -- so an edit stopping at the last changed range under-reports, and
+    /// the maps below keep a transform tree whose length no longer matches
+    /// this snapshot. `FoldMap::read` asserts on exactly that.
+    #[gpui::test]
+    fn a_concealment_change_reports_every_byte_it_moved(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple("a`b`c", cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let (mut map, _) = InlayMap::new(snapshot.clone());
+        map.splice(
+            &[],
+            vec![Inlay::mock_hint(
+                0,
+                snapshot.anchor_before(MultiBufferOffset(4)),
+                " 5s",
+            )],
+        );
+        let (before, _) = map.replace_concealments(vec![
+            MultiBufferOffset(1)..MultiBufferOffset(2),
+            MultiBufferOffset(3)..MultiBufferOffset(4),
+        ]);
+        let was = before.len();
+
+        let (after, edits) =
+            map.replace_concealments(vec![MultiBufferOffset(1)..MultiBufferOffset(2)]);
+
+        let moved = after.len().0.0 as i64 - was.0.0 as i64;
+        let reported = edits
+            .iter()
+            .map(|edit| {
+                (edit.new.end.0.0 as i64 - edit.new.start.0.0 as i64)
+                    - (edit.old.end.0.0 as i64 - edit.old.start.0.0 as i64)
+            })
+            .sum::<i64>();
+        assert_eq!(
+            moved, reported,
+            "the edit does not account for what the rebuild changed"
+        );
+    }
+
+    #[gpui::test]
+    fn rebuilding_a_suffix_skips_inlays_before_it(cx: &mut App) {
+        let buffer = MultiBuffer::build_simple(&"x".repeat(1_000), cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let inlays = (0..100)
+            .map(|index| {
+                Inlay::mock_hint(
+                    index,
+                    snapshot.anchor_before(MultiBufferOffset(index * 10)),
+                    "i",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut transforms = SumTree::default();
+
+        let walked = append_transforms_from(
+            &mut transforms,
+            &snapshot,
+            &inlays,
+            &[],
+            MultiBufferOffset(900),
+        );
+
+        assert_eq!(walked, 10);
+        assert_eq!(transforms.summary().input.len, MultiBufferOffset(100));
+        assert_eq!(transforms.summary().output.len, MultiBufferOffset(110));
     }
 
     #[gpui::test]

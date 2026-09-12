@@ -2,7 +2,7 @@
   description = "rho";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     flake-utils.url = "github:numtide/flake-utils";
     flakebox = {
@@ -41,8 +41,12 @@
             flakebox.overlays.default
           ];
         };
-
         projectName = "rho";
+        # The dev shell's linker. Flakebox's overlay pins wild 0.9.0 and
+        # neither wild 0.9.0 nor wild 0.10.0 can be used (see the shellHook);
+        # take mold from nixpkgs itself, without the overlay, so it is the
+        # wrapped mold and keeps the -rpath flags nix adds.
+        moldLinker = nixpkgs.legacyPackages.${system}.mold;
         octoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
             ./nix/patches/git-http-unix-socket.patch
@@ -133,7 +137,7 @@
                     CC = "${pkgs.stdenv.cc}/bin/cc";
                     CXX = "${pkgs.stdenv.cc}/bin/c++";
                     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
-                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "--cfg tokio_unstable";
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
                   };
                 };
               };
@@ -157,170 +161,8 @@
           paths = buildPaths;
         };
 
-        # The browser client is a GPUI application in its own wasm workspace.
-        # Keep its nightly toolchain separate from the native workspace's
-        # stable toolchain, while retaining a reproducible deployable bundle.
-        webuiToolchain = flakeboxLib.mkFenixToolchain {
-          channel = "complete";
-          componentTargetsChannelName = "latest";
-          components = [
-            "cargo"
-            "rustc"
-            "rust-src"
-          ];
-          targets = {
-            wasm32-unknown = (flakeboxLib.mkStdTargets { }).wasm32-unknown;
-          };
-        };
-        # Keep rust-src behind a stable sysroot wrapper so Crane's dependency
-        # and application builds resolve the same standard-library sources.
-        webuiRustSysroot = pkgs.runCommand "rho-gui-web-rust-sysroot" { } ''
-          mkdir -p $out/lib/rustlib/src
-          cp -a ${webuiToolchain.toolchain}/lib/rustlib/src/rust \
-            $out/lib/rustlib/src/
-        '';
-        webuiRustc = pkgs.writeShellScript "rho-gui-web-rustc" ''
-          previous=""
-          printSysroot=""
-          for argument in "$@"; do
-            if [ "$argument" = "--print=sysroot" ] || \
-               { [ "$previous" = "--print" ] && [ "$argument" = "sysroot" ]; }; then
-              printSysroot=1
-            fi
-            previous="$argument"
-          done
-          if [ -n "$printSysroot" ]; then
-            status=0
-            output="$(${webuiToolchain.toolchain}/bin/rustc "$@")" || status=$?
-            printf '%s\n' "$output" | sed \
-              's|^${webuiToolchain.toolchain}$|${webuiRustSysroot}|'
-            exit "$status"
-          fi
-          exec ${webuiToolchain.toolchain}/bin/rustc "$@"
-        '';
-        webuiVendorSrc = flakeboxLib.filterSubPaths {
-          root = builtins.path {
-            name = projectName;
-            path = ./.;
-          };
-          paths = [ "vendor" ];
-        };
-
-        # Trunk requires the wasm-bindgen CLI version to exactly match the
-        # `wasm-bindgen` crate in crates/rho-gui-web/Cargo.lock.
-        wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
-          src = pkgs.fetchCrate {
-            pname = "wasm-bindgen-cli";
-            version = "0.2.126";
-            hash = "sha256-H6Is3fiZVxZCfOMWK5dWMSrtn50VGv0sfdnsT+cTtyk=";
-          };
-          cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
-            inherit src;
-            inherit (src) pname version;
-            hash = "sha256-VucqkXbCi4qtQzY/HrXiDnbSURsagPsdNVMn1Tw3UiY=";
-          };
-        };
-        # Adds CSP hash sources for the inline scripts trunk injects into
-        # index.html; the meta-tag policy would otherwise block the wasm
-        # bootstrap on static hosts, where per-response nonces are impossible.
-        webuiCspHash = pkgs.writeText "webui-csp-hash.py" ''
-          import base64
-          import hashlib
-          import os
-          import re
-          import sys
-
-          path = sys.argv[1]
-          with open(path) as f:
-              html = f.read()
-          hashes = []
-          for m in re.finditer(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.DOTALL):
-              digest = base64.b64encode(hashlib.sha256(m.group(1).encode()).digest()).decode()
-              hashes.append("'sha256-" + digest + "'")
-          assert hashes, "no inline scripts found in index.html"
-          new, count = re.subn(r"script-src 'self'", "script-src 'self' " + " ".join(hashes), html)
-          assert count == 1, "expected one script-src directive, found %d" % count
-
-          def refresh_integrity(match):
-              tag = match.group(0)
-              href = re.search(r'href="\./([^"?]+)', tag)
-              if not href:
-                  return tag
-              with open(os.path.join(os.path.dirname(path), href.group(1)), "rb") as asset:
-                  digest = base64.b64encode(hashlib.sha384(asset.read()).digest()).decode()
-              return re.sub(r'integrity="sha384-[^"]+"', 'integrity="sha384-' + digest + '"', tag)
-
-          new = re.sub(r'<link\b[^>]*\bintegrity="sha384-[^"]+"[^>]*>', refresh_integrity, new)
-          with open(path, "w") as f:
-              f.write(new)
-        '';
-
-        webuiCraneBase = webuiToolchain.craneLib.overrideArgs {
-          pname = "rho-gui-web";
-          version = "0.1.0";
-          src = buildSrc;
-          cargoToml = ./crates/rho-gui-web/Cargo.toml;
-          cargoLock = ./crates/rho-gui-web/Cargo.lock;
-          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          CFLAGS_wasm32_unknown_unknown =
-            "${webuiToolchain.commonArgs.CFLAGS_wasm32_unknown_unknown} -matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
-          nativeBuildInputs = [
-            pkgs.lld
-            pkgs.python3
-            pkgs.protobuf
-          ];
-          # `ring` and the statically linked tree-sitter grammars compile C
-          # for wasm32. Do not use Nix's wrapped clang, which injects host
-          # flags that produce unlinkable objects.
-          env = {
-            RUSTC = webuiRustc;
-            TRUNK_OFFLINE = "true";
-            TRUNK_SKIP_VERSION_CHECK = "true";
-          };
-          postPatch = ''
-            substituteInPlace crates/rho-gui-web/.cargo/config.toml \
-              --replace-fail 'value = "toolchain/clang", relative = true, force = true' \
-              'value = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang", force = true'
-          '';
-          preBuild = ''
-            cd crates/rho-gui-web
-          '';
-        };
-        webuiCargoVendor = webuiCraneBase.vendorMultipleCargoDeps {
-          inherit (webuiCraneBase.findCargoFiles buildSrc) cargoConfigs;
-          cargoLockList = [
-            ./crates/rho-gui-web/Cargo.lock
-            "${webuiToolchain.toolchain}/lib/rustlib/src/rust/library/Cargo.lock"
-          ];
-        };
-        webuiCrane = webuiCraneBase.overrideArgs {
-          cargoVendorDir = webuiCargoVendor;
-        };
-        webuiDeps = webuiCrane.buildDepsOnly {
-          # Crane's dummy path crates intentionally differ from the real
-          # sources, so Cargo must refresh its dummy lock without networking.
-          cargoExtraArgs = "--offline";
-          # Direct path dependencies in vendor must keep their real sources so
-          # Crane can reuse their artifacts in the final Trunk build.
-          extraDummyScript = ''
-            rm -rf $out/vendor
-            cp -r --no-preserve=mode,ownership ${webuiVendorSrc}/vendor $out/vendor
-            cp ${./crates/rho-gui-web/Cargo.lock} $out/crates/rho-gui-web/Cargo.lock
-          '';
-        };
-        webui = webuiCrane.buildTrunkPackage {
-          cargoArtifacts = webuiDeps;
-          wasm-bindgen-cli = wasmBindgenCli;
-          # Relative public URL: GitHub Pages serves project sites under a
-          # /<repo>/ subpath.
-          trunkExtraBuildArgs = "--dist dist --public-url ./";
-          postFixup = ''
-            # Nix's reference stripping can rewrite the final Wasm after
-            # Trunk computes SRI. Refresh integrity and allow the injected
-            # inline bootstrap through CSP only after all output rewriting.
-            python3 ${webuiCspHash} $out/index.html
-          '';
-        };
+        pythonPackages = pkgs.python3.withPackages (ps: [ ps.pyyaml ps.httpx ]);
+        pythonSitePackages = "${pythonPackages}/${pkgs.python3.sitePackages}";
 
         guiNativeBuildInputs = [
           pkgs.clang
@@ -367,6 +209,7 @@
               nativeBuildInputs = guiNativeBuildInputs;
               buildInputs = guiBuildInputs;
               env.RUSTDOCFLAGS = "-D warnings";
+              env.RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
               env.PROTOC = "${pkgs.protobuf}/bin/protoc";
               env.OCTO_REMOTE_HTTP = "${octoGit}/libexec/git-core/git-remote-http";
               env.RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
@@ -376,6 +219,15 @@
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
               env.LK_CUSTOM_WEBRTC = webrtcPrebuilt;
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
+              # Linux AArch64 kernels commonly use either 4 KiB or 16 KiB
+              # pages. jemalloc accepts system pages no larger than its
+              # build-time page size, so 16 KiB supports both variants.
+              # Elsewhere 4 KiB is jemalloc's own default; it is spelled out
+              # because env refuses a null.
+              env.JEMALLOC_SYS_WITH_LG_PAGE =
+                if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
+                then "14"
+                else "12";
               postPatch = ''
                 # Brush denies warnings, but the root lockfile can select a
                 # newer Clap which deprecates attributes used by Brush.
@@ -383,8 +235,8 @@
                   --replace-fail 'warnings = { level = "deny" }' \
                     'warnings = { level = "warn" }'
               '';
-              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
-              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
             };
             cargoVendorDirBase = craneLibBase.vendorCargoDeps { };
             cargoVendorDir = pkgs.runCommand "rho-cargo-vendor-deps" { } ''
@@ -530,7 +382,7 @@
           default = multiBuild.package;
           rho = multiBuild.package;
           workspace = multiBuild.workspace;
-          inherit findutils webui;
+          inherit findutils;
         };
 
         ci = {
@@ -552,11 +404,16 @@
           ];
           NEXTEST_SHOW_PROGRESS = "none";
           RHO_LOG = "rho_agent=debug,info";
+          RHO_PYTHON_SITE_PACKAGES = pythonSitePackages;
           RHO_WAYLAND_SWAY = "${pkgs.sway}/bin/sway";
           RHO_WAYLAND_SWAYMSG = "${pkgs.sway}/bin/swaymsg";
           RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+          JEMALLOC_SYS_WITH_LG_PAGE =
+            if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
+            then "14"
+            else null;
           packages = [
             selfciMq
             pkgs.cargo-nextest
@@ -573,11 +430,20 @@
           NIX_LD_LIBRARY_PATH = guiLibraryPath;
           shellHook = ''
             ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
-            # Flakebox sets target-specific RUSTFLAGS (wild linker), which
-            # shadow build.rustflags from .cargo/config.toml; re-add the
-            # tokio_unstable cfg that dial9-tokio-telemetry needs.
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
+            # Flakebox sets target-specific RUSTFLAGS (its own wild 0.9.0 plus
+            # --compress-debug-sections=zstd), which shadow build.rustflags
+            # and [target.x86_64-unknown-linux-gnu] from .cargo/config.toml,
+            # so this replaces them outright and has to carry every flag.
+            # The linker is mold: wild 0.9.0 compresses the SHF_ALLOC section
+            # .debug_gdb_scripts and every optimised binary with line tables
+            # then fails to link ("Insufficient space allocated to section
+            # .debug_gdb_scripts"), and wild 0.10.0 lays a large binary out
+            # so that the PT_DYNAMIC program header's offset is sixteen bytes
+            # short of the .dynamic section and the binary does not start
+            # (GUI-CRATES-DESIGN.md, "The linker, not the size"). The tokio_unstable and frame-pointer flags are what
+            # dial9-tokio-telemetry and CPU stack capture need.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--ld-path=${moldLinker}/bin/mold -C link-arg=-Wl,--compress-debug-sections=zstd --cfg tokio_unstable -Cforce-frame-pointers=yes"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="--cfg tokio_unstable -Cforce-frame-pointers=yes"
           '';
         };
       }

@@ -863,6 +863,31 @@ impl Editor {
         );
     }
 
+    /// Re-anchors the scroll to the content it is currently showing, biased
+    /// so that text inserted above pushes the view down with it.
+    ///
+    /// A view scrolled to the very top anchors to [`Anchor::Min`], which stays
+    /// pinned to the top: prepend older content and the line the reader was
+    /// on slides down the screen. An anchor taken *after* the same position
+    /// moves with the content instead, which is what a transcript that fills
+    /// its history as the reader scrolls needs.
+    pub fn pin_scroll_to_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let current = self.scroll_manager.native_anchor(&display_map, cx);
+        let position = self.scroll_manager.scroll_position(&display_map, cx);
+        let buffer = self.buffer().read(cx).snapshot(cx);
+        let anchor = buffer.anchor_after(current.anchor.to_point(&buffer));
+        if anchor == current.anchor {
+            return;
+        }
+        // The anchor moves, so the offset has to absorb the difference or the
+        // view jumps by however many rows the old anchor stood for.
+        let row = anchor.to_display_point(&display_map).row().as_f64();
+        let mut offset = current.offset;
+        offset.y = position.y - row;
+        self.set_scroll_anchor(ScrollAnchor { anchor, offset }, window, cx);
+    }
+
     pub(crate) fn set_scroll_anchor_remote(
         &mut self,
         scroll_anchor: ScrollAnchor,

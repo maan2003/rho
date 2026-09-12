@@ -1,8 +1,9 @@
 use gpui::{
     App, Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div,
 };
-use ui::text_for_keystrokes;
-use workspace::{HideStatusItem, StatusItemView, item::ItemHandle, ui::prelude::*};
+use ui::{IntoElement, SharedString, prelude::*, text_for_keystrokes};
+#[cfg(feature = "zed-workspace")]
+use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
 
 use crate::{Vim, VimEvent, VimGlobals};
 
@@ -62,6 +63,11 @@ impl ModeIndicator {
         self.vim.as_ref().and_then(|vim| vim.upgrade())
     }
 
+    /// Plain current-mode text for clients that render their own mode line.
+    pub fn plain_mode(&self, cx: &App) -> Option<String> {
+        Some(self.vim()?.read(cx).mode.to_string().to_lowercase())
+    }
+
     fn current_operators_description(&self, vim: Entity<Vim>, cx: &mut Context<Self>) -> String {
         let recording = Vim::globals(cx)
             .recording_register
@@ -109,7 +115,10 @@ impl Render for ModeIndicator {
             crate::state::Mode::Visual => colors.vim_visual_foreground,
             crate::state::Mode::VisualLine => colors.vim_visual_line_foreground,
             crate::state::Mode::VisualBlock => colors.vim_visual_block_foreground,
-            crate::state::Mode::HelixNormal => colors.vim_helix_normal_foreground,
+            crate::state::Mode::HelixNormal | crate::state::Mode::HelixDeal => {
+                colors.vim_helix_normal_foreground
+            }
+            crate::state::Mode::Deal => colors.vim_normal_foreground,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_foreground,
         };
         let bg_color = match mode {
@@ -119,7 +128,10 @@ impl Render for ModeIndicator {
             crate::state::Mode::Visual => colors.vim_visual_background,
             crate::state::Mode::VisualLine => colors.vim_visual_line_background,
             crate::state::Mode::VisualBlock => colors.vim_visual_block_background,
-            crate::state::Mode::HelixNormal => colors.vim_helix_normal_background,
+            crate::state::Mode::HelixNormal | crate::state::Mode::HelixDeal => {
+                colors.vim_helix_normal_background
+            }
+            crate::state::Mode::Deal => colors.vim_normal_background,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_background,
         };
 
@@ -180,6 +192,7 @@ impl Render for ModeIndicator {
     }
 }
 
+#[cfg(feature = "zed-workspace")]
 impl StatusItemView for ModeIndicator {
     fn set_active_pane_item(
         &mut self,

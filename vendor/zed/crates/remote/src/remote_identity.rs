@@ -22,9 +22,13 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
-    Custom { name: String },
+    Custom {
+        name: String,
+    },
     #[cfg(any(test, feature = "test-support"))]
-    Mock { id: u64 },
+    Mock {
+        id: u64,
+    },
 }
 
 impl RemoteConnectionIdentity {

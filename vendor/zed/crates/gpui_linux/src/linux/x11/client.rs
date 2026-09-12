@@ -717,6 +717,7 @@ impl X11Client {
                     window.refresh(RequestFrameOptions {
                         require_presentation: true,
                         force_render: false,
+                        host_vsync: None,
                     });
                 }
             }
@@ -1051,6 +1052,10 @@ impl X11Client {
             }
             Event::KeyPress(event) => {
                 let window = self.get_window(event.event)?;
+                window.handle_input(PlatformInput::PhysicalKey(gpui::PhysicalKeyEvent {
+                    key: gpui::PhysicalKey::LinuxEvdev(u32::from(event.detail).saturating_sub(8)),
+                    pressed: true,
+                }));
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_state(event.state);
@@ -1115,6 +1120,10 @@ impl X11Client {
             }
             Event::KeyRelease(event) => {
                 let window = self.get_window(event.event)?;
+                window.handle_input(PlatformInput::PhysicalKey(gpui::PhysicalKeyEvent {
+                    key: gpui::PhysicalKey::LinuxEvdev(u32::from(event.detail).saturating_sub(8)),
+                    pressed: false,
+                }));
                 let mut state = self.0.borrow_mut();
 
                 let modifiers = modifiers_from_state(event.state);
@@ -1363,6 +1372,7 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
                     position,
+                    fingers: event.detail,
                     delta: 0.0,
                     modifiers,
                     phase: gpui::TouchPhase::Started,
@@ -1385,6 +1395,7 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
                     position,
+                    fingers: 0,
                     delta: zoom_delta,
                     modifiers,
                     phase: gpui::TouchPhase::Moved,
@@ -1403,9 +1414,14 @@ impl X11Client {
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
                     position,
+                    fingers: 0,
                     delta: 0.0,
                     modifiers,
-                    phase: gpui::TouchPhase::Ended,
+                    phase: if u32::from(event.flags) != 0 {
+                        gpui::TouchPhase::Cancelled
+                    } else {
+                        gpui::TouchPhase::Ended
+                    },
                 }));
             }
             _ => {}
@@ -1993,6 +2009,7 @@ impl X11ClientState {
                             window.refresh(RequestFrameOptions {
                                 require_presentation: false,
                                 force_render,
+                                host_vsync: None,
                             });
                         }
                         xcb_connection

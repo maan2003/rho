@@ -4,12 +4,70 @@ use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
+    cell::Cell,
     hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
+    time::Instant,
 };
 
 use super::LineWrapper;
+
+thread_local! {
+    static SHAPING: Cell<ShapingCounts> = const { Cell::new(ShapingCounts::ZERO) };
+}
+
+/// What the line layout cache did, for a caller that wants to tell a
+/// defeated cache from an honest first shape.
+///
+/// A row whose text, font size and runs are unchanged should be reused from
+/// the previous frame, so on a settled frame `misses` is the number that
+/// says whether the cache is working. `shaped_nanos` is the time inside the
+/// platform text system on those misses, which is the part of a prepaint
+/// that shaping actually owns.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct ShapingCounts {
+    /// Layouts served from this frame's map.
+    pub hits: u64,
+    /// Layouts carried over from the previous frame's map.
+    pub carried: u64,
+    /// Layouts the platform had to shape.
+    pub misses: u64,
+    /// Nanoseconds inside the platform text system on those misses.
+    pub shaped_nanos: u64,
+}
+
+impl ShapingCounts {
+    const ZERO: Self = Self {
+        hits: 0,
+        carried: 0,
+        misses: 0,
+        shaped_nanos: 0,
+    };
+
+    /// What happened between two reads of [`shaping_counts`].
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(earlier.hits),
+            carried: self.carried.saturating_sub(earlier.carried),
+            misses: self.misses.saturating_sub(earlier.misses),
+            shaped_nanos: self.shaped_nanos.saturating_sub(earlier.shaped_nanos),
+        }
+    }
+}
+
+/// This thread's running line layout cache counts.
+pub fn shaping_counts() -> ShapingCounts {
+    SHAPING.with(Cell::get)
+}
+
+fn count(f: impl FnOnce(&mut ShapingCounts)) {
+    SHAPING.with(|counts| {
+        let mut current = counts.get();
+        f(&mut current);
+        counts.set(current);
+    });
+}
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -595,19 +653,27 @@ impl LineLayoutCache {
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.lines.get(key) {
+            count(|counts| counts.hits += 1);
             return layout.clone();
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
         if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+            count(|counts| counts.carried += 1);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
         } else {
             let text = SharedString::from(text);
+            let started = Instant::now();
             let mut layout = self
                 .platform_text_system
                 .layout_line(&text, font_size, runs);
+            let shaped_nanos = started.elapsed().as_nanos() as u64;
+            count(|counts| {
+                counts.misses += 1;
+                counts.shaped_nanos += shaped_nanos;
+            });
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);

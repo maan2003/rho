@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use scheduler::{Instant, SpawnTime};
+use scheduler::SpawnTime;
 use std::{
     cell::LazyCell,
     collections::{HashMap, VecDeque},
@@ -15,6 +15,10 @@ use std::{
 mod actions;
 pub use actions::{ActionStatistics, ActionTiming, take_action_stats};
 pub(crate) use actions::{save_action_timing, update_running_action};
+/// The clock every timing here is stamped with. Public because the structs
+/// that carry it are: a caller that reads `MainThreadWork::start` needs to
+/// be able to name what it read.
+pub use scheduler::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -709,6 +713,11 @@ pub fn trace_enabled() -> bool {
 pub struct FrameTiming {
     /// The window that was drawn.
     pub window_id: WindowId,
+    /// How much there was to draw. A duration on its own cannot be divided
+    /// by anything, so a slow frame can be named but not explained; this is
+    /// what it was slow *per*. Accumulated across every element that
+    /// reported during the frame, and zero when nothing did.
+    pub work: FrameWorkScale,
     /// When the frame first became dirty (its first invalidation). `None` if
     /// frame tracing was not yet enabled when the invalidation occurred.
     pub dirty_at: Option<Instant>,
@@ -716,14 +725,79 @@ pub struct FrameTiming {
     pub invalidations: u64,
     /// When `Window::draw` started.
     pub draw_start: Instant,
+    /// When root layout and prepaint finished.
+    pub prepaint_end: Instant,
+    /// When root painting, including accessibility updates, finished.
+    pub paint_end: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+}
+
+/// What one frame had to draw.
+///
+/// Counts, not contents: like every other payload here these are numeric by
+/// design, so profiling never captures text or paths. Elements add their own
+/// numbers with [`record_frame_work`] while the frame is being drawn, and
+/// [`record_frame_timing`] takes the total.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct FrameWorkScale {
+    /// Rows actually on screen.
+    pub visible_rows: u64,
+    /// Rows the document has, on screen or not.
+    pub total_rows: u64,
+    /// Block decorations in the display map.
+    pub blocks: u64,
+    /// Excerpts the multibuffer is composed of.
+    pub excerpts: u64,
+    /// Inlays spliced into the display map.
+    pub inlays: u64,
+    /// Cursors and selections being drawn.
+    pub cursors: u64,
+}
+
+impl FrameWorkScale {
+    /// Adds another element's numbers to these. Saturating, because a
+    /// profiling counter must never be the thing that panics.
+    pub fn add(&mut self, other: Self) {
+        self.visible_rows = self.visible_rows.saturating_add(other.visible_rows);
+        self.total_rows = self.total_rows.saturating_add(other.total_rows);
+        self.blocks = self.blocks.saturating_add(other.blocks);
+        self.excerpts = self.excerpts.saturating_add(other.excerpts);
+        self.inlays = self.inlays.saturating_add(other.inlays);
+        self.cursors = self.cursors.saturating_add(other.cursors);
+    }
+}
+
+/// CPU time spent submitting a rendered scene to the platform renderer.
+#[derive(Debug, Copy, Clone)]
+pub struct PresentTiming {
+    /// The window whose scene was submitted.
+    pub window_id: WindowId,
+    /// When platform presentation started.
+    pub start: Instant,
+    /// When the platform renderer returned.
+    pub end: Instant,
 }
 
 impl FrameTiming {
     /// Time spent inside `Window::draw`.
     pub fn draw_duration(&self) -> Duration {
         self.draw_end.duration_since(self.draw_start)
+    }
+
+    /// Time spent setting up the frame, laying it out, and prepainting it.
+    pub fn prepaint_duration(&self) -> Duration {
+        self.prepaint_end.duration_since(self.draw_start)
+    }
+
+    /// Time spent painting the frame and updating its accessibility tree.
+    pub fn paint_duration(&self) -> Duration {
+        self.paint_end.duration_since(self.prepaint_end)
+    }
+
+    /// Time spent finishing and swapping frame state after painting.
+    pub fn finish_duration(&self) -> Duration {
+        self.draw_end.duration_since(self.paint_end)
     }
 
     /// Time from the frame's first invalidation to the end of its draw, if the
@@ -734,8 +808,9 @@ impl FrameTiming {
     }
 }
 
-// Allow 16MiB of frame timing entries.
-const MAX_FRAME_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<FrameTiming>();
+// Keep one MiB of frame timing entries. This ring is enabled in Rho's GUI in
+// normal operation, so its memory cost must remain small and fixed.
+const MAX_FRAME_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<FrameTiming>();
 
 struct FrameTimings {
     timings: VecDeque<FrameTiming>,
@@ -745,6 +820,17 @@ struct FrameTimings {
 static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings {
     timings: VecDeque::new(),
     total_pushed: 0,
+});
+static PRESENT_TIMINGS: spin::Mutex<VecDeque<PresentTiming>> = spin::Mutex::new(VecDeque::new());
+
+/// What the frame currently being drawn has reported so far.
+static FRAME_WORK: spin::Mutex<FrameWorkScale> = spin::Mutex::new(FrameWorkScale {
+    visible_rows: 0,
+    total_rows: 0,
+    blocks: 0,
+    excerpts: 0,
+    inlays: 0,
+    cursors: 0,
 });
 
 static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -763,7 +849,13 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         let mut frames = FRAME_TIMINGS.lock();
         frames.timings.clear();
         frames.timings.shrink_to_fit();
-        frames.total_pushed = 0;
+        let mut presents = PRESENT_TIMINGS.lock();
+        presents.clear();
+        presents.shrink_to_fit();
+        *FRAME_WORK.lock() = FrameWorkScale::default();
+        let mut work = MAIN_THREAD_WORK.lock();
+        work.work.clear();
+        work.work.shrink_to_fit();
     }
     true
 }
@@ -773,15 +865,41 @@ pub fn frame_trace_enabled() -> bool {
     FRAME_TRACE_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Records the timing of a drawn window frame.
+/// Reports how much this element had to draw in the frame being drawn.
+///
+/// Called during prepaint, once per element that knows its own scale. The
+/// numbers accumulate until the frame is recorded, so several editors in one
+/// window add up to what the window drew.
 ///
 /// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
-pub fn record_frame_timing(timing: FrameTiming) {
+pub fn record_frame_work(scale: FrameWorkScale) {
     if !frame_trace_enabled() {
         return;
     }
     std::hint::cold_path(); // optimize for when profiling is off
 
+    FRAME_WORK.lock().add(scale);
+}
+
+/// Takes what has been reported since the last frame and resets the total.
+pub fn take_frame_work() -> FrameWorkScale {
+    std::mem::take(&mut *FRAME_WORK.lock())
+}
+
+/// Records the timing of a drawn window frame.
+///
+/// The frame's work scale is taken from what elements reported during it, so
+/// callers need not thread it through; whatever is passed in `timing.work` is
+/// replaced.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+pub fn record_frame_timing(mut timing: FrameTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path(); // optimize for when profiling is off
+
+    timing.work = take_frame_work();
     let mut frames = FRAME_TIMINGS.lock();
     if frames.timings.len() >= MAX_FRAME_TIMINGS {
         frames.timings.pop_front();
@@ -790,10 +908,34 @@ pub fn record_frame_timing(timing: FrameTiming) {
     frames.total_pushed += 1;
 }
 
+/// Records CPU time spent in the platform renderer for one presentation.
+pub fn record_present_timing(timing: PresentTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut presents = PRESENT_TIMINGS.lock();
+    if presents.len() >= MAX_FRAME_TIMINGS {
+        presents.pop_front();
+    }
+    presents.push_back(timing);
+}
+
+/// Returns the buffered platform presentation timings in chronological order.
+pub fn snapshot_present_timings() -> Vec<PresentTiming> {
+    PRESENT_TIMINGS.lock().iter().copied().collect()
+}
+
 /// Drains frame timings recorded after this collector was created, tracking a
 /// cursor so each call to [`Self::collect_unseen`] returns only new entries.
 pub struct FrameTimingCollector {
     cursor: u64,
+}
+
+/// Returns a non-destructive copy of the current bounded frame timing ring.
+pub fn snapshot_frame_timings() -> Vec<FrameTiming> {
+    FRAME_TIMINGS.lock().timings.iter().copied().collect()
 }
 
 /// A timed text/display pipeline operation. Payloads are numeric by design so
@@ -808,6 +950,12 @@ pub struct EditorTiming {
     pub input_edits: u64,
     pub input_start: u64,
     pub input_rows: u64,
+    /// Sum of each input edit's own old/new row extent (the larger side).
+    pub touched_rows: u64,
+    /// Pipeline items actually visited while processing this stage. SumTree
+    /// cursors count leaf items but not shared untouched subtrees; stages also
+    /// count explicitly scanned non-tree work items.
+    pub walked_items: u64,
     pub output_edits: u64,
     pub output_start: u64,
     pub output_rows: u64,
@@ -815,6 +963,18 @@ pub struct EditorTiming {
     pub new_rows: u64,
     pub pending_batches: u64,
     pub flags: u64,
+    /// Transforms in the map the stage worked on. What a splice is divided
+    /// by: the same stage over ten transforms and ten thousand is the same
+    /// name and a different thing.
+    pub transforms: u64,
+    /// The span the stage affected, in the map's own offsets.
+    pub affected_start: u64,
+    /// The end of that span.
+    pub affected_end: u64,
+    /// How many distinct offsets inside it were touched. A splice costs the
+    /// offsets, not the span, so a wide span over few offsets is cheap and
+    /// the two must be told apart.
+    pub affected_offsets: u64,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -829,17 +989,64 @@ pub enum EditorTimingKind {
     BlockMapSync = 6,
     InlayMapSync = 7,
     WrapMapUpdate = 8,
+    /// The dashboard reconciling its tree into the editor's composition.
+    SyncTree = 9,
+    /// Inlays going into or out of the display map.
+    SpliceInlays = 10,
+    /// The multibuffer's pass over the buffers marked changed, counted apart
+    /// from `MultiBufferSync` because it is a different unit: one item per
+    /// changed buffer and one per path it carries, where the sync's own
+    /// number is SumTree leaf items crossed. It rises when many buffers
+    /// report a change at once - a screenful of parses finishing together -
+    /// and not with the size of the document.
+    MultiBufferBufferScan = 11,
+    /// Producing the highlighted chunks a screen's rows are shaped from:
+    /// the syntax, diagnostic and inlay iterators walking the drawn range.
+    /// Counted apart from the shaping because the two are interleaved in
+    /// one prepaint pass and want opposite fixes.
+    HighlightedChunks = 12,
 }
 
-const MAX_EDITOR_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<EditorTiming>();
+const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
 
 struct EditorTimings {
     timings: VecDeque<EditorTiming>,
+    total_pushed: u64,
+    /// Threads that have claimed the trace, or empty for "every thread".
+    /// A claim is how a measurement says which work is its own: the ring
+    /// is one buffer for the process and a bounded one, so a thread
+    /// working beside a measurement does not only add records to it, it
+    /// can push the measurement's own records out before they are read.
+    claimed: Vec<u64>,
 }
 
 static EDITOR_TIMINGS: spin::Mutex<EditorTimings> = spin::Mutex::new(EditorTimings {
     timings: VecDeque::new(),
+    total_pushed: 0,
+    claimed: Vec::new(),
 });
+
+/// A thread's claim on the editor trace, released when it is dropped.
+pub struct EditorTraceClaim(u64);
+
+impl Drop for EditorTraceClaim {
+    fn drop(&mut self) {
+        let mut timings = EDITOR_TIMINGS.lock();
+        if let Some(at) = timings.claimed.iter().position(|tid| *tid == self.0) {
+            timings.claimed.remove(at);
+        }
+    }
+}
+
+/// Records only this thread's editor work for as long as the claim is
+/// held - and any other thread's that has claimed it too. Unclaimed, the
+/// ring records every thread, which is what the running application wants
+/// and what a measurement standing next to other work does not.
+pub fn claim_editor_trace_for_this_thread() -> EditorTraceClaim {
+    let tid = editor_profile_tid();
+    EDITOR_TIMINGS.lock().claimed.push(tid);
+    EditorTraceClaim(tid)
+}
 
 static EDITOR_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static EDITOR_TRACE_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -872,10 +1079,14 @@ fn record_editor_timing(timing: EditorTiming, generation: u64) {
     if generation != EDITOR_TRACE_GENERATION.load(Ordering::Relaxed) {
         return;
     }
+    if !timings.claimed.is_empty() && !timings.claimed.contains(&timing.tid) {
+        return;
+    }
     if timings.timings.len() >= MAX_EDITOR_TIMINGS {
         timings.timings.pop_front();
     }
     timings.timings.push_back(timing);
+    timings.total_pushed += 1;
 }
 
 /// Records elapsed time on drop, including early-return paths.
@@ -896,6 +1107,8 @@ impl EditorTimingGuard {
                     input_edits: 0,
                     input_start: 0,
                     input_rows: 0,
+                    touched_rows: 0,
+                    walked_items: 0,
                     output_edits: 0,
                     output_start: 0,
                     output_rows: 0,
@@ -903,6 +1116,10 @@ impl EditorTimingGuard {
                     new_rows: 0,
                     pending_batches: 0,
                     flags: 0,
+                    transforms: 0,
+                    affected_start: 0,
+                    affected_end: 0,
+                    affected_offsets: 0,
                 },
                 generation,
             )
@@ -918,6 +1135,18 @@ impl EditorTimingGuard {
             timing.input_edits = edits as u64;
             timing.input_start = start;
             timing.input_rows = rows;
+        }
+    }
+
+    pub fn touched_rows(&mut self, rows: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.touched_rows = rows;
+        }
+    }
+
+    pub fn walked_items(&mut self, items: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.walked_items = timing.walked_items.saturating_add(items);
         }
     }
 
@@ -943,6 +1172,23 @@ impl EditorTimingGuard {
             timing.tid = tid;
         }
     }
+
+    /// What the stage worked on and where. `affected` is a span in the map's
+    /// own offsets and `offsets` is how many distinct points inside it were
+    /// touched, which is the number a splice's cost is actually in.
+    pub fn spliced(
+        &mut self,
+        transforms: u64,
+        affected: std::ops::Range<u64>,
+        affected_offsets: u64,
+    ) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.transforms = transforms;
+            timing.affected_start = affected.start;
+            timing.affected_end = affected.end;
+            timing.affected_offsets = affected_offsets;
+        }
+    }
 }
 
 fn editor_profile_tid() -> u64 {
@@ -959,6 +1205,21 @@ fn editor_profile_tid() -> u64 {
     }
 }
 
+impl EditorTimingGuard {
+    /// Records the span with a duration the caller measured rather than the
+    /// guard's own lifetime.
+    ///
+    /// For a stage whose work is interleaved with other work inside one
+    /// call - chunk building between shaping, say - where the guard's
+    /// lifetime would charge it for both.
+    pub fn finish_with_elapsed(mut self, elapsed: Duration) {
+        if let Some((mut timing, generation)) = self.0.take() {
+            timing.end = timing.start + elapsed;
+            record_editor_timing(timing, generation);
+        }
+    }
+}
+
 impl Drop for EditorTimingGuard {
     fn drop(&mut self) {
         if let Some((mut timing, generation)) = self.0.take() {
@@ -968,30 +1229,142 @@ impl Drop for EditorTimingGuard {
     }
 }
 
+/// Who was on the main thread, under a name.
+///
+/// The frame ring accounts for `Window::draw` as three numbers — prepaint,
+/// paint, present — and nothing else, so neither the work between frames nor
+/// the parts of a long prepaint has anywhere to be seen. Both are why a frame
+/// is late and neither is visible in a frame number, so a record names its
+/// owner rather than leaving it to be guessed from a stack.
+///
+/// Most records are of work outside a frame, which is where this started and
+/// what the named kinds below describe. A caller may also name a span inside
+/// one — the passes of a prepaint, say — under [`Self::Other`]; such a span is
+/// a share of a frame's own time and a reader that adds it to the
+/// between-frame total counts the same milliseconds twice.
+#[derive(Debug, Copy, Clone)]
+#[expect(missing_docs)]
+pub enum MainThreadWorkKind {
+    /// Reconciling a model event into the UI.
+    ModelEvent,
+    /// Rebuilding or patching the desk's map.
+    DeskSync,
+    /// Work a background task handed back to the main thread.
+    TaskCompletion,
+    /// Anything else the caller chose to name, under that name.
+    ///
+    /// The named kinds above are the ones gpui knows the shape of. An
+    /// application whose between-frame work has parts — a sync made of
+    /// several passes, say — can record each part under its own label
+    /// and keep the whole beside it, and a reader gets the breakdown
+    /// without gpui having to grow a variant per application. The label
+    /// is `'static` so a record stays `Copy` and the ring keeps costing
+    /// a fixed number of bytes per entry.
+    Other(&'static str),
+}
+
+/// One span of main-thread work outside a frame.
+#[derive(Debug, Copy, Clone)]
+pub struct MainThreadWork {
+    /// What was running.
+    pub owner: MainThreadWorkKind,
+    /// When it started.
+    pub start: Instant,
+    /// When it finished.
+    pub end: Instant,
+    /// How much it did, in whatever the owner counts — events reconciled,
+    /// rows patched. Divides the duration the way a frame's scale does.
+    pub work_units: u64,
+}
+
+// Keep the same bound as the frame ring: this is on in normal operation.
+const MAX_MAIN_THREAD_WORK: usize = (1024 * 1024) / core::mem::size_of::<MainThreadWork>();
+
+struct MainThreadWorkLog {
+    work: VecDeque<MainThreadWork>,
+    total_pushed: u64,
+}
+
+static MAIN_THREAD_WORK: spin::Mutex<MainThreadWorkLog> = spin::Mutex::new(MainThreadWorkLog {
+    work: VecDeque::new(),
+    total_pushed: 0,
+});
+
+/// Records a named span of main-thread work.
+///
+/// Usually work outside a frame; a caller that names a span inside one owns
+/// saying so in the label, since nothing here can tell the two apart.
+///
+/// No-op unless frame tracing is enabled via [`set_frame_trace_enabled`].
+/// The ring is shared and bounded, so a caller that records per frame rather
+/// than per event is the one that decides how far back the log reaches.
+pub fn record_main_thread_work(work: MainThreadWork) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut log = MAIN_THREAD_WORK.lock();
+    if log.work.len() >= MAX_MAIN_THREAD_WORK {
+        log.work.pop_front();
+    }
+    log.work.push_back(work);
+    log.total_pushed += 1;
+}
+
+/// The buffered outside-frame work, with how many records have ever been
+/// pushed. The second number is the point: the ring drops its oldest, so a
+/// reader that does not know the total cannot tell a quiet period from a
+/// dropped one.
+pub fn snapshot_main_thread_work() -> (Vec<MainThreadWork>, u64) {
+    let log = MAIN_THREAD_WORK.lock();
+    (log.work.iter().copied().collect(), log.total_pushed)
+}
+
+/// How many editor timings have ever been pushed, against however many the
+/// ring still holds. A stage total read without this is a total over an
+/// unknown window.
+pub fn editor_timings_pushed() -> u64 {
+    EDITOR_TIMINGS.lock().total_pushed
+}
+
+/// The same for frames.
+pub fn frame_timings_pushed() -> u64 {
+    FRAME_TIMINGS.lock().total_pushed
+}
+
 #[expect(missing_docs)]
 pub struct EditorTimingCollector {
-    spare: VecDeque<EditorTiming>,
+    cursor: u64,
 }
 
 #[expect(missing_docs)]
 impl EditorTimingCollector {
     pub fn new() -> Self {
         Self {
-            spare: VecDeque::with_capacity(MAX_EDITOR_TIMINGS),
+            cursor: EDITOR_TIMINGS.lock().total_pushed,
         }
     }
 
     pub fn collect_unseen(&mut self) -> Vec<EditorTiming> {
-        let mut batch = std::mem::take(&mut self.spare);
-        {
-            let mut timings = EDITOR_TIMINGS.lock();
-            std::mem::swap(&mut timings.timings, &mut batch);
-        }
-        let unseen = batch.iter().copied().collect();
-        batch.clear();
-        self.spare = batch;
+        let timings = EDITOR_TIMINGS.lock();
+        let buffer_len = timings.timings.len() as u64;
+        let buffer_start = timings.total_pushed.saturating_sub(buffer_len);
+        let skip = self.cursor.saturating_sub(buffer_start) as usize;
+        let unseen = timings
+            .timings
+            .iter()
+            .skip(skip.min(timings.timings.len()))
+            .copied()
+            .collect();
+        self.cursor = timings.total_pushed;
         unseen
     }
+}
+
+/// Returns a non-destructive copy of the current bounded editor timing ring.
+pub fn snapshot_editor_timings() -> Vec<EditorTiming> {
+    EDITOR_TIMINGS.lock().timings.iter().copied().collect()
 }
 
 impl Default for FrameTimingCollector {
@@ -1024,5 +1397,195 @@ impl FrameTimingCollector {
             .collect();
         self.cursor = frames.total_pushed;
         unseen
+    }
+}
+
+#[cfg(test)]
+mod timing_ring_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct WalkItem;
+
+    #[derive(Clone, Default)]
+    struct WalkSummary(usize);
+
+    #[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
+    struct WalkCount(usize);
+
+    impl sum_tree::Summary for WalkSummary {
+        type Context<'a> = ();
+
+        fn zero(_: ()) -> Self {
+            Self(0)
+        }
+
+        fn add_summary(&mut self, other: &Self, _: ()) {
+            self.0 += other.0;
+        }
+    }
+
+    impl sum_tree::Item for WalkItem {
+        type Summary = WalkSummary;
+
+        fn summary(&self, _: ()) -> Self::Summary {
+            WalkSummary(1)
+        }
+    }
+
+    impl sum_tree::Dimension<'_, WalkSummary> for WalkCount {
+        fn zero(_: ()) -> Self {
+            Self(0)
+        }
+
+        fn add_summary(&mut self, summary: &WalkSummary, _: ()) {
+            self.0 += summary.0;
+        }
+    }
+
+    /// The profiler's state is one per process: the trace flags, the
+    /// editor timing ring and the frame work accumulator are all statics.
+    /// A test that touches any of them cannot share the process with
+    /// another that does, so every test here takes this first. Two did
+    /// and four did not, which is why `--test-threads=1` passed all six
+    /// and the default threads either failed two or hung.
+    ///
+    /// A panicking test poisons the lock; the rest take it anyway rather
+    /// than fail on the poison, since the failure to report is the first
+    /// test's and not theirs.
+    fn exclusive_profiler_state() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn editor_timing_snapshot_is_non_destructive_and_bounded() {
+        let _state = exclusive_profiler_state();
+        set_editor_trace_enabled(false);
+        set_editor_trace_enabled(true);
+        for _ in 0..MAX_EDITOR_TIMINGS + 17 {
+            drop(EditorTimingGuard::new(EditorTimingKind::BufferEdit));
+        }
+        let first = snapshot_editor_timings();
+        let second = snapshot_editor_timings();
+        assert_eq!(first.len(), MAX_EDITOR_TIMINGS);
+        assert_eq!(second.len(), first.len());
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn editor_collector_survives_trace_toggle() {
+        let _state = exclusive_profiler_state();
+        set_editor_trace_enabled(false);
+        let mut collector = EditorTimingCollector::new();
+        set_editor_trace_enabled(true);
+        drop(EditorTimingGuard::new(EditorTimingKind::BufferEdit));
+        assert_eq!(collector.collect_unseen().len(), 1);
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_frame_s_work_is_the_sum_of_what_its_elements_reported() {
+        let _state = exclusive_profiler_state();
+        set_frame_trace_enabled(true);
+        let _ = take_frame_work();
+
+        record_frame_work(FrameWorkScale {
+            visible_rows: 40,
+            total_rows: 1_000,
+            inlays: 3,
+            ..Default::default()
+        });
+        // A second element in the same frame: a window can draw more than
+        // one editor, and what the frame drew is all of them.
+        record_frame_work(FrameWorkScale {
+            visible_rows: 2,
+            total_rows: 5,
+            cursors: 1,
+            ..Default::default()
+        });
+
+        let taken = take_frame_work();
+        assert_eq!(taken.visible_rows, 42);
+        assert_eq!(taken.total_rows, 1_005);
+        assert_eq!(taken.inlays, 3);
+        assert_eq!(taken.cursors, 1);
+        // Taking resets: the next frame starts from nothing, or every frame
+        // would report the whole session's work.
+        assert_eq!(take_frame_work(), FrameWorkScale::default());
+
+        set_frame_trace_enabled(false);
+    }
+
+    #[test]
+    fn work_outside_a_frame_is_recorded_with_its_owner_and_counted() {
+        let _state = exclusive_profiler_state();
+        set_frame_trace_enabled(true);
+        let before = snapshot_main_thread_work().1;
+
+        let start = Instant::now();
+        record_main_thread_work(MainThreadWork {
+            owner: MainThreadWorkKind::ModelEvent,
+            start,
+            end: start,
+            work_units: 7,
+        });
+
+        let (work, total) = snapshot_main_thread_work();
+        assert_eq!(total, before + 1);
+        let last = work.last().expect("the record just pushed");
+        assert_eq!(last.work_units, 7);
+        assert!(matches!(last.owner, MainThreadWorkKind::ModelEvent));
+
+        set_frame_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_stage_can_say_what_it_worked_on() {
+        let _state = exclusive_profiler_state();
+        set_editor_trace_enabled(true);
+        let mut collector = EditorTimingCollector::new();
+        {
+            let mut guard = EditorTimingGuard::new(EditorTimingKind::SpliceInlays);
+            guard.spliced(4_000, 120..980, 16);
+            guard.touched_rows(1);
+            guard.walked_items(7);
+        }
+        let timings = collector.collect_unseen();
+        let timing = timings.last().expect("the stage just recorded");
+        assert_eq!(timing.transforms, 4_000);
+        assert_eq!(timing.affected_start, 120);
+        assert_eq!(timing.affected_end, 980);
+        // The offsets, not the span: a splice costs the points it touches.
+        assert_eq!(timing.affected_offsets, 16);
+        assert_eq!(timing.touched_rows, 1);
+        assert_eq!(timing.walked_items, 7);
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn a_small_edit_in_a_large_tree_reports_a_small_walk() {
+        let _state = exclusive_profiler_state();
+        use sum_tree::{Bias, SumTree};
+
+        set_editor_trace_enabled(true);
+        let mut collector = EditorTimingCollector::new();
+        let tree = SumTree::from_iter((0..2_000).map(|_| WalkItem), ());
+        let mut cursor = tree.cursor::<WalkCount>(());
+        let _prefix = cursor.slice(&WalkCount(1_000), Bias::Right);
+        cursor.next();
+
+        let mut guard = EditorTimingGuard::new(EditorTimingKind::FoldMapSync);
+        guard.touched_rows(1);
+        guard.walked_items(cursor.walked_items());
+        drop(guard);
+
+        let timing = collector.collect_unseen().pop().unwrap();
+        assert_eq!(timing.touched_rows, 1);
+        assert!(timing.walked_items > 0);
+        assert!(timing.walked_items < 64);
+        set_editor_trace_enabled(false);
     }
 }

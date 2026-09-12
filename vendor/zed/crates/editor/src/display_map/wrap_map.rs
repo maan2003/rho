@@ -1,7 +1,7 @@
 use super::{
     Highlights,
     dimensions::RowDelta,
-    fold_map::{Chunk, FoldRows},
+    fold_map::{Chunk, ChunkRendererId, FoldRows},
     row_scale_map::RowScaleSnapshot,
     tab_map::{self, TabEdit, TabPoint, TabSnapshot},
 };
@@ -10,7 +10,15 @@ use futures_lite::future::yield_now;
 use gpui::{App, AppContext as _, Context, Entity, Font, LineWrapper, Pixels, Task};
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
-use std::{cmp, collections::VecDeque, mem, ops::Range, sync::LazyLock, time::Duration};
+use std::{
+    cmp,
+    collections::VecDeque,
+    mem,
+    ops::Range,
+    sync::LazyLock,
+    sync::atomic::{self, AtomicBool},
+    time::{Duration, Instant},
+};
 use sum_tree::{Bias, Cursor, Dimensions, SumTree};
 use text::Patch;
 
@@ -28,6 +36,83 @@ pub type WrapPatch = text::Patch<WrapRow>;
 pub struct WrapRow(pub u32);
 
 const WRAP_YIELD_ROW_INTERVAL: usize = 100;
+
+/// How long one batch of background rewrapping may run before it yields.
+///
+/// A batch used to be a count of rows, and a count of rows is not a
+/// quantity the user can feel. A row that wraps into twenty lines costs
+/// twenty times one that fits, so a hundred rows was anything between well
+/// under a frame and several of them; measured, it was p99 18.8 ms a batch
+/// at 999 rows, which is the frame the reader feels on `gg` and on every
+/// resize.
+///
+/// The clock is read once a row, and a row cannot be interrupted part way
+/// through, so what this bounds is the budget plus the cost of the row that
+/// crosses it. The budget is set well under the 4 ms frame to leave room
+/// for that row and for the frame the batch shares.
+const WRAP_BATCH_BUDGET: Duration = Duration::from_millis(2);
+
+/// How long a width change may hold the frame waiting for its own rewrap
+/// before it gives up and lets the background finish.
+///
+/// A width change is laid out inside the frame that changed the width, so
+/// whatever this is, the frame is at least that long. It was 5 ms against a
+/// 4 ms frame bound: a rewrap that runs to the timeout is a frame over the
+/// bound by construction, and the timeout is the case this branch exists
+/// for. The wait buys one thing - the new width is on screen this frame
+/// rather than the next - and it is not worth a frame the reader can see.
+///
+/// Waiting is still the common case and still the right one: on the walk's
+/// transcript the whole rewrap is about half a millisecond, well inside
+/// this. What changes is the document too big to finish, where the frame
+/// now shows the old width for one frame instead of running long.
+const WRAP_FOREGROUND_BUDGET: Duration = Duration::from_millis(3);
+
+/// Whether a batch is bounded by the clock, or by the row interval alone.
+///
+/// A harness that hashes a scene has to own every bound on the work behind
+/// it: with the clock in, how many rows a batch finishes depends on how
+/// busy the machine is, so the same seed composes differently on a loaded
+/// box and the scene it hashes is not the scene it hashed before. Zed's
+/// tests do not hash a scene across runs, so the clock costs them nothing.
+static WRAP_BATCH_CLOCK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Bounds a wrap batch by the row interval alone, for a harness whose
+/// scenes must be the same on every run. Off the harness this stays on:
+/// a row that wraps into twenty lines costs twenty times one that fits,
+/// and only the clock knows that.
+pub fn set_wrap_batch_clock_enabled(enabled: bool) {
+    WRAP_BATCH_CLOCK_ENABLED.store(enabled, atomic::Ordering::Relaxed);
+}
+
+/// Whether a sync validates that every row of the snapshot it hands out
+/// lies within its document.
+///
+/// The check walks every display row, so it costs the document on every
+/// sync, and under `wrap-test-support` that cost is in every number a test
+/// build produces: one flushed replacement at five thousand items measured
+/// 5.64s with it and 33.4ms without, and its shape went from 74x the
+/// hundred-item cost to 1.4x. A bench turns it off before it measures; a
+/// correctness suite leaves it on, which is where it earns its keep.
+#[cfg(feature = "wrap-test-support")]
+static WRAP_ROWS_CHECK_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Stops a sync validating its rows, for a bench measuring what a sync
+/// costs. On by default wherever the feature is on.
+#[cfg(feature = "wrap-test-support")]
+pub fn set_wrap_rows_check_enabled(enabled: bool) {
+    WRAP_ROWS_CHECK_ENABLED.store(enabled, atomic::Ordering::Relaxed);
+}
+
+/// When the current batch started, or `None` where there is no clock to ask.
+///
+/// `Instant::now` has no answer on wasm, where this runs on the browser's
+/// main thread; there the row interval stands in for the budget, which is
+/// what the whole map did before.
+fn wrap_batch_started() -> Option<Instant> {
+    (cfg!(not(target_family = "wasm")) && WRAP_BATCH_CLOCK_ENABLED.load(atomic::Ordering::Relaxed))
+        .then(Instant::now)
+}
 
 impl_for_row_types! {
     WrapRow => RowDelta
@@ -49,6 +134,38 @@ pub struct WrapMap {
     sync_traces: Vec<WrapSyncTrace>,
     #[cfg(feature = "wrap-test-support")]
     wrap_width_changes: Vec<(Option<Pixels>, Option<Pixels>)>,
+    /// Every snapshot handed out by a `sync` that did not describe one
+    /// document, in the words of [`WrapSnapshot::rows_within_their_document`].
+    #[cfg(feature = "wrap-test-support")]
+    sync_violations: Vec<String>,
+
+    /// One record per `sync` answered. See [`WrapSyncRecord`].
+    #[cfg(feature = "wrap-test-support")]
+    #[cfg(feature = "wrap-test-support")]
+    sync_rows_and_edit_ends: Vec<WrapSyncRecord>,
+}
+
+/// What one `sync` handed its caller: the snapshot's row count and the
+/// shape of the edits beside it.
+///
+/// The block map above resolves the rows those edits name against that
+/// snapshot, so the two have to describe one document — every row the
+/// snapshot gains or loses between two syncs is named by the edits handed
+/// over with it, no edit's old side reaches past the previous snapshot, and
+/// no edit's new side reaches past its own. When that fails, a row range is
+/// asked of a document that does not have it and a column of one row
+/// resolves on another, which reaches the rope four maps down as a point
+/// beyond its row. `WrapSnapshot::check_invariants` asserts the snapshot's
+/// own consistency and says nothing about the edits, and it is `cfg(test)`
+/// inside this crate, which is not a workspace member and cannot run its own
+/// tests here.
+#[cfg(feature = "wrap-test-support")]
+#[derive(Clone, Copy, Debug)]
+pub struct WrapSyncRecord {
+    pub rows: u32,
+    pub rows_named: i64,
+    pub old_end: u32,
+    pub new_end: u32,
 }
 
 #[cfg(feature = "wrap-test-support")]
@@ -146,6 +263,8 @@ impl WrapMap {
                 wrap_width: None,
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
+                #[cfg(feature = "wrap-test-support")]
+                sync_violations: Vec::new(),
                 edits_since_sync: Default::default(),
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
@@ -154,6 +273,9 @@ impl WrapMap {
                 sync_traces: Vec::new(),
                 #[cfg(feature = "wrap-test-support")]
                 wrap_width_changes: Vec::new(),
+                #[cfg(feature = "wrap-test-support")]
+                #[cfg(feature = "wrap-test-support")]
+                sync_rows_and_edit_ends: Vec::new(),
             };
             this.set_wrap_width(wrap_width, cx);
             mem::take(&mut this.edits_since_sync);
@@ -163,8 +285,7 @@ impl WrapMap {
         (handle, snapshot)
     }
 
-    #[cfg(test)]
-    pub fn is_rewrapping(&self) -> bool {
+    pub(crate) fn is_rewrapping(&self) -> bool {
         self.background_task.is_some()
     }
 
@@ -178,6 +299,18 @@ impl WrapMap {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::WrapMapSync);
         let old_rows = if profile.is_enabled() {
+            profile.touched_rows(
+                edits
+                    .iter()
+                    .map(|edit| {
+                        u64::from(
+                            (edit.old.end.row() - edit.old.start.row())
+                                .max(edit.new.end.row() - edit.new.start.row())
+                                + 1,
+                        )
+                    })
+                    .sum(),
+            );
             let input_start = edits
                 .iter()
                 .map(|edit| edit.new.start.row())
@@ -209,7 +342,7 @@ impl WrapMap {
         if self.wrap_width.is_some() {
             self.pending_edits
                 .push_back((tab_snapshot, self.row_scales.clone(), edits));
-            self.flush_edits(cx);
+            profile.walked_items(self.flush_edits(cx));
         } else {
             self.edits_since_sync = self
                 .edits_since_sync
@@ -218,6 +351,38 @@ impl WrapMap {
         }
 
         let output_edits = mem::take(&mut self.edits_since_sync);
+        #[cfg(feature = "wrap-test-support")]
+        {
+            self.sync_rows_and_edit_ends.push(WrapSyncRecord {
+                rows: self.snapshot.max_point().row().0 + 1,
+                rows_named: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| {
+                        i64::from(edit.new.end.0)
+                            - i64::from(edit.new.start.0)
+                            - (i64::from(edit.old.end.0) - i64::from(edit.old.start.0))
+                    })
+                    .sum(),
+                old_end: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| edit.old.end.0)
+                    .max()
+                    .unwrap_or(0),
+                new_end: output_edits
+                    .edits()
+                    .iter()
+                    .map(|edit| edit.new.end.0)
+                    .max()
+                    .unwrap_or(0),
+            });
+            if WRAP_ROWS_CHECK_ENABLED.load(atomic::Ordering::Relaxed)
+                && let Err(violation) = self.snapshot.rows_within_their_document()
+            {
+                self.sync_violations.push(violation);
+            }
+        }
         if profile.is_enabled() {
             let output_start = output_edits
                 .edits()
@@ -265,6 +430,32 @@ impl WrapMap {
     #[cfg(feature = "wrap-test-support")]
     pub fn take_wrap_width_changes(&mut self) -> Vec<(Option<Pixels>, Option<Pixels>)> {
         mem::take(&mut self.wrap_width_changes)
+    }
+
+    /// Every `sync` this map has answered: the snapshot's row count, the
+    /// rows the edits beside it added or removed, and how far those edits
+    /// reach on each side.
+    ///
+    /// `sync` hands its caller a snapshot and, beside it, the edits since
+    /// the caller's last one; the block map above resolves the rows those
+    /// edits name against that snapshot. A row the edits name past the end
+    /// of the snapshot is a row range asked of a document that does not have
+    /// it, which resolves a column of one row on another and reaches the
+    /// rope as a point beyond its row. `check_invariants` asserts the
+    /// snapshot's own consistency, but only under `cfg(test)` inside this
+    /// crate, which is not a workspace member and cannot run its tests here,
+    /// and it says nothing about the edits.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn sync_records(&self) -> &[WrapSyncRecord] {
+        &self.sync_rows_and_edit_ends
+    }
+
+    /// Every snapshot a `sync` handed out that offered a row its own tab
+    /// snapshot does not have. Empty is the contract; anything here is the
+    /// element being told to lay out rows the document cannot supply.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_sync_violations(&mut self) -> Vec<String> {
+        mem::take(&mut self.sync_violations)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -331,7 +522,7 @@ impl WrapMap {
             }];
 
             if cfg!(not(target_family = "wasm")) && total_rows < WRAP_YIELD_ROW_INTERVAL {
-                let edits = gpui::block_on(new_snapshot.update(
+                let (edits, _) = gpui::block_on(new_snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
@@ -342,7 +533,7 @@ impl WrapMap {
                 self.edits_since_sync = self.edits_since_sync.compose(&edits);
             } else {
                 let update = async move {
-                    let edits = new_snapshot
+                    let (edits, _) = new_snapshot
                         .update(
                             tab_snapshot,
                             &tab_edits,
@@ -370,7 +561,7 @@ impl WrapMap {
                     let task = cx.background_spawn(update);
                     match cx
                         .foreground_executor()
-                        .block_with_timeout(Duration::from_millis(5), task)
+                        .block_with_timeout(WRAP_FOREGROUND_BUDGET, task)
                     {
                         Ok((snapshot, edits)) => {
                             self.snapshot = snapshot;
@@ -415,15 +606,26 @@ impl WrapMap {
                     .compose(mem::take(&mut this.interpolated_edits).invert())
                     .compose(&edits);
                 this.background_task = None;
-                this.flush_edits(cx);
+                let _ = this.flush_edits(cx);
                 cx.notify();
             })
             .ok();
         }));
     }
 
+    /// Applies the queued tab edits, or queues them further.
+    ///
+    /// While a background wrap is in flight this returns without doing any
+    /// work, so every sync behind it only adds to `pending_edits` and the
+    /// first flush after it pays for all of them in one span. That is a
+    /// coalescing cliff: measured runs carry 40 batches behind an open's
+    /// rewrap and 167 behind a jump to the top, and the span that drains
+    /// them is O(all the rows they name) with a 1 ms foreground block in
+    /// front of it. It has not cost a reader a frame yet - the drains
+    /// measured were 33 rows - so it is named here and left alone.
     #[ztracing::instrument(skip_all)]
-    fn flush_edits(&mut self, cx: &mut Context<Self>) {
+    fn flush_edits(&mut self, cx: &mut Context<Self>) -> u64 {
+        let mut walked_items = 0_u64;
         if !self.snapshot.interpolated {
             let mut to_remove_len = 0;
             for (tab_snapshot, _, _) in &self.pending_edits {
@@ -437,7 +639,7 @@ impl WrapMap {
         }
 
         if self.pending_edits.is_empty() {
-            return;
+            return 0;
         }
 
         if let Some(wrap_width) = self.wrap_width
@@ -456,13 +658,14 @@ impl WrapMap {
                     .into_iter()
                     .next()
                     .expect("pending_edits has one item");
-                let wrap_edits = gpui::block_on(snapshot.update(
+                let (wrap_edits, update_work) = gpui::block_on(snapshot.update(
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
                     &row_scales,
                     &mut line_wrapper,
                 ));
+                walked_items = walked_items.saturating_add(update_work);
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
             } else {
@@ -476,6 +679,19 @@ impl WrapMap {
                     // OS thread.
                     profile.thread(0);
                     let old_rows = if profile.is_enabled() {
+                        profile.touched_rows(
+                            pending_edits
+                                .iter()
+                                .flat_map(|(_, _, edits)| edits)
+                                .map(|edit| {
+                                    u64::from(
+                                        (edit.old.end.row() - edit.old.start.row())
+                                            .max(edit.new.end.row() - edit.new.start.row())
+                                            + 1,
+                                    )
+                                })
+                                .sum(),
+                        );
                         let input_edits = pending_edits
                             .iter()
                             .map(|(_, _, edits)| edits.len())
@@ -506,8 +722,9 @@ impl WrapMap {
                         0
                     };
                     let mut edits = Patch::default();
+                    let mut walked_items = 0_u64;
                     for (tab_snapshot, row_scales, tab_edits) in pending_edits {
-                        let wrap_edits = snapshot
+                        let (wrap_edits, walked) = snapshot
                             .update(
                                 tab_snapshot,
                                 &tab_edits,
@@ -516,8 +733,10 @@ impl WrapMap {
                                 &mut line_wrapper,
                             )
                             .await;
+                        walked_items = walked_items.saturating_add(walked);
                         edits = edits.compose(&wrap_edits);
                     }
+                    profile.walked_items(walked_items);
                     if profile.is_enabled() {
                         let output_start = edits
                             .edits()
@@ -592,7 +811,20 @@ impl WrapMap {
         if !was_interpolated {
             self.pending_edits.drain(..to_remove_len);
         }
+        walked_items
     }
+}
+
+fn accumulate_walked_items(total: &mut u64, additional: u64) {
+    *total = total.saturating_add(additional);
+}
+
+fn align_edit_start(old_start: u32, new_start: u32, row_delta: i64) -> (u32, u32) {
+    let old_start = i64::from(old_start).min(i64::from(new_start) - row_delta);
+    (
+        old_start.try_into().unwrap(),
+        (old_start + row_delta).try_into().unwrap(),
+    )
 }
 
 /// Counts the rows that wrapping will actually recompute after neighboring
@@ -707,7 +939,7 @@ impl WrapSnapshot {
             },
         );
         self.check_invariants();
-        old_snapshot.compute_edits(tab_edits, self)
+        old_snapshot.compute_edits(tab_edits, self).0
     }
 
     #[ztracing::instrument(skip_all)]
@@ -718,7 +950,7 @@ impl WrapSnapshot {
         wrap_width: Pixels,
         row_scales: &RowScaleSnapshot,
         line_wrapper: &mut LineWrapper,
-    ) -> WrapPatch {
+    ) -> (WrapPatch, u64) {
         #[derive(Debug)]
         struct RowEdit {
             old_rows: Range<u32>,
@@ -749,6 +981,7 @@ impl WrapSnapshot {
         }
 
         let mut new_transforms;
+        let mut walked_items = 0_u64;
         if row_edits.is_empty() {
             new_transforms = self.transforms.clone();
         } else {
@@ -760,6 +993,7 @@ impl WrapSnapshot {
                 Bias::Right,
             );
 
+            let mut batch_started = wrap_batch_started();
             while let Some(edit) = row_edits.next() {
                 if edit.new_rows.start > new_transforms.summary().input.lines.row {
                     let summary = new_tab_snapshot.text_summary_for_range(
@@ -772,6 +1006,7 @@ impl WrapSnapshot {
                 let mut line = String::new();
                 let mut line_fragments = Vec::new();
                 let mut remaining = None;
+                let mut pending_renderer: Option<(ChunkRendererId, Pixels, usize, bool)> = None;
                 let mut chunks = new_tab_snapshot.chunks(
                     TabPoint::new(edit.new_rows.start, 0)..new_tab_snapshot.max_point(),
                     LanguageAwareStyling {
@@ -782,8 +1017,17 @@ impl WrapSnapshot {
                 );
                 let mut edit_transforms = Vec::<Transform>::new();
                 for (i, _) in (edit.new_rows.start..edit.new_rows.end).enumerate() {
+                    macro_rules! flush_renderer {
+                        () => {
+                            if let Some((_, width, len, _)) = pending_renderer.take() {
+                                line_fragments.push(gpui::LineFragment::element(width, len));
+                            }
+                        };
+                    }
                     while let Some(chunk) = remaining.take().or_else(|| chunks.next()) {
+                        accumulate_walked_items(&mut walked_items, 1);
                         if let Some(ix) = chunk.text.find('\n') {
+                            flush_renderer!();
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
                             line_fragments.push(gpui::LineFragment::text(prefix));
                             line.push_str(prefix);
@@ -793,17 +1037,38 @@ impl WrapSnapshot {
                             });
                             break;
                         } else {
-                            if let Some(width) =
-                                chunk.renderer.as_ref().and_then(|r| r.measured_width)
+                            if let Some(renderer) = chunk.renderer.as_ref()
+                                && (renderer.constrain_width || renderer.measured_width.is_some())
                             {
-                                line_fragments
-                                    .push(gpui::LineFragment::element(width, chunk.text.len()));
+                                let measured = renderer.measured_width.is_some();
+                                let chunk_width = renderer
+                                    .measured_width
+                                    .unwrap_or_else(|| line_wrapper.width_for_text(chunk.text));
+                                if let Some((id, width, len, pending_is_measured)) =
+                                    pending_renderer.as_mut()
+                                    && *id == renderer.id
+                                {
+                                    *len += chunk.text.len();
+                                    if !*pending_is_measured {
+                                        *width += chunk_width;
+                                    }
+                                } else {
+                                    flush_renderer!();
+                                    pending_renderer = Some((
+                                        renderer.id,
+                                        chunk_width,
+                                        chunk.text.len(),
+                                        measured,
+                                    ));
+                                }
                             } else {
+                                flush_renderer!();
                                 line_fragments.push(gpui::LineFragment::text(chunk.text));
                             }
                             line.push_str(chunk.text);
                         }
                     }
+                    flush_renderer!();
 
                     if line.is_empty() {
                         break;
@@ -834,8 +1099,13 @@ impl WrapSnapshot {
 
                     line.clear();
                     line_fragments.clear();
-                    if i % WRAP_YIELD_ROW_INTERVAL == WRAP_YIELD_ROW_INTERVAL - 1 {
+                    let batch_is_spent = match batch_started {
+                        Some(started) => started.elapsed() >= WRAP_BATCH_BUDGET,
+                        None => i % WRAP_YIELD_ROW_INTERVAL == WRAP_YIELD_ROW_INTERVAL - 1,
+                    };
+                    if batch_is_spent {
                         yield_now().await;
+                        batch_started = wrap_batch_started();
                     }
                 }
 
@@ -873,6 +1143,7 @@ impl WrapSnapshot {
                     new_transforms.append(old_cursor.suffix(), ());
                 }
             }
+            accumulate_walked_items(&mut walked_items, old_cursor.walked_items());
         }
 
         let old_snapshot = mem::replace(
@@ -884,14 +1155,20 @@ impl WrapSnapshot {
             },
         );
         self.check_invariants();
-        old_snapshot.compute_edits(tab_edits, self)
+        let (edits, comparison_work) = old_snapshot.compute_edits(tab_edits, self);
+        (edits, walked_items.saturating_add(comparison_work))
     }
 
     #[ztracing::instrument(skip_all)]
-    fn compute_edits(&self, tab_edits: &[TabEdit], new_snapshot: &WrapSnapshot) -> WrapPatch {
+    fn compute_edits(
+        &self,
+        tab_edits: &[TabEdit],
+        new_snapshot: &WrapSnapshot,
+    ) -> (WrapPatch, u64) {
         let mut wrap_edits = Vec::with_capacity(tab_edits.len());
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
         let mut new_cursor = new_snapshot.transforms.cursor::<TransformSummary>(());
+        let mut row_delta = 0_i64;
         for mut tab_edit in tab_edits.iter().cloned() {
             tab_edit.old.start.0.column = 0;
             tab_edit.old.end.0 += Point::new(1, 0);
@@ -905,14 +1182,28 @@ impl WrapSnapshot {
             old_cursor.seek_forward(&tab_edit.old.end, Bias::Right);
             let mut old_end = old_cursor.start().output.lines;
             old_end += tab_edit.old.end.0 - old_cursor.start().input.lines;
+            if tab_edit.old.end > self.tab_snapshot.max_point() {
+                old_end = Point::new(self.max_point().row().0 + 1, 0);
+            }
 
             new_cursor.seek(&tab_edit.new.start, Bias::Right);
             let mut new_start = new_cursor.start().output.lines;
             new_start += tab_edit.new.start.0 - new_cursor.start().input.lines;
 
+            let (old_start_row, new_start_row) =
+                align_edit_start(old_start.row, new_start.row, row_delta);
+            old_start = Point::new(old_start_row, 0);
+            new_start = Point::new(new_start_row, 0);
+
             new_cursor.seek_forward(&tab_edit.new.end, Bias::Right);
             let mut new_end = new_cursor.start().output.lines;
             new_end += tab_edit.new.end.0 - new_cursor.start().input.lines;
+            if tab_edit.new.end > new_snapshot.tab_snapshot.max_point() {
+                new_end = Point::new(new_snapshot.max_point().row().0 + 1, 0);
+            }
+
+            row_delta +=
+                i64::from(new_end.row - new_start.row) - i64::from(old_end.row - old_start.row);
 
             wrap_edits.push(WrapEdit {
                 old: WrapRow(old_start.row)..WrapRow(old_end.row),
@@ -920,8 +1211,11 @@ impl WrapSnapshot {
             });
         }
 
+        let walked_items = old_cursor
+            .walked_items()
+            .saturating_add(new_cursor.walked_items());
         wrap_edits = consolidate_wrap_edits(wrap_edits);
-        Patch::new(wrap_edits)
+        (Patch::new(wrap_edits), walked_items)
     }
 
     #[ztracing::instrument(skip_all)]
@@ -962,6 +1256,46 @@ impl WrapSnapshot {
     #[ztracing::instrument(skip_all)]
     pub fn max_point(&self) -> WrapPoint {
         WrapPoint(self.transforms.summary().output.lines)
+    }
+
+    /// Every display row this snapshot offers, checked against the tab
+    /// snapshot it is carrying: the row must start at a tab row that document
+    /// has, and at a column that row reaches.
+    ///
+    /// `line_len` resolves a display row's width as
+    /// `tab_line_len - start.1.column()`, on unsigned integers. A wrap
+    /// boundary kept across an edit that shortened its line sits at a column
+    /// the line no longer reaches, and that subtraction wraps to about four
+    /// billion wherever debug assertions are off, which is every build a
+    /// reader runs. The row then claims a width it does not have: the element
+    /// takes its row count from the snapshot and its text from a chunk
+    /// iterator that runs dry early, and indexes the layouts it never got.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn rows_within_their_document(&self) -> Result<(), String> {
+        let max_tab_row = self.tab_snapshot.max_point().row();
+        for row in 0..=self.max_point().row().0 {
+            let tab_point = self.to_tab_point(WrapPoint::new(WrapRow(row), 0));
+            if tab_point.row() > max_tab_row {
+                return Err(format!(
+                    "display row {row} of {} starts at tab row {} of a \
+                     document with {} rows",
+                    self.max_point().row().0 + 1,
+                    tab_point.row(),
+                    max_tab_row + 1,
+                ));
+            }
+            let line_len = self.tab_snapshot.line_len(tab_point.row());
+            if tab_point.column() > line_len {
+                return Err(format!(
+                    "display row {row} of {} starts at column {} of tab row \
+                     {}, which is {line_len} long",
+                    self.max_point().row().0 + 1,
+                    tab_point.column(),
+                    tab_point.row(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[ztracing::instrument(skip_all)]
@@ -1295,6 +1629,10 @@ pub struct WrapPointCursor<'transforms> {
 }
 
 impl WrapPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     /// Resets the cursor to the start so it can seek backward again.
     pub fn reset(&mut self) {
         self.cursor.reset();
@@ -1640,6 +1978,16 @@ mod tests {
     use theme::LoadThemes;
 
     #[test]
+    fn one_row_rewrap_accumulates_chunks_and_cursor_work() {
+        let mut walked_items = 0;
+        for _ in 0..4 {
+            accumulate_walked_items(&mut walked_items, 1);
+        }
+        accumulate_walked_items(&mut walked_items, 3);
+        assert_eq!(walked_items, 7);
+    }
+
+    #[test]
     fn multiple_edits_on_one_line_are_one_wrap_row() {
         let edits = [
             TabEdit {
@@ -1653,6 +2001,51 @@ mod tests {
         ];
 
         assert_eq!(affected_row_count(&edits), 1);
+    }
+
+    #[test]
+    fn moved_later_edit_replays_to_the_new_snapshot() {
+        let (first_old_start, first_new_start) = align_edit_start(0, 0, 0);
+        let first = WrapEdit {
+            old: WrapRow(first_old_start)..WrapRow(0),
+            new: WrapRow(first_new_start)..WrapRow(1),
+        };
+        let row_delta = i64::from(first.new_len().0) - i64::from(first.old_len().0);
+
+        // The second edit maps to row two on both sides, but the inserted row
+        // before it means its starts must differ by one. Widen its old start
+        // back to row one so the patch keeps its running delta.
+        let (second_old_start, second_new_start) = align_edit_start(2, 2, row_delta);
+        let second = WrapEdit {
+            old: WrapRow(second_old_start)..WrapRow(3),
+            new: WrapRow(second_new_start)..WrapRow(3),
+        };
+        let patch = Patch::new(vec![first, second]);
+
+        let mut replayed = Rope::from("a\nremove\nkeep\n");
+        let snapshot = Rope::from("insert\na\nkeep\n");
+        let mut running_delta = 0_i64;
+        for edit in &patch {
+            assert_eq!(
+                i64::from(edit.new.start.0),
+                i64::from(edit.old.start.0) + running_delta
+            );
+            let old_start = replayed.point_to_offset(Point::new(edit.new.start.0, 0));
+            let old_end = replayed.point_to_offset(Point::new(
+                edit.new.start.0 + (edit.old.end - edit.old.start).0,
+                0,
+            ));
+            let new_start = snapshot.point_to_offset(Point::new(edit.new.start.0, 0));
+            let new_end = snapshot.point_to_offset(Point::new(edit.new.end.0, 0));
+            replayed.replace(
+                old_start..old_end,
+                &snapshot
+                    .chunks_in_range(new_start..new_end)
+                    .collect::<String>(),
+            );
+            running_delta += i64::from(edit.new_len().0) - i64::from(edit.old_len().0);
+        }
+        assert_eq!(replayed.to_string(), snapshot.to_string());
     }
 
     #[gpui::test]
@@ -1999,12 +2392,10 @@ mod tests {
                 let start_row = rng.random_range(0..=end_row);
                 end_row += 1;
 
-                let mut expected_text = self.text_chunks(WrapRow(start_row)).collect::<String>();
-                if expected_text.ends_with('\n') {
-                    expected_text.push('\n');
-                }
-                let mut expected_text = expected_text
-                    .lines()
+                let mut expected_text = self
+                    .text_chunks(WrapRow(start_row))
+                    .collect::<String>()
+                    .split('\n')
                     .take((end_row - start_row) as usize)
                     .collect::<Vec<_>>()
                     .join("\n");

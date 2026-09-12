@@ -40,18 +40,18 @@ const OMITTED: &str = "[... older shell output omitted ...]\n";
 const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
 
-pub fn ensure_supported_workdirs(workdirs: &[rho_workset::WorkspaceInfo]) -> anyhow::Result<()> {
+pub fn ensure_supported_workdirs(workdirs: &[rho_workspaces::WorkspaceInfo]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !workdirs
             .iter()
-            .any(|workdir| matches!(workdir, rho_workset::WorkspaceInfo::Sandbox { .. })),
+            .any(|workdir| matches!(workdir, rho_workspaces::WorkspaceInfo::Sandbox { .. })),
         "sandboxed agents have no editor shells yet"
     );
     Ok(())
 }
 
 pub struct ShellSpawn {
-    pub view: Arc<rho_workset::Namespace>,
+    pub view: Arc<rho_workspaces::View>,
     /// Shell sidecar launched through the agent View.
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -1063,7 +1063,7 @@ impl Session {
             .env("JJ_PAGER", &spawn.pager_program)
             .env("COLUMNS", SHELL_COLS.to_string())
             .env("LINES", SHELL_ROWS.to_string());
-        spawn.view.prepare_command(&mut command, None)?;
+        spawn.view.prepare_command(&mut command, None).await?;
         if cfg!(test) {
             command.env("RHO_SHELL_TEST_CHILD", "1");
         }
@@ -1696,16 +1696,16 @@ mod tests {
 
     #[test]
     fn sandboxed_workdirs_are_refused() {
-        let sandbox = rho_workset::WorkspaceInfo::Sandbox {
-            workset: "test-workset".into(),
-            repo: "repo".into(),
-            name: "repo".into(),
+        let id =
+            rho_workspaces::WorkspaceId::from_counter(1, &rho_workspaces::WorkspaceIdDomain(42))
+                .unwrap();
+        let sandbox = rho_workspaces::WorkspaceInfo::Sandbox {
+            repo: camino::Utf8PathBuf::from("/repo"),
+            id,
         };
         assert!(ensure_supported_workdirs(&[sandbox]).is_err());
-        let checkout = rho_workset::WorkspaceInfo::Checkout {
-            workset: "test-workset".into(),
-            repo: "repo".into(),
-            name: "repo".into(),
+        let checkout = rho_workspaces::WorkspaceInfo::UserCheckout {
+            repo: camino::Utf8PathBuf::from("/repo"),
         };
         assert!(ensure_supported_workdirs(&[checkout]).is_ok());
     }
@@ -1978,21 +1978,6 @@ mod tests {
 
     #[tokio::test]
     async fn shell_end_to_end_over_registry() {
-        if !std::fs::read_to_string("/proc/self/uid_map")
-            .is_ok_and(|map| map.split_whitespace().nth(2) == Some("1"))
-        {
-            eprintln!("skipping: test process is not in an identity user namespace");
-            return;
-        }
-        let jj = std::env::var_os("RHO_JJ").unwrap_or_else(|| "jj".into());
-        if !std::process::Command::new(jj)
-            .args(["store", "--help"])
-            .output()
-            .is_ok_and(|output| output.status.success())
-        {
-            eprintln!("skipping: clone-store jj is unavailable");
-            return;
-        }
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -2003,68 +1988,23 @@ mod tests {
              trap 'printf fired >\"$HOME/brush-exit-hook\"' EXIT\n",
         )
         .unwrap();
-        let environment = rho_workset::UserEnvironment::new(vec![
+        let environment = rho_workspaces::UserEnvironment::new(vec![
             ("PATH".into(), std::env::var_os("PATH").unwrap()),
             ("HOME".into(), home.clone().into_os_string()),
             ("USER".into(), "rho-test".into()),
             ("LOGNAME".into(), "rho-test".into()),
             ("LANG".into(), "C.UTF-8".into()),
         ]);
-        let source = temp.path().join("source");
-        std::fs::create_dir(&source).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&source)
-                .status()
-                .unwrap()
-                .success()
+        let repo = Arc::new(
+            rho_workspaces::Repo::open_plain_with_environment(
+                temp.path(),
+                rho_workspaces::PathOverrides::default(),
+                environment,
+            )
+            .unwrap(),
         );
-        std::fs::write(source.join("README"), "test\n").unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=Rho Test",
-                    "-c",
-                    "user.email=rho@example.invalid",
-                    "add",
-                    "."
-                ])
-                .current_dir(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .args([
-                    "-c",
-                    "user.name=Rho Test",
-                    "-c",
-                    "user.email=rho@example.invalid",
-                    "commit",
-                    "-qm",
-                    "initial"
-                ])
-                .current_dir(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let worksets = rho_workset::Worksets::open(
-            temp.path().join("storage"),
-            rho_db::RhoDb::open(temp.path().join("rho.redb")),
-            environment,
-            rho_workset::PathOverrides::default(),
-        )
-        .unwrap();
-        let workset = worksets.create().await.unwrap();
-        workset
-            .clone("source", source.to_str().unwrap(), Some("source"), None)
-            .await
-            .unwrap();
-        let view = workset.enter(rho_workset::Mode::Exposed).await.unwrap();
+        let workspace = repo.user_checkout().await.unwrap();
+        let view = rho_workspaces::View::new(vec![workspace]).unwrap();
         let registry = Arc::new(ShellRegistry::default());
         let agent_id =
             AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter encodes");

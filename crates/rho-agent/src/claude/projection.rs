@@ -1,13 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Context as _;
+use rho_claude::protocol::{
+    AssistantContent, AssistantMessage, OutputContent, SystemCompactMetadata, TokenUsage,
+    UserOutputMessage,
+};
 use rho_core::{
-    ContentPart, ContextBlock, InferenceResponseItem, ProviderSpecificData, StreamingContextItem,
-    ToolCallId, ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs,
+    ProviderSpecificData, StreamingContextItem, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
+    ToolResult, ToolType, UnixMs,
 };
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::{TranscriptCall, TranscriptLine};
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct ClaudeProviderSpecificData;
@@ -132,306 +138,220 @@ impl ClaudeStreamItem {
     }
 }
 
-pub(super) fn transcript_messages_to_context(
-    messages: &[rho_claude::SessionMessage],
-) -> anyhow::Result<Vec<Arc<ContextBlock>>> {
-    messages
-        .iter()
-        .filter_map(transcript_message_to_context)
-        .collect()
+/// What the projection remembers from one line to the next.
+///
+/// `usage_told` is the id of the API message whose usage a row already
+/// carries: every block's event repeats the message's usage, and a
+/// reader counts a request once.
+///
+/// `calls_made` is when each open call was made, by id. Claude's log
+/// stamps lines, not tool runs, so a result's span is from the assistant
+/// line that made the call to the user line that answered it; without
+/// this a result carried no times and the transcript drew no duration.
+#[derive(Debug, Default)]
+pub(super) struct Projection {
+    usage_told: Option<String>,
+    calls_made: HashMap<String, UnixMs>,
 }
 
-pub(super) fn assistant_message_to_block(
-    message: rho_claude::protocol::AssistantMessage,
-) -> anyhow::Result<Arc<ContextBlock>> {
-    let message = rho_claude::SessionMessage {
-        kind: rho_claude::SessionMessageKind::Assistant,
-        uuid: message
-            .uuid
-            .and_then(|uuid| Uuid::parse_str(&uuid).ok())
-            .unwrap_or_else(Uuid::new_v4),
-        session_id: message.session_id.unwrap_or_else(Uuid::new_v4),
-        message: serde_json::to_value(message.message)?,
-        parent_tool_use_id: message.parent_tool_use_id,
-        timestamp: None,
-    };
-    let mut blocks = transcript_messages_to_context(&[message])?;
-    blocks
-        .pop()
-        .context("assistant message projected no blocks")
-}
-
-pub(super) fn user_output_to_block(
-    message: rho_claude::protocol::UserOutputMessage,
-) -> anyhow::Result<Option<Arc<ContextBlock>>> {
-    if message.is_synthetic.unwrap_or(false) || message.is_replay.unwrap_or(false) {
+/// The row an `assistant` event of the stream becomes: one finished
+/// content block, with the message's id, usage, uuid and time. `None`
+/// for a block a reader never sees (thinking only, empty).
+pub(super) fn assistant_row(
+    message: &AssistantMessage,
+    usage_model: crate::db::AgentUsageModel,
+    projection: &mut Projection,
+) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for content in &message.message.content {
+        match content {
+            AssistantContent::Text { text: part } => text.push_str(part),
+            AssistantContent::ToolUse { id, name, input } => calls.push(TranscriptCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: serde_json::to_string(input)?,
+            }),
+            AssistantContent::Thinking { .. } | AssistantContent::Other => {}
+        }
+    }
+    if text.trim().is_empty() && calls.is_empty() {
         return Ok(None);
     }
-    let Some(output) = message.message else {
+    let usage = message.message.usage.as_ref();
+    let context_used = usage.map(TokenUsage::context_total);
+    let usage = match (usage, &message.message.id) {
+        (Some(usage), Some(id)) if projection.usage_told.as_deref() != Some(id.as_str()) => {
+            projection.usage_told = Some(id.clone());
+            Some(usage_bucket(usage, usage_model))
+        }
+        (Some(usage), None) => Some(usage_bucket(usage, usage_model)),
+        _ => None,
+    };
+    let at = line_time(message.timestamp.as_deref());
+    for call in &calls {
+        projection.calls_made.insert(call.id.clone(), at);
+    }
+    Ok(Some((
+        row_uuid(message.uuid.as_deref()),
+        TranscriptLine::Assistant {
+            text,
+            calls,
+            usage,
+            context_used,
+        },
+        at,
+    )))
+}
+
+/// The row a `user` event of the stream becomes: the results it
+/// carries, else what the person said. Claude's own command echoes
+/// (`<command-name>`, `<local-command-stdout>`) are not something the
+/// person said.
+pub(super) fn user_row(
+    message: &UserOutputMessage,
+    projection: &mut Projection,
+) -> anyhow::Result<Option<(Uuid, TranscriptLine, UnixMs)>> {
+    let Some(body) = &message.message else {
         return Ok(None);
     };
-    let message = rho_claude::SessionMessage {
-        kind: rho_claude::SessionMessageKind::User,
-        uuid: message
-            .uuid
-            .and_then(|uuid| Uuid::parse_str(&uuid).ok())
-            .unwrap_or_else(Uuid::new_v4),
-        session_id: message.session_id.unwrap_or_else(Uuid::new_v4),
-        message: serde_json::to_value(output)?,
-        parent_tool_use_id: message.parent_tool_use_id,
-        timestamp: None,
-    };
-    Ok(transcript_messages_to_context(&[message])?.pop())
-}
-
-fn transcript_message_to_context(
-    message: &rho_claude::SessionMessage,
-) -> Option<anyhow::Result<Arc<ContextBlock>>> {
-    match message.kind {
-        rho_claude::SessionMessageKind::User => Some(project_user_message(message)),
-        rho_claude::SessionMessageKind::Assistant => Some(project_assistant_message(message)),
-        rho_claude::SessionMessageKind::System => None,
-    }
-}
-
-fn project_user_message(message: &rho_claude::SessionMessage) -> anyhow::Result<Arc<ContextBlock>> {
+    let at = line_time(message.timestamp.as_deref());
     let mut text = String::new();
     let mut results = Vec::new();
-    for content in message_content(&message.message) {
-        match content.get("type").and_then(Value::as_str) {
-            Some("text") => push_text(&mut text, content),
-            Some("image") => {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                let media_type = content
-                    .get("source")
-                    .and_then(|source| source.get("media_type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("image");
-                text.push_str(match media_type {
-                    "image/png" => "[image: PNG]",
-                    "image/jpeg" => "[image: JPEG]",
-                    "image/webp" => "[image: WebP]",
-                    "image/gif" => "[image: GIF]",
-                    _ => "[image]",
-                });
-            }
-            Some("tool_result") => {
-                if let Some(result) = project_tool_result(content)? {
-                    results.push(result);
+    for content in &body.content {
+        match content {
+            OutputContent::Text { text: part } => {
+                if !is_auxiliary_user_text(part) {
+                    push_line(&mut text, part);
                 }
             }
-            _ => {}
+            OutputContent::Image { source } => push_line(&mut text, image_marker(source)),
+            OutputContent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => results.push(tool_result(
+                tool_use_id,
+                content,
+                is_error.unwrap_or(false),
+                // A result whose call this projection never saw (a log
+                // read from its middle) spans nothing rather than
+                // everything since the epoch.
+                projection.calls_made.remove(tool_use_id).unwrap_or(at),
+                at,
+            )?),
+            OutputContent::Other => {}
         }
     }
+    let uuid = row_uuid(message.uuid.as_deref());
     if !results.is_empty() {
-        return Ok(Arc::new(ContextBlock::ToolResults { results }));
+        return Ok(Some((uuid, TranscriptLine::ToolResults { results }, at)));
     }
-    Ok(Arc::new(ContextBlock::UserMessage {
-        sender: rho_core::MessageSender::User,
-        content: vec![ContentPart::Text { text }],
-    }))
-}
-
-fn project_assistant_message(
-    message: &rho_claude::SessionMessage,
-) -> anyhow::Result<Arc<ContextBlock>> {
-    let mut items = Vec::new();
-    let mut text = String::new();
-    for content in message_content(&message.message) {
-        match content.get("type").and_then(Value::as_str) {
-            Some("text") => push_text(&mut text, content),
-            Some("thinking") => {
-                flush_text(&mut text, &mut items);
-                if let Some(thinking) = content.get("thinking").and_then(Value::as_str) {
-                    items.push(InferenceResponseItem::RawReasoning {
-                        provider_specific: Box::new(ClaudeProviderSpecificData),
-                        content: thinking.to_owned(),
-                        summary: Vec::new(),
-                    });
-                }
-            }
-            Some("tool_use") => {
-                flush_text(&mut text, &mut items);
-                items.push(project_tool_call(content)?);
-            }
-            _ => {}
-        }
-    }
-    flush_text(&mut text, &mut items);
-    Ok(Arc::new(ContextBlock::InferenceResponse {
-        items,
-        provider_response_id: None,
-    }))
-}
-
-fn message_content(message: &Value) -> Vec<&Value> {
-    match message.get("content") {
-        Some(Value::Array(content)) => content.iter().collect(),
-        Some(Value::String(_)) => vec![message],
-        _ => Vec::new(),
-    }
-}
-
-fn push_text(output: &mut String, content: &Value) {
-    if let Some(text) = content
-        .get("text")
-        .or_else(|| content.get("content"))
-        .and_then(Value::as_str)
-    {
-        output.push_str(text);
-    }
-}
-
-fn flush_text(text: &mut String, items: &mut Vec<InferenceResponseItem>) {
-    if text.is_empty() {
-        return;
-    }
-    items.push(InferenceResponseItem::AssistantMessage {
-        provider_specific: Box::new(ClaudeProviderSpecificData),
-        content: vec![ContentPart::Text {
-            text: std::mem::take(text),
-        }],
-        phase: None,
-    });
-}
-
-fn project_tool_call(content: &Value) -> anyhow::Result<InferenceResponseItem> {
-    let id = content
-        .get("id")
-        .and_then(Value::as_str)
-        .context("Claude tool_use missing id")?;
-    let name = content
-        .get("name")
-        .and_then(Value::as_str)
-        .context("Claude tool_use missing name")?;
-    let input = content.get("input").cloned().unwrap_or(Value::Null);
-    Ok(InferenceResponseItem::ToolCall {
-        provider_specific: Box::new(ClaudeProviderSpecificData),
-        id: ToolCallId::try_from(id)?,
-        name: ToolName::try_from(name)?,
-        tool_type: ToolType::Function,
-        arguments: serde_json::to_string(&input)?,
-    })
-}
-
-fn project_tool_result(content: &Value) -> anyhow::Result<Option<ToolResult>> {
-    let Some(tool_use_id) = content.get("tool_use_id").and_then(Value::as_str) else {
+    if text.trim().is_empty() {
         return Ok(None);
-    };
-    let output = match content.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
+    }
+    Ok(Some((uuid, TranscriptLine::User { text }, at)))
+}
+
+/// The row a `compact_boundary` becomes.
+pub(super) fn compacted_row(
+    uuid: Option<&str>,
+    metadata: Option<&SystemCompactMetadata>,
+) -> (Uuid, TranscriptLine, UnixMs) {
+    (
+        row_uuid(uuid),
+        TranscriptLine::Compacted {
+            context_used: metadata.and_then(|metadata| metadata.post_tokens),
+        },
+        UnixMs::now(),
+    )
+}
+
+/// The line's uuid as Claude names it (the same in its file); one of
+/// Rho's own for a message that came without one.
+fn row_uuid(uuid: Option<&str>) -> Uuid {
+    uuid.and_then(|uuid| Uuid::parse_str(uuid).ok())
+        .unwrap_or_else(Uuid::new_v4)
+}
+
+pub(super) fn line_time(timestamp: Option<&str>) -> UnixMs {
+    timestamp
+        .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|time| UnixMs(time.timestamp_millis().max(0) as u64))
+        .unwrap_or_else(UnixMs::now)
+}
+
+fn push_line(output: &mut String, part: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(part);
+}
+
+fn image_marker(source: &Value) -> &'static str {
+    match source.get("media_type").and_then(Value::as_str) {
+        Some("image/png") => "[image: PNG]",
+        Some("image/jpeg") => "[image: JPEG]",
+        Some("image/webp") => "[image: WebP]",
+        Some("image/gif") => "[image: GIF]",
+        _ => "[image]",
+    }
+}
+
+fn usage_bucket(
+    usage: &TokenUsage,
+    model: crate::db::AgentUsageModel,
+) -> crate::db::AgentUsageBucket {
+    crate::db::AgentUsageBucket {
+        model,
+        input_tokens: usage.input_tokens.unwrap_or(0),
+        cache_read_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        cache_write_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+        cache_write_1h_tokens: usage
+            .cache_creation
+            .as_ref()
+            .and_then(|cache| cache.ephemeral_1h_input_tokens)
+            .unwrap_or(0),
+        output_tokens: usage.output_tokens.unwrap_or(0),
+        requests: 1,
+        ..crate::db::AgentUsageBucket::default()
+    }
+}
+
+fn tool_result(
+    tool_use_id: &str,
+    content: &Value,
+    is_error: bool,
+    started_at: UnixMs,
+    finished_at: UnixMs,
+) -> anyhow::Result<ToolResult> {
+    let output = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
             .iter()
             .filter_map(|part| part.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join(""),
-        Some(other) => serde_json::to_string(other)?,
-        None => String::new(),
+        Value::Null => String::new(),
+        other => serde_json::to_string(other)?,
     };
-    let status = if content
-        .get("is_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        ToolOutputStatus::Error
-    } else {
-        ToolOutputStatus::Success
-    };
-    Ok(Some(ToolResult {
+    Ok(ToolResult {
         call_id: ToolCallId::try_from(tool_use_id)?,
         tool_type: ToolType::Function,
         body: ToolOutput {
+            full_output: None,
+            images: Arc::new(Vec::new()),
             output: Arc::new(output),
-            status,
+            status: if is_error {
+                ToolOutputStatus::Error
+            } else {
+                ToolOutputStatus::Success
+            },
         },
-        started_at: UnixMs(0),
-        finished_at: UnixMs(0),
+        started_at,
+        finished_at,
         metadata: None,
-    }))
-}
-
-/// Text-only, transcript-confirmed input for the shared Luna presentation
-/// sidecar. Tool results and hidden Claude protocol messages are omitted.
-pub(super) fn presentation_source(
-    message: &rho_claude::SessionMessage,
-) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
-    presentation_source_parts(message.kind, message.uuid, &message.message)
-}
-
-/// Projects a live assistant notification with the exact rules used when its
-/// JSONL transcript entry is reconciled after restart.
-pub(super) fn assistant_presentation_source(
-    message: &rho_claude::protocol::AssistantMessage,
-) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
-    let Some(source_id) = message
-        .uuid
-        .as_deref()
-        .and_then(|uuid| Uuid::parse_str(uuid).ok())
-    else {
-        return Ok(None);
-    };
-    presentation_source_parts(
-        rho_claude::SessionMessageKind::Assistant,
-        source_id,
-        &serde_json::to_value(&message.message)?,
-    )
-}
-
-/// Projects original queued content after a live echo confirms its UUID.
-/// Claude can rewrite image input into a marker in that echo, while its JSONL
-/// retains the image part; use the original text-only content so live and
-/// reload projection agree.
-pub(super) fn queued_user_presentation_source(
-    source_id: Uuid,
-    content: &[ContentPart],
-) -> Option<(Uuid, crate::PresentationSpeaker, String)> {
-    let text = content
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
-        })
-        .filter(|text| !is_auxiliary_user_text(text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.trim().is_empty()).then_some((source_id, crate::PresentationSpeaker::User, text))
-}
-
-fn presentation_source_parts(
-    kind: rho_claude::SessionMessageKind,
-    source_id: Uuid,
-    message: &Value,
-) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
-    let speaker = match kind {
-        rho_claude::SessionMessageKind::User => crate::PresentationSpeaker::User,
-        rho_claude::SessionMessageKind::Assistant => crate::PresentationSpeaker::Assistant,
-        rho_claude::SessionMessageKind::System => return Ok(None),
-    };
-    let text = message_content(message)
-        .into_iter()
-        .filter(|content| {
-            content
-                .get("type")
-                .and_then(Value::as_str)
-                .is_none_or(|kind| kind == "text")
-        })
-        .filter_map(|content| {
-            content
-                .get("text")
-                .or_else(|| content.get("content"))
-                .and_then(Value::as_str)
-        })
-        .filter(|text| {
-            kind != rho_claude::SessionMessageKind::User || !is_auxiliary_user_text(text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        return Ok(None);
-    };
-    Ok(Some((source_id, speaker, text)))
+    })
 }
 
 fn is_auxiliary_user_text(text: &str) -> bool {
@@ -443,256 +363,215 @@ fn is_auxiliary_user_text(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rho_core::text_content;
     use serde_json::json;
 
     use super::*;
 
-    fn session_message(
-        kind: rho_claude::SessionMessageKind,
-        message: Value,
-    ) -> rho_claude::SessionMessage {
-        rho_claude::SessionMessage {
-            kind,
-            uuid: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
-            session_id: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
-            message,
-            parent_tool_use_id: None,
-            timestamp: None,
-        }
-    }
+    const UUID: &str = "00000000-0000-4000-8000-000000000001";
 
-    #[test]
-    fn projects_user_text() {
-        let blocks = transcript_messages_to_context(&[session_message(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}),
-        )])
-        .unwrap();
-
-        let ContextBlock::UserMessage { content, .. } = blocks[0].as_ref() else {
-            panic!("expected user message");
-        };
-        assert_eq!(text_content(content), "hello");
-    }
-
-    #[test]
-    fn projects_user_images_as_bounded_markers() {
-        let blocks = transcript_messages_to_context(&[session_message(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [
-                {"type": "text", "text": "inspect"},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "RAW_BASE64_MUST_NOT_PROJECT"}}
-            ]}),
-        )])
-        .unwrap();
-        let ContextBlock::UserMessage { content, .. } = blocks[0].as_ref() else {
-            panic!("expected user message");
-        };
-        assert_eq!(text_content(content), "inspect\n[image: PNG]");
-        assert!(!text_content(content).contains("RAW_BASE64"));
-    }
-
-    #[test]
-    fn presentation_source_keeps_only_user_text() {
-        let source = presentation_source(&session_message(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [
-                {"type": "text", "text": "inspect"},
-                {"type": "image", "source": {"type": "base64", "data": "RAW_BASE64_MUST_NOT_PROJECT"}},
-                {"type": "tool_result", "content": "also not input"}
-            ]}),
-        ))
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(source.2, "inspect");
-    }
-
-    #[test]
-    fn presentation_source_omits_auxiliary_user_output() {
-        let source = presentation_source(&session_message(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": "<task-notification>done</task-notification>"}),
-        ))
-        .unwrap();
-
-        assert!(source.is_none());
-    }
-
-    #[test]
-    fn queued_user_presentation_source_matches_jsonl_projection() {
-        let source_id = uuid::uuid!("00000000-0000-4000-8000-000000000001");
-        let queued = vec![
-            ContentPart::Text {
-                text: "inspect".to_owned(),
-            },
-            ContentPart::Image {
-                media_type: "image/png".to_owned(),
-                data: Vec::new(),
-            },
-        ];
-        let jsonl = session_message(
-            rho_claude::SessionMessageKind::User,
-            json!({"role": "user", "content": [
-                {"type": "text", "text": "inspect"},
-                {"type": "image", "source": {"type": "base64", "data": "RAW_BASE64_MUST_NOT_PROJECT"}}
-            ]}),
-        );
-        // The echoed message has flattened the image into a marker, so it is
-        // intentionally not used as the source text.
-        let echo: rho_claude::protocol::UserOutputMessage = serde_json::from_value(json!({
-            "uuid": source_id,
-            "message": {"role": "user", "content": "inspect\n[image: PNG]"}
-        }))
-        .unwrap();
-        let echoed = user_output_to_block(echo).unwrap().unwrap();
-        let ContextBlock::UserMessage { content, .. } = echoed.as_ref() else {
-            panic!("expected user echo");
-        };
-        assert_eq!(text_content(content), "inspect\n[image: PNG]");
-        assert_eq!(
-            queued_user_presentation_source(source_id, &queued),
-            presentation_source(&jsonl).unwrap()
-        );
-
-        for (content, jsonl_content) in [
-            (
-                vec![ContentPart::Text {
-                    text: "peer report".to_owned(),
-                }],
-                json!([{"type": "text", "text": "peer report"}]),
-            ),
-            (
-                vec![ContentPart::Text {
-                    text: "<local-command-stdout>ignored</local-command-stdout>".to_owned(),
-                }],
-                json!("<local-command-stdout>ignored</local-command-stdout>"),
-            ),
-        ] {
-            let jsonl = session_message(
-                rho_claude::SessionMessageKind::User,
-                json!({"role": "user", "content": jsonl_content}),
-            );
-            assert_eq!(
-                queued_user_presentation_source(source_id, &content),
-                presentation_source(&jsonl).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn live_assistant_presentation_source_matches_jsonl_projection() {
-        let raw = json!({
+    fn user(message: Value) -> UserOutputMessage {
+        serde_json::from_value(json!({
+            "uuid": UUID,
             "session_id": "00000000-0000-4000-8000-000000000002",
-            "uuid": "00000000-0000-4000-8000-000000000001",
-            "message": {"role": "assistant", "content": [
-                {"type": "text", "text": "first"},
-                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}},
-                {"type": "text", "text": "second"}
-            ]}
-        });
-        let live: rho_claude::protocol::AssistantMessage =
-            serde_json::from_value(raw.clone()).unwrap();
-        let jsonl = session_message(
-            rho_claude::SessionMessageKind::Assistant,
-            raw["message"].clone(),
-        );
-
-        assert_eq!(
-            assistant_presentation_source(&live).unwrap(),
-            presentation_source(&jsonl).unwrap()
-        );
+            "timestamp": "2026-09-06T10:00:00.000Z",
+            "message": message,
+        }))
+        .unwrap()
     }
 
-    #[test]
-    fn ignores_synthetic_user_output() {
-        let message = serde_json::from_value(json!({
-            "message": {
-                "role": "user",
-                "content": "This session is being continued from a previous conversation."
-            },
-            "isSynthetic": true
+    fn assistant(message: Value) -> AssistantMessage {
+        serde_json::from_value(json!({
+            "uuid": UUID,
+            "session_id": "00000000-0000-4000-8000-000000000002",
+            "timestamp": "2026-09-06T10:00:01.000Z",
+            "message": message,
         }))
-        .unwrap();
-
-        assert!(user_output_to_block(message).unwrap().is_none());
+        .unwrap()
     }
 
-    #[test]
-    fn ignores_replayed_user_output() {
-        let message = serde_json::from_value(json!({
-            "message": {
-                "role": "user",
-                "content": "<task-notification><status>completed</status></task-notification>"
-            },
-            "isReplay": true
-        }))
-        .unwrap();
-
-        assert!(user_output_to_block(message).unwrap().is_none());
+    fn user_line(message: Value) -> Option<TranscriptLine> {
+        user_row(&user(message), &mut Projection::default())
+            .unwrap()
+            .map(|(_, line, _)| line)
     }
 
-    #[test]
-    fn projects_failed_tool_result_as_error() {
-        let message = serde_json::from_value(json!({
-            "message": {
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_1",
-                    "content": "command failed",
-                    "is_error": true
-                }]
-            }
-        }))
-        .unwrap();
+    fn assistant_line(message: Value) -> Option<TranscriptLine> {
+        assistant_row(
+            &assistant(message),
+            crate::db::AgentUsageModel::OPUS,
+            &mut Projection::default(),
+        )
+        .unwrap()
+        .map(|(_, line, _)| line)
+    }
 
-        let block = user_output_to_block(message).unwrap().unwrap();
-        let ContextBlock::ToolResults { results } = block.as_ref() else {
-            panic!("expected tool results");
+    /// The log stamps lines, so a result's span is from the line that made
+    /// the call to the line that answered it. A result whose call was not
+    /// seen spans nothing.
+    #[test]
+    fn a_result_spans_its_call_line_to_its_own() {
+        let mut projection = Projection::default();
+        let call = assistant(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}},
+        ]}));
+        let (_, _, called_at) =
+            assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut projection)
+                .unwrap()
+                .unwrap();
+        let mut answer: UserOutputMessage = user(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a\n"},
+            {"type": "tool_result", "tool_use_id": "toolu_unseen", "content": "b\n"},
+        ]}));
+        answer.timestamp = Some("2026-09-06T10:00:04.500Z".to_owned());
+        let (_, line, answered_at) = user_row(&answer, &mut projection).unwrap().unwrap();
+        let TranscriptLine::ToolResults { results } = line else {
+            panic!("expected results");
         };
+        assert_eq!(answered_at, UnixMs(called_at.0 + 3_500));
+        assert_eq!(results[0].started_at, called_at);
+        assert_eq!(results[0].finished_at, answered_at);
+        assert_eq!(results[1].started_at, answered_at);
+        assert_eq!(results[1].finished_at, answered_at);
+        assert!(
+            projection.calls_made.is_empty(),
+            "an answered call is forgotten"
+        );
+    }
+
+    #[test]
+    fn a_persons_text_is_a_user_line_with_the_streams_time() {
+        let message = user(json!({"role": "user", "content": [{"type": "text", "text": "hello"}]}));
+        let (uuid, line, at) = user_row(&message, &mut Projection::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
+        assert_eq!(
+            line,
+            TranscriptLine::User {
+                text: "hello".to_owned()
+            }
+        );
+        assert_eq!(at, UnixMs(1788688800000));
+    }
+
+    #[test]
+    fn images_become_bounded_markers() {
+        assert_eq!(
+            user_line(json!({"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+            ]})),
+            Some(TranscriptLine::User {
+                text: "look\n[image: PNG]".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_commands_own_output_is_not_a_line() {
+        assert_eq!(
+            user_line(json!({"role": "user", "content": "<command-name>/compact</command-name>"})),
+            None
+        );
+        assert_eq!(
+            user_line(
+                json!({"role": "user", "content": [{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_result_is_an_error() {
+        let Some(TranscriptLine::ToolResults { results }) = user_line(
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "boom"},
+            ]}),
+        ) else {
+            panic!("expected results");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].call_id.as_str(), "toolu_1");
         assert_eq!(results[0].body.status, ToolOutputStatus::Error);
+        assert_eq!(results[0].body.output.as_str(), "boom");
+    }
+
+    #[test]
+    fn text_and_call_with_usage_told_once_per_message() {
+        let usage = json!({"input_tokens": 3, "cache_read_input_tokens": 100, "output_tokens": 7});
+        let text = assistant(
+            json!({"role": "assistant", "id": "msg_1", "usage": usage, "content": [
+                {"type": "text", "text": "reading"},
+            ]}),
+        );
+        let call = assistant(
+            json!({"role": "assistant", "id": "msg_1", "usage": usage, "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "a.rs"}},
+            ]}),
+        );
+        let mut told = Projection::default();
+        let (_, first, _) = assistant_row(&text, crate::db::AgentUsageModel::OPUS, &mut told)
+            .unwrap()
+            .unwrap();
+        let (_, second, _) = assistant_row(&call, crate::db::AgentUsageModel::OPUS, &mut told)
+            .unwrap()
+            .unwrap();
+        let TranscriptLine::Assistant {
+            text,
+            calls,
+            usage,
+            context_used,
+        } = first
+        else {
+            panic!("expected assistant");
+        };
+        assert_eq!(text, "reading");
+        assert!(calls.is_empty());
+        let usage = usage.expect("first row carries usage");
+        assert_eq!(usage.cache_read_tokens, 100);
+        assert_eq!(usage.requests, 1);
+        assert_eq!(context_used, Some(110));
+        let TranscriptLine::Assistant { calls, usage, .. } = second else {
+            panic!("expected assistant");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Read");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert!(usage.is_none(), "the same message's usage is told once");
+    }
+
+    #[test]
+    fn a_thinking_only_block_is_no_line() {
+        assert_eq!(
+            assistant_line(
+                json!({"role": "assistant", "id": "msg_2", "content": [{"type": "thinking", "thinking": "hmm"}]})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_compaction_boundary_is_compacted() {
+        let metadata = SystemCompactMetadata {
+            trigger: None,
+            pre_tokens: Some(9000),
+            post_tokens: Some(2000),
+        };
+        let (uuid, line, _) = compacted_row(Some(UUID), Some(&metadata));
+        assert_eq!(uuid, uuid::uuid!("00000000-0000-4000-8000-000000000001"));
+        assert_eq!(
+            line,
+            TranscriptLine::Compacted {
+                context_used: Some(2000)
+            }
+        );
     }
 
     #[test]
     fn ignores_unknown_stream_content_block() {
-        let block = serde_json::from_value(json!({
-            "type": "future_content_block",
-            "payload": "new"
-        }))
-        .unwrap();
-
-        assert!(
-            ClaudeStreamItem::from_content_block(block)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn projects_assistant_text_and_tool_call() {
-        let blocks = transcript_messages_to_context(&[session_message(
-            rho_claude::SessionMessageKind::Assistant,
-            json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "I'll check."},
-                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "pwd"}},
-                ],
-            }),
-        )])
-        .unwrap();
-
-        let ContextBlock::InferenceResponse { items, .. } = blocks[0].as_ref() else {
-            panic!("expected inference response");
-        };
-        assert!(
-            matches!(&items[0], InferenceResponseItem::AssistantMessage { content, .. } if text_content(content) == "I'll check.")
-        );
-        assert!(
-            matches!(&items[1], InferenceResponseItem::ToolCall { id, name, arguments, .. }
-            if id.as_ref() == "toolu_1" && name.as_ref() == "Bash" && arguments.contains("pwd"))
-        );
+        let item =
+            ClaudeStreamItem::from_content_block(rho_claude::protocol::StreamContentBlock::Other)
+                .unwrap();
+        assert!(item.is_none());
     }
 }

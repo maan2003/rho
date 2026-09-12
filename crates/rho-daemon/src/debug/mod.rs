@@ -1,15 +1,15 @@
 use std::fmt::Write as _;
 use std::io::{self, Write as _};
-use std::path::PathBuf;
+use std::os::fd::AsRawFd as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rho_agent::db::{
-    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentWriteTxnExt as _,
-    EngineerIntelligence,
+    AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workset::WorkspaceInfo;
+use rho_workspaces::WorkspaceInfo;
 
 use crate::default_db_path;
 
@@ -18,6 +18,14 @@ pub struct DebugArgs {
     /// Source database path. Defaults to rho's normal daemon database.
     #[arg(long = "db-path")]
     db_path: Option<PathBuf>,
+
+    /// The Claude config directory whose transcripts to read, with accounts
+    /// beside it as `<dir>-accounts`. Defaults to the user's. A database
+    /// from somewhere else wants the transcripts from that somewhere else:
+    /// name it, or the reading is of the user's transcripts under another
+    /// store's session ids.
+    #[arg(long = "claude-config-dir", value_name = "DIR")]
+    claude_config_dir: Option<camino::Utf8PathBuf>,
 
     #[command(subcommand)]
     command: DebugCommand,
@@ -29,23 +37,55 @@ enum DebugCommand {
     Agents,
     /// Snapshot the database and run pending migrations on the copy.
     Migrate,
+    /// Put the real database back as it was before its last migration,
+    /// from the savepoint taken then. Stop the daemon first.
+    Rollback,
+    /// List the recovery savepoints the real database holds, and the
+    /// migration each was taken for. Stop the daemon first.
+    Savepoints,
+    /// Drop the savepoints no migration recorded: leftovers of older
+    /// builds that keep freed pages from being reused. Stop the daemon
+    /// first.
+    DropStaleSavepoints,
+    /// Drop the savepoints recorded for migrations once they are verified,
+    /// so nothing pins the pages they freed. Stop the daemon first.
+    ForgetSavepoints,
+    /// Rewrite the real database file without the pages nothing refers to
+    /// any more. Needs every savepoint gone (`drop-stale-savepoints` after
+    /// the last migration is done). Stop the daemon first.
+    Compact,
+    /// Print bytes stored per table and pages allocated overall for the
+    /// real database. Stop the daemon first.
+    Stats,
     /// Snapshot the database and print the context usage each agent would
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
-        /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
-        /// eng-alt, pm, advisor, advisor-cheap, or advisor-high.
+        /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high,
+        /// eng-ultra, eng-alt, eng-gemini, pm, advisor,
+        /// advisor-cheap, or advisor-high.
         role: String,
     },
 }
 
 pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
+    // Resolved once, here: the readers below are handed a path.
+    let claude = match args.claude_config_dir.clone() {
+        Some(dir) => rho_claude::accounts::ClaudePaths::at(dir),
+        None => rho_claude::accounts::ClaudePaths::from_env()?,
+    };
     match args.command {
-        DebugCommand::Agents => print_agents(args.db_path).await,
+        DebugCommand::Agents => print_agents(args.db_path, &claude).await,
         DebugCommand::Migrate => test_migration(args.db_path).await,
-        DebugCommand::Context => print_context(args.db_path).await,
+        DebugCommand::Rollback => rollback(args.db_path).await,
+        DebugCommand::Savepoints => savepoints(args.db_path).await,
+        DebugCommand::DropStaleSavepoints => drop_stale_savepoints(args.db_path).await,
+        DebugCommand::Compact => compact(args.db_path),
+        DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
+        DebugCommand::Stats => stats(args.db_path),
+        DebugCommand::Context => print_context(args.db_path, &claude).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
 }
@@ -53,37 +93,17 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let role = parse_role(role)?;
     let cwd = std::env::current_dir().context("read current directory")?;
-    let root =
-        std::process::Command::new(std::env::var_os("RHO_JJ").unwrap_or_else(|| "jj".into()))
-            .args(["root"])
-            .current_dir(&cwd)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|root| PathBuf::from(root.trim()))
-            .unwrap_or(cwd);
-    let storage = tempfile::tempdir().context("create prompt workset storage")?;
-    let environment = rho_workset::UserEnvironment::new(std::env::vars_os().collect());
-    let worksets = rho_workset::Worksets::open(
-        storage.path(),
-        rho_db::RhoDb::open(storage.path().join("rho.redb")),
-        environment,
-        rho_workset::PathOverrides::default(),
-    )?;
-    let workset = worksets.create().await?;
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    workset
-        .clone(name, root.to_string_lossy().as_ref(), Some(name), None)
-        .await?;
-    let view = workset
-        .enter(rho_workset::Mode::View {
-            home_skeleton: None,
-        })
-        .await?;
+    let (root, is_jj) = rho_workspaces::resolve_workdir_root(&cwd)?;
+    let repo = if is_jj {
+        rho_workspaces::Repo::open(root.as_std_path())?
+    } else {
+        rho_workspaces::Repo::open_plain_with_path_overrides(
+            root.as_std_path(),
+            rho_workspaces::PathOverrides::default(),
+        )?
+    };
+    let workspace = std::sync::Arc::new(repo).user_checkout().await?;
+    let view = rho_workspaces::View::new(vec![workspace])?;
     let surface = rho_agent::render_agent_surface(view, role)?;
 
     println!("# System prompt\n");
@@ -136,7 +156,9 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-alt" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         },
-        "pm" => AgentRole::pm(),
+        "eng-gemini" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Gemini,
+        },
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
@@ -147,11 +169,12 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, pm, advisor, advisor-cheap, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high"
         ),
     })
 }
 
+#[derive(Debug)]
 struct Snapshot {
     source: PathBuf,
     path: PathBuf,
@@ -163,18 +186,117 @@ fn copy_snapshot(db_path: Option<PathBuf>) -> anyhow::Result<Snapshot> {
         .map(Ok)
         .unwrap_or_else(default_db_path)
         .context("resolve rho db path")?;
-    let temp = tempfile::tempdir().context("create debug db snapshot tempdir")?;
+    let paths = rho_ui_proto::RuntimePaths::from_env()?;
+    std::fs::create_dir_all(paths.directory()).context("create rho runtime directory")?;
+    copy_snapshot_from(&source, &paths.daemon_lock())
+}
+
+/// The name every debug copy carries, so a stray one says who made it.
+const SNAPSHOT_PREFIX: &str = "rho-debug-snapshot-";
+
+/// Where a copy of the store goes: beside the store itself, never the
+/// system temp directory. The copy is as big as the store, and
+/// `std::env::temp_dir()` may be a different and smaller disk; beside
+/// the store it is on a volume that already holds something that size.
+fn snapshot_dir(source: &Path) -> anyhow::Result<PathBuf> {
+    let dir = source
+        .parent()
+        .context("the rho db path has no directory")?
+        .join("debug-snapshots");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create debug snapshot directory {}", dir.display()))?;
+    report_leftover_snapshots(&dir);
+    Ok(dir)
+}
+
+/// Copies an earlier run left behind. `TempDir` removes its own on the
+/// way out, panic included, but nothing runs when the process is killed.
+/// One that is still here is a dead item, and a dead item is a question
+/// rather than a deletion: this names it and goes on, and the user is the
+/// one who decides it is rubbish. A copy another run is reading right now
+/// is named too, which is the same answer said early.
+fn leftover_snapshots(dir: &Path) -> Vec<(PathBuf, std::time::Duration)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut leftovers = Vec::new();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SNAPSHOT_PREFIX)
+        {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|data| data.modified())
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .unwrap_or_default();
+        leftovers.push((entry.path(), age));
+    }
+    leftovers.sort();
+    leftovers
+}
+
+fn report_leftover_snapshots(dir: &Path) {
+    for (path, age) in leftover_snapshots(dir) {
+        eprintln!(
+            "a debug db copy from an earlier run is still here: {} ({}); it is yours to delete",
+            path.display(),
+            describe_age(age)
+        );
+    }
+}
+
+fn describe_age(age: std::time::Duration) -> String {
+    let hours = age.as_secs_f64() / 3600.0;
+    if hours < 1.0 {
+        format!("{:.0} minutes old", age.as_secs_f64() / 60.0)
+    } else if hours < 48.0 {
+        format!("{hours:.1} hours old")
+    } else {
+        format!("{:.1} days old", hours / 24.0)
+    }
+}
+
+fn copy_snapshot_from(source: &Path, daemon_lock: &Path) -> anyhow::Result<Snapshot> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(daemon_lock)
+        .with_context(|| format!("open daemon lock {}", daemon_lock.display()))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "refusing to copy {} while the rho daemon is running; stop the daemon first",
+                source.display()
+            );
+        }
+        return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
+    }
+    let temp = tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempdir_in(snapshot_dir(source)?)
+        .context("create debug db snapshot directory")?;
     let snapshot = temp.path().join("rho.redb");
-    std::fs::copy(&source, &snapshot)
+    std::fs::copy(source, &snapshot)
         .with_context(|| format!("copy rho db snapshot from {}", source.display()))?;
     Ok(Snapshot {
-        source,
+        source: source.to_owned(),
         path: snapshot,
         _temp: temp,
     })
 }
 
-async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn print_agents(
+    db_path: Option<PathBuf>,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
 
     let db = RhoDb::open(&snapshot.path);
@@ -190,33 +312,28 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     for (agent_id, agent) in agents {
         writeln!(output)?;
         writeln!(output, "{agent_id:?}")?;
-        if let Some(name) = &agent.display_name {
+        if let Some(name) = agent.title() {
             writeln!(output, "  name: {name}")?;
         }
-        if let Some(parent) = agent.parent_agent {
-            writeln!(output, "  parent: {parent:?}")?;
-        }
-        if !agent.labels.is_empty() {
-            writeln!(output, "  labels: {}", agent.labels.join(", "))?;
-        }
+        writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
-            "  disposition: {}",
-            disposition_name(agent.disposition)
+            "  log: next {:?}, {} rows visible",
+            agent.next,
+            read.agent_events(agent_id).1.len()
         )?;
-        writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
-        writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
             "  workdirs: {}",
             agent
+                .config
                 .workdirs
                 .iter()
                 .map(workspace_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
                 writeln!(output, "  runtime: rho")?;
                 writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
@@ -225,8 +342,9 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
                 match rho_claude::find_session_transcript(
+                    &claude.projects(),
                     session_id,
-                    &workspace_visible_path(agent.primary_workdir()),
+                    agent.primary_workdir().repo(),
                 )
                 .await?
                 {
@@ -240,7 +358,10 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn print_context(
+    db_path: Option<PathBuf>,
+    claude: &rho_claude::accounts::ClaudePaths,
+) -> anyhow::Result<()> {
     let snapshot = copy_snapshot(db_path)?;
     let db = RhoDb::open(&snapshot.path);
     migrate_snapshot(&db).await?;
@@ -256,15 +377,15 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         writeln!(
             output,
             "{agent_id:?} ({})",
-            agent.display_name.as_deref().unwrap_or("unnamed")
+            agent.title().unwrap_or("unnamed")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { .. } => {
                 let (_, events) = read.agent_events(agent_id);
                 let mut context_used = None;
                 let mut responses = 0usize;
                 for event in &events {
-                    if let rho_agent::AgentEvent::InferenceResponse {
+                    if let rho_agent::AgentEvent::Replied {
                         context_used: response_context_used,
                         ..
                     } = event
@@ -287,8 +408,9 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
                 let transcript = rho_claude::find_session_transcript(
+                    &claude.projects(),
                     session_id,
-                    &workspace_visible_path(agent.primary_workdir()),
+                    agent.primary_workdir().repo(),
                 )
                 .await?;
                 let Some(transcript) = transcript else {
@@ -297,8 +419,9 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 };
                 writeln!(output, "  transcript: {transcript}")?;
                 let messages = rho_claude::read_session_messages_by_id(
+                    &claude.projects(),
                     session_id,
-                    &workspace_visible_path(agent.primary_workdir()),
+                    agent.primary_workdir().repo(),
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;
@@ -354,33 +477,122 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     writeln!(output, "migration on copied database: ok")?;
     writeln!(output, "agents decoded: {}", agents.len())?;
     writeln!(output, "events decoded: {events}")?;
+    // The fused migration drops the old layout; a migration check is the
+    // place that says whether any of it is still there.
+    for table in [
+        "projects",
+        "view_config",
+        "agent_heads",
+        "agent_events",
+        "lineage_parents",
+        "agent_story",
+        "agent_story_source",
+        "agent_attention_until_slice_b",
+    ] {
+        writeln!(
+            output,
+            "table {table}: {}",
+            if read.has_table(table) {
+                "present"
+            } else {
+                "dropped"
+            }
+        )?;
+    }
     io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     Inference::migrate(db).await?;
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.commit();
+    rho_agent::db::prepare(db).await;
     Ok(())
 }
 
-fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
-    use rho_agent::db::AgentDisposition;
-    match disposition {
-        AgentDisposition::Pending => "pending".to_owned(),
-        AgentDisposition::Done => "done".to_owned(),
-        AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
-        AgentDisposition::Hidden => "hidden".to_owned(),
+async fn savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    for (id, hop) in rho_agent::db::savepoints(&db).await {
+        println!(
+            "savepoint {id}: {}",
+            hop.as_deref().unwrap_or("not recorded for a migration")
+        );
     }
+    Ok(())
+}
+
+async fn drop_stale_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let dropped = rho_agent::db::drop_stale_savepoints(&db).await;
+    println!(
+        "{}: dropped {} stale savepoint(s) {dropped:?}",
+        path.display(),
+        dropped.len()
+    );
+    Ok(())
+}
+
+async fn forget_savepoints(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let dropped = rho_agent::db::forget_savepoints(&db).await;
+    println!(
+        "{}: forgot {} migration savepoint(s) {dropped:?}",
+        path.display(),
+        dropped.len()
+    );
+    Ok(())
+}
+
+fn stats(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    RhoDb::print_stats(&path)
+}
+
+fn compact(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let started = std::time::Instant::now();
+    let (before, after) = RhoDb::compact(&path)?;
+    println!(
+        "{}: {} -> {} bytes in {:.1?}",
+        path.display(),
+        before,
+        after,
+        started.elapsed()
+    );
+    Ok(())
+}
+
+async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let path = db_path
+        .map(Ok)
+        .unwrap_or_else(default_db_path)
+        .context("resolve rho db path")?;
+    let db = RhoDb::open(&path);
+    let hop = rho_agent::db::rollback(&db).await?;
+    println!("{}: migration {hop} undone", path.display());
+    Ok(())
 }
 
 fn config_name(config: rho_agent::db::AgentRole) -> String {
     use rho_agent::db::{AgentRole, EngineerIntelligence};
     match config {
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => "pm".to_owned(),
-        AgentRole::Iris => "iris".to_owned(),
         AgentRole::Advisor { intelligence } => format!(
             "advisor {}",
             match intelligence {
@@ -389,7 +601,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 rho_agent::db::AdvisorIntelligence::Cheap => "cheap",
             }
         ),
-        AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {
+        AgentRole::Engineer { intelligence } => {
             let intelligence = match intelligence {
                 EngineerIntelligence::Mini => "mini",
                 EngineerIntelligence::Low => "low",
@@ -398,6 +610,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 EngineerIntelligence::High => "high",
                 EngineerIntelligence::Ultra => "ultra",
                 EngineerIntelligence::Alt => "alt",
+                EngineerIntelligence::Gemini => "gemini",
             };
             format!("engineer {intelligence}")
         }
@@ -406,13 +619,14 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
 
 fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
-        WorkspaceInfo::Checkout { repo, name, .. } => format!("checkout {name} in {repo}"),
-        WorkspaceInfo::Sandbox { repo, name, .. } => format!("sandbox {name} from {repo}"),
+        WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
+        WorkspaceInfo::Workspace { repo, id } => {
+            format!("workspace ws-{} in {repo}", id.encoded())
+        }
+        WorkspaceInfo::Sandbox { repo, id } => {
+            format!("sandbox ws-{} from {repo}", id.encoded())
+        }
     }
-}
-
-fn workspace_visible_path(workspace: &WorkspaceInfo) -> camino::Utf8PathBuf {
-    camino::Utf8PathBuf::from("/src").join(workspace.name())
 }
 
 #[cfg(test)]
@@ -423,11 +637,104 @@ mod render_prompt_tests {
     fn parses_render_prompt_roles() {
         assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
         assert_eq!(
+            parse_role("eng-gemini").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini,
+            }
+        );
+        assert_eq!(
             parse_role("advisor-high").unwrap(),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High
             }
         );
         assert!(parse_role("ultra").is_err());
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn a_live_daemon_lock_refuses_the_redb_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rho.redb");
+        drop(RhoDb::open(&source));
+        let lock_path = directory.path().join("daemon.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        let error = copy_snapshot_from(&source, &lock_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("while the rho daemon is running")
+        );
+
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        drop(lock);
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        drop(RhoDb::open(&snapshot.path));
+    }
+
+    /// The copy lands beside the store, which is what keeps it off the
+    /// system temp directory and its own disk. (This test's own store is
+    /// under a temp directory, so "beside the store" is the whole of what
+    /// can be asserted here.)
+    #[test]
+    fn the_copy_is_taken_beside_the_store_and_is_gone_when_the_run_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rho.redb");
+        drop(RhoDb::open(&source));
+        let lock_path = directory.path().join("daemon.lock");
+
+        let snapshot = copy_snapshot_from(&source, &lock_path).unwrap();
+        let held = snapshot.path.clone();
+        assert!(
+            held.starts_with(directory.path().join("debug-snapshots")),
+            "the copy is beside the store: {}",
+            held.display()
+        );
+
+        drop(snapshot);
+        assert!(
+            !held.exists(),
+            "the copy goes when the run that took it does"
+        );
+    }
+
+    /// What a killed run left behind is named, not removed. A copy the
+    /// tool did not take away is a dead item, and a dead item is the
+    /// user's to decide about.
+    #[test]
+    fn a_copy_from_an_earlier_run_is_named_and_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("debug-snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
+        let killed = dir.join(format!("{SNAPSHOT_PREFIX}killed"));
+        std::fs::create_dir(&killed).unwrap();
+        std::fs::write(killed.join("rho.redb"), b"x").unwrap();
+        let two_days = std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60);
+        std::fs::File::open(&killed)
+            .unwrap()
+            .set_modified(two_days)
+            .unwrap();
+
+        let leftovers = leftover_snapshots(&dir);
+
+        assert_eq!(
+            leftovers.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![&killed],
+            "the copy is named"
+        );
+        assert!(leftovers[0].1.as_secs() >= 47 * 60 * 60, "with its age");
+        assert!(killed.exists(), "and it is still there afterwards");
     }
 }

@@ -23,8 +23,8 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
         .to_owned();
     let workspace_name = current_jj_workspace(&checkout)?;
     let workspace_root = PathBuf::from(workspace_root);
-    let repo_root = Utf8PathBuf::try_from(workspace_root.clone())
-        .context("workspace root is not valid UTF-8")?;
+    let repo_root =
+        rho_workspaces::resolve_repo_root(&workspace_root).context("resolve origin repo")?;
     let agent_id = current_agent_id()?;
     let mut lease =
         LandLease::acquire(repo_root.clone(), agent_id, args.socket_path.as_deref()).await?;
@@ -122,10 +122,9 @@ impl LandLease {
         agent_id: Option<AgentId>,
         socket_path: Option<&Path>,
     ) -> Result<Self> {
-        let socket_path = match socket_path {
-            Some(path) => path.to_owned(),
-            None => rho_daemon::default_socket_path()?,
-        };
+        let socket_path = rho_ui_proto::RuntimePaths::resolve(socket_path.map(Path::to_owned))?
+            .socket()
+            .to_owned();
         let mut client = connect_or_start_daemon(&socket_path).await?;
         eprintln!("queued for land lease");
         client

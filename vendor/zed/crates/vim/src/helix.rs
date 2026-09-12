@@ -5,6 +5,7 @@ mod paste;
 mod select;
 mod surround;
 
+use crate::Direction;
 use editor::display_map::{DisplayRow, DisplaySnapshot};
 use editor::{
     DisplayPoint, Editor, EditorSettings, MultiBufferOffset, NavigationOverlayLabel,
@@ -14,12 +15,14 @@ use gpui::actions;
 use gpui::{App, Context, Font, Hsla, Pixels, TaskExt, Window, WindowTextSystem};
 use language::{CharClassifier, CharKind, Point, Selection};
 use multi_buffer::MultiBufferSnapshot;
+#[cfg(feature = "zed-workspace")]
 use search::{BufferSearchBar, SearchOptions};
 use settings::Settings;
 use text::{Bias, LineEnding, SelectionGoal};
 use theme::ActiveTheme as _;
 use ui::px;
-use workspace::searchable::{self, Direction, FilteredSearchRange};
+#[cfg(feature = "zed-workspace")]
+use workspace::searchable::FilteredSearchRange;
 
 use crate::motion::{self, MotionKind};
 use crate::state::{HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, SearchState};
@@ -77,6 +80,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_yank);
     Vim::action(editor, cx, Vim::helix_goto_last_modification);
     Vim::action(editor, cx, Vim::helix_paste);
+    #[cfg(feature = "zed-workspace")]
     Vim::action(editor, cx, Vim::helix_select_regex);
     Vim::action(editor, cx, Vim::helix_keep_newest_selection);
     Vim::action(editor, cx, |vim, _: &HelixDuplicateBelow, window, cx| {
@@ -90,8 +94,11 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_substitute);
     Vim::action(editor, cx, Vim::helix_substitute_no_yank);
     Vim::action(editor, cx, Vim::helix_jump_to_word);
-    Vim::action(editor, cx, Vim::helix_select_next);
-    Vim::action(editor, cx, Vim::helix_select_previous);
+    #[cfg(feature = "zed-workspace")]
+    {
+        Vim::action(editor, cx, Vim::helix_select_next);
+        Vim::action(editor, cx, Vim::helix_select_previous);
+    }
     Vim::action(editor, cx, Vim::helix_trim_selections);
     Vim::action(editor, cx, |vim, _: &PushHelixSurroundAdd, window, cx| {
         vim.clear_operator(window, cx);
@@ -660,6 +667,7 @@ impl Vim {
         self.switch_mode(Mode::Insert, false, window, cx);
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn helix_select_regex(
         &mut self,
         _: &HelixSelectRegex,
@@ -705,7 +713,7 @@ impl Vim {
                         .detach_and_log_err(cx);
                     }
                     self.search = SearchState {
-                        direction: searchable::Direction::Next,
+                        direction: Direction::Next,
                         count: 1,
                         cmd_f_search: false,
                         prior_selections,
@@ -1079,6 +1087,7 @@ impl Vim {
         self.do_helix_substitute(false, window, cx);
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn helix_select_next(
         &mut self,
         _: &HelixSelectNext,
@@ -1088,6 +1097,7 @@ impl Vim {
         self.do_helix_select(Direction::Next, window, cx);
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn helix_select_previous(
         &mut self,
         _: &HelixSelectPrevious,
@@ -1097,9 +1107,10 @@ impl Vim {
         self.do_helix_select(Direction::Prev, window, cx);
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn do_helix_select(
         &mut self,
-        direction: searchable::Direction,
+        direction: Direction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

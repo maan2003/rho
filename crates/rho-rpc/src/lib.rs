@@ -27,7 +27,7 @@ pub const ZSTD_WINDOW_LOG: u32 = 17;
 /// Fast, general-purpose compression for latency-sensitive application data.
 pub const ZSTD_LEVEL: i32 = 3;
 #[cfg(unix)]
-const UNIX_PREFACE: &[u8; 12] = b"RHO-STREAM-3";
+const UNIX_PREFACE: &[u8; 12] = b"RHO-STREAM-5";
 #[cfg(unix)]
 const PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -53,32 +53,13 @@ pub async fn bind_ephemeral_iroh_client() -> anyhow::Result<iroh::Endpoint> {
         .context("bind ephemeral iroh client endpoint")
 }
 
-/// Binds the browser client's externally derived persistent identity with the
-/// bounded stream credit used for selected-agent replacement overlap.
-#[cfg(feature = "browser-client")]
-pub async fn bind_browser_iroh_client(secret: iroh::SecretKey) -> anyhow::Result<iroh::Endpoint> {
-    iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(secret)
-        .transport_config(
-            iroh::endpoint::QuicTransportConfig::builder()
-                .max_concurrent_uni_streams(16u32.into())
-                .build(),
-        )
-        .bind()
-        .await
-        .context("bind browser iroh client endpoint")
-}
-
 /// Performs the mandatory raw, bounded authentication exchange before any
 /// compressed application stream can be opened.
 pub async fn authenticate_iroh_client(
     connection: &iroh::endpoint::Connection,
     client_endpoint_id: iroh::EndpointId,
 ) -> anyhow::Result<rho_iroh_auth::ClientAuthResult> {
-    // `n0_future::time` rather than `tokio::time`: browser clients run this
-    // path on wasm, where tokio's timer calls `std::time::Instant::now` and
-    // panics ("time not implemented on this platform").
-    n0_future::time::timeout(
+    tokio::time::timeout(
         AUTH_TIMEOUT,
         rho_iroh_auth::authenticate_client(connection, client_endpoint_id),
     )
@@ -441,30 +422,11 @@ impl Stream {
             // direction never disables progress in the reverse direction.
             let _: anyhow::Result<((), ())> = tokio::try_join!(reader_loop, writer_loop);
         };
-        #[cfg(not(target_family = "wasm"))]
         let task = tokio::spawn(channel_future);
-        #[cfg(target_family = "wasm")]
-        let task = {
-            let (abort, registration) = futures::future::AbortHandle::new_pair();
-            let (done, joined) = futures::channel::oneshot::channel();
-            wasm_bindgen_futures::spawn_local(async move {
-                let result = futures::future::Abortable::new(channel_future, registration).await;
-                let _ = done.send(result);
-            });
-            BrowserChannelTask {
-                abort,
-                joined: Some(joined),
-            }
-        };
         FramedChannel {
             outgoing,
             incoming,
-            task: ChannelTask {
-                #[cfg(not(target_family = "wasm"))]
-                task: Some(task),
-                #[cfg(target_family = "wasm")]
-                task,
-            },
+            task: ChannelTask { task: Some(task) },
         }
     }
 }
@@ -497,46 +459,21 @@ impl<Tx, Rx> FramedChannel<Tx, Rx> {
 
 /// Aborts both channel directions when the owning application surface drops.
 pub struct ChannelTask {
-    #[cfg(not(target_family = "wasm"))]
     task: Option<tokio::task::JoinHandle<()>>,
-    #[cfg(target_family = "wasm")]
-    task: BrowserChannelTask,
-}
-
-#[cfg(target_family = "wasm")]
-struct BrowserChannelTask {
-    abort: futures::future::AbortHandle,
-    joined: Option<futures::channel::oneshot::Receiver<Result<(), futures::future::Aborted>>>,
 }
 
 impl ChannelTask {
     /// Waits for a sender-driven graceful half-close and peer EOF.
-    #[cfg(not(target_family = "wasm"))]
     pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
         self.task.take().expect("channel task already joined").await
-    }
-
-    /// Waits for a browser-local channel pump to finish or be aborted.
-    #[cfg(target_family = "wasm")]
-    pub async fn join(mut self) -> anyhow::Result<()> {
-        self.task
-            .joined
-            .take()
-            .expect("channel task already joined")
-            .await
-            .map_err(|_| anyhow::anyhow!("channel task completion dropped"))?
-            .map_err(|_| anyhow::anyhow!("channel task aborted"))
     }
 }
 
 impl Drop for ChannelTask {
     fn drop(&mut self) {
-        #[cfg(not(target_family = "wasm"))]
         if let Some(task) = &self.task {
             task.abort();
         }
-        #[cfg(target_family = "wasm")]
-        self.task.abort.abort();
     }
 }
 
@@ -670,12 +607,29 @@ where
     R: AsyncRead + Unpin,
     T: Unpacker,
 {
-    let (payload, ()) = read_frame_with(reader, max_len, |_| async {}).await?;
+    read_frame_optional(reader, max_len)
+        .await?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+}
+
+/// Reads and decodes one bounded frame, returning `None` only for clean EOF
+/// before any bytes of the next decompressed length prefix.
+pub async fn read_frame_optional<R, T>(
+    reader: &mut R,
+    max_len: usize,
+) -> anyhow::Result<Option<(T, usize)>>
+where
+    R: AsyncRead + Unpin,
+    T: Unpacker,
+{
+    let Some((payload, ())) = read_frame_with_optional(reader, max_len, |_| async {}).await? else {
+        return Ok(None);
+    };
     let len = payload.len();
     let mut payload = payload.as_slice();
     let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
     anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok((value, len))
+    Ok(Some((value, len)))
 }
 
 /// Reads one bounded frame while allowing a caller to reserve its declared
@@ -854,6 +808,46 @@ mod tests {
             .unwrap();
         let (message, _): (String, _) = read_frame(&mut receiver, 1024).await.unwrap();
         assert_eq!(message, "hello zstd");
+    }
+
+    #[tokio::test]
+    async fn clean_stream_shutdown_after_frame_returns_eof() {
+        let (left, right) = tokio::io::duplex(4096);
+        let (_, mut writer) = Stream::new(tokio::io::empty(), left).into_split();
+        let (mut reader, _) = Stream::new(right, tokio::io::sink()).into_split();
+
+        write_frame(&mut writer, &"last frame".to_owned(), 1024)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let (message, _): (String, _) = read_frame(&mut reader, 1024).await.unwrap();
+        assert_eq!(message, "last frame");
+        assert!(
+            read_frame_optional::<_, String>(&mut reader, 1024)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_zstd_stream_after_frame_is_an_error() {
+        let (left, right) = tokio::io::duplex(4096);
+        let (_, mut writer) = Stream::new(tokio::io::empty(), left).into_split();
+        let (mut reader, _) = Stream::new(right, tokio::io::sink()).into_split();
+
+        write_frame(&mut writer, &"last frame".to_owned(), 1024)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let (message, _): (String, _) = read_frame(&mut reader, 1024).await.unwrap();
+        assert_eq!(message, "last frame");
+        let error = read_frame_optional::<_, String>(&mut reader, 1024)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("zstd stream did not finish"));
     }
 
     #[tokio::test]

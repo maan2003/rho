@@ -19,11 +19,11 @@ use rho_core::{
 };
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::db::{
-    AgentDisposition, AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _,
-    AgentRole, AgentWriteTxnExt as _, PresentationField, TurnReport,
+    AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, AgentWant,
+    AgentWriteTxnExt as _, PresentationField, TurnReport,
 };
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
@@ -61,23 +61,190 @@ summary is a concise few-word label of the outcome — for report_needs_you, of 
 asked — at most 50 bytes, the same shape as activity. Use lowercase except for types, \
 functions, and other code identifiers; no trailing period. Use the tools; do not write prose.";
 
-pub struct Watch {
-    release: Option<Box<dyn FnOnce() + Send>>,
+/// What the sidecar's background task tells its owning loop. A loop that
+/// gets one of these hands it to [`Sidecar`] on its own thread of control,
+/// so completion can never race the loop's own source commits.
+pub(crate) enum SidecarMessage {
+    /// Whether anyone is looking at the agent: the pool says so when it
+    /// enters or leaves the live set.
+    Watch { watching: bool },
+    /// The task is about to read the durable tail; `acknowledged` says
+    /// whether that generation is still wanted.
+    Started {
+        generation: u64,
+        acknowledged: oneshot::Sender<bool>,
+    },
+    Finished {
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    },
 }
 
-impl Drop for Watch {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            release();
+/// The scheduling half of the sidecar, owned by a runtime loop: when a
+/// generation runs, coalescing, throttling, and which durable source the
+/// last request read. The loop persists what comes back.
+pub(crate) struct Sidecar {
+    session: Arc<TokioMutex<Session>>,
+    /// Someone is looking: titles and activity are made only then.
+    watched: bool,
+    dirty: bool,
+    generation: u64,
+    last_started: Option<tokio::time::Instant>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// The newest source committed, so a late result for an older one is
+    /// never allowed to overwrite the cache.
+    last_source: Option<AgentEventPos>,
+}
+
+impl Sidecar {
+    pub(crate) fn new(inference: Inference, last_source: Option<AgentEventPos>) -> Self {
+        Self {
+            session: Arc::new(TokioMutex::new(Session::new(inference))),
+            watched: false,
+            dirty: false,
+            generation: 0,
+            last_started: None,
+            task: None,
+            last_source,
         }
     }
-}
 
-impl Watch {
-    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
-        Self {
-            release: Some(Box::new(release)),
+    /// The loop-owned session, shared with turn reports so both request
+    /// kinds keep one prompt prefix warm.
+    pub(crate) fn session(&self) -> Arc<TokioMutex<Session>> {
+        Arc::clone(&self.session)
+    }
+
+    /// A source landed durably at `through`. Follow with [`Self::schedule`].
+    pub(crate) fn source_committed(&mut self, through: AgentEventPos) {
+        self.last_source = Some(through);
+        self.dirty = true;
+    }
+
+    /// Returns whether a schedule is now due.
+    pub(crate) fn watch(&mut self, watching: bool) -> bool {
+        if watching == self.watched {
+            return false;
         }
+        self.watched = watching;
+        if watching {
+            self.dirty = true;
+            true
+        } else {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+            false
+        }
+    }
+
+    /// Whether `generation` may go ahead and read the durable snapshot.
+    pub(crate) fn started(&mut self, generation: u64) -> bool {
+        let accepted = self.generation == generation && self.watched && self.task.is_some();
+        if accepted {
+            // Sources observed before this boundary are in the durable
+            // snapshot about to be read; only later sources need another
+            // coalesced request.
+            self.dirty = false;
+            self.last_started = Some(tokio::time::Instant::now());
+        }
+        accepted
+    }
+
+    /// A generation finished. `None` when it was not the current one and
+    /// there is nothing to do; otherwise the update to persist, if any,
+    /// and the caller schedules again afterwards.
+    pub(crate) fn finished(
+        &mut self,
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    ) -> Option<Option<AgentPresentationUpdate>> {
+        if self.generation != generation {
+            return None;
+        }
+        self.task = None;
+        Some(match result {
+            // A newer source already has a coalesced request pending; this
+            // older snapshot must not overwrite the cache meanwhile.
+            Ok(Some(update)) if self.last_source != Some(update.through) => None,
+            Ok(update) => update,
+            Err(error) => {
+                eprintln!("rho-agent: presentation generation failed: {error}");
+                None
+            }
+        })
+    }
+
+    /// Forget any request in flight: the lineage moved under it.
+    pub(crate) fn reset(&mut self, last_source: Option<AgentEventPos>) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.last_started = None;
+        self.dirty = self.watched;
+        self.last_source = last_source;
+    }
+
+    /// The turn ended: the next turn's first update should not inherit
+    /// this one's throttle spacing.
+    pub(crate) fn turn_settled(&mut self) {
+        self.last_started = None;
+    }
+
+    pub(crate) fn abort(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    /// Start a generation if one is wanted and none is running. `deliver`
+    /// hands the task's messages back to the owning loop and says whether
+    /// the loop is still there.
+    pub(crate) fn schedule(
+        &mut self,
+        db: RhoDb,
+        agent_id: AgentId,
+        deliver: impl Fn(SidecarMessage) -> bool + Send + Sync + 'static,
+    ) {
+        if !self.watched || !self.dirty || self.task.is_some() {
+            return;
+        }
+        self.dirty = false;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let now = tokio::time::Instant::now();
+        let delay = self
+            .last_started
+            .and_then(|started| MIN_INTERVAL.checked_sub(now.duration_since(started)))
+            .unwrap_or_default();
+        let session = Arc::clone(&self.session);
+        self.task = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = if !has_input(&db, agent_id) {
+                Ok(None)
+            } else {
+                match acquire_request().await {
+                    Ok(permit) => {
+                        let (acknowledged, accepted) = oneshot::channel();
+                        if !deliver(SidecarMessage::Started {
+                            generation,
+                            acknowledged,
+                        }) {
+                            return;
+                        }
+                        if !accepted.await.unwrap_or(false) {
+                            return;
+                        }
+                        generate(db, session, agent_id, permit)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            deliver(SidecarMessage::Finished { generation, result });
+        }));
     }
 }
 
@@ -94,24 +261,6 @@ pub(crate) async fn acquire_request() -> anyhow::Result<OwnedSemaphorePermit> {
 
 pub(crate) fn has_input(db: &RhoDb, agent_id: AgentId) -> bool {
     presentation_input(db, agent_id).is_some()
-}
-
-/// Canonical durable representation of one external Claude transcript item.
-/// Keeping the cap at the mirror boundary prevents an unbounded JSONL record
-/// from becoming a second unbounded local persistence path.
-pub(crate) fn canonical_source_text(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut capped = String::new();
-    for character in text.chars() {
-        if capped.len() + character.len_utf8() > MAX_MESSAGE_BYTES {
-            break;
-        }
-        capped.push(character);
-    }
-    Some(capped)
 }
 
 pub(crate) async fn generate(
@@ -147,15 +296,9 @@ pub(crate) fn spawn_turn_report(
         return;
     }
     // Sub-agent turns are the parent's court unless the user has personally
-    // messaged the agent, and Iris is not a rail row; neither gets a report.
-    let record = db.read().get_agent(agent_id);
-    if (record.parent_agent.is_some() && !record.user_interacted)
-        || record.role == AgentRole::Iris
-        || record
-            .labels
-            .iter()
-            .any(|label| label == crate::iris_tools::LABEL)
-    {
+    // messaged the agent; those get no report.
+    let head = db.read().get_agent(agent_id);
+    if head.parent.is_some() && !head.user_interacted {
         return;
     }
     tokio::spawn(async move {
@@ -175,20 +318,22 @@ pub(crate) fn spawn_turn_report(
                 return;
             }
         };
-        // Pending still wants the report; so does snoozed — the turn
-        // finished inside the quiet window and the expiry broadcast will
-        // resurface this row, summary and all. A Done row keeps showing its
-        // settled summary, so a raced ack persists too; only Hidden means
-        // the user does not want the row at all.
-        match db.read().get_agent(agent_id).disposition {
-            AgentDisposition::Pending
-            | AgentDisposition::Snoozed { .. }
-            | AgentDisposition::Done => {}
-            AgentDisposition::Hidden => return,
-        }
         {
             let mut write = db.write().await;
-            write.record_agent_turn_report(agent_id, &report);
+            // Until the reply's own tag is parsed (`AGENT-WANTS-DESIGN.md`),
+            // this classification is what the log has to say about what
+            // the turn asks of the person. Whether the person wants the
+            // row at all is the desk's, on the client.
+            write.tell_wants(
+                rho_core::UnixMs::now(),
+                agent_id,
+                if report.needs_you {
+                    AgentWant::Ask
+                } else {
+                    AgentWant::Show
+                },
+                (!report.summary.is_empty()).then(|| report.summary.clone()),
+            );
             write.commit();
         }
         if let Some(pool) = pool.upgrade() {
@@ -209,10 +354,12 @@ fn presentation_context(db: &RhoDb, agent_id: AgentId) -> (Seed, Vec<Presentatio
     (
         Seed {
             title: record
-                .display_name
+                .config
+                .spawn_name
+                .clone()
                 .map(|title| (title, true))
-                .or_else(|| record.generated_title.map(|title| (title, false))),
-            activity: record.activity,
+                .or_else(|| record.generated_title.clone().map(|title| (title, false))),
+            activity: record.activity.clone(),
         },
         presentation_sources(agent_id, &records),
     )
@@ -615,6 +762,8 @@ fn tool_results(items: &[InferenceResponseItem]) -> Vec<ToolResult> {
                     call_id: id.clone(),
                     tool_type: *tool_type,
                     body: ToolOutput {
+                        full_output: None,
+                        images: std::sync::Arc::new(Vec::new()),
                         output: Arc::new("presentation recorded".to_owned()),
                         status: ToolOutputStatus::Success,
                     },
@@ -650,8 +799,7 @@ fn xml_escape_capped(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, MAX_STATUS_BYTES, MAX_SUMMARY_BYTES, bounded_status, bounded_summary,
-        bounded_title, canonical_source_text,
+        MAX_STATUS_BYTES, MAX_SUMMARY_BYTES, bounded_status, bounded_summary, bounded_title,
     };
 
     #[test]
@@ -682,13 +830,5 @@ mod tests {
         let capped = bounded_summary(&"é".repeat(MAX_SUMMARY_BYTES)).unwrap();
         assert!(capped.len() <= MAX_SUMMARY_BYTES);
         assert!(capped.is_char_boundary(capped.len()));
-    }
-
-    #[test]
-    fn canonical_source_text_trims_and_caps_unicode() {
-        assert_eq!(canonical_source_text("  \n "), None);
-        let text = canonical_source_text(&"é".repeat(MAX_MESSAGE_BYTES)).unwrap();
-        assert!(text.len() <= MAX_MESSAGE_BYTES);
-        assert!(text.is_char_boundary(text.len()));
     }
 }

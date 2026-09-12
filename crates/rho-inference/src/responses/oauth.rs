@@ -401,7 +401,7 @@ fn format_error_body(content_type: &str, body: &str) -> String {
     trimmed.to_owned()
 }
 
-fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "no parent for atomic write path")
     })?;
@@ -416,7 +416,7 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(tmp_path, path)
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {

@@ -1,13 +1,13 @@
 use gpui::{App, Context, Entity};
 use language::{self, Buffer, BufferEditSource, TransactionId};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Range,
     time::Duration,
 };
-use web_time::Instant;
 use sum_tree::Bias;
 use text::BufferId;
+use web_time::Instant;
 
 use crate::{Anchor, BufferState, MultiBufferOffset};
 
@@ -41,6 +41,8 @@ struct Transaction {
     first_edit_at: Instant,
     last_edit_at: Instant,
     suppress_grouping: bool,
+    external: bool,
+    aliases: HashSet<TransactionId>,
 }
 
 impl History {
@@ -54,6 +56,8 @@ impl History {
                 first_edit_at: now,
                 last_edit_at: now,
                 suppress_grouping: false,
+                external: false,
+                aliases: HashSet::new(),
             });
             Some(id)
         } else {
@@ -107,6 +111,8 @@ impl History {
             first_edit_at: now,
             last_edit_at: now,
             suppress_grouping: false,
+            external: false,
+            aliases: HashSet::new(),
         };
         if !transaction.buffer_transactions.is_empty() {
             self.undo_stack.push(transaction);
@@ -170,6 +176,28 @@ impl History {
         }
     }
 
+    fn push_external(&mut self, now: Instant) -> TransactionId {
+        let id = self.next_transaction_id.tick();
+        self.undo_stack.push(Transaction {
+            id,
+            buffer_transactions: HashMap::new(),
+            first_edit_at: now,
+            last_edit_at: now,
+            suppress_grouping: true,
+            external: true,
+            aliases: HashSet::new(),
+        });
+        self.redo_stack.clear();
+        id
+    }
+
+    fn external_undo(&mut self) -> Option<TransactionId> {
+        self.undo_stack
+            .last()
+            .is_some_and(|transaction| transaction.external)
+            .then(|| self.undo_stack.pop().unwrap().id)
+    }
+
     fn pop_redo(&mut self) -> Option<&mut Transaction> {
         assert_eq!(self.transaction_depth, 0);
         if let Some(transaction) = self.redo_stack.pop() {
@@ -212,7 +240,7 @@ impl History {
     fn group_until(&mut self, transaction_id: TransactionId) {
         let mut count = 0;
         for transaction in self.undo_stack.iter().rev() {
-            if transaction.id == transaction_id {
+            if transaction.id == transaction_id || transaction.aliases.contains(&transaction_id) {
                 self.group_trailing(count);
                 break;
             } else if transaction.suppress_grouping {
@@ -231,6 +259,10 @@ impl History {
                 last_transaction.last_edit_at = transaction.last_edit_at;
             }
             for to_merge in transactions_to_merge {
+                last_transaction.aliases.insert(to_merge.id);
+                last_transaction
+                    .aliases
+                    .extend(to_merge.aliases.iter().copied());
                 for (buffer_id, transaction_id) in &to_merge.buffer_transactions {
                     last_transaction
                         .buffer_transactions
@@ -442,6 +474,13 @@ impl MultiBuffer {
         self.history.finalize_last_transaction();
     }
 
+    /// Adds an undo entry for a semantic edit owned by the embedding view
+    /// rather than by a text buffer. The returned id is emitted through
+    /// `TransactionUndone` when this entry reaches the top of the stack.
+    pub fn push_external_transaction(&mut self) -> TransactionId {
+        self.history.push_external(Instant::now())
+    }
+
     pub fn group_until_transaction(
         &mut self,
         transaction_id: TransactionId,
@@ -457,11 +496,13 @@ impl MultiBuffer {
     }
     pub fn undo(&mut self, cx: &mut Context<Self>) -> Option<TransactionId> {
         let mut transaction_id = None;
-        if let Some(buffer) = self.as_singleton() {
+        if let Some(external) = self.history.external_undo() {
+            transaction_id = Some(external);
+        } else if let Some(buffer) = self.as_singleton() {
             transaction_id = buffer.update(cx, |buffer, cx| buffer.undo(cx));
         } else {
             while let Some(transaction) = self.history.pop_undo() {
-                let mut undone = false;
+                let mut undone = transaction.external;
                 for (buffer_id, buffer_transaction_id) in &mut transaction.buffer_transactions {
                     if let Some(BufferState { buffer, .. }) = self.buffers.get(buffer_id) {
                         undone |= buffer.update(cx, |buffer, cx| {
@@ -543,5 +584,51 @@ impl MultiBuffer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod external_transaction_tests {
+    use super::*;
+
+    #[test]
+    fn external_transaction_is_consumed_by_undo() {
+        let mut history = History::default();
+        let id = history.push_external(Instant::now());
+        assert_eq!(history.external_undo(), Some(id));
+        assert!(history.external_undo().is_none());
+        assert!(history.pop_redo().is_none());
+    }
+
+    #[test]
+    fn grouped_transaction_alias_keeps_insert_session_attached() {
+        let mut history = History::default();
+        let external = history.push_external(Instant::now());
+        let first = history.next_transaction_id.tick();
+        history.undo_stack.push(Transaction {
+            id: first,
+            buffer_transactions: HashMap::new(),
+            first_edit_at: Instant::now(),
+            last_edit_at: Instant::now(),
+            suppress_grouping: false,
+            external: false,
+            aliases: HashSet::new(),
+        });
+        history.group_until(external);
+        let second = history.next_transaction_id.tick();
+        history.undo_stack.push(Transaction {
+            id: second,
+            buffer_transactions: HashMap::new(),
+            first_edit_at: Instant::now(),
+            last_edit_at: Instant::now(),
+            suppress_grouping: false,
+            external: false,
+            aliases: HashSet::new(),
+        });
+
+        history.group_until(first);
+
+        assert_eq!(history.undo_stack.len(), 1);
+        assert_eq!(history.external_undo(), Some(external));
     }
 }

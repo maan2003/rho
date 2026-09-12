@@ -34,6 +34,12 @@ use std::{
     pin::Pin,
 };
 
+mod scene_recorder;
+pub use scene_recorder::{
+    DistinctScene, FrameSubscene, PrimitiveChange, RecordedPrimitive, SceneFrame, SceneOwner,
+    SceneRecorder, SubsceneId,
+};
+
 /// Strategy injected into `#[gpui::property_test]` tests to control the seed
 /// given to the scheduler. Doesn't shrink, since all scheduler seeds are
 /// equivalent in complexity. If `$SEED` is set, it always uses that value.

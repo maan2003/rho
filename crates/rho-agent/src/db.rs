@@ -1,42 +1,49 @@
 //! Raw redb schema for persisted agents.
+//!
+//! One log per agent (`agent_log`), dense positions from zero; one journal
+//! (`journal`) naming every append in the order it landed. Nothing derived
+//! is stored: what an agent is now is folded from its log on read
+//! (`AGENT-LOG-DESIGN.md`, "the mirror is a pure function of the raw log").
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use camino::Utf8PathBuf;
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
-use rho_workset::WorkspaceInfo;
+pub use rho_ui_proto::mirror::{AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome};
+use rho_workspaces::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 
 use crate::AgentEvent;
+use crate::mirror::{Feed, Journal, LogAppended};
 
 const COUNTERS: TableDefinition<CounterKey, u64> = TableDefinition::new("counters");
 /// Singleton row holding this database's random machine seed (see
 /// [`PrefixIdDomain::machine_seed`]), generated once at init.
 const MACHINE: TableDefinition<u8, u64> = TableDefinition::new("machine");
 const MACHINE_SEED_KEY: u8 = 0;
-const FORMAT: TableDefinition<(), String> = TableDefinition::new("format");
-const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
-    TableDefinition::new("lineage_parents");
-const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
-    TableDefinition::new("agent_events");
-/// A compact index of presentation history. Keeping it separate from the
-/// full transcript lets rewind repair inspect only sidecar updates.
-const PRESENTATION_EVENTS: TableDefinition<AgentEventPos, Sen<AgentPresentationUpdate>> =
-    TableDefinition::new("agent_presentation_events");
+pub(crate) const FORMAT: TableDefinition<(), String> = TableDefinition::new("format");
+/// The redb savepoint taken before a migration, by the hop it guards
+/// (`from->to`), so `rho debug rollback` can put the store back.
+const RECOVERY: TableDefinition<String, u64> = TableDefinition::new("recovery_savepoints");
+/// Every agent's raw log: one row per event, keyed by agent then
+/// position, so a range read gives one agent and nothing else. Never
+/// rewritten; a rewind is a row like any other.
+const AGENT_LOG: TableDefinition<(AgentId, u64), Sen<AgentEvent<'static>>> =
+    TableDefinition::new("agent_log");
+/// The order every append landed in, across agents: `seq -> (agent, pos)`,
+/// written in the same transaction as the row it names. What a client
+/// follows to stay current.
+const JOURNAL: TableDefinition<u64, (AgentId, u64)> = TableDefinition::new("journal");
+/// Where each Claude agent's transcript rows stop: the session file they
+/// came from and one past the last line copied. Written with the rows.
 const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
-const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
-const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
-/// Opaque client-owned view configuration (see
-/// [`AgentReadTxnExt::view_config`]).
-const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
 const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
@@ -45,7 +52,10 @@ const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
 const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_time_provider");
-const CURRENT_AGENT_DB_FORMAT: &str = "d37a6f02";
+/// The Claude account every agent runs on. One row: the account is global,
+/// and switching it moves every agent at its next turn.
+const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
+const CURRENT_AGENT_DB_FORMAT: &str = "3ac1e7d4";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -61,7 +71,6 @@ struct CounterKey(u8);
 
 impl CounterKey {
     pub const LAST_AGENT_ID: Self = Self(1);
-    pub const LAST_LINEAGE_ID: Self = Self(2);
 }
 
 /// A persistent relationship that routes every future terminal response from
@@ -132,6 +141,8 @@ impl AgentUsageModel {
     pub const OPUS: Self = Self(3);
     pub const TERRA: Self = Self(4);
     pub const LUNA: Self = Self(5);
+    pub const GEMINI: Self = Self(6);
+    pub const ASTRA: Self = Self(7);
 
     pub fn name(self) -> &'static str {
         match self {
@@ -140,6 +151,8 @@ impl AgentUsageModel {
             Self::OPUS => "opus",
             Self::TERRA => "terra",
             Self::LUNA => "luna",
+            Self::GEMINI => "gemini",
+            Self::ASTRA => "astra",
             _ => "unknown",
         }
     }
@@ -196,14 +209,21 @@ impl AgentUsageBucket {
     }
 }
 
-fn usage_model(record: &AgentRecord) -> AgentUsageModel {
-    match record.runtime {
-        AgentRuntime::Rho { .. } => match record.binding.deep_model() {
+fn usage_model(config: &AgentConfig) -> AgentUsageModel {
+    usage_model_of(&config.runtime, config.binding)
+}
+
+/// The model a runtime and binding bill as.
+pub(crate) fn usage_model_of(runtime: &AgentRuntime, binding: SessionBinding) -> AgentUsageModel {
+    match runtime {
+        AgentRuntime::Rho { .. } => match binding.deep_model() {
+            Some(InferenceModel::Gpt6Astra) => AgentUsageModel::ASTRA,
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
+            Some(InferenceModel::Gemini37FlashLow) => AgentUsageModel::GEMINI,
             _ => AgentUsageModel::GPT,
         },
-        AgentRuntime::Claude { .. } => match record.binding.claude_model() {
+        AgentRuntime::Claude { .. } => match binding.claude_model() {
             Some(rho_claude::Model::Opus) => AgentUsageModel::OPUS,
             Some(rho_claude::Model::Fable | rho_claude::Model::Sonnet) | None => {
                 AgentUsageModel::FABLE
@@ -240,39 +260,48 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
         }
 }
 
-pub use rho_core::{
-    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, AgentWorkflow,
-    EngineerIntelligence,
-};
+pub use rho_core::{AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence};
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct ProjectRecord {
-    pub name: String,
-    pub description: String,
-    pub created_at: UnixMillis,
-}
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
-)]
-pub struct AgentLineageId(u64);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Key, RedbValue, Encode, Decode,
-)]
+/// A position in one agent's log: dense from zero, never reused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct AgentEventPos {
-    lineage_id: AgentLineageId,
-    seq: u32,
+    pub pos: u64,
 }
 
-/// One field in a model-derived presentation update. `Clear` remains distinct
-/// from `Unchanged` for explicit cache maintenance, while normal turn
-/// settlement leaves the last model-derived activity intact.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum PresentationField {
-    Unchanged,
-    Set(String),
-    Clear,
+impl AgentEventPos {
+    pub const ZERO: Self = Self { pos: 0 };
+
+    pub fn new(pos: u64) -> Self {
+        Self { pos }
+    }
+
+    pub fn next(self) -> Self {
+        Self {
+            pos: self
+                .pos
+                .checked_add(1)
+                .expect("agent log position overflow"),
+        }
+    }
+
+    /// The position before this one; zero stays zero.
+    pub fn previous(self) -> Self {
+        Self {
+            pos: self.pos.saturating_sub(1),
+        }
+    }
+}
+
+impl From<AgentEventPos> for rho_ui_proto::mirror::AgentPos {
+    fn from(pos: AgentEventPos) -> Self {
+        Self(pos.pos)
+    }
+}
+
+impl From<rho_ui_proto::mirror::AgentPos> for AgentEventPos {
+    fn from(pos: rho_ui_proto::mirror::AgentPos) -> Self {
+        Self { pos: pos.0 }
+    }
 }
 
 /// A sidecar-derived title/activity update. `through` is a durable source
@@ -285,89 +314,63 @@ pub struct AgentPresentationUpdate {
     pub through: AgentEventPos,
 }
 
-/// The durable cache projected to the UI and used to seed a fresh Luna turn.
+/// The title and activity a reader sees, and what seeds a fresh Luna turn.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentPresentationCache {
     pub generated_title: Option<String>,
     pub activity: Option<String>,
 }
 
-impl AgentEventPos {
-    fn root(lineage_id: AgentLineageId) -> Self {
-        Self { lineage_id, seq: 0 }
-    }
-
-    pub(crate) fn next(self) -> Self {
-        Self {
-            lineage_id: self.lineage_id,
-            seq: self
-                .seq
-                .checked_add(1)
-                .expect("agent timeline sequence overflow"),
-        }
-    }
-}
-
 pub type UnixMillis = UnixMs;
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct AgentRecord {
-    pub display_name: Option<String>,
-    /// The sidecar title. A manual `display_name` always takes precedence.
-    #[senax(default)]
-    pub generated_title: Option<String>,
-    /// The last durable, model-derived activity label.
-    #[senax(default)]
-    pub activity: Option<String>,
+/// What the agent is, folded from `Created` and the config events that
+/// follow it. Nothing here is written directly: a change is an event
+/// first and reaches the head through the fold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConfig {
+    pub role: AgentRole,
+    pub(crate) binding: SessionBinding,
+    pub runtime: AgentRuntime,
     /// The agent's working set: where it works, primary workdir first.
-    /// Fixed at spawn — never removed or reordered, because accumulated
+    /// Fixed at spawn - never removed or reordered, because accumulated
     /// model context assumes the entries stay valid. Managed workspace ids
     /// are repository-local and allocated by jj; joined agents retain the
     /// owning agent's id for that repository.
     pub workdirs: Vec<WorkspaceInfo>,
-    pub created_at: UnixMillis,
-    pub updated_at: UnixMillis,
-    pub current_lineage: AgentLineageId,
-    pub parent_agent: Option<AgentId>,
     pub spawned_by: AgentSpawnedBy,
-    pub role: AgentRole,
-    pub(crate) binding: SessionBinding,
-    pub runtime: AgentRuntime,
+    /// The name the spawner gave. A generated title is never made for an
+    /// agent that has one, and it always beats a generated title.
+    pub spawn_name: Option<String>,
+    pub created_at: UnixMillis,
     /// A message-only Claude rewind whose destination transcript has not yet
     /// been durably materialized and verified. The old runtime remains
     /// authoritative until then.
-    #[senax(default)]
     pub claude_rewind: Option<ClaudeRewind>,
-    /// When the user last sent this agent a message; rail recency seed.
-    /// Turn ends raise attention but leave this alone — replying is the
-    /// engagement signal, finishing is the agent's schedule.
-    #[senax(default)]
-    pub last_user_message: UnixMillis,
-    /// A one-line snippet of that message, so summaries can say what the
-    /// user last asked without replaying the transcript.
-    #[senax(default)]
-    pub last_user_message_text: String,
-    /// Free-form markers ("pin", …); semantics live in the client's view
-    /// layer. Not copied on spawn.
-    #[senax(default)]
-    pub labels: Vec<String>,
-    /// The user's verdict on the last finished turn; attention is derived
-    /// from this plus live agent state, never stored.
-    #[senax(default)]
-    pub disposition: AgentDisposition,
-    /// One-shot classification of the last finished turn. Cleared when the
-    /// user replies — the report describes a ball that is no longer in the
-    /// user's court.
-    #[senax(default)]
-    pub turn_report: Option<TurnReport>,
-    /// The user has messaged this agent directly (agent mail doesn't count).
-    /// Sticky: once engaged, the agent's turn ends are the user's court even
-    /// for a sub-agent, so it gets attention and turn reports like a root.
-    #[senax(default)]
-    pub user_interacted: bool,
 }
 
-/// What a finished turn asks of the user, derived from its final message.
+/// What an agent is now: the fold of its whole log, hidden rows included
+/// (a rewind takes back history, not configuration). Made on read, never
+/// stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentHead {
+    pub config: AgentConfig,
+    /// The sidecar title. A spawn name always takes precedence.
+    pub generated_title: Option<String>,
+    /// The last durable, model-derived activity label.
+    pub activity: Option<String>,
+    /// Whether a turn is running, folded from the log's turn events.
+    pub turn_running: bool,
+    /// The agent that spawned this one.
+    pub parent: Option<AgentId>,
+    /// The user has messaged this agent directly (agent mail doesn't count).
+    /// Sticky: once engaged, the agent's turn ends are the user's court even
+    /// for a sub-agent, so it gets turn reports like a root.
+    pub user_interacted: bool,
+    pub last_turn_ended: Option<UnixMillis>,
+    /// Where the next event goes: one past the last row, hidden or not.
+    pub next: AgentEventPos,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TurnReport {
     pub needs_you: bool,
@@ -377,11 +380,27 @@ pub struct TurnReport {
     pub summary: String,
 }
 
-impl AgentRecord {
+impl AgentHead {
     pub fn config(&self) -> AgentRole {
-        self.role
+        self.config.role
     }
 
+    /// The primary workdir (entry 0): default cwd, prompt header, UI label.
+    pub fn primary_workdir(&self) -> &WorkspaceInfo {
+        self.config.primary_workdir()
+    }
+
+    /// The agent's name for a reader: what the spawner called it, else what
+    /// the sidecar made of it.
+    pub fn title(&self) -> Option<&str> {
+        self.config
+            .spawn_name
+            .as_deref()
+            .or(self.generated_title.as_deref())
+    }
+}
+
+impl AgentConfig {
     /// The primary workdir (entry 0): default cwd, prompt header, UI label.
     pub fn primary_workdir(&self) -> &WorkspaceInfo {
         self.workdirs
@@ -403,16 +422,33 @@ pub struct ClaudeRewind {
     pub resume_at: Option<Uuid>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode)]
 pub enum AgentSpawnedBy {
     #[default]
+    Direct,
+    Engineer,
+}
+
+/// `AgentSpawnedBy` as rows wrote it while the PM role existed; a PM
+/// parent reads as an Engineer parent now.
+#[derive(Decode)]
+enum StoredAgentSpawnedBy {
     Direct,
     PM,
     Engineer,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub(crate) enum SessionBinding {
+impl senax_encoder::Decoder for AgentSpawnedBy {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        Ok(match StoredAgentSpawnedBy::decode(reader)? {
+            StoredAgentSpawnedBy::Direct => Self::Direct,
+            StoredAgentSpawnedBy::PM | StoredAgentSpawnedBy::Engineer => Self::Engineer,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
+pub enum SessionBinding {
     ResponsesGpt55(InferenceProfile),
     ClaudeFable {
         effort: ClaudeEffort,
@@ -425,12 +461,6 @@ pub(crate) enum SessionBinding {
     ResponsesSol(InferenceProfile),
     ResponsesLuna(InferenceProfile),
     ResponsesTerra(InferenceProfile),
-    /// Terra with a coordinator system-prompt section: a user-facing agent
-    /// that delegates repo-specific work to spawned workers. Appended so
-    /// persisted modes keep decoding.
-    CoordinatorTerra(InferenceProfile),
-    /// Sol-backed coordinator used by the opinionated medium/high levels.
-    CoordinatorSol(InferenceProfile),
     /// Ultra advisory agent. Kept distinct from an ultra engineer so its role
     /// survives session pinning.
     ClaudeAdvisor {
@@ -441,6 +471,63 @@ pub(crate) enum SessionBinding {
     /// Terra-backed cheap advisory agent. Appended so persisted modes keep
     /// decoding.
     AdvisorTerra(InferenceProfile),
+    /// Reduced function-tool Gemini agent. Appended for persisted
+    /// compatibility.
+    AntigravityFlashLow(InferenceProfile),
+    /// GPT-6 Astra-backed engineer.
+    ResponsesAstra(InferenceProfile),
+    /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
+    AdvisorAstra(InferenceProfile),
+}
+
+/// `SessionBinding` as rows wrote it while the PM role existed. The
+/// coordinator bindings were Sol and Terra with a PM prompt; they read as
+/// the plain Sol and Terra bindings now. The Python-suffixed bindings named
+/// a tool surface every engineer has since, so they read as their models.
+#[derive(Decode)]
+enum StoredSessionBinding {
+    ResponsesGpt55(InferenceProfile),
+    ClaudeFable { effort: ClaudeEffort },
+    ClaudeOpus { effort: ClaudeEffort },
+    ResponsesSol(InferenceProfile),
+    ResponsesLuna(InferenceProfile),
+    ResponsesTerra(InferenceProfile),
+    CoordinatorTerra(InferenceProfile),
+    CoordinatorSol(InferenceProfile),
+    ClaudeAdvisor { effort: ClaudeEffort },
+    AdvisorSol(InferenceProfile),
+    AdvisorTerra(InferenceProfile),
+    AntigravityFlashLow(InferenceProfile),
+    ResponsesAstra(InferenceProfile),
+    AdvisorAstra(InferenceProfile),
+    ResponsesSolPython(InferenceProfile),
+    ClaudeFablePython { effort: ClaudeEffort },
+}
+
+impl senax_encoder::Decoder for SessionBinding {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        use StoredSessionBinding as Stored;
+        Ok(match Stored::decode(reader)? {
+            Stored::ResponsesGpt55(config) => Self::ResponsesGpt55(config),
+            Stored::ClaudeFable { effort } => Self::ClaudeFable { effort },
+            Stored::ClaudeOpus { effort } => Self::ClaudeOpus { effort },
+            Stored::ResponsesSol(config) | Stored::CoordinatorSol(config) => {
+                Self::ResponsesSol(config)
+            }
+            Stored::ResponsesLuna(config) => Self::ResponsesLuna(config),
+            Stored::ResponsesTerra(config) | Stored::CoordinatorTerra(config) => {
+                Self::ResponsesTerra(config)
+            }
+            Stored::ClaudeAdvisor { effort } => Self::ClaudeAdvisor { effort },
+            Stored::AdvisorSol(config) => Self::AdvisorSol(config),
+            Stored::AdvisorTerra(config) => Self::AdvisorTerra(config),
+            Stored::AntigravityFlashLow(config) => Self::AntigravityFlashLow(config),
+            Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
+            Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
+            Stored::ResponsesSolPython(config) => Self::ResponsesSol(config),
+            Stored::ClaudeFablePython { effort } => Self::ClaudeFable { effort },
+        })
+    }
 }
 
 pub(crate) trait AgentRoleSessionProfile {
@@ -452,98 +539,57 @@ impl AgentRoleSessionProfile for AgentRole {
         let deep = |effort| InferenceProfile {
             effort,
             fast_mode: false,
-            code_mode: true,
         };
         Ok(match self {
-            AgentRole::PM | AgentRole::WorkflowPM { .. } => {
-                SessionBinding::CoordinatorSol(InferenceProfile {
-                    code_mode: false,
-                    ..deep(ReasoningEffort::Low)
-                })
-            }
-            AgentRole::Iris => SessionBinding::ResponsesTerra(InferenceProfile {
-                effort: ReasoningEffort::Medium,
-                fast_mode: true,
-                code_mode: false,
-            }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Mini,
-                ..
             } => SessionBinding::ResponsesLuna(InferenceProfile {
                 fast_mode: true,
-                code_mode: false,
                 ..deep(ReasoningEffort::Xhigh)
             }),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Low,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Low,
-                ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::Low)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             } => SessionBinding::ResponsesTerra(deep(ReasoningEffort::High)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Medium,
             } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Medium,
-                workflow: AgentWorkflow::PrFriendly,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::High)),
-            AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Medium,
-                workflow: AgentWorkflow::Default,
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::High,
-                ..
-            } => SessionBinding::ResponsesSol(deep(ReasoningEffort::Xhigh)),
+            } => SessionBinding::ResponsesAstra(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Ultra,
-                ..
             } => SessionBinding::ClaudeFable {
                 effort: ClaudeEffort::High,
             },
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Alt,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Alt,
-                ..
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
             },
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini,
+            } => SessionBinding::AntigravityFlashLow(InferenceProfile {
+                effort: ReasoningEffort::Medium,
+                fast_mode: false,
+            }),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
-            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
+            } => SessionBinding::AdvisorSol(deep(ReasoningEffort::High)),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Cheap,
             } => SessionBinding::AdvisorTerra(deep(ReasoningEffort::Xhigh)),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
-            } => SessionBinding::ClaudeAdvisor {
-                effort: ClaudeEffort::High,
-            },
+            } => SessionBinding::AdvisorAstra(deep(ReasoningEffort::Medium)),
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub(crate) enum ClaudeEffort {
+pub enum ClaudeEffort {
     Medium,
     Xhigh,
     High,
@@ -551,9 +597,11 @@ pub(crate) enum ClaudeEffort {
 
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
-        if self.is_coordinator() {
-            return AgentRole::pm();
-        } else if matches!(self, Self::ClaudeAdvisor { .. }) {
+        if matches!(self, Self::ResponsesAstra(_)) {
+            return AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            };
+        } else if matches!(self, Self::ClaudeAdvisor { .. } | Self::AdvisorAstra(_)) {
             return AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
             };
@@ -568,6 +616,7 @@ impl SessionBinding {
         }
         let intelligence = match self {
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
+            Self::AntigravityFlashLow(_) => EngineerIntelligence::Gemini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
@@ -586,11 +635,12 @@ impl SessionBinding {
             Self::ResponsesTerra(config) if config.effort == ReasoningEffort::High => {
                 EngineerIntelligence::Cheap
             }
+            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => {
+                unreachable!("Astra role binding returned above")
+            }
             Self::ResponsesGpt55(config)
             | Self::ResponsesSol(config)
             | Self::ResponsesTerra(config)
-            | Self::CoordinatorTerra(config)
-            | Self::CoordinatorSol(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => match config.effort {
                 ReasoningEffort::Low => EngineerIntelligence::Low,
@@ -610,10 +660,11 @@ impl SessionBinding {
             | Self::ResponsesSol(config)
             | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
-            | Self::CoordinatorTerra(config)
-            | Self::CoordinatorSol(config)
+            | Self::ResponsesAstra(config)
+            | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
+            Self::AntigravityFlashLow(config) => Some(config),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -623,10 +674,9 @@ impl SessionBinding {
             Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
-            Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) | Self::AdvisorTerra(_) => {
-                Some(InferenceModel::Gpt56Terra)
-            }
-            Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::ResponsesTerra(_) | Self::AdvisorTerra(_) => Some(InferenceModel::Gpt56Terra),
+            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
+            Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -639,10 +689,11 @@ impl SessionBinding {
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
-            | Self::CoordinatorTerra(_)
-            | Self::CoordinatorSol(_)
+            | Self::ResponsesAstra(_)
+            | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
+            Self::AntigravityFlashLow(_) => None,
         }
     }
 
@@ -656,15 +707,22 @@ impl SessionBinding {
             | Self::ResponsesSol(_)
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
-            | Self::CoordinatorTerra(_)
-            | Self::CoordinatorSol(_)
+            | Self::ResponsesAstra(_)
+            | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
+            Self::AntigravityFlashLow(_) => None,
         }
     }
+}
 
-    pub fn is_coordinator(self) -> bool {
-        matches!(self, Self::CoordinatorTerra(_) | Self::CoordinatorSol(_))
+impl SessionBinding {
+    /// Whether this Claude session runs with Rho's Python notebook as its
+    /// only tool, served in-process over MCP, instead of Claude's built-ins.
+    /// Every Claude engineer does; only a stored Claude advisor keeps the
+    /// built-ins.
+    pub fn claude_python(self) -> bool {
+        matches!(self, Self::ClaudeFable { .. } | Self::ClaudeOpus { .. })
     }
 }
 
@@ -683,30 +741,43 @@ pub trait AgentReadTxnExt {
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
-    /// Opaque client-owned view configuration; the daemon stores and
-    /// forwards it without interpreting a byte.
-    fn view_config(&self) -> Vec<u8>;
-    fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
-    fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
-    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
+    /// The fold of one agent's log. Panics when there is no such agent.
+    fn get_agent(&self, agent_id: AgentId) -> AgentHead;
+    fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead>;
+    fn agent_exists(&self, agent_id: AgentId) -> bool;
+    /// Every agent, by the first row of its log; touches one row per agent.
+    fn list_agent_ids(&self) -> Vec<AgentId>;
+    /// Every agent's fold: the whole store. For conversions and tools.
+    fn list_agents(&self) -> Vec<(AgentId, AgentHead)>;
+    /// Who spawned an agent, read from its creation alone.
+    fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId>;
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId>;
     fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool;
+    /// The agent's history as it stands: every row a later `Rewound` did
+    /// not take back, oldest first, and where the next row goes.
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
     fn agent_event_records(
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
-    /// Historical presentation events whose source position remains reachable
-    /// from the selected lineage. Their own event positions intentionally do
-    /// not decide reachability: a result may arrive after newer input.
-    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate>;
-    /// Newest text-bearing event records, read from the selected lineage in
-    /// reverse and bounded before decoding/building a Luna request.
+    /// One row, hidden or not.
+    fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>>;
+    /// Newest text-bearing visible rows, read backward and bounded before
+    /// decoding/building a Luna request.
     fn agent_presentation_source_tail(
         &self,
         agent_id: AgentId,
         max_source_bytes: usize,
     ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
+    /// How far the journal runs; zero when nothing has been appended.
+    fn journal_head(&self) -> Seq;
+    /// Journal entries after `since`, at most `limit`, with the rows they
+    /// name.
+    fn journal_since(
+        &self,
+        since: Seq,
+        limit: usize,
+    ) -> Vec<(Seq, AgentId, AgentEventPos, AgentEvent<'static>)>;
     /// Samples for one model, bounded to the horizon plus its preceding
     /// baseline.
     fn quota_observations(
@@ -717,18 +788,20 @@ pub trait AgentReadTxnExt {
     fn agent_usage(&self, agent_id: AgentId, since: UnixMillis) -> Vec<AgentUsageBucket>;
     fn agent_usage_total(&self, agent_id: AgentId) -> AgentUsageBucket;
     fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)>;
+    /// The Claude account agents run on, which is the default account until
+    /// someone switches it.
+    fn claude_account(&self) -> String;
 }
 
 #[allow(clippy::too_many_arguments)]
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 
-    /// Adds or removes one agent label; adding twice is a no-op.
-    fn agent_label(&mut self, now: UnixMillis, agent_id: AgentId, label: &str, add: bool);
+    /// Appends one event at the agent's tail and names it in the journal.
+    /// The tail is read from the table, not from a runtime's cursor, so
+    /// any writer may append at any time. Returns where it landed.
+    fn append_agent_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) -> AgentEventPos;
 
-    fn set_view_config(&mut self, data: Vec<u8>);
-
-    fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey);
     fn set_agent_claude_rewind(&mut self, agent_id: AgentId, rewind: Option<ClaudeRewind>);
@@ -736,56 +809,36 @@ pub trait AgentWriteTxnExt {
 
     fn alloc_agent_id(&mut self) -> AgentId;
 
-    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String);
-
-    fn remove_project(&mut self, path: &str);
-
-    fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
-    fn append_agent_presentation_history(
-        &mut self,
-        at: AgentEventPos,
-        update: &AgentPresentationUpdate,
-    );
-
-    /// Applies an update only when its source is still in the selected
-    /// lineage. The returned cache is the acknowledged source of truth for a
-    /// sidecar session; `None` means its result was made stale by rewind.
+    /// Applies an update only when its source is still visible. The
+    /// returned cache is the acknowledged source of truth for a sidecar
+    /// session; `None` means its result was made stale by a rewind.
     fn apply_agent_presentation(
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
         update: &AgentPresentationUpdate,
     ) -> Option<AgentPresentationCache>;
-    /// Rebuilds the denormalized cache after a lineage fork.
-    fn rebuild_agent_presentation_cache(
+
+    /// Takes back history from `to` on: told at a new position, so what
+    /// the agent walked away from stays in the log
+    /// (`DECISION-history-only-branches`). Returns where it was told.
+    fn rewind_agent(
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-    ) -> AgentPresentationCache;
-    fn fork_agent_lineage(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        parent: AgentEventPos,
+        to: AgentEventPos,
     ) -> AgentEventPos;
 
-    /// Records a turn end for attention purposes; resets the disposition to
-    /// `Pending` — every finished turn demands a fresh disposition. An
-    /// unexpired snooze survives: "quiet until T" holds across turn ends and
-    /// the expiry broadcast resurfaces whatever finished meanwhile.
-    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId);
+    fn tell_turn(&mut self, now: UnixMillis, agent_id: AgentId, edge: TurnEdge);
 
-    /// Stores the one-shot classification of the last finished turn. The
-    /// caller checks the disposition is still `Pending` so a late result
-    /// never describes a turn the user already answered.
-    fn record_agent_turn_report(&mut self, agent_id: AgentId, report: &TurnReport);
+    fn tell_wants(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        want: AgentWant,
+        summary: Option<String>,
+    );
 
-    /// Stamps the user's engagement with an agent (rail recency), keeps a
-    /// one-line snippet of the message, and clears its disposition:
-    /// replying is as much a verdict as acking.
-    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId, text: &str);
-
-    fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
     fn set_agent_response_subscription(
         &mut self,
         subscriber: AgentId,
@@ -794,6 +847,9 @@ pub trait AgentWriteTxnExt {
     );
     /// Records a changed whole-percentage weekly quota sample.
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
+    /// Puts every agent on `account` from its next turn. Running processes
+    /// keep the account their namespace has mounted until then.
+    fn set_claude_account(&mut self, account: &str);
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket);
     fn replace_agent_usage(
         &mut self,
@@ -803,16 +859,20 @@ pub trait AgentWriteTxnExt {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) trait AgentProfileWriteTxnExt {
+    /// The agent's first event. The role is the caller's: a binding
+    /// implies one, but a spawner may ask for a narrower role than the
+    /// binding's default.
     fn create_agent(
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        display_name: Option<String>,
+        spawn_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
+        role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
-    ) -> AgentEventPos;
+    );
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
 }
@@ -822,69 +882,47 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        display_name: Option<String>,
+        spawn_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
+        role: AgentRole,
         mode: SessionBinding,
         runtime: AgentRuntime,
         parent_agent: Option<AgentId>,
-    ) -> AgentEventPos {
+    ) {
         assert!(!workdirs.is_empty(), "agent needs at least one workdir");
-        let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
-        self.open_table(LINEAGE_PARENTS);
         let spawned_by = parent_agent.map_or(AgentSpawnedBy::Direct, |parent| {
-            match self
-                .open_table(AGENTS)
-                .get(&parent)
+            match agent_head_write(self, parent)
                 .expect("parent agent must exist")
-                .value()
-                .into_owned()
+                .config
                 .role
             {
-                AgentRole::PM | AgentRole::WorkflowPM { .. } | AgentRole::Iris => {
-                    AgentSpawnedBy::PM
-                }
-                AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => {
-                    AgentSpawnedBy::Engineer
-                }
+                AgentRole::Engineer { .. } => AgentSpawnedBy::Engineer,
                 AgentRole::Advisor { .. } => panic!("Advisors cannot spawn agents"),
             }
         });
-        let agent = AgentRecord {
-            display_name,
-            generated_title: None,
-            activity: None,
-            workdirs,
-            created_at: now,
-            updated_at: now,
-            current_lineage: lineage_id,
-            parent_agent,
-            spawned_by,
-            role: mode.agent_role(),
+        let created = AgentEvent::Created {
+            role,
             binding: mode,
             runtime,
-            claude_rewind: None,
-            last_user_message: now,
-            last_user_message_text: String::new(),
-            labels: Vec::new(),
-            disposition: AgentDisposition::Done,
-            turn_report: None,
-            user_interacted: false,
+            workdirs,
+            spawned_by,
+            spawn_name,
+            created_at: now,
+            parent: parent_agent,
         };
-        self.open_table(AGENTS)
-            .insert(&agent_id, SenValue::borrowed(&agent));
-        AgentEventPos::root(lineage_id)
+        let at = self.append_agent_event(agent_id, &created);
+        assert_eq!(at, AgentEventPos::ZERO, "agent {agent_id:?} already exists");
     }
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.role = role;
-        agent.binding = binding;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::RoleChanged {
+                role,
+                binding: Some(binding),
+                at: UnixMillis::now(),
+            },
+        );
     }
 }
 
@@ -903,38 +941,50 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or(0)
     }
 
-    fn view_config(&self) -> Vec<u8> {
-        if !self.has_table("view_config") {
-            return Vec::new();
+    fn get_agent(&self, agent_id: AgentId) -> AgentHead {
+        self.try_get_agent(agent_id)
+            .unwrap_or_else(|| panic!("agent id missing: {agent_id:?}"))
+    }
+
+    fn try_get_agent(&self, agent_id: AgentId) -> Option<AgentHead> {
+        let log = self.open_table(AGENT_LOG);
+        fold_head(rows(log.range(agent_range(agent_id))))
+    }
+
+    fn agent_exists(&self, agent_id: AgentId) -> bool {
+        self.open_table(AGENT_LOG).get(&(agent_id, 0)).is_some()
+    }
+
+    fn list_agent_ids(&self) -> Vec<AgentId> {
+        let log = self.open_table(AGENT_LOG);
+        let mut ids = Vec::new();
+        let mut cursor = log.iter().next().map(|(key, _)| key.value().0);
+        while let Some(agent_id) = cursor {
+            ids.push(agent_id);
+            // Jump past this agent's last possible key straight to the
+            // next agent's first: one descent per agent, not one per row.
+            cursor = log
+                .range((agent_id, u64::MAX)..)
+                .next()
+                .map(|(key, _)| key.value().0)
+                .filter(|next| *next != agent_id);
         }
-        self.open_table(VIEW_CONFIG)
-            .get(&())
-            .map(|value| value.value())
-            .unwrap_or_default()
+        ids
     }
 
-    fn get_agent(&self, agent_id: AgentId) -> AgentRecord {
-        self.open_table(AGENTS)
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned()
-    }
-
-    fn list_agents(&self) -> Vec<(AgentId, AgentRecord)> {
-        self.open_table(AGENTS)
-            .iter()
-            .map(|(key, value)| (key.value(), value.value().into_owned()))
+    fn list_agents(&self) -> Vec<(AgentId, AgentHead)> {
+        self.list_agent_ids()
+            .into_iter()
+            .filter_map(|agent_id| Some((agent_id, self.try_get_agent(agent_id)?)))
             .collect()
     }
 
-    fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)> {
-        self.open_table(PROJECTS)
-            .iter()
-            .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
-            .collect()
+    fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
+        match self.agent_event(agent_id, AgentEventPos::ZERO)? {
+            AgentEvent::Created { parent, .. } => parent,
+            _ => None,
+        }
     }
-
     fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId> {
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
             .iter()
@@ -960,53 +1010,14 @@ impl AgentReadTxnExt for ReadTxn {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>) {
-        let agent = self.get_agent(agent_id);
-        let mut segments = Vec::new();
-        let mut lineage_id = agent.current_lineage;
-        let mut end_seq = u32::MAX;
-        let lineage_parents = self.open_table(LINEAGE_PARENTS);
-        loop {
-            segments.push((lineage_id, end_seq));
-            let Some(parent) = lineage_parents.get(&lineage_id) else {
-                break;
-            };
-            let parent = parent.value();
-            lineage_id = parent.lineage_id;
-            end_seq = parent.seq;
-        }
-        drop(lineage_parents);
-
-        let mut events = Vec::new();
-        let mut next = AgentEventPos::root(agent.current_lineage);
-        let timeline = self.open_table(AGENT_EVENTS);
-        for (lineage_id, end_seq) in segments.into_iter().rev() {
-            let is_current_lineage = lineage_id == agent.current_lineage;
-            for (key, value) in timeline.range(
-                AgentEventPos::root(lineage_id)..=AgentEventPos {
-                    lineage_id,
-                    seq: end_seq,
-                },
-            ) {
-                let key = key.value();
-                if key.seq == end_seq && end_seq != u32::MAX {
-                    break;
-                }
-                if is_current_lineage {
-                    next = key.next();
-                }
-                events.push((key, value.value().into_owned()));
-            }
-        }
-        (next, events)
+        let log = self.open_table(AGENT_LOG);
+        visible_rows(rows(log.range(agent_range(agent_id))))
     }
 
-    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate> {
-        let agent = self.get_agent(agent_id);
-        self.open_table(PRESENTATION_EVENTS)
-            .iter()
-            .map(|(_, update)| update.value().into_owned())
-            .filter(|update| agent_event_visible_read(self, &agent, update.through))
-            .collect()
+    fn agent_event(&self, agent_id: AgentId, pos: AgentEventPos) -> Option<AgentEvent<'static>> {
+        self.open_table(AGENT_LOG)
+            .get(&(agent_id, pos.pos))
+            .map(|value| value.value().into_owned())
     }
 
     fn agent_presentation_source_tail(
@@ -1014,46 +1025,62 @@ impl AgentReadTxnExt for ReadTxn {
         agent_id: AgentId,
         max_source_bytes: usize,
     ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
-        let agent = self.get_agent(agent_id);
-        let segments = agent_lineage_segments_read(self, &agent);
-        let events = self.open_table(AGENT_EVENTS);
+        let log = self.open_table(AGENT_LOG);
+        let mut hidden = Hidden::default();
         let mut selected = Vec::new();
         let mut source_bytes = 0_usize;
         let mut scanned_events = 0_usize;
-        for (lineage_id, end_seq) in segments {
-            for (position, value) in events
-                .range(
-                    AgentEventPos::root(lineage_id)..=AgentEventPos {
-                        lineage_id,
-                        seq: end_seq,
-                    },
-                )
-                .rev()
-            {
-                let position = position.value();
-                if position.seq == end_seq && end_seq != u32::MAX {
-                    continue;
-                }
-                if scanned_events >= MAX_PRESENTATION_SOURCE_SCANNED_EVENTS {
-                    selected.reverse();
-                    return selected;
-                }
-                scanned_events += 1;
-                let event = value.value().into_owned();
-                let bytes = presentation_event_text_bytes(&event);
-                if bytes == 0 {
-                    continue;
-                }
-                source_bytes = source_bytes.saturating_add(bytes.min(1024));
-                selected.push((position, event));
-                if source_bytes >= max_source_bytes {
-                    selected.reverse();
-                    return selected;
-                }
+        for (position, event) in rows(log.range(agent_range(agent_id)).rev()) {
+            if !hidden.visible(position, &event) {
+                continue;
+            }
+            if scanned_events >= MAX_PRESENTATION_SOURCE_SCANNED_EVENTS {
+                break;
+            }
+            scanned_events += 1;
+            let bytes = presentation_event_text_bytes(&event);
+            if bytes == 0 {
+                continue;
+            }
+            source_bytes = source_bytes.saturating_add(bytes.min(1024));
+            selected.push((position, event));
+            if source_bytes >= max_source_bytes {
+                break;
             }
         }
         selected.reverse();
         selected
+    }
+
+    fn journal_head(&self) -> Seq {
+        Seq(self
+            .open_table(JOURNAL)
+            .iter()
+            .next_back()
+            .map(|(key, _)| key.value())
+            .unwrap_or(0))
+    }
+
+    fn journal_since(
+        &self,
+        since: Seq,
+        limit: usize,
+    ) -> Vec<(Seq, AgentId, AgentEventPos, AgentEvent<'static>)> {
+        let journal = self.open_table(JOURNAL);
+        let log = self.open_table(AGENT_LOG);
+        journal
+            .range(since.0.saturating_add(1)..)
+            .take(limit)
+            .map(|(seq, row)| {
+                let (agent_id, pos) = row.value();
+                let event = log
+                    .get(&(agent_id, pos))
+                    .expect("journal names a row that exists")
+                    .value()
+                    .into_owned();
+                (Seq(seq.value()), agent_id, AgentEventPos::new(pos), event)
+            })
+            .collect()
     }
 
     fn quota_observations(
@@ -1107,6 +1134,13 @@ impl AgentReadTxnExt for ReadTxn {
             .unwrap_or_default()
     }
 
+    fn claude_account(&self) -> String {
+        self.open_table(CLAUDE_ACCOUNT)
+            .get(&())
+            .map(|value| value.value())
+            .unwrap_or_else(|| rho_claude::accounts::DEFAULT_ACCOUNT.to_owned())
+    }
+
     fn global_agent_usage(&self, since: UnixMillis) -> Vec<(AgentUsageModel, AgentUsageBucket)> {
         self.open_table(GLOBAL_AGENT_USAGE)
             .range(
@@ -1131,137 +1165,104 @@ impl AgentWriteTxnExt for WriteTxn {
         migrate_agent_db_format(self);
         self.open_table(COUNTERS);
         self.open_table(FORMAT);
-        self.open_table(LINEAGE_PARENTS);
-        self.open_table(AGENT_EVENTS);
-        self.open_table(PRESENTATION_EVENTS);
-        self.open_table(AGENTS);
+        self.open_table(AGENT_LOG);
+        self.open_table(JOURNAL);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
-        self.open_table(PROJECTS);
-        self.open_table(VIEW_CONFIG);
         self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
         self.open_table(GLOBAL_AGENT_USAGE);
+        self.open_table(CLAUDE_ACCOUNT);
         let mut machine = self.open_table(MACHINE);
         if machine.get(&MACHINE_SEED_KEY).is_none() {
             machine.insert(&MACHINE_SEED_KEY, &rand::random::<u64>());
         }
     }
-
-    fn agent_label(&mut self, now: UnixMillis, agent_id: AgentId, label: &str, add: bool) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        edit_labels(&mut agent.labels, label, add);
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
-    fn set_view_config(&mut self, data: Vec<u8>) {
-        self.open_table(VIEW_CONFIG).insert(&(), &data);
-    }
-
-    fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.display_name = Some(name);
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    fn append_agent_event(&mut self, agent_id: AgentId, event: &AgentEvent<'_>) -> AgentEventPos {
+        let pos = {
+            let log = self.open_table(AGENT_LOG);
+            log.range(agent_range(agent_id))
+                .next_back()
+                .map(|(key, _)| AgentEventPos::new(key.value().1).next())
+                .unwrap_or(AgentEventPos::ZERO)
+        };
+        debug_assert!(
+            (pos == AgentEventPos::ZERO) == matches!(event, AgentEvent::Created { .. }),
+            "creation is the first row of a log and nothing else is"
+        );
+        self.open_table(AGENT_LOG)
+            .insert(&(agent_id, pos.pos), SenValue::borrowed(event));
+        let seq = {
+            let mut journal = self.open_table(JOURNAL);
+            let seq = journal
+                .iter()
+                .next_back()
+                .map(|(key, _)| key.value() + 1)
+                .unwrap_or(1);
+            journal.insert(&seq, &(agent_id, pos.pos));
+            seq
+        };
+        // Told after the commit, so a listener woken by it finds the row.
+        if let Some(journal) = self.observer::<Journal>() {
+            let appends = journal.sender();
+            let appended = LogAppended {
+                seq: Seq(seq),
+                agent_id,
+                pos: pos.into(),
+                event: crate::mirror::strip(event),
+            };
+            self.after_commit(move || {
+                let _ = appends.send(Feed::Appended(appended));
+            });
+        }
+        pos
     }
 
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.role = role;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::RoleChanged {
+                role,
+                binding: None,
+                at: UnixMillis::now(),
+            },
+        );
     }
 
     fn set_agent_prompt_cache_key(&mut self, agent_id: AgentId, key: PromptCacheKey) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.runtime = AgentRuntime::Rho {
-            prompt_cache_key: key,
-        };
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::RuntimeRebound {
+                change: crate::RuntimeChange::PromptCacheKey(key),
+                at: UnixMillis::now(),
+            },
+        );
     }
 
     fn set_agent_claude_rewind(&mut self, agent_id: AgentId, rewind: Option<ClaudeRewind>) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.claude_rewind = rewind;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::RuntimeRebound {
+                change: crate::RuntimeChange::ClaudeRewindPending(rewind),
+                at: UnixMillis::now(),
+            },
+        );
     }
 
     fn complete_agent_claude_rewind(&mut self, agent_id: AgentId, session_id: Uuid) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent missing")
-            .value()
-            .into_owned();
-        agent.runtime = AgentRuntime::Claude { session_id };
-        agent.claude_rewind = None;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::RuntimeRebound {
+                change: crate::RuntimeChange::ClaudeRewound { session_id },
+                at: UnixMillis::now(),
+            },
+        );
     }
 
     fn alloc_agent_id(&mut self) -> AgentId {
         let domain = AgentIdDomain(machine_seed(self));
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
             .expect("agent id counter exceeds prefix-id capacity")
-    }
-
-    fn upsert_project(&mut self, now: UnixMillis, path: &str, name: String, description: String) {
-        let mut projects = self.open_table(PROJECTS);
-        let created_at = projects
-            .get(&path.to_owned())
-            .map(|record| record.value().into_owned().created_at)
-            .unwrap_or(now);
-        projects.insert(
-            &path.to_owned(),
-            SenValue::borrowed(&ProjectRecord {
-                name,
-                description,
-                created_at,
-            }),
-        );
-    }
-
-    fn remove_project(&mut self, path: &str) {
-        self.open_table(PROJECTS).remove(&path.to_owned());
-    }
-
-    fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos {
-        self.open_table(AGENT_EVENTS)
-            .insert(&at, SenValue::borrowed(event));
-        at.next()
-    }
-
-    fn append_agent_presentation_history(
-        &mut self,
-        at: AgentEventPos,
-        update: &AgentPresentationUpdate,
-    ) {
-        self.open_table(PRESENTATION_EVENTS)
-            .insert(&at, SenValue::borrowed(update));
     }
 
     fn apply_agent_presentation(
@@ -1273,141 +1274,57 @@ impl AgentWriteTxnExt for WriteTxn {
         if !agent_event_visible_write(self, agent_id, update.through) {
             return None;
         }
-        let cache = {
-            let mut agents = self.open_table(AGENTS);
-            let mut agent = agents
-                .get(&agent_id)
-                .expect("agent id missing")
-                .value()
-                .into_owned();
-            match &update.generated_title {
-                PresentationField::Unchanged => {}
-                PresentationField::Set(title) if agent.display_name.is_none() => {
-                    agent.generated_title = Some(title.clone());
-                }
-                PresentationField::Set(_) | PresentationField::Clear => {}
-            }
-            match &update.activity {
-                PresentationField::Unchanged => {}
-                PresentationField::Set(activity) => agent.activity = Some(activity.clone()),
-                PresentationField::Clear => agent.activity = None,
-            }
-            agent.updated_at = agent.updated_at.max(now);
-            let cache = AgentPresentationCache {
-                generated_title: agent.generated_title.clone(),
-                activity: agent.activity.clone(),
-            };
-            agents.insert(&agent_id, SenValue::borrowed(&agent));
-            cache
-        };
-        Some(cache)
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::Presented {
+                title: update.generated_title.clone(),
+                activity: update.activity.clone(),
+                at: now,
+            },
+        );
+        let head = agent_head_write(self, agent_id).expect("agent id missing");
+        Some(AgentPresentationCache {
+            generated_title: head.generated_title,
+            activity: head.activity,
+        })
     }
 
-    fn rebuild_agent_presentation_cache(
+    fn rewind_agent(
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-    ) -> AgentPresentationCache {
-        let updates = self
-            .open_table(PRESENTATION_EVENTS)
-            .iter()
-            .map(|(_, update)| update.value().into_owned())
-            .collect::<Vec<_>>();
-        let updates = updates
-            .into_iter()
-            .filter(|update| agent_event_visible_write(self, agent_id, update.through))
-            .collect::<Vec<_>>();
-        let mut cache = AgentPresentationCache::default();
-        for update in updates {
-            match update.generated_title {
-                PresentationField::Set(title) => cache.generated_title = Some(title),
-                PresentationField::Clear => cache.generated_title = None,
-                PresentationField::Unchanged => {}
-            }
-            match update.activity {
-                PresentationField::Set(activity) => cache.activity = Some(activity),
-                PresentationField::Clear => cache.activity = None,
-                PresentationField::Unchanged => {}
-            }
-        }
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.generated_title = cache.generated_title.clone();
-        agent.activity = cache.activity.clone();
-        agent.updated_at = agent.updated_at.max(now);
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-        cache
+        to: AgentEventPos,
+    ) -> AgentEventPos {
+        assert!(
+            to != AgentEventPos::ZERO,
+            "an agent's creation cannot be rewound away"
+        );
+        assert!(
+            agent_event_visible_write(self, agent_id, to),
+            "rewind target {to:?} of {agent_id:?} is not in its history"
+        );
+        self.append_agent_event(agent_id, &AgentEvent::Rewound { to, at: now })
     }
 
-    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        // A turn end puts the ball back in the user's court; it says
-        // nothing about engagement, so `last_user_message` stays.
-        agent.disposition = match agent.disposition {
-            AgentDisposition::Snoozed { until } if until > now => {
-                AgentDisposition::Snoozed { until }
-            }
-            _ => AgentDisposition::Pending,
-        };
-        // The previous turn's report describes a superseded final message,
-        // and the activity label describes work that just stopped.
-        agent.turn_report = None;
-        agent.activity = None;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    fn tell_turn(&mut self, now: UnixMillis, agent_id: AgentId, edge: TurnEdge) {
+        self.append_agent_event(agent_id, &AgentEvent::Turn { edge, at: now });
     }
 
-    fn record_agent_turn_report(&mut self, agent_id: AgentId, report: &TurnReport) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.turn_report = Some(report.clone());
-        // An FYI asks nothing of the user; settle it like a pressed Done so
-        // it carries no attention weight while the row keeps its summary.
-        if !report.needs_you {
-            agent.disposition = AgentDisposition::Done;
-        }
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
-    fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId, text: &str) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.last_user_message = now;
-        agent.last_user_message_text = message_snippet(text);
-        agent.user_interacted = true;
-        // Replying is a verdict like acking — the ball moves to the agent's
-        // court even if the turn hasn't started yet (queued delivery), so a
-        // pending lamp must not linger.
-        agent.disposition = AgentDisposition::Done;
-        agent.turn_report = None;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
-    fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.disposition = disposition;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    fn tell_wants(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        want: AgentWant,
+        summary: Option<String>,
+    ) {
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::Wants {
+                want,
+                summary,
+                at: now,
+            },
+        );
     }
 
     fn set_agent_response_subscription(
@@ -1425,26 +1342,9 @@ impl AgentWriteTxnExt for WriteTxn {
             subscriptions.remove(&key);
         }
     }
-
-    fn fork_agent_lineage(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        parent: AgentEventPos,
-    ) -> AgentEventPos {
-        let lineage_id = AgentLineageId(next_counter(self, CounterKey::LAST_LINEAGE_ID));
-        self.open_table(LINEAGE_PARENTS)
-            .insert(&lineage_id, &parent);
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.current_lineage = lineage_id;
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-        AgentEventPos::root(lineage_id)
+    fn set_claude_account(&mut self, account: &str) {
+        self.open_table(CLAUDE_ACCOUNT)
+            .insert(&(), account.to_owned());
     }
 
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
@@ -1481,14 +1381,9 @@ impl AgentWriteTxnExt for WriteTxn {
 
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket) {
         let mut bucket = bucket.clone();
-        let record = self
-            .open_table(AGENTS)
-            .get(&agent_id)
-            .expect("usage agent missing")
-            .value()
-            .into_owned();
         if bucket.model == AgentUsageModel::UNKNOWN {
-            bucket.model = usage_model(&record);
+            let head = agent_head_write(self, agent_id).expect("usage agent missing");
+            bucket.model = usage_model(&head.config);
         }
         let key = AgentUsageKey {
             agent_id,
@@ -1561,92 +1456,415 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 }
 
-fn agent_lineage_segments_read(read: &ReadTxn, agent: &AgentRecord) -> Vec<(AgentLineageId, u32)> {
-    let mut segments = Vec::new();
-    let mut lineage_id = agent.current_lineage;
-    let mut end_seq = u32::MAX;
-    let lineage_parents = read.open_table(LINEAGE_PARENTS);
-    loop {
-        segments.push((lineage_id, end_seq));
-        let Some(parent) = lineage_parents.get(&lineage_id) else {
-            break;
-        };
-        let parent = parent.value();
-        lineage_id = parent.lineage_id;
-        end_seq = parent.seq;
+/// Every key of one agent's log.
+fn agent_range(agent_id: AgentId) -> std::ops::RangeInclusive<(AgentId, u64)> {
+    (agent_id, 0)..=(agent_id, u64::MAX)
+}
+
+/// Rows as `(position, event)`, from either kind of table iterator.
+fn rows<'a>(
+    iter: impl Iterator<
+        Item = (
+            redb::AccessGuard<'a, (AgentId, u64)>,
+            redb::AccessGuard<'a, Sen<AgentEvent<'static>>>,
+        ),
+    >,
+) -> impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)> {
+    iter.map(|(key, value)| {
+        (
+            AgentEventPos::new(key.value().1),
+            value.value().into_owned(),
+        )
+    })
+}
+
+/// The rows a reader sees, oldest first: every `Rewound` takes back what
+/// stands from `to` on, itself included in what remains. Also where the
+/// next row goes, hidden rows counted.
+fn visible_rows(
+    all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>,
+) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>) {
+    let mut visible = Vec::new();
+    let mut next = AgentEventPos::ZERO;
+    for (pos, event) in all {
+        next = pos.next();
+        if let AgentEvent::Rewound { to, .. } = &event {
+            let to = *to;
+            visible.retain(|(kept, _)| *kept < to);
+        }
+        visible.push((pos, event));
     }
-    segments
+    (next, visible)
 }
 
-fn agent_event_visible_read(read: &ReadTxn, agent: &AgentRecord, position: AgentEventPos) -> bool {
-    agent_lineage_segments_read(read, agent)
-        .into_iter()
-        .find_map(|(lineage_id, end_seq)| (lineage_id == position.lineage_id).then_some(end_seq))
-        .is_some_and(|end_seq| end_seq == u32::MAX || position.seq < end_seq)
+/// Walking a log backward: which positions a later `Rewound` hides.
+#[derive(Default)]
+struct Hidden {
+    from: Option<u64>,
 }
 
+impl Hidden {
+    /// Whether the row at `pos` is visible, noting the rewind it may be.
+    /// Rows must come newest first.
+    fn visible(&mut self, pos: AgentEventPos, event: &AgentEvent<'_>) -> bool {
+        if self.from.is_some_and(|from| pos.pos >= from) {
+            return false;
+        }
+        if let AgentEvent::Rewound { to, .. } = event {
+            self.from = Some(self.from.map_or(to.pos, |from| from.min(to.pos)));
+        }
+        true
+    }
+}
+
+/// The fold of one agent's rows, hidden ones included; `None` when the
+/// log does not begin with a creation (no such agent).
+fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) -> Option<AgentHead> {
+    let mut head: Option<AgentHead> = None;
+    for (pos, event) in all {
+        match &mut head {
+            None => {
+                let AgentEvent::Created { parent, .. } = &event else {
+                    return None;
+                };
+                head = Some(AgentHead {
+                    config: created_config(&event),
+                    generated_title: None,
+                    activity: None,
+                    turn_running: false,
+                    parent: *parent,
+                    user_interacted: false,
+                    last_turn_ended: None,
+                    next: pos.next(),
+                });
+            }
+            Some(head) => {
+                fold_agent_head(head, &event);
+                head.next = pos.next();
+            }
+        }
+    }
+    head
+}
+
+fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Option<AgentHead> {
+    let log = write.open_table(AGENT_LOG);
+    fold_head(rows(log.range(agent_range(agent_id))))
+}
+
+/// Whether `position` still stands in the agent's history, read from a
+/// write transaction: a backward walk from the tail, so only the rows
+/// after it are decoded.
 fn agent_event_visible_write(
     write: &mut WriteTxn,
     agent_id: AgentId,
     position: AgentEventPos,
 ) -> bool {
-    let agent = write
-        .open_table(AGENTS)
-        .get(&agent_id)
-        .expect("agent id missing")
-        .value()
-        .into_owned();
-    let mut lineage_id = agent.current_lineage;
-    let mut end_seq = u32::MAX;
-    let lineage_parents = write.open_table(LINEAGE_PARENTS);
-    loop {
-        if lineage_id == position.lineage_id {
-            return end_seq == u32::MAX || position.seq < end_seq;
+    let log = write.open_table(AGENT_LOG);
+    let mut hidden = Hidden::default();
+    for (pos, event) in rows(log.range(agent_range(agent_id)).rev()) {
+        let visible = hidden.visible(pos, &event);
+        if pos <= position {
+            return pos == position && visible;
         }
-        let Some(parent) = lineage_parents.get(&lineage_id) else {
-            break;
-        };
-        let parent = parent.value();
-        lineage_id = parent.lineage_id;
-        end_seq = parent.seq;
     }
     false
 }
-
 fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
     match event {
-        AgentEvent::Queued(crate::QueuedItem {
-            kind: crate::QueuedItemKind::UserMessage { content, .. },
+        AgentEvent::Accepted(crate::QueuedInput {
+            kind: crate::InputKind::Message { content },
             ..
-        }) => content
+        }) => text_bytes(content),
+        AgentEvent::Replied { blocks, .. } => blocks
             .iter()
-            .filter_map(|part| match part {
-                rho_core::ContentPart::Text { text } => Some(text.len()),
-                rho_core::ContentPart::Image { .. } => None,
-            })
-            .sum(),
-        AgentEvent::InferenceResponse { items, .. } => items
-            .iter()
-            .filter_map(|item| match item {
-                crate::InferenceResponseItem::AssistantMessage { content, .. } => Some(
-                    content
-                        .iter()
-                        .filter_map(|part| match part {
-                            rho_core::ContentPart::Text { text } => Some(text.len()),
-                            rho_core::ContentPart::Image { .. } => None,
-                        })
-                        .sum::<usize>(),
-                ),
-                _ => None,
+            .map(|block| match block {
+                rho_core::ContextBlock::InferenceResponse { items, .. } => {
+                    assistant_text_bytes(items)
+                }
+                _ => 0,
             })
             .sum(),
         AgentEvent::ClaudePresentationSource { text, .. } => text.len(),
-        AgentEvent::ToolResult { .. }
-        | AgentEvent::Queued(_)
-        | AgentEvent::Dequeued { .. }
+        AgentEvent::Transcript {
+            line:
+                crate::TranscriptLine::User { text } | crate::TranscriptLine::Assistant { text, .. },
+            ..
+        } => text.len(),
+        AgentEvent::Transcript { .. }
+        | AgentEvent::Accepted(_)
+        | AgentEvent::Sent { .. }
         | AgentEvent::QueueCleared
-        | AgentEvent::PresentationUpdated { .. } => 0,
+        | AgentEvent::Cleared { .. }
+        | AgentEvent::Turn { .. }
+        | AgentEvent::Presented { .. }
+        | AgentEvent::Wants { .. }
+        | AgentEvent::Rewound { .. }
+        | AgentEvent::PythonStream { .. }
+        | AgentEvent::Failed { .. }
+        | AgentEvent::Created { .. }
+        | AgentEvent::RoleChanged { .. }
+        | AgentEvent::WorkdirAdded { .. }
+        | AgentEvent::RuntimeRebound { .. } => 0,
     }
+}
+
+fn text_bytes(content: &[rho_core::ContentPart]) -> usize {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            rho_core::ContentPart::Text { text } => Some(text.len()),
+            rho_core::ContentPart::Image { .. } => None,
+        })
+        .sum()
+}
+
+fn assistant_text_bytes(items: &[crate::InferenceResponseItem]) -> usize {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            crate::InferenceResponseItem::AssistantMessage { content, .. } => {
+                Some(text_bytes(content))
+            }
+            _ => None,
+        })
+        .sum()
+}
+
+/// The config a `Created` event states. Panics on any other event: only
+/// creation can begin a config.
+fn created_config(event: &AgentEvent<'_>) -> AgentConfig {
+    let AgentEvent::Created {
+        role,
+        binding,
+        runtime,
+        workdirs,
+        spawned_by,
+        spawn_name,
+        created_at,
+        ..
+    } = event
+    else {
+        panic!("config can only begin at a Created event");
+    };
+    AgentConfig {
+        role: *role,
+        binding: *binding,
+        runtime: runtime.clone(),
+        workdirs: workdirs.clone(),
+        spawned_by: *spawned_by,
+        spawn_name: spawn_name.clone(),
+        created_at: *created_at,
+        claude_rewind: None,
+    }
+}
+
+/// One event's effect on the head.
+fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
+    let mut presented = |title: &PresentationField, activity: &PresentationField| {
+        match title {
+            PresentationField::Set(title) => {
+                head.generated_title = Some(title.clone());
+            }
+            PresentationField::Clear => head.generated_title = None,
+            PresentationField::Unchanged => {}
+        }
+        match activity {
+            PresentationField::Set(activity) => head.activity = Some(activity.clone()),
+            PresentationField::Clear => head.activity = None,
+            PresentationField::Unchanged => {}
+        }
+    };
+    match event {
+        AgentEvent::Created { .. } => head.config = created_config(event),
+        AgentEvent::RoleChanged { role, binding, .. } => {
+            head.config.role = *role;
+            if let Some(binding) = binding {
+                head.config.binding = *binding;
+            }
+        }
+        AgentEvent::WorkdirAdded { workdir, .. } => head.config.workdirs.push(workdir.clone()),
+        AgentEvent::RuntimeRebound { change, .. } => match change {
+            crate::RuntimeChange::ClaudeRewindPending(rewind) => {
+                head.config.claude_rewind = rewind.clone();
+            }
+            crate::RuntimeChange::ClaudeRewound { session_id } => {
+                head.config.runtime = AgentRuntime::Claude {
+                    session_id: *session_id,
+                };
+                head.config.claude_rewind = None;
+            }
+            crate::RuntimeChange::PromptCacheKey(key) => {
+                head.config.runtime = AgentRuntime::Rho {
+                    prompt_cache_key: *key,
+                };
+            }
+        },
+        AgentEvent::Presented {
+            title, activity, ..
+        } => presented(title, activity),
+        AgentEvent::Turn { edge, at } => match edge {
+            TurnEdge::Started => head.turn_running = true,
+            TurnEdge::Ended(_) => {
+                head.turn_running = false;
+                // The activity label describes work that just stopped.
+                head.activity = None;
+                head.last_turn_ended = Some(*at);
+            }
+        },
+        AgentEvent::Accepted(crate::QueuedInput {
+            source: rho_core::MessageSender::User,
+            kind: crate::InputKind::Message { .. },
+            ..
+        })
+        | AgentEvent::ClaudePresentationSource {
+            speaker: crate::PresentationSpeaker::User,
+            ..
+        }
+        | AgentEvent::Transcript {
+            line: crate::TranscriptLine::User { .. },
+            ..
+        } => head.user_interacted = true,
+        AgentEvent::Accepted(_)
+        | AgentEvent::Sent { .. }
+        | AgentEvent::Replied { .. }
+        | AgentEvent::QueueCleared
+        | AgentEvent::Cleared { .. }
+        | AgentEvent::Wants { .. }
+        | AgentEvent::Rewound { .. }
+        | AgentEvent::PythonStream { .. }
+        | AgentEvent::Failed { .. }
+        | AgentEvent::ClaudePresentationSource { .. }
+        | AgentEvent::Transcript { .. } => {}
+    }
+}
+
+/// The hop the store would make on open, if its format is behind.
+pub fn pending_migration(read: &rho_db::ReadTxn) -> Option<(&'static str, &'static str)> {
+    if !read.has_table("format") {
+        return None;
+    }
+    let format = read
+        .open_table(FORMAT)
+        .get(&())
+        .map(|value| value.value())?;
+    if format == CURRENT_AGENT_DB_FORMAT {
+        return None;
+    }
+    AGENT_DB_MIGRATIONS
+        .iter()
+        .find(|migration| migration.from == format)
+        .map(|migration| (migration.from, migration.to))
+}
+
+/// Opens the store for use: a savepoint first when a migration is due,
+/// so the store can be put back if the migrated build turns out wrong,
+/// then the tables and the migration itself.
+pub async fn prepare(db: &rho_db::RhoDb) {
+    if let Some((from, to)) = pending_migration(&db.read()) {
+        let key = format!("{from}->{to}");
+        let id = db
+            .persistent_savepoint(|write, id| {
+                write.open_table(RECOVERY).insert(&key, &id);
+            })
+            .await;
+        eprintln!(
+            "rho-agent: savepoint {id} taken before migrating the store {from} -> {to}; \
+             `rho debug rollback` puts it back"
+        );
+    }
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let started = std::time::Instant::now();
+    write.commit();
+    if started.elapsed() > std::time::Duration::from_secs(1) {
+        eprintln!("rho-agent: store committed in {:?}", started.elapsed());
+    }
+}
+
+/// Every persistent savepoint in the store, with the migration hop it
+/// was recorded for when `prepare` took it.
+pub async fn savepoints(db: &rho_db::RhoDb) -> Vec<(u64, Option<String>)> {
+    let mut write = db.write().await;
+    let ids = write.persistent_savepoints();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let recorded = write
+        .open_table(RECOVERY)
+        .iter()
+        .map(|(key, value)| (value.value(), key.value()))
+        .collect::<HashMap<_, _>>();
+    ids.into_iter()
+        .map(|id| (id, recorded.get(&id).cloned()))
+        .collect()
+}
+
+/// Drops the savepoints `prepare` recorded, once the migration they guard
+/// has been verified and nothing will roll back to them. Returns the ids
+/// dropped. A dropped savepoint stops pinning the pages the migration
+/// freed, so `rho debug compact` can give them back.
+pub async fn forget_savepoints(db: &rho_db::RhoDb) -> Vec<u64> {
+    let mut write = db.write().await;
+    let recorded = write
+        .open_table(RECOVERY)
+        .iter()
+        .map(|(key, value)| (key.value(), value.value()))
+        .collect::<Vec<_>>();
+    let mut dropped = Vec::new();
+    for (key, id) in recorded {
+        write.delete_persistent_savepoint(id);
+        write.open_table(RECOVERY).remove(&key);
+        dropped.push(id);
+    }
+    write.commit();
+    dropped
+}
+
+/// Drops every persistent savepoint `prepare` did not record: leftovers
+/// of older builds, each pinning every page freed since it was taken.
+/// Returns the ids dropped.
+pub async fn drop_stale_savepoints(db: &rho_db::RhoDb) -> Vec<u64> {
+    let stale = savepoints(db)
+        .await
+        .into_iter()
+        .filter_map(|(id, hop)| hop.is_none().then_some(id))
+        .collect::<Vec<_>>();
+    if stale.is_empty() {
+        return stale;
+    }
+    let mut write = db.write().await;
+    for id in &stale {
+        write.delete_persistent_savepoint(*id);
+    }
+    write.commit();
+    stale
+}
+
+/// Puts the store back as it was before its last migration, from the
+/// savepoint `prepare` took, and drops that savepoint. Returns the hop
+/// undone. Nothing else may have the store open.
+pub async fn rollback(db: &rho_db::RhoDb) -> anyhow::Result<String> {
+    let mut write = db.write().await;
+    let recorded = if write.persistent_savepoints().is_empty() {
+        Vec::new()
+    } else {
+        write
+            .open_table(RECOVERY)
+            .iter()
+            .map(|(key, value)| (key.value(), value.value()))
+            .collect::<Vec<_>>()
+    };
+    let Some((hop, id)) = recorded.into_iter().max_by_key(|(_, id)| *id) else {
+        anyhow::bail!("no migration savepoint is recorded in this store");
+    };
+    anyhow::ensure!(
+        write.restore_persistent_savepoint(id),
+        "savepoint {id} for {hop} is no longer in the store"
+    );
+    write.delete_persistent_savepoint(id);
+    write.commit();
+    Ok(hop)
 }
 
 fn migrate_agent_db_format(write: &mut WriteTxn) {
@@ -1678,26 +1896,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     write.open_table(FORMAT).insert(&(), &current.to_owned());
 }
 
-/// One display line from a user message: whitespace collapsed, cut at a
-/// character boundary. Long enough to recall what was asked, short enough
-/// for a summary row.
-fn message_snippet(text: &str) -> String {
-    let mut snippet = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if let Some((limit, _)) = snippet.char_indices().nth(160) {
-        snippet.truncate(limit);
-        snippet.push('\u{2026}');
-    }
-    snippet
-}
-
-/// Adds or removes a label, keeping the set free of duplicates.
-fn edit_labels(labels: &mut Vec<String>, label: &str, add: bool) {
-    labels.retain(|existing| existing != label);
-    if add {
-        labels.push(label.to_owned());
-    }
-}
-
 fn next_counter(write: &mut WriteTxn, key: CounterKey) -> u64 {
     let mut counters = write.open_table(COUNTERS);
     let next = counters.get(&key).map(|value| value.value()).unwrap_or(0) + 1;
@@ -1714,4 +1912,4 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

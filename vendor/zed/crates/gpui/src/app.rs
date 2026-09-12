@@ -52,8 +52,8 @@ use crate::{
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
     ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
     SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    ThermalState, UserIdleEvent, Window, WindowAppearance, WindowButtonLayout, WindowHandle,
+    WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -980,6 +980,15 @@ impl App {
     /// Get the current keyboard mapper.
     pub fn keyboard_mapper(&self) -> &Rc<dyn PlatformKeyboardMapper> {
         &self.keyboard_mapper
+    }
+
+    /// Invokes a handler when the system-wide user idle state changes.
+    /// On unsupported platforms the handler is never invoked.
+    pub fn on_user_idle<F>(&self, timeout: Duration, callback: F)
+    where
+        F: 'static + FnMut(UserIdleEvent),
+    {
+        self.platform.on_user_idle(timeout, Box::new(callback));
     }
 
     /// Invokes a handler when the current keyboard layout changes

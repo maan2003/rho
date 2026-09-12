@@ -17,7 +17,7 @@ struct RhoEmbedded;
 /// Vendored from zed's `assets/settings/default.json` (at the pinned fork
 /// rev) with rho's chrome opinions applied: no line numbers, no gutter
 /// buttons, no scrollbars, no indent guides. Editors are bare buffers; the
-/// split tree is the chrome.
+/// surface viewport is the chrome.
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
 pub struct RhoAssets;
@@ -58,5 +58,26 @@ impl RhoAssets {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         cx.text_system().add_fonts(fonts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oled_theme_is_embedded_and_valid() {
+        let path = "themes/rho-oled/rho-oled.json";
+        assert!(
+            RhoAssets
+                .list("themes/")
+                .unwrap()
+                .iter()
+                .any(|item| item == path)
+        );
+
+        let registry = theme::ThemeRegistry::new(Box::new(RhoAssets));
+        theme_settings::load_bundled_themes(&registry);
+        registry.get("Rho OLED").expect("registered OLED theme");
     }
 }

@@ -9,11 +9,13 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use camino::Utf8PathBuf;
-use rho_workset::PathOverrides;
+use rho_workspaces::PathOverrides;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+pub mod accounts;
 pub mod protocol;
+pub mod settings;
 mod transcript;
 
 pub use protocol::{ClaudeEvent, Effort, Model, Session};
@@ -224,6 +226,45 @@ impl ClaudeCode {
         .await
     }
 
+    /// Registers in-process MCP servers: from here on the CLI routes their
+    /// JSON-RPC traffic to us as `control_request` messages of subtype
+    /// `mcp_message`, each answered with [`ClaudeCode::respond_control`].
+    /// Returns the request id of the `initialize` control request.
+    pub async fn initialize_sdk_mcp(&mut self, servers: &[SdkMcpServer]) -> Result<String> {
+        self.write_control_request(sdk_mcp_initialize_request(servers))
+            .await
+    }
+
+    /// Answers a `control_request` from the CLI successfully.
+    pub async fn respond_control(
+        &mut self,
+        request_id: &str,
+        response: serde_json::Value,
+    ) -> Result<()> {
+        self.write_json(&serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": response,
+            },
+        }))
+        .await
+    }
+
+    /// Answers a `control_request` from the CLI with an error.
+    pub async fn respond_control_error(&mut self, request_id: &str, error: &str) -> Result<()> {
+        self.write_json(&serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": request_id,
+                "error": error,
+            },
+        }))
+        .await
+    }
+
     async fn write_control_request(&mut self, request: serde_json::Value) -> Result<String> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.write_json(&serde_json::json!({
@@ -292,11 +333,84 @@ impl ClaudeCode {
     }
 }
 
+/// An MCP server the driving process serves itself over the control channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdkMcpServer {
+    pub name: String,
+    /// How long the CLI waits for one tool call before failing it. Unset
+    /// leaves the CLI's default (or `MCP_TOOL_TIMEOUT`) in force.
+    pub timeout: Option<Duration>,
+}
+
+fn sdk_mcp_initialize_request(servers: &[SdkMcpServer]) -> serde_json::Value {
+    let names = servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>();
+    let configs = servers
+        .iter()
+        .filter_map(|server| {
+            let timeout = server.timeout?;
+            Some((
+                server.name.clone(),
+                serde_json::json!({ "timeout": timeout.as_millis() as u64 }),
+            ))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::json!({
+        "subtype": "initialize",
+        "sdkMcpServers": names,
+        "sdkMcpServerConfigs": configs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn initialize_registers_sdk_mcp_servers() {
+        let request = sdk_mcp_initialize_request(&[SdkMcpServer {
+            name: "py".into(),
+            timeout: Some(Duration::from_secs(7200)),
+        }]);
+        assert_eq!(
+            request,
+            json!({
+                "subtype": "initialize",
+                "sdkMcpServers": ["py"],
+                "sdkMcpServerConfigs": { "py": { "timeout": 7_200_000 } },
+            })
+        );
+    }
+
+    #[test]
+    fn parses_mcp_control_requests() {
+        let event: ClaudeEvent = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"mcp_message","server_name":"py","message":{"jsonrpc":"2.0","id":3,"method":"tools/list"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            ClaudeEvent::ControlRequest(protocol::ControlRequestMessage {
+                request_id: "r1".into(),
+                request: protocol::ControlRequest::McpMessage {
+                    server_name: "py".into(),
+                    message: json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+                },
+            })
+        );
+        let event: ClaudeEvent = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"r2","request":{"subtype":"hook_callback","x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event,
+            ClaudeEvent::ControlRequest(protocol::ControlRequestMessage {
+                request_id: "r2".into(),
+                request: protocol::ControlRequest::Other,
+            })
+        );
+    }
 
     #[test]
     fn builds_stream_json_args() {

@@ -59,6 +59,8 @@ use gpui::{
     relative, size, solid_background, transparent_black,
 };
 use itertools::Itertools;
+#[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+use language::InlayId;
 use language::{
     HighlightedText, IndentGuideSettings, LanguageAwareStyling,
     language_settings::ShowWhitespaceSetting,
@@ -90,7 +92,7 @@ use std::{
     ops::{Deref, Range},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
@@ -745,8 +747,14 @@ impl EditorElement {
     }
 
     #[cfg(not(feature = "native"))]
-    fn register_actions(&self, window: &mut Window, _: &mut App) {
+    fn register_actions(&self, window: &mut Window, cx: &mut App) {
         let editor = &self.editor;
+        editor.update(cx, |editor, cx| {
+            for action in editor.editor_actions.borrow().values() {
+                (action)(editor, window, cx)
+            }
+        });
+
         register_action(editor, window, Editor::move_left);
         register_action(editor, window, Editor::move_right);
         register_action(editor, window, Editor::move_up);
@@ -2092,8 +2100,6 @@ impl EditorElement {
         Some(button)
     }
 
-    #[cfg(feature = "native")]
-
     /// Lays out end-of-line hints for every visible row that carries
     /// one: pure paint after the line's content, no display-space
     /// footprint (see [`Editor::set_eol_hints`]).
@@ -2155,6 +2161,7 @@ impl EditorElement {
         elements
     }
 
+    #[cfg(feature = "native")]
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -3350,8 +3357,13 @@ impl EditorElement {
                 diagnostics: true,
             };
             let chunks = snapshot.highlighted_chunks(rows.clone(), language_aware, style);
+            let chunks = TimedChunks { inner: chunks };
             let first_row = rows.start;
-            LineWithInvisibles::from_chunks(
+            CHUNK_WORK.set((0, 0));
+            let mut guard = gpui::profiler::EditorTimingGuard::new(
+                gpui::profiler::EditorTimingKind::HighlightedChunks,
+            );
+            let lines = LineWithInvisibles::from_chunks(
                 chunks,
                 style,
                 MAX_LINE_LEN,
@@ -3363,7 +3375,12 @@ impl EditorElement {
                 bg_segments_per_row,
                 window,
                 cx,
-            )
+            );
+            let (nanos, count) = CHUNK_WORK.get();
+            guard.touched_rows(rows.len() as u64);
+            guard.walked_items(count);
+            guard.finish_with_elapsed(Duration::from_nanos(nanos));
+            lines
         }
     }
 
@@ -6635,8 +6652,6 @@ impl EditorElement {
         }
     }
 
-    #[cfg(feature = "native")]
-
     fn paint_eol_hints(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         let elements = std::mem::take(&mut layout.eol_hint_layouts);
         if elements.is_empty() {
@@ -6649,6 +6664,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "native")]
     fn paint_inline_blame(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(mut blame_layout) = layout.inline_blame_layout.take() {
             window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
@@ -7509,19 +7525,36 @@ impl LineWithInvisibles {
 
         let ellipsis = SharedString::from("⋯");
 
-        for highlighted_chunk in chunks.chain([HighlightedChunk {
-            text: "\n",
-            style: None,
-            is_tab: false,
-            is_inlay: false,
-            replacement: None,
-        }]) {
+        let mut chunks = chunks
+            .chain([HighlightedChunk {
+                text: "\n",
+                style: None,
+                is_tab: false,
+                is_inlay: false,
+                replacement: None,
+            }])
+            .peekable();
+        while let Some(highlighted_chunk) = chunks.next() {
             if let Some(replacement) = highlighted_chunk.replacement {
+                let mut replacement_text = Cow::Borrowed(highlighted_chunk.text);
+                if let ChunkReplacement::Renderer(renderer) = &replacement {
+                    while chunks.peek().is_some_and(|next| {
+                        matches!(
+                            &next.replacement,
+                            Some(ChunkReplacement::Renderer(next_renderer))
+                                if next_renderer.id == renderer.id
+                        )
+                    }) {
+                        let next = chunks.next().unwrap();
+                        replacement_text.to_mut().push_str(next.text);
+                    }
+                }
+
                 if line_exceeded_max_len {
                     continue;
                 }
 
-                if len + line.len() + highlighted_chunk.text.len() > max_line_len {
+                if len + line.len() + replacement_text.len() > max_line_len {
                     line_exceeded_max_len = true;
                     continue;
                 }
@@ -7549,15 +7582,15 @@ impl LineWithInvisibles {
                 match replacement {
                     ChunkReplacement::Renderer(renderer) => {
                         let available_width = if renderer.constrain_width {
-                            let chunk = if highlighted_chunk.text == ellipsis.as_ref() {
+                            let chunk = if replacement_text == ellipsis.as_ref() {
                                 ellipsis.clone()
                             } else {
-                                SharedString::from(Arc::from(highlighted_chunk.text))
+                                SharedString::from(Arc::from(replacement_text.as_ref()))
                             };
                             let shaped_line = window.text_system().shape_line(
                                 chunk,
                                 font_size,
-                                &[text_style.to_run(highlighted_chunk.text.len())],
+                                &[text_style.to_run(replacement_text.len())],
                                 None,
                             );
                             AvailableSpace::Definite(shaped_line.width)
@@ -7578,13 +7611,13 @@ impl LineWithInvisibles {
                         );
 
                         width += size.width;
-                        len += highlighted_chunk.text.len();
-                        line_byte_offset += highlighted_chunk.text.len();
+                        len += replacement_text.len();
+                        line_byte_offset += replacement_text.len();
                         fragments.push(LineFragment::Element {
                             id: renderer.id,
                             element: Some(element),
                             size,
-                            len: highlighted_chunk.text.len(),
+                            len: replacement_text.len(),
                         });
                     }
                     ChunkReplacement::Str(x) => {
@@ -7898,10 +7931,14 @@ impl LineWithInvisibles {
                 line_y,
             );
 
-        for fragment in &self.fragments {
+        for (fragment_ix, fragment) in self.fragments.iter().enumerate() {
             match fragment {
                 LineFragment::Text(line) => {
-                    line.paint(
+                    line.paint_cached(
+                        (
+                            "editor-line-fragment",
+                            (u64::from(row.0) << 32) | fragment_ix as u64,
+                        ),
                         fragment_origin,
                         line_height,
                         layout.text_align,
@@ -8325,6 +8362,196 @@ impl Drop for EditorPrepaintGuard {
     }
 }
 
+/// What each pass of [`EditorElement::prepaint`] cost, timed on the stack and
+/// pushed to the profiler only for a frame whose prepaint already went long.
+///
+/// The frame log times prepaint whole, so a prepaint of 4.2 ms against a
+/// median of 1.4 says a frame missed and names nothing. Timing the passes is
+/// cheap — one clock read each — but recording them is not: a rig run draws
+/// about sixteen hundred frames, and a dozen records apiece would push the
+/// between-frame log out of the ring the two share. The question is only ever
+/// asked about a frame that went long, so the marks are taken always and
+/// recorded almost never.
+///
+/// A mark closes the segment *ending* with the pass it names rather than
+/// timing that call alone, so the segments sum to the whole prepaint exactly
+/// and no time hides between two passes. `prepaint/rest` is everything after
+/// the last mark: the popovers, the gutter menu, the toggles and the minimap.
+///
+/// A prepaint that returns early to re-wrap re-enters this function, and the
+/// abandoned attempt records nothing: the marks are dropped with it and the
+/// call that follows times itself from its own start. Such a frame therefore
+/// under-reports, by the work it did before deciding to start again.
+///
+/// The labels are `prepaint/<pass>`, the same shape a desk sync's passes use,
+/// with the difference that these are *inside* a frame and that one is not —
+/// a reader that adds them to the between-frame total is counting the draw
+/// twice.
+thread_local! {
+    /// Nanoseconds inside the chunk iterator and chunks taken from it, for
+    /// the prepaint that is consuming it. Set to zero before the pass and
+    /// read after, because the iterator is moved into `from_chunks` and
+    /// cannot be asked afterwards.
+    static CHUNK_WORK: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Times the highlighted-chunk iterator so a prepaint can say what
+/// producing the chunks cost apart from shaping them.
+///
+/// The two are interleaved - a chunk is taken, appended to the line, and
+/// the line is shaped when it ends - so the only way to tell them apart is
+/// to time the iterator itself.
+struct TimedChunks<I> {
+    inner: I,
+}
+
+impl<I: Iterator> Iterator for TimedChunks<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        let started = Instant::now();
+        let item = self.inner.next();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        let (nanos, count) = CHUNK_WORK.get();
+        CHUNK_WORK.set((nanos + elapsed, count + u64::from(item.is_some())));
+        item
+    }
+}
+
+struct PrepaintPasses {
+    started: Instant,
+    last: Instant,
+    /// Each mark's name, what it took, and the units it did that work in.
+    /// Zero units means the pass worked in the rows the frame drew, which
+    /// is all of them but shaping: shaping's unit is the layout cache
+    /// misses it paid for, and a pass over 39 rows that shaped none of them
+    /// has to be able to say so.
+    marks: [(&'static str, Duration, u64); Self::MAX],
+    count: usize,
+    /// What the line layout cache did for this prepaint. Recorded on every
+    /// frame, not only on long ones: the question is whether a settled
+    /// frame reshapes rows nothing changed, and a settled frame is short.
+    shaping: gpui::ShapingCounts,
+    /// Time inside the platform text system on this prepaint's misses.
+    shaped: Duration,
+}
+
+impl PrepaintPasses {
+    /// Marks a prepaint can hold. One more than it has passes, so a pass
+    /// added without a slot added is a dropped mark and not a panic.
+    const MAX: usize = 16;
+
+    /// The prepaint worth naming. The bound the user set is 4 ms on the whole
+    /// draw, of which prepaint is one part beside paint and the present, so
+    /// the interesting prepaints start below it; the shape seen on a rig is
+    /// 3.8 to 4.4 ms against a median of 1.4.
+    const LONG: Duration = Duration::from_millis(3);
+
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            marks: [("", Duration::ZERO, 0); Self::MAX],
+            count: 0,
+            shaping: gpui::ShapingCounts::default(),
+            shaped: Duration::ZERO,
+        }
+    }
+
+    fn mark(&mut self, pass: &'static str) {
+        let now = Instant::now();
+        if self.count < Self::MAX {
+            self.marks[self.count] = (pass, now.saturating_duration_since(self.last), 0);
+            self.count += 1;
+        }
+        self.last = now;
+    }
+
+    /// Marks the pass that just ended as two, a measured part and the rest.
+    ///
+    /// Shaping lines and building the highlighted chunks they are shaped
+    /// from happen in one pass and answer different questions: shaping that
+    /// repeats on a row nothing changed is a defeated layout cache, chunk
+    /// building that grows with the document is the syntax map. The shaping
+    /// half is timed inside the line layout cache, on its misses only, so
+    /// it is handed in here rather than measured again.
+    fn mark_split(
+        &mut self,
+        part: &'static str,
+        rest: &'static str,
+        took: Duration,
+        part_units: u64,
+    ) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last);
+        let took = took.min(elapsed);
+        if self.count < Self::MAX {
+            self.marks[self.count] = (part, took, part_units);
+            self.count += 1;
+        }
+        if self.count < Self::MAX {
+            self.marks[self.count] = (rest, elapsed - took, 0);
+            self.count += 1;
+        }
+        self.last = now;
+    }
+
+    /// Records the prepaint whole, always, and the passes it broke into only
+    /// when it went long.
+    ///
+    /// The whole is recorded every frame because the question a gated
+    /// instrument cannot answer is how much of the window's prepaint the
+    /// editor holds on an ordinary frame: a 3 ms floor hides every prepaint
+    /// under it, so a window spending 3.5 ms with the editor taking 0.4 of
+    /// it reads exactly like one that drew no editor at all.
+    ///
+    /// `rows` is the visible range, so a segment's cost per row means what a
+    /// frame's does; a pass that is flat in the rows drawn and long anyway is
+    /// the answer this exists to give.
+    fn finish(mut self, rows: u64) {
+        self.mark("prepaint/rest");
+        let ended = self.last;
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("prepaint/editor"),
+            start: self.started,
+            end: ended,
+            work_units: rows,
+        });
+        // Always, and apart from the pass breakdown below, because the
+        // breakdown only prints on a long prepaint and a defeated layout
+        // cache shows itself on the short ones: a settled frame that
+        // reshapes every row it draws is the fault, and it never trips the
+        // 3 ms floor.
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("shape/misses"),
+            start: ended.checked_sub(self.shaped).unwrap_or(ended),
+            end: ended,
+            work_units: self.shaping.misses,
+        });
+        gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+            owner: gpui::profiler::MainThreadWorkKind::Other("shape/reused"),
+            start: ended,
+            end: ended,
+            work_units: self.shaping.hits + self.shaping.carried,
+        });
+        if ended.saturating_duration_since(self.started) < Self::LONG {
+            return;
+        }
+        let mut start = self.started;
+        for (pass, took, units) in &self.marks[..self.count] {
+            let end = start + *took;
+            gpui::profiler::record_main_thread_work(gpui::profiler::MainThreadWork {
+                owner: gpui::profiler::MainThreadWorkKind::Other(pass),
+                start,
+                end,
+                work_units: if *units == 0 { rows } else { *units },
+            });
+            start = end;
+        }
+    }
+}
+
 impl Element for EditorElement {
     type RequestLayoutState = EditorRequestLayoutState;
     type PrepaintState = EditorLayout;
@@ -8441,9 +8668,11 @@ impl Element for EditorElement {
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    let mut passes = PrepaintPasses::new();
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
                         (editor.snapshot(window, cx), editor.read_only(cx))
                     });
+                    passes.mark("prepaint/snapshot");
                     let style = &self.style;
 
                     let rem_size = window.rem_size();
@@ -8492,35 +8721,50 @@ impl Element for EditorElement {
                         extended_right,
                     };
 
-                    snapshot = self.editor.update(cx, |editor, cx| {
-                        editor.last_bounds = Some(bounds);
-                        editor.gutter_dimensions = gutter_dimensions;
-                        editor.set_visible_line_count(
-                            (bounds.size.height / line_height) as f64,
-                            window,
-                            cx,
-                        );
-                        editor.set_visible_column_count(f64::from(editor_width / em_advance));
-
-                        if matches!(
-                            editor.mode,
-                            EditorMode::AutoHeight { .. } | EditorMode::Minimap { .. }
-                        ) {
-                            snapshot
-                        } else {
-                            let wrap_width = calculate_wrap_width(
-                                editor.soft_wrap_mode(cx),
-                                editor_width,
-                                em_layout_width,
+                    let (new_snapshot, defer_paint_until_rewrapped) =
+                        self.editor.update(cx, |editor, cx| {
+                            let is_initial_layout = editor.last_bounds.is_none();
+                            editor.last_bounds = Some(bounds);
+                            editor.gutter_dimensions = gutter_dimensions;
+                            editor.set_visible_line_count(
+                                (bounds.size.height / line_height) as f64,
+                                window,
+                                cx,
                             );
+                            editor.set_visible_column_count(f64::from(editor_width / em_advance));
 
-                            if editor.set_wrap_width(wrap_width, cx) {
-                                editor.snapshot(window, cx)
+                            if matches!(
+                                editor.mode,
+                                EditorMode::AutoHeight { .. } | EditorMode::Minimap { .. }
+                            ) {
+                                (snapshot, false)
                             } else {
-                                snapshot
+                                let wrap_width = calculate_wrap_width(
+                                    editor.soft_wrap_mode(cx),
+                                    editor_width,
+                                    em_layout_width,
+                                );
+
+                                if editor.defer_paint_until_initial_wrap
+                                    && !editor.display_map.read(cx).is_rewrapping(cx)
+                                {
+                                    editor.defer_paint_until_initial_wrap = false;
+                                }
+                                let snapshot = if editor.set_wrap_width(wrap_width, cx) {
+                                    editor.snapshot(window, cx)
+                                } else {
+                                    snapshot
+                                };
+                                let is_rewrapping = editor.display_map.read(cx).is_rewrapping(cx);
+                                if is_initial_layout && is_rewrapping {
+                                    editor.defer_paint_until_initial_wrap = true;
+                                } else if !is_rewrapping {
+                                    editor.defer_paint_until_initial_wrap = false;
+                                }
+                                (snapshot, editor.defer_paint_until_initial_wrap)
                             }
-                        }
-                    });
+                        });
+                    snapshot = new_snapshot;
 
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                     let gutter_hitbox = window.insert_hitbox(
@@ -8929,6 +9173,8 @@ impl Element for EditorElement {
                         }
                     }
 
+                    passes.mark("prepaint/selections");
+
                     let gutter = Gutter {
                         line_height,
                         range: start_row..end_row,
@@ -8946,6 +9192,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/line_numbers");
 
                     let mut expand_toggles =
                         window.with_element_namespace("expand_toggles", |window| {
@@ -8993,6 +9240,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/diff_hunks");
 
                     #[cfg(feature = "native")]
                     Self::layout_word_diff_highlights(
@@ -9018,6 +9266,7 @@ impl Element for EditorElement {
                         self.style.background,
                     );
 
+                    let shaping_before = gpui::shaping_counts();
                     let mut line_layouts = Self::layout_lines(
                         start_row..end_row,
                         &snapshot,
@@ -9028,6 +9277,40 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    let shaping = gpui::shaping_counts().since(shaping_before);
+                    passes.shaping = shaping;
+                    passes.shaped = Duration::from_nanos(shaping.shaped_nanos);
+                    passes.mark_split(
+                        "prepaint/shape_lines/shaped",
+                        "prepaint/shape_lines/chunks",
+                        Duration::from_nanos(shaping.shaped_nanos),
+                        shaping.misses,
+                    );
+                    #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+                    self.editor.update(cx, |editor, _| {
+                        editor.image_renderer_element_counts.clear();
+                        for id in line_layouts
+                            .iter()
+                            .flat_map(|layout| &layout.fragments)
+                            .filter_map(|fragment| match fragment {
+                                LineFragment::Element {
+                                    id: ChunkRendererId::Inlay(InlayId::Image(id)),
+                                    ..
+                                } => Some(InlayId::Image(*id)),
+                                _ => None,
+                            })
+                        {
+                            if let Some((_, count)) = editor
+                                .image_renderer_element_counts
+                                .iter_mut()
+                                .find(|(renderer_id, _)| *renderer_id == id)
+                            {
+                                *count += 1;
+                            } else {
+                                editor.image_renderer_element_counts.push((id, 1));
+                            }
+                        }
+                    });
                     let new_renderer_widths = (!is_minimap).then(|| {
                         line_layouts
                             .iter()
@@ -9106,6 +9389,8 @@ impl Element for EditorElement {
                     )
                     .width;
 
+                    passes.mark("prepaint/longest_line");
+
                     let scrollbar_layout_information = ScrollbarLayoutInformation::new(
                         text_hitbox.bounds,
                         glyph_grid_cell,
@@ -9147,6 +9432,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/indent_guides");
                     let indent_guides_for_spacers = indent_guides.clone();
 
                     let blocks = (!is_minimap)
@@ -9270,7 +9556,7 @@ impl Element for EditorElement {
                     );
                     #[cfg(feature = "native")]
                     let sticky_headers = if !is_minimap
-                        && is_singleton
+                        && (is_singleton || self.editor.read(cx).has_custom_sticky_headers())
                         && EditorSettings::get_global(cx).sticky_scroll.enabled
                     {
                         let relative = self.editor.read(cx).relative_line_numbers(cx);
@@ -9469,6 +9755,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    passes.mark("prepaint/blocks");
                     let line_elements = self.prepaint_lines(
                         start_row,
                         &mut line_layouts,
@@ -9479,6 +9766,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/lines");
 
                     window.with_element_namespace("blocks", |window| {
                         self.layout_blocks(
@@ -9529,6 +9817,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/cursors");
                     let navigation_overlay_paint_commands = self.layout_navigation_overlays(
                         &snapshot,
                         start_row..end_row,
@@ -9553,6 +9842,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    passes.mark("prepaint/scrollbars");
 
                     let gutter_settings = EditorSettings::get_global(cx).gutter;
 
@@ -9931,8 +10221,25 @@ impl Element for EditorElement {
                         editor.last_horizontal_scrollbar_visible = visible_horizontal_scrollbar;
                     });
 
+                    // What this frame had to draw, for the profiler. A
+                    // duration cannot be divided by anything on its own, so
+                    // every element that knows its own scale reports it and
+                    // the frame takes the total. Everything here is already
+                    // computed or O(1); nothing is walked for it, and the
+                    // call returns immediately when tracing is off.
+                    gpui::profiler::record_frame_work(gpui::profiler::FrameWorkScale {
+                        visible_rows: end_row.0.saturating_sub(start_row.0) as u64,
+                        total_rows: position_map.snapshot.max_point().row().0 as u64 + 1,
+                        blocks: blocks.len() as u64,
+                        excerpts: position_map.snapshot.buffer_snapshot().excerpt_count() as u64,
+                        inlays: position_map.snapshot.inlay_count() as u64,
+                        cursors: selections.len() as u64,
+                    });
+
+                    passes.finish(end_row.0.saturating_sub(start_row.0).into());
                     EditorLayout {
                         mode,
+                        defer_paint_until_rewrapped,
                         position_map,
                         visible_display_row_range: start_row..end_row,
                         wrap_guides,
@@ -10037,6 +10344,16 @@ impl Element for EditorElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     self.paint_mouse_listeners(layout, window, cx);
+
+                    // A newly laid-out editor can still have a wrap snapshot for its old width
+                    // after the bounded synchronous wait in WrapMap. Painting that snapshot makes
+                    // the text visibly reflow when the background rewrap finishes. Leave the
+                    // initial content blank instead; the wrap task notifies this editor when the
+                    // target-width snapshot is ready.
+                    if layout.defer_paint_until_rewrapped {
+                        self.paint_background(layout, window, cx);
+                        return;
+                    }
 
                     // Mask the editor behind sticky scroll headers. Important
                     // for transparent backgrounds.
@@ -10178,6 +10495,7 @@ impl IntoElement for EditorElement {
 
 pub struct EditorLayout {
     position_map: Rc<PositionMap>,
+    defer_paint_until_rewrapped: bool,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
     content_origin: gpui::Point<Pixels>,
@@ -11586,6 +11904,49 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_initial_paint_waits_for_large_soft_wrap(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let text =
+                "a long transcript line that needs to wrap at the editor width\n".repeat(20_000);
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
+            editor
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        let (_, initial_state) = cx.draw(Default::default(), size(px(180.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert!(
+            initial_state.defer_paint_until_rewrapped,
+            "the initial frame must not paint the stale unwrapped snapshot"
+        );
+
+        let (_, second_pending_state) =
+            cx.draw(Default::default(), size(px(180.), px(500.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
+        assert!(
+            second_pending_state.defer_paint_until_rewrapped,
+            "redraws must remain blank until the initial rewrap finishes"
+        );
+
+        cx.run_until_parked();
+        let (_, resized_state) = cx.draw(Default::default(), size(px(220.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style)
+        });
+        assert!(
+            !resized_state.defer_paint_until_rewrapped,
+            "a later resize rewrap must not inherit initial-paint suppression"
+        );
+        assert!(resized_state.position_map.snapshot.max_point().row().0 > 20_000);
+    }
+
+    #[gpui::test]
     async fn test_status_bar_blame_location_reserves_no_scroll_width(cx: &mut TestAppContext) {
         struct FixedWidthBlameRenderer;
 
@@ -12790,9 +13151,9 @@ mod tests {
                 a: 0.5,
             };
             let player_color = PlayerColor {
-                cursor: selection_color,
-                background: selection_color,
-                selection: selection_color,
+                cursor: selection_color.into(),
+                background: selection_color.into(),
+                selection: selection_color.into(),
             };
 
             let spanning_selection = SelectionLayout {
@@ -12839,9 +13200,9 @@ mod tests {
                 a: 0.5,
             };
             let player_color = PlayerColor {
-                cursor: selection_color,
-                background: selection_color,
-                selection: selection_color,
+                cursor: selection_color.into(),
+                background: selection_color.into(),
+                selection: selection_color.into(),
             };
 
             let selection = SelectionLayout {

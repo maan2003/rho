@@ -203,6 +203,10 @@ pub trait Platform: 'static {
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
 
+    /// Registers a callback for system-wide user idle and resumed events.
+    /// Platforms without idle notification support never invoke the callback.
+    fn on_user_idle(&self, _timeout: Duration, _callback: Box<dyn FnMut(UserIdleEvent)>) {}
+
     // Mobile platform methods. On mobile the OS owns the application
     // lifecycle: apps are backgrounded, foregrounded, and killed at the
     // system's discretion, and must react rather than decide.
@@ -326,6 +330,15 @@ pub trait Platform: 'static {
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
+}
+
+/// A system-wide user idle notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserIdleEvent {
+    /// The configured timeout elapsed without user activity.
+    Idle,
+    /// User activity resumed after an idle event.
+    Resumed,
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
@@ -729,6 +742,16 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    pub host_vsync: Option<HostVsync>,
+}
+
+/// Timing of a host-compositor vblank, in the host's monotonic clock domain.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct HostVsync {
+    /// Presentation timestamp in the host compositor's monotonic clock.
+    pub timestamp: Duration,
+    /// Fixed refresh period of the output presenting the window.
+    pub refresh_period: Option<Duration>,
 }
 
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
@@ -802,10 +825,24 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Create a below-parent Wayland child surface. Non-Wayland platforms do
+    /// not expose this compositor fast path.
+    #[cfg(target_os = "linux")]
+    fn create_linux_wayland_passthrough(
+        &self,
+        _events: Box<dyn Fn(crate::LinuxWaylandPassthroughEvent) + Send + Sync>,
+    ) -> Option<anyhow::Result<Arc<dyn crate::LinuxWaylandPassthrough>>> {
+        None
+    }
     /// Routes touch contacts inside `bounds` as immediate mouse presses instead of
     /// platform gestures. Intended for latency-sensitive, canvas-rendered controls
     /// such as an on-screen keyboard. Platforms without touch may ignore this.
     fn set_direct_touch_region(&mut self, _bounds: Option<Bounds<Pixels>>) {}
+    /// Temporarily installs the platform serial that initiated a synthesized
+    /// compatibility click. Paired with end_touch_serial.
+    fn begin_touch_serial(&self, _serial: Option<u32>) {}
+    /// Restores input serial state after a synthesized compatibility click.
+    fn end_touch_serial(&self) {}
 
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;

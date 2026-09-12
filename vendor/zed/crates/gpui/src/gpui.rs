@@ -56,6 +56,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod touch_gestures;
 mod util;
 mod view;
 mod window;
@@ -344,3 +345,7 @@ pub struct GpuSpecs {
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
 }
+#[cfg(target_os = "linux")]
+mod linux_dmabuf;
+#[cfg(target_os = "linux")]
+pub use linux_dmabuf::*;

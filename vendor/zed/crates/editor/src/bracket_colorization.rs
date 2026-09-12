@@ -516,7 +516,7 @@ mod tests {
         ];
 
         let palette =
-            bracket_colorization_accents(&accents, Appearance::Dark, dark_editor_background());
+            bracket_colorization_hsla_accents(&accents, Appearance::Dark, dark_editor_background());
 
         assert_eq!(palette.as_ref(), accents.as_slice());
     }
@@ -529,8 +529,11 @@ mod tests {
             hsla(0.22, 0.9, 0.76, 1.0),
         ];
 
-        let palette =
-            bracket_colorization_accents(&accents, Appearance::Light, light_editor_background());
+        let palette = bracket_colorization_hsla_accents(
+            &accents,
+            Appearance::Light,
+            light_editor_background(),
+        );
         let original = hsla_to_oklch(accents[2]);
         let adjusted = hsla_to_oklch(palette[2]);
 
@@ -560,7 +563,7 @@ mod tests {
         ];
         let background = Hsla::from(Rgba::try_from("#FBF1C7").expect("valid color"));
 
-        let palette = bracket_colorization_accents(&accents, Appearance::Light, background);
+        let palette = bracket_colorization_hsla_accents(&accents, Appearance::Light, background);
         let original_min_adj = min_adjacent_oklab_distance(&accents, background);
 
         assert_eq!(palette.as_ref(), accents.as_slice());
@@ -608,8 +611,11 @@ mod tests {
         let color = hsla(0.22, 0.9, 0.76, 1.0);
         let original_contrast = background_contrast(color, light_editor_background());
         assert!(original_contrast < 20.0);
-        let palette =
-            bracket_colorization_accents(&[color], Appearance::Light, light_editor_background());
+        let palette = bracket_colorization_hsla_accents(
+            &[color],
+            Appearance::Light,
+            light_editor_background(),
+        );
         assert_ne!(palette.as_ref(), &[color][..]);
         assert!(
             background_contrast(palette[0], light_editor_background()) >= BACKGROUND_APCA_LIGHT
@@ -1875,8 +1881,8 @@ mod foo «1{
         let adjusted_palette = cx.update(|cx| {
             bracket_colorization_accents(
                 &[
-                    Hsla::from(Rgba::try_from("#ff0000").expect("valid override accent")),
-                    Hsla::from(Rgba::try_from("#0000ff").expect("valid override accent")),
+                    Hsla::from(Rgba::try_from("#ff0000").expect("valid override accent")).into(),
+                    Hsla::from(Rgba::try_from("#0000ff").expect("valid override accent")).into(),
                 ],
                 cx.theme().appearance,
                 cx.theme().colors().editor_background,
@@ -1902,8 +1908,8 @@ mod foo «1{
     }2»
 }1»
 "#,},
-            adjusted_palette[0],
-            adjusted_palette[1],
+            Hsla::from(adjusted_palette[0]),
+            Hsla::from(adjusted_palette[1]),
         );
         assert_eq!(
             expected_markup,

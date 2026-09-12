@@ -1,11 +1,10 @@
 //! Built-in multi-agent tools: `spawn_engineer`, `message_agent`,
-//! `interrupt_engineer`, `wait_agent`.
+//! `interrupt_engineer`.
 //!
 //! These are ordinary fast tools (codex-v2 style): asynchrony lives in the
 //! per-agent message queue, not in tool execution. `spawn_engineer` returns the
-//! child id immediately; results come back as mail. `wait` is special: the
-//! agent loop arms and resolves it itself — when deliverable input arrives
-//! or the deadline passes — so only its spec and argument parsing live here.
+//! child id immediately; results come back as mail, and the loop's own `wait`
+//! tool is how an agent waits for them.
 //!
 //! The tools are injected into the core agent as a [`MultiAgentTools`]
 //! handle holding a `Weak<AgentPool>`; the agent loop itself knows nothing
@@ -61,17 +60,8 @@ impl MultiAgentTools {
             .db()
             .read()
             .get_agent(self.self_id)
+            .config
             .spawned_by
-    }
-
-    #[cfg(feature = "code-mode")]
-    pub(crate) fn role(&self) -> AgentRole {
-        self.pool()
-            .expect("multi-agent tools require a live agent pool")
-            .db()
-            .read()
-            .get_agent(self.self_id)
-            .role
     }
 
     pub(crate) fn display_id(&self, agent_id: AgentId) -> String {
@@ -92,11 +82,7 @@ pub const SPAWN_ENGINEER_TOOL_NAME: &str = "spawn_engineer";
 pub const MESSAGE_AGENT_TOOL_NAME: &str = "message_agent";
 pub const INTERRUPT_ENGINEER_TOOL_NAME: &str = "interrupt_engineer";
 pub const ASK_ADVISOR_TOOL_NAME: &str = "ask_advisor";
-pub const WAIT_TOOL_NAME: &str = "wait_agent";
 
-const MIN_WAIT_SECONDS: u64 = 30;
-const DEFAULT_WAIT_SECONDS: u64 = 300;
-const MAX_WAIT_SECONDS: u64 = 3600;
 const AGENT_ID_EXAMPLE: &str = "eng-h6u7";
 
 pub fn is_agent_tool(name: &str) -> bool {
@@ -106,26 +92,18 @@ pub fn is_agent_tool(name: &str) -> bool {
             | MESSAGE_AGENT_TOOL_NAME
             | INTERRUPT_ENGINEER_TOOL_NAME
             | ASK_ADVISOR_TOOL_NAME
-            | WAIT_TOOL_NAME
     )
 }
 
 pub fn agent_tool_specs(role: AgentRole) -> Vec<ToolSpec> {
     match role {
-        AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. } => vec![
+        AgentRole::Engineer { .. } => vec![
             spawn_engineer_spec(),
             message_agent_spec(),
             interrupt_engineer_spec(),
             advisor_spec(),
-            wait_spec(),
         ],
-        AgentRole::PM | AgentRole::WorkflowPM { .. } => vec![
-            spawn_engineer_spec(),
-            message_agent_spec(),
-            interrupt_engineer_spec(),
-        ],
-        AgentRole::Advisor { .. } => vec![message_agent_spec(), wait_spec()],
-        AgentRole::Iris => Vec::new(),
+        AgentRole::Advisor { .. } => vec![message_agent_spec()],
     }
 }
 
@@ -317,39 +295,12 @@ The answer arrives later as mail. Wait patiently for up to five minutes for its 
     }
 }
 
-fn wait_spec() -> ToolSpec {
-    ToolSpec {
-        name: ToolName::try_from(WAIT_TOOL_NAME).expect("valid tool name"),
-        tool_type: ToolType::Function,
-        description: "Wait for a mailbox update from any live agent, including queued messages \
-                      and final responses. The wait also ends early when new user input is \
-                      steered into the active turn, so prefer one longer timeout over repeated \
-                      short waits. Does not return the content; queued input enters context \
-                      after this tool returns."
-            .to_owned(),
-        input_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "timeout_seconds": {
-                    "type": "integer",
-                    "minimum": MIN_WAIT_SECONDS,
-                    "maximum": MAX_WAIT_SECONDS,
-                    "description": format!("Give up after this many seconds (default: {DEFAULT_WAIT_SECONDS}, min: {MIN_WAIT_SECONDS}, max: {MAX_WAIT_SECONDS}). Prefer a longer timeout; the wait returns early when mail arrives.")
-                }
-            }
-        }),
-        format: None,
-    }
-}
-
 pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> ToolOutput {
     let result = match call.name.as_str() {
         SPAWN_ENGINEER_TOOL_NAME => spawn_engineer(&tools, &call).await,
         MESSAGE_AGENT_TOOL_NAME => message_agent(&tools, &call).await,
         INTERRUPT_ENGINEER_TOOL_NAME => interrupt_engineer(&tools, &call).await,
         ASK_ADVISOR_TOOL_NAME => ask_advisor(&tools, &call).await,
-        WAIT_TOOL_NAME => wait_agent(&tools, &call).await,
         _ => Err(anyhow::anyhow!(
             "unsupported tool call: {}",
             call.name.as_str()
@@ -357,26 +308,18 @@ pub(crate) async fn call_agent_tool(tools: MultiAgentTools, call: ToolCall) -> T
     };
     match result {
         Ok(output) => ToolOutput {
+            full_output: None,
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(output),
             status: ToolOutputStatus::Success,
         },
         Err(error) => ToolOutput {
+            full_output: None,
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(error.to_string()),
             status: ToolOutputStatus::Error,
         },
     }
-}
-
-async fn wait_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result<String> {
-    let timeout = std::time::Duration::from_secs(parse_wait_timeout(&call.arguments)?);
-    let pool = tools.pool()?;
-    let (_, agent, _) = pool.load(tools.self_id).await?;
-    Ok(if agent.wait_for_input(timeout).await {
-        "Wait completed."
-    } else {
-        "Wait timed out."
-    }
-    .to_owned())
 }
 
 #[derive(Deserialize)]
@@ -388,14 +331,13 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let args: AdvisorArgs = serde_json::from_str(&call.arguments)?;
     anyhow::ensure!(!args.message.trim().is_empty(), "message must not be empty");
     let pool = tools.pool()?;
-    let workdirs = pool
-        .db()
-        .read()
-        .get_agent(tools.self_id)
+    let parent = pool.db().read().get_agent(tools.self_id).config;
+    let advisor_intelligence = default_advisor_intelligence(parent.role);
+    let workdirs = parent
         .workdirs
         .into_iter()
         .map(|info| SpawnWorkdir {
-            repo: info.repo().to_owned().into(),
+            repo: info.repo().to_owned(),
             checkout: SpawnCheckout::Shared,
         })
         .collect();
@@ -406,7 +348,7 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
             args.message,
             workdirs,
             AgentRole::Advisor {
-                intelligence: crate::db::AdvisorIntelligence::Medium,
+                intelligence: advisor_intelligence,
             },
         )
         .await?;
@@ -414,6 +356,15 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         "Advisor adv-{} is considering the question. Its answer will arrive as mail.",
         pool.agent_id_prefix(advisor)
     ))
+}
+
+fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligence {
+    match role {
+        AgentRole::Engineer {
+            intelligence: crate::db::EngineerIntelligence::High,
+        } => crate::db::AdvisorIntelligence::High,
+        _ => crate::db::AdvisorIntelligence::Medium,
+    }
 }
 
 #[derive(Deserialize)]
@@ -517,7 +468,12 @@ async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resu
         anyhow::bail!("no agent with id {handle}");
     }
     anyhow::ensure!(
-        pool.db().read().get_agent(recipient).role.handle_prefix()
+        pool.db()
+            .read()
+            .get_agent(recipient)
+            .config
+            .role
+            .handle_prefix()
             == handle.split('-').next().unwrap(),
         "agent handle role prefix does not match target"
     );
@@ -560,7 +516,7 @@ async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow:
         anyhow::bail!("no agent with id {}", args.engineer_id);
     }
     anyhow::ensure!(
-        pool.db().read().get_agent(target).role.is_engineer(),
+        pool.db().read().get_agent(target).config.role.is_engineer(),
         "target is not an Engineer"
     );
     if target == tools.self_id {
@@ -572,25 +528,6 @@ async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow:
         "Engineer eng-{} interrupted. It remains available for follow-up messages.",
         pool.agent_id_prefix(target)
     ))
-}
-
-/// Parse a `wait` call's timeout for the loop that arms it.
-pub(crate) fn parse_wait_timeout(arguments: &str) -> anyhow::Result<u64> {
-    #[derive(Deserialize)]
-    struct WaitArgs {
-        timeout_seconds: Option<u64>,
-    }
-    let args: WaitArgs = if arguments.trim().is_empty() {
-        WaitArgs {
-            timeout_seconds: None,
-        }
-    } else {
-        serde_json::from_str(arguments)?
-    };
-    Ok(args
-        .timeout_seconds
-        .unwrap_or(DEFAULT_WAIT_SECONDS)
-        .clamp(MIN_WAIT_SECONDS, MAX_WAIT_SECONDS))
 }
 
 #[cfg(test)]
@@ -621,17 +558,22 @@ mod tests {
     }
 
     #[test]
-    fn wait_uses_long_timeouts_with_a_thirty_second_minimum() {
-        let spec = wait_spec();
-        assert!(spec.description.contains("prefer one longer timeout"));
-        assert_eq!(parse_wait_timeout(r#"{"timeout_seconds":1}"#).unwrap(), 30);
-        assert_eq!(parse_wait_timeout(r#"{"timeout_seconds":60}"#).unwrap(), 60);
-        assert_eq!(parse_wait_timeout("{}").unwrap(), 300);
-    }
-
-    #[test]
     fn parses_spawn_role() {
         assert_eq!(parse_spawn_role("eng").unwrap(), AgentRole::default());
         assert!(parse_spawn_role("terra").is_err());
+    }
+
+    #[test]
+    fn high_engineers_get_high_advisors() {
+        assert_eq!(
+            default_advisor_intelligence(AgentRole::Engineer {
+                intelligence: crate::db::EngineerIntelligence::High,
+            }),
+            crate::db::AdvisorIntelligence::High
+        );
+        assert_eq!(
+            default_advisor_intelligence(AgentRole::default()),
+            crate::db::AdvisorIntelligence::Medium
+        );
     }
 }

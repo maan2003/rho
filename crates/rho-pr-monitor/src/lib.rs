@@ -15,9 +15,9 @@ use client::OctoClient;
 use db::{FeedbackRecord, PrMonitorReadTxnExt as _, PrMonitorWriteTxnExt as _, PrWatch};
 use futures_util::stream::{self, StreamExt as _};
 use octo_types::{PrFeedback, PrSnapshot};
+use rho_agent::MessageDelivery;
 use rho_agent::db::{AgentId, AgentReadTxnExt as _};
 use rho_agent::pool::AgentPool;
-use rho_agent::{InputSourceId, MessageDelivery};
 use rho_db::RhoDb;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
@@ -43,11 +43,15 @@ pub struct PrMonitor {
 }
 
 impl PrMonitor {
-    pub async fn new(pool: Arc<AgentPool>, db: RhoDb) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        pool: Arc<AgentPool>,
+        db: RhoDb,
+        octo_socket: std::path::PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
         let monitor = Arc::new(Self {
             pool,
             db,
-            octo: OctoClient::new()?,
+            octo: OctoClient::new(octo_socket)?,
         });
         Ok(monitor)
     }
@@ -210,17 +214,13 @@ impl PrMonitor {
             "subscriber Engineer no longer exists"
         );
         let (_, agent, _) = self.pool.load(subscriber).await?;
-        let source_id = InputSourceId::fresh_internal();
-        let mut accepted = self.pool.subscribe_accepted_inputs();
-        agent.send_user_message_with_source(message, MessageDelivery::NextRequest, Some(source_id));
-        tokio::time::timeout(DELIVERY_TIMEOUT, async {
-            loop {
-                let report = accepted.recv().await?;
-                if report.input_id.agent_id == subscriber && report.source_id == Some(source_id) {
-                    return Ok::<_, tokio::sync::broadcast::error::RecvError>(());
-                }
-            }
-        })
+        tokio::time::timeout(
+            DELIVERY_TIMEOUT,
+            agent.send_user_content_accepted(
+                vec![rho_core::ContentPart::Text { text: message }],
+                MessageDelivery::NextRequest,
+            ),
+        )
         .await??;
         Ok(())
     }
@@ -445,7 +445,12 @@ impl PrMonitor {
     fn ensure_engineer(&self, subscriber: AgentId) -> anyhow::Result<()> {
         anyhow::ensure!(self.pool.agent_exists(subscriber), "agent no longer exists");
         anyhow::ensure!(
-            self.db.read().get_agent(subscriber).role.is_engineer(),
+            self.db
+                .read()
+                .get_agent(subscriber)
+                .config
+                .role
+                .is_engineer(),
             "PR subscriptions are owned by Engineers"
         );
         Ok(())

@@ -1,10 +1,10 @@
 use crate::display_map::inlay_map::InlayChunk;
 
 use super::{
-    ElisionPolicy, Highlights,
+    Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
 use language::InlayId;
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
@@ -232,17 +232,11 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
 pub(crate) struct FoldMapWriter<'a>(&'a mut FoldMap);
 
 pub(crate) trait FoldInput<T> {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy);
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder);
 }
 
 impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder) {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
-        (self.0, self.1, ElisionPolicy::Hidden)
-    }
-}
-
-impl<T> FoldInput<T> for (Range<T>, FoldPlaceholder, ElisionPolicy) {
-    fn into_parts(self) -> (Range<T>, FoldPlaceholder, ElisionPolicy) {
+    fn into_parts(self) -> (Range<T>, FoldPlaceholder) {
         self
     }
 }
@@ -257,7 +251,7 @@ impl FoldMapWriter<'_> {
         let mut folds = Vec::new();
         let snapshot = self.0.snapshot.inlay_snapshot.clone();
         for input in ranges.into_iter() {
-            let (range, fold_text, elision_policy) = input.into_parts();
+            let (range, fold_text) = input.into_parts();
             let buffer = &snapshot.buffer;
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
 
@@ -267,19 +261,10 @@ impl FoldMapWriter<'_> {
             }
 
             let fold_range = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-            // For now, ignore any ranges that span an excerpt boundary.
-            if buffer
-                .anchor_range_to_buffer_anchor_range(fold_range.clone())
-                .is_none()
-            {
-                continue;
-            }
-
             folds.push(Fold {
                 id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                 range: FoldRange(fold_range),
                 placeholder: fold_text,
-                elision_policy,
             });
 
             let inlay_range =
@@ -352,18 +337,13 @@ impl FoldMapWriter<'_> {
         let buffer = &snapshot.buffer;
         let mut desired = Vec::new();
         for input in ranges {
-            let (range, placeholder, elision_policy) = input.into_parts();
+            let (range, placeholder) = input.into_parts();
             let range = range.start.to_offset(buffer)..range.end.to_offset(buffer);
             if range.is_empty() {
                 continue;
             }
             let anchors = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-            if buffer
-                .anchor_range_to_buffer_anchor_range(anchors.clone())
-                .is_some()
-            {
-                desired.push((range, FoldRange(anchors), placeholder, elision_policy));
-            }
+            desired.push((range, FoldRange(anchors), placeholder));
         }
 
         let mut existing_by_range: HashMap<_, Vec<Fold>> = HashMap::default();
@@ -387,15 +367,12 @@ impl FoldMapWriter<'_> {
         drop(cursor);
 
         let mut edits = Vec::new();
-        for (range, anchors, placeholder, elision_policy) in desired {
+        for (range, anchors, placeholder) in desired {
             let key = (range.start, range.end);
             let existing = existing_by_range.get_mut(&key).and_then(|folds| {
                 folds
                     .iter()
-                    .position(|fold| {
-                        fold.elision_policy == elision_policy
-                            && fold.placeholder.equivalent_for_replacement(&placeholder)
-                    })
+                    .position(|fold| fold.placeholder.equivalent_for_replacement(&placeholder))
                     .map(|ix| folds.swap_remove(ix))
             });
             if let Some(existing) = existing {
@@ -405,7 +382,6 @@ impl FoldMapWriter<'_> {
                     id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                     range: anchors,
                     placeholder,
-                    elision_policy,
                 };
                 self.0.snapshot.fold_metadata_by_id.insert(
                     fold.id,
@@ -558,12 +534,102 @@ impl FoldMapWriter<'_> {
 pub struct FoldMap {
     snapshot: FoldSnapshot,
     next_fold_id: FoldId,
+    /// Every widened edit that stopped describing a range, in the words of
+    /// [`widening_violation`].
+    ///
+    /// The widening loops in `sync` are where an edit is made wrong; the
+    /// seek that walks over it is where the panic happens, and the two are
+    /// far enough apart that the message names the wrong layer. Both faults
+    /// found on the rig this week — an unsigned underflow at a fold
+    /// beginning at offset zero, and an edit left behind a cursor that
+    /// stepped over it — are visible here, at the point the edit is built,
+    /// before anything is asked to seek anywhere.
+    #[cfg(feature = "wrap-test-support")]
+    widening_violations: Vec<String>,
+    /// Every sync whose emitted edits did not account for the change in
+    /// this map's own output extent.
+    ///
+    /// The layer-by-layer accounting question, asked of the fold map at
+    /// its own output: does this snapshot's extent equal the last one's
+    /// plus the net of the edits handed over with it. A sync that says
+    /// the document grew by six bytes over an output that did not grow is
+    /// telling the layers above about a document that does not exist, and
+    /// they find out later and further away - as `display point out of
+    /// range` in `FoldPoint::to_offset`, reached from `BlockMap::sync`,
+    /// or as rows a snapshot claims and the chunks do not yield.
+    #[cfg(feature = "wrap-test-support")]
+    accounting_violations: Vec<String>,
+    /// How many times the two ends of an edit met at one buffer offset at
+    /// the end of one and the same fold - the shape that is allowed.
+    ///
+    /// Kept so that an empty violation record means something. Without it,
+    /// a document whose ends converge legitimately and one whose ends never
+    /// converge at all are the same silence.
+    #[cfg(feature = "wrap-test-support")]
+    end_convergences: usize,
+}
+
+/// Whether a widened edit still describes a range of a document that exists.
+///
+/// Deliberately narrow. It does not know what the right answer is, only
+/// what cannot be one: a range whose start is past its own end, or whose
+/// end is past everything there is. Both are unreachable in a document and
+/// both are one subtraction away in the loops that build them.
+#[cfg(feature = "wrap-test-support")]
+pub fn widening_violation(
+    side: &str,
+    range: std::ops::Range<usize>,
+    extent: usize,
+    stage: &str,
+) -> Option<String> {
+    if range.start > range.end {
+        return Some(format!(
+            "{stage}: the {side} side was widened to {}..{}, which starts after it ends; an unsigned subtraction took more than the side had in front of it",
+            range.start, range.end
+        ));
+    }
+    if range.end > extent {
+        return Some(format!(
+            "{stage}: the {side} side was widened to {}..{}, past the {extent} bytes the tree has",
+            range.start, range.end
+        ));
+    }
+    None
 }
 
 impl FoldMap {
+    /// Every widened edit this map built that did not describe a range,
+    /// and forgets them. Empty is the answer a healthy sync gives.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_widening_violations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.widening_violations)
+    }
+
+    /// Every sync whose edits did not account for its own output extent,
+    /// and forgets them. Empty is the answer a healthy sync gives.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_accounting_violations(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.accounting_violations)
+    }
+
+    /// How many edits had both ends widened to the end of one and the same
+    /// fold, and forgets the count. A test asserting the violation record
+    /// is empty asserts this is not zero beside it, or it has not shown
+    /// that the shape is legitimate - only that it did not occur.
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_end_convergences(&mut self) -> usize {
+        std::mem::take(&mut self.end_convergences)
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn new(inlay_snapshot: InlaySnapshot) -> (Self, FoldSnapshot) {
         let this = Self {
+            #[cfg(feature = "wrap-test-support")]
+            widening_violations: Vec::new(),
+            #[cfg(feature = "wrap-test-support")]
+            accounting_violations: Vec::new(),
+            #[cfg(feature = "wrap-test-support")]
+            end_convergences: 0,
             snapshot: FoldSnapshot {
                 folds: SumTree::new(&inlay_snapshot.buffer),
                 transforms: SumTree::from_item(
@@ -609,7 +675,12 @@ impl FoldMap {
 
     #[ztracing::instrument(skip_all)]
     fn check_invariants(&self) {
-        if cfg!(test) {
+        // `cfg!(test)` alone never fires from rho: this crate is vendored and
+        // is not a workspace member, so its own tests do not run here and the
+        // invariant that would have caught a fold tree out of step with its
+        // inlay snapshot was dead code for us. The feature lets rho's tests
+        // run it.
+        if cfg!(test) || cfg!(feature = "wrap-test-support") {
             assert_eq!(
                 self.snapshot.transforms.summary().input.len,
                 self.snapshot.inlay_snapshot.len().0,
@@ -641,11 +712,23 @@ impl FoldMap {
     fn sync(
         &mut self,
         inlay_snapshot: InlaySnapshot,
-        inlay_edits: Vec<InlayEdit>,
+        mut inlay_edits: Vec<InlayEdit>,
     ) -> Vec<FoldEdit> {
         let mut profile =
             gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::FoldMapSync);
         let old_rows = if profile.is_enabled() {
+            profile.touched_rows(
+                inlay_edits
+                    .iter()
+                    .map(|edit| {
+                        let old_start = self.snapshot.inlay_snapshot.to_point(edit.old.start).row();
+                        let old_end = self.snapshot.inlay_snapshot.to_point(edit.old.end).row();
+                        let new_start = inlay_snapshot.to_point(edit.new.start).row();
+                        let new_end = inlay_snapshot.to_point(edit.new.end).row();
+                        u64::from((old_end - old_start).max(new_end - new_start) + 1)
+                    })
+                    .sum(),
+            );
             let input_start = inlay_edits
                 .iter()
                 .map(|edit| inlay_snapshot.to_point(edit.new.start).row())
@@ -666,6 +749,7 @@ impl FoldMap {
         } else {
             0
         };
+        let mut walked_items = 0_u64;
         let fold_edits = if inlay_edits.is_empty() {
             if self.snapshot.inlay_snapshot.version != inlay_snapshot.version {
                 self.snapshot.version += 1;
@@ -673,7 +757,156 @@ impl FoldMap {
             self.snapshot.inlay_snapshot = inlay_snapshot;
             Vec::new()
         } else {
-            let mut inlay_edits_iter = inlay_edits.iter().cloned().peekable();
+            // The snapshot the old tree is written against. Lengths on the
+            // two sides are only comparable through the buffer, so both
+            // snapshots have to be in hand to convert either way.
+            let old_inlay_snapshot = self.snapshot.inlay_snapshot.clone();
+
+            // Removing an excerpt makes its anchors unresolvable. Such folds
+            // no longer have a stable ordering in the new buffer, so discard
+            // them before using the fold tree with the new snapshot. A text
+            // edit can make an anchor invalid while it remains resolvable at
+            // its biased position, and that fold must be retained: the text
+            // it hides is still there.
+            let mut invalid_folds_by_start =
+                HashMap::<MultiBufferOffset, HashSet<FoldId>>::default();
+            let mut invalid_fold_edits = Vec::new();
+            for edit in &inlay_edits {
+                let old_range = old_inlay_snapshot.to_buffer_offset(edit.old.start)
+                    ..old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                let mut folds =
+                    intersecting_folds(&old_inlay_snapshot, &self.snapshot.folds, old_range, true);
+                while let Some(fold) = folds.item() {
+                    if !inlay_snapshot.buffer.can_resolve(&fold.range.start)
+                        || !inlay_snapshot.buffer.can_resolve(&fold.range.end)
+                    {
+                        let newly_invalid = invalid_folds_by_start
+                            .entry(fold.range.start.to_offset(&old_inlay_snapshot.buffer))
+                            .or_default()
+                            .insert(fold.id);
+                        if newly_invalid {
+                            let old_start = fold.range.start.to_offset(&old_inlay_snapshot.buffer);
+                            let old_end = fold.range.end.to_offset(&old_inlay_snapshot.buffer);
+                            let new_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
+                            let new_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
+                            invalid_fold_edits.push(InlayEdit {
+                                old: old_inlay_snapshot.to_inlay_offset(old_start)
+                                    ..old_inlay_snapshot.to_inlay_offset(old_end),
+                                new: inlay_snapshot.to_inlay_offset(new_start.min(new_end))
+                                    ..inlay_snapshot.to_inlay_offset(new_start.max(new_end)),
+                            });
+                        }
+                        self.snapshot.fold_metadata_by_id.remove(&fold.id);
+                    }
+                    folds.next();
+                }
+            }
+            if !invalid_folds_by_start.is_empty() {
+                let mut invalid_folds_by_start =
+                    invalid_folds_by_start.into_iter().collect::<Vec<_>>();
+                invalid_folds_by_start.sort_unstable_by_key(|(start, _)| *start);
+                self.snapshot.folds = {
+                    let mut cursor = self
+                        .snapshot
+                        .folds
+                        .cursor::<FoldRange>(&old_inlay_snapshot.buffer);
+                    let mut folds = SumTree::new(&inlay_snapshot.buffer);
+                    for (start, invalid_ids) in invalid_folds_by_start {
+                        let target =
+                            FoldRange(old_inlay_snapshot.buffer.anchor_before(start)..Anchor::Max);
+                        folds.append(cursor.slice(&target, Bias::Left), &inlay_snapshot.buffer);
+                        while let Some(fold) = cursor.item()
+                            && fold.range.start.to_offset(&old_inlay_snapshot.buffer) == start
+                        {
+                            if !invalid_ids.contains(&fold.id) {
+                                folds.push(fold.clone(), &inlay_snapshot.buffer);
+                            }
+                            cursor.next();
+                        }
+                    }
+                    folds.append(cursor.suffix(), &inlay_snapshot.buffer);
+                    folds
+                };
+                inlay_edits.extend(invalid_fold_edits);
+                inlay_edits = consolidate_inlay_edits(inlay_edits);
+            }
+
+            // A retained fold can straddle the start of a later edit in the
+            // batch. Widen that edit before either cursor starts walking, so
+            // overlapping widened edits are coalesced and the fold is rebuilt
+            // once from its beginning rather than appended at its old extent.
+            let mut normalized_edits: Vec<InlayEdit> = Vec::with_capacity(inlay_edits.len());
+            for mut edit in inlay_edits {
+                let (old_transform_start, _, old_transform) = self
+                    .snapshot
+                    .transforms
+                    .find::<InlayOffset, _>((), &edit.old.start, Bias::Left);
+                let transform_prefix = edit.old.start - old_transform_start;
+                let mut scan_old_start = edit.old.start;
+                let mut scan_new_start = edit.new.start;
+                if old_transform.is_some_and(|transform| !transform.is_fold())
+                    && transform_prefix <= edit.new.start.0.0
+                {
+                    scan_new_start -= transform_prefix;
+                    scan_old_start = old_transform_start;
+                }
+                loop {
+                    let old_start = old_inlay_snapshot.to_buffer_offset(scan_old_start);
+                    let new_start = inlay_snapshot.to_buffer_offset(scan_new_start);
+                    let mut folds = intersecting_folds(
+                        &old_inlay_snapshot,
+                        &self.snapshot.folds,
+                        old_start..old_inlay_snapshot.buffer.len(),
+                        true,
+                    );
+                    let mut containing = None;
+                    while let Some(fold) = folds.item() {
+                        let old_buffer_start =
+                            fold.range.start.to_offset(&old_inlay_snapshot.buffer);
+                        let old_buffer_end = fold.range.end.to_offset(&old_inlay_snapshot.buffer);
+                        let new_buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
+                        let new_buffer_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
+                        if old_buffer_start > old_start && new_buffer_start > new_start {
+                            break;
+                        }
+                        let old_range = old_inlay_snapshot.to_inlay_offset(old_buffer_start)
+                            ..old_inlay_snapshot.to_inlay_offset(old_buffer_end);
+                        let new_range = inlay_snapshot.to_inlay_offset(new_buffer_start)
+                            ..inlay_snapshot.to_inlay_offset(new_buffer_end);
+                        if (old_range.start < scan_old_start && scan_old_start < old_range.end)
+                            || (new_range.start < scan_new_start && scan_new_start < new_range.end)
+                        {
+                            containing = Some((old_buffer_start, new_buffer_start));
+                            break;
+                        }
+                        folds.next();
+                    }
+                    let Some((old_buffer_start, new_buffer_start)) = containing else {
+                        break;
+                    };
+                    edit.old.start = edit.old.start.min(widen_start_over_inlays(
+                        &old_inlay_snapshot,
+                        old_buffer_start,
+                    ));
+                    edit.new.start = edit
+                        .new
+                        .start
+                        .min(widen_start_over_inlays(&inlay_snapshot, new_buffer_start));
+                    scan_old_start = edit.old.start;
+                    scan_new_start = edit.new.start;
+                }
+                while normalized_edits.last().is_some_and(|previous| {
+                    edit.old.start <= previous.old.end || edit.new.start <= previous.new.end
+                }) {
+                    let previous = normalized_edits.pop().unwrap();
+                    edit.old.start = edit.old.start.min(previous.old.start);
+                    edit.old.end = edit.old.end.max(previous.old.end);
+                    edit.new.start = edit.new.start.min(previous.new.start);
+                    edit.new.end = edit.new.end.max(previous.new.end);
+                }
+                normalized_edits.push(edit);
+            }
+            let mut inlay_edits_iter = normalized_edits.iter().cloned().peekable();
 
             let mut new_transforms = SumTree::<Transform>::default();
             let mut cursor = self.snapshot.transforms.cursor::<InlayOffset>(());
@@ -694,49 +927,40 @@ impl FoldMap {
                     );
                 }
                 new_transforms.append(cursor.slice(&edit.old.start, Bias::Left), ());
-                edit.new.start -= edit.old.start - *cursor.start();
+                let prefix = edit.old.start - *cursor.start();
+                if prefix <= edit.new.start.0.0 {
+                    edit.new.start -= prefix;
+                } else {
+                    let boundary = old_inlay_snapshot.to_buffer_offset(*cursor.start());
+                    edit.new.start = widen_start_over_inlays(&inlay_snapshot, boundary);
+                }
                 edit.old.start = *cursor.start();
 
                 cursor.seek(&edit.old.end, Bias::Right);
                 cursor.next();
 
                 let mut delta = edit.new_len() as isize - edit.old_len() as isize;
-                loop {
-                    edit.old.end = *cursor.start();
-
-                    if let Some(next_edit) = inlay_edits_iter.peek() {
-                        if next_edit.old.start > edit.old.end {
-                            break;
-                        }
-
-                        let next_edit = inlay_edits_iter.next().unwrap();
-                        delta += next_edit.new_len() as isize - next_edit.old_len() as isize;
-
-                        if next_edit.old.end >= edit.old.end {
-                            edit.old.end = next_edit.old.end;
-                            cursor.seek(&edit.old.end, Bias::Right);
-                            cursor.next();
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
+                delta += absorb_edits_behind_the_cursor(
+                    &mut edit,
+                    &mut cursor,
+                    &mut inlay_edits_iter,
+                    true,
+                );
                 edit.new.end = InlayOffset(MultiBufferOffset(
                     ((edit.new.start + edit.old_len()).0.0 as isize + delta) as usize,
                 ));
-
-                let anchor = inlay_snapshot
-                    .buffer
-                    .anchor_before(inlay_snapshot.to_buffer_offset(edit.new.start));
-                let mut folds_cursor = self
-                    .snapshot
-                    .folds
-                    .cursor::<FoldRange>(&inlay_snapshot.buffer);
-                folds_cursor.seek(&FoldRange(anchor..Anchor::Max), Bias::Left);
+                let edit_start = inlay_snapshot.to_buffer_offset(edit.new.start);
+                let mut folds_cursor = intersecting_folds(
+                    &inlay_snapshot,
+                    &self.snapshot.folds,
+                    edit_start..inlay_snapshot.buffer.len(),
+                    false,
+                );
+                let folds_cursor_work = std::cell::Cell::new(folds_cursor.walked_items());
 
                 let mut folds = iter::from_fn({
                     let inlay_snapshot = &inlay_snapshot;
+                    let folds_cursor_work = &folds_cursor_work;
                     move || {
                         let item = folds_cursor.item().map(|fold| {
                             let buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
@@ -748,6 +972,7 @@ impl FoldMap {
                             )
                         });
                         folds_cursor.next();
+                        folds_cursor_work.set(folds_cursor.walked_items());
                         item
                     }
                 })
@@ -760,13 +985,14 @@ impl FoldMap {
                     let (fold, mut fold_range) = folds.next().unwrap();
                     let sum = new_transforms.summary();
 
-                    assert!(fold_range.start.0 >= sum.input.len);
-
+                    // Historical anchors at the edit boundary can make the
+                    // intersection cursor include a fold already copied in full.
+                    if fold_range.end.0 <= sum.input.len {
+                        continue;
+                    }
                     while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
                         next_fold_range.start < fold_range.end
                             || (next_fold_range.start == fold_range.end
-                                && fold.elision_policy == ElisionPolicy::Hidden
-                                && next_fold.elision_policy == ElisionPolicy::Hidden
                                 && fold.placeholder.merge_adjacent
                                 && next_fold.placeholder.merge_adjacent)
                     }) {
@@ -782,10 +1008,7 @@ impl FoldMap {
                         push_isomorphic(&mut new_transforms, text_summary);
                     }
 
-                    let (placeholder_range, visible_tail_range) =
-                        elided_ranges(&inlay_snapshot, fold_range, fold.elision_policy);
-
-                    if let Some(fold_range) = placeholder_range {
+                    if fold_range.start < fold_range.end {
                         const ELLIPSIS: &str = "⋯";
 
                         let placeholder_text: SharedString = fold
@@ -827,11 +1050,6 @@ impl FoldMap {
                             (),
                         );
                     }
-
-                    if let Some(tail_range) = visible_tail_range {
-                        let text_summary = inlay_snapshot.text_summary_for_range(tail_range);
-                        push_isomorphic(&mut new_transforms, text_summary);
-                    }
                 }
 
                 let sum = new_transforms.summary();
@@ -840,9 +1058,12 @@ impl FoldMap {
                         .text_summary_for_range(InlayOffset(sum.input.len)..edit.new.end);
                     push_isomorphic(&mut new_transforms, text_summary);
                 }
+                drop(folds);
+                walked_items = walked_items.saturating_add(folds_cursor_work.get());
             }
 
             new_transforms.append(cursor.suffix(), ());
+            walked_items = walked_items.saturating_add(cursor.walked_items());
             if new_transforms.is_empty() {
                 let text_summary = inlay_snapshot.text_summary();
                 push_isomorphic(&mut new_transforms, text_summary);
@@ -850,7 +1071,20 @@ impl FoldMap {
 
             drop(cursor);
 
-            let mut fold_edits = Vec::with_capacity(inlay_edits.len());
+            let mut fold_edits = Vec::with_capacity(normalized_edits.len());
+            #[cfg(feature = "wrap-test-support")]
+            let mut widening_violations = Vec::new();
+            #[cfg(feature = "wrap-test-support")]
+            let mut accounting_violations = Vec::new();
+            #[cfg(feature = "wrap-test-support")]
+            let mut end_convergences = 0usize;
+            // Taken from the trees before the cursors shadow them: what a
+            // widened edit is checked against is the whole of each side,
+            // and a cursor only knows where it is standing.
+            #[cfg(feature = "wrap-test-support")]
+            let old_extent = self.snapshot.transforms.summary().output.len.0;
+            #[cfg(feature = "wrap-test-support")]
+            let new_extent = new_transforms.summary().output.len.0;
             {
                 let mut old_transforms = self
                     .snapshot
@@ -858,38 +1092,279 @@ impl FoldMap {
                     .cursor::<Dimensions<InlayOffset, FoldOffset>>(());
                 let mut new_transforms =
                     new_transforms.cursor::<Dimensions<InlayOffset, FoldOffset>>(());
-
-                for mut edit in inlay_edits {
-                    old_transforms.seek(&edit.old.start, Bias::Left);
-                    if old_transforms.item().is_some_and(|t| t.is_fold()) {
-                        edit.old.start = old_transforms.start().0;
+                for mut edit in normalized_edits {
+                    // An edit landing inside a fold is widened to the fold,
+                    // which has to be re-emitted whole. Both sides of the
+                    // edit name the same boundary in the text - the bytes
+                    // before an edit are the same bytes before and after it
+                    // - so widening one side widens the other by the same
+                    // inlay bytes. Widen either side alone and the edit
+                    // stops describing one document: the map above adds up
+                    // the rows it names and gets a total the snapshot
+                    // beside it does not have.
+                    //
+                    // The folds are not the same on both sides - that is
+                    // what the edit is often about - so moving one side
+                    // can land the other in a fold of its own, and this
+                    // repeats until neither side is inside one. It walks
+                    // the folds the edit touches and no others.
+                    // How far the new side's start sits from the old
+                    // side's, in the coordinate they share, before any
+                    // widening. This is not zero in general: within a
+                    // batch, an edit's new side carries the shift of every
+                    // edit before it. What the widening must not do is
+                    // change it.
+                    #[cfg(feature = "wrap-test-support")]
+                    let unwidened_start = (edit.old.start, edit.new.start);
+                    #[cfg(feature = "wrap-test-support")]
+                    let start_skew = inlay_snapshot.to_buffer_offset(edit.new.start).0 as isize
+                        - old_inlay_snapshot.to_buffer_offset(edit.old.start).0 as isize;
+                    loop {
+                        old_transforms.seek(&edit.old.start, Bias::Left);
+                        let old_fold_start = old_transforms
+                            .item()
+                            .is_some_and(|t| t.is_fold())
+                            .then(|| old_inlay_snapshot.to_buffer_offset(old_transforms.start().0));
+                        new_transforms.seek(&edit.new.start, Bias::Left);
+                        let new_fold_start = new_transforms
+                            .item()
+                            .is_some_and(|t| t.is_fold())
+                            .then(|| inlay_snapshot.to_buffer_offset(new_transforms.start().0));
+                        // The boundary the edit is being moved back to,
+                        // named once, in the coordinate both sides share.
+                        // Whichever side is inside a fold names the fold's
+                        // start; if both are, the earlier of the two wins,
+                        // because the later side is inside that fold too
+                        // once it gets there.
+                        let target = match (old_fold_start, new_fold_start) {
+                            (Some(old), Some(new)) => old.min(new),
+                            (Some(side), None) | (None, Some(side)) => side,
+                            (None, None) => break,
+                        };
+                        // Said back on each side in its own coordinates.
+                        // The two sides can differ here, and only here:
+                        // by the inlay bytes standing in front of the
+                        // boundary on that side. Stepping back over an
+                        // adjacent inlay brings it inside the widened
+                        // edit, which is where it belongs.
+                        let old_start = widen_start_over_inlays(&old_inlay_snapshot, target);
+                        let new_start = widen_start_over_inlays(&inlay_snapshot, target);
+                        if old_start >= edit.old.start && new_start >= edit.new.start {
+                            break;
+                        }
+                        edit.old.start = edit.old.start.min(old_start);
+                        edit.new.start = edit.new.start.min(new_start);
+                    }
+                    // Both sides moved back to one boundary, so the gap
+                    // between them is the one they started with. That is
+                    // the invariant the layers above depend on: they add
+                    // up the rows the edit names and expect the total the
+                    // snapshot beside them has. Sides that moved by
+                    // different amounts describe two different documents,
+                    // and that is the fault this records.
+                    #[cfg(feature = "wrap-test-support")]
+                    {
+                        let skew = inlay_snapshot.to_buffer_offset(edit.new.start).0 as isize
+                            - old_inlay_snapshot.to_buffer_offset(edit.old.start).0 as isize;
+                        if skew != start_skew {
+                            widening_violations.push(format!(
+                                "fold widening: the two sides of the start stood {start_skew} apart in the buffer and stand {skew} apart after widening; they did not move back to the same boundary"
+                            ));
+                        }
+                        // An inlay standing on a widened start belongs
+                        // inside the widened edit, whatever its own bias:
+                        // the direction of travel decides, and a start
+                        // travels backwards. A byte just before the start
+                        // that maps to the same buffer offset as the start
+                        // is inlay text left outside.
+                        for (side, start, unwidened, snapshot) in [
+                            (
+                                "old",
+                                edit.old.start,
+                                unwidened_start.0,
+                                &old_inlay_snapshot,
+                            ),
+                            ("new", edit.new.start, unwidened_start.1, &inlay_snapshot),
+                        ] {
+                            // Only a side the widening moved. An inlay
+                            // beside a start that never moved is where the
+                            // inlay map put the edit, and the edit already
+                            // covers it; this is about a boundary chosen
+                            // here.
+                            if start < unwidened && start.0.0 > 0 {
+                                let before = InlayOffset(MultiBufferOffset(start.0.0 - 1));
+                                if snapshot.to_buffer_offset(before)
+                                    == snapshot.to_buffer_offset(start)
+                                {
+                                    widening_violations.push(format!(
+                                        "fold widening: an inlay stands on the widened {side} start at {} and was left outside the edit",
+                                        start.0.0
+                                    ));
+                                }
+                            }
+                        }
                     }
                     let old_start =
                         old_transforms.start().1.0 + (edit.old.start - old_transforms.start().0);
-
-                    old_transforms.seek_forward(&edit.old.end, Bias::Right);
-                    if old_transforms.item().is_some_and(|t| t.is_fold()) {
-                        old_transforms.next();
-                        edit.old.end = old_transforms.start().0;
-                    }
-                    let old_end =
-                        old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
-
-                    new_transforms.seek(&edit.new.start, Bias::Left);
-                    if new_transforms.item().is_some_and(|t| t.is_fold()) {
-                        edit.new.start = new_transforms.start().0;
-                    }
                     let new_start =
                         new_transforms.start().1.0 + (edit.new.start - new_transforms.start().0);
 
-                    new_transforms.seek_forward(&edit.new.end, Bias::Right);
-                    if new_transforms.item().is_some_and(|t| t.is_fold()) {
-                        new_transforms.next();
-                        edit.new.end = new_transforms.start().0;
+                    #[cfg(feature = "wrap-test-support")]
+                    let unwidened_end = (edit.old.end, edit.new.end);
+                    // The last fold each end was widened out of, as a
+                    // range of the buffer, which is the only coordinate in
+                    // which the two sides' folds can be compared.
+                    #[cfg(feature = "wrap-test-support")]
+                    let mut widened_out_of: (
+                        Option<std::ops::Range<MultiBufferOffset>>,
+                        Option<std::ops::Range<MultiBufferOffset>>,
+                    ) = (None, None);
+                    // The two ends stand a fixed distance apart in the
+                    // buffer - past the edit both sides are the same bytes,
+                    // so whatever the edit added or removed is all that
+                    // separates them - and widening must leave that
+                    // distance alone. So the boundary each side is widened
+                    // to is named in the buffer, where the two sides can be
+                    // compared at all, and said back on each side through
+                    // its own inlays. Adding one and the same *inlay* step
+                    // to both, which is what this did, is only right where
+                    // the inlays either side of the boundary match: an
+                    // inlay on one side and not the other moves one end
+                    // further through the document than the other, and the
+                    // two ends stop naming one document.
+                    loop {
+                        old_transforms.seek_forward(&edit.old.end, Bias::Right);
+                        new_transforms.seek_forward(&edit.new.end, Bias::Right);
+                        let old_end = old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                        let new_end = inlay_snapshot.to_buffer_offset(edit.new.end);
+                        // What the edit itself did, in buffer bytes.
+                        let skew = new_end.0 as isize - old_end.0 as isize;
+                        let mut target = old_end;
+                        if old_transforms.item().is_some_and(|t| t.is_fold()) {
+                            #[cfg(feature = "wrap-test-support")]
+                            {
+                                widened_out_of.0 = Some(
+                                    old_inlay_snapshot.to_buffer_offset(old_transforms.start().0)
+                                        ..old_inlay_snapshot
+                                            .to_buffer_offset(old_transforms.end().0),
+                                );
+                            }
+                            target = target
+                                .max(old_inlay_snapshot.to_buffer_offset(old_transforms.end().0));
+                        }
+                        if new_transforms.item().is_some_and(|t| t.is_fold()) {
+                            #[cfg(feature = "wrap-test-support")]
+                            {
+                                widened_out_of.1 = Some(
+                                    inlay_snapshot.to_buffer_offset(new_transforms.start().0)
+                                        ..inlay_snapshot.to_buffer_offset(new_transforms.end().0),
+                                );
+                            }
+                            // The new side's fold end said in the old
+                            // side's buffer, which is where the two are
+                            // compared.
+                            let end = inlay_snapshot.to_buffer_offset(new_transforms.end().0);
+                            target = target
+                                .max(MultiBufferOffset((end.0 as isize - skew).max(0) as usize));
+                        }
+                        if target <= old_end {
+                            break;
+                        }
+                        // An end travels forwards, so each side takes the
+                        // inlay offset past any inlay standing on the
+                        // boundary: the inlay falls inside the widened edit
+                        // rather than just beyond it.
+                        edit.old.end = widen_end_over_inlays(&old_inlay_snapshot, target);
+                        edit.new.end = widen_end_over_inlays(
+                            &inlay_snapshot,
+                            MultiBufferOffset((target.0 as isize + skew).max(0) as usize),
+                        );
                     }
+                    // Whether the two ends met, and whether they had a
+                    // right to.
+                    //
+                    // Two ends inside one fold converge on one buffer
+                    // offset legitimately: the fold is re-emitted whole, so
+                    // both ends are moved to its end and that end is the
+                    // same text on both sides. Two ends that converge for
+                    // any other reason - two different folds whose ends
+                    // happen to land on one offset, or a common step
+                    // carrying one end further than its own fold needed -
+                    // are the end's version of the inverted range the
+                    // common step used to hide at the start.
+                    //
+                    // The legitimate case is counted and not only the
+                    // faulty one recorded. Silence on its own cannot tell
+                    // a document whose ends met legitimately from one whose
+                    // ends never met at all, and without the count "it
+                    // never fired" would be partly a statement about the
+                    // documents rather than about the rule. eng-8gpr's
+                    // point, from having been caught by their own record.
+                    #[cfg(feature = "wrap-test-support")]
+                    if edit.old.end > unwidened_end.0 || edit.new.end > unwidened_end.1 {
+                        let old_buffer = old_inlay_snapshot.to_buffer_offset(edit.old.end);
+                        let new_buffer = inlay_snapshot.to_buffer_offset(edit.new.end);
+                        if old_buffer == new_buffer {
+                            match (&widened_out_of.0, &widened_out_of.1) {
+                                (Some(old), Some(new)) if old == new => {
+                                    end_convergences += 1;
+                                }
+                                (old, new) => {
+                                    accounting_violations.push(format!(
+                                        "fold end convergence: the two ends met at buffer offset {}, and the old side was widened out of {:?} while the new side was widened out of {:?}; ends only have a right to meet at the end of one fold",
+                                        old_buffer.0,
+                                        old.as_ref().map(|r| r.start.0..r.end.0),
+                                        new.as_ref().map(|r| r.start.0..r.end.0),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    // The mirror at the end: an end travels forwards, so
+                    // a byte just after it mapping to the same buffer
+                    // offset is inlay text left outside.
+                    #[cfg(feature = "wrap-test-support")]
+                    for (side, end, unwidened, snapshot) in [
+                        ("old", edit.old.end, unwidened_end.0, &old_inlay_snapshot),
+                        ("new", edit.new.end, unwidened_end.1, &inlay_snapshot),
+                    ] {
+                        if end > unwidened && end < snapshot.len() {
+                            let after = InlayOffset(MultiBufferOffset(end.0.0 + 1));
+                            if snapshot.to_buffer_offset(after) == snapshot.to_buffer_offset(end) {
+                                widening_violations.push(format!(
+                                    "fold widening: an inlay stands on the widened {side} end at {} and was left outside the edit",
+                                    end.0.0
+                                ));
+                            }
+                        }
+                    }
+                    // Common-step widening can carry one side past its input
+                    // snapshot when the other side's fold is longer. Map the
+                    // reachable endpoint, not an overshoot beyond the document.
+                    edit.old.end = edit.old.end.min(old_inlay_snapshot.len());
+                    edit.new.end = edit.new.end.min(inlay_snapshot.len());
+                    old_transforms.seek(&edit.old.end, Bias::Right);
+                    new_transforms.seek(&edit.new.end, Bias::Right);
+                    let old_end =
+                        old_transforms.start().1.0 + (edit.old.end - old_transforms.start().0);
                     let new_end =
                         new_transforms.start().1.0 + (edit.new.end - new_transforms.start().0);
 
+                    #[cfg(feature = "wrap-test-support")]
+                    {
+                        widening_violations.extend(widening_violation(
+                            "old",
+                            old_start.0..old_end.0,
+                            old_extent,
+                            "fold widening",
+                        ));
+                        widening_violations.extend(widening_violation(
+                            "new",
+                            new_start.0..new_end.0,
+                            new_extent,
+                            "fold widening",
+                        ));
+                    }
                     fold_edits.push(FoldEdit {
                         old: FoldOffset(old_start)..FoldOffset(old_end),
                         new: FoldOffset(new_start)..FoldOffset(new_end),
@@ -897,13 +1372,60 @@ impl FoldMap {
                 }
 
                 fold_edits = consolidate_fold_edits(fold_edits);
+
+                // The new start of each edit is its old start shifted by the edits
+                // before it. Compute that only after consolidation: widening can make
+                // otherwise disjoint input edits overlap in fold output, where applying
+                // either raw edit's full delta to the other would double-count it.
+                let mut output_delta = 0isize;
+                for edit in &mut fold_edits {
+                    edit.new.start = FoldOffset(MultiBufferOffset(
+                        (edit.old.start.0.0 as isize + output_delta)
+                            .try_into()
+                            .expect("consolidated fold edits cannot move a start before zero"),
+                    ));
+                    output_delta += edit.new_len() as isize - edit.old_len() as isize;
+                }
+
+                // Asked after consolidation, because consolidation is
+                // part of what is handed over and a fault introduced
+                // there would be invisible before it.
+                #[cfg(feature = "wrap-test-support")]
+                {
+                    let net: isize = fold_edits
+                        .iter()
+                        .map(|edit| {
+                            (edit.new.end.0 - edit.new.start.0) as isize
+                                - (edit.old.end.0 - edit.old.start.0) as isize
+                        })
+                        .sum();
+                    let accounted = old_extent as isize + net;
+                    if accounted != new_extent as isize {
+                        accounting_violations.push(format!(
+                            "fold output accounting: the old output was {old_extent} bytes and the {} edit(s) handed over net {net}, which is {accounted}; the new output is {new_extent}",
+                            fold_edits.len()
+                        ));
+                    }
+                }
+                walked_items = walked_items
+                    .saturating_add(old_transforms.walked_items())
+                    .saturating_add(new_transforms.walked_items());
             }
 
             self.snapshot.transforms = new_transforms;
             self.snapshot.inlay_snapshot = inlay_snapshot;
             self.snapshot.version += 1;
+            #[cfg(feature = "wrap-test-support")]
+            self.widening_violations.extend(widening_violations);
+            #[cfg(feature = "wrap-test-support")]
+            self.accounting_violations.extend(accounting_violations);
+            #[cfg(feature = "wrap-test-support")]
+            {
+                self.end_convergences += end_convergences;
+            }
             fold_edits
         };
+        profile.walked_items(walked_items);
         if profile.is_enabled() {
             let output_start = fold_edits
                 .iter()
@@ -1281,6 +1803,10 @@ pub struct FoldPointCursor<'transforms> {
 }
 
 impl FoldPointCursor<'_> {
+    pub(crate) fn walked_items(&self) -> u64 {
+        self.cursor.walked_items()
+    }
+
     /// Resets the cursor to the start so it can seek backward again.
     pub fn reset(&mut self) {
         self.cursor.reset();
@@ -1333,46 +1859,109 @@ fn push_isomorphic(transforms: &mut SumTree<Transform>, summary: MBTextSummary) 
     }
 }
 
-fn elided_ranges(
-    inlay_snapshot: &InlaySnapshot,
-    fold_range: Range<InlayOffset>,
-    elision_policy: ElisionPolicy,
-) -> (Option<Range<InlayOffset>>, Option<Range<InlayOffset>>) {
-    if fold_range.start >= fold_range.end {
-        return (None, None);
+/// The inlay offset of a buffer boundary, on the side of any inlay sitting
+/// there that a *start* being widened backwards wants: in front of it, so
+/// the inlay falls inside the widened edit.
+///
+/// `InlaySnapshot::to_inlay_offset` cannot answer this on its own. It
+/// resolves the ambiguity at an inlay by the inlay's own bias - stepping
+/// over left-biased ones and stopping in front of right-biased ones - so
+/// which side you get is a property of the inlay rather than of what you
+/// are doing with it. A widening has a direction of travel and the choice
+/// belongs to that. An inlay left straddling the edge of an edit is a side
+/// naming bytes the other side does not, which is the fault this whole
+/// function was rewritten to make impossible.
+fn widen_start_over_inlays(snapshot: &InlaySnapshot, buffer: MultiBufferOffset) -> InlayOffset {
+    let offset = snapshot.to_inlay_offset(buffer);
+    let mut start = offset;
+    while start > InlayOffset(MultiBufferOffset(0)) {
+        let before = InlayOffset(MultiBufferOffset(start.0.0 - 1));
+        if snapshot.to_buffer_offset(before) != buffer {
+            break;
+        }
+        start = before;
     }
+    start
+}
 
-    match elision_policy {
-        ElisionPolicy::Visible => (None, Some(fold_range)),
-        ElisionPolicy::Hidden => (Some(fold_range), None),
-        ElisionPolicy::Tail { rows } => {
-            if rows == 0 {
-                return (Some(fold_range), None);
-            }
+/// The same boundary on the side an *end* being widened forwards wants:
+/// past any inlay sitting there, so the inlay falls inside the widened
+/// edit rather than beyond its end.
+fn widen_end_over_inlays(snapshot: &InlaySnapshot, buffer: MultiBufferOffset) -> InlayOffset {
+    let offset = snapshot.to_inlay_offset(buffer);
+    let mut end = offset;
+    let limit = snapshot.len();
+    while end < limit {
+        let after = InlayOffset(MultiBufferOffset(end.0.0 + 1));
+        if snapshot.to_buffer_offset(after) != buffer {
+            break;
+        }
+        end = after;
+    }
+    end
+}
 
-            let start_point = inlay_snapshot.to_point(fold_range.start);
-            let end_point = inlay_snapshot.to_point(fold_range.end);
-            let tail_start_row = end_point
-                .row()
-                .saturating_sub(rows.saturating_sub(1))
-                .max(start_point.row());
-            let tail_start = inlay_snapshot
-                .to_offset(InlayPoint(Point::new(tail_start_row, 0)))
-                .max(fold_range.start)
-                .min(fold_range.end);
+/// Grow an edit's end to the boundary its cursor now stands on, and take in
+/// the later edits that boundary has moved past.
+///
+/// The rule this keeps, and the one both faults in this function broke: the
+/// cursor never passes an offset a later edit still names, and the two sides
+/// of an edit always name the same bytes. An edit's end moves forward for two
+/// reasons - the old tree's boundary lies past it, or the folds emitted for
+/// it reach past it - and in both cases the edits behind the new end can no
+/// longer be sliced to, because the cursor is already past them. They are
+/// taken into this edit instead, with their lengths, so that the one edit
+/// that survives describes everything the cursor walked over.
+///
+/// It moves the old end only, and returns the length the edits it took in
+/// added or removed. The new end is the caller's, because the two callers
+/// know it from different places: the one that widens to a boundary in the
+/// old tree derives it from the running delta, and the one that widens
+/// because the emitted folds reached past the edit derives it from how far
+/// the new tree already reaches. What they must both do is move the new end
+/// by what this returns.
+fn absorb_edits_behind_the_cursor<I>(
+    edit: &mut InlayEdit,
+    cursor: &mut sum_tree::Cursor<'_, '_, Transform, InlayOffset>,
+    edits: &mut iter::Peekable<I>,
+    widen_to_cursor: bool,
+) -> isize
+where
+    I: Iterator<Item = InlayEdit>,
+{
+    let mut absorbed = 0;
+    loop {
+        // Where the cursor has reached is what decides which edits can no
+        // longer be sliced to. How far this edit is widened is a separate
+        // question: when a fold was taken whole the edit has to name all of
+        // it, and when a run of text was split the edit only has to name
+        // what the edits behind the cursor named, which is the difference
+        // between O(edit) and O(document).
+        let reach = *cursor.start();
+        if widen_to_cursor {
+            edit.old.end = reach;
+        }
 
-            if tail_start <= fold_range.start {
-                (None, Some(fold_range))
-            } else if tail_start >= fold_range.end {
-                (Some(fold_range), None)
-            } else {
-                (
-                    Some(fold_range.start..tail_start),
-                    Some(tail_start..fold_range.end),
-                )
-            }
+        let Some(next_edit) = edits.peek() else {
+            break;
+        };
+        if next_edit.old.start > reach {
+            break;
+        }
+
+        let next_edit = edits.next().expect("peeked");
+        absorbed += next_edit.new_len() as isize - next_edit.old_len() as isize;
+
+        if next_edit.old.end > edit.old.end {
+            edit.old.end = next_edit.old.end;
+        }
+        if next_edit.old.end >= reach {
+            cursor.seek_forward(&edit.old.end, Bias::Right);
+            cursor.next();
         }
     }
+
+    absorbed
 }
 
 fn intersecting_folds<'a>(
@@ -1539,7 +2128,6 @@ pub struct Fold {
     pub id: FoldId,
     pub range: FoldRange,
     pub placeholder: FoldPlaceholder,
-    pub elision_policy: ElisionPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2060,6 +2648,7 @@ mod tests {
     use crate::{MultiBuffer, ToPoint, display_map::inlay_map::InlayMap};
     use Bias::{Left, Right};
     use collections::HashSet;
+    use multi_buffer::PathKey;
     use rand::prelude::*;
     use settings::SettingsStore;
     use std::{env, mem};
@@ -2190,18 +2779,13 @@ mod tests {
             (Point::new(2, 4)..Point::new(4, 1), FoldPlaceholder::test()),
         ]);
         assert_eq!(snapshot2.text(), "aa⋯cc⋯eeeee");
+        // Rho merges nearby fold edits so transcript markup batches make one downstream pass.
         assert_eq!(
             edits,
-            &[
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(16)),
-                    new: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(5)),
-                },
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(18))..FoldOffset(MultiBufferOffset(29)),
-                    new: FoldOffset(MultiBufferOffset(7))..FoldOffset(MultiBufferOffset(10)),
-                },
-            ]
+            &[FoldEdit {
+                old: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(29)),
+                new: FoldOffset(MultiBufferOffset(2))..FoldOffset(MultiBufferOffset(10)),
+            }]
         );
 
         let buffer_snapshot = buffer.update(cx, |buffer, cx| {
@@ -2222,16 +2806,10 @@ mod tests {
         assert_eq!(snapshot3.text(), "123a⋯c123c⋯eeeee");
         assert_eq!(
             edits,
-            &[
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(1)),
-                    new: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(3)),
-                },
-                FoldEdit {
-                    old: FoldOffset(MultiBufferOffset(6))..FoldOffset(MultiBufferOffset(6)),
-                    new: FoldOffset(MultiBufferOffset(8))..FoldOffset(MultiBufferOffset(11)),
-                },
-            ]
+            &[FoldEdit {
+                old: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(6)),
+                new: FoldOffset(MultiBufferOffset(0))..FoldOffset(MultiBufferOffset(11)),
+            }]
         );
 
         let buffer_snapshot = buffer.update(cx, |buffer, cx| {
@@ -2255,22 +2833,126 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_tail_elision(cx: &mut gpui::App) {
+    fn test_insertion_at_fold_end_stays_local(cx: &mut gpui::App) {
         init_test(cx);
-        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\nfive", cx);
+        let buffer = MultiBuffer::build_simple("prefix\nabcdEF", cx);
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
         let buffer_snapshot = buffer.read(cx).snapshot(cx);
-        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
         let mut map = FoldMap::new(inlay_snapshot.clone()).0;
 
-        let (mut writer, _, _) = map.write(inlay_snapshot.clone(), vec![]);
-        writer.fold(vec![(
-            Point::new(0, 0)..Point::new(4, 4),
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(1, 0)..Point::new(1, 4),
             FoldPlaceholder::test(),
-            ElisionPolicy::Tail { rows: 2 },
         )]);
+        assert_eq!(snapshot.text(), "prefix\n⋯EF");
 
-        let (snapshot, _) = map.read(inlay_snapshot, vec![]);
-        assert_eq!(snapshot.text(), "⋯four\nfive");
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(1, 4)..Point::new(1, 4), "X")], None, cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, edits) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.text(), "prefix\n⋯XEF");
+        assert!(edits.iter().all(|edit| edit.old.start.0.0 >= 7));
+    }
+
+    #[gpui::test]
+    fn test_fold_spanning_excerpt_boundaries(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_multi(
+            [
+                ("parent\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+                ("child\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+            ],
+            cx,
+        );
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        // Composition separates excerpts by a row so their buffer boundaries stay distinct.
+        assert_eq!(buffer_snapshot.text(), "parent\n\nchild\n");
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(0, 6)..Point::new(3, 0),
+            FoldPlaceholder::test(),
+        )]);
+        assert_eq!(snapshot.text(), "parent⋯");
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(1, 0)..Point::new(1, 0), "new ")], None, cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.text(), "parent⋯");
+    }
+
+    #[gpui::test]
+    fn test_removing_excerpt_discards_its_folds(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_multi(
+            [
+                ("remove\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+                ("keep\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+            ],
+            cx,
+        );
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![
+            (Point::new(0, 0)..Point::new(2, 4), FoldPlaceholder::test()),
+            (Point::new(0, 0)..Point::new(2, 4), FoldPlaceholder::test()),
+            (Point::new(0, 0)..Point::new(0, 2), FoldPlaceholder::test()),
+        ]);
+        assert_eq!(snapshot.fold_count(), 3);
+
+        // Give one of the two equal-start folds a stable start anchor. Its
+        // sibling keeps its anchor into the excerpt that will be removed.
+        let old_buffer = snapshot.inlay_snapshot.buffer.clone();
+        let mut folds = map.snapshot.folds.items(&old_buffer);
+        let kept_fold = folds
+            .iter_mut()
+            .find(|fold| fold.range.end.to_point(&old_buffer) == Point::new(2, 4))
+            .unwrap();
+        kept_fold.range.start = Anchor::Min;
+        let kept_fold_id = kept_fold.id;
+        map.snapshot.fold_metadata_by_id.insert_or_replace(
+            kept_fold.id,
+            FoldMetadata {
+                range: kept_fold.range.clone(),
+                width: None,
+            },
+        );
+        folds.sort_unstable_by(|a, b| a.range.cmp(&b.range, &old_buffer));
+        map.snapshot.folds = SumTree::from_iter(folds, &old_buffer);
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.remove_excerpts(PathKey::sorted(0), cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.fold_count(), 1);
+        assert_eq!(
+            snapshot
+                .folds
+                .items(&snapshot.inlay_snapshot.buffer)
+                .into_iter()
+                .map(|fold| fold.id)
+                .collect::<Vec<_>>(),
+            [kept_fold_id]
+        );
     }
 
     #[gpui::test]
@@ -2341,7 +3023,9 @@ mod tests {
             let (snapshot, _) = map.read(inlay_snapshot, vec![]);
             assert_eq!(snapshot.text(), "⋯fghijkl");
 
-            // Edit within one of the folds.
+            // Delete the text fragment carrying the first fold's start
+            // anchor. The anchor remains resolvable, so both folds remain and
+            // are still merged into one placeholder.
             let buffer_snapshot = buffer.update(cx, |buffer, cx| {
                 buffer.edit(
                     [(MultiBufferOffset(0)..MultiBufferOffset(1), "12345")],
@@ -2353,6 +3037,7 @@ mod tests {
             let (inlay_snapshot, inlay_edits) =
                 inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
             let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+            assert_eq!(snapshot.fold_count(), 2);
             assert_eq!(snapshot.text(), "12345⋯fghijkl");
         }
     }
@@ -2452,6 +3137,7 @@ mod tests {
 
         let (mut initial_snapshot, _) = map.read(inlay_snapshot, vec![]);
         let mut snapshot_edits = Vec::new();
+        let mut expected_folds = ExpectedFolds::default();
 
         let mut next_inlay_id = 0;
         for _ in 0..operations {
@@ -2460,7 +3146,9 @@ mod tests {
             let mut inlay_edits = Vec::new();
             match rng.random_range(0..=100) {
                 0..=39 => {
-                    snapshot_edits.extend(map.randomly_mutate(&mut rng));
+                    let mutation = map.random_mutation(&mut rng);
+                    expected_folds.apply(&mutation, &map.snapshot.inlay_snapshot.buffer);
+                    snapshot_edits.extend(map.apply_random_mutation(mutation));
                 }
                 40..=59 => {
                     let (_, edits) = inlay_map.randomly_mutate(&mut next_inlay_id, &mut rng);
@@ -2487,8 +3175,12 @@ mod tests {
             let (snapshot, edits) = map.read(inlay_snapshot.clone(), inlay_edits);
             snapshot_edits.push((snapshot.clone(), edits));
 
+            expected_folds.retain_resolvable(&inlay_snapshot.buffer);
+            let merged_folds = expected_folds.merged(&inlay_snapshot.buffer);
+            assert_eq!(map.merged_folds(), merged_folds);
+
             let mut expected_text: String = inlay_snapshot.text().to_string();
-            for fold_range in map.merged_folds().into_iter().rev() {
+            for fold_range in merged_folds.iter().rev() {
                 let fold_inlay_start = inlay_snapshot.to_inlay_offset(fold_range.start);
                 let fold_inlay_end = inlay_snapshot.to_inlay_offset(fold_range.end);
                 expected_text.replace_range(fold_inlay_start.0.0..fold_inlay_end.0.0, "⋯");
@@ -2503,7 +3195,7 @@ mod tests {
 
             let mut prev_row = 0;
             let mut expected_buffer_rows = Vec::new();
-            for fold_range in map.merged_folds() {
+            for fold_range in merged_folds {
                 let fold_start = inlay_snapshot
                     .to_point(inlay_snapshot.to_inlay_offset(fold_range.start))
                     .row();
@@ -2527,7 +3219,7 @@ mod tests {
                 expected_text
             );
 
-            for (output_row, line) in expected_text.lines().enumerate() {
+            for (output_row, line) in expected_text.split('\n').enumerate() {
                 let line_len = snapshot.line_len(output_row as u32);
                 assert_eq!(line_len, line.len() as u32);
             }
@@ -2849,6 +3541,75 @@ mod tests {
         cx.set_global(store);
     }
 
+    #[derive(Default)]
+    struct ExpectedFolds(Vec<Range<Anchor>>);
+
+    impl ExpectedFolds {
+        fn apply(&mut self, mutation: &RandomFoldMutation, buffer: &MultiBufferSnapshot) {
+            match mutation {
+                RandomFoldMutation::Fold(ranges) => {
+                    self.0.extend(ranges.iter().filter_map(|range| {
+                        (!range.is_empty()).then(|| {
+                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end)
+                        })
+                    }));
+                }
+                RandomFoldMutation::Unfold { ranges, inclusive } => {
+                    self.0.retain(|fold| {
+                        !ranges.iter().any(|range| {
+                            let start = buffer.anchor_before(range.start);
+                            let end = buffer.anchor_after(range.end);
+                            let start_cmp = start.cmp(&fold.end, buffer);
+                            let end_cmp = end.cmp(&fold.start, buffer);
+                            if *inclusive {
+                                start_cmp <= Ordering::Equal && end_cmp >= Ordering::Equal
+                            } else {
+                                start_cmp == Ordering::Less && end_cmp == Ordering::Greater
+                            }
+                        })
+                    });
+                }
+            }
+        }
+
+        fn retain_resolvable(&mut self, buffer: &MultiBufferSnapshot) {
+            self.0
+                .retain(|fold| buffer.can_resolve(&fold.start) && buffer.can_resolve(&fold.end));
+        }
+
+        fn merged(&self, buffer: &MultiBufferSnapshot) -> Vec<Range<MultiBufferOffset>> {
+            let mut folds = self
+                .0
+                .iter()
+                .map(|fold| fold.start.to_offset(buffer)..fold.end.to_offset(buffer))
+                .collect::<Vec<_>>();
+            folds.sort_unstable_by_key(|fold| (fold.start, cmp::Reverse(fold.end)));
+
+            let mut merged = Vec::<Range<MultiBufferOffset>>::new();
+            for fold in folds {
+                if fold.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = merged.last_mut()
+                    && previous.end >= fold.start
+                {
+                    previous.end = previous.end.max(fold.end);
+                } else {
+                    merged.push(fold);
+                }
+            }
+            merged
+        }
+    }
+
+    enum RandomFoldMutation {
+        Fold(Vec<Range<MultiBufferOffset>>),
+        Unfold {
+            ranges: Vec<Range<MultiBufferOffset>>,
+            inclusive: bool,
+        },
+    }
+
     impl FoldMap {
         fn merged_folds(&self) -> Vec<Range<MultiBufferOffset>> {
             let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
@@ -2884,45 +3645,62 @@ mod tests {
             &mut self,
             rng: &mut impl Rng,
         ) -> Vec<(FoldSnapshot, Vec<FoldEdit>)> {
+            let mutation = self.random_mutation(rng);
+            self.apply_random_mutation(mutation)
+        }
+
+        fn random_mutation(&self, rng: &mut impl Rng) -> RandomFoldMutation {
+            let buffer = &self.snapshot.inlay_snapshot.buffer;
+            if rng.random_range(0..=100) <= 39 && !self.snapshot.folds.is_empty() {
+                let mut ranges = Vec::new();
+                for _ in 0..rng.random_range(1..=3) {
+                    let end = buffer
+                        .clip_offset(rng.random_range(MultiBufferOffset(0)..=buffer.len()), Right);
+                    let start =
+                        buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
+                    ranges.push(start..end);
+                }
+                RandomFoldMutation::Unfold {
+                    ranges,
+                    inclusive: rng.random(),
+                }
+            } else {
+                let mut ranges = Vec::new();
+                for _ in 0..rng.random_range(1..=2) {
+                    let end = buffer
+                        .clip_offset(rng.random_range(MultiBufferOffset(0)..=buffer.len()), Right);
+                    let start =
+                        buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
+                    ranges.push(start..end);
+                }
+                RandomFoldMutation::Fold(ranges)
+            }
+        }
+
+        fn apply_random_mutation(
+            &mut self,
+            mutation: RandomFoldMutation,
+        ) -> Vec<(FoldSnapshot, Vec<FoldEdit>)> {
             let mut snapshot_edits = Vec::new();
-            match rng.random_range(0..=100) {
-                0..=39 if !self.snapshot.folds.is_empty() => {
+            match mutation {
+                RandomFoldMutation::Unfold { ranges, inclusive } => {
                     let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
-                    let buffer = &inlay_snapshot.buffer;
-                    let mut to_unfold = Vec::new();
-                    for _ in 0..rng.random_range(1..=3) {
-                        let end = buffer.clip_offset(
-                            rng.random_range(MultiBufferOffset(0)..=buffer.len()),
-                            Right,
-                        );
-                        let start =
-                            buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
-                        to_unfold.push(start..end);
-                    }
-                    let inclusive = rng.random();
-                    log::info!("unfolding {:?} (inclusive: {})", to_unfold, inclusive);
+                    log::info!("unfolding {:?} (inclusive: {})", ranges, inclusive);
                     let (mut writer, snapshot, edits) = self.write(inlay_snapshot, vec![]);
                     snapshot_edits.push((snapshot, edits));
-                    let (snapshot, edits) = writer.unfold_intersecting(to_unfold, inclusive);
+                    let (snapshot, edits) = writer.unfold_intersecting(ranges, inclusive);
                     snapshot_edits.push((snapshot, edits));
                 }
-                _ => {
+                RandomFoldMutation::Fold(ranges) => {
                     let inlay_snapshot = self.snapshot.inlay_snapshot.clone();
-                    let buffer = &inlay_snapshot.buffer;
-                    let mut to_fold = Vec::new();
-                    for _ in 0..rng.random_range(1..=2) {
-                        let end = buffer.clip_offset(
-                            rng.random_range(MultiBufferOffset(0)..=buffer.len()),
-                            Right,
-                        );
-                        let start =
-                            buffer.clip_offset(rng.random_range(MultiBufferOffset(0)..=end), Left);
-                        to_fold.push((start..end, FoldPlaceholder::test()));
-                    }
-                    log::info!("folding {:?}", to_fold);
+                    log::info!("folding {:?}", ranges);
                     let (mut writer, snapshot, edits) = self.write(inlay_snapshot, vec![]);
                     snapshot_edits.push((snapshot, edits));
-                    let (snapshot, edits) = writer.fold(to_fold);
+                    let (snapshot, edits) = writer.fold(
+                        ranges
+                            .into_iter()
+                            .map(|range| (range, FoldPlaceholder::test())),
+                    );
                     snapshot_edits.push((snapshot, edits));
                 }
             }

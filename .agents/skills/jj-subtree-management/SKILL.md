@@ -123,7 +123,7 @@ dependency to local paths. Run the narrowest relevant consumer check, such as:
 
 ```sh
 cargo check -p rho-gui
-cargo check -p rho-workset
+cargo check -p rho-workspaces
 ```
 
 Inspect the final commit stack with `jj log` and ensure temporary adoption or

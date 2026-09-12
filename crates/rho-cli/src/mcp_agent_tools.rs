@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use rho_agent::multi_agent_tools;
-use rho_ui_proto::{
-    AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage,
-};
+use rho_ui_proto::{AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -17,10 +15,9 @@ pub(crate) async fn run(args: McpAgentToolsArgs) -> anyhow::Result<()> {
         .agent_id
         .or_else(|| std::env::var("RHO_MCP_AGENT_ID").ok())
         .ok_or_else(|| anyhow::anyhow!("missing --agent-id or RHO_MCP_AGENT_ID"))?;
-    let socket_path = match args.socket_path {
-        Some(path) => path,
-        None => rho_daemon::default_socket_path()?,
-    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon.send(&ClientMessage::Subscribe).await?;
     let ready = loop {
@@ -83,7 +80,7 @@ async fn handle_request(
             "serverInfo": {"name": "rho-agent-tools", "version": env!("CARGO_PKG_VERSION")},
         })),
         "tools/list" => Ok(json!({
-            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::pm())
+            "tools": multi_agent_tools::agent_tool_specs(rho_agent::db::AgentRole::default())
                 .into_iter()
                 .map(|tool| json!({
                     "name": tool.name.as_str(),
@@ -155,12 +152,6 @@ fn tool_request(name: &str, arguments: Value) -> anyhow::Result<McpAgentToolRequ
         multi_agent_tools::ASK_ADVISOR_TOOL_NAME => Ok(McpAgentToolRequest::AskAdvisor {
             message: serde_json::from_value::<AdvisorArgs>(arguments)?.message,
         }),
-        multi_agent_tools::WAIT_TOOL_NAME => {
-            let args: WaitArgs = serde_json::from_value(arguments)?;
-            Ok(McpAgentToolRequest::Wait {
-                timeout_seconds: args.timeout_seconds,
-            })
-        }
         _ => anyhow::bail!("unsupported tool: {name}"),
     }
 }
@@ -203,9 +194,4 @@ struct InterruptArgs {
 #[derive(Deserialize)]
 struct AdvisorArgs {
     message: String,
-}
-
-#[derive(Deserialize)]
-struct WaitArgs {
-    timeout_seconds: Option<u64>,
 }

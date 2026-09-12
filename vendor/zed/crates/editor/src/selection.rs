@@ -1647,17 +1647,16 @@ impl Editor {
 
         let selection_anchors = self.selections.disjoint_anchors_arc();
 
-        let should_publish_active_selections = self.focus_handle.is_focused(window)
-            && {
-                #[cfg(feature = "native")]
-                {
-                    self.leader_id.is_none()
-                }
-                #[cfg(not(feature = "native"))]
-                {
-                    true
-                }
-            };
+        let should_publish_active_selections = self.focus_handle.is_focused(window) && {
+            #[cfg(feature = "native")]
+            {
+                self.leader_id.is_none()
+            }
+            #[cfg(not(feature = "native"))]
+            {
+                true
+            }
+        };
         if should_publish_active_selections {
             self.buffer.update(cx, |buffer, cx| {
                 buffer.set_active_selections(
@@ -1705,63 +1704,64 @@ impl Editor {
 
             #[cfg(feature = "native")]
             {
-            let mut context_menu = self.context_menu.borrow_mut();
-            let completion_menu = match context_menu.as_ref() {
-                Some(CodeContextMenu::Completions(menu)) => Some(menu),
-                Some(CodeContextMenu::CodeActions(_)) => {
-                    *context_menu = None;
-                    None
-                }
-                None => None,
-            };
-            let completion_position = completion_menu.map(|menu| menu.initial_position);
-            drop(context_menu);
-
-            if effects.completions
-                && let Some(completion_position) = completion_position
-            {
-                let start_offset = selection_start.to_offset(buffer);
-                let position_matches = start_offset == completion_position.to_offset(buffer);
-                let continue_showing = if let Some((snap, ..)) =
-                    buffer.point_to_buffer_offset(completion_position)
-                    && !snap.capability.editable()
-                {
-                    false
-                } else if position_matches {
-                    if self.snippet_stack.is_empty() {
-                        buffer.char_kind_before(start_offset, Some(CharScopeContext::Completion))
-                            == Some(CharKind::Word)
-                    } else {
-                        // Snippet choices can be shown even when the cursor is in whitespace.
-                        // Dismissing the menu with actions like backspace is handled by
-                        // invalidation regions.
-                        true
+                let mut context_menu = self.context_menu.borrow_mut();
+                let completion_menu = match context_menu.as_ref() {
+                    Some(CodeContextMenu::Completions(menu)) => Some(menu),
+                    Some(CodeContextMenu::CodeActions(_)) => {
+                        *context_menu = None;
+                        None
                     }
-                } else {
-                    false
+                    None => None,
                 };
+                let completion_position = completion_menu.map(|menu| menu.initial_position);
+                drop(context_menu);
 
-                if continue_showing {
-                    self.open_or_update_completions_menu(None, None, false, window, cx);
-                } else {
-                    self.hide_context_menu(window, cx);
+                if effects.completions
+                    && let Some(completion_position) = completion_position
+                {
+                    let start_offset = selection_start.to_offset(buffer);
+                    let position_matches = start_offset == completion_position.to_offset(buffer);
+                    let continue_showing = if let Some((snap, ..)) =
+                        buffer.point_to_buffer_offset(completion_position)
+                        && !snap.capability.editable()
+                    {
+                        false
+                    } else if position_matches {
+                        if self.snippet_stack.is_empty() {
+                            buffer
+                                .char_kind_before(start_offset, Some(CharScopeContext::Completion))
+                                == Some(CharKind::Word)
+                        } else {
+                            // Snippet choices can be shown even when the cursor is in whitespace.
+                            // Dismissing the menu with actions like backspace is handled by
+                            // invalidation regions.
+                            true
+                        }
+                    } else {
+                        false
+                    };
+
+                    if continue_showing {
+                        self.open_or_update_completions_menu(None, None, false, window, cx);
+                    } else {
+                        self.hide_context_menu(window, cx);
+                    }
                 }
-            }
 
-            hide_hover(self, cx);
+                hide_hover(self, cx);
 
-            self.refresh_code_actions_for_selection(window, cx);
-            self.refresh_document_highlights(cx);
-            refresh_linked_ranges(self, window, cx);
+                self.refresh_code_actions_for_selection(window, cx);
+                self.refresh_document_highlights(cx);
+                refresh_linked_ranges(self, window, cx);
 
-            self.refresh_selected_text_highlights(&display_map, false, window, cx);
-            self.refresh_matching_bracket_highlights(&display_map, cx);
-            self.refresh_outline_symbols_at_cursor(cx);
-            self.update_visible_edit_prediction(window, cx);
-            self.hide_blame_popover(true, cx);
-            if self.git_blame_inline_enabled {
-                self.start_inline_blame_timer(window, cx);
-            }
+                self.refresh_selected_text_highlights(&display_map, false, window, cx);
+                self.refresh_matching_bracket_highlights(&display_map, cx);
+                self.refresh_outline_symbols_at_cursor(cx);
+                self.update_visible_edit_prediction(window, cx);
+                self.hide_blame_popover(true, cx);
+                if self.git_blame_inline_enabled {
+                    self.start_inline_blame_timer(window, cx);
+                }
             }
 
             #[cfg(not(feature = "native"))]

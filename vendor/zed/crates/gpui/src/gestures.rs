@@ -93,6 +93,8 @@ pub struct GestureTuning {
     /// Distance a touch may travel before it stops being a potential tap and
     /// becomes a pan/drag.
     pub touch_slop: Pixels,
+    /// Maximum duration of a touch that can be recognized as a tap.
+    pub tap_duration: Duration,
     /// Maximum interval between taps for them to accumulate a tap count.
     pub multi_tap_interval: Duration,
     /// Maximum distance between taps for them to accumulate a tap count.
@@ -113,6 +115,7 @@ impl Default for GestureTuning {
     fn default() -> Self {
         Self {
             touch_slop: px(8.),
+            tap_duration: Duration::from_millis(300),
             multi_tap_interval: Duration::from_millis(400),
             multi_tap_slop: px(16.),
             long_press_duration: Duration::from_millis(500),

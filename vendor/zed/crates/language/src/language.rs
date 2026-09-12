@@ -125,6 +125,7 @@ pub enum InlayId {
     DebuggerValue(usize),
     Hint(usize),
     Color(usize),
+    Image(usize),
     ReplResult(usize),
     Custom(usize),
 }
@@ -136,6 +137,7 @@ impl InlayId {
             | Self::DebuggerValue(id)
             | Self::Hint(id)
             | Self::Color(id)
+            | Self::Image(id)
             | Self::ReplResult(id)
             | Self::Custom(id) => *id,
         }

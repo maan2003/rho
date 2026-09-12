@@ -21,8 +21,25 @@ AI APIs.
   minutes.
   Only namespace names, percentages, and reset times are persisted or sent to
   clients; provider account identifiers remain memory-only.
+- The explicit `eng-gemini` mode reads one separate Antigravity credential file
+  under `auth.d/antigravity/`; it is never scanned as a ChatGPT namespace or
+  considered by ChatGPT routing. Its refresh token, access token, and Google
+  project id remain daemon-side. GenerateContent responses are capped at 8 MiB,
+  HTTP/error text is bounded, and dropping or aborting the session cancels its
+  request/retry task.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
+- Authenticated clients and view-aware tools may supply image files. Rho accepts
+  at most 20 user images within the UI frame budget and 10 MiB per source,
+  decodes each under fixed dimension and allocation limits, resizes to a bounded
+  vision patch/pixel budget, and writes a fresh single-frame PNG before durable
+  context or provider upload. This strips container metadata, color profiles,
+  animation, and the source encoding. `view_image` detail `original` preserves
+  resolution only within its separate 6,000-pixel/10,000-patch budget. In
+  sandbox views, `view_image` uses the
+  same checked in-process path mapping as patch writes and rejects paths outside
+  the workdirs; ordinary views retain their documented ambient filesystem
+  authority.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB
   per message), text-only recent transcript excerpt to Luna to derive a
   title/activity cache. Native agents commit source events directly; Claude
@@ -42,6 +59,41 @@ AI APIs.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.
+- The native GUI always retains fixed-size in-memory rings of GPUI frame timing
+  and numeric editor/display-pipeline timing. An explicit
+  `Ctrl-Alt-Shift-P` action sends a versioned JSON snapshot (at most 8 MiB) over
+  the already authenticated connection to one active daemon. It contains
+  precise timings, numeric window/thread IDs, edit counts, affected row ranges,
+  map row totals, pending-batch counts, display flags, and embedded-browser
+  scene/barrier IDs with production, coalescing, receipt, scheduling, paint,
+  and frame-ack timing. Browser markers contain no URLs, pixels, or page
+  content; snapshots contain no buffer text or filesystem paths. The daemon
+  chooses a unique filename and writes a mode-0600 file under
+  `dirs::state_dir()/rho/gui-telemetry` (normally
+  `~/.local/state/rho/gui-telemetry`). There is no automatic upload, expiry, or
+  deletion; users control retention of these local diagnostic files.
+- The native GUI keeps a client-only append-only action journal under the rho
+  state directory. It may contain agent/page identities, Desk locations,
+  minibuffer prompts and input, navigation, and dealer decisions with precise
+  timestamps. A dedicated local writer commits each event in its own redb
+  transaction; the journal is
+  never uploaded, analyzed, or used to adapt behavior automatically, and has no
+  automatic retention, so users control it like other sensitive local state.
+- A Desk connection binds one persisted random `DeviceId` to a daemon-assigned
+  node/text namespace before writing. Cell mutations are bounded, atomic, and
+  idempotent by stamp; they must advance that device's frontier without an
+  unobservable clock jump. Clients can create only complete user-owned notes
+  in their namespace. Raw kind cells enforce ownership even for deleted rows;
+  machine nodes are read-only except for exact state/defer/parent changes
+  recorded by a validated user verdict. Node text is namespace-bound,
+  causally complete, and capped at 4 MiB; tags, cell strings, paths,
+  transactions, verdict changes, and mutation write counts have independent
+  bounds before persistence. Failed validation commits no frontier, cell,
+  verdict, text, or mutation-log entry.
+  The one-time native-tree V1 conversion is gone, with its marker and its
+  frozen decoder: it ran on every daemon it was ever going to run on. A
+  database that never took it has no cell state to read, and going back to
+  it means the pre-upgrade database copy.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row
@@ -49,7 +101,8 @@ AI APIs.
   file paths.
   They do not intentionally include transcript data, but remain local
   diagnostic files whose destination and retention are the user's
-  responsibility. On Linux, Dial9 normally samples through `perf_event_open`;
+  responsibility. Always-on timing collection does not enable Dial9 or CPU
+  sampling. On Linux, Dial9 normally samples through `perf_event_open`;
   its clock-timer fallback owns process-global `SIGPROF`, installs a chained
   process-global `SIGSEGV` handler for safe stack reads, and samples only
   registered threads. The `SIGSEGV` handler is not restored, but profiling
@@ -57,8 +110,8 @@ AI APIs.
   in-process profiler using `SIGPROF`. Perf sampling frequency is per
   inherited thread, and inherited child-process samples are collected before
   Dial9 discards them, so overhead can scale with process and subprocess
-  parallelism. GUI frame timings are retained in memory until shutdown, and
-  the single-file trace grows linearly with profiled CPU/frame activity.
+  parallelism. The single-file trace grows linearly with profiled CPU/frame
+  activity.
   Dial9 symbolization and compression materialize the whole segment in memory
   during shutdown; profiling is intended only for bounded diagnostic runs.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
@@ -70,20 +123,126 @@ AI APIs.
   single path component, and records process start identities before sending
   signals during cleanup. Applications launched in a driver session are not
   sandboxed and retain the invoking user's authority.
+  The driver sets an exact process-local marker for rho-browser's QA-only SHM
+  root transport; ordinary GUI launches cannot silently select it. The path
+  accepts only checked ARGB/XRGB buffers, copies validated rows into owned
+  memory, releases the source immediately, retains the 16 MiB ancillary and
+  32 MiB current-scene bounds, and preserves one-scene coalescing. It does not
+  test the production DMA-BUF/fence invariants.
+- Native embedded pages run pinned Brave Origin with the invoking user's full authority
+  and the ordinary Brave Origin cookie/storage identity. Rho does not synthesize
+  or mount browser policy. The NixOS Home Manager Brave module installs user-level
+  policy for Brave Origin. That policy disables
+  Rewards, Wallet/Web3, VPN, Leo, News, Talk, Tor, Playlist, Speedreader,
+  Wayback integration, Sync, background mode, product analytics, usage pings,
+  web discovery, metrics, command-line warnings, and default-browser prompts.
+  It also enables Brave's maximum-savings Memory Saver mode; page unloading is
+  performed by Brave's native eligibility policy rather than forced through the
+  extension API.
+  Rho installs its native-messaging manifest in Brave Origin's ordinary XDG config
+  tree. Ordinary Brave and Rho must never run concurrently: Chromium's singleton
+  is scoped to the user-data directory, and Rho terminates the process it starts.
+  Brave retains its native process and renderer sandboxes.
+  `RHO_CUSTOM_BRAVE_BIN` selects the locally built, Rho-patched Brave artifact;
+  the NixOS Brave profile sets it to a configuration wrapper around its pinned
+  package. There is no stock-browser fallback: `rho-browser` requires the
+  component loader and private tab API from that build. The Nix wrapper adds the
+  process-scoped tab-strip hiding switch. Rho accepts only bounded HTTP(S) launch
+  URLs, holds an exclusive advisory lock on its runtime,
+  and exposes Brave only to one private Wayland socket. One bundled MV3
+  extension is registered by Rho's custom Brave build as a component extension
+  from the isolated client-state directory. Updated worker and DOM-adapter code
+  is therefore registered on browser restart without rebuilding Brave; its
+  source is still supplied only by the installed `rho-gui` binary.
+  The extension has `tabs`, `storage`, `clipboardWrite`, and `nativeMessaging`
+  privileges. Clipboard writes occur only for explicit Vim copy commands
+  handled synchronously from trusted keyboard input. The
+  allowlisted `rhoPrivate.tabs` API stores UUID page identity in browser tab
+  session data instead of exposing it through visible tab groups. Its bundled
+  content script runs on HTTP(S) documents only. Its isolated-world,
+  document-start `window` capture listener owns Vim modes and synchronously
+  consumes matched commands, active prefixes/counts, and unmodified Hints-mode
+  input; unmatched top-level keys and focused-control conflicts continue to the
+  website as their original trusted events. The page agent performs nested
+  native smooth scrolling, focus, visible-element label/text hints, and scroll
+  marks locally. Find and Caret remain disabled pending native browser integration.
+  Hint candidate text is not persisted or sent to the worker. An explicit `gB`
+  command stores only the page origin in
+  extension-local blacklist state.
+  Browser history and
+  reload requests contain only a fixed command name and are handled by the
+  worker for the active sender tab. Hint activation currently uses DOM
+  `element.click()`, which is not a trusted synthetic click, though it executes
+  during the trusted key event's user-activation window. Brave's native Memory
+  Saver discards eligible inactive tabs. Websites cannot read or modify the
+  browser-owned UUID session metadata.
+  URL-free lifecycle
+  diagnostics sent over the
+  native bridge contain page UUIDs, ephemeral tab IDs, and tab state booleans,
+  but no URLs, titles, pixels, or page content. Brave native messaging starts a
+  copy of the
+  `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
+  GUI through a mode-0600 relay socket beside the selected local daemon
+  socket. The socket is a same-user trust boundary and uses no additional
+  authentication. No TCP listener, CDP/remote debugging, or arbitrary injected
+  website script participates. The compositor binds only an
+  exactly-one-pending-window/exactly-one-unbound-top-level pair; no activation
+  token is issued or accepted. Additional or ambiguous top-levels fail closed.
+  Browser content also fails closed unless GPUI and Brave share an
+  importable DMA-BUF format on the selected DRM render node and explicit-sync
+  eventfd support. Root SHM content, missing acquire/release points on any
+  DMA-BUF surface, unsupported buffer transforms, and non-SHM/non-DMA-BUF
+  ancillary buffers are rejected rather than displayed under a guessed mapping.
+  The opt-in host-subsurface passthrough additionally requires the host to
+  advertise the exact DMA-BUF format/modifier. Where the host lacks Wayland's
+  legacy explicit-sync protocol (including niri), Rho imports Chromium's acquire
+  sync file into every DMA-BUF plane's implicit reservation object before attach.
+  At `wl_buffer.release`, it exports and waits for all implicit reader/writer
+  fences before returning the buffer to Chromium. With explicit sync,
+  fenced releases are not returned to Brave until their sync files signal.
+  Synchronized commits are published as one versioned surface tree, preventing
+  buffers or hit-test geometry from different Wayland transactions from mixing.
+  Ancillary SHM buffers are the bounded exception: only ARGB8888 and XRGB8888
+  rows with checked dimensions, stride, pool range, per-surface size, and total
+  scene size are copied into owned memory and released immediately. GPUI/WGPU
+  performs the only rendering; Smithay retains protocol, popup/grab, and input
+  state but does not render browser pixels. With `RHO_BROWSER_PASSTHROUGH=1`, an
+  eligible single-node DMA-BUF is instead sampled by the host compositor through
+  a below-parent subsurface; all other scenes retain the GPUI/WGPU path.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent
   drops and kills its retained child processes.
-- An agent's Workset provides version isolation rather than access isolation.
-  View mode presents the Workset's Checkouts and clone stores under a generated
-  `/src` root; exposed mode retains the host view and mounts the same tree under
-  `/ws`. Both run as the invoking user in an unprivileged user namespace, so
-  this is filesystem hygiene, not a security boundary. Apply-patch translates
-  paths inside a Workset to its host-frame Checkout, so in-process writes follow
-  the same mapping as namespaced commands.
-- Sandbox workdirs are currently refused. TODO(clone-store-sandbox) is the
-  revival point for synthetic Git/VCS masking and a sandbox-native startup
-  policy on Worksets; the previous unwired Landlock implementation was removed.
+- An agent's working set (its workdirs/mount-namespace view) is fixed at spawn,
+  persisted on the agent record, and provides version isolation rather than
+  access isolation: the namespace redirects entry paths to the agent's
+  checkouts but does not restrict access to the rest of the filesystem.
+  Isolated jj workdirs are stable bcachefs subvolumes. Each live Rho process
+  holds a shared advisory lock on a persistent sibling lease file; jj's
+  repository-local GC alone requests a nonblocking exclusive lock, rechecks
+  its last-use timestamp, snapshots the working copy, and only then deletes
+  the subvolume.
+  The lock coordinates cooperating Rho/jj processes, not arbitrary same-user
+  filesystem mutation. Managed workspaces require bcachefs; jj invokes the
+  kernel's bcachefs subvolume ioctls directly rather than spawning a mutable
+  executable from PATH.
+  Apply-patch translates absolute paths inside any workdir to that workdir's
+  checkout, so in-process file writes follow the same redirection as
+  namespaced commands.
+- Sandbox workspaces are a narrower, opt-in boundary for native agents. Rho
+  creates a normal isolated jj-managed workspace, masks its original `.jj` and
+  colocated `.git` metadata in the command mount namespace, and points Git at
+  a separate synthetic baseline. Child commands receive a fail-closed Landlock policy: sandbox
+  workdirs/home/temp/runtime directories are writable, explicit system and
+  toolchain paths are read-only, other filesystem access is denied, and new
+  TCP bind/connect operations are denied; a seccomp filter permits creation
+  of Unix sockets only, covering UDP and other network families unavailable
+  to Landlock ABI 7. The policy requires Landlock ABI 7. In-process patch
+  writes separately reject paths outside the
+  sandbox workdirs. Sandbox views never mix sandbox and ordinary workdirs.
+  This is practical containment for evaluation workloads, not a hardened
+  multi-tenant boundary: Landlock does not govern every metadata syscall or
+  resource-exhaustion vector, and selected runtime paths remain readable.
 - User/repo `AGENTS.md` files and local/project Markdown skills are trusted
   prompt input when discovered. Treat them as useful local guidance, not a
   sandbox or permission boundary.
@@ -96,7 +255,8 @@ AI APIs.
   and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
   so the token never touches disk and survives daemon restarts but not reboots.
   Token values must not appear in logs or errors.
-- The embedded Octo server listens only on its fixed per-user Unix socket and
+- The embedded Octo server listens only on a Unix socket beside the daemon
+  socket and
   uses the sealed platform secret store as its GitHub API and constrained Git
   HTTP token source. It has no token argv/env/file/admin import path in Rho.
   Token-backed fetches are limited to standard GitHub remotes; receive-pack
@@ -180,7 +340,7 @@ AI APIs.
   response is queued, or a transient delivery failure, can lose that response;
   subscriptions are not an outbox and do not replay missed deliveries.
 
-## Remote UI transports (iroh and web UI)
+## Remote UI transport (iroh)
 
 - With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
   (relay-backed QUIC). An enrolled client is fully privileged: everything a
@@ -217,9 +377,9 @@ AI APIs.
   denial-of-service boundary. The daemon's iroh secret key lives in the local
   rho database.
   The auth stream remains raw so unauthenticated input cannot invoke a
-  decompressor. All later application directions use ALPN `rho/ui/3` and one
+  decompressor. All later application directions use ALPN `rho/ui/8` and one
   streaming zstd frame with a 128 KiB maximum decoder window. Local Unix peers
-  must first exchange the fixed, ten-second-bounded `RHO-STREAM-3` preface.
+  must first exchange the fixed, ten-second-bounded `RHO-STREAM-4` preface.
   Senax frame limits are enforced on declared decompressed lengths before
   allocating payloads; compression is not an authorization or integrity
   boundary.
@@ -238,10 +398,8 @@ AI APIs.
   128 MiB while allowing small frames to bypass a waiting large allocation.
   The reservation remains attached to the decoded GUI event until consumption,
   so slow UI handling cannot refill an unbounded queue of large agent frames.
-  The web UI retains only one selected-agent subscription, advertises 16
-  unidirectional stream credits for replacement overlap, and applies a 64 MiB
-  aggregate decompressed-frame allocation budget. A malformed individual
-  agent stream is discarded without tearing down unrelated control traffic.
+  A malformed individual agent stream is discarded without tearing down
+  unrelated control traffic.
   Setting `QLOGDIR` opts the process into writing a qlog file for every iroh
   connection. Qlog records transport metadata such as endpoint addresses,
   connection IDs, packet timing and sizes, stream IDs and offsets, loss, and
@@ -268,38 +426,6 @@ AI APIs.
   `--remote-rho <path>` selects the remote executable (default `rho`) and
   accepts only a nonempty shell-safe path alphabet; it is not an arbitrary
   remote shell command.
-- The browser UI (a static GPUI/wasm page in `crates/rho-gui-web`, hostable anywhere) is
-  an iroh client like any other: it connects on the native UI ALPN and passes
-  the same per-key enrollment before the daemon serves it. Its session uses
-  the same framed native UI protocol and therefore has the same privileges as
-  the native GUI. The browser uses a user-verifying WebAuthn credential's
-  PRF extension to derive a stable, daemon-specific iroh key on each connect;
-  only the non-secret credential id and daemon id are kept in local storage.
-  The PRF output and derived iroh key remain in browser memory and are never
-  persisted. The hosting origin and all JavaScript it serves are fully trusted.
-  On static hosts that cannot set response headers (including GitHub Pages),
-  the page's same-origin COI service worker adds COOP and COEP after its first
-  activation and reloads the page so threaded wasm can use `SharedArrayBuffer`:
-  code running after the user approves the WebAuthn prompt can read the
-  derived enrolled key and thereby gain persistent daemon access. Deploy the
-  page on a dedicated origin without third-party scripts and treat its build
-  and publishing pipeline as security-critical. The page refuses to run when
-  framed and ships a restrictive meta CSP. GPUI background work runs in module
-  workers created from same-page blobs; `worker-src` permits those blobs, while
-  the locally carried `wasm_thread` bootstrap avoids JavaScript `eval` and
-  imports only the build's same-origin wasm-bindgen shim. Production hosting
-  must additionally send `Content-Security-Policy: frame-ancestors 'none'` as
-  an HTTP header.
-  Besides user-authored text, the page sends bounded agent creation choices
-  (topic, registered workdir, role, base revset, and workspace mode).
-  A compromised origin can register a persistent service worker as well as
-  steal an unlocked key, so recovery requires revoking the endpoint, clearing
-  the origin's browser site data, verifying the deployment, and enrolling a
-  new identity.
-  `rho iroh revoke <endpoint-id>` removes persistent and in-memory trust through
-  the local daemon socket; already-established connections are not forcibly
-  closed and must be disconnected (or the daemon restarted) during compromise
-  recovery. In-memory trust is always lost when the daemon exits.
 - Inbound data on the iroh ALPN is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`) and malformed frames end the
   connection.
@@ -472,9 +598,8 @@ metadata; it performs no inference and creates no agent or workspace.
 
 ## Realtime voice provider (`rho-rtc` / `rho-openai-realtime`)
 
-- Native and browser Iris start when the user toggles voice. The dashboard row
-  and both clients' controls expose that voice-session state. `rho-rtc`
-  captures and plays audio using target-specific native or browser facilities.
+- Iris starts when the user toggles voice. The dashboard row exposes that
+  voice-session state. `rho-rtc` captures and plays audio using native devices.
   Encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
   never through the daemon. Audio capture stays disabled until sideband
   readiness. Rho creates no WebRTC data channel; all provider control traffic
@@ -570,51 +695,120 @@ is truncated before the closing fence. Discovery follows symlinks with cycle
 detection for roots/directories/files. Skill files are prompt input only; they
 do not restrict filesystem access or grant tools.
 
-## Code mode (`rho-code-mode`)
+## Papercut reports
 
-- `rho-code-mode` runs model-authored JavaScript in an in-process V8 isolate
-  (deno_core), one isolate per session on a dedicated thread. Scripts have full
-  access to the host through the nested tool dispatcher — the same access the
-  model already has through shell tools. Code mode is not a sandbox and adds no
-  new privilege beyond the existing tool surface.
-- Code mode is used by GPT-5.6-backed roles except `eng-mini`, which uses the
-  direct tool surface, and is fixed at agent creation; the daemon rejects
-  changing the role on a running agent. When on,
-  the model-facing tools are only
-  `exec`/`wait`, and
-  shell plus multi-agent tools are dispatched from scripts on the agent's
-  normal runtime through the same code paths as direct tool calls.
-- Nested command calls return structured JSON values to JavaScript (including
-  process session ids), while direct command calls render the equivalent
-  Codex-style status headers as text. Other nested tools return JSON strings;
-  tool errors reject the JavaScript promise rather than becoming values.
-- `spawn_engineer` is installed in the nested runtime registry and listed by
-  `ALL_TOOLS`, but its full declaration and delegation guidance live in the
-  dynamically discovered `delegate-engineering` skill instead of every code
-  mode prompt. Runtime authorization and spawn validation are unchanged.
-- Trust boundaries: script source is model-controlled input; nested tool calls
-  leave the isolate through the `ToolDispatcher`, which forwards to the agent's
-  normal tool path with its existing controls. The JS environment strips
-  `console`, `Atomics`, `SharedArrayBuffer`, and `WebAssembly`, and exposes no
-  I/O ops other than nested tool calls, `text`/`notify` output, and timers.
-- `notify(...)` becomes a `ToolUpdate` attributed to the cell's originating
-  `exec` call: it rides the agent's persisted input queue and enters model
-  context at the next request boundary of the active turn. With no active
-  turn the update is dropped, and leftover updates alone never start a turn,
-  so script output cannot wake an idle agent.
-- Resource bounds: exec/wait yield back to the model after a deadline (default
-  10 s) while the script keeps running as a tracked cell; result text is
-  middle-truncated to a token budget (default 10k tokens); a 100 ms heartbeat
-  on the runtime thread detects synchronous busy loops.
-- Cancellation: terminating a cell escalates from cancelling its pending tool
-  ops (rejecting the promises it awaits), to `TerminateExecution` on the
-  isolate if the heartbeat is stale (the isolate and other cells survive), to
-  marking the cell an inert zombie whose ops are refused and output discarded.
-  Dropping the session cancels all cells and shuts down the runtime thread.
-- Tests: `crates/rho-code-mode/tests/session.rs` covers REPL state
-  persistence, concurrent cells, yield/wait, terminate of both parked and
-  busy-looping cells (with session survival), tool-failure propagation, and
-  output truncation.
+The native `papercut` tool appends model-authored reports to a separate local
+`papercuts` table, alongside the reporting agent id and timestamp. Descriptions
+must be nonempty and at most 16 KiB; there is no aggregate quota or automatic
+retention policy. Reports are opaque data, not instructions, and trigger no
+notification, external submission, or background work. Success is returned only
+after the database commit. Cancellation before acquiring the write lock leaves
+no report; once writing starts, the short transaction completes atomically.
+Tests cover validation, concurrent appends, and reopening the database.
+
+## Python code mode (`rho-python`, `rho-agent-tools`)
+
+Every role works in the Python notebook: native agents have it as their only
+tool, and Claude engineers get it as an in-process MCP server with Claude's
+own tools denied.
+
+- Model-authored Python runs in-process on a dedicated RustPython thread, with
+  persistent globals and cooperative top-level-await cells. The crate boundary
+  carries serialized messages, not interpreter objects, so a future worker can
+  replace the thread without moving tool or scheduling policy.
+- Ordinary RustPython host access is enabled: `pathlib`, `open`, `os`, and
+  other supported standard-library modules work directly. `pathlib` and `Path`
+  are prebound; imports remain ordinary Python imports. The dedicated VM thread
+  unshares its filesystem state before entering the agent's View mount namespace
+  and setting its initial cwd. Python `chdir` therefore affects that notebook,
+  not the daemon or sibling notebooks; it remains shared between its live cells.
+- Python is explicitly **not a sandbox**. Workspace mount mapping provides path
+  correctness, not capability isolation. Unlike managed shell commands, native
+  Python file operations are not Landlock-restricted. Process-global environment
+  mutations, signals, descriptor operations, and process exit retain their normal
+  in-process behavior and can affect the daemon. Python code must be trusted to
+  the same extent as daemon code. Automatic Python signal-handler installation
+  is disabled so imports do not replace the host's Ctrl-C handler; explicit
+  Python signal changes still retain their normal semantics.
+  A worker process is required before promising fault or resource isolation.
+  Commands should use `command()` when Rust-managed
+  lifetime and automatic output are wanted; ordinary Python subprocesses do not
+  acquire that managed lifecycle automatically.
+- Standard asyncio owns Python task scheduling, timers, and I/O. Rust messages
+  wake its selector through an eventfd; cell context follows tasks and callbacks.
+  Asyncio networking and subprocesses have ordinary unsandboxed Python access,
+  not the managed lifecycle of `command()`. Native extension wheels are unsupported.
+  Real Python threads are enabled. Notebook-created threads inherit cell context
+  unless the caller supplies an explicit context; executor workers belong to
+  the pool, while each submitted job keeps its cell alive until actual completion.
+  Cancelling an asyncio future does not imply its thread has stopped. Host-function
+  registration must run on the notebook event loop, not a worker thread.
+  PyYAML and HTTPX are supplied from the Nix-pinned package closure; Rustls provides
+  TLS and SQLite is compiled into the runtime.
+  A ten-second event-loop heartbeat and per-callback timing detect synchronous
+  blocking. After two minutes, tracing raises a timeout in the executing user
+  task or callback, including imported Python code, at a safe dispatch boundary.
+  Awaiting I/O and executor workers do not consume this blocking budget. Other
+  cells and pending work remain live; this does not cancel an entire cell's jobs.
+  Python can exhaust memory, disable tracing, catch cancellation, or block in
+  native computation. Cancellation of Python is best-effort; Rust command and
+  nested-tool cancellation do not depend on Python cooperation.
+- Commands, stdin writes, and nested tools share eager Rust-owned registration;
+  awaiting a Python result is not what starts or owns the work. Their source remains
+  attached to the actual provider `exec` call until evaluation and attached work
+  finish and final output is drained. Internal jobs never invent provider calls.
+  Output previews are token-budgeted; explicit reads use an independent cursor
+  over a private temporary file, including after command completion. Each job
+  retains its first 8 MiB with explicit overflow counts. At most 64 job records
+  are retained, evicting oldest completed, delivered records; temporary files
+  disappear with their records. Up to 32 image references are retained.
+- Runtime payloads are capped at 1 MiB and the completion/input queue at 256 entries,
+  live cells at 128, and pending host requests and registered tasks at 1,024 each.
+  Reliable asynchronous completion delivery applies backpressure without blocking
+  the interpreter. Python-to-Rust callbacks commit synchronously and have no
+  deferred event consumer. These bounds do not cap arbitrary Python allocations.
+- Commands and internal tool calls inside Python are independent scheduling sources. Their output remains
+  attached to the originating `exec` call; command IDs identify the work, not
+  notebook cell IDs. The core tracks each command's first drain separately.
+- `notify` marks meaningful output; `text` and captured stdout/stderr mark
+  ordinary progress. Standard streams expose no daemon file descriptors. Both
+  become output on the originating call at the core's next request boundary;
+  neither starts inference directly. `set_checkin` conveys a model-authored
+  one-turn interval and tool-wakeup policy, not a Python sleep or a tool-selected timeout. It updates
+  its execution's shared Rust state synchronously. Only the execution from the
+  latest model response controls check-ins; old settings need no mutation or
+  stale-setter warnings. A quiet successful setter-only
+  completion is not news that immediately defeats its own interval; failures,
+  command completion, and meaningful output retain normal wake/batching rules
+  unless `wake_on_tools=False` suppresses tool deadlines for that turn. Suppression
+  includes the execution itself, does not cancel work or discard buffered output,
+  and does not disable the timer, user input, or agent mail.
+- Python source can execute complete top-level units before its provider response
+  finishes. The agent validates one stable, append-only custom `exec` identity,
+  bounds total source to 1 MiB, and persists admission before permitting each unit.
+  It persists settlement before permitting the next unit. Transport loss never
+  closes the compiler as EOF: unadmitted source is discarded, while an admitted
+  unit and its commands continue as ordinary sources on the accepted `exec`
+  call. The next request respects their normal completion, batching, and check-in
+  rules rather than a forced retry deadline. Failures before admission retain
+  bounded backoff. Fresh context reports completed, running, or failed statements
+  rather than automatically replaying them. Admission records do not prove
+  side effects occurred; a crash between admission and settlement is uncertain.
+- Notebook state and live jobs are ephemeral and do not survive restart. The
+  existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
+  the JavaScript runtime for all other code-mode roles.
+
+## Headless evaluations (`rho eval`)
+
+The CLI runs the production agent loop with the selected native engineer role
+(default `eng-high` / GPT-6 Astra), configured provider credentials, and isolated
+temporary agent state. It neither connects to nor replaces the running daemon.
+The default workdir is temporary; `--workdir` deliberately grants ordinary live
+workspace tool authority and does not roll back writes. Evaluations make real
+provider requests. JSONL output contains assistant/tool transcripts and usage,
+not provider reasoning or image bytes; it remains potentially sensitive.
+Timeout/interruption cancels the agent. Expected final substrings and required
+observed tool calls are CLI evaluation criteria, not a security boundary.
 
 ## Visualization artifacts
 

@@ -4,6 +4,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use collections::{FxHashMap, HashMap};
@@ -33,10 +34,10 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    HostVsync, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -124,6 +125,18 @@ pub struct WaylandWindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     renderer_presented: bool,
+    /// Whether the last commit carried a buffer. A bufferless commit produces
+    /// no damage, so compositors that only repaint on damage (niri) never
+    /// deliver the requested frame callback; a dirty window must then drive
+    /// its own next frame via `wake_frame`.
+    frame_callback_reliable: bool,
+    /// A `wake_frame` task is already queued on the executor.
+    frame_wake_queued: bool,
+    /// A `wl_surface.frame` request is outstanding, so requesting another
+    /// would stack duplicate callbacks that all fire on the next repaint.
+    frame_callback_requested: bool,
+    host_presentation: Option<HostVsync>,
+    passthrough_surface_created: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -654,6 +667,11 @@ impl WaylandWindowState {
             hovered: false,
             force_render_after_recovery: false,
             renderer_presented: false,
+            frame_callback_reliable: true,
+            frame_wake_queued: false,
+            frame_callback_requested: false,
+            host_presentation: None,
+            passthrough_surface_created: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -871,8 +889,109 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn frame(&self) {
+        self.request_frame(None);
+    }
+
+    pub fn frame_at(&self, _callback_data: u32) {
+        self.state.borrow_mut().frame_callback_requested = false;
+        self.produce_frame();
+    }
+
+    /// Drives a frame for a dirty window without relying on the compositor's
+    /// frame callback. After a bufferless commit no output damage exists, so
+    /// the callback requested last frame may never fire; without this, a
+    /// dirty window only repaints on external damage such as cursor movement.
+    pub fn wake_frame(&self) {
         let mut state = self.state.borrow_mut();
-        state.surface.frame(&state.globals.qh, state.surface.id());
+        if state.frame_callback_reliable || state.frame_wake_queued {
+            return;
+        }
+        state.frame_wake_queued = true;
+        let executor = state.globals.executor.clone();
+        drop(state);
+        // Deferred: the waker fires from inside the request_frame callback
+        // while `self.callbacks` is mutably borrowed.
+        let this = self.clone();
+        executor
+            .spawn(async move {
+                {
+                    let mut state = this.state.borrow_mut();
+                    state.frame_wake_queued = false;
+                    if state.frame_callback_reliable {
+                        return;
+                    }
+                }
+                this.produce_frame();
+            })
+            .detach();
+    }
+
+    fn produce_frame(&self) {
+        // Bind before the branch: an if-let scrutinee would hold this borrow
+        // across request_frame's borrow_mut and panic.
+        let host_presentation = self.state.borrow().host_presentation;
+        if let Some(host_vsync) = host_presentation {
+            self.request_frame(Some(host_vsync));
+            return;
+        }
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let host_vsync = (unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0)
+            .then(|| {
+                let state = self.state.borrow();
+                let refresh_period = state
+                    .display
+                    .as_ref()
+                    .and_then(|(_, output)| output.refresh_period)
+                    .or_else(|| {
+                        state
+                            .outputs
+                            .values()
+                            .find_map(|output| output.refresh_period)
+                    });
+                Some(HostVsync {
+                    timestamp: Duration::new(now.tv_sec as u64, now.tv_nsec as u32),
+                    refresh_period,
+                })
+            })
+            .flatten();
+        self.request_frame(host_vsync);
+    }
+
+    pub fn presented(&self, timestamp: Duration, refresh_period: Option<Duration>) {
+        let mut state = self.state.borrow_mut();
+        let refresh_period = refresh_period
+            .or_else(|| {
+                state
+                    .host_presentation
+                    .and_then(|timing| timing.refresh_period)
+            })
+            .or_else(|| {
+                state
+                    .display
+                    .as_ref()
+                    .and_then(|(_, output)| output.refresh_period)
+            })
+            .or_else(|| {
+                state
+                    .outputs
+                    .values()
+                    .find_map(|output| output.refresh_period)
+            });
+        state.host_presentation = Some(HostVsync {
+            timestamp,
+            refresh_period,
+        });
+    }
+
+    fn request_frame(&self, host_vsync: Option<HostVsync>) {
+        let mut state = self.state.borrow_mut();
+        if !state.frame_callback_requested {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+            state.frame_callback_requested = true;
+        }
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;
@@ -882,6 +1001,7 @@ impl WaylandWindowStatePtr {
         if let Some(fun) = cb.request_frame.as_mut() {
             fun(RequestFrameOptions {
                 force_render,
+                host_vsync,
                 ..Default::default()
             });
             self.update_ime_enabled();
@@ -898,7 +1018,7 @@ impl WaylandWindowStatePtr {
             .input_handler
             .as_mut()
             .map(|input_handler| input_handler.query_accepts_text_input())
-            .unwrap_or(true);
+            .unwrap_or(false);
         drop(state);
         if Some(ime_enabled) == client.ime_enabled() {
             return;
@@ -1041,9 +1161,11 @@ impl WaylandWindowStatePtr {
                 let mut fullscreen = false;
                 let mut maximized = false;
                 let mut resizing = false;
+                let mut active = false;
 
                 for state in states {
                     match state {
+                        xdg_toplevel::State::Activated => active = true,
                         xdg_toplevel::State::Maximized => {
                             maximized = true;
                         }
@@ -1068,6 +1190,8 @@ impl WaylandWindowStatePtr {
                         }
                     }
                 }
+
+                self.set_active(active);
 
                 if fullscreen || maximized {
                     tiling = Tiling::tiled();
@@ -1378,15 +1502,21 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn set_focused(&self, focus: bool) {
-        self.state.borrow_mut().active = focus;
+    pub fn set_active(&self, active: bool) {
+        let mut state = self.state.borrow_mut();
+        if state.active == active {
+            return;
+        }
+        state.active = active;
+        drop(state);
+
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
-            fun(focus);
+            fun(active);
             self.callbacks.borrow_mut().active_status_change = Some(fun);
         }
         if let Some(adapter) = self.state.borrow_mut().accesskit_adapter.as_mut() {
-            adapter.update_window_focus_state(focus);
+            adapter.update_window_focus_state(active);
         }
     }
 
@@ -1460,6 +1590,35 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn begin_touch_serial(&self, serial: Option<u32>) {
+        self.borrow().client.begin_touch_serial(serial);
+    }
+
+    fn end_touch_serial(&self) {
+        self.borrow().client.end_touch_serial();
+    }
+
+    fn create_linux_wayland_passthrough(
+        &self,
+        events: Box<dyn Fn(gpui::LinuxWaylandPassthroughEvent) + Send + Sync>,
+    ) -> Option<anyhow::Result<Arc<dyn gpui::LinuxWaylandPassthrough>>> {
+        let mut state = self.borrow_mut();
+        // Keep the swapchain alpha mode stable across promotion/demotion. A
+        // reconfigure on the exact hole transition can stall or flash.
+        state.passthrough_surface_created = true;
+        let client = state.client.get_client();
+        let client = client.borrow();
+        let connection = client.connection.clone();
+        let global_list = client.global_list.clone();
+        Some(super::passthrough::create(
+            connection,
+            global_list,
+            state.globals.compositor.clone(),
+            state.surface.clone(),
+            events.into(),
+        ))
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.borrow().bounds
     }
@@ -1693,6 +1852,18 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Weak: the waker outlives the window inside the Invalidator.
+        let state = Rc::downgrade(&self.0.state);
+        let callbacks = Rc::downgrade(&self.0.callbacks);
+        Some(Rc::new(move || {
+            let (Some(state), Some(callbacks)) = (state.upgrade(), callbacks.upgrade()) else {
+                return;
+            };
+            WaylandWindowStatePtr { state, callbacks }.wake_frame();
+        }))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1761,6 +1932,12 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
+        let transparent = state.is_transparent() || state.passthrough_surface_created;
+        state.renderer.update_transparency(transparent);
+        update_scene_opaque_region(&state, scene);
+        if let Some(presentation) = state.globals.presentation.as_ref() {
+            presentation.feedback(&state.surface, &state.globals.qh, state.surface.id());
+        }
         state.renderer_presented = state.renderer.draw(scene);
 
         if state.renderer.needs_redraw() {
@@ -1777,6 +1954,7 @@ impl PlatformWindow for WaylandWindow {
             state.surface.commit();
         }
 
+        state.frame_callback_reliable = state.renderer_presented;
         state.renderer_presented = false;
     }
 
@@ -1970,6 +2148,45 @@ impl PlatformWindow for WaylandWindow {
     fn a11y_update_window_bounds(&self) {
         // Wayland doesn't expose window position, so this is a no-op
     }
+}
+
+fn update_scene_opaque_region(state: &WaylandWindowState, scene: &Scene) {
+    if state.background_appearance != WindowBackgroundAppearance::Opaque
+        || state.decorations != WindowDecorations::Server
+    {
+        // Decorations/background can change after an opaque region was set.
+        // Explicitly clear it so a stale full-window region cannot hide a
+        // transparent hole and its below-parent child.
+        state.surface.set_opaque_region(None);
+        return;
+    }
+
+    let region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    let opaque_area = state
+        .window_bounds
+        .map(|value| f32::from(value) as i32)
+        .inset(f32::from(state.inset()) as i32);
+    region.add(
+        opaque_area.origin.x,
+        opaque_area.origin.y,
+        opaque_area.size.width,
+        opaque_area.size.height,
+    );
+
+    let scale = state.scale.max(f32::EPSILON);
+    for hole in &scene.holes {
+        let bounds = hole.bounds.intersect(&hole.content_mask.bounds);
+        let left = (bounds.origin.x.0 / scale).floor() as i32;
+        let top = (bounds.origin.y.0 / scale).floor() as i32;
+        let right = (bounds.right().0 / scale).ceil() as i32;
+        let bottom = (bounds.bottom().0 / scale).ceil() as i32;
+        region.subtract(left, top, right - left, bottom - top);
+    }
+    state.surface.set_opaque_region(Some(&region));
+    region.destroy();
 }
 
 struct TrivialActivationHandler {

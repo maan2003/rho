@@ -8,7 +8,8 @@ use tokio::sync::watch;
 
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
-use crate::responses::{InferenceAuth, InferenceSession, PromptCacheKey, QuotaUpdate};
+use crate::responses::{InferenceAuth, PromptCacheKey, QuotaUpdate, RouteSelector};
+use crate::session::InferenceSession;
 
 /// Provider account policy, quota, persistence, and session creation. Cheap to
 /// clone.
@@ -18,6 +19,8 @@ pub struct Inference(Arc<Inner>);
 #[derive(Debug)]
 struct Inner {
     accounts: Option<Arc<AccountManager>>,
+    responses_base_url: Arc<str>,
+    routes: RouteSelector,
     #[cfg(test)]
     fixed_auth: Option<InferenceAuth>,
 }
@@ -29,17 +32,35 @@ impl Inference {
         accounts::init(db).await
     }
 
-    /// Opens the daemon-owned inference runtime and starts its fallback quota
-    /// poller.
+    /// Opens the daemon-owned inference runtime and starts its quota and route
+    /// pollers.
     pub async fn new(db: RhoDb) -> anyhow::Result<Self> {
+        Self::new_with_config(db, InferenceConfig::default()).await
+    }
+
+    /// Opens inference with explicit provider transport configuration. This is
+    /// used by isolated QA rigs; the production default remains ChatGPT.
+    pub async fn new_with_config(db: RhoDb, config: InferenceConfig) -> anyhow::Result<Self> {
         Self::migrate(&db).await?;
-        let accounts = Arc::new(AccountManager::open(db).await);
-        accounts.spawn_poller();
+        let accounts = Arc::new(AccountManager::open(db.clone()).await);
+        // The quota endpoint is a first-party ChatGPT-only API. An explicit
+        // Responses endpoint (for example the full-stack QA server) must not
+        // leak a side request to the production provider.
+        if &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL {
+            accounts.spawn_poller();
+        }
+        let production_chatgpt =
+            &*config.responses_base_url == crate::responses::DEFAULT_CHATGPT_BASE_URL;
         let inference = Self(Arc::new(Inner {
             accounts: Some(accounts),
+            responses_base_url: config.responses_base_url,
+            routes: RouteSelector::new(Some(db)),
             #[cfg(test)]
             fixed_auth: None,
         }));
+        if production_chatgpt {
+            inference.spawn_route_prober();
+        }
         Ok(inference)
     }
 
@@ -47,8 +68,33 @@ impl Inference {
     pub(crate) fn for_test(auth: InferenceAuth) -> Self {
         Self(Arc::new(Inner {
             accounts: None,
+            responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
+            routes: RouteSelector::new(None),
             fixed_auth: Some(auth),
         }))
+    }
+
+    pub(crate) fn responses_base_url(&self) -> &str {
+        &self.0.responses_base_url
+    }
+
+    pub(crate) fn routes(&self) -> &RouteSelector {
+        &self.0.routes
+    }
+
+    fn spawn_route_prober(&self) {
+        let weak = Arc::downgrade(&self.0);
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let inference = Inference(inner);
+                inference.0.routes.probe_once(&inference).await;
+                drop(inference);
+                tokio::time::sleep(RouteSelector::probe_interval()).await;
+            }
+        });
     }
 
     pub fn deep_session(
@@ -57,7 +103,12 @@ impl Inference {
         model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
     ) -> InferenceSession {
-        InferenceSession::new_deep(self.clone(), profile, model, prompt_cache_key)
+        match model {
+            InferenceModel::Gemini37FlashLow => {
+                InferenceSession::new_antigravity(profile, prompt_cache_key)
+            }
+            _ => InferenceSession::new_responses(self.clone(), profile, model, prompt_cache_key),
+        }
     }
 
     pub fn title_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
@@ -118,7 +169,42 @@ impl Inference {
         self.accounts().history(since)
     }
 
+    pub fn route_probe_history(&self, since: UnixMs) -> Vec<crate::responses::InferenceRouteProbe> {
+        self.0.routes.history(since)
+    }
+
     fn accounts(&self) -> &AccountManager {
         self.0.accounts.as_ref().expect("inference account manager")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InferenceConfig {
+    responses_base_url: Arc<str>,
+}
+
+impl InferenceConfig {
+    pub fn with_responses_base_url(base_url: impl Into<Arc<str>>) -> anyhow::Result<Self> {
+        let base_url = base_url.into();
+        let parsed = url::Url::parse(&base_url)?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "inference base URL must use http or https"
+        );
+        anyhow::ensure!(
+            parsed.host().is_some(),
+            "inference base URL must have a host"
+        );
+        Ok(Self {
+            responses_base_url: base_url,
+        })
+    }
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            responses_base_url: crate::responses::DEFAULT_CHATGPT_BASE_URL.into(),
+        }
     }
 }

@@ -27,9 +27,6 @@ declare const tools: {
   interrupt_engineer(args: {
     engineer_id: string;
   }): Promise<string>;
-  wait_agent(args: {
-    timeout_seconds?: number;
-  }): Promise<string>;
 };
 ```
 
@@ -42,7 +39,7 @@ until it reports completion. Do not independently investigate, edit, or verify
 the same task while the Engineer is working; that duplicates work and weakens
 the ownership boundary. You may work concurrently only on a clearly disjoint
 subtask with separately assigned ownership. Otherwise, send necessary
-follow-ups and use `wait_agent` rather than doing the delegated work yourself
+follow-ups and use `wait` rather than doing the delegated work yourself
 or yielding a final response while it is still running.
 
 Each jj workdir is always isolated in the child. Omit `workdirs` to fork the

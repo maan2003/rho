@@ -21,7 +21,7 @@ use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
-use rho_workset::{Namespace, PathOverrides};
+use rho_workspaces::{PathOverrides, View};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -37,6 +37,22 @@ const MAX_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = MAX_OUTPUT_TOKENS * APPROX_BYTES_PER_TOKEN as usize;
 const APPROX_BYTES_PER_TOKEN: u64 = 4;
 static NEXT_CHUNK_ID: AtomicI32 = AtomicI32::new(1);
+/// `exec_command` waits for the command to finish by default. A result that
+/// says "still running" costs the model a full round trip to poll, while
+/// waiting server-side costs nothing, so the default is the ceiling.
+const DEFAULT_EXEC_YIELD_MS: u64 = 300_000;
+const MIN_YIELD_MS: u64 = 250;
+const MAX_YIELD_MS: u64 = 300_000;
+/// An empty `write_stdin` is a poll: it blocks until the process prints more
+/// or exits, so a model that polls anyway pays one trip per event rather than
+/// one per second.
+const MIN_POLL_YIELD_MS: u64 = 30_000;
+const DEFAULT_POLL_YIELD_MS: u64 = 300_000;
+/// A real stdin write yields soon, so interactive sessions stay responsive.
+const DEFAULT_STDIN_WRITE_YIELD_MS: u64 = 10_000;
+const MAX_STDIN_WRITE_YIELD_MS: u64 = 30_000;
+/// After a poll sees output, gather the rest of the burst before returning.
+const POLL_SETTLE: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug)]
 pub struct ShellTools {
@@ -45,16 +61,22 @@ pub struct ShellTools {
     processes: Arc<ProcessManager>,
 }
 
+/// Collects output until the process exits or `yield_time` passes. With
+/// `until_output`, a poll returns as soon as the process has said something
+/// (after a short settle so a burst arrives whole).
 async fn collect_process_output(
     session: &mut ProcessSession,
     yield_time: Duration,
+    until_output: bool,
 ) -> Result<(Option<std::process::ExitStatus>, Vec<u8>)> {
-    let deadline = time::Instant::now() + yield_time.min(Duration::from_secs(300));
+    let deadline = time::Instant::now() + yield_time.min(Duration::from_millis(MAX_YIELD_MS));
     let mut output = BoundedOutput::new(MAX_OUTPUT_BYTES);
+    let mut settle: Option<time::Instant> = None;
     let status = loop {
         if let Some(status) = session.status {
             break Some(status);
         }
+        let settle_at = settle.unwrap_or(deadline);
         tokio::select! {
             biased;
             status = &mut session.wait_task => {
@@ -63,9 +85,15 @@ async fn collect_process_output(
                 break Some(status);
             }
             chunk = session.output_rx.recv() => {
-                if let Some(chunk) = chunk { output.push(&chunk); }
+                if let Some(chunk) = chunk {
+                    output.push(&chunk);
+                    if until_output && settle.is_none() {
+                        settle = Some(time::Instant::now() + POLL_SETTLE);
+                    }
+                }
             }
             _ = time::sleep_until(deadline) => break None,
+            _ = time::sleep_until(settle_at), if settle.is_some() => break None,
             _ = time::sleep(Duration::from_millis(10)) => {}
         }
     };
@@ -151,7 +179,7 @@ enum ExecContext {
         working_directory: Utf8PathBuf,
         path_overrides: PathOverrides,
     },
-    Namespace(Arc<Namespace>),
+    View(Arc<View>),
 }
 
 #[derive(Clone, Debug)]
@@ -166,8 +194,7 @@ struct ShellArgs {
     cmd: String,
     #[serde(alias = "cwd")]
     workdir: Option<String>,
-    #[serde(default = "default_yield_time_ms")]
-    yield_time_ms: u64,
+    yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
 }
 
@@ -176,16 +203,8 @@ struct WriteStdinArgs {
     session_id: i32,
     #[serde(default)]
     chars: String,
-    #[serde(default = "default_poll_time_ms")]
-    yield_time_ms: u64,
+    yield_time_ms: Option<u64>,
     max_output_tokens: Option<usize>,
-}
-
-fn default_yield_time_ms() -> u64 {
-    10_000
-}
-fn default_poll_time_ms() -> u64 {
-    10_000
 }
 
 #[derive(Debug)]
@@ -200,6 +219,96 @@ struct ProcessSession {
     wait_task: tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>,
     status: Option<std::process::ExitStatus>,
     output_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+/// A command started by [`ShellTools::spawn`], for a caller that streams its
+/// output itself instead of collecting it inside one tool call.
+///
+/// Dropping it kills a live command.
+#[derive(Debug)]
+pub struct SpawnedProcess {
+    session: ProcessSession,
+    /// After exit, how long to keep reading for output that is still in the
+    /// pipes before calling the process closed. A grandchild that inherited
+    /// the pipes could otherwise hold the reader open forever.
+    drain_deadline: Option<time::Instant>,
+}
+
+/// One thing a [`SpawnedProcess`] did.
+#[derive(Debug)]
+pub enum ProcessEvent {
+    /// Some stdout or stderr, in read order.
+    Output(Vec<u8>),
+    /// The process exited. Output may still follow, then `Closed`.
+    Exited(std::process::ExitStatus),
+    /// Nothing more will come.
+    Closed,
+    /// The process could not be waited on; treat as ended.
+    Failed(String),
+}
+
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
+
+impl SpawnedProcess {
+    /// The next thing that happens. After `Closed` or `Failed`, keeps
+    /// returning `Closed`.
+    pub async fn next(&mut self) -> ProcessEvent {
+        let session = &mut self.session;
+        if session.status.is_some() {
+            let deadline = self
+                .drain_deadline
+                .get_or_insert_with(|| time::Instant::now() + POST_EXIT_DRAIN);
+            return tokio::select! {
+                biased;
+                chunk = session.output_rx.recv() => match chunk {
+                    Some(chunk) => ProcessEvent::Output(chunk),
+                    None => ProcessEvent::Closed,
+                },
+                _ = time::sleep_until(*deadline) => ProcessEvent::Closed,
+            };
+        }
+        tokio::select! {
+            biased;
+            status = &mut session.wait_task => match status {
+                Ok(Ok(status)) => {
+                    session.status = Some(status);
+                    ProcessEvent::Exited(status)
+                }
+                Ok(Err(error)) => {
+                    session.status = Some(std::process::ExitStatus::default());
+                    ProcessEvent::Failed(error.to_string())
+                }
+                Err(error) => {
+                    session.status = Some(std::process::ExitStatus::default());
+                    ProcessEvent::Failed(format!("shell wait task failed: {error}"))
+                }
+            },
+            chunk = session.output_rx.recv() => match chunk {
+                Some(chunk) => ProcessEvent::Output(chunk),
+                // Both pipes closed before the process exited: only the exit
+                // is left to wait for.
+                None => match (&mut session.wait_task).await {
+                    Ok(Ok(status)) => {
+                        session.status = Some(status);
+                        ProcessEvent::Exited(status)
+                    }
+                    Ok(Err(error)) => {
+                        session.status = Some(std::process::ExitStatus::default());
+                        ProcessEvent::Failed(error.to_string())
+                    }
+                    Err(error) => {
+                        session.status = Some(std::process::ExitStatus::default());
+                        ProcessEvent::Failed(format!("shell wait task failed: {error}"))
+                    }
+                },
+            },
+        }
+    }
+
+    /// The process's stdin, once; `None` if already taken.
+    pub fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.session.stdin.take()
+    }
 }
 
 impl Drop for ProcessSession {
@@ -223,9 +332,9 @@ impl ShellTools {
     /// Tools for an agent's workspace view. Namespace setup and cache warming
     /// run lazily on the first shell command, hiding their latency behind the
     /// model's first response.
-    pub fn new(_timeout: Duration, view: Arc<Namespace>) -> Self {
+    pub fn new(_timeout: Duration, view: Arc<View>) -> Self {
         Self {
-            exec: ExecContext::Namespace(view),
+            exec: ExecContext::View(view),
             env: Vec::new(),
             processes: Arc::new(ProcessManager::default()),
         }
@@ -265,7 +374,7 @@ impl ShellTools {
             } else {
                 working_directory.as_std_path().join(path)
             }),
-            ExecContext::Namespace(view) => view
+            ExecContext::View(view) => view
                 .resolve_host_path_checked(path)
                 .map_err(|error| error.to_string()),
         }
@@ -293,7 +402,7 @@ impl ShellTools {
                 "properties": {
                     "cmd": {
                         "type": "string",
-                        "description": "Command to run with bash -c"
+                        "description": "Command to run with bash -o pipefail -c"
                     },
                     "workdir": {
                         "type": "string",
@@ -301,7 +410,7 @@ impl ShellTools {
                     },
                     "yield_time_ms": {
                         "type": "integer",
-                        "description": "Wait before yielding output. Defaults to 10000 ms."
+                        "description": "How long to wait for the command to finish before yielding with a session ID. Defaults to 300000 ms, so the call normally returns the finished result; lower it only for an interactive command that needs stdin."
                     },
                     "max_output_tokens": {
                         "type": "integer",
@@ -324,8 +433,8 @@ impl ShellTools {
                 "type": "object", "additionalProperties": false, "required": ["session_id"],
                 "properties": {
                     "session_id": {"type": "integer", "description": "Identifier of the running unified exec session."},
-                    "chars": {"type": "string", "description": "Bytes to write to stdin. Defaults to empty, which polls without writing."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding output."},
+                    "chars": {"type": "string", "description": "Bytes to write to stdin. Defaults to empty, which waits for the process to print more or exit instead of writing."},
+                    "yield_time_ms": {"type": "integer", "description": "With empty chars: how long to wait for more output or exit, 30000 to 300000 ms; returns as soon as something arrives. After a write: how long to wait for a response, at most 30000 ms."},
                     "max_output_tokens": {"type": "integer", "description": "Output token budget. Defaults to 10000 tokens."}
                 }
             }),
@@ -399,6 +508,8 @@ impl ShellTools {
         match self.call_inner(&call).await {
             Ok((output, metadata)) => ShellToolOutput {
                 body: ToolOutput {
+                    full_output: None,
+                    images: std::sync::Arc::new(Vec::new()),
                     output: Arc::from(output),
                     status: ToolOutputStatus::Success,
                 },
@@ -406,6 +517,8 @@ impl ShellTools {
             },
             Err(error) => ShellToolOutput {
                 body: ToolOutput {
+                    full_output: None,
+                    images: std::sync::Arc::new(Vec::new()),
                     output: Arc::from(error.to_string()),
                     status: ToolOutputStatus::Error,
                 },
@@ -423,12 +536,65 @@ impl ShellTools {
         }
     }
 
+    /// Initialize ordinary Python filesystem operations in this tool's workdir.
+    ///
+    /// # Safety
+    /// Must run on a dedicated interpreter thread with CLONE_FS unshared.
+    /// Poll this future on that same thread throughout.
+    pub async unsafe fn enter_interpreter_thread(&self) -> Result<()> {
+        match &self.exec {
+            ExecContext::Directory {
+                working_directory, ..
+            } => {
+                std::env::set_current_dir(working_directory)?;
+                Ok(())
+            }
+            ExecContext::View(view) => unsafe { view.enter_interpreter_thread().await },
+        }
+    }
+
+    /// Start `cmd` the way `exec_command` would, and hand the running process
+    /// over instead of collecting its output.
+    pub async fn spawn(&self, cmd: &str, workdir: Option<&str>) -> Result<SpawnedProcess> {
+        let session = self.spawn_process(cmd, workdir).await?;
+        Ok(SpawnedProcess {
+            session,
+            drain_deadline: None,
+        })
+    }
+
     async fn exec_command(&self, call: &ToolCall) -> Result<ExecOutput> {
         if call.tool_type != ToolType::Function {
             return Err(anyhow!("exec_command expects a function tool call"));
         }
 
         let args: ShellArgs = serde_json::from_str(&call.arguments)?;
+        let started = Instant::now();
+        let mut session = self
+            .spawn_process(&args.cmd, args.workdir.as_deref())
+            .await?;
+        let yield_ms = args
+            .yield_time_ms
+            .unwrap_or(DEFAULT_EXEC_YIELD_MS)
+            .clamp(MIN_YIELD_MS, MAX_YIELD_MS);
+        let (status, output) =
+            collect_process_output(&mut session, Duration::from_millis(yield_ms), false).await?;
+        let process_id = status
+            .is_none()
+            .then(|| self.processes.next_id.fetch_add(1, Ordering::Relaxed));
+        if let Some(id) = process_id {
+            self.processes.sessions.lock().await.insert(id, session);
+        }
+        Ok(exec_output(
+            started.elapsed(),
+            status.and_then(|s| s.code()),
+            process_id,
+            output,
+            args.max_output_tokens,
+        ))
+    }
+
+    async fn spawn_process(&self, cmd: &str, workdir: Option<&str>) -> Result<ProcessSession> {
         let mut command = Command::new("direnv");
         command.args(["exec", "."]);
         command.env_remove("DIRENV_DIFF");
@@ -438,9 +604,11 @@ impl ShellTools {
         for (name, value) in &self.env {
             command.env(name, value);
         }
-        command.args(["bash", "-c"]).arg(&args.cmd);
+        // A pipeline reports its last failing stage, so `cargo test | tail`
+        // fails when the tests do rather than when `tail` does.
+        command.args(["bash", "-o", "pipefail", "-c"]).arg(cmd);
         command.kill_on_drop(true);
-        let cwd = args.workdir.as_deref().map(Utf8Path::new);
+        let cwd = workdir.map(Utf8Path::new);
         match &self.exec {
             ExecContext::Directory {
                 working_directory,
@@ -458,12 +626,11 @@ impl ShellTools {
                 );
                 command.current_dir(cwd.as_std_path());
             }
-            ExecContext::Namespace(view) => {
-                view.prepare_command(&mut command, cwd)?;
+            ExecContext::View(view) => {
+                view.prepare_command(&mut command, cwd).await?;
             }
         }
 
-        let started = Instant::now();
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -487,27 +654,12 @@ impl ShellTools {
         drop(stdout_task);
         drop(stderr_task);
         let wait_task = tokio::spawn(async move { child.wait().await });
-        let mut session = ProcessSession {
+        Ok(ProcessSession {
             stdin: Some(stdin),
             wait_task,
             status: None,
             output_rx,
-        };
-        let (status, output) =
-            collect_process_output(&mut session, Duration::from_millis(args.yield_time_ms)).await?;
-        let process_id = status
-            .is_none()
-            .then(|| self.processes.next_id.fetch_add(1, Ordering::Relaxed));
-        if let Some(id) = process_id {
-            self.processes.sessions.lock().await.insert(id, session);
-        }
-        Ok(exec_output(
-            started.elapsed(),
-            status.and_then(|s| s.code()),
-            process_id,
-            output,
-            args.max_output_tokens,
-        ))
+        })
     }
 
     async fn write_stdin(&self, call: &ToolCall) -> Result<ExecOutput> {
@@ -520,7 +672,8 @@ impl ShellTools {
             .await
             .remove(&args.session_id)
             .ok_or_else(|| anyhow!("unknown session ID {}", args.session_id))?;
-        if !args.chars.is_empty() {
+        let poll = args.chars.is_empty();
+        if !poll {
             let stdin = session
                 .stdin
                 .as_mut()
@@ -528,8 +681,17 @@ impl ShellTools {
             stdin.write_all(args.chars.as_bytes()).await?;
             stdin.flush().await?;
         }
+        let yield_ms = if poll {
+            args.yield_time_ms
+                .unwrap_or(DEFAULT_POLL_YIELD_MS)
+                .clamp(MIN_POLL_YIELD_MS, MAX_YIELD_MS)
+        } else {
+            args.yield_time_ms
+                .unwrap_or(DEFAULT_STDIN_WRITE_YIELD_MS)
+                .clamp(MIN_YIELD_MS, MAX_STDIN_WRITE_YIELD_MS)
+        };
         let (status, output) =
-            collect_process_output(&mut session, Duration::from_millis(args.yield_time_ms)).await?;
+            collect_process_output(&mut session, Duration::from_millis(yield_ms), poll).await?;
         let process_id = status.is_none().then_some(args.session_id);
         if process_id.is_some() {
             self.processes
@@ -564,6 +726,11 @@ impl ShellTools {
     }
 }
 
+/// Lossy UTF-8, for callers that render process output themselves.
+pub fn decode_output_lossy(bytes: Vec<u8>) -> String {
+    decode_output(bytes).0
+}
+
 fn decode_output(bytes: Vec<u8>) -> (String, bool) {
     match String::from_utf8(bytes) {
         Ok(output) => (output, true),
@@ -574,7 +741,9 @@ fn decode_output(bytes: Vec<u8>) -> (String, bool) {
     }
 }
 
-struct BoundedOutput {
+/// Keeps the first and last halves of a byte budget and notes what fell out
+/// of the middle, so a long log still shows how it started and how it ended.
+pub struct BoundedOutput {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     head_limit: usize,
@@ -597,6 +766,26 @@ struct OutputStats {
 }
 
 impl BoundedOutput {
+    /// Bytes for `tokens` tokens at the shell tools' usual estimate, capped at
+    /// their own ceiling.
+    pub fn for_tokens(tokens: Option<usize>) -> Self {
+        Self::new(
+            tokens
+                .unwrap_or(MAX_OUTPUT_TOKENS)
+                .min(MAX_OUTPUT_TOKENS)
+                .saturating_mul(APPROX_BYTES_PER_TOKEN as usize),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_bytes == 0
+    }
+
+    /// The kept bytes, with a marker where the middle was dropped.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.finish().bytes
+    }
+
     fn new(limit: usize) -> Self {
         let head_limit = limit / 2;
         let tail_limit = limit - head_limit;
@@ -611,7 +800,7 @@ impl BoundedOutput {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    pub fn push(&mut self, chunk: &[u8]) {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         self.newline_count = self
             .newline_count

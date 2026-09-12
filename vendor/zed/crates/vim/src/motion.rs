@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{f64, ops::Range};
 
-use workspace::searchable::Direction;
+use crate::Direction;
 
 use crate::{
     Vim,
@@ -705,7 +705,7 @@ impl Vim {
                         });
                     }
                 }
-                Mode::Normal | Mode::Replace | Mode::Insert => {
+                Mode::Normal | Mode::Deal | Mode::HelixDeal | Mode::Replace | Mode::Insert => {
                     if self.active_operator().is_none() {
                         return;
                     }
@@ -731,7 +731,7 @@ impl Vim {
         let active_operator = self.active_operator();
         let mut waiting_operator: Option<Operator> = None;
         match self.mode {
-            Mode::Normal | Mode::Replace | Mode::Insert => {
+            Mode::Normal | Mode::Deal | Mode::HelixDeal | Mode::Replace | Mode::Insert => {
                 if active_operator == Some(Operator::AddSurrounds { target: None }) {
                     waiting_operator = Some(Operator::AddSurrounds {
                         target: Some(SurroundsType::Motion(motion)),

@@ -6,42 +6,56 @@ members = [
   "crates/octo-types",
   "crates/prefix-id",
   "crates/rho-agent",
-  "crates/rho-agent2",
+  "crates/rho-agent-tools",
+  "crates/rho-agents",
+  "crates/rho-browser",
+  "crates/rho-browser-wayland",
   "crates/rho-ci",
   "crates/rho-claude",
   "crates/rho-claude-usage",
   "crates/rho-cli",
-  "crates/rho-code-mode",
   "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
   "crates/rho-db",
-  "crates/rho-shell",
-  "crates/rho-shell-proto",
+  "crates/rho-desk",
+  "crates/rho-fake-model",
+  "crates/rho-fake-slack",
+  "crates/rho-files",
   "crates/rho-gui",
-  "crates/rho-touch-keyboard",
+  "crates/rho-hosts",
+  "crates/rho-image",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
-  "crates/rho-pr-monitor",
-  "crates/rho-profiling",
-  "crates/rho-rpc",
+  "crates/rho-journal",
+  "crates/rho-mirror",
   "crates/rho-openai-realtime",
+  "crates/rho-pr-monitor",
+  "crates/rho-python",
+  "crates/rho-profiling",
+  "crates/rho-qa",
+  "crates/rho-rpc",
   "crates/rho-rtc",
-  "crates/rho-registry",
+  "crates/rho-shell",
+  "crates/rho-terminal",
+  "crates/rho-shell-proto",
+  "crates/rho-shell-view",
+  "crates/rho-slack",
   "crates/rho-tool-shell",
+  "crates/rho-transcript",
+  "crates/rho-touch-keyboard",
   "crates/rho-ui-proto",
+  "crates/rho-window",
   "crates/rho-visualizations",
   "crates/rho-web-search",
   "crates/rho-workset",
   "crates/rho-workset-types",
-  "crates/rho-zulip",
+  "crates/rho-workspaces",
+  "crates/rho-workspaces-types",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
-# The GPUI browser client is its own workspace: it targets wasm32 and is built
-# with Trunk.
 exclude = [
-  "crates/rho-gui-web",
   "vendor/brush",
   "vendor/jj",
   "vendor/noq",
@@ -58,20 +72,20 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
-brush-builtins = { path = "vendor/brush/brush-builtins" }
-brush-core = { path = "vendor/brush/brush-core" }
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
 anyhow = "1"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
-bytes = "1"
+brush-builtins = { path = "vendor/brush/brush-builtins" }
+brush-core = { path = "vendor/brush/brush-core" }
 buffer_diff = { path = "vendor/zed/crates/buffer_diff" }
+bytes = "1"
 camino = "1"
-clock = { path = "vendor/zed/crates/clock" }
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
+clock = { path = "vendor/zed/crates/clock" }
 deno_core = "0.407"
 deno_error = "0.7"
 dirs = { version = "6", default-features = false }
@@ -80,53 +94,72 @@ futures = "0.3"
 futures-util = "0.3"
 imara-diff = "0.2.0"
 iroh = { version = "1.0.2", default-features = false }
-json-stream = { path = "crates/json-stream" }
-jj-lib = { path = "vendor/jj/lib" }
 jj-cli = { path = "vendor/jj/cli" }
-libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
+jj-lib = { path = "vendor/jj/lib" }
+json-stream = { path = "crates/json-stream" }
 libc = "0.2"
-notify = "9.0.0-rc.4"
+libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "d0e27be0cdad89eadab3e36207cda0a2b6e359ee" }
 noq-proto = { version = "=1.0.1", default-features = false }
+notify = "9.0.0-rc.4"
 octo-server = { path = "crates/octo-server" }
 octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 rand = "0.8"
-redb = "4.1.0"
+redb = "4.2.0"
 redb-derive = "0.1.0"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "json",
   "rustls-tls-native-roots-no-provider",
+  "stream",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
+rho-agents = { path = "crates/rho-agents" }
+rho-browser = { path = "crates/rho-browser" }
+rho-browser-wayland = { path = "crates/rho-browser-wayland" }
 rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
 rho-cli = { path = "crates/rho-cli" }
-rho-code-mode = { path = "crates/rho-code-mode" }
+rho-agent-tools = { path = "crates/rho-agent-tools" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
-rho-shell-proto = { path = "crates/rho-shell-proto" }
+rho-desk = { path = "crates/rho-desk" }
+rho-fake-model = { path = "crates/rho-fake-model" }
+rho-fake-slack = { path = "crates/rho-fake-slack" }
+rho-files = { path = "crates/rho-files" }
+rho-image = { path = "crates/rho-image" }
 rho-inference = { path = "crates/rho-inference" }
+rho-iroh-auth = { path = "crates/rho-iroh-auth" }
+rho-journal = { path = "crates/rho-journal" }
+rho-mirror = { path = "crates/rho-mirror" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
-rho-rtc = { path = "crates/rho-rtc" }
-rho-registry = { path = "crates/rho-registry" }
-rho-iroh-auth = { path = "crates/rho-iroh-auth", default-features = false }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
+rho-python = { path = "crates/rho-python" }
 rho-profiling = { path = "crates/rho-profiling" }
+rho-hosts = { path = "crates/rho-hosts" }
+rho-window = { path = "crates/rho-window" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
+rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "crates/rho-shell" }
+rho-terminal = { path = "crates/rho-terminal" }
+rho-shell-proto = { path = "crates/rho-shell-proto" }
+rho-shell-view = { path = "crates/rho-shell-view" }
+rho-slack = { path = "crates/rho-slack", default-features = false }
+rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workset = { path = "crates/rho-workset" }
 rho-workset-types = { path = "crates/rho-workset-types" }
-rho-zulip = { path = "crates/rho-zulip", default-features = false }
+rho-workspaces = { path = "crates/rho-workspaces" }
+rho-workspaces-types = { path = "crates/rho-workspaces-types" }
+rpassword = "7"
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [
   "aws_lc_rs",
@@ -175,6 +208,12 @@ incremental = false
 inherits = "dev"
 lto = "off"
 
+# Thin LTO trims the enormous monomorphized .text sections (the six release
+# binaries total over 400MB without it) at a modest link-time cost.
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+
 [profile.profiling]
 debug = "line-tables-only"
 inherits = "release"
@@ -183,11 +222,12 @@ inherits = "release"
 # Local noq fork: adds per-send-stream weights to fair scheduling while
 # preserving noq's strict priority classes. Keep both crates patched because
 # `noq` exposes the API and `noq-proto` owns the packet scheduler.
+iroh = { path = "vendor/iroh/iroh" }
 noq = { path = "vendor/noq/noq" }
 noq-proto = { path = "vendor/noq/noq-proto" }
-iroh = { path = "vendor/iroh/iroh" }
-# On wasm32-unknown-unknown this crate supplies libc (malloc et al.) for the
-# tree-sitter runtime and grammars. Upstream's wasm malloc is a bump allocator
-# for isolated scanner instances that corrupts linear memory when linked into a
-# binary sharing its heap with Rust; our fork forwards to Rust's allocator.
+# Local redb fork: compaction keeps relocating pages past one it cannot
+# move lower, instead of stopping at the first such page.
+redb = { path = "vendor/redb" }
+# Upstream fix for integer comparison ambiguity exposed by RustPython/malachite.
+redb-derive = { git = "https://github.com/cberner/redb", rev = "32f8a1368f766fee33042a7f88abe3173d529ffe" }
 tree-sitter-language = { path = "vendor/tree-sitter-language" }

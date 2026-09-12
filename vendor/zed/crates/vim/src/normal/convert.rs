@@ -212,7 +212,7 @@ impl Vim {
                         }
                     }
 
-                    Mode::HelixNormal | Mode::HelixSelect => {
+                    Mode::HelixNormal | Mode::HelixDeal | Mode::HelixSelect => {
                         if selection.is_empty() {
                             // Handle empty selection by operating on single character
                             let start = selection.start;
@@ -224,7 +224,7 @@ impl Vim {
                             cursor_positions.push(selection.start..selection.end);
                         }
                     }
-                    Mode::Insert | Mode::Normal | Mode::Replace => {
+                    Mode::Insert | Mode::Normal | Mode::Deal | Mode::Replace => {
                         let start = selection.start;
                         let mut end = start;
                         for _ in 0..count {

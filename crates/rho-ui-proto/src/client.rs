@@ -2,6 +2,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::io::AsyncWriteExt as _;
+
 use crate::{
     ClientMessage, ProtocolLogDirection, ServerMessage, append_protocol_log_record,
     protocol_frame_bytes, read_frame, write_frame,
@@ -40,6 +42,12 @@ impl Client {
             logger.log(ProtocolLogDirection::ServerToClient, &message);
         }
         Ok(message)
+    }
+
+    /// Finishes the client's compressed send stream and half-closes the
+    /// connection so the daemon can distinguish a normal exit from truncation.
+    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.stream.shutdown().await.map_err(Into::into)
     }
 
     pub fn into_stream(self) -> rho_rpc::Stream {

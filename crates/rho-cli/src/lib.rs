@@ -7,14 +7,15 @@
 use std::io;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
-use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
+use rho_ui_proto::{ClientMessage, ServerMessage};
 
-mod desk;
+mod eval;
 mod land;
 mod mcp_agent_tools;
 mod pr;
@@ -25,14 +26,37 @@ mod wayland;
 mod tests;
 
 pub fn main() -> Result<()> {
-    // Dying quietly on a closed pipe is the correct
-    // CLI behavior; Rust's default ignore turns it into a print panic.
-    // SAFETY: top of main, single-threaded, resetting to default handling.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args = Args::parse_or_exit(std::env::args().skip(1));
+    // Ordinary utilities die quietly on a closed pipe. Evaluations own live
+    // agent work: BrokenPipe must unwind through cancellation, not kill us
+    // before subprocess destructors run.
+    // SAFETY: top of main, single-threaded, before any runtime exists.
+    unsafe {
+        libc::signal(
+            libc::SIGPIPE,
+            if matches!(&args.command, Command::Eval(_)) {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            },
+        );
+    }
+    if let Command::Land(land) = &args.command
+        && let Some(socket_path) = &land.socket_path
+    {
+        let socket_path = rho_ui_proto::RuntimePaths::new(Some(socket_path))?
+            .socket()
+            .to_owned();
+        // SAFETY: no runtime or other thread exists; jj may invoke
+        // git-remote-octo, which must follow this CLI's daemon.
+        unsafe {
+            std::env::set_var(rho_ui_proto::RuntimePaths::SOCKET_ENV, socket_path);
+        }
+    }
     if let Command::Daemon(mut daemon_args) = args.command {
-        // SAFETY: top of main, before the async runtime starts any threads.
-        unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon user namespace");
+        // SAFETY: top of main, before the runtime — no threads exist yet and
+        // nothing has captured pre-namespace state.
+        unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
         let profiler = rho_daemon::DaemonProfiler::start(&mut daemon_args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -41,6 +65,10 @@ pub fn main() -> Result<()> {
         let result = runtime.block_on(rho_daemon::run(daemon_args));
         drop(runtime);
         return profiler.finish(result);
+    }
+    if matches!(&args.command, Command::Eval(_)) {
+        // SAFETY: before creating the shared runtime or any other thread.
+        unsafe { rho_daemon::init_daemon_namespace() }.context("set up evaluation namespace")?;
     }
     if let Command::Wayland(args) = args.command {
         return wayland::run(args);
@@ -58,12 +86,13 @@ async fn run(command: Command) -> Result<()> {
             run_auth_cli(auth)?;
             Ok(())
         }
+        Command::ClaudeAccount(args) => run_claude_account(args).await,
         Command::Daemon(_) => unreachable!("daemon runs before the shared async runtime"),
         Command::Debug(args) => {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
-        Command::Desk(args) => desk::run(args).await,
+        Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
@@ -90,10 +119,9 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
             rho_ui_proto::ClientMessage::IrohRevoke { endpoint_id }
         }
     };
-    let socket_path = match args.socket_path {
-        Some(path) => path,
-        None => default_socket_path()?,
-    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     let mut client = UiClient::connect(&socket_path).await?;
     client.send(&request).await?;
     loop {
@@ -167,9 +195,12 @@ struct Args {
 #[derive(Clone)]
 enum Command {
     Auth(AuthArgs),
+    ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
-    Desk(desk::DeskArgs),
+    /// Run a headless agent evaluation; JSONL output, temporary state, real
+    /// provider.
+    Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -192,10 +223,13 @@ enum CliCommand {
         #[command(subcommand)]
         command: AuthArgs,
     },
+    /// Manage the Claude accounts agents run on.
+    ClaudeAccount(ClaudeAccountArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
-    /// Read and edit the Desk document through checkout/apply files.
-    Desk(desk::DeskArgs),
+    /// Run a headless agent evaluation; JSONL output, temporary state, real
+    /// provider.
+    Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -205,6 +239,66 @@ enum CliCommand {
     ProtocolLog(ProtocolLogArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
+}
+
+#[derive(Clone, clap::Args)]
+pub(crate) struct ClaudeAccountArgs {
+    #[arg(long = "socket-path")]
+    socket_path: Option<PathBuf>,
+    #[command(subcommand)]
+    command: ClaudeAccountCommand,
+}
+
+#[derive(Clone, Subcommand)]
+pub(crate) enum ClaudeAccountCommand {
+    /// List the accounts agents can run on, marking the current one.
+    List,
+    /// Open Claude against one account so it can be logged in, creating the
+    /// account if it is new. Run `/login` in the session that opens.
+    Login { name: String },
+    /// Put new agents on an account. Running agents keep theirs.
+    Use { name: String },
+}
+
+/// Accounts are directories, so making one is a local matter; which one
+/// agents run on is the daemon's, so listing and switching go through it.
+/// A login names the directory in `CLAUDE_CONFIG_DIR` because there is no
+/// view namespace outside an agent; agents get the same directory by mount.
+async fn run_claude_account(args: ClaudeAccountArgs) -> Result<()> {
+    let request = match &args.command {
+        ClaudeAccountCommand::List => ClientMessage::ClaudeAccounts,
+        ClaudeAccountCommand::Use { name } => {
+            ClientMessage::SetClaudeAccount { name: name.clone() }
+        }
+        ClaudeAccountCommand::Login { name } => {
+            let dir = rho_claude::accounts::ClaudePaths::from_env()?.prepare(name)?;
+            eprintln!("rho: opening Claude on account {name} ({dir}); run /login");
+            let status = std::process::Command::new("claude")
+                .env("CLAUDE_CONFIG_DIR", dir.as_str())
+                .status()
+                .context("run claude for account login")?;
+            anyhow::ensure!(status.success(), "claude exited with {status}");
+            return Ok(());
+        }
+    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
+    daemon.send(&request).await?;
+    loop {
+        match daemon.recv().await? {
+            ServerMessage::ClaudeAccounts { accounts, current } => {
+                for name in accounts {
+                    let mark = if name == current { "*" } else { " " };
+                    println!("{mark} {name}");
+                }
+                return Ok(());
+            }
+            ServerMessage::Error { message } => anyhow::bail!(message),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, clap::Args)]
@@ -323,9 +417,10 @@ impl Args {
         let cli = Cli::try_parse_from(std::iter::once("rho".to_owned()).chain(args))?;
         let command = match cli.command {
             CliCommand::Auth { command } => Command::Auth(command),
+            CliCommand::ClaudeAccount(args) => Command::ClaudeAccount(args),
             CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
-            CliCommand::Desk(args) => Command::Desk(args),
+            CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Land(args) => Command::Land(args),
             CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),

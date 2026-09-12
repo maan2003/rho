@@ -1,0 +1,235 @@
+//! Whether rho can still be trusted to know what Slack knows.
+//!
+//! A dropped socket is ordinary: it reconnects in a second and the feed
+//! covers the gap. What is not ordinary is being *out* for minutes, or a feed
+//! that keeps refusing, because then a mention can be sitting unread with
+//! nothing on screen saying so. That is the only case worth a notice and a
+//! lamp, and it clears only once a catch-up poll has actually succeeded.
+
+use std::time::Duration;
+
+/// How long an outage may last before it is worth telling the user about.
+/// Shorter than this is a reconnect they should never have to think about.
+pub const OUTAGE_GRACE: Duration = Duration::from_secs(180);
+/// Consecutive failed polls before the feed counts as broken. One is a
+/// hiccup; three in a row is Slack refusing us.
+pub const FEED_FAILURE_LIMIT: u32 = 3;
+/// Consecutive failed connections before the socket counts as broken. One is
+/// a reconnect nobody needs to hear about; two in a row is a session Slack is
+/// refusing, and a refused session that says nothing is exactly the silence
+/// this whole module exists to prevent.
+pub const CONNECT_FAILURE_LIMIT: u32 = 2;
+
+/// What the GUI should do about a change in health.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// Say so, and light the lamp.
+    Degraded(String),
+    /// Say so, and put the lamp out.
+    Recovered,
+}
+
+#[derive(Debug, Default)]
+pub struct Health {
+    connected: bool,
+    disconnected_since_ms: Option<i64>,
+    feed_failures: u32,
+    connect_failures: u32,
+    reason: Option<String>,
+}
+
+impl Health {
+    pub fn is_degraded(&self) -> bool {
+        self.reason.is_some()
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    pub fn connected(&mut self, _now_ms: i64) -> Option<Signal> {
+        self.connected = true;
+        self.connect_failures = 0;
+        self.disconnected_since_ms = None;
+        // A socket coming back is not the end of an outage. What rho missed
+        // is still missing until a poll fills it, and `feed_ok` is the only
+        // thing that clears `reason`, so the lamp stays lit until then
+        // without this having to say so.
+        None
+    }
+
+    /// The socket ended, or never started. `reason` is what Slack or the
+    /// network said, and it reaches the user verbatim: "the socket is down"
+    /// is not actionable, `invalid_auth` is.
+    pub fn disconnected(&mut self, now_ms: i64, reason: &str) -> Option<Signal> {
+        self.connected = false;
+        self.disconnected_since_ms.get_or_insert(now_ms);
+        self.connect_failures = self.connect_failures.saturating_add(1);
+        tracing::warn!(
+            reason,
+            failures = self.connect_failures,
+            "slack socket down"
+        );
+        match self.connect_failures >= CONNECT_FAILURE_LIMIT {
+            true => self.degrade(&format!("slack: {reason}")),
+            false => None,
+        }
+    }
+
+    /// Called on every poll result and on the clock, so an outage that never
+    /// produces another event still lights the lamp.
+    pub fn tick(&mut self, now_ms: i64) -> Option<Signal> {
+        let out_for = self.disconnected_since_ms.map(|since| now_ms - since);
+        match out_for {
+            // A named reason is never replaced by the generic one: what
+            // Slack said is more use than the fact that time passed.
+            Some(elapsed)
+                if elapsed >= OUTAGE_GRACE.as_millis() as i64 && self.reason.is_none() =>
+            {
+                self.degrade("slack: connection lost")
+            }
+            _ => None,
+        }
+    }
+
+    pub fn feed_failed(&mut self, error: &str) -> Option<Signal> {
+        self.feed_failures = self.feed_failures.saturating_add(1);
+        tracing::warn!(
+            error,
+            failures = self.feed_failures,
+            "slack feed poll failed"
+        );
+        match self.feed_failures >= FEED_FAILURE_LIMIT {
+            true => self.degrade("slack: cannot reach the activity feed"),
+            false => None,
+        }
+    }
+
+    /// A poll landed. This is the only thing that clears a degraded session:
+    /// the feed is what fills the gap, so until one succeeds the catch-up has
+    /// not happened. That is also what keeps the lamp lit across a socket
+    /// that comes back while degraded -- the reconnect does not clear
+    /// `reason`, only this does, because until a poll lands rho still does
+    /// not know what it missed.
+    pub fn feed_ok(&mut self) -> Option<Signal> {
+        self.feed_failures = 0;
+        match (self.connected, self.reason.take()) {
+            (true, Some(_)) => Some(Signal::Recovered),
+            // Still no socket: the poll proves the network, not the session.
+            (false, reason) => {
+                self.reason = reason;
+                None
+            }
+            (true, None) => None,
+        }
+    }
+
+    fn degrade(&mut self, reason: &str) -> Option<Signal> {
+        match self.reason.as_deref() == Some(reason) {
+            true => None,
+            false => {
+                self.reason = Some(reason.to_owned());
+                Some(Signal::Degraded(reason.to_owned()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINUTE: i64 = 60_000;
+
+    #[test]
+    fn a_short_outage_says_nothing() {
+        let mut health = Health::default();
+        health.connected(0);
+        assert_eq!(health.disconnected(0, "connection reset"), None);
+        health.connected(MINUTE);
+        assert_eq!(health.tick(MINUTE), None, "a reconnect is not news");
+        assert!(!health.is_degraded());
+    }
+
+    #[test]
+    fn a_session_slack_keeps_refusing_says_what_slack_said() {
+        let mut health = Health::default();
+        assert_eq!(health.disconnected(0, "connecting to Slack: 401"), None);
+        assert_eq!(
+            health.disconnected(1_000, "connecting to Slack: 401"),
+            Some(Signal::Degraded(
+                "slack: connecting to Slack: 401".to_owned()
+            )),
+            "a refused session names Slack and the error, not silence"
+        );
+        assert_eq!(
+            health.tick(9 * MINUTE),
+            None,
+            "the named reason stands; time passing adds nothing"
+        );
+        assert_eq!(health.reason(), Some("slack: connecting to Slack: 401"));
+    }
+
+    #[test]
+    fn a_long_outage_lights_the_lamp_once_and_clears_only_after_a_catch_up() {
+        let mut health = Health::default();
+        health.connected(0);
+        health.disconnected(0, "closed");
+        assert_eq!(
+            health.tick(4 * MINUTE),
+            Some(Signal::Degraded("slack: connection lost".to_owned()))
+        );
+        assert_eq!(health.tick(5 * MINUTE), None, "one notice, not one a tick");
+
+        health.connected(6 * MINUTE);
+        assert!(
+            health.is_degraded(),
+            "a socket is not knowledge: the gap is still unread"
+        );
+        assert_eq!(health.feed_ok(), Some(Signal::Recovered));
+        assert!(!health.is_degraded());
+    }
+
+    #[test]
+    fn repeated_poll_failures_degrade_and_a_single_one_does_not() {
+        let mut health = Health::default();
+        health.connected(0);
+        assert_eq!(health.feed_failed("500"), None);
+        assert_eq!(health.feed_failed("500"), None);
+        assert_eq!(
+            health.feed_failed("500"),
+            Some(Signal::Degraded(
+                "slack: cannot reach the activity feed".to_owned()
+            ))
+        );
+        assert_eq!(health.feed_ok(), Some(Signal::Recovered));
+    }
+
+    /// Why a degraded state may only come from here. `feed_ok` lifts one by
+    /// taking the reason this holds; a `Signal::Degraded` raised anywhere
+    /// else leaves that reason unset, so there is nothing to take and no
+    /// recovery is ever announced. The lamp it lit stays lit. `open_file`
+    /// used to raise one when a file would not open, which is how a 404 on
+    /// an image became a session that had lost touch for the rest of the run.
+    #[test]
+    fn a_healthy_session_announces_no_recovery_because_it_never_degraded() {
+        let mut health = Health::default();
+        health.connected(0);
+        assert!(!health.is_degraded());
+        assert_eq!(
+            health.feed_ok(),
+            None,
+            "nothing to recover from, so nothing that could lift one raised elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_poll_that_lands_while_the_socket_is_down_does_not_clear_the_lamp() {
+        let mut health = Health::default();
+        health.connected(0);
+        health.disconnected(0, "closed");
+        health.tick(4 * MINUTE);
+        assert_eq!(health.feed_ok(), None);
+        assert!(health.is_degraded(), "the session is still not live");
+    }
+}

@@ -60,7 +60,7 @@ impl Remote {
 }
 
 async fn query_pat_available(host: &str) -> Result<bool> {
-    let socket = rho_ui_proto::socket_path()?;
+    let socket = rho_ui_proto::RuntimePaths::from_env()?.socket().to_owned();
     let mut client = rho_ui_proto::client::Client::connect(&socket)
         .await
         .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
@@ -195,7 +195,7 @@ fn parse_planned_refs(value: &str) -> Result<Vec<String>> {
 }
 
 async fn run_transport(request: GitTransportRequest, helper_handshake: bool) -> Result<()> {
-    let socket = rho_ui_proto::socket_path()?;
+    let socket = rho_ui_proto::RuntimePaths::from_env()?.socket().to_owned();
     let mut client = rho_ui_proto::client::Client::connect(&socket)
         .await
         .with_context(|| format!("connect to rho daemon at {}", socket.display()))?;
@@ -272,7 +272,7 @@ struct HttpHelper {
 
 impl HttpHelper {
     fn spawn(remote_name: &str, remote: &Remote) -> Result<Self> {
-        let socket = octo_types::socket_path()?;
+        let socket = rho_ui_proto::RuntimePaths::from_env()?.octo_socket();
         let socket_type = socket
             .metadata()
             .with_context(|| format!("Octo socket is unavailable at {}", socket.display()))?
@@ -281,9 +281,13 @@ impl HttpHelper {
             std::os::unix::fs::FileTypeExt::is_socket(&socket_type),
             "Octo socket path does not refer to a Unix socket"
         );
-        let remote_http: PathBuf = option_env!("OCTO_REMOTE_HTTP")
+        let remote_http: PathBuf = std::env::var_os("OCTO_REMOTE_HTTP")
             .map(PathBuf::from)
-            .context("git-remote-octo was built without Rho's patched git-remote-http")?;
+            .or_else(|| option_env!("OCTO_REMOTE_HTTP").map(PathBuf::from))
+            .context(
+                "OCTO_REMOTE_HTTP is not set and git-remote-octo was built \
+                 without Rho's patched git-remote-http",
+            )?;
         anyhow::ensure!(
             Path::new(&remote_http).is_file(),
             "Rho's patched git-remote-http was not found at {}",

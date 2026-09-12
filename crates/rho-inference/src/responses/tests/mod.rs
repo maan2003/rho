@@ -150,6 +150,8 @@ fn tool_result_success(call_id: ToolCallId, content: impl Into<String>) -> ToolR
         call_id,
         tool_type: ToolType::Function,
         body: ToolOutput {
+            full_output: None,
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::from(content.into()),
             status: ToolOutputStatus::Success,
         },
@@ -279,7 +281,6 @@ fn test_inference_service_with(
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
-            code_mode: false,
         },
         InferenceModel::Gpt55,
         prompt_cache_key,

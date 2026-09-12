@@ -1,0 +1,432 @@
+//! The local mirror, against the fake: what rho keeps on disk, and how
+//! little it asks Slack for once it has it.
+//!
+//! The request pattern is the point. An unofficial client that walks history
+//! in the background is the kind Slack bans, so these tests assert what was
+//! *not* fetched as carefully as what was.
+
+use std::sync::Arc;
+
+use rho_slack::api::Client;
+use rho_slack::config::Credentials;
+use rho_slack::fake::Fake;
+use rho_slack::mirror::{Mirror, Scope};
+use rho_slack::types::{ChannelId, Message, Ts};
+use serde_json::json;
+
+fn client(fake: &Fake) -> Arc<Client> {
+    let credentials = Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
+    Arc::new(Client::with_base(credentials, fake.api_base()).unwrap())
+}
+
+fn mirror() -> (tempfile::TempDir, Mirror) {
+    let dir = tempfile::tempdir().unwrap();
+    let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
+    (dir, mirror)
+}
+
+fn message(ts: &str, text: &str) -> Message {
+    Message {
+        ts: Ts::from(ts),
+        thread_ts: None,
+        channel: ChannelId::from("C1"),
+        user: Some(rho_slack::types::UserId::from("UD")),
+        bot_name: None,
+        blocks: Vec::new(),
+        text: text.to_owned(),
+        attachments: Vec::new(),
+        files: Vec::new(),
+        subtype: None,
+        reply_count: 0,
+        latest_reply: None,
+        edited: false,
+        reactions: Vec::new(),
+    }
+}
+
+fn scope() -> Scope {
+    Scope::conversation("acme", &ChannelId::from("C1"))
+}
+
+/// Opening the conversation list reads names and unread counts. It must not
+/// read a single message: that is the fan-out over the workspace that gets a
+/// client banned.
+#[tokio::test]
+async fn opening_the_list_fetches_no_history() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UD", "david", "David");
+    fake.add_channel("C1", "design");
+    fake.add_message(
+        "C1",
+        json!({"ts": "100.000000", "user": "UD", "text": "morning"}),
+    );
+    let client = client(&fake);
+
+    let users = client.users().await.unwrap();
+    let conversations = client.conversations().await.unwrap();
+    client.counts().await.unwrap();
+
+    assert!(!users.is_empty(), "the list has names");
+    assert!(!conversations.is_empty(), "and conversations");
+    assert_eq!(
+        fake.calls("conversations.history"),
+        0,
+        "the list reads no history"
+    );
+    assert_eq!(fake.calls("conversations.replies"), 0, "and no threads");
+}
+
+/// Reopening a conversation rho already holds asks only for what came after
+/// it. Everything already on disk is read from disk.
+#[tokio::test]
+async fn a_mirrored_conversation_asks_only_for_what_is_newer() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    for (ts, text) in [("100.000000", "one"), ("200.000000", "two")] {
+        fake.add_message("C1", json!({"ts": ts, "user": "UD", "text": text}));
+    }
+    let client = client(&fake);
+    let (_dir, mirror) = mirror();
+    let channel = ChannelId::from("C1");
+
+    // First open: nothing cached, so the newest page is fetched whole.
+    let page = client.conversations_history(&channel, None).await.unwrap();
+    mirror.insert_messages(&scope(), &page.messages);
+    assert_eq!(mirror.newest_ts(&scope()), Some(Ts::from("200.000000")));
+
+    // Reopen: the mirror renders first and bounds the request.
+    let cached = mirror.newest_chunk(&scope(), 50);
+    assert_eq!(
+        cached.len(),
+        2,
+        "the conversation is readable before asking"
+    );
+    let since = mirror.newest_ts(&scope()).unwrap();
+    let refreshed = client
+        .conversations_history_since(&channel, &since)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.last_field("conversations.history", "oldest")
+            .as_deref(),
+        Some("200.000000"),
+        "the refresh is bounded by what the mirror holds"
+    );
+    assert!(
+        refreshed.messages.is_empty(),
+        "and nothing already mirrored comes back"
+    );
+}
+
+/// Coming back after downtime appends the live tail. If the tail does not
+/// reach the newest message rho already had, the hole is written down rather
+/// than papered over: the transcript must never imply a continuity it does
+/// not have.
+#[test]
+fn a_tail_that_does_not_reach_the_cache_leaves_a_gap() {
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    mirror.insert_messages(&scope, &[message("100.000000", "before the outage")]);
+
+    // The socket comes back with messages that plainly skip a stretch.
+    let tail = [
+        message("500.000000", "after the outage"),
+        message("600.000000", "and later"),
+    ];
+    mirror.insert_messages(&scope, &tail);
+    mirror.put_gap(&scope, &Ts::from("500.000000"), &Ts::from("500.000000"));
+
+    let (at, gap) = mirror
+        .gap_below(&scope, None)
+        .expect("the hole is a record");
+    assert_eq!(at, Ts::from("500.000000"));
+    assert_eq!(
+        gap.page_before,
+        Ts::from("500.000000"),
+        "the gap carries the cursor that fills it"
+    );
+
+    let chunk = mirror.newest_chunk(&scope, 50);
+    assert_eq!(
+        chunk
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["after the outage", "and later"],
+        "opening shows the newest chunk, not a run across the hole"
+    );
+
+    // Filling it joins the two runs.
+    mirror.insert_messages(&scope, &[message("300.000000", "during the outage")]);
+    mirror.clear_gap(&scope, &Ts::from("500.000000"));
+    assert_eq!(mirror.newest_chunk(&scope, 50).len(), 4);
+}
+
+/// A message said to the room reaches both the places it belongs, and costs
+/// one commit to do it.
+///
+/// A durable commit is the floor of what an arriving message costs -- 88 µs
+/// against a microsecond of model work -- and a top-level message used to
+/// pay two, one for the channel and one for the thread its own timestamp
+/// roots. The thread copy is what a reader who opens a thread on a message
+/// with no replies sees before Slack answers, so it stays; what goes is the
+/// second commit.
+#[test]
+fn a_message_said_to_the_room_reaches_its_thread_and_its_channel_at_once() {
+    let (_dir, mirror) = mirror();
+    let channel = scope();
+    let said = message("100.000000", "anyone about?");
+    let thread = Scope::thread("acme", &ChannelId::from("C1"), &said.ts);
+
+    mirror.insert_live(&[&thread, &channel], &said);
+
+    assert_eq!(
+        mirror
+            .newest_chunk(&channel, 50)
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anyone about?"],
+        "the room has it"
+    );
+    assert_eq!(
+        mirror
+            .newest_chunk(&thread, 50)
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["anyone about?"],
+        "and a thread opened on a message nobody has replied to still shows          the message it was opened on"
+    );
+    // Both scopes were empty, so both are islands: nothing is known under
+    // either until a page says otherwise, and that has to be true of the
+    // scope that shared the transaction as much as of the one that started
+    // it.
+    assert!(mirror.gap_below(&channel, None).is_some());
+    assert!(mirror.gap_below(&thread, None).is_some());
+}
+
+/// `has_more: false` is the beginning of history, and that is a fact worth
+/// keeping: `shift-p` at the top is then an echo rather than a request.
+#[test]
+fn the_beginning_of_history_is_remembered() {
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    assert!(!mirror.history_begins(&scope));
+    mirror.set_history_begins(&scope);
+    assert!(
+        mirror.history_begins(&scope),
+        "the top of the conversation is known without asking again"
+    );
+}
+
+/// A deletion removes the message from the mirror too. A copy the user
+/// cannot see anywhere else is not a cache, it is a leak.
+#[test]
+fn a_deleted_message_leaves_the_mirror() {
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    mirror.insert_messages(
+        &scope,
+        &[message("100.000000", "one"), message("200.000000", "two")],
+    );
+    mirror.remove_message(&scope, &Ts::from("200.000000"));
+
+    let held = mirror.all_messages(&scope);
+    assert_eq!(
+        held.iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["one"],
+        "the deleted message is gone from disk"
+    );
+    assert_eq!(mirror.newest_ts(&scope), Some(Ts::from("100.000000")));
+}
+
+/// An edit overwrites in place. The timestamp is the identity, so a changed
+/// message stays exactly one message.
+#[test]
+fn an_edited_message_overwrites_in_place() {
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    mirror.insert_messages(&scope, &[message("100.000000", "frist")]);
+    let mut corrected = message("100.000000", "first");
+    corrected.edited = true;
+    mirror.insert_messages(&scope, &[corrected]);
+
+    let held = mirror.all_messages(&scope);
+    assert_eq!(held.len(), 1, "an edit is not a second message");
+    assert_eq!(held[0].text, "first");
+    assert!(held[0].edited, "and it says it was edited");
+}
+
+/// A ping brings its own context, once: the twenty messages before it and
+/// the twenty after, so the reader lands with both sides of the exchange,
+/// plus the thread when it is one. The budget is what Slack's own web client
+/// spends when someone clicks the notification. A ping for something already
+/// mirrored spends nothing.
+#[tokio::test]
+async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    // Long enough to tell the window apart from the tail: a ping in the
+    // middle of a busy channel is hundreds of messages from the newest one,
+    // and a fetch that answers with the newest would look right on a short
+    // conversation and be useless on this one.
+    for index in 0..500 {
+        fake.add_message(
+            "C1",
+            json!({
+                "ts": format!("{}.000000", 100 + index),
+                "user": "UD",
+                "text": format!("message {index}"),
+            }),
+        );
+    }
+    let client = client(&fake);
+    let (_dir, mirror) = mirror();
+    let channel = ChannelId::from("C1");
+    let pinged = Ts::from("350.000000");
+
+    assert!(
+        !mirror.holds(&scope(), &pinged),
+        "the ping is news the first time"
+    );
+    let window = client
+        .conversations_history_around(&channel, &pinged, 20)
+        .await
+        .unwrap();
+    mirror.insert_messages(&scope(), &window);
+    client
+        .conversations_replies(&channel, &pinged, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.calls("conversations.history"),
+        2,
+        "one window each side, never a page back"
+    );
+    assert_eq!(fake.calls("conversations.replies"), 1, "and one thread");
+    assert_eq!(
+        fake.fields("conversations.history", "latest"),
+        vec![Some("350.000000".to_owned()), None],
+        "the first call ends at the pinged message"
+    );
+    assert_eq!(
+        fake.fields("conversations.history", "oldest"),
+        vec![None, Some("350.000000".to_owned())],
+        "and the second starts there"
+    );
+    assert_eq!(
+        fake.fields("conversations.history", "limit"),
+        vec![Some("20".to_owned()), Some("20".to_owned())],
+        "both are bounded"
+    );
+
+    let seen = window
+        .iter()
+        .map(|message| message.ts.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seen.first().map(|ts| ts.0.as_str()),
+        Some("331.000000"),
+        "the window starts twenty messages before the ping"
+    );
+    assert_eq!(
+        seen.last().map(|ts| ts.0.as_str()),
+        Some("370.000000"),
+        "and ends twenty after it, not at the newest message in the channel"
+    );
+    assert!(
+        seen.iter().any(|ts| pinged.is_newer_than(ts)),
+        "and what came before it"
+    );
+    assert!(
+        seen.windows(2).all(|pair| pair[1].is_newer_than(&pair[0])),
+        "in one run, in order, with no message twice"
+    );
+
+    // The second ping for the same message is free: the guard is the mirror.
+    assert!(mirror.holds(&scope(), &pinged));
+    assert_eq!(
+        fake.calls("conversations.history"),
+        2,
+        "a mirrored ping costs no request"
+    );
+}
+
+/// Scrolling into a gap is what fills history now: there is no manual
+/// "load older". The reader coming within a screen of the top costs exactly
+/// one page, bounded by the gap's own cursor; a second scroll while it is in
+/// flight costs nothing; and a conversation whose beginning rho already
+/// knows costs nothing at all.
+#[tokio::test]
+async fn scrolling_into_a_gap_costs_one_bounded_page() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UD", "david", "David");
+    fake.add_channel("C1", "design");
+    for at in ["100.000000", "200.000000", "500.000000"] {
+        fake.add_message("C1", json!({"ts": at, "user": "UD", "text": "said"}));
+    }
+    let client = client(&fake);
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    // What a restart sees: a run off the socket that does not reach back to
+    // the beginning, so the mirror carries the gap under it.
+    mirror.insert_messages(&scope, &[message("500.000000", "after the outage")]);
+    mirror.put_gap(&scope, &Ts::from("500.000000"), &Ts::from("500.000000"));
+
+    let gap = mirror.gap_below(&scope, None).map(|(at, _)| at);
+    let request = rho_slack::session::older_request(false, false, None, gap.clone());
+    let Some(rho_slack::session::Older::Before(cursor)) = request else {
+        panic!("a run with a gap under it pages from the gap's cursor: {request:?}");
+    };
+    assert_eq!(cursor, Ts::from("500.000000"));
+    let page = client
+        .conversations_history_before(&ChannelId::from("C1"), &cursor)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.calls("conversations.history"),
+        1,
+        "scrolling to the top costs one page"
+    );
+    assert_eq!(
+        fake.last_field("conversations.history", "latest")
+            .as_deref(),
+        Some("500.000000"),
+        "and it is bounded by the gap's own cursor"
+    );
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|message| message.ts.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["100.000000", "200.000000"],
+        "the page is what sits under the gap"
+    );
+
+    // A second scroll before the page lands asks for nothing: one request is
+    // in flight per conversation.
+    assert_eq!(
+        rho_slack::session::older_request(true, false, None, gap),
+        None,
+        "a burst of scroll events is still one request"
+    );
+    assert_eq!(fake.calls("conversations.history"), 1);
+
+    // And once the beginning is known, the top is an echo, not a request.
+    mirror.insert_messages(&scope, &page.messages);
+    mirror.clear_gap(&scope, &Ts::from("500.000000"));
+    mirror.set_history_begins(&scope);
+    assert!(mirror.gap_below(&scope, None).is_none());
+    assert_eq!(
+        rho_slack::session::older_request(false, mirror.history_begins(&scope), None, None),
+        None,
+        "the beginning of history is on disk: nothing to ask for"
+    );
+    assert_eq!(fake.calls("conversations.history"), 1);
+}

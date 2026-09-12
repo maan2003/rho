@@ -7,5 +7,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-dirs.workspace = true
 serde.workspace = true

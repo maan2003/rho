@@ -4,93 +4,87 @@
 //! make live-workspace sharing possible. Higher layers (the daemon) own
 //! product policy around it: topics, titles, land leases.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use camino::Utf8PathBuf;
-use futures::StreamExt as _;
-use futures::future::BoxFuture;
-use futures::stream::BoxStream;
+use camino::{Utf8Path, Utf8PathBuf};
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workset::{Mode, Namespace, PathOverrides, UserEnvironment, Worksets, WorkspaceInfo};
+use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
+use crate::agent::AgentHandle;
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
-    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWorkflow,
-    AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
+    AGENT_USAGE_BUCKET_MS, AgentId, AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _,
+    AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkdir};
+use crate::{AgentStatus, MessageDelivery, StartWorkdir};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
 const MAX_WORKING_CHILDREN: usize = 20;
+/// How many agents stay loaded. Past this the least recently used one
+/// that is settled and nobody is looking at is dropped; its log is the
+/// whole of it, so nothing is lost.
+pub const MAX_LOADED: usize = 100;
 const ID_LABEL_HEADROOM: u64 = 200;
 
 pub struct AgentPool {
     db: RhoDb,
     inference: Inference,
+    path_overrides: PathOverrides,
+    /// Where sandboxes are made, named by the daemon rather than resolved
+    /// here: a library does not reach for the user's state directory.
+    state_dir: camino::Utf8PathBuf,
+    /// The Claude configuration agents run against, named by the daemon for
+    /// the same reason as `state_dir`: a library that resolves `$HOME` puts
+    /// every caller on the user's live `~/.claude`.
+    claude: rho_claude::accounts::ClaudePaths,
+    user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
+    /// Loaded agents, least recently used first. Touched by every load.
+    recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
+    /// Which agents each connection is looking at; the union is the live
+    /// set. A connection that goes away takes its wants with it.
+    live_wants: std::sync::Mutex<HashMap<u64, HashSet<AgentId>>>,
+    /// The live set: agents whose loops tell the tail as it changes. A
+    /// loaded live agent is also told it is watched, which is what lets
+    /// its title and activity refresh.
+    live: std::sync::Mutex<HashSet<AgentId>>,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout but retain separate View namespaces) only
     /// holds within one instance.
-    worksets: Arc<Worksets>,
+    repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
-    /// Synchronously pre-arms daemon-owned observation before a newly loaded
-    /// runtime is returned to callers that may immediately start work.
-    activation_observer: std::sync::RwLock<Option<Arc<ActivationObserver>>>,
-    /// Fires when a loaded agent completes a turn with a final answer.
-    completed_turns: broadcast::Sender<AgentTurnCompleted>,
-    /// Fires once for each fully-finished assistant message item.
-    completed_assistant_items: broadcast::Sender<AgentAssistantItemCompleted>,
-    /// Fires after a user input has been durably accepted into an agent log.
-    accepted_inputs: broadcast::Sender<AgentInputAccepted>,
     presentation_changes: broadcast::Sender<AgentPresentationChanged>,
     turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
-    iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
 }
 
-/// Broadcast when any agent is created in the pool.
+/// Broadcast when any agent is created in the pool. Carries no handle:
+/// a handle sitting in the channel's buffer would keep an evicted loop
+/// alive.
 #[derive(Clone)]
 pub struct AgentCreated {
     pub agent_id: AgentId,
-    pub agent: RunningAgent,
+    /// The agent that spawned this one, when another agent did.
+    pub parent: Option<AgentId>,
 }
 
-pub type ActivationObserver = dyn Fn(AgentId, RunningAgent) -> BoxFuture<'static, ()> + Send + Sync;
-
-/// Broadcast when an agent completes a turn.
+/// An agent completed a turn: its final answer is mailed to whoever
+/// subscribed to its responses.
 #[derive(Clone, Debug)]
 pub struct AgentTurnCompleted {
     pub agent_id: AgentId,
     pub final_answer: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct AgentAssistantItemCompleted {
-    pub agent_id: AgentId,
-    pub phase: rho_core::MessagePhase,
-    pub text: String,
-}
-
-/// Broadcast when a user input is accepted into an agent.
-#[derive(Clone, Debug)]
-pub struct AgentInputAccepted {
-    pub input_id: AgentInputId,
-    pub sender: rho_core::MessageSender,
-    pub content: Vec<rho_core::ContentPart>,
-    pub delivery: MessageDelivery,
-    pub source_id: Option<InputSourceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,36 +101,6 @@ pub struct AgentTurnReported {
     pub report: crate::db::TurnReport,
 }
 
-/// One agent used as the execution backend for another agent runtime.
-///
-/// The caller owns provider-specific request correlation. This handle only
-/// supplies generic agent input and structured final-output delivery.
-pub struct DelegationBackend {
-    agent_id: AgentId,
-    agent: RunningAgent,
-    source_id: InputSourceId,
-    completed: broadcast::Receiver<AgentTurnCompleted>,
-}
-
-impl DelegationBackend {
-    pub fn submit(&self, text: String) {
-        self.agent.send_user_message_with_source(
-            text,
-            MessageDelivery::Immediate,
-            Some(self.source_id),
-        );
-    }
-
-    pub async fn next_final(&mut self) -> anyhow::Result<String> {
-        loop {
-            let completed = self.completed.recv().await?;
-            if completed.agent_id == self.agent_id {
-                return Ok(completed.final_answer);
-            }
-        }
-    }
-}
-
 /// One entry of a spawned child's working set.
 pub struct SpawnWorkdir {
     /// Absolute path anywhere inside the repository (or plain directory).
@@ -145,7 +109,6 @@ pub struct SpawnWorkdir {
 }
 
 /// Which checkout a child workdir works in.
-#[derive(Clone)]
 pub enum SpawnCheckout {
     /// The checkout the parent uses for this repo (its workspace or a live
     /// checkout), or the user's live checkout when the repo is outside the
@@ -164,29 +127,33 @@ impl AgentPool {
         db: RhoDb,
         inference: Inference,
         path_overrides: PathOverrides,
+        state_dir: camino::Utf8PathBuf,
+        claude: rho_claude::accounts::ClaudePaths,
         user_environment: UserEnvironment,
     ) -> Arc<Self> {
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        write.commit();
-        let worksets =
-            Worksets::open_default(db.clone(), user_environment.clone(), path_overrides.clone())
-                .expect("open workset storage");
+        crate::db::prepare(&db).await;
+        // The account agents run on has to exist before the first spawn.
+        let account = db.read().claude_account();
+        if let Err(error) = claude.bootstrap(&account) {
+            panic!("Claude account {account} could not be prepared: {error:#}");
+        }
         let pool = Arc::new(Self {
             db,
             inference: inference.clone(),
+            path_overrides,
+            state_dir,
+            claude,
+            user_environment,
             agents: Mutex::new(HashMap::new()),
+            recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            live_wants: std::sync::Mutex::new(HashMap::new()),
+            live: std::sync::Mutex::new(HashSet::new()),
             load_locks: Mutex::new(HashMap::new()),
-            worksets,
+            repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
-            activation_observer: std::sync::RwLock::new(None),
-            completed_turns: broadcast::channel(64).0,
-            completed_assistant_items: broadcast::channel(64).0,
-            accepted_inputs: broadcast::channel(64).0,
             presentation_changes: broadcast::channel(64).0,
             turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
-            iris_tool_host: std::sync::RwLock::new(None),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -204,41 +171,8 @@ impl AgentPool {
         pool
     }
 
-    pub fn worksets(&self) -> &Arc<Worksets> {
-        &self.worksets
-    }
-
-    pub fn set_iris_tool_host(&self, host: crate::iris_tools::SharedIrisToolHost) {
-        *self.iris_tool_host.write().expect("poison") = Some(host);
-    }
-
-    pub(crate) fn iris_tool_host(&self) -> Option<crate::iris_tools::SharedIrisToolHost> {
-        self.iris_tool_host.read().expect("poison").clone()
-    }
-
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
         self.created.subscribe()
-    }
-
-    pub fn set_activation_observer(&self, observer: Arc<ActivationObserver>) {
-        *self.activation_observer.write().expect("poison") = Some(observer);
-    }
-
-    async fn observe_activation(&self, agent_id: AgentId, agent: RunningAgent) {
-        let observer = self.activation_observer.read().expect("poison").clone();
-        if let Some(observer) = observer {
-            observer(agent_id, agent).await;
-        }
-    }
-
-    pub fn subscribe_completed_turns(&self) -> broadcast::Receiver<AgentTurnCompleted> {
-        self.completed_turns.subscribe()
-    }
-
-    pub fn subscribe_completed_assistant_items(
-        &self,
-    ) -> broadcast::Receiver<AgentAssistantItemCompleted> {
-        self.completed_assistant_items.subscribe()
     }
 
     pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
@@ -255,38 +189,6 @@ impl AgentPool {
             .send(AgentTurnReported { agent_id, report });
     }
 
-    /// Keeps Luna work for this agent alive while the returned handle
-    /// exists. Dropping the last handle cancels any in-flight provider call.
-    pub async fn watch_presentation(
-        &self,
-        agent_id: AgentId,
-    ) -> Option<crate::presentation::Watch> {
-        self.agents
-            .lock()
-            .await
-            .get(&agent_id)
-            .and_then(RunningAgent::watch_presentation)
-    }
-
-    pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
-        self.accepted_inputs.subscribe()
-    }
-
-    /// Load an agent as a generic delegated-work backend.
-    pub async fn delegation_backend(
-        self: &Arc<Self>,
-        agent_id: AgentId,
-    ) -> anyhow::Result<DelegationBackend> {
-        let completed = self.subscribe_completed_turns();
-        let (_, agent, _) = self.load(agent_id).await?;
-        Ok(DelegationBackend {
-            agent_id,
-            agent,
-            source_id: InputSourceId::fresh_internal(),
-            completed,
-        })
-    }
-
     pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
         self.flush_agent_usage(Some(completed.agent_id)).await;
         self.deliver_response(
@@ -298,7 +200,6 @@ impl AgentPool {
             },
         )
         .await;
-        let _ = self.completed_turns.send(completed);
     }
 
     pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
@@ -344,27 +245,10 @@ impl AgentPool {
             .is_agent_response_subscribed(subscriber, target)
     }
 
-    /// Persist that execution stopped and the agent is back in the user's
-    /// court. Runtimes call this from their non-coalescing state machines
-    /// only when no newer queued turn took over, or on terminal failure
-    /// where queued work cannot proceed. Sub-agent turn ends are the
-    /// parent's court unless the user has personally engaged the agent.
+    /// Execution stopped: the usage it accrued lands now rather than at
+    /// the next flush. The turn's edge itself is the log's (`Turn`).
     pub async fn settle_turn(&self, agent_id: AgentId) {
         self.flush_agent_usage(Some(agent_id)).await;
-        let record = self.db.read().get_agent(agent_id);
-        if record.parent_agent.is_none() || record.user_interacted {
-            let mut write = self.db.write().await;
-            write.record_agent_turn_end(crate::db::UnixMillis::now(), agent_id);
-            write.commit();
-        }
-    }
-
-    pub(crate) fn publish_completed_assistant_item(&self, item: AgentAssistantItemCompleted) {
-        let _ = self.completed_assistant_items.send(item);
-    }
-
-    pub fn publish_accepted_input(&self, accepted: AgentInputAccepted) {
-        let _ = self.accepted_inputs.send(accepted);
     }
 
     pub(crate) fn publish_presentation_changed(
@@ -423,20 +307,130 @@ impl AgentPool {
         &self.inference
     }
 
-    pub async fn loaded(&self) -> Vec<(AgentId, RunningAgent)> {
-        let mut agents = self
-            .agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent_id, agent)| (*agent_id, agent.clone()))
-            .collect::<Vec<_>>();
-        agents.sort_by_key(|(agent_id, _)| *agent_id);
-        agents
+    pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
+        let agent = self.agents.lock().await.get(&agent_id).cloned();
+        if agent.is_some() {
+            self.touch(agent_id);
+        }
+        agent
     }
 
-    pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
-        self.agents.lock().await.get(&agent_id).cloned()
+    /// Whether any client is looking at this agent right now. Read by the
+    /// loops on every publish, so it is a plain lock and no await.
+    pub fn is_live(&self, agent_id: AgentId) -> bool {
+        self.live.lock().expect("poison").contains(&agent_id)
+    }
+
+    /// One connection's whole focus set, replacing what it wanted before.
+    /// The live set is the union over connections; an agent entering it
+    /// starts telling its tail (whole, once) and an agent leaving it stops.
+    pub async fn set_live_wants(&self, connection: u64, wants: HashSet<AgentId>) {
+        let union = {
+            let mut live_wants = self.live_wants.lock().expect("poison");
+            if wants.is_empty() {
+                live_wants.remove(&connection);
+            } else {
+                live_wants.insert(connection, wants);
+            }
+            live_wants
+                .values()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        let (joined, left) = {
+            let mut live = self.live.lock().expect("poison");
+            let left = live
+                .iter()
+                .copied()
+                .filter(|agent_id| !union.contains(agent_id))
+                .collect::<Vec<_>>();
+            let joined = union
+                .iter()
+                .copied()
+                .filter(|agent_id| !live.contains(agent_id))
+                .collect::<Vec<_>>();
+            *live = union;
+            (joined, left)
+        };
+        let agents = self.agents.lock().await;
+        for agent_id in left {
+            if let Some(agent) = agents.get(&agent_id) {
+                agent.set_watched(false);
+            }
+        }
+        for agent_id in joined {
+            if let Some(agent) = agents.get(&agent_id) {
+                self.attach_live(agent_id, agent);
+            }
+        }
+    }
+
+    /// A live agent is loaded: it is watched (titles and activity get
+    /// made) and tells its tail whole. Leaving the live set unwatches it.
+    fn attach_live(&self, agent_id: AgentId, agent: &RunningAgent) {
+        if !self.live.lock().expect("poison").contains(&agent_id) {
+            return;
+        }
+        agent.set_watched(true);
+        agent.tell_tail();
+    }
+
+    /// Every loaded live agent tells its tail whole again: a connection
+    /// just caught up from the journal and holds nothing of the tails.
+    pub async fn tell_tails(&self) {
+        let live = self
+            .live
+            .lock()
+            .expect("poison")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let agents = self.agents.lock().await;
+        for agent_id in live {
+            if let Some(agent) = agents.get(&agent_id) {
+                agent.tell_tail();
+            }
+        }
+    }
+
+    fn touch(&self, agent_id: AgentId) {
+        let mut recent = self.recent.lock().expect("poison");
+        recent.retain(|id| *id != agent_id);
+        recent.push_back(agent_id);
+    }
+
+    /// Drop the least recently used loaded agents past [`MAX_LOADED`],
+    /// skipping any that is mid-turn, has input waiting, or is being
+    /// looked at. Dropping the last handle ends its loop.
+    fn trim(&self, agents: &mut HashMap<AgentId, RunningAgent>) {
+        if agents.len() <= MAX_LOADED {
+            return;
+        }
+        let candidates = self
+            .recent
+            .lock()
+            .expect("poison")
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for agent_id in candidates {
+            if agents.len() <= MAX_LOADED {
+                break;
+            }
+            if self.is_live(agent_id) {
+                continue;
+            }
+            let settled = agents.get(&agent_id).is_some_and(RunningAgent::settled);
+            if !settled {
+                continue;
+            }
+            agents.remove(&agent_id);
+            self.recent
+                .lock()
+                .expect("poison")
+                .retain(|id| *id != agent_id);
+        }
     }
 
     pub async fn create(
@@ -462,11 +456,12 @@ impl AgentPool {
             | SessionBinding::ResponsesSol(_)
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
-            | SessionBinding::CoordinatorTerra(_)
-            | SessionBinding::CoordinatorSol(_)
+            | SessionBinding::ResponsesAstra(_)
             | SessionBinding::AdvisorSol(_)
-            | SessionBinding::AdvisorTerra(_) => {
-                let (agent_id, agent) = Agent::create(
+            | SessionBinding::AdvisorTerra(_)
+            | SessionBinding::AdvisorAstra(_)
+            | SessionBinding::AntigravityFlashLow(_) => {
+                let (agent_id, agent) = AgentHandle::create(
                     self.db.clone(),
                     self.inference.clone(),
                     mode,
@@ -485,6 +480,7 @@ impl AgentPool {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     self.inference.clone(),
+                    self.claude.clone(),
                     display_name,
                     start,
                     mode,
@@ -496,14 +492,14 @@ impl AgentPool {
                 (agent_id, RunningAgent::Claude(agent))
             }
         };
-        self.agents.lock().await.insert(agent_id, agent.clone());
-        self.observe_activation(agent_id, agent.clone()).await;
-        if config != AgentRole::Iris {
-            let _ = self.created.send(AgentCreated {
-                agent_id,
-                agent: agent.clone(),
-            });
+        {
+            let mut agents = self.agents.lock().await;
+            agents.insert(agent_id, agent.clone());
+            self.touch(agent_id);
+            self.attach_live(agent_id, &agent);
+            self.trim(&mut agents);
         }
+        let _ = self.created.send(AgentCreated { agent_id, parent });
         Ok((agent_id, agent))
     }
 
@@ -521,64 +517,71 @@ impl AgentPool {
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
         let (parent_workdirs, parent_role) = {
-            let read = self.db.read();
-            let record = read.get_agent(parent);
-            (record.workdirs, record.role)
+            let record = self.load(parent).await?.1.head();
+            (record.config.workdirs, record.config.role)
         };
-        let selected = if workdirs.is_empty() {
+        let workdirs = if workdirs.is_empty() {
             parent_workdirs
                 .iter()
-                .map(|info| (info, SpawnCheckout::Own { revset: None }))
-                .collect::<Vec<_>>()
+                .map(|info| SpawnWorkdir {
+                    repo: info.repo().to_owned(),
+                    checkout: SpawnCheckout::Own { revset: None },
+                })
+                .collect()
         } else {
             workdirs
-                .iter()
-                .map(|request| {
-                    let repo = request
-                        .repo
-                        .file_name()
-                        .context("spawn repository has no name")?;
-                    let info = parent_workdirs
-                        .iter()
-                        .find(|info| info.repo() == repo)
-                        .with_context(|| format!("parent has no checkout for {repo}"))?;
-                    Ok((info, request.checkout.clone()))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?
         };
-        let owns = selected
-            .iter()
-            .any(|(_, checkout)| matches!(checkout, SpawnCheckout::Own { .. }));
-        anyhow::ensure!(
-            selected
+        let parent_is_sandboxed = parent_workdirs[0].is_sandbox();
+        let mut start = Vec::with_capacity(workdirs.len());
+        for entry in workdirs {
+            let repo = self.repo(&entry.repo).await?;
+            let parent_entry = parent_workdirs
                 .iter()
-                .all(|(_, checkout)| matches!(checkout, SpawnCheckout::Own { .. }))
-                || !owns,
-            "cannot mix shared and owned child checkouts"
-        );
-        let child_workset = owns.then(|| self.worksets.create());
-        let child_workset = match child_workset {
-            Some(workset) => Some(workset.await?),
-            None => None,
-        };
-        let mut start = Vec::with_capacity(selected.len());
-        for (info, checkout) in selected {
-            let source = self.open_checkout(info).await?;
-            let checkout = match checkout {
+                .find(|info| info.repo() == repo.root());
+            start.push(match entry.checkout {
+                SpawnCheckout::Own { revset } if repo.is_jj() => {
+                    // The child's change forks off whatever the parent's
+                    // checkout currently points at; repos outside the
+                    // parent's working set start from trunk.
+                    let parent_revset = revset
+                        .unwrap_or_else(|| parent_entry.map_or("trunk()", |_| "@").to_owned());
+                    let source = match parent_entry {
+                        Some(info) => self.open_workspace(info).await?,
+                        None => repo.user_checkout().await?,
+                    };
+                    let workspace = if parent_is_sandboxed {
+                        repo.create_sandbox_from(&source, &parent_revset).await?
+                    } else {
+                        repo.create_workspace_from(&source, &parent_revset).await?
+                    };
+                    StartWorkdir::Existing(workspace)
+                }
                 SpawnCheckout::Own { revset } => {
                     anyhow::ensure!(
                         revset.is_none(),
-                        "custom spawn revsets are no longer supported"
+                        "revset is only supported inside a jj repository: {}",
+                        repo.root()
                     );
-                    child_workset
-                        .as_ref()
-                        .expect("owned checkout has child workset")
-                        .fork_from(&source, Some(info.name()))
-                        .await?
+                    anyhow::ensure!(
+                        !parent_is_sandboxed,
+                        "sandboxed Engineers cannot spawn into plain directories: {}",
+                        repo.root()
+                    );
+                    // Plain directories have no workspaces to create.
+                    StartWorkdir::Existing(repo.user_checkout().await?)
                 }
-                SpawnCheckout::Shared => source,
-            };
-            start.push(StartWorkdir::Existing(checkout));
+                SpawnCheckout::Shared => {
+                    anyhow::ensure!(
+                        !parent_is_sandboxed || parent_entry.is_some_and(WorkspaceInfo::is_sandbox),
+                        "sandboxed Engineers cannot share an ordinary checkout: {}",
+                        repo.root()
+                    );
+                    match parent_entry {
+                        Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
+                        None => StartWorkdir::Existing(repo.user_checkout().await?),
+                    }
+                }
+            });
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
@@ -609,22 +612,18 @@ impl AgentPool {
                 if depth > MAX_SPAWN_DEPTH {
                     anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
                 }
-                cursor = read.get_agent(id).parent_agent;
+                cursor = read.agent_parent(id);
             }
-            read.list_agents()
+            read.list_agent_ids()
                 .into_iter()
-                .filter(|(_, record)| {
-                    record.parent_agent == Some(parent)
-                        && record.disposition != AgentDisposition::Hidden
-                })
-                .map(|(id, _)| id)
+                .filter(|id| read.agent_parent(*id) == Some(parent))
                 .collect::<Vec<_>>()
         };
         let agents = self.agents.lock().await;
         let working_children = child_ids
             .into_iter()
             .filter_map(|id| agents.get(&id))
-            .filter(|agent| agent.state().kind.is_working())
+            .filter(|agent| agent.status().kind.is_working())
             .count();
         if working_children >= MAX_WORKING_CHILDREN {
             anyhow::bail!(
@@ -647,7 +646,7 @@ impl AgentPool {
         let (_, agent, _) = self.load(to).await?;
         let sender_label = self.agent_handle(from);
         if matches!(
-            self.db.read().get_agent(from).role,
+            self.load(from).await?.1.head().config.role,
             AgentRole::Advisor { .. }
         ) {
             body.push_str(&format!(
@@ -676,10 +675,7 @@ impl AgentPool {
     }
 
     pub fn agent_exists(&self, agent_id: AgentId) -> bool {
-        let read = self.db.read();
-        read.list_agents()
-            .iter()
-            .any(|(existing, _)| *existing == agent_id)
+        self.db.read().agent_exists(agent_id)
     }
 
     /// Short raw prefix for an agent id.
@@ -691,7 +687,13 @@ impl AgentPool {
     }
 
     pub fn agent_handle(&self, agent_id: AgentId) -> String {
-        let role = self.db.read().get_agent(agent_id).role;
+        // A loaded loop keeps its head; only a cold agent folds its log.
+        let loaded = self
+            .agents
+            .try_lock()
+            .ok()
+            .and_then(|agents| agents.get(&agent_id).map(|agent| agent.head().config.role));
+        let role = loaded.unwrap_or_else(|| self.db.read().get_agent(agent_id).config.role);
         format!(
             "{}-{}",
             role.handle_prefix(),
@@ -699,50 +701,70 @@ impl AgentPool {
         )
     }
 
-    pub async fn open_checkout(
-        &self,
-        info: &WorkspaceInfo,
-    ) -> anyhow::Result<Arc<rho_workset::Checkout>> {
-        self.worksets
-            .open_workset(info.workset())
-            .await?
-            .checkout(info.name())
-            .await
-            .with_context(|| format!("checkout {} is missing", info.name()))
+    /// The shared handle for the workdir containing `path`: the enclosing jj
+    /// repo when there is one, otherwise the plain directory itself
+    /// (live-only, no separate workspaces). Cache-keyed by the resolved root
+    /// so agents in the same repo share one instance.
+    pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
+        let (root, is_jj) = rho_workspaces::resolve_workdir_root(path.as_std_path())?;
+        let repo = if is_jj {
+            Repo::open_with_environment(
+                root.as_std_path(),
+                self.path_overrides.clone(),
+                self.user_environment.clone(),
+            )?
+            .with_state_dir(self.state_dir.clone())
+        } else {
+            Repo::open_plain_with_environment(
+                root.as_std_path(),
+                self.path_overrides.clone(),
+                self.user_environment.clone(),
+            )?
+            .with_state_dir(self.state_dir.clone())
+        };
+        let mut repos = self.repos.lock().await;
+        Ok(match repos.entry(repo.root().to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Arc::clone(entry.insert(Arc::new(repo)))
+            }
+        })
     }
 
-    pub async fn materialize_namespace(
+    pub async fn open_workspace(
         &self,
-        workdirs: &[WorkspaceInfo],
-    ) -> anyhow::Result<Arc<Namespace>> {
-        let first = workdirs.first().context("agent has no checkouts")?;
-        anyhow::ensure!(
-            workdirs
-                .iter()
-                .all(|info| info.workset() == first.workset()),
-            "agent checkouts span worksets"
-        );
-        self.worksets
-            .open_workset(first.workset())
-            .await?
-            .enter(Mode::View {
-                home_skeleton: None,
-            })
-            .await
+        info: &WorkspaceInfo,
+    ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
+        match info {
+            WorkspaceInfo::UserCheckout { repo } => self.repo(repo).await?.user_checkout().await,
+            WorkspaceInfo::Workspace { repo, id } => {
+                self.repo(repo).await?.open_workspace(*id).await
+            }
+            WorkspaceInfo::Sandbox { repo, id } => self.repo(repo).await?.open_sandbox(*id).await,
+        }
+    }
+
+    /// Materializes an agent's persisted working set into a live view.
+    pub async fn materialize_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
+        let mut entries = Vec::with_capacity(workdirs.len());
+        for info in workdirs {
+            entries.push(self.open_workspace(info).await?);
+        }
+        View::new(entries)
     }
 
     fn lazy_view(
         self: &Arc<Self>,
         _agent_id: AgentId,
         workdirs: Vec<WorkspaceInfo>,
-    ) -> Arc<Lazy<Arc<Namespace>>> {
+    ) -> Arc<Lazy<Arc<View>>> {
         let pool = Arc::downgrade(self);
         Arc::new(Lazy::new(move || {
             let pool = pool.clone();
             let workdirs = workdirs.clone();
             async move {
                 let pool = pool.upgrade().context("agent pool dropped")?;
-                pool.materialize_namespace(&workdirs).await
+                pool.materialize_view(&workdirs).await
             }
         }))
     }
@@ -766,22 +788,27 @@ impl AgentPool {
             .clone();
         let _loading = load_lock.lock().await;
         if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
+            self.touch(agent_id);
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.workdirs.clone());
-        let agent = match record.runtime {
-            AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
-                self.db.clone(),
-                self.inference.clone(),
-                agent_id,
-                view,
-                Arc::downgrade(self),
-            )),
+        let view = self.lazy_view(agent_id, record.config.workdirs.clone());
+        let agent = match record.config.runtime {
+            AgentRuntime::Rho { .. } => RunningAgent::Rho(
+                AgentHandle::load(
+                    self.db.clone(),
+                    self.inference.clone(),
+                    agent_id,
+                    view,
+                    Arc::downgrade(self),
+                )
+                .await?,
+            ),
             AgentRuntime::Claude { .. } => {
                 let agent = ClaudeAgent::load(
                     self.db.clone(),
                     self.inference.clone(),
+                    self.claude.clone(),
                     agent_id,
                     view,
                     Arc::downgrade(self),
@@ -790,8 +817,13 @@ impl AgentPool {
                 RunningAgent::Claude(agent)
             }
         };
-        self.agents.lock().await.insert(agent_id, agent.clone());
-        self.observe_activation(agent_id, agent.clone()).await;
+        {
+            let mut agents = self.agents.lock().await;
+            agents.insert(agent_id, agent.clone());
+            self.touch(agent_id);
+            self.attach_live(agent_id, &agent);
+            self.trim(&mut agents);
+        }
         Ok((agent_id, agent, true))
     }
 }
@@ -801,34 +833,22 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Alt,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Alt,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
         },
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
         },
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Cheap,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Cheap,
-                ..
             },
             AgentRole::Advisor { .. },
         ) => AgentRole::Advisor {
@@ -837,32 +857,10 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         (
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
-            }
-            | AgentRole::WorkflowEngineer {
-                intelligence: EngineerIntelligence::Mini,
-                ..
             },
-            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+            AgentRole::Engineer { .. },
         ) => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Mini,
-        },
-        (
-            AgentRole::WorkflowPM {
-                workflow: AgentWorkflow::PrFriendly,
-            },
-            AgentRole::Engineer { intelligence, .. },
-        ) => AgentRole::WorkflowEngineer {
-            intelligence,
-            workflow: AgentWorkflow::PrFriendly,
-        },
-        (
-            AgentRole::WorkflowPM {
-                workflow: AgentWorkflow::PrFriendly,
-            },
-            AgentRole::WorkflowEngineer { intelligence, .. },
-        ) => AgentRole::WorkflowEngineer {
-            intelligence,
-            workflow: AgentWorkflow::PrFriendly,
         },
         (_, child) => child,
     }
@@ -870,27 +868,55 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
 
 #[derive(Clone)]
 pub enum RunningAgent {
-    Rho(Agent),
+    Rho(AgentHandle),
     Claude(ClaudeAgent),
 }
 
 impl RunningAgent {
-    pub(crate) fn watch_presentation(&self) -> Option<crate::presentation::Watch> {
+    /// Whether anyone is looking at this agent; titles and activity are
+    /// made only then.
+    pub(crate) fn set_watched(&self, watching: bool) {
         match self {
-            Self::Rho(agent) => Some(agent.watch_presentation()),
-            Self::Claude(agent) => Some(agent.watch_presentation()),
+            Self::Rho(agent) => agent.set_watched(watching),
+            Self::Claude(agent) => agent.set_watched(watching),
         }
     }
 
-    pub fn state(&self) -> AgentState {
+    pub fn status(&self) -> AgentStatus {
         match self {
-            Self::Rho(agent) => agent.state(),
-            Self::Claude(agent) => agent.state(),
+            Self::Rho(agent) => agent.status(),
+            Self::Claude(agent) => agent.status(),
         }
+    }
+
+    /// The record as the loop keeps it.
+    pub fn head(&self) -> crate::db::AgentHead {
+        match self {
+            Self::Rho(agent) => agent.head(),
+            Self::Claude(agent) => agent.head(),
+        }
+    }
+
+    /// Say the live tail whole again.
+    pub fn tell_tail(&self) {
+        match self {
+            Self::Rho(agent) => agent.tell_tail(),
+            Self::Claude(agent) => agent.tell_tail(),
+        }
+    }
+
+    /// Nothing running and nothing waiting: safe to drop.
+    pub fn settled(&self) -> bool {
+        self.status().settled()
     }
 
     pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        self.send_user_message_with_source(text, delivery, None);
+        match self {
+            Self::Rho(agent) => agent.send_user_message(text, delivery),
+            // The Claude CLI does its own mid-turn steering; there is no
+            // lane choice to forward.
+            Self::Claude(agent) => agent.send_user_message(text),
+        }
     }
 
     pub fn send_user_content(
@@ -904,33 +930,15 @@ impl RunningAgent {
         }
     }
 
+    /// Send user input and return once the agent has durably queued it.
     pub async fn send_user_content_accepted(
         &self,
         content: Vec<rho_core::ContentPart>,
         delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Rho(agent) => {
-                agent
-                    .send_user_content_accepted(content, delivery, source_id)
-                    .await
-            }
+            Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await,
             Self::Claude(agent) => agent.send_user_content_accepted(content).await,
-        }
-    }
-
-    pub fn send_user_message_with_source(
-        &self,
-        text: String,
-        delivery: MessageDelivery,
-        source_id: Option<InputSourceId>,
-    ) {
-        match self {
-            Self::Rho(agent) => agent.send_user_message_with_source(text, delivery, source_id),
-            // The Claude CLI does its own mid-turn steering; there is no
-            // lane choice to forward.
-            Self::Claude(agent) => agent.send_user_message(text),
         }
     }
 
@@ -940,10 +948,10 @@ impl RunningAgent {
         sender: AgentId,
         sender_label: String,
         body: String,
-        delivery: MessageDelivery,
+        _delivery: MessageDelivery,
     ) {
         match self {
-            Self::Rho(agent) => agent.send_agent_message(sender, body, delivery),
+            Self::Rho(agent) => agent.send_agent_message(sender, body),
             // Claude has no agent-mail lane; mail arrives as a labeled user
             // message.
             Self::Claude(agent) => agent.send_user_message(format!(
@@ -957,14 +965,10 @@ impl RunningAgent {
         sender: AgentId,
         sender_label: String,
         body: String,
-        delivery: MessageDelivery,
+        _delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
         match self {
-            Self::Rho(agent) => {
-                agent
-                    .send_agent_message_accepted(sender, body, delivery)
-                    .await
-            }
+            Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await,
             Self::Claude(agent) => {
                 agent
                     .send_agent_message_accepted(format!(
@@ -975,16 +979,10 @@ impl RunningAgent {
         }
     }
 
-    pub fn compact(&self, delivery: MessageDelivery) -> anyhow::Result<()> {
+    pub fn compact(&self) {
         match self {
-            Self::Claude(agent) => {
-                agent.compact();
-                Ok(())
-            }
-            Self::Rho(agent) => {
-                agent.compact(delivery);
-                Ok(())
-            }
+            Self::Claude(agent) => agent.compact(),
+            Self::Rho(agent) => agent.compact(),
         }
     }
 
@@ -995,42 +993,11 @@ impl RunningAgent {
         }
     }
 
-    pub fn continue_unfinished(&self) {
+    /// Retry after a failure, or resume a turn a restart interrupted.
+    pub fn retry(&self) {
         match self {
-            Self::Rho(agent) => agent.continue_unfinished(),
+            Self::Rho(agent) => agent.retry(),
             Self::Claude(_) => {}
-        }
-    }
-
-    pub async fn wait_for_input(&self, timeout: std::time::Duration) -> bool {
-        match self {
-            Self::Claude(agent) => agent.wait_for_input(timeout).await,
-            Self::Rho(agent) => {
-                let deadline = tokio::time::Instant::now() + timeout;
-                loop {
-                    if !agent.state().queued_inputs.is_empty() {
-                        return true;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-            }
-        }
-    }
-
-    pub fn set_deep_config(
-        &self,
-        config: InferenceProfile,
-        model: InferenceModel,
-    ) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => {
-                agent.set_deep_config(config, model);
-                Ok(())
-            }
-            Self::Claude(_) => anyhow::bail!("cannot apply deep config to Claude agent"),
         }
     }
 
@@ -1054,9 +1021,7 @@ impl RunningAgent {
                 agent.change_prompt_cache_key();
                 Ok(())
             }
-            Self::Claude(_) => {
-                anyhow::bail!("prompt cache keys are only available for Rho agents")
-            }
+            Self::Claude(_) => anyhow::bail!("prompt cache keys are only available for Rho agents"),
         }
     }
 
@@ -1066,42 +1031,12 @@ impl RunningAgent {
             Self::Claude(agent) => agent.rewind(turns).await,
         }
     }
-
-    pub fn subscribe(&self) -> BoxStream<'static, AgentState> {
-        match self {
-            Self::Rho(agent) => agent.subscribe().boxed(),
-            Self::Claude(agent) => agent.subscribe().boxed(),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{AgentWorkflow, EngineerIntelligence};
-
-    #[test]
-    fn github_workflow_only_flows_from_pm_to_engineer() {
-        let engineer = AgentRole::Engineer {
-            intelligence: EngineerIntelligence::Medium,
-        };
-        let pr_pm = AgentRole::WorkflowPM {
-            workflow: AgentWorkflow::PrFriendly,
-        };
-        assert_eq!(
-            child_role(pr_pm, engineer).workflow(),
-            AgentWorkflow::PrFriendly
-        );
-
-        let pr_engineer = AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Medium,
-            workflow: AgentWorkflow::PrFriendly,
-        };
-        assert_eq!(
-            child_role(pr_engineer, engineer).workflow(),
-            AgentWorkflow::Default
-        );
-    }
+    use crate::db::EngineerIntelligence;
 
     #[test]
     fn mini_engineers_spawn_mini_engineers() {
@@ -1136,16 +1071,6 @@ mod tests {
             child_role(
                 AgentRole::Engineer {
                     intelligence: EngineerIntelligence::Alt,
-                },
-                AgentRole::default(),
-            ),
-            cheap
-        );
-        assert_eq!(
-            child_role(
-                AgentRole::WorkflowEngineer {
-                    intelligence: EngineerIntelligence::Alt,
-                    workflow: AgentWorkflow::PrFriendly,
                 },
                 AgentRole::default(),
             ),

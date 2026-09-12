@@ -1414,6 +1414,42 @@ mod tests {
     }
 
     #[test]
+    fn cursor_work_counts_leaf_items_not_shared_subtrees() {
+        let tree = SumTree::from_iter((0..2_000).map(|_| 0_u8), ());
+        let mut cursor = tree.cursor::<Count>(());
+
+        let prefix = cursor.slice(&Count(1_000), Bias::Right);
+        assert_eq!(prefix.extent::<Count>(()).0, 1_000);
+        let prefix_work = cursor.walked_items();
+        assert!(
+            prefix_work < 64,
+            "a seek through a large shared tree walked {prefix_work} leaf items"
+        );
+
+        cursor.next();
+        assert_eq!(cursor.walked_items(), prefix_work + 1);
+        cursor.reset();
+        cursor.seek(&Count(1), Bias::Right);
+        assert!(
+            cursor.walked_items() > prefix_work,
+            "reset/seek must preserve the cumulative counter"
+        );
+
+        let small_tree = SumTree::from_iter(1_u8..5, ());
+        let mut filtered = small_tree.cursor::<Count>(());
+        filtered.search_forward(|summary| summary.max == 3);
+        assert_eq!(filtered.item(), Some(&3));
+        assert_eq!(filtered.walked_items(), 2);
+        let before_inspection = filtered.walked_items();
+        assert_eq!(filtered.item(), Some(&3));
+        assert_eq!(filtered.walked_items(), before_inspection);
+        filtered.next();
+        assert_eq!(filtered.walked_items(), before_inspection + 1);
+        filtered.prev();
+        assert_eq!(filtered.walked_items(), before_inspection + 2);
+    }
+
+    #[test]
     fn test_random() {
         let mut starting_seed = 0;
         if let Ok(value) = std::env::var("SEED") {

@@ -1,5 +1,5 @@
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
-use rho_workset::PathOverrides;
+use rho_workspaces::PathOverrides;
 
 use super::*;
 
@@ -47,6 +47,18 @@ async fn runs_shell_call() {
         result.output
     );
     assert!(result.output.as_ref().contains("Output:\nhello"));
+}
+
+#[tokio::test]
+async fn a_pipeline_fails_when_any_stage_does() {
+    let result = test_tools(2)
+        .call_code_mode(shell_call(
+            json!({"cmd": "sh -c 'echo partial; exit 3' | cat"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(result["exit_code"], 3, "pipefail reports the failing stage");
+    assert_eq!(result["output"], "partial\n");
 }
 
 #[tokio::test]
@@ -98,19 +110,71 @@ async fn write_stdin_continues_a_running_process() {
 }
 
 #[tokio::test]
+async fn exec_command_waits_for_the_command_by_default() {
+    let tools = test_tools(2);
+    let result = tools
+        .call(shell_call(json!({"cmd": "sleep 0.4; printf done"})))
+        .await;
+    assert!(
+        result
+            .output
+            .as_ref()
+            .contains("Process exited with code 0"),
+        "{}",
+        result.output
+    );
+    assert!(result.output.as_ref().contains("Output:\ndone"));
+}
+
+#[tokio::test]
+async fn an_empty_poll_returns_as_soon_as_the_process_says_something() {
+    let tools = test_tools(2);
+    let result = tools
+        .call(shell_call(json!({
+            "cmd": "sleep 0.4; echo first; sleep 0.4; echo second; sleep 5",
+            "yield_time_ms": 1
+        })))
+        .await;
+    assert!(result.output.as_ref().contains("Process running"));
+    for expected in ["first", "second"] {
+        let started = std::time::Instant::now();
+        let result = tools
+            .call(ToolCall {
+                id: ToolCallId::try_from(format!("poll-{expected}").as_str()).unwrap(),
+                name: ToolName::try_from(WRITE_STDIN_TOOL_NAME).unwrap(),
+                tool_type: ToolType::Function,
+                // A tiny yield is raised to the poll floor, so this returns on
+                // output rather than after 1 ms with nothing.
+                arguments: json!({"session_id": 1, "yield_time_ms": 1}).to_string(),
+            })
+            .await;
+        assert!(
+            result.output.as_ref().contains(expected),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.as_ref().contains("Process exited"));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "poll did not return on output"
+        );
+    }
+}
+
+#[tokio::test]
 async fn reaps_a_session_that_exits_without_another_poll() {
     let temp = tempfile::tempdir().unwrap();
     let pid_file = temp.path().join("pid");
     let tools = test_tools(2);
     let result = tools
         .call(shell_call(json!({
-            "cmd": format!("printf '%s' $$ > {}; sleep 0.05", pid_file.display()),
+            "cmd": format!("printf '%s' $$ > {}; sleep 0.5", pid_file.display()),
             "yield_time_ms": 1
         })))
         .await;
     assert!(result.output.as_ref().contains("Process running"));
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
     let pid = std::fs::read_to_string(pid_file).unwrap();
     assert!(
         !std::path::Path::new("/proc").join(pid).exists(),

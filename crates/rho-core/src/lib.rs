@@ -58,20 +58,18 @@ impl PrefixIdDomain for AgentIdDomain {
     }
 }
 
-/// What the user did about an agent's last finished turn.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentDisposition {
-    Pending,
-    #[default]
-    Done,
-    Snoozed {
-        until: UnixMs,
-    },
-    Hidden,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
+pub enum AgentRole {
+    Engineer { intelligence: EngineerIntelligence },
+    Advisor { intelligence: AdvisorIntelligence },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentRole {
+/// The role as rows wrote it before the PM and Iris roles were retired.
+/// Variant ids come from the variant names, so this decodes what
+/// `AgentRole` used to; a retired role folds into the nearest live one.
+#[allow(dead_code)]
+#[derive(Decode)]
+enum StoredAgentRole {
     Engineer {
         intelligence: EngineerIntelligence,
     },
@@ -81,23 +79,40 @@ pub enum AgentRole {
     },
     WorkflowEngineer {
         intelligence: EngineerIntelligence,
-        workflow: AgentWorkflow,
+        workflow: StoredAgentWorkflow,
     },
     WorkflowPM {
-        workflow: AgentWorkflow,
+        workflow: StoredAgentWorkflow,
     },
-    /// Built-in hidden coordinator for Rho's global Iris voice surface.
     Iris,
 }
 
+impl senax_encoder::Decoder for AgentRole {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        Ok(match StoredAgentRole::decode(reader)? {
+            StoredAgentRole::Engineer { intelligence } => Self::Engineer { intelligence },
+            StoredAgentRole::Advisor { intelligence } => Self::Advisor { intelligence },
+            // Workflow engineers are retired. Old rows retain their intelligence
+            // while folding into the only creatable engineer role.
+            StoredAgentRole::WorkflowEngineer { intelligence, .. } => {
+                Self::Engineer { intelligence }
+            }
+            StoredAgentRole::PM | StoredAgentRole::Iris => Self::default(),
+            StoredAgentRole::WorkflowPM { .. } => Self::Engineer {
+                intelligence: EngineerIntelligence::Medium,
+            },
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentWorkflow {
+enum StoredAgentWorkflow {
     #[default]
     Default,
     PrFriendly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Pack, Unpack)]
 pub enum EngineerIntelligence {
     Low,
     Medium,
@@ -106,6 +121,42 @@ pub enum EngineerIntelligence {
     Mini,
     Alt,
     Cheap,
+    /// Reduced function-tool agent backed by Gemini through Antigravity.
+    Gemini,
+}
+
+/// The intelligence as rows wrote it while `eng-py` and `eng-ultra-py`
+/// existed. Every engineer has the Python notebook now, so those fold into
+/// the same model without the suffix.
+#[allow(dead_code)]
+#[derive(Decode)]
+enum StoredEngineerIntelligence {
+    Low,
+    Medium,
+    High,
+    Ultra,
+    Mini,
+    Alt,
+    Cheap,
+    Gemini,
+    Python,
+    UltraPython,
+}
+
+impl senax_encoder::Decoder for EngineerIntelligence {
+    fn decode(reader: &mut impl bytes::Buf) -> Result<Self, senax_encoder::EncoderError> {
+        use StoredEngineerIntelligence as Stored;
+        Ok(match Stored::decode(reader)? {
+            Stored::Low => Self::Low,
+            Stored::Medium | Stored::Python => Self::Medium,
+            Stored::High => Self::High,
+            Stored::Ultra | Stored::UltraPython => Self::Ultra,
+            Stored::Mini => Self::Mini,
+            Stored::Alt => Self::Alt,
+            Stored::Cheap => Self::Cheap,
+            Stored::Gemini => Self::Gemini,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -124,33 +175,14 @@ impl Default for AgentRole {
 }
 
 impl AgentRole {
-    pub fn pm() -> Self {
-        Self::PM
-    }
-
-    pub fn workflow(self) -> AgentWorkflow {
-        match self {
-            Self::WorkflowEngineer { workflow, .. } | Self::WorkflowPM { workflow } => workflow,
-            Self::Engineer { .. } | Self::PM | Self::Advisor { .. } | Self::Iris => {
-                AgentWorkflow::Default
-            }
-        }
-    }
-
-    pub fn is_pm(self) -> bool {
-        matches!(self, Self::PM | Self::WorkflowPM { .. } | Self::Iris)
-    }
-
     pub fn is_engineer(self) -> bool {
-        matches!(self, Self::Engineer { .. } | Self::WorkflowEngineer { .. })
+        matches!(self, Self::Engineer { .. })
     }
 
     pub fn handle_prefix(self) -> &'static str {
         match self {
-            Self::Engineer { .. } | Self::WorkflowEngineer { .. } => "eng",
-            Self::PM | Self::WorkflowPM { .. } => "pm",
+            Self::Engineer { .. } => "eng",
             Self::Advisor { .. } => "adv",
-            Self::Iris => "iris",
         }
     }
 }
@@ -170,8 +202,6 @@ pub enum MessageDelivery {
     Immediate,
     /// Enter at the next inference-request boundary.
     NextRequest,
-    /// Wait for the current turn to finish, then start a new turn.
-    NextTurn,
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -241,6 +271,25 @@ pub enum ContentPart {
     },
 }
 
+/// A decoded and normalized image suitable for provider input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
+pub struct ImageContent {
+    pub media_type: String,
+    pub data: Vec<u8>,
+    #[senax(default)]
+    pub detail: ImageDetail,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    #[default]
+    High,
+    Original,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]
 pub enum MessagePhase {
@@ -284,10 +333,24 @@ pub enum ToolOutputStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct ToolOutput {
-    /// Sent to the model verbatim.
+    /// Bounded rendering sent to the model verbatim.
     pub output: Arc<String>,
+    /// Complete textual record for persistence and readers. `None` means the
+    /// model-facing output is already the complete record.
+    #[serde(default)]
+    #[senax(default)]
+    pub full_output: Option<Arc<String>>,
+    /// Typed image items sent to the model after the textual output.
+    #[senax(default)]
+    pub images: Arc<Vec<ImageContent>>,
     /// Harness/UI metadata only; not included in the provider wire payload.
     pub status: ToolOutputStatus,
+}
+
+impl ToolOutput {
+    pub fn recorded_output(&self) -> &str {
+        self.full_output.as_deref().unwrap_or(&self.output)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -306,9 +369,9 @@ pub struct ToolResult {
 }
 
 /// An extra output item for a tool call that has (or will have) its own
-/// result — a progress note, not an execution summary. Providers accept
-/// multiple output items per call id; the update replays with the same wire
-/// shape as the call's result.
+/// result — a progress note, not an execution summary. Responses serializes
+/// updates as named standalone outputs without a provider call id; the local
+/// call id retains transcript attribution across compaction.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ToolUpdate {
     /// The [`ToolCall`] this update annotates.
@@ -316,9 +379,18 @@ pub struct ToolUpdate {
     /// Wire shape for replaying this update to the provider.
     pub tool_type: ToolType,
     pub output: Arc<String>,
+    /// Complete textual record when `output` is a bounded model view.
+    #[senax(default)]
+    pub full_output: Option<Arc<String>>,
     /// When the tool emitted the update (a single instant; updates have no
     /// duration).
     pub at: UnixMs,
+}
+
+impl ToolUpdate {
+    pub fn recorded_output(&self) -> &str {
+        self.full_output.as_deref().unwrap_or(&self.output)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
@@ -591,7 +663,9 @@ pub enum InferenceEvent {
         usage: Option<TokenUsage>,
         provider_response_id: Option<ProviderResponseId>,
     },
-    /// You should see RequestSent soon
+    /// Recoverable failure. With agent-owned retries the attempt is over;
+    /// the caller must rebuild context and schedule another request.
+    /// Other sessions may retry internally at `retrying_at`.
     TemporaryFailure {
         error: Arc<anyhow::Error>,
         retrying_at: Instant,
@@ -601,7 +675,7 @@ pub enum InferenceEvent {
     /// server has started sending tokens
     StreamingStarted,
     /// turn has failed due to some reason
-    /// you shouldn't retry, that is already done internally
+    /// Not automatically retryable.
     Failed {
         // TODO: specific error message if needed if future
         error: Arc<anyhow::Error>,
@@ -658,6 +732,125 @@ mod tests {
         Box::new(TestProviderSpecificData {
             item_id: "item_1".to_owned(),
         })
+    }
+
+    #[test]
+    fn tool_output_without_images_decodes_from_legacy_shape() {
+        #[derive(Encode)]
+        struct LegacyToolOutput {
+            output: Arc<String>,
+            status: ToolOutputStatus,
+        }
+
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(
+            &LegacyToolOutput {
+                output: Arc::new("done".to_owned()),
+                status: ToolOutputStatus::Success,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded = <ToolOutput as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded.output.as_str(), "done");
+        assert!(decoded.full_output.is_none());
+        assert!(decoded.images.is_empty());
+        assert_eq!(decoded.status, ToolOutputStatus::Success);
+    }
+
+    #[test]
+    fn tool_output_round_trips_its_complete_record() {
+        let output = ToolOutput {
+            output: Arc::new("bounded".to_owned()),
+            full_output: Some(Arc::new("complete".to_owned())),
+            images: Arc::new(Vec::new()),
+            status: ToolOutputStatus::Success,
+        };
+
+        let mut encoded = senax_encoder::encode(&output).unwrap();
+        let decoded = senax_encoder::decode::<ToolOutput>(&mut encoded).unwrap();
+        assert_eq!(decoded, output);
+        assert_eq!(decoded.recorded_output(), "complete");
+    }
+
+    #[test]
+    fn tool_update_without_complete_record_decodes_from_legacy_shape() {
+        #[derive(Encode)]
+        struct LegacyToolUpdate {
+            call_id: ToolCallId,
+            tool_type: ToolType,
+            output: Arc<String>,
+            at: UnixMs,
+        }
+
+        let mut encoded = senax_encoder::encode(&LegacyToolUpdate {
+            call_id: "call-1".try_into().unwrap(),
+            tool_type: ToolType::Custom,
+            output: Arc::new("done".to_owned()),
+            at: UnixMs(1),
+        })
+        .unwrap();
+        let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
+        assert_eq!(decoded.output.as_str(), "done");
+        assert!(decoded.full_output.is_none());
+    }
+
+    #[test]
+    fn python_intelligences_fold_into_their_models() {
+        #[derive(Encode)]
+        #[allow(dead_code)]
+        enum LegacyEngineerIntelligence {
+            Python,
+            UltraPython,
+        }
+        for (legacy, expected) in [
+            (
+                LegacyEngineerIntelligence::Python,
+                EngineerIntelligence::Medium,
+            ),
+            (
+                LegacyEngineerIntelligence::UltraPython,
+                EngineerIntelligence::Ultra,
+            ),
+        ] {
+            let mut encoded = bytes::BytesMut::new();
+            senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
+            let decoded =
+                <EngineerIntelligence as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn legacy_workflow_engineer_decodes_as_engineer() {
+        #[derive(Encode)]
+        enum LegacyWorkflow {
+            PrFriendly,
+        }
+        #[derive(Encode)]
+        enum LegacyAgentRole {
+            WorkflowEngineer {
+                intelligence: EngineerIntelligence,
+                workflow: LegacyWorkflow,
+            },
+        }
+
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(
+            &LegacyAgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::High,
+                workflow: LegacyWorkflow::PrFriendly,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded = <AgentRole as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(
+            decoded,
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High,
+            }
+        );
     }
 
     #[test]

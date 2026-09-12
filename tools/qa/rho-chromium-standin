@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Run vanilla Chromium as rho-browser's software-rendering QA stand-in.
+#
+# rho-gui writes the extension and native-host manifest before invoking this
+# wrapper. Vanilla Chromium lacks Brave Origin's rhoPrivate tab-ID API, so the
+# QA extension stores the same IDs in extension-local storage instead. A fresh
+# profile avoids Chromium reusing a cached service worker from an earlier run.
+set -euo pipefail
+
+: "${RHO_CHROMIUM_BIN:?set RHO_CHROMIUM_BIN to a Chromium executable}"
+
+state_dir="${RHO_BROWSER_QA_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/rho}"
+extension="$state_dir/chromium-extension"
+profile="$state_dir/chromium-qa-profile"
+manifest="${XDG_CONFIG_HOME:-$HOME/.config}/BraveSoftware/Brave-Origin/NativeMessagingHosts/dev.rho.browser.json"
+
+rm -rf "$profile"
+mkdir -p "$profile/NativeMessagingHosts"
+cp "$manifest" "$profile/NativeMessagingHosts/dev.rho.browser.json"
+
+python3 - "$extension/service-worker.js" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+patched = source.replace(
+    """async function getPageId(tabId) {
+  return chrome.rhoPrivate.tabs.getId(tabId);
+}
+
+async function setPageId(tabId, id) {
+  await chrome.rhoPrivate.tabs.setId(tabId, id);
+}
+
+async function removePageId(tabId) {
+  await chrome.rhoPrivate.tabs.removeId(tabId);
+}""",
+    """async function getPageId(tabId) {
+  return (await chrome.storage.local.get(`qa-tab:${tabId}`))[`qa-tab:${tabId}`];
+}
+
+async function setPageId(tabId, id) {
+  await chrome.storage.local.set({ [`qa-tab:${tabId}`]: id });
+}
+
+async function removePageId(tabId) {
+  await chrome.storage.local.remove(`qa-tab:${tabId}`);
+}""",
+)
+if patched == source:
+    raise SystemExit("rhoPrivate compatibility block was not found")
+path.write_text(patched)
+PY
+
+exec "$RHO_CHROMIUM_BIN" \
+  --user-data-dir="$profile" \
+  --load-extension="$extension" \
+  "$@"

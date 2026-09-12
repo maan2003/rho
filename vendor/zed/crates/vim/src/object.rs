@@ -457,7 +457,7 @@ impl Vim {
         let count = Self::take_count(cx);
 
         match self.mode {
-            Mode::Normal | Mode::HelixNormal => {
+            Mode::Normal | Mode::Deal | Mode::HelixNormal | Mode::HelixDeal => {
                 self.normal_object(object, count, opening, window, cx)
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::HelixSelect => {

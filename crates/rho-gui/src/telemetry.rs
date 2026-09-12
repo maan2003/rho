@@ -1,0 +1,703 @@
+//! Always-on, bounded GUI timing snapshot serialization.
+
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+const CPU_ROTATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+const CPU_TRACE_DISK_BUDGET: u64 = 8 * 1024 * 1024;
+// Half a minute of history, because the stalls worth a snapshot last
+// seconds: five segments were ten seconds, and a six-second freeze filled
+// most of the window with itself and pushed out what led up to it.
+const CPU_SNAPSHOT_SEGMENTS: usize = 16;
+
+const MAX_SNAPSHOT_FRAMES: usize = 8_192;
+const MAX_SNAPSHOT_EDITOR_EVENTS: usize = 4_096;
+static STARTED: OnceLock<Instant> = OnceLock::new();
+static MONOTONIC_ORIGIN_NS: OnceLock<u64> = OnceLock::new();
+static SURFACES: OnceLock<Mutex<VecDeque<(Instant, SurfaceState)>>> = OnceLock::new();
+static PASSIVE_CPU: OnceLock<Mutex<Option<PassiveCpuProfiler>>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub(crate) enum SurfaceKind {
+    Dashboard,
+    Draft,
+    Transcript,
+    File,
+    Shell,
+    Diff,
+    Terminal,
+    Browser,
+    SlackList,
+    SlackResults,
+    SlackConversation,
+    Messages,
+    Usage,
+    Image,
+}
+
+impl SurfaceKind {
+    pub(crate) const fn bit(self) -> u16 {
+        1 << self as u16
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Draft => "draft",
+            Self::Transcript => "transcript",
+            Self::File => "file",
+            Self::Shell => "shell",
+            Self::Diff => "diff",
+            Self::Terminal => "terminal",
+            Self::Browser => "browser",
+            Self::SlackList => "slack_list",
+            Self::SlackResults => "slack_results",
+            Self::SlackConversation => "slack_conversation",
+            Self::Messages => "messages",
+            Self::Usage => "usage",
+            Self::Image => "image",
+        }
+    }
+}
+
+const SURFACE_KINDS: [SurfaceKind; 14] = [
+    SurfaceKind::Dashboard,
+    SurfaceKind::Draft,
+    SurfaceKind::Transcript,
+    SurfaceKind::File,
+    SurfaceKind::Shell,
+    SurfaceKind::Diff,
+    SurfaceKind::Terminal,
+    SurfaceKind::Browser,
+    SurfaceKind::SlackList,
+    SurfaceKind::SlackResults,
+    SurfaceKind::SlackConversation,
+    SurfaceKind::Messages,
+    SurfaceKind::Usage,
+    SurfaceKind::Image,
+];
+
+#[derive(Clone, Copy)]
+struct SurfaceState {
+    focused: SurfaceKind,
+    visible: u16,
+}
+
+#[derive(Serialize)]
+struct Snapshot<'a> {
+    schema: &'static str,
+    version: u32,
+    captured_unix_ms: u64,
+    application: &'static str,
+    application_version: &'a str,
+    build: BuildInfo,
+    monotonic_origin_ns: Option<u64>,
+    cpu_profile: Option<CpuProfileSnapshot>,
+    frames: Vec<FrameRecord>,
+    /// How many frame records have ever been pushed, against however many
+    /// are in `frames`. The difference is what the ring dropped, and
+    /// without it a total over `frames` is a total over an unknown window.
+    frames_pushed: u64,
+    editor: Vec<EditorRecord>,
+    /// The same for the editor ring, which is the one that misleads: it
+    /// holds 4,096 records, and on a real report it has covered seconds
+    /// while `frames` covered minutes.
+    editor_pushed: u64,
+    /// Main-thread work that happened outside any frame.
+    main_thread_work: Vec<MainThreadWorkRecord>,
+    main_thread_work_pushed: u64,
+    browser: Vec<BrowserRecord>,
+    browser_frames: Vec<BrowserFrameRecord>,
+    browser_commands: Vec<BrowserCommandRecord>,
+    browser_handoffs: Vec<HandoffEventRecord>,
+    browser_tab_states: Vec<TabStateRecord>,
+}
+
+#[derive(Serialize)]
+struct CpuProfileSnapshot {
+    sampling_hz: u64,
+    history_seconds: u64,
+    maximum_tail_gap_ms: u64,
+    tail_unsealed: bool,
+    format: &'static str,
+    encoding: &'static str,
+    segments: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BuildInfo {
+    profile: &'static str,
+    opt_level: &'static str,
+    target: &'static str,
+    debug_assertions: bool,
+}
+
+#[derive(Serialize)]
+struct FrameRecord {
+    window_id: u64,
+    start_ns: u64,
+    draw_ns: u64,
+    prepaint_ns: u64,
+    paint_ns: u64,
+    finish_ns: u64,
+    present_ns: Option<u64>,
+    draw_to_present_ns: Option<u64>,
+    dirty_to_draw_ns: Option<u64>,
+    invalidations: u64,
+    focused_surface: &'static str,
+    visible_surfaces: Vec<&'static str>,
+    /// What the frame had to draw, summed over the elements that reported.
+    /// A duration divided by nothing explains nothing.
+    visible_rows: u64,
+    total_rows: u64,
+    blocks: u64,
+    excerpts: u64,
+    inlays: u64,
+    cursors: u64,
+}
+
+#[derive(Serialize)]
+struct MainThreadWorkRecord {
+    owner: &'static str,
+    start_ns: u64,
+    duration_ns: u64,
+    work_units: u64,
+}
+
+#[derive(Serialize)]
+struct EditorRecord {
+    stage: &'static str,
+    start_ns: u64,
+    duration_ns: u64,
+    tid: u64,
+    input_edits: u64,
+    input_start: u64,
+    input_rows: u64,
+    output_edits: u64,
+    output_start: u64,
+    output_rows: u64,
+    old_rows: u64,
+    new_rows: u64,
+    pending_batches: u64,
+    flags: u64,
+    transforms: u64,
+    affected_start: u64,
+    affected_end: u64,
+    affected_offsets: u64,
+}
+
+#[derive(Serialize)]
+struct BrowserRecord {
+    stage: &'static str,
+    scene_id: u64,
+    barrier: u64,
+    related_scene_id: Option<u64>,
+    at_ns: u64,
+    duration_ns: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BrowserCommandRecord {
+    method: String,
+    at_ns: u64,
+    round_trip_us: u32,
+    handler_us: Option<u32>,
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct HandoffEventRecord {
+    at_ns: u64,
+    generation: u64,
+    event: &'static str,
+    barrier: u64,
+}
+
+#[derive(Serialize)]
+struct TabStateRecord {
+    at_ns: u64,
+    state: String,
+    reason: String,
+    page_id: String,
+    tab_id: i64,
+    active: Option<bool>,
+    discarded: Option<bool>,
+    frozen: Option<bool>,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct BrowserFrameRecord {
+    tab_id: i64,
+    at_ns: u64,
+    frames: u32,
+    window_ms: u32,
+    mean_interval_us: u32,
+    p95_interval_us: u32,
+    max_interval_us: u32,
+    long_frames: u32,
+}
+
+pub fn enable() {
+    STARTED.get_or_init(Instant::now);
+    MONOTONIC_ORIGIN_NS.get_or_init(rho_profiling::monotonic_ns);
+    gpui::profiler::set_frame_trace_enabled(true);
+    gpui::profiler::set_editor_trace_enabled(true);
+}
+
+struct PassiveCpuProfiler {
+    profiler: rho_profiling::CpuProfiler,
+    _directory: tempfile::TempDir,
+}
+
+pub fn enable_passive_cpu_profile() -> anyhow::Result<()> {
+    let mut passive = PASSIVE_CPU
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if passive.is_some() {
+        return Ok(());
+    }
+    let directory = tempfile::Builder::new().prefix("rho-gui-cpu-").tempdir()?;
+    let profiler = rho_profiling::CpuProfiler::start_rolling(
+        directory.path().join("trace.bin"),
+        CPU_ROTATION_PERIOD,
+        CPU_TRACE_DISK_BUDGET,
+    )?;
+    *passive = Some(PassiveCpuProfiler {
+        profiler,
+        _directory: directory,
+    });
+    Ok(())
+}
+
+pub fn shutdown_passive_cpu_profile() {
+    let passive = PASSIVE_CPU
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(passive) = passive
+        && let Err(error) = passive.profiler.shutdown()
+    {
+        tracing::warn!(%error, "failed to shut down passive GUI CPU profiler");
+    }
+}
+
+/// Records the privacy-safe kind of content being composed into the frame.
+pub(crate) fn record_surfaces(focused: SurfaceKind, visible: u16) {
+    let mut surfaces = SURFACES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if surfaces.len() == MAX_SNAPSHOT_FRAMES {
+        surfaces.pop_front();
+    }
+    surfaces.push_back((Instant::now(), SurfaceState { focused, visible }));
+}
+
+pub(crate) fn snapshot() -> anyhow::Result<Vec<u8>> {
+    let cpu_profiles = PASSIVE_CPU
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|passive| passive.profiler.snapshot_segments(CPU_SNAPSHOT_SEGMENTS))
+        .transpose()?;
+    let tail_unsealed = cpu_profiles.as_ref().is_some_and(|cpu| cpu.tail_unsealed);
+    let cpu_profiles = cpu_profiles.map(|cpu| cpu.segments).unwrap_or_default();
+    snapshot_with_cpu_profiles(&cpu_profiles, tail_unsealed)
+}
+
+fn snapshot_with_cpu_profiles(
+    cpu_profiles: &[Vec<u8>],
+    tail_unsealed: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let started = *STARTED.get_or_init(Instant::now);
+    let frames = gpui::profiler::snapshot_frame_timings();
+    let frames_pushed = gpui::profiler::frame_timings_pushed();
+    let editor = gpui::profiler::snapshot_editor_timings();
+    let editor_pushed = gpui::profiler::editor_timings_pushed();
+    let presents = gpui::profiler::snapshot_present_timings();
+    let browser = rho_browser::snapshot_browser_timings();
+    let surfaces = SURFACES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let frames = frames
+        .into_iter()
+        .rev()
+        .take(MAX_SNAPSHOT_FRAMES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|timing| {
+            let present = presents
+                .iter()
+                .skip(presents.partition_point(|present| present.start < timing.draw_end))
+                .find(|present| present.window_id == timing.window_id);
+            let surface = surfaces
+                .partition_point(|(at, _)| *at <= timing.draw_end)
+                .checked_sub(1)
+                .map(|index| surfaces[index].1);
+            FrameRecord {
+                present_ns: present.map(|present| {
+                    duration_ns(present.end.saturating_duration_since(present.start))
+                }),
+                draw_to_present_ns: present.map(|present| {
+                    duration_ns(present.start.saturating_duration_since(timing.draw_end))
+                }),
+                window_id: timing.window_id.as_u64(),
+                start_ns: duration_ns(timing.draw_start.saturating_duration_since(started)),
+                draw_ns: duration_ns(timing.draw_duration()),
+                prepaint_ns: duration_ns(timing.prepaint_duration()),
+                paint_ns: duration_ns(timing.paint_duration()),
+                finish_ns: duration_ns(timing.finish_duration()),
+                dirty_to_draw_ns: timing.dirty_to_draw_duration().map(duration_ns),
+                invalidations: timing.invalidations,
+                focused_surface: surface
+                    .map(|surface| surface.focused.name())
+                    .unwrap_or("unknown"),
+                visible_surfaces: surface
+                    .map(|surface| {
+                        SURFACE_KINDS
+                            .into_iter()
+                            .filter(|kind| surface.visible & kind.bit() != 0)
+                            .map(SurfaceKind::name)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                visible_rows: timing.work.visible_rows,
+                total_rows: timing.work.total_rows,
+                blocks: timing.work.blocks,
+                excerpts: timing.work.excerpts,
+                inlays: timing.work.inlays,
+                cursors: timing.work.cursors,
+            }
+        })
+        .collect();
+    let editor = editor
+        .into_iter()
+        .rev()
+        .take(MAX_SNAPSHOT_EDITOR_EVENTS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|timing| EditorRecord {
+            stage: editor_stage_name(timing.kind),
+            start_ns: duration_ns(timing.start.saturating_duration_since(started)),
+            duration_ns: duration_ns(timing.end.saturating_duration_since(timing.start)),
+            tid: timing.tid,
+            input_edits: timing.input_edits,
+            input_start: timing.input_start,
+            input_rows: timing.input_rows,
+            output_edits: timing.output_edits,
+            output_start: timing.output_start,
+            output_rows: timing.output_rows,
+            old_rows: timing.old_rows,
+            new_rows: timing.new_rows,
+            transforms: timing.transforms,
+            affected_start: timing.affected_start,
+            affected_end: timing.affected_end,
+            affected_offsets: timing.affected_offsets,
+            pending_batches: timing.pending_batches,
+            flags: timing.flags,
+        })
+        .collect();
+    let browser = browser
+        .into_iter()
+        .map(|timing| BrowserRecord {
+            stage: browser_stage_name(timing.kind),
+            scene_id: timing.scene_id,
+            barrier: timing.barrier,
+            related_scene_id: timing.related_scene_id,
+            at_ns: duration_ns(timing.at.saturating_duration_since(started)),
+            duration_ns: timing.duration.map(duration_ns),
+        })
+        .collect();
+    let browser_frames = rho_browser::snapshot_extension_frame_stats()
+        .into_iter()
+        .map(|stats| BrowserFrameRecord {
+            tab_id: stats.tab_id,
+            at_ns: duration_ns(stats.at.saturating_duration_since(started)),
+            frames: stats.frames,
+            window_ms: stats.window_ms,
+            mean_interval_us: stats.mean_interval_us,
+            p95_interval_us: stats.p95_interval_us,
+            max_interval_us: stats.max_interval_us,
+            long_frames: stats.long_frames,
+        })
+        .collect();
+    let browser_commands = rho_browser::snapshot_extension_command_stats()
+        .into_iter()
+        .map(|stats| BrowserCommandRecord {
+            at_ns: duration_ns(stats.at.saturating_duration_since(started)),
+            method: stats.method,
+            round_trip_us: stats.round_trip_us,
+            handler_us: stats.handler_us,
+            ok: stats.ok,
+        })
+        .collect();
+    let browser_handoffs = rho_browser::snapshot_handoff_events()
+        .into_iter()
+        .map(|event| HandoffEventRecord {
+            at_ns: duration_ns(event.at.saturating_duration_since(started)),
+            generation: event.generation,
+            event: event.event,
+            barrier: event.barrier,
+        })
+        .collect();
+    let browser_tab_states = rho_browser::snapshot_tab_state_events()
+        .into_iter()
+        .map(|event| TabStateRecord {
+            at_ns: duration_ns(event.at.saturating_duration_since(started)),
+            state: event.state,
+            reason: event.reason,
+            page_id: event.page_id,
+            tab_id: event.tab_id,
+            active: event.active,
+            discarded: event.discarded,
+            frozen: event.frozen,
+            status: event.status,
+        })
+        .collect();
+    let (main_thread_work, main_thread_work_pushed) = gpui::profiler::snapshot_main_thread_work();
+    let main_thread_work = main_thread_work
+        .into_iter()
+        .rev()
+        .take(MAX_SNAPSHOT_FRAMES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|work| MainThreadWorkRecord {
+            owner: main_thread_work_owner(work.owner),
+            start_ns: duration_ns(work.start.saturating_duration_since(started)),
+            duration_ns: duration_ns(work.end.saturating_duration_since(work.start)),
+            work_units: work.work_units,
+        })
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&Snapshot {
+        schema: "dev.rho.gui-performance-snapshot",
+        version: 11,
+        captured_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        application: "rho-gui",
+        application_version: env!("CARGO_PKG_VERSION"),
+        build: BuildInfo {
+            profile: env!("RHO_BUILD_PROFILE"),
+            opt_level: env!("RHO_BUILD_OPT_LEVEL"),
+            target: env!("RHO_BUILD_TARGET"),
+            debug_assertions: cfg!(debug_assertions),
+        },
+        monotonic_origin_ns: { MONOTONIC_ORIGIN_NS.get().copied() },
+        cpu_profile: (!cpu_profiles.is_empty()).then(|| {
+            use base64::Engine as _;
+            CpuProfileSnapshot {
+                sampling_hz: 100,
+                history_seconds: CPU_ROTATION_PERIOD.as_secs() * CPU_SNAPSHOT_SEGMENTS as u64,
+                // With the unsealed segment in hand the newest sample is as
+                // new as the last flush, not as old as the last rotation.
+                maximum_tail_gap_ms: if tail_unsealed {
+                    0
+                } else {
+                    CPU_ROTATION_PERIOD.as_millis() as u64
+                },
+                tail_unsealed,
+                format: "dial9-trace-v4",
+                encoding: "base64",
+                segments: cpu_profiles
+                    .iter()
+                    .map(|trace| base64::engine::general_purpose::STANDARD.encode(trace))
+                    .collect(),
+            }
+        }),
+        frames,
+        frames_pushed,
+        editor,
+        editor_pushed,
+        main_thread_work,
+        main_thread_work_pushed,
+        browser,
+        browser_frames,
+        browser_commands,
+        browser_handoffs,
+        browser_tab_states,
+    })?;
+    anyhow::ensure!(
+        bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        "GUI performance snapshot exceeds the upload limit"
+    );
+    Ok(bytes)
+}
+
+fn browser_stage_name(kind: rho_browser::BrowserTimingKind) -> &'static str {
+    use rho_browser::BrowserTimingKind::*;
+    match kind {
+        SceneProduced => "scene_produced",
+        SceneCoalesced => "scene_coalesced",
+        SceneReceived => "scene_received",
+        SceneScheduled => "scene_scheduled",
+        ScenePainted => "scene_painted",
+        FrameAcknowledged => "frame_acknowledged",
+        FrameCallbackSent => "frame_callback_sent",
+        HostFrameCallbackSent => "frame_callback_sent_host",
+        FallbackFrameCallbackSent => "frame_callback_sent_fallback",
+    }
+}
+
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+/// What a span of main-thread work is called in a report or a profile.
+/// Public because the rig's `.work.json` sidecar names owners the same way,
+/// and two spellings of `desk_sync` would be two things to a reader.
+pub fn main_thread_work_owner(kind: gpui::profiler::MainThreadWorkKind) -> &'static str {
+    use gpui::profiler::MainThreadWorkKind::*;
+    match kind {
+        ModelEvent => "model_event",
+        DeskSync => "desk_sync",
+        TaskCompletion => "task_completion",
+        // The label is the name: a span the caller named is reported
+        // under that name and nothing else, so `desk_sync/…` sorts and
+        // reads beside the `desk_sync` it is part of.
+        Other(label) => label,
+    }
+}
+
+fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
+    use gpui::profiler::EditorTimingKind::*;
+    match kind {
+        BufferEdit => "buffer_edit",
+        MultiBufferSync => "multi_buffer_sync",
+        InlayMapSync => "inlay_map_sync",
+        FoldMapSync => "fold_map_sync",
+        TabMapSync => "tab_map_sync",
+        WrapMapSync => "wrap_map_sync",
+        BlockMapSync => "block_map_sync",
+        WrapMapUpdate => "wrap_map_update",
+        SyncTree => "sync_tree",
+        SpliceInlays => "splice_inlays",
+        MultiBufferBufferScan => "multi_buffer_buffer_scan",
+        HighlightedChunks => "highlighted_chunks",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn snapshot_is_versioned_and_bounded() {
+        super::enable();
+        let draw_start = std::time::Instant::now();
+        super::record_surfaces(
+            super::SurfaceKind::Transcript,
+            super::SurfaceKind::Transcript.bit() | super::SurfaceKind::Browser.bit(),
+        );
+        gpui::profiler::record_frame_timing(gpui::profiler::FrameTiming {
+            window_id: gpui::WindowId::from(99),
+            dirty_at: Some(draw_start),
+            invalidations: 3,
+            draw_start,
+            prepaint_end: draw_start + std::time::Duration::from_millis(1),
+            paint_end: draw_start + std::time::Duration::from_millis(3),
+            draw_end: draw_start + std::time::Duration::from_millis(4),
+            work: gpui::profiler::FrameWorkScale::default(),
+        });
+        gpui::profiler::record_present_timing(gpui::profiler::PresentTiming {
+            window_id: gpui::WindowId::from(99),
+            start: draw_start + std::time::Duration::from_millis(5),
+            end: draw_start + std::time::Duration::from_millis(7),
+        });
+        rho_browser::record_browser_timing(
+            rho_browser::BrowserTimingKind::ScenePainted,
+            42,
+            7,
+            None,
+            Some(std::time::Duration::from_millis(3)),
+        );
+        let bytes = super::snapshot_with_cpu_profiles(&[], false).unwrap();
+        assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
+        assert_eq!(value["version"], 11);
+        assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
+        assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
+        assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));
+        assert_eq!(value["build"]["debug_assertions"], cfg!(debug_assertions));
+        assert!(value["cpu_profile"].is_null());
+        assert!(value["frames"].is_array());
+        let frame = value["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|frame| frame["invalidations"] == 3)
+            .unwrap();
+        assert_eq!(frame["draw_ns"], 4_000_000);
+        assert_eq!(frame["prepaint_ns"], 1_000_000);
+        assert_eq!(frame["paint_ns"], 2_000_000);
+        assert_eq!(frame["finish_ns"], 1_000_000);
+        assert_eq!(frame["present_ns"], 2_000_000);
+        assert_eq!(frame["draw_to_present_ns"], 1_000_000);
+        assert_eq!(frame["focused_surface"], "transcript");
+        // Schema 11: a frame carries what it had to draw. Recorded here as
+        // zero because this test drives the profiler directly and no
+        // element reported, which is the honest value — the point is that
+        // the fields exist and travel, not that this test invents a scale.
+        assert_eq!(frame["visible_rows"], 0);
+        assert_eq!(frame["total_rows"], 0);
+        assert!(frame["excerpts"].is_number());
+        assert!(frame["inlays"].is_number());
+        assert!(value["frames_pushed"].is_number());
+        assert!(value["editor_pushed"].is_number());
+        assert!(value["main_thread_work"].is_array());
+        assert_eq!(
+            frame["visible_surfaces"],
+            serde_json::json!(["transcript", "browser"])
+        );
+        assert!(value["editor"].is_array());
+        assert!(value["browser"].is_array());
+        assert!(value["browser"].as_array().unwrap().iter().any(|record| {
+            record["stage"] == "scene_painted" && record["scene_id"] == 42 && record["barrier"] == 7
+        }));
+        assert!(value["browser_handoffs"].is_array());
+        assert!(value["browser_tab_states"].is_array());
+    }
+
+    #[test]
+    fn snapshot_embeds_dial9_profile() {
+        let bytes = super::snapshot_with_cpu_profiles(&[vec![1, 2, 3]], false).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["cpu_profile"]["format"], "dial9-trace-v4");
+        assert_eq!(value["cpu_profile"]["encoding"], "base64");
+        assert_eq!(
+            value["cpu_profile"]["segments"],
+            serde_json::json!(["AQID"])
+        );
+        assert_eq!(value["cpu_profile"]["tail_unsealed"], false);
+        assert_eq!(
+            value["cpu_profile"]["maximum_tail_gap_ms"],
+            super::CPU_ROTATION_PERIOD.as_millis() as u64
+        );
+    }
+
+    /// The unsealed tail is the part that holds a stall, so a reader must be
+    /// able to tell it apart from the sealed history and know there is no
+    /// rotation-sized hole in front of it.
+    #[test]
+    fn an_unsealed_tail_is_marked_and_leaves_no_gap() {
+        let bytes = super::snapshot_with_cpu_profiles(&[vec![1, 2, 3]], true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["cpu_profile"]["tail_unsealed"], true);
+        assert_eq!(value["cpu_profile"]["maximum_tail_gap_ms"], 0);
+    }
+}

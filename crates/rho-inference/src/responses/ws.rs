@@ -7,9 +7,10 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderMap;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::oauth::ResolvedAuth;
+use super::route::DialRoute;
 use super::session::SessionConfig;
 use super::wire::ResponsesRequest;
 use super::{OPENAI_BETA_WS, responses_url};
@@ -39,12 +40,13 @@ pub(crate) struct WebSocketConnection {
     /// Response id returned on this live connection. It is only used as
     /// `previous_response_id` when that same id is present in the next prompt.
     pub(crate) cached_response_id: Option<String>,
+    pub(crate) route: DialRoute,
     ping_interval: tokio::time::Interval,
     last_event_at: tokio::time::Instant,
 }
 
 impl WebSocketConnection {
-    pub(crate) fn new(socket: WebSocket, auth: &ResolvedAuth) -> Self {
+    pub(crate) fn new(socket: WebSocket, auth: &ResolvedAuth, route: DialRoute) -> Self {
         let now = tokio::time::Instant::now();
         Self {
             socket,
@@ -52,6 +54,7 @@ impl WebSocketConnection {
             bearer_token: auth.bearer_token.clone(),
             client_secret: auth.client_secret,
             cached_response_id: None,
+            route,
             ping_interval: tokio::time::interval_at(now + PING_INTERVAL, PING_INTERVAL),
             last_event_at: now,
         }
@@ -91,6 +94,25 @@ impl WebSocketConnection {
     ) -> Result<()> {
         self.socket.send(WsMessage::Pong(payload)).await?;
         Ok(())
+    }
+}
+
+pub(crate) async fn connect(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    route: DialRoute,
+) -> std::result::Result<
+    (
+        WebSocket,
+        tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    match route.ip() {
+        None => connect_async(request).await,
+        Some(ip) => {
+            let tcp = TcpStream::connect((ip, 443)).await?;
+            tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None).await
+        }
     }
 }
 
@@ -146,7 +168,15 @@ pub(crate) fn build_ws_request(
     thread_id: Option<&str>,
     auth: &ResolvedAuth,
 ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
-    let url = build_ws_url(session)?;
+    build_ws_request_for_base_url(&session.base_url, thread_id, auth)
+}
+
+pub(crate) fn build_ws_request_for_base_url(
+    base_url: &str,
+    thread_id: Option<&str>,
+    auth: &ResolvedAuth,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let url = build_ws_url(base_url)?;
     let mut request = url.into_client_request()?;
     set_header(request.headers_mut(), "OpenAI-Beta", OPENAI_BETA_WS)?;
     set_header(
@@ -164,8 +194,8 @@ pub(crate) fn build_ws_request(
     Ok(request)
 }
 
-fn build_ws_url(session: &SessionConfig) -> Result<String> {
-    let url = responses_url(&session.base_url);
+fn build_ws_url(base_url: &str) -> Result<String> {
+    let url = responses_url(base_url);
     if let Some(rest) = url.strip_prefix("https://") {
         Ok(format!("wss://{rest}"))
     } else if let Some(rest) = url.strip_prefix("http://") {

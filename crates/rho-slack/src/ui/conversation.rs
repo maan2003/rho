@@ -1,0 +1,4024 @@
+//! One conversation: a transcript with a compose region at its end.
+//!
+//! A channel, a group, a DM, and a thread are the same surface. What differs
+//! is where a composed message goes, and that is the source's business, not
+//! the view's.
+//!
+//! Block Kit is rendered to text by the model, so the transcript is plain
+//! prose carrying the host's Markdown pipeline, exactly like the agent
+//! transcript beside it.
+
+use std::collections::HashSet;
+use std::ops::Range;
+use std::rc::Rc;
+
+use editor::scroll::{Autoscroll, AutoscrollStrategy};
+use editor::{
+    CompletionContext, CompletionProvider, Editor, EditorEvent, EditorMode, Inlay,
+    SelectionEffects, SizingBehavior,
+};
+use gpui::prelude::*;
+use gpui::{App, Context, Entity, EventEmitter, Task, Window, div};
+use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
+use multi_buffer::{MultiBuffer, PathKey};
+use rho_transcript::{BlockSpec, Item, Transcript};
+use theme::ActiveTheme as _;
+
+use crate::model::Model;
+use crate::session::{Session, Source, Update};
+use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
+use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
+
+/// The composer's placeholder, which is the only custom inlay this surface
+/// puts in its editor.
+const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
+
+/// The stripe down the gutter beside the composer, the agent transcript's
+/// prompt marker worn by the Slack surface.
+pub struct ComposeGutter;
+
+/// The stripe beside what hangs off a message: an attachment's card, a link
+/// preview, a file. The agent transcript marks the user's own message this
+/// way, and here it says the same thing -- these lines came with the
+/// message rather than being the words in it.
+pub struct ChromeGutter;
+
+pub struct ConversationView {
+    session: Entity<Session>,
+    source: Source,
+    /// The messages on screen, each keyed and each owning its own range: a
+    /// new message rewrites one item, not the conversation.
+    transcript: Transcript<Row, Class, LineMeta, ChromeGutter>,
+    input: Entity<Buffer>,
+    multi_buffer: Entity<MultiBuffer>,
+    editor: Entity<Editor>,
+    /// How far the session's messages have been applied here.
+    revision: u64,
+    /// Whether the surface is writing the transcript. The edits move the
+    /// cursor and the view on their own, and none of that is the reader
+    /// asking for anything.
+    editing: bool,
+    /// Set by a rebuild: every row went, so the scroll the reader had is
+    /// meaningless and the point the refresh puts back is centred.
+    centre_on_the_point: bool,
+    /// How long the last redraw took. The per-event path is one of the few
+    /// where a number is the requirement, so the surface times itself and a
+    /// test reads it, rather than a test timing the socket and the executor
+    /// along with it.
+    #[cfg(any(test, feature = "fake"))]
+    last_refresh: std::time::Duration,
+    /// One user action buys one page. Set when a fill is asked for, cleared
+    /// when the reader scrolls or moves the cursor themselves, so a landed
+    /// page cannot walk the whole conversation back to its beginning.
+    fill: Fill,
+    /// Where the surface last put the view and the cursor itself. The events
+    /// that come back for those are not the reader moving, and must not buy
+    /// another page.
+    moved: Moved,
+    /// The message a deal is about: tinted, and the place the surface puts
+    /// the cursor when it opens. It stays for the life of the surface, so
+    /// the reader can scroll away and still find what they were dealt.
+    dealt: Option<Ts>,
+    /// Why the surface landed there. Only the tint depends on it: the
+    /// reader is owed the difference between the message rho asked them to
+    /// answer and the message they went looking for.
+    landing: Landing,
+    /// Whether the dealt message has been scrolled to yet. It may not be
+    /// loaded when the deal opens; the first refresh that brings it in does
+    /// the scroll.
+    dealt_placed: bool,
+    /// Slack's read cursor as it stood when the surface opened. Opening
+    /// marks the conversation read, so this is taken once and kept: the
+    /// rule has to stay where the reader found it for as long as they are
+    /// reading, or it would vanish out from under them.
+    unread_from: Option<Ts>,
+    /// The message the rule currently sits above, and whether the cursor
+    /// has been put there yet. The first unread may arrive a page later
+    /// than the surface, so both are settled on the refresh that brings it.
+    unread_at: Option<Ts>,
+    unread_placed: bool,
+    /// Messages that arrived at the live end while the reader was reading
+    /// further up. The status line says how many; reaching the end again
+    /// clears it, because then they have been seen.
+    unseen: usize,
+    /// The picture the next message carries, if the reader attached one.
+    /// One at a time: a second attachment replaces it, which is what the
+    /// chip shows.
+    attached: Option<Attached>,
+    /// The message being rewritten, if `e` is open on one: tinted, and what
+    /// `enter` updates instead of sending. The composer's own text is held
+    /// beside it so `escape` gives the reader back what they were writing.
+    editing_message: Option<Ts>,
+    held_compose: Option<String>,
+    /// Messages drawn before their picture had finished downloading, by the
+    /// file the message is waiting on. Nothing in the update log speaks for
+    /// a download, so the surface remembers this itself.
+    awaiting_images: Vec<(Ts, String)>,
+    /// Messages drawn while the roster had no name for their author, so the
+    /// row says "someone". The name arriving is not a change to the message
+    /// and is not in the update log either, so the surface remembers which
+    /// rows are waiting on one and redraws exactly those.
+    awaiting_names: Vec<Ts>,
+    _subscriptions: Vec<gpui::Subscription>,
+}
+
+/// What the surface asks its host for. Showing a picture is the host's
+/// business: this crate knows which file was asked for, not what the frame
+/// around it can draw.
+pub enum Event {
+    OpenFile(FileSummary),
+    /// A dropped path that could not be read. The host says so; this crate
+    /// has no notice line of its own.
+    AttachFailed(String),
+    /// A dropped path the surface would not take, because an edit is open.
+    /// The host says why, the same as it does for the other two ways in.
+    AttachRefused,
+    /// The message a rewrite was open on was deleted by someone else. The
+    /// rewrite has closed and the words are back in the composer; the host
+    /// says so, because this crate has no notice line of its own.
+    RewriteLost,
+}
+
+/// What a press of enter turned out to be, once Slack had answered.
+///
+/// The host records the reader's day from this, so nothing in here is what
+/// was attempted: only what happened. A refused write is `Refused`, and the
+/// surface has already put the words back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// Nothing to send: an empty composer with no picture waiting.
+    Nothing,
+    /// A new message went out.
+    Sent,
+    /// The rewrite of this message was accepted.
+    Edited(Ts),
+    /// A picture of this many bytes went out with its message.
+    FileSent(u64),
+    /// Slack refused the write.
+    Refused,
+}
+
+/// What came of asking to attach a picture. The host says a different line
+/// for each, so this is the answer rather than a bare yes and no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attaching {
+    /// The chip is now showing this picture, and there was none before.
+    Attached,
+    /// It took the place of one already waiting, which the reader is told
+    /// so they do not send the wrong file.
+    Replaced,
+    /// An edit is open, and a rewrite cannot carry a picture.
+    NotWhileEditing,
+}
+
+/// A picture waiting to go with the next message: what the chip shows and
+/// what `enter` uploads.
+#[derive(Clone)]
+pub struct Attached {
+    pub name: String,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+}
+
+impl Attached {
+    /// The chip, which reads like a file line in the transcript because it
+    /// is about to become one.
+    fn line(&self) -> String {
+        format!(
+            "{} · {}",
+            self.name,
+            crate::types::human_size(self.bytes.len() as u64)
+        )
+    }
+}
+
+/// One emoji a reaction menu can offer: the shortcode Slack takes, the
+/// glyph the reader reads, and whether the reader is already one of the
+/// reactors — which is what decides whether pressing it puts theirs on or
+/// takes it off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionChoice {
+    pub name: String,
+    pub glyph: String,
+    pub mine: bool,
+}
+
+/// What a reaction menu over the message under the point is about.
+///
+/// Two rows of choices, in the order a reader wants them: what is already
+/// on the message, because joining a reaction is the commonest thing
+/// anyone does with one, and then what this reader reaches for. Anything
+/// else is typed by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionChoices {
+    pub ts: Ts,
+    pub on_message: Vec<ReactionChoice>,
+    pub recent: Vec<ReactionChoice>,
+}
+
+/// What asking for an edit did. A message that is not the reader's own is
+/// the one case worth telling them about: nothing happens, and silence
+/// would read as a broken key.
+pub enum EditStart {
+    Started(Ts),
+    NotYours,
+    Nothing,
+}
+
+impl EventEmitter<Event> for ConversationView {}
+
+/// One page per user action, and the two cases where nobody has asked yet:
+/// opening a conversation whose mirrored run is short, and a gap line on a
+/// view that has not asked for anything.
+#[derive(Default)]
+struct Fill {
+    asked: bool,
+    /// Whether the reader has moved at all. A conversation opening onto a
+    /// gap asks once for history, but a run that has not caught up with the
+    /// live end waits to be scrolled onto: opening is not a request to walk
+    /// forward through everything missed.
+    moved: bool,
+}
+
+impl Fill {
+    /// The reader scrolled or moved the cursor: the next fill is theirs to
+    /// buy again.
+    fn user_moved(&mut self) {
+        self.asked = false;
+        self.moved = true;
+    }
+
+    /// The one page this action buys, if the view is sitting on something
+    /// worth asking for.
+    fn wants(&mut self, want: Option<Want>) -> Option<Want> {
+        if self.asked {
+            return None;
+        }
+        let want = match want? {
+            Want::Newer(_) if !self.moved => return None,
+            want => want,
+        };
+        self.asked = true;
+        Some(want)
+    }
+}
+
+/// Which side of the loaded run a page is wanted on. Paging back happens at
+/// the top; a hole is filled forward from the message it sits over, because
+/// that is the end the reader has read up to.
+#[derive(Clone, Debug, PartialEq)]
+enum Want {
+    Older,
+    Newer(Ts),
+}
+
+/// What the surface moved on its own, so the resulting events can be told
+/// apart from the reader's own scrolling and cursor motion.
+#[derive(Default)]
+struct Moved {
+    scroll: Option<f64>,
+    cursor: Option<u32>,
+    /// Whether the reader has just moved the cursor. The scroll that brings
+    /// the view to it is part of that motion, not a second action: without
+    /// this, one `G` at the bottom of a hole buys two pages.
+    after_selection: bool,
+}
+
+/// What the transcript keys on. Day rules and the gap notice are items like
+/// any other, so they insert and disappear through the same path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Row {
+    /// The loading or failure line above everything.
+    Notice,
+    /// "older messages not loaded", while the run does not reach the start.
+    Gap,
+    /// "newer messages not loaded", under the message a hole sits over.
+    Newer(Ts),
+    Day(String),
+    /// `── new ──`: everything under it arrived since the reader last read
+    /// the conversation.
+    Unread,
+    Message(Ts),
+    /// The picture waiting to go with the next message, under everything
+    /// and over the composer.
+    Chip,
+}
+
+/// What a line offers the cursor.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LineMeta {
+    /// The thread the line belongs to, so `enter` opens the right one.
+    thread: Option<Ts>,
+    /// The file the line names, which `enter` opens instead.
+    file: Option<FileSummary>,
+    /// The URL the line stands for. The text shows a link's label alone, so
+    /// this is the only place the address survives for `enter` to open.
+    link: Option<String>,
+    /// The pictures that hang under this line. A picture has no line of its
+    /// own — it is the whole of what it has to say — so the message's last
+    /// line before its reactions carries them.
+    images: Vec<FileSummary>,
+}
+
+type Rendered = Item<Row, Class, LineMeta>;
+
+impl ConversationView {
+    pub fn new(
+        session: Entity<Session>,
+        source: Source,
+        hooks: Hooks,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The conversation is a document of Markdown blocks, one to a
+        // message, read by the same pipeline the agent transcript uses: it
+        // parses the markup, conceals the markers and styles what is left,
+        // so nothing here paints emphasis, code or a link by hand.
+        let transcript = cx.new(|cx| {
+            let mut buffer = Buffer::local("", cx);
+            buffer.set_capability(Capability::Read, cx);
+            (hooks.configure_markdown)(&mut buffer, cx);
+            buffer
+        });
+        let input = cx.new(|cx| Buffer::local("", cx));
+        let multi_buffer = cx.new(|cx| {
+            let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(0),
+                transcript.clone(),
+                [Point::zero()..transcript.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(1),
+                input.clone(),
+                [Point::zero()..input.read(cx).max_point()],
+                0,
+                cx,
+            );
+            multi_buffer
+        });
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                multi_buffer.clone(),
+                None,
+                window,
+                cx,
+            );
+            (hooks.configure_editor)(&mut editor, window, cx);
+            editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
+            editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
+            // Completion is the composer's, not the transcript's: the
+            // provider answers for that one buffer and nothing else.
+            editor.set_completion_provider(Some(Rc::new(ComposeCompletions {
+                session: session.downgrade(),
+                channel: source.channel().clone(),
+                input: input.entity_id(),
+            })));
+            editor
+        });
+
+        let mut subscriptions = vec![cx.observe_in(&session, window, |this, _, window, cx| {
+            this.refresh(window, cx);
+        })];
+        // The placeholder goes on the first keystroke and comes back when the
+        // reader empties the composer again, so the boundary is never a bare
+        // line whatever they do to it.
+        subscriptions.push(cx.subscribe(&input, |this, _, event: &BufferEvent, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                this.apply_compose_chrome(cx);
+            }
+        }));
+        // History fills as the reader scrolls, and there is no other way to
+        // ask for it. The fetch starts a screen early so the older messages
+        // are usually already there by the time the top comes into view.
+        subscriptions.push(
+            cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
+                match event {
+                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {
+                        let position = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
+                        // The surface's own re-anchoring comes back as a
+                        // scroll event too, and so does the view following
+                        // the content when a page lands under the cursor.
+                        // Only the reader's own counts, or one keypress at
+                        // the bottom of a hole would walk the whole way down
+                        // it a page at a time.
+                        if this.moved.scroll == Some(position) {
+                            this.moved.scroll = None;
+                        } else if *local && !*autoscroll && !this.moved.after_selection {
+                            this.fill.user_moved();
+                        }
+                        this.moved.after_selection = false;
+                        cx.notify();
+                    }
+                    // A reader already at the top who presses `gg` moves the
+                    // cursor without moving the view, so no scroll event
+                    // comes: the motion is the action.
+                    EditorEvent::SelectionsChanged { local: true } => {
+                        // An edit under the cursor shifts it: the transcript
+                        // growing is not the reader moving.
+                        if this.editing {
+                            return;
+                        }
+                        let row = this.cursor_row(cx) as u32;
+                        if this.moved.cursor == Some(row) {
+                            this.moved.cursor = None;
+                            return;
+                        }
+                        this.moved.after_selection = true;
+                        this.fill.user_moved();
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }),
+        );
+
+        let mut view = Self {
+            session: session.clone(),
+            source: source.clone(),
+            transcript: {
+                let mut transcript = Transcript::new(transcript);
+                transcript.set_gutter(hooks.gutter_colour);
+                transcript
+            },
+            input,
+            multi_buffer,
+            editor,
+            revision: 0,
+            editing: false,
+            centre_on_the_point: false,
+            #[cfg(any(test, feature = "fake"))]
+            last_refresh: std::time::Duration::ZERO,
+            fill: Fill::default(),
+            moved: Moved::default(),
+            dealt: None,
+            landing: Landing::Dealt,
+            dealt_placed: false,
+            unread_from: None,
+            unread_at: None,
+            unread_placed: false,
+            unseen: 0,
+            editing_message: None,
+            held_compose: None,
+            attached: None,
+            awaiting_images: Vec::new(),
+            awaiting_names: Vec::new(),
+            _subscriptions: subscriptions,
+        };
+        view.transcript.attach(&view.editor.clone(), cx);
+        session.update(cx, |session, cx| session.open(&source, cx));
+        // Read before the open's own mark can land.
+        view.adopt_cursor(cx);
+        view.apply_compose_chrome(cx);
+        view.refresh(window, cx);
+        // A conversation with nothing new opens on the composer, which is
+        // what the reader came to do. One with unread messages opens on the
+        // first of them instead; `refresh` has already put the cursor there.
+        if !view.unread_placed {
+            view.select_compose(window, cx);
+        }
+        view
+    }
+
+    /// How many messages have arrived at the end while the reader was
+    /// elsewhere in the conversation, for the status line to say.
+    pub fn unseen(&self) -> usize {
+        self.unseen
+    }
+
+    pub fn editor(&self) -> &Entity<Editor> {
+        &self.editor
+    }
+
+    /// The session behind this surface, for a host that has to ask it
+    /// something the view does not wrap — the emoji table, say.
+    pub fn session(&self) -> &Entity<Session> {
+        &self.session
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// The file on the cursor's line, if the line is one. A file is opened
+    /// before a thread, because the reader who put the cursor on a file line
+    /// asked for the file.
+    pub fn cursor_file(&self, cx: &mut Context<Self>) -> Option<FileSummary> {
+        let row = self.cursor_row(cx) as u32;
+        self.transcript
+            .line_meta(row, cx)
+            .and_then(|meta| meta.file.clone())
+    }
+
+    /// The transcript as the reader reads it, one string per line. A test
+    /// that cannot read the rows cannot say what is on screen.
+    pub fn drawn_lines_for_test(&self, cx: &App) -> Vec<String> {
+        self.transcript
+            .buffer()
+            .read(cx)
+            .snapshot()
+            .text()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
+        self.editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head()
+                .row as usize
+        })
+    }
+
+    /// The URL the cursor's line stands for: a link's label shows no address,
+    /// so `enter` reads it from here.
+    pub fn cursor_link(&self, cx: &mut Context<Self>) -> Option<String> {
+        let row = self.cursor_row(cx) as u32;
+        self.transcript
+            .line_meta(row, cx)
+            .and_then(|meta| meta.link.clone())
+    }
+
+    /// The thread the cursor is in, for opening a thread from a channel. A
+    /// thread surface has none: it is already the thread.
+    pub fn cursor_thread(&self, cx: &mut Context<Self>) -> Option<ThreadKey> {
+        if matches!(self.source, Source::Thread(_)) {
+            return None;
+        }
+        let row = self.cursor_row(cx) as u32;
+        let thread_ts = self.transcript.line_meta(row, cx)?.thread.clone()?;
+        Some(
+            self.session
+                .read(cx)
+                .model()
+                .key(self.source.channel(), &thread_ts),
+        )
+    }
+
+    /// Sends the compose region, or posts the rewrite if an edit is open.
+    /// The message appears when Slack accepts it, so nothing is shown that
+    /// was not actually sent.
+    ///
+    /// The answer says what happened once Slack replied, for a host that
+    /// records the reader's day and must not record a write that did not
+    /// land. It does not carry the work: the write is spawned detached in
+    /// here and the returned task only watches for the outcome, so a caller
+    /// with no use for the answer can drop it without cancelling a message.
+    pub fn submit(&mut self, cx: &mut Context<Self>) -> Task<Submitted> {
+        let text = self.input.read(cx).text();
+        // A picture is a message on its own; words are not required.
+        if text.trim().is_empty() && self.attached.is_none() {
+            return Task::ready(Submitted::Nothing);
+        }
+        let source = self.source.clone();
+        if let Some(file) = self.attached.take() {
+            return self.send_attached(file, text, cx);
+        }
+        if let Some(ts) = self.editing_message.take() {
+            // The composer goes back to whatever the reader had put aside to
+            // make the edit, the same as cancelling: the rewrite is done
+            // with, and the half-written message is not.
+            let held = self.held_compose.take().unwrap_or_default();
+            self.set_compose(held.clone(), cx);
+            self.retint(&ts, cx);
+            let editing = self.session.update(cx, |session, cx| {
+                session.edit_message(&source, ts.clone(), text.clone(), cx)
+            });
+            let (tell, told) = futures::channel::oneshot::channel();
+            cx.spawn(async move |this, cx| {
+                let outcome = match editing.await {
+                    Ok(()) => Submitted::Edited(ts),
+                    Err(_) => {
+                        let _ = this.update(cx, |this, cx| this.restore_edit(ts, text, held, cx));
+                        Submitted::Refused
+                    }
+                };
+                let _ = tell.send(outcome);
+            })
+            .detach();
+            return watch(cx, told);
+        }
+        self.set_compose(String::new(), cx);
+        let sending = self
+            .session
+            .update(cx, |session, cx| session.send(&source, text.clone(), cx));
+        let (tell, told) = futures::channel::oneshot::channel();
+        cx.spawn(async move |this, cx| {
+            let outcome = match sending.await {
+                Ok(()) => Submitted::Sent,
+                Err(_) => {
+                    let _ = this.update(cx, |this, cx| this.restore_compose(text, cx));
+                    Submitted::Refused
+                }
+            };
+            let _ = tell.send(outcome);
+        })
+        .detach();
+        watch(cx, told)
+    }
+
+    /// Whether one of these updates deletes the message a rewrite is open
+    /// on. Costs the updates, which is what just arrived.
+    fn rewrite_was_deleted(&self, updates: &[Update]) -> bool {
+        let Some(editing) = self.editing_message.as_ref() else {
+            return false;
+        };
+        updates
+            .iter()
+            .any(|update| matches!(update, Update::Removed(ts) if ts == editing))
+    }
+
+    /// Closes a rewrite whose message someone else has deleted.
+    ///
+    /// It cannot land: `chat.update` on a message that is not there is
+    /// refused, and the refusal puts the reader back into the same rewrite
+    /// with the same words -- pressing enter again refuses again, and
+    /// nothing on screen says why. The rewrite closes here instead, and the
+    /// words stay in the composer over whatever was held aside for it, the
+    /// same as any other refusal: text that was typed is never dropped on
+    /// the floor. From the composer they can be sent as a new message,
+    /// which is the only thing Slack will now accept.
+    fn lose_the_rewrite(&mut self, cx: &mut Context<Self>) {
+        if self.editing_message.take().is_none() {
+            return;
+        }
+        let held = self.held_compose.take().unwrap_or_default();
+        let rewrite = self.input.read(cx).text();
+        self.set_compose(restored_compose(rewrite, &held), cx);
+        cx.emit(Event::RewriteLost);
+        cx.notify();
+    }
+
+    /// Puts a refused message back where it was typed. Whatever the reader
+    /// has written since goes under it rather than over it: text that was
+    /// typed is never dropped on the floor, and which of the two they want
+    /// is theirs to decide.
+    fn restore_compose(&mut self, text: String, cx: &mut Context<Self>) {
+        let held = self.input.read(cx).text();
+        self.set_compose(restored_compose(text, &held), cx);
+        cx.notify();
+    }
+
+    /// Puts a refused rewrite back the way the reader left it: the message
+    /// is being edited again, their words are in the composer, and what they
+    /// had set aside to make the edit is set aside again. A rewrite is text
+    /// that was typed, and text that was typed is never dropped on the floor.
+    ///
+    /// Unless the reader has moved on. If they have started another edit, or
+    /// touched the composer since, that is what they are looking at and it
+    /// wins; the refused words go under it, the same as a refused send.
+    fn restore_edit(&mut self, ts: Ts, text: String, held: String, cx: &mut Context<Self>) {
+        let composer = self.input.read(cx).text();
+        match refused_rewrite(self.editing_message.is_some(), &composer, &held) {
+            Refused::UnderTheComposer => self.restore_compose(text, cx),
+            Refused::BackIntoTheEdit => {
+                self.held_compose = Some(held);
+                self.editing_message = Some(ts.clone());
+                self.set_compose(text, cx);
+                self.retint(&ts, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Puts the point on a named message, the way a reader does by
+    /// scrolling to it. Used by the rebuild to put the reader back where
+    /// they were, and by the test that pins where the point ends up when
+    /// the message under it changes: a test that cannot place the point
+    /// cannot say what happens to it.
+    pub fn place_cursor_on_for_test(
+        &mut self,
+        ts: &Ts,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.place_cursor_on(ts, window, cx)
+    }
+
+    fn place_cursor_on(&mut self, ts: &Ts, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts.clone()))
+            .map(|range| range.start)
+        else {
+            return false;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        true
+    }
+
+    /// The message under the point, which is what the reader's next `e`,
+    /// reaction or `enter` is about.
+    pub fn cursor_message_for_test(&self, cx: &mut Context<Self>) -> Option<Message> {
+        self.cursor_message(cx)
+    }
+
+    /// The composer's text, for a test that asserts what the reader is
+    /// left holding.
+    pub fn compose_text_for_test(&self, cx: &App) -> String {
+        self.input.read(cx).text()
+    }
+
+    /// Puts words in the composer, the way typing does.
+    pub fn set_compose_for_test(&mut self, text: String, cx: &mut Context<Self>) {
+        self.set_compose(text, cx);
+    }
+
+    /// The message the cursor is on, if the transcript has one there.
+    fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
+        let ts = self.cursor_message_ts(cx)?;
+        self.shown_messages(cx)
+            .into_iter()
+            .find(|message| message.ts == ts)
+    }
+
+    /// Which message the point is on, without reading the message itself:
+    /// the transcript's own search, so a refresh can ask it twice without
+    /// paying for a pass over what is shown.
+    fn cursor_message_ts(&self, cx: &mut Context<Self>) -> Option<Ts> {
+        let row = self.cursor_row(cx) as u32;
+        match self.transcript.key_at_row(row, cx) {
+            Some(Row::Message(ts)) => Some(ts.clone()),
+            _ => None,
+        }
+    }
+
+    /// The emoji a reaction menu should offer over the message under the
+    /// point, or `None` when the point is not on a message.
+    ///
+    /// Cost: the reactions on that one message plus the remembered list,
+    /// which are exactly the rows the menu draws. (Finding the message
+    /// under the point is the transcript's own lookup, as it is for `e`.)
+    pub fn reaction_choices(&self, cx: &mut Context<Self>) -> Option<ReactionChoices> {
+        let message = self.cursor_message(cx)?;
+        let session = self.session.read(cx);
+        let mine = session.model().self_id().clone();
+        let on_message = message
+            .reactions
+            .iter()
+            .map(|reaction| ReactionChoice {
+                glyph: crate::emoji::render(&format!(":{}:", reaction.name)),
+                mine: reaction.users.contains(&mine),
+                name: reaction.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let recent = session
+            .reacted_with()
+            .iter()
+            .filter(|name| !on_message.iter().any(|choice| &&choice.name == name))
+            .map(|name| ReactionChoice {
+                glyph: crate::emoji::render(&format!(":{name}:")),
+                name: name.clone(),
+                mine: false,
+            })
+            .collect();
+        Some(ReactionChoices {
+            ts: message.ts,
+            on_message,
+            recent,
+        })
+    }
+
+    /// Puts the reader's own emoji on a message, or takes it off. The
+    /// surface's own source, so a reaction in a thread goes to the thread.
+    pub fn react(&mut self, ts: &Ts, name: &str, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        let name = name.to_owned();
+        let ts = ts.clone();
+        self.session.update(cx, |session, cx| {
+            session.toggle_reaction(&source, &ts, &name, cx);
+        });
+    }
+
+    /// `e`: rewrite the message under the cursor. Only the reader's own can
+    /// be rewritten, and saying so is the host's job, so a refusal is
+    /// reported rather than swallowed.
+    pub fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> EditStart {
+        let Some(message) = self.cursor_message(cx) else {
+            return EditStart::Nothing;
+        };
+        if message.user.as_ref() != Some(self.session.read(cx).model().self_id()) {
+            return EditStart::NotYours;
+        }
+        self.begin_edit(&message, window, cx);
+        EditStart::Started(message.ts)
+    }
+
+    /// `up` in an empty composer: rewrite the last thing the reader said,
+    /// which is the habit Slack teaches. Nothing of theirs on screen, or a
+    /// composer with something in it, and this is not the reader asking.
+    pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) -> EditStart {
+        if !self.input.read(cx).text().trim().is_empty() || self.editing_message.is_some() {
+            return EditStart::Nothing;
+        }
+        let self_id = self.session.read(cx).model().self_id().clone();
+        let Some(message) = self
+            .shown_messages(cx)
+            .into_iter()
+            .rfind(|message| message.user.as_ref() == Some(&self_id))
+        else {
+            return EditStart::Nothing;
+        };
+        self.begin_edit(&message, window, cx);
+        EditStart::Started(message.ts)
+    }
+
+    fn begin_edit(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        if self.held_compose.is_none() {
+            self.held_compose = Some(self.input.read(cx).text());
+        }
+        let previous = self.editing_message.replace(message.ts.clone());
+        // The composer holds what was sent, not what was drawn, and what was
+        // sent is the wire form: an edit starting from `<@U1>` does not start
+        // from the reader's own words. `decode` gives those back, and leaves
+        // alone every escape that has no typed form rather than render it
+        // into one that could not be sent again.
+        let typed = self.session.read(cx).model().decode(&message.text);
+        self.set_compose(typed, cx);
+        if let Some(previous) = previous.filter(|previous| previous != &message.ts) {
+            self.retint(&previous, cx);
+        }
+        self.retint(&message.ts, cx);
+        self.select_compose(window, cx);
+    }
+
+    /// `escape` with an edit open: the message stands as it was and the
+    /// composer holds what it held before.
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(ts) = self.editing_message.take() else {
+            return false;
+        };
+        let held = self.held_compose.take().unwrap_or_default();
+        self.set_compose(held, cx);
+        self.retint(&ts, cx);
+        true
+    }
+
+    /// Attaches a picture to the next message. One at a time: a second
+    /// replaces the first, and the answer says so, because a chip that
+    /// quietly changed under the reader would send the wrong file.
+    ///
+    /// Nothing can be attached while an edit is open. Slack has no way to
+    /// put a file on a message that already exists -- `chat.update` carries
+    /// text -- so the honest answer is a refusal here, where the rewrite is
+    /// still on screen to be finished or left, rather than a surprise at
+    /// send time.
+    pub fn attach(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) -> Attaching {
+        if self.editing_message.is_some() {
+            return Attaching::NotWhileEditing;
+        }
+        let replaced = self.attached.is_some();
+        self.attached = Some(Attached {
+            name,
+            bytes: std::sync::Arc::new(bytes),
+        });
+        self.refresh_chip(cx);
+        cx.notify();
+        match replaced {
+            true => Attaching::Replaced,
+            false => Attaching::Attached,
+        }
+    }
+
+    /// Reads a file from disk and attaches it: the path a drop or a prompt
+    /// gave. The bytes are read here so the failure is one the reader hears
+    /// about before they press enter.
+    pub fn attach_path(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<Attaching> {
+        // Asked before the file is read, so a refusal costs no disk.
+        if self.editing_message.is_some() {
+            return Ok(Attaching::NotWhileEditing);
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_owned());
+        Ok(self.attach(name, bytes, cx))
+    }
+
+    /// Drops the attachment without sending it.
+    pub fn clear_attachment(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = self.attached.take().is_some();
+        if had {
+            self.refresh_chip(cx);
+            cx.notify();
+        }
+        had
+    }
+
+    /// How big the waiting picture is, for the host's journal.
+    pub fn attached_size(&self) -> Option<u64> {
+        self.attached.as_ref().map(|file| file.bytes.len() as u64)
+    }
+
+    /// Uploads the picture with the message. Nothing is drawn from the
+    /// local bytes: the message arrives from Slack like any other. A
+    /// refusal puts the chip and the words back, so the reader can try
+    /// again without retyping.
+    fn send_attached(
+        &mut self,
+        file: Attached,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Submitted> {
+        self.set_compose(String::new(), cx);
+        self.refresh_chip(cx);
+        let source = self.source.clone();
+        let bytes = file.bytes.len() as u64;
+        let sending = self.session.update(cx, |session, cx| {
+            session.send_file(
+                &source,
+                file.name.clone(),
+                file.bytes.as_ref().clone(),
+                text.clone(),
+                cx,
+            )
+        });
+        let (tell, told) = futures::channel::oneshot::channel();
+        cx.spawn(async move |this, cx| {
+            let outcome = match sending.await {
+                Ok(()) => Submitted::FileSent(bytes),
+                Err(_) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.attached = Some(file);
+                        this.restore_compose(text, cx);
+                        this.refresh_chip(cx);
+                    });
+                    Submitted::Refused
+                }
+            };
+            let _ = tell.send(outcome);
+        })
+        .detach();
+        watch(cx, told)
+    }
+
+    /// The chip line, kept last: it belongs between the transcript and the
+    /// composer, and a message arriving appends itself after whatever is
+    /// at the end.
+    fn refresh_chip(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.attached.clone() else {
+            self.transcript.remove(&Row::Chip, cx);
+            return;
+        };
+        let item = muted_item(Row::Chip, format!("{}\n", file.line()), Class::Muted);
+        let last = self.transcript.keys().last().cloned();
+        if last.as_ref() == Some(&Row::Chip) {
+            self.transcript.replace(&Row::Chip, item, cx);
+            return;
+        }
+        self.transcript.remove(&Row::Chip, cx);
+        self.transcript.insert_before(None, vec![item], cx);
+    }
+
+    /// Which message an open edit is about, for the host's journal.
+    pub fn editing_message(&self) -> Option<&Ts> {
+        self.editing_message.as_ref()
+    }
+
+    fn set_compose(&mut self, text: String, cx: &mut Context<Self>) {
+        self.input.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+    }
+
+    /// Redraws one message, which is how the tint goes on and comes off.
+    fn retint(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        let key = Row::Message(ts.clone());
+        let messages = self.shown_messages(cx);
+        let Some(item) = self.item_for_key(&key, &messages, cx) else {
+            return;
+        };
+        self.editing = true;
+        self.transcript.replace(&key, item, cx);
+        self.editing = false;
+    }
+
+    /// Where the file's bytes are, fetched if the cache lacks them: a host
+    /// showing a picture itself needs the path, not the desktop's opener.
+    pub fn file_path(
+        &mut self,
+        file: &FileSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
+        self.session
+            .update(cx, |session, cx| session.file_path(file, cx))
+    }
+
+    /// Opens the file under the cursor with whatever the desktop uses for
+    /// it, fetching it first if the cache does not have it yet.
+    pub fn open_file(&mut self, file: FileSummary, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |session, cx| session.open_file(&file, cx));
+    }
+
+    pub fn load_older(&mut self, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.load_older(&source, cx));
+    }
+
+    /// Fills the hole under `after` with one page forward.
+    fn load_newer(&mut self, after: Ts, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.load_newer(&source, after, cx));
+    }
+
+    /// What the view is sitting on, if it is sitting on something worth a
+    /// page: the top of the run, or a hole in it.
+    fn wanted(&self, position: f64, screen: f64, cursor: f64, cx: &App) -> Option<Want> {
+        let snapshot = self.transcript.buffer().read(cx).snapshot();
+        let holes = self
+            .transcript
+            .keys()
+            .filter_map(|key| {
+                let Row::Newer(ts) = key else {
+                    return None;
+                };
+                let start = self.transcript.range_of(key)?.start;
+                let row = text::ToPoint::to_point(&start, &snapshot).row as f64;
+                Some((row, ts.clone()))
+            })
+            .collect::<Vec<_>>();
+        wanted_at(position, screen, cursor, &holes)
+    }
+
+    /// Buys the page the view is sitting on, if this action has not spent
+    /// one already.
+    fn fill(&mut self, position: f64, screen: f64, cx: &mut Context<Self>) {
+        let cursor = self.cursor_row(cx) as f64;
+        let want = self.wanted(position, screen, cursor, cx);
+        match self.fill.wants(want) {
+            Some(Want::Older) => self.load_older(cx),
+            Some(Want::Newer(after)) => self.load_newer(after, cx),
+            None => {}
+        }
+    }
+
+    /// The composer's chrome, which is the agent transcript's prompt worn by
+    /// a Slack surface: a stripe down the gutter marking where the reader
+    /// writes, and, while there is nothing in it, a muted `message #design`
+    /// standing in the empty line rather than a bare gap.
+    fn apply_compose_chrome(&self, cx: &mut Context<Self>) {
+        let placeholder = self.compose_placeholder(cx);
+        let (empty, start, end) = {
+            let buffer = self.input.read(cx);
+            (
+                buffer.is_empty(),
+                buffer.anchor_before(0),
+                buffer.anchor_after(buffer.len()),
+            )
+        };
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let (Some(start), Some(end)) = (
+            snapshot.anchor_in_excerpt(start),
+            snapshot.anchor_in_excerpt(end),
+        ) else {
+            return;
+        };
+        let inlays = match empty {
+            true => vec![Inlay::custom(
+                COMPOSE_PLACEHOLDER_INLAY_ID,
+                start,
+                placeholder,
+            )],
+            false => Vec::new(),
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&[InlayId::Custom(COMPOSE_PLACEHOLDER_INLAY_ID)], inlays, cx);
+            editor.highlight_gutter::<ComposeGutter>(
+                vec![start..end],
+                |cx| cx.theme().colors().text_accent.into(),
+                cx,
+            );
+        });
+    }
+
+    fn compose_placeholder(&self, cx: &App) -> String {
+        let label = self.session.read(cx).model().label(self.source.channel());
+        compose_placeholder(&label, matches!(self.source, Source::Thread(_)))
+    }
+
+    /// Puts the cursor in the composer: what `i` asks for.
+    pub fn select_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let end = {
+            let buffer = self.input.read(cx);
+            buffer.anchor_after(buffer.len())
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(end)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_autoscroll_pin(anchor, AutoscrollStrategy::Bottom, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+    }
+
+    /// Shows the message a deal is about: tinted for the life of the
+    /// surface, with the cursor on it and the view centred on it. A deal is
+    /// one message to answer, and this is that message.
+    pub fn reveal(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        self.land(ts, Landing::Dealt, window, cx);
+    }
+
+    /// Shows the message a search found. The same landing as a deal's --
+    /// the chunk fetched if the mirror lacks it, the cursor on the message,
+    /// the view centred -- under its own tint.
+    pub fn reveal_found(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        self.land(ts, Landing::Found, window, cx);
+    }
+
+    fn land(&mut self, ts: Ts, landing: Landing, window: &mut Window, cx: &mut Context<Self>) {
+        self.landing = landing;
+        if self.dealt.as_ref() == Some(&ts) && self.dealt_placed {
+            return;
+        }
+        self.dealt = Some(ts.clone());
+        self.dealt_placed = false;
+        // The message may be in an older chunk than the one the surface
+        // opened on, which is the ordinary case on a long history.
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.open_at(&source, &ts, cx));
+        let key = Row::Message(ts);
+        let messages = self.shown_messages(cx);
+        if let Some(item) = self.item_for_key(&key, &messages, cx) {
+            self.transcript.replace(&key, item, cx);
+        }
+        self.refresh(window, cx);
+    }
+
+    /// Takes the session's read cursor for this surface, but only while the
+    /// surface has none of its own.
+    ///
+    /// Both halves matter. A cursor can land after the surface opened — the
+    /// mirror has none for a conversation opened for the first time, and
+    /// `client.counts` answers a moment later — and a surface that read it
+    /// once at construction would show no rule at all for the whole of that
+    /// conversation's life. And once a rule is drawn it is the reader's
+    /// place in the conversation: a mark arriving from the phone, or rho's
+    /// own mark on the way out, must not pull it out from under them.
+    fn adopt_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.unread_from.is_some() {
+            return;
+        }
+        let session = self.session.read(cx);
+        self.unread_from = match &self.source {
+            Source::Conversation(channel) => session.model().last_read(channel).cloned(),
+            // A thread's cursor is Slack's per-thread one, a different fact
+            // from the cursor on the conversation it hangs in.
+            Source::Thread(key) => session.model().thread_last_read(key).cloned(),
+        };
+    }
+
+    /// Keeps `── new ──` above the first message the reader has not seen.
+    /// The anchor is recomputed rather than remembered because a page of
+    /// older messages can land above it, and the rule belongs over the
+    /// oldest unread one, not over whichever was first on screen.
+    fn refresh_unread(&mut self, cx: &mut Context<Self>) {
+        self.adopt_cursor(cx);
+        let Some(from) = self.unread_from.clone() else {
+            return;
+        };
+        let first = first_unread(&self.shown_messages(cx), &from);
+        if first == self.unread_at {
+            return;
+        }
+        self.editing = true;
+        if self.unread_at.is_some() {
+            self.transcript.remove(&Row::Unread, cx);
+        }
+        self.unread_at = first.clone();
+        if let Some(ts) = first {
+            self.transcript
+                .insert_before(Some(&Row::Message(ts)), vec![unread_rule()], cx);
+        }
+        self.editing = false;
+    }
+
+    /// Opens the conversation on the first thing the reader has not read.
+    /// Not the composer, which is where a conversation with nothing new
+    /// opens, and not the top, which is last week. Once only: after that
+    /// the cursor is the reader's own.
+    fn place_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unread_placed || self.dealt.is_some() {
+            return;
+        }
+        // The reader started writing while the page was in flight. Their
+        // cursor is theirs now; the rule is still on screen to scroll to.
+        if !self.input.read(cx).is_empty() {
+            self.unread_placed = true;
+            return;
+        }
+        let Some(ts) = self.unread_at.clone() else {
+            return;
+        };
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts))
+            .map(|range| range.start)
+        else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.unread_placed = true;
+        self.editor.update(cx, |editor, cx| {
+            // Near the top rather than centred: what the reader wants in
+            // front of them is everything under the rule.
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::focused()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+    }
+
+    /// Puts the cursor on the dealt message once it is in the transcript.
+    fn place_dealt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dealt_placed {
+            return;
+        }
+        let Some(ts) = self.dealt.clone() else {
+            return;
+        };
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts))
+            .map(|range| range.start)
+        else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            // Centred once, not pinned: a pin re-asserts itself every frame,
+            // so in a conversation long enough to scroll it would drag the
+            // reader back onto the message the moment they moved off it.
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+        });
+        // The surface moved the cursor, not the reader: that must not spend
+        // the reader's one page of history.
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+        self.dealt_placed = true;
+    }
+
+    /// Brings the transcript up to date with the session. Only the messages
+    /// the session says changed are rewritten: a socket frame costs one
+    /// item, a page costs one insert, and everything else keeps its anchors,
+    /// so the cursor and the scroll stay where the reader put them.
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(any(test, feature = "fake"))]
+        let started = std::time::Instant::now();
+        // The point is the reader's, and no redraw is allowed to move it.
+        // An anchor keeps it through an edit that leaves the message alone,
+        // but not through one that rewrites the row it sits on or inserts a
+        // day rule in front of it: there the anchor is left on the row that
+        // slid under it, which for a day rule is a row that is not a
+        // message at all. Asked as a key, which is the transcript's own
+        // search rather than a pass over what is shown.
+        let was_on = self.cursor_message_ts(cx);
+        let Some((revision, updates)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.revision(), loaded.updates_since(self.revision)))
+        else {
+            return;
+        };
+        match updates {
+            // A surface that has fallen too far behind (or has never been
+            // filled) renders the run it can see in one insert.
+            None => self.rebuild(cx),
+            Some(updates) => {
+                // Asked of the log rather than of the transcript: the log
+                // says the message was deleted, where an absent row could
+                // also be a run that has not been drawn yet.
+                let lost = self.rewrite_was_deleted(&updates);
+                self.apply_updates(updates, window, cx);
+                if lost {
+                    self.lose_the_rewrite(cx);
+                }
+            }
+        }
+        self.revision = revision;
+        // Resolving authors rewrites rows too; restore the reader's point after it.
+        self.settle_names(cx);
+        // Back on the message it was on, if the redraw moved it off. The
+        // reader chose that message; everything below is the surface's own
+        // placing, and each of those is asked for.
+        if let Some(ts) = was_on
+            && self.cursor_message_ts(cx) != Some(ts.clone())
+            && self.place_cursor_on(&ts, window, cx)
+            && std::mem::take(&mut self.centre_on_the_point)
+        {
+            self.editor.update(cx, |editor, cx| {
+                editor.request_autoscroll(Autoscroll::center(), cx);
+            });
+        }
+        self.centre_on_the_point = false;
+        // A deal may open on a message the tail does not hold yet: the page
+        // that brings it in is where the cursor goes.
+        self.refresh_unread(cx);
+        self.place_dealt(window, cx);
+        self.place_unread(window, cx);
+        self.settle_images(cx);
+        self.refresh_chrome(cx);
+        self.refresh_holes(cx);
+        self.refresh_chip(cx);
+        cx.notify();
+        #[cfg(any(test, feature = "fake"))]
+        {
+            self.last_refresh = started.elapsed();
+        }
+    }
+
+    /// What the last redraw cost, for the test that holds the per-event
+    /// path to a number.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn last_refresh_for_test(&self) -> std::time::Duration {
+        self.last_refresh
+    }
+
+    /// How many rows the transcript is drawing, so a cost has a size beside
+    /// it.
+    #[cfg(any(test, feature = "fake"))]
+    pub fn drawn_row_count_for_test(&self) -> usize {
+        self.transcript.keys().count()
+    }
+
+    /// A picture whose bytes were still arriving when its message was
+    /// drawn. The download changes nothing about the message and nothing
+    /// about its box, which was already the picture's size: the block reads
+    /// the cache when it draws, so all this owes the reader is a redraw.
+    /// Rewriting the item would move every row under it for one frame.
+    fn settle_images(&mut self, cx: &mut Context<Self>) {
+        let arrived = {
+            let session = self.session.read(cx);
+            self.awaiting_images
+                .iter()
+                .any(|(_, id)| session.cached_file(id).is_some_and(|path| path.exists()))
+        };
+        if !arrived {
+            return;
+        }
+        let session = self.session.read(cx);
+        self.awaiting_images
+            .retain(|(_, id)| !session.cached_file(id).is_some_and(|path| path.exists()));
+        cx.notify();
+    }
+
+    /// Redraws the rows whose author had no name when they were drawn and
+    /// has one now. Nothing else moves: a name is not a change to the
+    /// message, so the run, the anchors, the cursor and the scroll are all
+    /// where the reader left them.
+    ///
+    /// Cost: the rows that carried "someone", which is none at all once
+    /// every author on screen has a name.
+    fn settle_names(&mut self, cx: &mut Context<Self>) {
+        if self.awaiting_names.is_empty() {
+            return;
+        }
+        let messages = self.shown_messages(cx);
+        let named = self
+            .awaiting_names
+            .iter()
+            .filter_map(|ts| messages.iter().find(|message| &message.ts == ts))
+            .filter(|message| !self.unnamed_author(message, cx))
+            .cloned()
+            .collect::<Vec<_>>();
+        for message in named {
+            // `item_for` takes the row off the waiting list itself, the same
+            // as it does for a picture that has landed.
+            let key = Row::Message(message.ts.clone());
+            let item = self.item_for(&message, cx);
+            self.editing = true;
+            self.transcript.replace(&key, item, cx);
+            self.editing = false;
+        }
+    }
+
+    /// Whether this row would draw as "someone" — the author is a person
+    /// rho has no name for, rather than a bot, which carries its own.
+    fn unnamed_author(&self, message: &Message, cx: &App) -> bool {
+        let Some(id) = message.user.as_ref() else {
+            return false;
+        };
+        message.bot_name.is_none() && !self.session.read(cx).model().knows_user(id)
+    }
+
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.editing = true;
+        self.transcript.clear(cx);
+        // The rule went with everything else; where it belongs is worked
+        // out again from the run that replaces it.
+        self.unread_at = None;
+        let messages = self.shown_messages(cx);
+        let mut items = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in &messages {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                items.push(day_item(at));
+            }
+            last = Some(at);
+            items.push(self.item_for(message, cx));
+        }
+        self.transcript.insert_before(None, items, cx);
+        self.editing = false;
+        // The rows the scroll was measured against are gone with them, so
+        // the point the refresh puts back is centred rather than left
+        // wherever the new text happens to put it.
+        self.centre_on_the_point = true;
+    }
+
+    /// Carries out the plan: each operation is one transcript edit.
+    fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
+        // Only what lands at the live end counts: a page of history
+        // arriving above is not something the reader is missing. Read from
+        // the end, because the newest message is at the end: the chip is
+        // the only row that can sit under it.
+        let tail = self.transcript.keys().rev().find_map(|key| match key {
+            Row::Message(ts) => Some(ts.clone()),
+            _ => None,
+        });
+        self.unseen += updates
+            .iter()
+            .filter(|update| match update {
+                Update::Inserted(ts) => tail.as_ref().is_none_or(|tail| ts.is_newer_than(tail)),
+                _ => false,
+            })
+            .count();
+        // The plan is made against the run on screen without copying it:
+        // an arriving message costs the message, and a transcript of a
+        // thousand lines is not a thousand clones per frame of traffic.
+        let in_thread = matches!(self.source, Source::Thread(_));
+        let (ops, messages) = {
+            let session = self.session.read(cx);
+            let shown = session
+                .loaded(&self.source)
+                .map(|loaded| {
+                    loaded
+                        .messages
+                        .iter()
+                        .filter(|message| in_thread || message.is_top_level())
+                        .collect::<Vec<&Message>>()
+                })
+                .unwrap_or_default();
+            let ops = plan(&updates, &shown, &self.transcript);
+            // The messages the plan actually names, and no others. Found by
+            // binary search, because the run is ordered by `ts`.
+            let messages = ops
+                .iter()
+                .flat_map(|op| match op {
+                    Op::Insert { keys, .. } => keys.as_slice(),
+                    Op::Replace(key) => std::slice::from_ref(key),
+                    Op::Remove(_) => &[],
+                })
+                .filter_map(|key| match key {
+                    Row::Message(ts) => at_ts(&shown, ts).cloned(),
+                    _ => None,
+                })
+                .collect::<Vec<Message>>();
+            (ops, messages)
+        };
+        // The first message of a page arriving above everything on screen:
+        // where the cursor goes if it was resting on the gap line.
+        let first_loaded = ops
+            .iter()
+            .find(|op| reaches_the_top(op, &self.transcript))
+            .and_then(|op| match op {
+                Op::Insert { keys, .. } => keys
+                    .iter()
+                    .find(|key| matches!(key, Row::Message(_)))
+                    .cloned(),
+                _ => None,
+            });
+        // A reader at the very top is anchored to the top itself, so older
+        // messages arriving above would slide their line down the screen.
+        // Re-taking the anchor after the insertion point first is what keeps
+        // the view on the message it was showing.
+        if ops.iter().any(|op| reaches_the_top(op, &self.transcript)) {
+            let pinned = self.editor.update(cx, |editor, cx| {
+                editor.pin_scroll_to_content(window, cx);
+                editor.scroll_position(cx).y
+            });
+            self.moved.scroll = Some(pinned);
+        }
+        // Where the point goes if the message under it is one of the ones
+        // going away. Read before the removal, because afterwards there is
+        // nothing to read: the row is gone.
+        let landing = self.landing_for_removals(&ops, cx);
+        self.editing = true;
+        for op in ops {
+            match op {
+                Op::Insert { before, keys } => {
+                    let items = keys
+                        .iter()
+                        .filter_map(|key| self.item_for_key(key, &messages, cx))
+                        .collect::<Vec<_>>();
+                    if !items.is_empty() {
+                        self.transcript.insert_before(before.as_ref(), items, cx);
+                    }
+                }
+                Op::Replace(key) => {
+                    if let Some(item) = self.item_for_key(&key, &messages, cx) {
+                        self.transcript.replace(&key, item, cx);
+                    }
+                }
+                Op::Remove(key) => {
+                    self.transcript.remove(&key, cx);
+                }
+            }
+        }
+        if let Some(key) = first_loaded {
+            self.leave_the_gap_line(&key, window, cx);
+        }
+        self.editing = false;
+        if let Some(landing) = landing {
+            self.place_point(&landing, window, cx);
+        }
+    }
+
+    /// The row the point should end up on, given what is about to be
+    /// removed. `None` unless the point is on a message that is going: a
+    /// point anywhere else is the reader's own place and nothing moves it.
+    ///
+    /// Cost: one comparison per removal in the plan, and a walk off the
+    /// removed row that stops at the first message — over a day rule or the
+    /// unread rule, never over a run of them.
+    fn landing_for_removals(&self, ops: &[Op], cx: &mut Context<Self>) -> Option<Row> {
+        let removing = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Remove(key @ Row::Message(_)) => Some(key),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if removing.is_empty() {
+            return None;
+        }
+        let under = self.transcript.key_at_row(self.cursor_row(cx) as u32, cx)?;
+        let on_it = removing.contains(&under);
+        let after = self.message_beside(under, Side::After);
+        let before = self.message_beside(under, Side::Before);
+        point_after_removal(on_it, after, before)
+    }
+
+    /// The nearest message on one side of a row, stepping over the rules
+    /// and lines that are not messages.
+    fn message_beside(&self, from: &Row, side: Side) -> Option<Row> {
+        let mut at = from;
+        loop {
+            at = match side {
+                Side::After => self.transcript.key_after(at)?,
+                Side::Before => self.transcript.key_before(at)?,
+            };
+            if matches!(at, Row::Message(_)) {
+                return Some(at.clone());
+            }
+        }
+    }
+
+    /// Puts the point on a row without moving the view. The surface moved
+    /// it, not the reader, so it is recorded as such: a page of history is
+    /// spent by the reader scrolling, never by rho tidying up after someone
+    /// else's deletion.
+    fn place_point(&mut self, key: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(start) = self.transcript.range_of(key).map(|range| range.start) else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+    }
+
+    /// Puts the cursor on the first message of a page that has just landed,
+    /// if it was sitting on the gap line the page arrived under. The reader
+    /// ends up looking at content rather than at a line that no longer says
+    /// anything, and the view stops being at the very top, so the next
+    /// scroll is a fresh action rather than the same one repeating.
+    fn leave_the_gap_line(&mut self, key: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(start) = self.transcript.range_of(key).map(|range| range.start) else {
+            return;
+        };
+        // Only a cursor the page arrived above is moved: one sitting in the
+        // conversation is the reader's own place and stays put.
+        let snapshot = self.transcript.buffer().read(cx).snapshot();
+        let first = text::ToPoint::to_point(&start, &snapshot).row;
+        if self.cursor_row(cx) as u32 > first {
+            return;
+        }
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+    }
+
+    fn item_for_key(
+        &mut self,
+        key: &Row,
+        messages: &[Message],
+        cx: &mut Context<Self>,
+    ) -> Option<Rendered> {
+        match key {
+            Row::Day(label) => Some(day_rule(label.clone())),
+            Row::Message(ts) => {
+                let message = messages.iter().find(|message| &message.ts == ts)?.clone();
+                Some(self.item_for(&message, cx))
+            }
+            Row::Unread => Some(unread_rule()),
+            Row::Notice | Row::Gap | Row::Newer(_) | Row::Chip => None,
+        }
+    }
+
+    /// The loading, failure and gap lines above the transcript. They are
+    /// items too, so they cost one edit each and never disturb a message.
+    fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
+        let Some((error, loading, reached_oldest)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.error.clone(), loaded.loading, loaded.reached_oldest))
+        else {
+            return;
+        };
+        let notice = match (error, loading) {
+            (Some(error), _) => Some(muted_item(
+                Row::Notice,
+                format!("{error}\n\n"),
+                Class::Error,
+            )),
+            (None, true) => Some(muted_item(Row::Notice, "loading…\n\n", Class::Muted)),
+            (None, false) => None,
+        };
+        // A run that does not reach the beginning says so on one muted line.
+        // The reader scrolling onto it is what fills it, so it is a state,
+        // not a button.
+        let gap = (!reached_oldest)
+            .then(|| muted_item(Row::Gap, "older messages not loaded\n", Class::Muted));
+        let first = self
+            .transcript
+            .keys()
+            .find(|key| !matches!(key, Row::Notice | Row::Gap))
+            .cloned();
+        self.put_top(Row::Gap, gap, first.clone(), cx);
+        let after_notice = self
+            .transcript
+            .contains(&Row::Gap)
+            .then_some(Row::Gap)
+            .or(first);
+        self.put_top(Row::Notice, notice, after_notice, cx);
+    }
+
+    /// The rows that say history is missing in the middle: one under each
+    /// chunk that does not run into what sits over it. A hole between two
+    /// loaded chunks and a run that has not caught up with the live end are
+    /// the same thing to a reader, so they read the same and fill the same
+    /// way.
+    fn refresh_holes(&mut self, cx: &mut Context<Self>) {
+        let Some((mut holes, behind_live)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.holes.clone(), loaded.behind_live))
+        else {
+            return;
+        };
+        let shown = self.shown_messages(cx);
+        if behind_live && let Some(last) = shown.last() {
+            holes.push(last.ts.clone());
+        }
+        // A hole over a message this surface does not show — a reply in a
+        // channel — has no line to sit under.
+        holes.retain(|ts| self.transcript.contains(&Row::Message(ts.clone())));
+        let wanted = holes
+            .iter()
+            .cloned()
+            .map(Row::Newer)
+            .collect::<HashSet<_>>();
+        for key in self.transcript.keys().cloned().collect::<Vec<_>>() {
+            if matches!(key, Row::Newer(_)) && !wanted.contains(&key) {
+                self.transcript.remove(&key, cx);
+            }
+        }
+        for ts in holes {
+            let key = Row::Newer(ts.clone());
+            if self.transcript.contains(&key) {
+                continue;
+            }
+            // Above the day rule that heads the chunk over it: the rule
+            // belongs to the messages under it, not to the hole.
+            let before = self.transcript.key_after(&Row::Message(ts)).cloned();
+            let item = muted_item(key, "newer messages not loaded\n", Class::Muted);
+            self.transcript
+                .insert_before(before.as_ref(), vec![item], cx);
+        }
+    }
+
+    /// Puts one chrome item in place, replacing or removing it as its state
+    /// changes, without touching anything below.
+    fn put_top(
+        &mut self,
+        key: Row,
+        item: Option<Rendered>,
+        before: Option<Row>,
+        cx: &mut Context<Self>,
+    ) {
+        match item {
+            None => {
+                self.transcript.remove(&key, cx);
+            }
+            Some(item) if self.transcript.contains(&key) => {
+                self.transcript.replace(&key, item, cx);
+            }
+            Some(item) => {
+                self.transcript
+                    .insert_before(before.as_ref(), vec![item], cx);
+            }
+        }
+    }
+
+    /// The messages this surface shows: replies live in their thread and
+    /// nowhere else, which is what Slack does and what makes a channel
+    /// readable. The exception is a reply the sender also sent to the
+    /// channel, which was addressed to the room.
+    fn shown_messages(&self, cx: &App) -> Vec<Message> {
+        let in_thread = matches!(self.source, Source::Thread(_));
+        self.session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| {
+                loaded
+                    .messages
+                    .iter()
+                    .filter(|message| in_thread || message.is_top_level())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One message as an item, with its image previews attached. The bytes
+    /// are fetched when the line first renders and read from the state cache
+    /// after that, so scrolling costs nothing and nothing is downloaded that
+    /// the reader never opened.
+    fn item_for(&mut self, message: &Message, cx: &mut Context<Self>) -> Rendered {
+        let in_thread = matches!(self.source, Source::Thread(_));
+        let mut item = {
+            let session = self.session.read(cx);
+            message_item(message, session.model(), in_thread)
+        };
+        let images = image_boxes(&item)
+            .into_iter()
+            .map(|(line, file)| (line, file.clone()))
+            .collect::<Vec<_>>();
+        if self.dealt.as_ref() == Some(&message.ts) {
+            mark_landing(&mut item, self.landing);
+        } else if self.editing_message.as_ref() == Some(&message.ts) {
+            // A rewrite is tinted as a deal is: it is the one message this
+            // surface is about for as long as it is open.
+            mark_landing(&mut item, Landing::Dealt);
+        }
+        if self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .is_some_and(|loaded| loaded.is_pending(&message.ts))
+        {
+            mark_pending(&mut item);
+        }
+        self.awaiting_images
+            .retain(|(waiting, _)| waiting != &message.ts);
+        self.awaiting_names.retain(|waiting| waiting != &message.ts);
+        if self.unnamed_author(message, cx) {
+            self.awaiting_names.push(message.ts.clone());
+        }
+        for (order, (line, file)) in images.into_iter().enumerate() {
+            let ready = self.session.update(cx, |session, cx| {
+                // The thumbnail is asked for alongside the picture: it is
+                // what stands in the box until the picture lands.
+                if let Some(thumb) = file.thumbnail() {
+                    session.cache_file(&thumb, cx);
+                }
+                session.cache_file(&file, cx);
+                session
+                    .cached_file(&file.id)
+                    .is_some_and(|path| path.exists())
+            });
+            if !ready {
+                self.awaiting_images
+                    .push((message.ts.clone(), file.id.clone()));
+            }
+            item.blocks.push(image_block(
+                line,
+                order,
+                file,
+                self.session.downgrade(),
+                cx.entity().downgrade(),
+            ));
+        }
+        item
+    }
+}
+
+/// What the transcript is asked to do about a batch of session updates.
+/// Deciding this apart from carrying it out is what lets a test say that a
+/// message off the socket costs exactly one append.
+#[derive(Clone, Debug, PartialEq)]
+enum Op {
+    /// A run of items, day rules included, in front of `before` (`None` is
+    /// the end): one page of history, or one arriving message.
+    Insert {
+        before: Option<Row>,
+        keys: Vec<Row>,
+    },
+    Replace(Row),
+    Remove(Row),
+}
+
+/// What the view is sitting on, if it is sitting on something worth a page.
+///
+/// The cursor decides, not the scroll: a motion moves it a frame before the
+/// view follows, so asking on the scroll alone would fetch the top of the
+/// buffer while the reader is standing at the bottom of it. A hole the
+/// reader has read down to, or one on screen, is asked forward; only a
+/// reader who is at the top with the cursor asks backwards.
+fn wanted_at(position: f64, screen: f64, cursor: f64, holes: &[(f64, Ts)]) -> Option<Want> {
+    let hole = holes.iter().find_map(|(row, ts)| {
+        let read_up_to = cursor + 1.0 >= *row;
+        let on_screen = row + 1.0 >= position && *row <= position + screen;
+        (read_up_to || on_screen).then(|| Want::Newer(ts.clone()))
+    });
+    hole.or_else(|| {
+        (near_top(position, screen) && cursor <= screen.max(1.0)).then_some(Want::Older)
+    })
+}
+
+/// Whether the end of the conversation is on screen. A view that has not
+/// been laid out reports no visible lines and counts as at the end: that is
+/// what opening looks like, and opening is not missing anything.
+fn at_tail(position: f64, screen: f64, last: f64) -> bool {
+    screen <= 0.0 || position + screen >= last
+}
+
+/// Whether the view is close enough to the top to ask for older messages.
+/// One screen early, so the page has usually landed by the time the top
+/// comes into view. A view that has never been laid out reports no visible
+/// lines and counts as at the top: that is what opening looks like.
+fn near_top(position: f64, screen: f64) -> bool {
+    position <= screen.max(1.0)
+}
+
+/// Whether an operation puts text above everything on screen. Only chrome
+/// may sit above such a run: the gap notice, a loading or error line, and
+/// the day rule heading the message the page arrives over. It is what says
+/// the scroll has to be re-anchored and the cursor taken off the gap line.
+fn reaches_the_top(op: &Op, placed: &impl Placed) -> bool {
+    let Op::Insert { before, .. } = op else {
+        return false;
+    };
+    let Some(before) = before.clone() else {
+        return false;
+    };
+    let mut above = placed.above(&before);
+    while let Some(key) = above {
+        if !matches!(key, Row::Notice | Row::Gap | Row::Day(_) | Row::Unread) {
+            return false;
+        }
+        above = placed.above(&key);
+    }
+    true
+}
+
+/// What the transcript already holds, which is all the planner needs to
+/// know about it.
+trait Placed {
+    fn holds(&self, key: &Row) -> bool;
+    fn above(&self, key: &Row) -> Option<Row>;
+    fn below(&self, key: &Row) -> Option<Row>;
+}
+
+impl Placed for Transcript<Row, Class, LineMeta, ChromeGutter> {
+    fn holds(&self, key: &Row) -> bool {
+        self.contains(key)
+    }
+
+    fn above(&self, key: &Row) -> Option<Row> {
+        self.key_before(key).cloned()
+    }
+
+    fn below(&self, key: &Row) -> Option<Row> {
+        self.key_after(key).cloned()
+    }
+}
+
+/// Which way to look for the message next to a row.
+#[derive(Clone, Copy)]
+enum Side {
+    After,
+    Before,
+}
+
+/// Where the point goes when the message it was on is deleted by someone
+/// else.
+///
+/// Three of the four cases the anchors already answer: the point is an
+/// editor selection over an anchor, and an anchor inside deleted text
+/// collapses to the boundary, which is where the message that followed now
+/// begins. The fourth is the one that needed writing down. When the next
+/// message is under a day rule, the boundary is the rule, and a point on a
+/// rule is a point with nothing under it: `e` does nothing, a reaction does
+/// nothing, `enter` does nothing, and the reader is given no reason.
+///
+/// So: the message that followed, which is where they were reading towards;
+/// at the end of the run there is nothing after it and the one before is
+/// the answer. A point that was not on the deleted message is the reader's
+/// own place and is not touched.
+fn point_after_removal(on_it: bool, after: Option<Row>, before: Option<Row>) -> Option<Row> {
+    match on_it {
+        true => after.or(before),
+        false => None,
+    }
+}
+
+/// Turns the session's changes into transcript operations. Arriving messages
+/// are gathered into runs, so a page of history is one edit at the top
+/// rather than fifty, and a day rule rides with the message it heads.
+fn plan(updates: &[Update], shown: &[&Message], placed: &impl Placed) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut added: HashSet<Row> = HashSet::new();
+    let mut gone: HashSet<Row> = HashSet::new();
+    let held = |key: &Row, added: &HashSet<Row>, gone: &HashSet<Row>| {
+        (placed.holds(key) || added.contains(key)) && !gone.contains(key)
+    };
+    let arriving = updates
+        .iter()
+        .filter_map(|update| match update {
+            Update::Inserted(ts) => Some(ts.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut pending: Vec<Ts> = Vec::new();
+    for update in updates {
+        match update {
+            Update::Inserted(ts) => pending.push(ts.clone()),
+            Update::Replaced(ts) => {
+                plan_inserts(
+                    std::mem::take(&mut pending),
+                    shown,
+                    &arriving,
+                    placed,
+                    &mut added,
+                    &gone,
+                    &mut ops,
+                );
+                let key = Row::Message(ts.clone());
+                if held(&key, &added, &gone) {
+                    ops.push(Op::Replace(key));
+                }
+            }
+            Update::Removed(ts) => {
+                plan_inserts(
+                    std::mem::take(&mut pending),
+                    shown,
+                    &arriving,
+                    placed,
+                    &mut added,
+                    &gone,
+                    &mut ops,
+                );
+                let key = Row::Message(ts.clone());
+                if !held(&key, &added, &gone) {
+                    continue;
+                }
+                let above = placed.above(&key);
+                let below = placed.below(&key);
+                ops.push(Op::Remove(key.clone()));
+                gone.insert(key);
+                // A day rule with nothing left under it goes too.
+                let Some(Row::Day(label)) = above else {
+                    continue;
+                };
+                let heads_something = match below {
+                    Some(Row::Message(ts)) => day_label(ts.epoch_seconds() as i64) == label,
+                    _ => false,
+                };
+                if !heads_something {
+                    ops.push(Op::Remove(Row::Day(label.clone())));
+                    gone.insert(Row::Day(label));
+                }
+            }
+        }
+    }
+    plan_inserts(
+        pending, shown, &arriving, placed, &mut added, &gone, &mut ops,
+    );
+    ops
+}
+
+fn plan_inserts(
+    mut arrived: Vec<Ts>,
+    shown: &[&Message],
+    arriving: &HashSet<Ts>,
+    placed: &impl Placed,
+    added: &mut HashSet<Row>,
+    gone: &HashSet<Row>,
+    ops: &mut Vec<Op>,
+) {
+    if arrived.is_empty() {
+        return;
+    }
+    arrived.sort_by(|left, right| left.epoch_seconds().total_cmp(&right.epoch_seconds()));
+    let held = |key: &Row, added: &HashSet<Row>| {
+        (placed.holds(key) || added.contains(key)) && !gone.contains(key)
+    };
+    let mut keys: Vec<Row> = Vec::new();
+    let mut before: Option<Row> = None;
+    let mut follows: Option<String> = None;
+    let mut previous_day: Option<i64> = None;
+    let mut last_day: Option<i64> = None;
+    for ts in arrived {
+        // A reply in a channel is not shown there at all; it changed the
+        // parent's count line instead, which arrives as its own update.
+        let Some(place) = position_of(shown, &ts) else {
+            continue;
+        };
+        let at = shown[place].ts.epoch_seconds() as i64;
+        let next = anchor_after(shown, place, arriving, |key| held(key, added));
+        if !keys.is_empty() && next != before {
+            close_run(
+                std::mem::take(&mut keys),
+                before.clone(),
+                follows.take(),
+                last_day,
+                ops,
+            );
+            previous_day = None;
+        }
+        if keys.is_empty() {
+            before = next;
+            // The day rule heading the message the run lands on. It stays
+            // where it is when the run starts on that same day, and is dealt
+            // with by `close_run` when the run reaches back further.
+            let rule = match before.as_ref().and_then(|before| placed.above(before)) {
+                Some(Row::Day(label)) => Some(label),
+                _ => None,
+            };
+            let covered = rule.as_ref().is_some_and(|label| label == &day_label(at));
+            follows = match covered {
+                true => None,
+                false => rule,
+            };
+            previous_day = match covered {
+                true => Some(at),
+                false => day_before(before.as_ref(), shown, place, arriving, |key| {
+                    held(key, added)
+                }),
+            };
+        }
+        // A day rule heads the first message of its day.
+        if previous_day.is_none_or(|last| crosses_day(last, at)) {
+            let rule = Row::Day(day_label(at));
+            keys.push(rule.clone());
+            added.insert(rule);
+        }
+        previous_day = Some(at);
+        last_day = Some(at);
+        let key = Row::Message(ts);
+        keys.push(key.clone());
+        added.insert(key);
+    }
+    close_run(keys, before, follows, last_day, ops);
+}
+
+/// Puts one run in, around the day rule that heads the message it lands on.
+/// A run ending on that same day now heads the day itself, so the old rule
+/// would sit in the middle of it: it comes down first, and the run takes its
+/// place. A run that ends earlier simply goes in above it.
+fn close_run(
+    keys: Vec<Row>,
+    before: Option<Row>,
+    follows: Option<String>,
+    last_day: Option<i64>,
+    ops: &mut Vec<Op>,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let stale = follows
+        .clone()
+        .filter(|label| last_day.is_some_and(|at| &day_label(at) == label));
+    match stale {
+        Some(label) => {
+            ops.push(Op::Remove(Row::Day(label)));
+            ops.push(Op::Insert { before, keys });
+        }
+        None => ops.push(Op::Insert {
+            before: follows.map(Row::Day).or(before),
+            keys,
+        }),
+    }
+}
+
+/// The item an arriving message goes in front of: the next message already
+/// on screen. `None` means the end.
+fn anchor_after(
+    shown: &[&Message],
+    place: usize,
+    arriving: &HashSet<Ts>,
+    held: impl Fn(&Row) -> bool,
+) -> Option<Row> {
+    shown
+        .get(place + 1..)?
+        .iter()
+        .find(|message| !arriving.contains(&message.ts))
+        .map(|message| Row::Message(message.ts.clone()))
+        .filter(|row| held(row))
+}
+
+/// Where a timestamp sits in the run on screen, or `None` if it is not
+/// shown there — a reply in a channel is the case.
+///
+/// A binary search, because the run is held in `ts` order and an arriving
+/// message must cost the message rather than the run it lands at the end
+/// of. Walking would be the whole transcript for every message the socket
+/// brings, which is what a live conversation does all day.
+fn position_of(shown: &[&Message], ts: &Ts) -> Option<usize> {
+    let at = shown
+        .binary_search_by(|message| message.ts.epoch_seconds().total_cmp(&ts.epoch_seconds()))
+        .ok()?;
+    (shown[at].ts == *ts).then_some(at)
+}
+
+/// The message at a timestamp, by the same search.
+fn at_ts<'a>(shown: &[&'a Message], ts: &Ts) -> Option<&'a Message> {
+    position_of(shown, ts).map(|at| shown[at])
+}
+
+/// The day of the message the run will follow, which decides whether it
+/// needs a day rule of its own.
+fn day_before(
+    anchor: Option<&Row>,
+    shown: &[&Message],
+    place: usize,
+    arriving: &HashSet<Ts>,
+    held: impl Fn(&Row) -> bool,
+) -> Option<i64> {
+    // From the anchor's own place backwards, not from the end: the run is
+    // ordered, so the message this one follows is the nearest one under it
+    // that is not arriving with it.
+    let below = match anchor {
+        Some(Row::Message(ts)) => position_of(shown, ts).unwrap_or(place),
+        _ => shown.len(),
+    };
+    let before = shown
+        .get(..below)?
+        .iter()
+        .rev()
+        .find(|message| !arriving.contains(&message.ts))?;
+    held(&Row::Message(before.ts.clone())).then(|| before.ts.epoch_seconds() as i64)
+}
+
+/// The pictures a message hangs under itself: which line each sits on, and
+/// which file it is. What is cached is not an input, which is the whole of
+/// the no-jump rule — the same boxes, of the same height, are asked for
+/// whether the bytes have arrived or not.
+fn image_boxes(item: &Rendered) -> Vec<(u32, &FileSummary)> {
+    item.lines
+        .iter()
+        .enumerate()
+        .flat_map(|(line, meta)| meta.images.iter().map(move |file| (line as u32, file)))
+        .collect()
+}
+
+/// How big the picture is drawn inside its box: its own shape, scaled to
+/// fill the box the rows were measured for. The thumbnail standing in for
+/// it is drawn at exactly the same size, so the swap changes the pixels and
+/// nothing else — no row moves, on any screen or at any font size.
+fn drawn_size(
+    file: &FileSummary,
+    box_width: gpui::Pixels,
+    box_height: gpui::Pixels,
+) -> (gpui::Pixels, gpui::Pixels) {
+    let (width, height) = (file.original_w as f32, file.original_h as f32);
+    if width <= 0.0 || height <= 0.0 {
+        return (box_width, box_height);
+    }
+    let scale = (f32::from(box_width) / width).min(f32::from(box_height) / height);
+    (gpui::px(width * scale), gpui::px(height * scale))
+}
+
+/// A picture under the line that names it, indented to the body column.
+/// Clicking it asks for the full-size view, the same thing `enter` on the
+/// file line asks for.
+///
+/// The box exists from the first draw, sized from what Slack says the
+/// picture measures, and holds its size for the picture's whole journey:
+/// Slack's smallest thumbnail blown up to fill it, then the picture itself.
+/// Nothing under it moves, and the arrival costs no item — the block reads
+/// the cache each time it draws, so the surface only asks for a redraw.
+fn image_block(
+    line: u32,
+    order: usize,
+    file: FileSummary,
+    session: gpui::WeakEntity<Session>,
+    view: gpui::WeakEntity<ConversationView>,
+) -> BlockSpec {
+    let rows = file.image_rows();
+    BlockSpec {
+        line,
+        height: rows,
+        render: std::sync::Arc::new(move |cx| {
+            let (file, view) = (file.clone(), view.clone());
+            let cached = |id: &str| {
+                session
+                    .read_with(cx, |session, _| {
+                        session.cached_file(id).map(std::path::Path::to_owned)
+                    })
+                    .ok()
+                    .flatten()
+                    .filter(|path| path.exists())
+            };
+            let thumb = file.thumbnail();
+            let picture =
+                cached(&file.id).or_else(|| thumb.as_ref().and_then(|thumb| cached(&thumb.id)));
+            // The spacer is real text in the transcript's own font, which is
+            // the only way to land the picture exactly under the body column
+            // whatever font the reader has set.
+            let style = cx.editor_style.text.clone();
+            let box_height = cx.line_height * rows as f32;
+            let box_width = cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT);
+            // The picture's own size inside the box, spelled out rather than
+            // left to the element: the editor measures a block and resizes
+            // it to what it drew, so a thumbnail allowed to be its own tiny
+            // self would shrink the box and move every row under it.
+            let (width, height) = drawn_size(&file, box_width, box_height);
+            let measured = file.original_w > 0 && file.original_h > 0;
+            let inside = match picture {
+                // A picture Slack measured is asked for at the size the box
+                // was built from, which is its own shape, so what is asked
+                // for and what the bytes turn out to be agree.
+                //
+                // One Slack never measured is asked for by height alone.
+                // gpui takes the aspect ratio from the bytes and lets it
+                // override a width or height that disagrees, so a tall
+                // picture given the box's own shape paints past the block
+                // and over the messages under it. Height is the side that
+                // must not give, so it is the side that is spelled out.
+                Some(path) if measured => gpui::img(path).w(width).h(height).into_any_element(),
+                Some(path) => gpui::img(path)
+                    .h(box_height)
+                    .max_w(box_width)
+                    .into_any_element(),
+                // Nothing cached yet, not even the thumbnail: an empty box
+                // of the right size, which still holds the rows below it.
+                None => div()
+                    .w(width)
+                    .h(height)
+                    .bg(cx.app.theme().colors().element_background)
+                    .into_any_element(),
+            };
+            div()
+                .flex()
+                .items_start()
+                .h(box_height)
+                // Nothing a picture does may reach the rows under it.
+                .overflow_hidden()
+                .font_family(style.font_family.clone())
+                .text_size(style.font_size)
+                .child(" ".repeat(BODY_INDENT))
+                .child(
+                    div()
+                        .id(("slack-image", line))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            let file = file.clone();
+                            let _ = view.update(cx, |_, cx| cx.emit(Event::OpenFile(file)));
+                        })
+                        .child(inside),
+                )
+                .into_any_element()
+        }),
+        priority: order,
+    }
+}
+
+/// One message as a block of the document: `name: body  time`.
+///
+/// The shape is a chat log's, not a table's: the name introduces the words,
+/// the time trails them, and nothing is padded into a column, so one long
+/// name cannot push every other line across the screen. The words are
+/// markdown and the parse lays them out, so nothing is indented into place;
+/// only the chrome under a message sits at [`BODY_INDENT`]. No blank line
+/// between messages; a day is the only break.
+fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
+    let at = message.ts.epoch_seconds() as i64;
+    let thread = Some(message.thread_root());
+    let indent = " ".repeat(BODY_INDENT);
+    let mut spans = Vec::new();
+    let mut lines = Vec::new();
+
+    // Slack shows joins, leaves, and topic changes, and so does rho: leaving
+    // them out makes a channel read as if nothing happened. They are one
+    // muted line, without a name of their own.
+    if let Some(line) = system_line(message, model) {
+        spans.push(Span::styled(format!("{line}\n"), Class::Muted));
+        lines.push(LineMeta {
+            thread,
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+        return item(Row::Message(message.ts.clone()), spans, lines);
+    }
+
+    let you = message.user.as_ref() == Some(model.self_id());
+    let name = Span::styled(
+        model.author(message),
+        match you {
+            true => Class::You,
+            false => Class::Sender,
+        },
+    );
+    // The time trails what was said rather than heading it: it is the least
+    // of what the reader came for. It trails the words only: what the
+    // renderer hangs under a message (a card, a file, a picture) was not
+    // said at a time of its own.
+    let time = Span::styled(format!("  {}", clock_time(at)), Class::Time);
+    // The reader is told what they are looking at is not what was sent.
+    let edited = message
+        .edited
+        .then(|| Span::styled(" (edited)", Class::Muted));
+
+    let (said, chrome) = model.markdown_parts(message);
+    let said = said.trim_end().to_owned();
+    let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
+    // A file's line is the one that reads as the file: `enter` there opens
+    // it rather than the thread.
+    let meta = |line: &str| LineMeta {
+        thread: thread.clone(),
+        file: message
+            .files
+            .iter()
+            .find(|file| line.trim() == file.line())
+            .cloned(),
+        link: link_on(line, &links),
+        images: Vec::new(),
+    };
+
+    // One line of speech keeps the chat log's shape: `name: what they
+    // said  time`. Words the parse reads as a block of their own -- a list,
+    // a quote, a fence, a heading, a table -- cannot begin after a name, so
+    // there the name and the time are a line of their own and the words
+    // start under them, which is how the transcript names a turn.
+    if said.lines().count() <= 1 && !opens_a_block(&said) {
+        spans.push(name);
+        spans.push(Span::plain(": "));
+        push_body(&mut spans, &said, model, &message.files);
+        spans.extend(edited);
+        spans.push(time);
+        spans.push(Span::plain("\n"));
+        lines.push(meta(&said));
+    } else {
+        spans.push(name);
+        spans.extend(edited);
+        spans.push(time);
+        spans.push(Span::plain("\n"));
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+        push_body(&mut spans, &said, model, &message.files);
+        spans.push(Span::plain("\n"));
+        lines.extend(said.split('\n').map(&meta));
+    }
+    // What came with the message rather than being it -- an attachment's
+    // card, a link preview, a file -- is marked in the gutter and starts at
+    // the margin like anything else. Nothing is drawn into the text to say
+    // so: that is what the bar beside it is for.
+    let mut gutter = None;
+    if !chrome.is_empty() {
+        let text = chrome.join("\n");
+        let from = width(&spans);
+        push_body(&mut spans, &text, model, &message.files);
+        spans.push(Span::plain("\n"));
+        gutter = Some(from..width(&spans));
+        lines.extend(text.split('\n').map(&meta));
+    }
+    // The pictures hang under everything the message said and named, and
+    // above its reactions and its thread line: those are about the message,
+    // and a picture is part of it.
+    if let Some(last) = lines.last_mut() {
+        last.images = message
+            .files
+            .iter()
+            .filter(|file| file.is_image())
+            .cloned()
+            .collect();
+    }
+
+    if !message.reactions.is_empty() {
+        spans.push(Span::plain(indent.clone()));
+        push_reactions(&mut spans, message, model);
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+    }
+    if !in_thread && message.is_broadcast() {
+        // It was said in a thread and sent here too: the reader should know
+        // which, or the thread reads as two conversations.
+        spans.push(Span::styled(
+            format!("{indent}also sent to the channel\n"),
+            Class::Muted,
+        ));
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+    }
+    // The thread under a message is one line, not a fold-out: the reader
+    // sees that it exists and opens it with `enter`.
+    if !in_thread && message.reply_count > 0 {
+        spans.push(Span::styled(
+            format!("{indent}{}\n", replies_line(message)),
+            Class::Topic,
+        ));
+        lines.push(LineMeta {
+            thread,
+            file: None,
+            link: None,
+            images: Vec::new(),
+        });
+    }
+    let item = item(Row::Message(message.ts.clone()), spans, lines);
+    match gutter {
+        Some(gutter) => item.with_gutter(gutter),
+        None => item,
+    }
+}
+
+/// How far into the item's text the spans have got, which is where the next
+/// one starts. The item's own text is what a gutter range is measured in.
+fn width(spans: &[Span]) -> usize {
+    spans.iter().map(|span| span.text.len()).sum()
+}
+
+/// What the empty composer says it is for. A thread's composer says so in
+/// its own words, because a reply landing in the channel instead is the
+/// mistake this line exists to prevent.
+fn compose_placeholder(label: &str, thread: bool) -> String {
+    match thread {
+        false => format!("message {label}"),
+        true => format!("reply in {label}"),
+    }
+}
+
+/// Waits for the outcome of a write that is already on its way. The write
+/// is detached, so this task holds nothing: dropping it drops the answer and
+/// not the message. A sender that goes away without answering -- the window
+/// closing under the write -- reads as nothing having happened, which is the
+/// only honest thing to record when nobody is left to hear.
+fn watch(
+    cx: &mut Context<ConversationView>,
+    told: futures::channel::oneshot::Receiver<Submitted>,
+) -> Task<Submitted> {
+    cx.background_spawn(async move { told.await.unwrap_or(Submitted::Nothing) })
+}
+
+/// The composer after a refused send: the words that did not go out, and
+/// under them whatever the reader has typed since. Which of the two they
+/// want is theirs to decide; neither is thrown away to make room.
+fn restored_compose(refused: String, held: &str) -> String {
+    match held.trim().is_empty() {
+        true => refused,
+        false => format!("{refused}\n{held}"),
+    }
+}
+
+/// Where a refused rewrite goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// The edit is reopened on the message and the rewrite is the composer
+    /// again: nothing of the reader's has moved since, so the surface can
+    /// put them back exactly where they pressed enter.
+    BackIntoTheEdit,
+    /// The reader has started something else. It wins, and the refused words
+    /// go under it, the same as a refused send.
+    UnderTheComposer,
+}
+
+/// Whether the surface may reopen the edit, given whether another one is
+/// already open and whether the composer still holds exactly what closing
+/// the edit put there.
+fn refused_rewrite(editing: bool, composer: &str, held: &str) -> Refused {
+    match editing || composer != held {
+        true => Refused::UnderTheComposer,
+        false => Refused::BackIntoTheEdit,
+    }
+}
+
+/// A message still on its way out: the whole line goes muted, so the reader
+/// can tell what has landed from what has not without a marker to decode.
+fn mark_pending(item: &mut Rendered) {
+    item.styles = vec![(Class::Muted, 0..item.text.trim_end_matches('\n').len())];
+}
+
+/// Why the surface put the reader on a particular message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Landing {
+    /// A card rho is asking them to answer.
+    Dealt,
+    /// A place they went looking for.
+    Found,
+}
+
+impl Landing {
+    fn class(self) -> Class {
+        match self {
+            Self::Dealt => Class::Dealt,
+            Self::Found => Class::Found,
+        }
+    }
+}
+
+/// Tints the message the surface landed on. The trailing newline is left
+/// out: it is the gap to the next message, and tinting it would draw an
+/// empty band under the card.
+fn mark_landing(item: &mut Rendered, landing: Landing) {
+    item.backgrounds
+        .push((landing.class(), 0..item.text.trim_end_matches('\n').len()));
+}
+
+/// The break between days, which is the only separator the transcript has.
+fn day_item(at: i64) -> Rendered {
+    day_rule(day_label(at))
+}
+
+/// The oldest message the reader has not seen, out of the run on screen.
+/// Recomputed on every refresh: a page of older messages landing above can
+/// carry unread ones with it, and the rule belongs over the oldest of them.
+fn first_unread(messages: &[Message], from: &Ts) -> Option<Ts> {
+    messages
+        .iter()
+        .find(|message| message.ts.is_newer_than(from))
+        .map(|message| message.ts.clone())
+}
+
+/// The unread rule, written as the document's own heading so the parse
+/// draws it and hides its markers. It reads as unread rather than as
+/// chrome: a day break is where the reader is in the week, this is where
+/// they stopped.
+fn unread_rule() -> Rendered {
+    muted_item(Row::Unread, "## new\n", Class::Unread)
+}
+
+fn day_rule(label: String) -> Rendered {
+    muted_item(
+        Row::Day(label.clone()),
+        format!("## {label}\n"),
+        Class::Muted,
+    )
+}
+
+fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {
+    let text = text.into();
+    let lines = text.matches('\n').count().max(1);
+    item(
+        key,
+        vec![Span::styled(text, class)],
+        vec![LineMeta::default(); lines],
+    )
+}
+
+fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
+    let (text, styles) = lay_out(&spans);
+    Item::new(key, text).with_styles(styles).with_lines(lines)
+}
+
+/// Where a continuation line, a reaction row, a thread count and a picture
+/// all start: two columns in, so they read as belonging to the message
+/// above rather than as a message of their own.
+const BODY_INDENT: usize = 2;
+
+/// Whether words would be read as a block of their own rather than as a
+/// sentence: a heading, a list, a quote, a fence, a table. Such a message
+/// cannot begin after a name on the same line, because the marker only
+/// means what it means at the start of a line.
+fn opens_a_block(said: &str) -> bool {
+    let head = said.trim_start_matches(' ');
+    let opener = ["#", ">", "- ", "+ ", "* ", "```", "~~~", "|", "---", "==="];
+    opener.iter().any(|mark| head.starts_with(mark))
+        || head.split_once(['.', ')']).is_some_and(|(number, rest)| {
+            !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && rest.starts_with(' ')
+        })
+}
+
+/// A membership or housekeeping event, as one line. Slack shows these and a
+/// channel reads wrong without them, but they are not what anyone came to
+/// read: no author column, no time.
+fn system_line(message: &Message, model: &Model) -> Option<String> {
+    let author = model.author(message);
+    Some(match message.subtype.as_deref()? {
+        "channel_join" | "group_join" => format!("— {author} joined —"),
+        "channel_leave" | "group_leave" => format!("— {author} left —"),
+        // The topic itself is the news here, so the message keeps its words.
+        "channel_topic" | "channel_purpose" | "pinned_item" => {
+            format!("— {} —", model.render(message).trim_start_matches('@'))
+        }
+        _ => return None,
+    })
+}
+
+/// The reactions under a message: `👍 3 · 🎉 1`. One the reader added is in
+/// their own class, which is the whole of how they can tell; a word for it
+/// would be noise on every line.
+fn push_reactions(spans: &mut Vec<Span>, message: &Message, model: &Model) {
+    for (index, reaction) in message.reactions.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" · ", Class::Muted));
+        }
+        let mine = reaction.users.iter().any(|user| user == model.self_id());
+        spans.push(Span::styled(
+            format!(
+                "{} {}",
+                crate::emoji::render(&format!(":{}:", reaction.name)),
+                reaction.count
+            ),
+            match mine {
+                true => Class::You,
+                false => Class::Muted,
+            },
+        ));
+    }
+    spans.push(Span::plain("\n"));
+}
+
+/// `↳ 3 replies · 14:41`: how many, and when the thread was last touched.
+fn replies_line(message: &Message) -> String {
+    let count = message.reply_count;
+    let plural = match count {
+        1 => "reply",
+        _ => "replies",
+    };
+    match &message.latest_reply {
+        Some(latest) => format!(
+            "↳ {count} {plural} · {}",
+            clock_time(latest.epoch_seconds() as i64)
+        ),
+        None => format!("↳ {count} {plural}"),
+    }
+}
+
+/// A body, with the workspace's own emoji muted. `:forrest_gump_wave:` is a
+/// picture everywhere but here, so it reads as chrome rather than as a word
+/// someone typed.
+/// The link a line stands for: the first whose label the line carries, so
+/// `enter` opens what the reader is looking at.
+fn link_on(line: &str, links: &[crate::block::Link]) -> Option<String> {
+    links
+        .iter()
+        .find(|link| line.contains(&link.label))
+        .map(|link| link.url.clone())
+}
+
+fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, files: &[FileSummary]) {
+    let mut marked: Vec<(Range<usize>, Class)> = Vec::new();
+    // Lines the renderer added rather than the author: an attachment's card,
+    // preview or app card alike. They read as chrome, not as speech.
+    let mut offset = 0;
+    for line in body.split('\n') {
+        let trimmed = line.trim_start();
+        let start = offset + (line.len() - trimmed.len());
+        // A file's name and size are a caption, not something anyone said:
+        // muted like a timestamp, so the picture under it is what the eye
+        // lands on.
+        if files.iter().any(|file| trimmed == file.line()) {
+            marked.push((start..offset + line.len(), Class::Muted));
+        }
+        offset += line.len() + 1;
+    }
+    for range in crate::emoji::shortcodes(body) {
+        if model.is_custom_emoji(&body[range.start + 1..range.end - 1]) {
+            marked.push((range, Class::Muted));
+        }
+    }
+    // A mention of the reader carries their name like anyone else's; only
+    // the class says it is about them.
+    if let Some(mention) = model.self_mention() {
+        let mut from = 0;
+        while let Some(at) = body[from..].find(&mention) {
+            let start = from + at;
+            from = start + mention.len();
+            marked.push((start..from, Class::You));
+        }
+    }
+    marked.sort_by_key(|(range, _)| range.start);
+    let mut cursor = 0;
+    for (range, class) in marked {
+        if range.start < cursor {
+            continue;
+        }
+        spans.push(Span::plain(body[cursor..range.start].to_owned()));
+        spans.push(Span::styled(body[range.clone()].to_owned(), class));
+        cursor = range.end;
+    }
+    spans.push(Span::plain(body[cursor..].to_owned()));
+}
+
+/// The token the composer would complete: where it starts, which sigil
+/// opened it, and what has been typed since. A sigil only counts at the
+/// start of a word, so `https://x` and `me@example.com` are prose.
+fn compose_token(before: &str) -> Option<(usize, char, &str)> {
+    let name_start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_name_char(*character))
+        .last()
+        .map_or(before.len(), |(at, _)| at);
+    let sigil_at = before[..name_start]
+        .char_indices()
+        .next_back()
+        .filter(|(_, character)| matches!(character, '@' | '#' | ':'))?
+        .0;
+    let opens_word = before[..sigil_at]
+        .chars()
+        .next_back()
+        .is_none_or(|character| !is_name_char(character) && character != ':');
+    if !opens_word {
+        return None;
+    }
+    let needle = &before[name_start..];
+    // There are thousands of emoji and no useful first page of them: the
+    // list is worth showing once the reader has narrowed it at all.
+    if before[sigil_at..].starts_with(':') && needle.is_empty() {
+        return None;
+    }
+    Some((sigil_at, before[sigil_at..].chars().next()?, needle))
+}
+
+fn is_name_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// Completion in the composer: `@` over the people, `#` over the channels,
+/// `:` over the emoji, through the editor's own completion menu so it reads
+/// and moves like completion everywhere else in rho.
+struct ComposeCompletions {
+    session: gpui::WeakEntity<Session>,
+    channel: crate::types::ChannelId,
+    /// The composer's buffer. The transcript shares this editor and must
+    /// never offer anything: it is not writable.
+    input: gpui::EntityId,
+}
+
+impl CompletionProvider for ComposeCompletions {
+    fn completions(
+        &self,
+        buffer: &Entity<Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: CompletionContext,
+        _window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> gpui::Task<anyhow::Result<Vec<project::CompletionResponse>>> {
+        let empty = gpui::Task::ready(Ok(Vec::new()));
+        if buffer.entity_id() != self.input {
+            return empty;
+        }
+        let Some(session) = self.session.upgrade() else {
+            return empty;
+        };
+        let read = buffer.read(cx);
+        let cursor = buffer_position.to_offset(read);
+        let before = read.text_for_range(0..cursor).collect::<String>();
+        let Some((start, sigil, needle)) = compose_token(&before) else {
+            return empty;
+        };
+        let replace_range = read.anchor_before(start)..read.anchor_before(cursor);
+        let completions = session
+            .read(cx)
+            .model()
+            .suggestions(&self.channel, sigil, needle)
+            .into_iter()
+            .map(|suggestion| project::Completion {
+                replace_range: replace_range.clone(),
+                new_text: suggestion.value.clone(),
+                label: CodeLabel::plain(suggestion.value, None),
+                documentation: match suggestion.detail.is_empty() {
+                    true => None,
+                    false => Some(project::lsp_store::CompletionDocumentation::SingleLine(
+                        suggestion.detail.into(),
+                    )),
+                },
+                source: project::CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect();
+        gpui::Task::ready(Ok(vec![project::CompletionResponse {
+            completions,
+            display_options: project::CompletionDisplayOptions {
+                dynamic_width: true,
+            },
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: language::Anchor,
+        text: &str,
+        _trigger_in_words: bool,
+        _cx: &mut Context<Editor>,
+    ) -> bool {
+        text.chars().last().is_some_and(|character| {
+            matches!(character, '@' | '#' | ':') || is_name_char(character)
+        })
+    }
+}
+
+impl gpui::Render for ConversationView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One page per frame, which is what makes it one page per keypress:
+        // a motion raises a scroll event and a selection event, and a
+        // conversation opening onto a gap raises neither.
+        let (position, screen) = self.editor.update(cx, |editor, cx| {
+            (
+                editor.scroll_position(cx).y,
+                editor.visible_line_count().unwrap_or(0.0),
+            )
+        });
+        // Reaching the end is what reads them: `G` clears the count
+        // because it puts the end on screen, not because it is `G`.
+        let last = self.multi_buffer.read(cx).snapshot(cx).max_point().row as f64;
+        if at_tail(position, screen, last) {
+            self.unseen = 0;
+        }
+        self.fill(position, screen, cx);
+        div()
+            .id("rho-slack-conversation")
+            .key_context("RhoSlackConversation")
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            // A file dropped on the conversation is an attachment for the
+            // next message, the same as pasting one.
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                    let Some(path) = paths.paths().first().cloned() else {
+                        return;
+                    };
+                    match this.attach_path(&path, cx) {
+                        Ok(Attaching::NotWhileEditing) => cx.emit(Event::AttachRefused),
+                        Ok(Attaching::Attached | Attaching::Replaced) => {}
+                        Err(error) => cx.emit(Event::AttachFailed(format!("{error:#}"))),
+                    }
+                }),
+            )
+            .child(self.editor.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::WorkspaceName;
+    use crate::types::{ChannelId, IMAGE_ROWS, UserId};
+
+    fn model() -> Model {
+        let mut model = Model::new(WorkspaceName("acme".into()));
+        model.set_self(UserId("ME".into()));
+        model.add_users([crate::types::User {
+            id: UserId("U1".into()),
+            name: "ada".into(),
+            handle: "ada".into(),
+        }]);
+        model
+    }
+
+    fn message(ts: &str, thread_ts: Option<&str>, text: &str) -> Message {
+        let mut value = json!({"ts": ts, "user": "U1", "text": text});
+        if let Some(thread_ts) = thread_ts {
+            value["thread_ts"] = json!(thread_ts);
+        }
+        crate::api::parse_message(&value, &ChannelId("C1".into())).unwrap()
+    }
+
+    fn parsed(value: serde_json::Value) -> Message {
+        crate::api::parse_message(&value, &ChannelId("C1".into())).unwrap()
+    }
+
+    /// The transcript as one string, its classes, and its line map: what
+    /// the surface would put in the buffer, built the way `rebuild` does.
+    #[test]
+    fn a_chip_reads_like_the_file_line_it_becomes() {
+        let waiting = Attached {
+            name: "image.png".to_owned(),
+            bytes: std::sync::Arc::new(vec![0; 327_680]),
+        };
+        assert_eq!(waiting.line(), "image.png · 320 KB");
+    }
+
+    /// What a rendered run of messages is: the text, the classes over it,
+    /// and one metadata entry per line.
+    type Rendered = (String, Vec<(Class, Range<usize>)>, Vec<LineMeta>);
+
+    fn render_messages(messages: &[Message], model: &Model, in_thread: bool) -> Rendered {
+        let shown = messages
+            .iter()
+            .filter(|message| in_thread || message.is_top_level());
+        let mut items = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in shown {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                items.push(day_item(at));
+            }
+            last = Some(at);
+            items.push(message_item(message, model, in_thread));
+        }
+        let mut text = String::new();
+        let mut styles = Vec::new();
+        let mut lines = Vec::new();
+        for item in items {
+            let offset = text.len();
+            text.push_str(&item.text);
+            styles.extend(
+                item.styles
+                    .into_iter()
+                    .map(|(class, range)| (class, offset + range.start..offset + range.end)),
+            );
+            lines.extend(item.lines);
+        }
+        (text, styles, lines)
+    }
+
+    /// A stand-in for what the transcript holds, in display order.
+    struct Held(Vec<Row>);
+
+    impl Placed for Held {
+        fn holds(&self, key: &Row) -> bool {
+            self.0.contains(key)
+        }
+
+        fn above(&self, key: &Row) -> Option<Row> {
+            let at = self.0.iter().position(|held| held == key)?;
+            self.0.get(at.checked_sub(1)?).cloned()
+        }
+
+        fn below(&self, key: &Row) -> Option<Row> {
+            let at = self.0.iter().position(|held| held == key)?;
+            self.0.get(at + 1).cloned()
+        }
+    }
+
+    /// What a conversation open on the surface looks like: a day rule and
+    /// the messages under it.
+    fn held(messages: &[Message]) -> Held {
+        let mut keys = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in messages {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                keys.push(Row::Day(day_label(at)));
+            }
+            last = Some(at);
+            keys.push(Row::Message(message.ts.clone()));
+        }
+        Held(keys)
+    }
+
+    /// The text carrying one class, in order: what the reader sees painted.
+    fn classed(text: &str, styles: &[(Class, Range<usize>)], class: Class) -> Vec<String> {
+        styles
+            .iter()
+            .filter(|(candidate, _)| *candidate == class)
+            .map(|(_, range)| text[range.clone()].to_owned())
+            .collect()
+    }
+
+    /// The run on screen as `plan` takes it: borrowed, never copied.
+    fn borrowed(shown: &[Message]) -> Vec<&Message> {
+        shown.iter().collect()
+    }
+
+    #[test]
+    fn a_page_landing_over_a_day_rule_still_reaches_the_top() {
+        let older = message("1.0", None, "older");
+        let shown = [older.clone(), message("2.0", None, "newest")];
+        let held = held(&shown[1..]);
+        let ops = plan(
+            &[Update::Inserted(older.ts.clone())],
+            &borrowed(&shown),
+            &held,
+        );
+        assert!(
+            ops.iter().any(|op| reaches_the_top(op, &held)),
+            "a day rule above the first message is chrome, not content: {ops:?}"
+        );
+        let deeper = Held(vec![
+            Row::Gap,
+            Row::Day("Tue 1 Sep".into()),
+            Row::Message(Ts("2.0".into())),
+        ]);
+        assert!(
+            reaches_the_top(
+                &Op::Insert {
+                    before: Some(Row::Message(Ts("2.0".into()))),
+                    keys: vec![Row::Message(Ts("1.0".into()))],
+                },
+                &deeper
+            ),
+            "the gap line and its day rule are both chrome"
+        );
+        assert!(
+            !reaches_the_top(
+                &Op::Insert {
+                    before: Some(Row::Message(Ts("2.0".into()))),
+                    keys: vec![Row::Message(Ts("1.5".into()))],
+                },
+                &Held(vec![
+                    Row::Message(Ts("1.0".into())),
+                    Row::Message(Ts("2.0".into())),
+                ])
+            ),
+            "a message above means the run landed in the middle"
+        );
+    }
+
+    #[test]
+    fn one_action_buys_exactly_one_page() {
+        let mut fill = Fill::default();
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "opening onto a gap asks once"
+        );
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            None,
+            "the page landing does not buy another"
+        );
+        fill.user_moved();
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "the reader scrolling buys one more"
+        );
+        assert_eq!(fill.wants(Some(Want::Older)), None, "and only one");
+        let mut fill = Fill::default();
+        assert_eq!(
+            fill.wants(None),
+            None,
+            "a reader away from the top asks for nothing"
+        );
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "and has spent nothing"
+        );
+    }
+
+    #[test]
+    fn a_hole_is_filled_forward_and_costs_the_same_one_page() {
+        let mut fill = Fill::default();
+        let hole = Want::Newer(Ts("2.0".into()));
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            None,
+            "opening at the bottom of a run is not a request to walk forward"
+        );
+        fill.user_moved();
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            Some(hole.clone()),
+            "a reader sitting on the hole asks for the page under it"
+        );
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            None,
+            "and that spends the action, whichever end the next one wants"
+        );
+        fill.user_moved();
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            Some(hole),
+            "moving buys one"
+        );
+        let mut fill = Fill::default();
+        assert_eq!(
+            fill.wants(None),
+            None,
+            "a view sitting on neither end asks for nothing"
+        );
+    }
+
+    #[test]
+    fn the_cursor_decides_which_end_is_asked_about() {
+        let hole = [(93.0, Ts("2.0".into()))];
+        assert_eq!(
+            wanted_at(3.0, 38.0, 95.0, &hole),
+            Some(Want::Newer(Ts("2.0".into()))),
+            "a reader who pressed `G` is at the bottom, whatever the view has \
+             caught up to yet"
+        );
+        assert_eq!(
+            wanted_at(60.0, 38.0, 61.0, &hole),
+            Some(Want::Newer(Ts("2.0".into()))),
+            "and a hole scrolled onto is asked about too"
+        );
+        assert_eq!(
+            wanted_at(0.0, 38.0, 0.0, &hole),
+            Some(Want::Older),
+            "at the top it is history that is missing"
+        );
+        assert_eq!(
+            wanted_at(60.0, 38.0, 61.0, &[]),
+            None,
+            "and in the middle of a run with no hole, nothing is"
+        );
+    }
+
+    #[test]
+    fn the_top_of_the_view_is_what_asks() {
+        assert!(near_top(0.0, 0.0), "a view not laid out yet is at the top");
+        assert!(near_top(0.0, 40.0), "the top itself asks");
+        assert!(near_top(39.0, 40.0), "a screen early still asks");
+        assert!(
+            !near_top(41.0, 40.0),
+            "a reader who has scrolled away is left alone"
+        );
+    }
+
+    #[test]
+    fn a_message_off_the_socket_costs_one_append() {
+        let held = held(&[message("1700000000.0", None, "hello")]);
+        let arrived = message("1700000060.0", None, "and another");
+        let shown = [message("1700000000.0", None, "hello"), arrived.clone()];
+
+        let ops = plan(
+            &[Update::Inserted(arrived.ts.clone())],
+            &borrowed(&shown),
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![Op::Insert {
+                before: None,
+                keys: vec![Row::Message(arrived.ts)],
+            }],
+            "one item at the end, and nothing else is touched"
+        );
+    }
+
+    #[test]
+    fn an_edit_costs_one_replacement() {
+        let shown = [
+            message("1700000000.0", None, "hello"),
+            message("1700000060.0", None, "fixed"),
+        ];
+        let held = held(&shown);
+
+        let ops = plan(
+            &[Update::Replaced(Ts("1700000060.0".into()))],
+            &borrowed(&shown),
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![Op::Replace(Row::Message(Ts("1700000060.0".into())))],
+            "the edited message is rewritten where it stands"
+        );
+    }
+
+    #[test]
+    fn a_page_of_history_costs_one_insert_at_the_top() {
+        let anchor = message("1700000600.0", None, "already here");
+        let held = held(std::slice::from_ref(&anchor));
+        let older = [
+            message("1700000000.0", None, "older"),
+            message("1700000060.0", None, "older still"),
+        ];
+        let shown = [older[0].clone(), older[1].clone(), anchor.clone()];
+
+        let ops = plan(
+            &older
+                .iter()
+                .map(|message| Update::Inserted(message.ts.clone()))
+                .collect::<Vec<_>>(),
+            &borrowed(&shown),
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![Op::Insert {
+                before: Some(Row::Message(anchor.ts.clone())),
+                keys: vec![
+                    Row::Message(older[0].ts.clone()),
+                    Row::Message(older[1].ts.clone()),
+                ],
+            }],
+            "a whole page arrives as one run, under the day rule already there"
+        );
+    }
+
+    #[test]
+    fn a_page_reaching_back_a_day_takes_over_the_day_rule() {
+        // A day and a bit: the page ends on the same day as what is on
+        // screen, so the rule that used to head that day would end up in the
+        // middle of the page.
+        let day = 86_400.0;
+        let anchor = message("1700000600.0", None, "already here");
+        let older = [
+            message(&format!("{}.0", 1700000600.0 - day), None, "the day before"),
+            message("1700000000.0", None, "earlier the same day"),
+        ];
+        let held = held(std::slice::from_ref(&anchor));
+        let shown = [older[0].clone(), older[1].clone(), anchor.clone()];
+        let rule = |message: &Message| Row::Day(day_label(message.ts.epoch_seconds() as i64));
+
+        let ops = plan(
+            &older
+                .iter()
+                .map(|message| Update::Inserted(message.ts.clone()))
+                .collect::<Vec<_>>(),
+            &borrowed(&shown),
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![
+                Op::Remove(rule(&anchor)),
+                Op::Insert {
+                    before: Some(Row::Message(anchor.ts.clone())),
+                    keys: vec![
+                        rule(&older[0]),
+                        Row::Message(older[0].ts.clone()),
+                        rule(&older[1]),
+                        Row::Message(older[1].ts.clone()),
+                    ],
+                },
+            ],
+            "the old rule comes down and the page brings its own"
+        );
+    }
+
+    #[test]
+    fn a_deleted_message_takes_its_day_rule_with_it() {
+        let only = message("1700000000.0", None, "hello");
+        let held = held(std::slice::from_ref(&only));
+
+        let ops = plan(&[Update::Removed(only.ts.clone())], &[], &held);
+
+        assert_eq!(
+            ops,
+            vec![
+                Op::Remove(Row::Message(only.ts.clone())),
+                Op::Remove(Row::Day(day_label(only.ts.epoch_seconds() as i64))),
+            ],
+            "nothing is left under the rule, so the rule goes"
+        );
+    }
+
+    #[test]
+    fn a_message_reads_as_name_body_then_time() {
+        let (text, styles, _) = render_messages(
+            &[
+                message("1700000000.0", None, "hello"),
+                message("1700000060.0", None, "over\ntwo lines"),
+            ],
+            &model(),
+            false,
+        );
+        assert!(!text.contains("1700000000"), "no raw timestamps: {text}");
+        let body = text
+            .lines()
+            .find(|line| line.contains("hello"))
+            .expect("the message is on a line");
+        assert!(
+            body.starts_with("ada: hello  ") && body.len() == "ada: hello  00:00".len(),
+            "name, body, then the time trailing it: {body:?}"
+        );
+        assert!(
+            !text.contains("\n\n"),
+            "no blank line between messages: {text:?}"
+        );
+        // Words that run past one line cannot start after a name: the
+        // markup at the start of a line is what the parse reads, so the
+        // name and the time are a line of their own and the words follow.
+        let named = text
+            .lines()
+            .position(|line| line.starts_with("ada  "))
+            .expect("the turn is named on a line of its own");
+        assert_eq!(
+            text.lines().skip(named + 1).take(2).collect::<Vec<_>>(),
+            vec!["over", "two lines"],
+            "the words start under the name, at the margin: {text:?}"
+        );
+        let times = classed(&text, &styles, Class::Time);
+        assert_eq!(times.len(), 2, "one time per message: {times:?}");
+        assert!(
+            times
+                .iter()
+                .all(|time| time.starts_with("  ") && time.len() == 7),
+            "the time trails the body, two spaces after it: {times:?}"
+        );
+    }
+
+    #[test]
+    fn the_reader_is_named_like_anyone_else_and_told_apart_by_class() {
+        let mut model = model();
+        model.add_users([crate::types::User {
+            id: UserId("ME".into()),
+            name: "Manmeet".into(),
+            handle: "manmeet".into(),
+        }]);
+        let mut own = message("1700000000.0", None, "on it");
+        own.user = Some(UserId("ME".into()));
+        let mention = message("1700000001.0", None, "can <@ME> take this?");
+        let (text, styles, _) = render_messages(&[own, mention], &model, false);
+
+        assert!(!text.contains("you"), "the word never appears: {text}");
+        assert!(text.contains("Manmeet"), "{text}");
+        assert!(text.contains("can @Manmeet take this?"), "{text}");
+        assert_eq!(
+            classed(&text, &styles, Class::You),
+            vec!["Manmeet", "@Manmeet"],
+            "own author line and a mention of the reader, class only"
+        );
+    }
+
+    #[test]
+    fn standard_emoji_are_glyphs_and_workspace_emoji_stay_muted_shortcodes() {
+        let mut model = model();
+        model.set_custom_emoji(["forrest_gump_wave".to_owned()]);
+        let (text, styles, _) = render_messages(
+            &[message(
+                "1700000000.0",
+                None,
+                "morning :wave: :forrest_gump_wave:",
+            )],
+            &model,
+            false,
+        );
+        assert!(text.contains("morning 👋"), "{text}");
+        assert!(
+            text.contains(":forrest_gump_wave:"),
+            "a workspace emoji has no glyph to become: {text}"
+        );
+        assert!(
+            classed(&text, &styles, Class::Muted)
+                .iter()
+                .any(|muted| muted == ":forrest_gump_wave:"),
+            "the shortcode reads as chrome: {text}"
+        );
+    }
+
+    #[test]
+    fn a_channel_shows_top_level_messages_and_a_count_line_for_the_thread() {
+        let parent = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "the curve needs a name",
+            "reply_count": 3,
+            "latest_reply": "1700000900.0",
+        }));
+        let reply = parsed(json!({
+            "ts": "1700000600.0",
+            "thread_ts": "1700000000.0",
+            "user": "U1",
+            "text": "deal curve is fine",
+        }));
+        let broadcast = parsed(json!({
+            "ts": "1700000900.0",
+            "thread_ts": "1700000000.0",
+            "subtype": "thread_broadcast",
+            "user": "U1",
+            "text": "named: deal curve",
+        }));
+        let messages = [parent, reply, broadcast];
+
+        let (text, _, lines) = render_messages(&messages, &model(), false);
+        assert!(
+            !text.contains("deal curve is fine"),
+            "an ordinary reply belongs to its thread alone: {text}"
+        );
+        assert!(
+            text.contains("named: deal curve"),
+            "a broadcast was said to the room: {text}"
+        );
+        assert!(text.contains("also sent to the channel"), "{text}");
+        assert!(text.contains("↳ 3 replies · "), "{text}");
+        assert!(!text.contains("in thread"), "the marker is gone: {text}");
+        assert_eq!(
+            lines.len(),
+            text.matches('\n').count(),
+            "the line map still covers the transcript exactly"
+        );
+        let root = Ts("1700000000.0".into());
+        assert_eq!(
+            lines.last().and_then(|line| line.thread.clone()),
+            Some(root),
+            "enter on the count line opens the thread"
+        );
+
+        // The thread surface is where every reply renders.
+        let (text, _, _) = render_messages(&messages, &model(), true);
+        assert!(text.contains("deal curve is fine"), "{text}");
+        assert!(
+            !text.contains("↳ 3 replies"),
+            "a thread does not count itself: {text}"
+        );
+    }
+
+    #[test]
+    fn reactions_read_as_glyphs_and_the_readers_own_is_told_apart_by_class() {
+        let mut model = model();
+        model.add_users([crate::types::User {
+            id: UserId("ME".into()),
+            name: "Manmeet".into(),
+            handle: "manmeet".into(),
+        }]);
+        let message = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "friday?",
+            "reactions": [
+                {"name": "thumbsup", "count": 2, "users": ["U1", "ME"]},
+                {"name": "tada", "count": 1, "users": ["U1"]},
+            ],
+        }));
+        let (text, styles, lines) = render_messages(&[message], &model, false);
+        assert!(text.contains("👍 2 · 🎉 1"), "{text}");
+        assert!(!text.contains("you"), "no word for it: {text}");
+        assert!(
+            classed(&text, &styles, Class::You).contains(&"👍 2".to_owned()),
+            "one the reader added is theirs"
+        );
+        assert!(classed(&text, &styles, Class::Muted).contains(&"🎉 1".to_owned()));
+        assert_eq!(lines.len(), text.matches('\n').count());
+    }
+
+    #[test]
+    fn an_edited_message_says_so() {
+        let message = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "friday it is",
+            "edited": {"user": "U1", "ts": "1700000100.0"},
+        }));
+        let (text, styles, lines) = render_messages(&[message], &model(), false);
+        assert!(text.contains("friday it is (edited)  "), "{text}");
+        assert!(
+            classed(&text, &styles, Class::Muted).contains(&" (edited)".to_owned()),
+            "{text}"
+        );
+        assert_eq!(lines.len(), text.matches('\n').count());
+    }
+
+    #[test]
+    fn a_join_is_one_muted_line_and_an_app_card_reads_as_chrome() {
+        let join = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "subtype": "channel_join",
+            "text": "<@U1> has joined the channel",
+        }));
+        let bot = parsed(json!({
+            "ts": "1700000060.0",
+            "username": "deploybot",
+            "text": "deploy finished",
+            "attachments": [{
+                "title": "build #412",
+                "pretext": "pipeline",
+                "text": "all checks passed",
+                "fields": [{"title": "branch", "value": "main", "short": true}],
+            }],
+        }));
+        let preview = parsed(json!({
+            "ts": "1700000120.0",
+            "user": "U1",
+            "text": "worth a read",
+            "attachments": [{"is_msg_unfurl": true, "title": "Worth a read", "text": "buried"}],
+        }));
+        let (text, styles, lines) = render_messages(&[join, bot, preview], &model(), false);
+
+        assert!(text.contains("— ada joined —"), "{text}");
+        assert!(
+            !text.contains("has joined the channel"),
+            "one line, not a sentence: {text}"
+        );
+        assert!(
+            text.contains("deploybot"),
+            "a bot is named like anyone: {text}"
+        );
+        assert!(text.contains("branch: main"), "{text}");
+        // An app card is the same quote box as a preview: it starts at the
+        // margin with the bar beside it, not a stray dash in the middle of
+        // the conversation.
+        assert!(text.lines().any(|line| line == "pipeline"), "{text}");
+        assert!(!text.contains("— pipeline"), "{text}");
+        let _ = &styles;
+        assert_eq!(lines.len(), text.matches('\n').count());
+    }
+
+    #[test]
+    fn an_unfurl_reads_as_a_quote_box_and_enter_opens_it() {
+        let preview = parsed(json!({
+            "ts": "1700000120.0",
+            "user": "U1",
+            "text": "worth a read <https://example.com/post|the post>",
+            "attachments": [{
+                "is_msg_unfurl": true,
+                "title": "Worth a read",
+                "text": "the first line\n\nthe second line\nthe third line",
+                "service_name": "example.com",
+                "title_link": "https://example.com/post",
+            }],
+        }));
+        let (text, styles, lines) =
+            render_messages(std::slice::from_ref(&preview), &model(), false);
+        assert!(
+            text.contains("Worth a read · example.com"),
+            "the title names the page and the site says where it is: {text}"
+        );
+        assert!(
+            text.contains("the second line") && !text.contains("the third line"),
+            "two lines of someone else's page, no more: {text}"
+        );
+        assert!(
+            !text.contains("\u{258e}"),
+            "the card's edge is the gutter's bar, not a column of text: {text}"
+        );
+        let _ = &styles;
+        assert!(
+            text.contains("[the post](https://example.com/post)"),
+            "the body's own link is markdown, for the parse to render: {text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|meta| meta.link.as_deref() == Some("https://example.com/post"))
+                .count()
+                >= 2,
+            "every line of the card opens the page it stands for"
+        );
+        // The card is marked in the gutter, which is the whole of what
+        // makes it one thing: the bar runs beside every row of it and
+        // beside nothing the sender said.
+        let item = message_item(&preview, &model(), false);
+        let marked = item.gutter.clone().expect("the card is marked");
+        assert_eq!(
+            item.text[marked].lines().collect::<Vec<_>>(),
+            vec![
+                "Worth a read · example.com",
+                "the first line",
+                "the second line"
+            ],
+            "the bar covers the card and stops there: {:?}",
+            item.text
+        );
+    }
+
+    #[test]
+    fn the_time_trails_the_words_and_never_the_chrome_under_them() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the deck",
+            "files": [{
+                "id": "F1",
+                "name": "deck.pdf",
+                "title": "deck.pdf",
+                "filetype": "pdf",
+                "size": 225_280,
+                "url_private": "https://files.example.com/deck.pdf",
+            }],
+        }));
+        let (text, _, _) = render_messages(&[with_file], &model(), false);
+        let timed = text
+            .lines()
+            .filter(|line| line.contains(&clock_time(1_700_000_000)))
+            .collect::<Vec<_>>();
+        assert_eq!(timed.len(), 1, "one time, on one line: {text}");
+        assert!(
+            timed[0].contains("here is the deck"),
+            "the time trails what was said: {text}"
+        );
+        assert!(
+            text.lines().any(|line| line.trim() == "deck.pdf · 220 KB"),
+            "the file line carries no time of its own: {text}"
+        );
+    }
+
+    #[test]
+    fn a_pictures_box_is_asked_for_before_its_bytes_arrive() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the mock",
+            "files": [{
+                "id": "F1",
+                "name": "image.png",
+                "title": "image.png",
+                "filetype": "png",
+                "size": 225_280,
+                "url_private": "https://files.example.com/image.png",
+                "original_w": 1200,
+                "original_h": 200,
+            }],
+        }));
+        let item = message_item(&with_file, &model(), false);
+        let boxes = image_boxes(&item);
+        assert_eq!(boxes.len(), 1, "one box, under what the message said");
+        let (line, file) = boxes[0];
+        // A picture is just the picture: no name, no size, nothing but the
+        // words it was sent with for it to hang under.
+        assert!(
+            !item.text.contains("image.png"),
+            "a picture names itself nowhere: {}",
+            item.text
+        );
+        assert!(
+            item.text
+                .lines()
+                .nth(line as usize)
+                .is_some_and(|line| line.contains("here is the mock")),
+            "the box hangs under the message: {}",
+            item.text
+        );
+        // Nothing here consulted the cache, which is why the arrival of the
+        // bytes cannot change the height and cannot move the rows below.
+        assert_eq!(file.image_rows(), 4);
+    }
+
+    /// 1.25: a picture Slack never measured. The block still decides the
+    /// size on its own, and the drawn picture is held inside it whatever
+    /// shape the bytes turn out to be.
+    #[test]
+    fn a_picture_with_no_dimensions_is_held_inside_its_block() {
+        let unmeasured = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "and one it never measured",
+            "files": [{
+                "id": "F2",
+                "name": "tall.png",
+                "title": "tall.png",
+                "filetype": "png",
+                "size": 196_608,
+                "url_private": "https://files.example.com/tall.png",
+            }],
+        }));
+        let item = message_item(&unmeasured, &model(), false);
+        let boxes = image_boxes(&item);
+        assert_eq!(boxes.len(), 1);
+        let file = boxes[0].1;
+        // No numbers from Slack, so the box is the cap and nothing else.
+        assert_eq!(file.image_rows(), IMAGE_ROWS);
+        let (box_width, box_height) = (gpui::px(480.), gpui::px(240.));
+        let (width, height) = drawn_size(file, box_width, box_height);
+        assert!(
+            width <= box_width && height <= box_height,
+            "the picture is asked for no larger than its box: {width:?} {height:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_line_is_a_muted_caption() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the deck",
+            "files": [{
+                "id": "F1",
+                "name": "deck.pdf",
+                "title": "deck.pdf",
+                "filetype": "pdf",
+                "size": 225_280,
+                "url_private": "https://files.example.com/deck.pdf",
+            }],
+        }));
+        let (text, styles, _) = render_messages(&[with_file], &model(), false);
+        assert!(
+            classed(&text, &styles, Class::Muted)
+                .iter()
+                .any(|span| span.trim() == "deck.pdf · 220 KB"),
+            "the name and size read as chrome, not as words someone said: {text}"
+        );
+    }
+
+    #[test]
+    fn emphasis_is_rewritten_in_the_markers_the_parse_reads() {
+        let (text, styles, _) = render_messages(
+            &[message(
+                "1700000000.0",
+                None,
+                "*bold*, _italic_, ~struck~, `inline code`",
+            )],
+            &model(),
+            false,
+        );
+        assert!(
+            text.contains("**bold**, *italic*, ~~struck~~, `inline code`"),
+            "Slack's markers become markdown's: {text}"
+        );
+        // What is left painted is who spoke, when, and the day above them:
+        // emphasis is the parse's, which styles it and conceals its markers.
+        assert!(
+            styles
+                .iter()
+                .all(|(class, _)| matches!(class, Class::Sender | Class::Time | Class::Muted)),
+            "nothing here paints emphasis: {styles:?}"
+        );
+    }
+
+    #[test]
+    fn every_line_of_a_message_opens_its_thread() {
+        let messages = [
+            message("1700000000.0", None, "first line\nsecond line"),
+            message("1700000001.0", Some("1700000000.0"), "a reply"),
+        ];
+        let (text, _, lines) = render_messages(&messages, &model(), true);
+        assert_eq!(
+            lines.len(),
+            text.matches('\n').count(),
+            "the line map must cover the transcript exactly"
+        );
+        let root = Ts("1700000000.0".into());
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.thread.as_ref() == Some(&root))
+                .count()
+                >= 3,
+            "both messages belong to the same thread"
+        );
+    }
+
+    #[test]
+    fn the_dealt_message_is_tinted_but_the_gap_under_it_is_not() {
+        let mut item = message_item(
+            &message("1700000000.0", None, "look at this"),
+            &model(),
+            false,
+        );
+        mark_landing(&mut item, Landing::Dealt);
+        let (class, range) = item.backgrounds.last().cloned().unwrap();
+        assert_eq!(class, Class::Dealt);
+        assert_eq!(&item.text[range.clone()], item.text.trim_end_matches('\n'));
+        assert!(
+            item.text[range.end..]
+                .chars()
+                .all(|character| character == '\n'),
+            "the tint must stop before the gap to the next message"
+        );
+    }
+
+    #[test]
+    fn a_message_on_its_way_out_reads_muted_from_end_to_end() {
+        let sending = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "ME",
+            "text": "on its way",
+        }));
+        let mut item = message_item(&sending, &model(), false);
+        assert!(
+            item.styles.iter().any(|(class, _)| *class == Class::You),
+            "a landed message names its sender"
+        );
+        mark_pending(&mut item);
+        assert_eq!(
+            item.styles
+                .iter()
+                .map(|(class, range)| (*class, item.text[range.clone()].to_owned()))
+                .collect::<Vec<_>>(),
+            vec![(Class::Muted, item.text.trim_end().to_owned())],
+            "nothing about it reads as landed, not even the name"
+        );
+    }
+
+    #[test]
+    fn a_refused_message_goes_back_above_whatever_was_typed_since() {
+        assert_eq!(restored_compose("refused".into(), "   "), "refused");
+        assert_eq!(
+            restored_compose("refused".into(), "typed since"),
+            "refused\ntyped since",
+            "neither the refused message nor the new one is dropped"
+        );
+    }
+
+    #[test]
+    fn a_refused_rewrite_goes_back_into_the_edit_it_came_from() {
+        assert_eq!(
+            refused_rewrite(false, "half a sentence", "half a sentence"),
+            Refused::BackIntoTheEdit,
+            "the composer still holds what closing the edit put there, so \
+             nothing of the reader's is at risk in reopening it"
+        );
+        assert_eq!(
+            refused_rewrite(false, "", ""),
+            Refused::BackIntoTheEdit,
+            "an edit made from an empty composer is the ordinary case"
+        );
+        assert_eq!(
+            refused_rewrite(false, "typed since", ""),
+            Refused::UnderTheComposer,
+            "the reader has written something since; it is not overwritten"
+        );
+        assert_eq!(
+            refused_rewrite(true, "another rewrite", "another rewrite"),
+            Refused::UnderTheComposer,
+            "a second edit is already open and it is what the reader sees"
+        );
+    }
+
+    #[test]
+    fn the_unread_rule_sits_over_the_oldest_message_the_reader_has_not_seen() {
+        let held = |timestamps: &[&str]| {
+            timestamps
+                .iter()
+                .map(|ts| parsed(json!({"ts": ts, "user": "UD", "text": "said"})))
+                .collect::<Vec<_>>()
+        };
+        let read = Ts("300.0".into());
+        assert_eq!(
+            first_unread(&held(&["100.0", "400.0", "500.0"]), &read),
+            Some(Ts("400.0".into()))
+        );
+        // A page of older messages landing above carries unread ones with
+        // it: the rule moves up to the oldest of them, not the one that
+        // happened to be first on screen before.
+        assert_eq!(
+            first_unread(&held(&["100.0", "350.0", "400.0"]), &read),
+            Some(Ts("350.0".into()))
+        );
+        assert_eq!(first_unread(&held(&["100.0", "200.0"]), &read), None);
+
+        let rule = unread_rule();
+        assert_eq!(rule.text, "## new\n");
+        assert_eq!(
+            rule.styles
+                .iter()
+                .map(|(class, _)| *class)
+                .collect::<Vec<_>>(),
+            vec![Class::Unread],
+            "it reads as unread, not as chrome"
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_conversation_is_what_clears_the_new_count() {
+        // A view that has not been laid out yet: opening is not missing
+        // anything, so nothing is counted against it.
+        assert!(at_tail(0.0, 0.0, 0.0));
+        // The last line on screen is the end.
+        assert!(at_tail(20.0, 30.0, 50.0));
+        assert!(at_tail(21.0, 30.0, 50.0), "past the end counts too");
+        assert!(
+            !at_tail(10.0, 30.0, 50.0),
+            "a reader twenty lines up is missing what arrives"
+        );
+    }
+
+    #[test]
+    fn the_empty_composer_says_where_the_message_is_going() {
+        assert_eq!(compose_placeholder("#design", false), "message #design");
+        // A thread's composer is the one place the reader can be wrong about
+        // where the words land, so it says the thread out loud.
+        assert_eq!(compose_placeholder("#design", true), "reply in #design");
+    }
+
+    #[test]
+    fn a_deleted_message_hands_the_point_to_the_one_after_it() {
+        let second = Row::Message(Ts("2.0".into()));
+        let first = Row::Message(Ts("1.0".into()));
+        // The ordinary case: the reader was reading down, so the message
+        // that followed is where they were going.
+        assert_eq!(
+            point_after_removal(true, Some(second.clone()), Some(first.clone())),
+            Some(second)
+        );
+        // The last message in the run. Nothing after it, so the one before
+        // it, rather than a rule with nothing under it.
+        assert_eq!(
+            point_after_removal(true, None, Some(first.clone())),
+            Some(first.clone())
+        );
+        // The only message there was. Nothing to hand the point to, and
+        // nothing is better than a guess.
+        assert_eq!(point_after_removal(true, None, None), None);
+        // The point was somewhere else. That is the reader's own place: a
+        // deletion further up the conversation does not move them.
+        assert_eq!(point_after_removal(false, Some(first), None), None);
+    }
+
+    #[test]
+    fn only_a_sigil_that_opens_a_word_completes() {
+        assert_eq!(compose_token("hey @ad"), Some((4, '@', "ad")));
+        assert_eq!(compose_token("see #des"), Some((4, '#', "des")));
+        assert_eq!(compose_token("(@ad"), Some((1, '@', "ad")));
+        assert_eq!(compose_token("nice :tad"), Some((5, ':', "tad")));
+        // An address and a URL are prose, and a bare `:` has no useful
+        // first page of emoji to show.
+        assert_eq!(compose_token("me@example.com"), None);
+        assert_eq!(compose_token("https://x"), None);
+        assert_eq!(compose_token("nice :"), None);
+        assert_eq!(compose_token("plain words"), None);
+    }
+}

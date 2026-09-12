@@ -33401,7 +33401,12 @@ async fn test_rename_with_duplicate_edits(cx: &mut TestAppContext) {
         editor.highlight_background(
             HighlightKey::DocumentHighlightRead,
             &[highlight_range],
-            |_, theme| theme.colors().editor_document_highlight_read_background,
+            |_, theme| {
+                theme
+                    .colors()
+                    .editor_document_highlight_read_background
+                    .into()
+            },
             cx,
         );
     });
@@ -33487,13 +33492,23 @@ async fn test_rename_with_out_of_order_document_highlights(cx: &mut TestAppConte
         editor.highlight_background(
             HighlightKey::DocumentHighlightRead,
             &[read_highlight],
-            |_, theme| theme.colors().editor_document_highlight_read_background,
+            |_, theme| {
+                theme
+                    .colors()
+                    .editor_document_highlight_read_background
+                    .into()
+            },
             cx,
         );
         editor.highlight_background(
             HighlightKey::DocumentHighlightWrite,
             &[write_highlight],
-            |_, theme| theme.colors().editor_document_highlight_write_background,
+            |_, theme| {
+                theme
+                    .colors()
+                    .editor_document_highlight_write_background
+                    .into()
+            },
             cx,
         );
     });
@@ -33546,7 +33561,12 @@ async fn test_rename_without_prepare(cx: &mut TestAppContext) {
         editor.highlight_background(
             HighlightKey::DocumentHighlightRead,
             &[highlight_range],
-            |_, theme| theme.colors().editor_document_highlight_read_background,
+            |_, theme| {
+                theme
+                    .colors()
+                    .editor_document_highlight_read_background
+                    .into()
+            },
             cx,
         );
     });
@@ -37098,7 +37118,12 @@ let result = variable * 2;",
         editor.highlight_background(
             HighlightKey::DocumentHighlightRead,
             &anchor_ranges,
-            |_, theme| theme.colors().editor_document_highlight_read_background,
+            |_, theme| {
+                theme
+                    .colors()
+                    .editor_document_highlight_read_background
+                    .into()
+            },
             cx,
         );
     });

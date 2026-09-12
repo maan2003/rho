@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rho_core::{InferenceEvent, InferenceRequest};
 use senax_encoder::{Decode, Encode};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+#[cfg(test)]
 use super::DEFAULT_CHATGPT_BASE_URL;
 use super::wire::{ProviderError, ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
@@ -127,6 +127,7 @@ enum TurnPhase {
 /// built from what was true when the request was made.
 #[derive(Clone)]
 pub(crate) struct SessionConfig {
+    pub(crate) agent_retries: bool,
     pub(crate) base_url: String,
     pub(crate) inference: Inference,
     pub(crate) mode: InferenceSessionMode,
@@ -251,6 +252,7 @@ pub(crate) enum ResponsesModel {
     Gpt56Sol,
     Gpt56Luna,
     Gpt56Terra,
+    Gpt6Astra,
     #[cfg(test)]
     Test(String),
 }
@@ -268,6 +270,10 @@ impl From<InferenceModel> for ResponsesModel {
             InferenceModel::Gpt56Sol => Self::Gpt56Sol,
             InferenceModel::Gpt56Luna => Self::Gpt56Luna,
             InferenceModel::Gpt56Terra => Self::Gpt56Terra,
+            InferenceModel::Gpt6Astra => Self::Gpt6Astra,
+            InferenceModel::Gemini37FlashLow => {
+                unreachable!("Antigravity models do not use ResponsesConfig")
+            }
         }
     }
 }
@@ -279,18 +285,19 @@ impl ResponsesModel {
             Self::Gpt56Sol => "gpt-5.6-sol",
             Self::Gpt56Luna => "gpt-5.6-luna",
             Self::Gpt56Terra => "gpt-5.6-terra",
+            Self::Gpt6Astra => "gpt-6-astra",
             #[cfg(test)]
             Self::Test(model) => model,
         }
     }
 
-    /// gpt-5.6 models use the Responses Lite wire shape: tools and base
+    /// Responses Lite models use a distinct wire shape: tools and base
     /// instructions ride the input timeline as developer items instead of
     /// top-level request fields, and the request is flagged via
     /// `client_metadata`.
     pub(crate) fn use_responses_lite(&self) -> bool {
         match self {
-            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra => true,
+            Self::Gpt56Sol | Self::Gpt56Luna | Self::Gpt56Terra | Self::Gpt6Astra => true,
             Self::Gpt55 => false,
             #[cfg(test)]
             Self::Test(_) => false,
@@ -303,7 +310,7 @@ impl ResponsesModel {
                 context_window: 372_000,
                 auto_compact_token_limit: 280_000,
             },
-            Self::Gpt55 => ResponsesModelInfo {
+            Self::Gpt55 | Self::Gpt6Astra => ResponsesModelInfo {
                 context_window: 272_000,
                 auto_compact_token_limit: 232_560,
             },
@@ -368,7 +375,8 @@ impl InferenceSession {
         prompt_cache_key: PromptCacheKey,
     ) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            agent_retries: false,
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Deep(config),
             responses_config: ResponsesConfig::deep(config, model.into()),
@@ -378,7 +386,8 @@ impl InferenceSession {
 
     pub(crate) fn new_title(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            agent_retries: false,
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Title,
             responses_config: ResponsesConfig::title(),
@@ -388,7 +397,8 @@ impl InferenceSession {
 
     pub(crate) fn new_status(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
         Self::new(SessionConfig {
-            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            agent_retries: false,
+            base_url: inference.responses_base_url().to_owned(),
             inference,
             mode: InferenceSessionMode::Status,
             responses_config: ResponsesConfig::status(),
@@ -447,6 +457,12 @@ impl InferenceSession {
                 .info()
                 .auto_compact_token_limit
         })
+    }
+
+    /// A single attempt; recoverable failures return to the agent's boundary.
+    pub fn request_once(&mut self, request: InferenceRequest) {
+        self.config.agent_retries = true;
+        self.request(request);
     }
 
     /// Queue a turn. The work happens in the task.
@@ -509,7 +525,9 @@ impl InferenceSession {
             if matches!(
                 event,
                 InferenceEvent::Finished { .. } | InferenceEvent::Failed { .. }
-            ) {
+            ) || (self.config.agent_retries
+                && matches!(event, InferenceEvent::TemporaryFailure { .. }))
+            {
                 self.awaiting = None;
             }
             return event;
@@ -527,6 +545,7 @@ impl SessionTask {
     /// split exists to hold, and it is why the task may have a `select!` where
     /// the caller may not.
     async fn drive(mut self, mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let mut route_updates = self.config.inference.routes().subscribe();
         loop {
             tokio::select! {
                 biased;
@@ -545,6 +564,13 @@ impl SessionTask {
                         if self.config.prompt_cache_key != config.prompt_cache_key {
                             self.connection = None;
                             self.selected_auth = None;
+                        } else if self.config.responses_config != config.responses_config
+                            && let Some(connection) = self.connection.as_mut()
+                        {
+                            // A live role change keeps the warm socket and prompt-cache
+                            // key, but its next Lite request must carry the new model's
+                            // developer prefix instead of chaining through the old one.
+                            connection.cached_response_id = None;
                         }
                         self.config = config;
                         self.epoch = epoch;
@@ -567,7 +593,7 @@ impl SessionTask {
                         }
                     }
                 },
-                () = self.pump() => unreachable!("the socket is never finished with"),
+                () = self.pump(&mut route_updates) => unreachable!("the socket is never finished with"),
             }
         }
     }
@@ -603,7 +629,10 @@ impl SessionTask {
     /// Send what is queued and read what comes back, emitting as it goes.
     /// Never returns: with nothing to send it keeps any warm socket alive, and
     /// with no socket either it pends.
-    async fn pump(&mut self) {
+    async fn pump(
+        &mut self,
+        route_updates: &mut tokio::sync::watch::Receiver<super::route::RouteSelection>,
+    ) {
         loop {
             // 1. Send a queued envelope (connecting first if needed). Read
             // once: what the phase says is settled before anything below is
@@ -665,17 +694,38 @@ impl SessionTask {
             let timeout = self.turn.is_some().then_some(ws::EVENT_TIMEOUT);
             // Read to a value first, so the borrow of the connection is over
             // before anything below reaches for it again.
-            let read = self
-                .connection
-                .as_mut()
-                .unwrap()
-                .next_message(timeout)
-                .await
-                .and_then(|message| {
-                    message.ok_or_else(|| {
-                        anyhow::anyhow!("stream error: websocket ended before response.completed")
-                    })
-                });
+            let read = if self.turn.is_none() {
+                tokio::select! {
+                    changed = route_updates.changed() => {
+                        if changed.is_ok() {
+                            let desired = self.config.inference.routes().for_session(
+                                &self.config.responses_config,
+                                self.selected_auth.as_ref(),
+                            );
+                            if self.connection.as_ref().is_some_and(|connection| connection.route != desired) {
+                                self.connection = None;
+                                if let Err(error) = self.ensure_connection().await {
+                                    tracing::debug!(%error, "failed to replace idle ChatGPT route connection");
+                                    self.connection = None;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    message = self.connection.as_mut().unwrap().next_message(timeout) => message,
+                }
+            } else {
+                self.connection
+                    .as_mut()
+                    .unwrap()
+                    .next_message(timeout)
+                    .await
+            }
+            .and_then(|message| {
+                message.ok_or_else(|| {
+                    anyhow::anyhow!("stream error: websocket ended before response.completed")
+                })
+            });
 
             match read {
                 Ok(WsMessage::Text(text)) => self.apply_text(text.as_ref()).await,
@@ -765,6 +815,12 @@ impl SessionTask {
     /// A read/write failure: replay or fail the active turn, or just drop the
     /// dead socket when idle.
     async fn on_socket_failure(&mut self, error: anyhow::Error) {
+        if let Some(connection) = &self.connection {
+            self.config
+                .inference
+                .routes()
+                .report_connect_failure(connection.route, self.selected_auth.as_ref());
+        }
         match self.turn.is_some() {
             true => self.fail_turn(error).await,
             // Nothing to fail, so the dead socket is the whole of it.
@@ -772,8 +828,8 @@ impl SessionTask {
         }
     }
 
-    /// Say what a failed turn sounds like: a recoverable failure if it is being
-    /// retried internally, and a final one if it is not.
+    /// Classify failure. Agent-owned sessions end the attempt here; standalone
+    /// sessions may queue an internal retry.
     async fn fail_turn(&mut self, error: anyhow::Error) {
         match self.on_turn_error(error).await {
             ErrorAction::Retry { error, retrying_at } => {
@@ -785,10 +841,9 @@ impl SessionTask {
         }
     }
 
-    /// Decide whether a failed active turn should be retried or surfaced to the
-    /// caller. Stale `previous_response_id` failures are retried once as a full
-    /// replay; transient provider/transport failures are retried with bounded
-    /// exponential backoff.
+    /// Preserve account-health handling and invalidate broken connection state.
+    /// Agent-owned sessions report retryability without resending; standalone
+    /// sessions retain their bounded transport retry policy.
     async fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
         if let Some(turn) = &self.turn
             && let Some(sequence) = turn.debug_sequence
@@ -804,6 +859,31 @@ impl SessionTask {
             self.turn = None;
             self.connection = None;
             return ErrorAction::Fail(error);
+        }
+        if self.config.agent_retries {
+            let mut retryable =
+                is_transient_turn_error(&error) || super::is_stale_previous_response_error(&error);
+            if is_quota_exhaustion_error(&error) {
+                retryable = false;
+                if let Some(selected) = &self.selected_auth
+                    && self.config.inference.mark_rate_limited(selected).await
+                    && let Ok(replacement) = self.config.inference.select().await
+                {
+                    self.selected_auth = Some(replacement);
+                    retryable = true;
+                }
+            }
+            // Never reuse a partial response or a stale previous-response chain.
+            self.turn = None;
+            self.connection = None;
+            return if retryable {
+                ErrorAction::Retry {
+                    error,
+                    retrying_at: Instant::now(),
+                }
+            } else {
+                ErrorAction::Fail(error)
+            };
         }
         let quota_exhaustion = is_quota_exhaustion_error(&error);
         let quota_failover = quota_exhaustion && self.selected_auth.is_some();
@@ -997,8 +1077,14 @@ impl SessionTask {
         self.selected_auth = Some(selected.clone());
 
         let reusable = self.connection.as_ref().is_some_and(|connection| {
+            let route = self
+                .config
+                .inference
+                .routes()
+                .for_session(&self.config.responses_config, Some(&selected));
             connection.bearer_token == resolved.bearer_token
                 && connection.client_secret == resolved.client_secret
+                && connection.route == route
                 && connection.opened_at.elapsed() < ws::MAX_CONNECTION_AGE
         });
         if reusable {
@@ -1015,19 +1101,32 @@ impl SessionTask {
                     .to_wire_uuid(&self.config.base_url, resolved.client_secret)
                     .to_string()
             });
+        let mut route = self
+            .config
+            .inference
+            .routes()
+            .for_session(&self.config.responses_config, Some(&selected));
         let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
-        match connect_async(request).await {
+        let mut result = ws::connect(request, route).await;
+        if let Err(error) = &result
+            && route != super::route::DialRoute::Dns
+            && !matches!(websocket_status(error), Some(401 | 403 | 429))
+        {
+            self.config
+                .inference
+                .routes()
+                .report_connect_failure(route, Some(&selected));
+            route = super::route::DialRoute::Dns;
+            let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
+            result = ws::connect(request, route).await;
+        }
+        match result {
             Ok((socket, _response)) => {
-                self.connection = Some(WebSocketConnection::new(socket, &resolved));
+                self.connection = Some(WebSocketConnection::new(socket, &resolved, route));
                 Ok(())
             }
             Err(error) => {
-                let status = match &error {
-                    tokio_tungstenite::tungstenite::Error::Http(response) => {
-                        Some(response.status().as_u16())
-                    }
-                    _ => None,
-                };
+                let status = websocket_status(&error);
                 if status == Some(429) {
                     return Err(ProviderError::rate_limit(
                         "websocket handshake failed",
@@ -1041,6 +1140,13 @@ impl SessionTask {
                 Err(error.into())
             }
         }
+    }
+}
+
+fn websocket_status(error: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => Some(response.status().as_u16()),
+        _ => None,
     }
 }
 
@@ -1189,6 +1295,7 @@ mod account_selection_tests {
                 retry_deadline: None,
             }),
             config: SessionConfig {
+                agent_retries: false,
                 base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
                 inference: Inference::for_test(auth),
                 mode: InferenceSessionMode::Title,
@@ -1213,6 +1320,19 @@ mod account_selection_tests {
                 .await,
             ErrorAction::Retry { .. }
         ));
+        assert_eq!(task.selected_auth, Some(selected.clone()));
+
+        task.config.agent_retries = true;
+        assert!(matches!(
+            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
+                .await,
+            ErrorAction::Retry { .. }
+        ));
+        assert!(
+            task.turn.is_none(),
+            "agent retry must not queue an internal resend"
+        );
+        assert!(task.connection.is_none());
         assert_eq!(task.selected_auth, Some(selected));
     }
 }

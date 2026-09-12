@@ -9,6 +9,7 @@ use gpui::{Context, Entity, EntityId, TaskExt, UpdateGlobal, Window};
 use language::SelectionGoal;
 use text::Point;
 use ui::App;
+#[cfg(feature = "zed-workspace")]
 use workspace::OpenOptions;
 
 use crate::{
@@ -73,6 +74,7 @@ impl Vim {
         self.stored_visual_mode.replace((mode, reversed));
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn open_buffer_mark(
         &mut self,
         line: bool,
@@ -125,6 +127,7 @@ impl Vim {
         });
     }
 
+    #[cfg(feature = "zed-workspace")]
     fn open_path_mark(
         &mut self,
         line: bool,
@@ -199,10 +202,12 @@ impl Vim {
         let anchors = match mark {
             None => None,
             Some(Mark::Local(anchors)) => Some(anchors),
+            #[cfg(feature = "zed-workspace")]
             Some(Mark::Buffer(entity_id, anchors)) => {
                 self.open_buffer_mark(line, entity_id, anchors, window, cx);
                 return;
             }
+            #[cfg(feature = "zed-workspace")]
             Some(Mark::Path(path, points)) => {
                 self.open_path_mark(line, path, points, window, cx);
                 return;
@@ -211,6 +216,7 @@ impl Vim {
 
         let Some(mut anchors) = anchors else { return };
 
+        #[cfg(feature = "zed-workspace")]
         self.update_editor(cx, |_, editor, cx| {
             editor.create_nav_history_entry(cx);
         });
@@ -272,9 +278,6 @@ impl Vim {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
         if name == "`" {
             name = "'".to_string();
         }
@@ -282,9 +285,14 @@ impl Vim {
             // Not allowed marks
             return;
         }
-        let entity_id = workspace.entity_id();
         Vim::update_globals(cx, |vim_globals, cx| {
-            let Some(marks_state) = vim_globals.marks.get(&entity_id) else {
+            #[cfg(feature = "zed-workspace")]
+            let marks_state = self
+                .workspace(window, cx)
+                .and_then(|workspace| vim_globals.marks.get(&workspace.entity_id()).cloned());
+            #[cfg(not(feature = "zed-workspace"))]
+            let marks_state = vim_globals.marks.clone();
+            let Some(marks_state) = marks_state else {
                 return;
             };
             marks_state.update(cx, |ms, cx| {
@@ -324,11 +332,13 @@ impl Vim {
             return Some(Mark::Local(anchors));
         }
         VimGlobals::update_global(cx, |globals, cx| {
+            #[cfg(feature = "zed-workspace")]
             let workspace_id = self.workspace(window, cx)?.entity_id();
-            globals
-                .marks
-                .get_mut(&workspace_id)?
-                .update(cx, |ms, cx| ms.get_mark(name, editor.buffer(), cx))
+            #[cfg(feature = "zed-workspace")]
+            let marks_state = globals.marks.get_mut(&workspace_id)?.clone();
+            #[cfg(not(feature = "zed-workspace"))]
+            let marks_state = globals.marks.clone()?;
+            marks_state.update(cx, |ms, cx| ms.get_mark(name, editor.buffer(), cx))
         })
     }
 
@@ -339,15 +349,17 @@ impl Vim {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
         if name == "`" || name == "'" {
             return;
         }
-        let entity_id = workspace.entity_id();
         Vim::update_globals(cx, |vim_globals, cx| {
-            let Some(marks_state) = vim_globals.marks.get(&entity_id) else {
+            #[cfg(feature = "zed-workspace")]
+            let marks_state = self
+                .workspace(window, cx)
+                .and_then(|workspace| vim_globals.marks.get(&workspace.entity_id()).cloned());
+            #[cfg(not(feature = "zed-workspace"))]
+            let marks_state = vim_globals.marks.clone();
+            let Some(marks_state) = marks_state else {
                 return;
             };
             marks_state.update(cx, |ms, cx| {

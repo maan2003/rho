@@ -82,7 +82,9 @@ struct GlobalParams {
     premultiplied_alpha: u32,
     output_color_space: u32,
     framebuffer_is_srgb: u32,
-    pad: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 struct GammaParams {
@@ -1402,19 +1404,16 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    texture_origin: vec2<f32>,
+    texture_size: vec2<f32>,
+    opaque: u32,
+    y_inverted: u32,
+    _pad: vec2<u32>,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
-@group(1) @binding(1) var t_y: texture_2d<f32>;
-@group(1) @binding(2) var t_cb_cr: texture_2d<f32>;
-@group(1) @binding(3) var s_surface: sampler;
-
-const ycbcr_to_RGB = mat4x4<f32>(
-    vec4<f32>( 1.0000f,  1.0000f,  1.0000f, 0.0),
-    vec4<f32>( 0.0000f, -0.3441f,  1.7720f, 0.0),
-    vec4<f32>( 1.4020f, -0.7141f,  0.0000f, 0.0),
-    vec4<f32>(-0.7010f,  0.5291f, -0.8860f, 1.0),
-);
+@group(1) @binding(1) var t_surface: texture_2d<f32>;
+@group(1) @binding(2) var s_surface: sampler;
 
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
@@ -1428,7 +1427,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
-    out.texture_position = unit_vertex;
+    out.texture_position = surface_locals.texture_origin + unit_vertex * surface_locals.texture_size;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
     return out;
 }
@@ -1440,10 +1439,21 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let y_cb_cr = vec4<f32>(
-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
-        1.0);
-
-    return ycbcr_to_RGB * y_cb_cr;
+    var texture_position = input.texture_position;
+    if (surface_locals.y_inverted != 0u) {
+        texture_position.y = 1.0 - texture_position.y;
+    }
+    var color = textureSampleLevel(t_surface, s_surface, texture_position, 0.0);
+    if (surface_locals.opaque != 0u) {
+        color.a = 1.0;
+    }
+    if (color.a == 0.0) {
+        return color;
+    }
+    // Wayland ARGB buffers contain premultiplied, sRGB-encoded channels.
+    // Convert the straight color into GPUI's framebuffer colorimetry, then
+    // restore premultiplication for this pipeline's blend state.
+    let alpha = color.a;
+    let converted = srgba_asset_to_framebuffer(vec4<f32>(color.rgb / alpha, alpha));
+    return vec4<f32>(converted.rgb * alpha, alpha);
 }

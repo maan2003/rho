@@ -40,6 +40,26 @@ fn gpt56_models_use_explicit_context_and_compaction_limits() {
 }
 
 #[test]
+fn astra_uses_the_normal_context_window() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = InferenceSession::new_deep(
+        Inference::for_test(auth),
+        InferenceProfile::default(),
+        InferenceModel::Gpt6Astra,
+        PromptCacheKey::from_bytes(*b"testkey2"),
+    );
+
+    assert_eq!(
+        session.config.responses_config.model.as_str(),
+        "gpt-6-astra"
+    );
+    assert!(session.config.responses_config.model.use_responses_lite());
+    assert_eq!(session.context_window(), Some(272_000));
+    assert_eq!(session.auto_compact_token_limit(), Some(232_560));
+    assert_eq!(session.config.responses_config.auto_compaction, None);
+}
+
+#[test]
 fn provider_debug_file_name_uses_prompt_cache_key_and_sequence() {
     assert_eq!(
         debug_file_name(PromptCacheKey::from_bytes(*b"testkey1"), 7, "request"),

@@ -49,6 +49,13 @@ pub struct BlockMap {
     pub(super) folded_buffers: HashSet<BufferId>,
     buffers_with_disabled_headers: HashSet<BufferId>,
     pub(super) deferred_edits: Cell<Patch<WrapRow>>,
+    /// Rows the last sync rebuilt, which is what holds an edit to its own
+    /// size. A transcript carries no block transforms - its elisions and
+    /// concealments are folds, below this map - so the whole document is
+    /// one isomorphic transform, and an edit widened to the end of the
+    /// transform it lands in is an edit that rebuilds the file.
+    #[cfg(any(test, feature = "test-support"))]
+    rebuilt_rows: Cell<u32>,
 }
 
 pub struct BlockMapReader<'a> {
@@ -699,6 +706,15 @@ impl<'a> CompanionViewMut<'a> {
 }
 
 impl BlockMap {
+    /// How many rows the last sync rebuilt. An edit costs the rows it
+    /// touches plus the block transforms around it; a sync that answers
+    /// with the whole document has widened an edit to a transform that
+    /// did not need rebuilding.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rebuilt_rows(&self) -> u32 {
+        self.rebuilt_rows.get()
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn new(
         wrap_snapshot: WrapSnapshot,
@@ -721,6 +737,8 @@ impl BlockMap {
             buffer_header_height,
             excerpt_header_height,
             deferred_edits: Cell::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            rebuilt_rows: Cell::default(),
         };
         map.sync(
             &wrap_snapshot,
@@ -870,7 +888,28 @@ impl BlockMap {
         }
         start.column = 0;
         let start_row = wrap_snapshot.make_wrap_point(start, Bias::Left).row();
-        let end_row = wrap_snapshot.make_wrap_point(end, Bias::Left).row() + WrapRow(1);
+        // To the end of the wrapped line, not to the end of the row the
+        // elision happens to stop on. An edit widened to an elision is
+        // rebuilt whole, and a block anchored inside the last line of it
+        // sits on whichever row the wrap put it on - past the widened end
+        // if the end is in the middle of a line, which leaves the rebuilt
+        // transforms a row longer than the text they describe.
+        //
+        // `next_row_boundary` is the wrong instrument for it: it reports the
+        // next *transform* boundary that begins a line, and an isomorphic
+        // transform covers every line that did not need wrapping, so from a
+        // row inside one it answers None however much document follows. The
+        // fallback then ran the elision to the last row, every elision
+        // reached every edit, and the widening below took each keystroke to
+        // the whole document. The line after the elision's last line is the
+        // same boundary and the tree finds it in log time.
+        let end_row = if end.row + 1 > buffer.max_point().row {
+            wrap_snapshot.max_point().row() + WrapRow(1)
+        } else {
+            wrap_snapshot
+                .make_wrap_point(Point::new(end.row + 1, 0), Bias::Left)
+                .row()
+        };
         Some(start_row..end_row)
     }
 
@@ -892,6 +931,19 @@ impl BlockMap {
 
         edits = self.deferred_edits.take().compose(edits);
         if profile.is_enabled() {
+            profile.touched_rows(
+                edits
+                    .edits()
+                    .iter()
+                    .map(|edit| {
+                        u64::from(
+                            (edit.old.end.0 - edit.old.start.0)
+                                .max(edit.new.end.0 - edit.new.start.0)
+                                .max(1),
+                        )
+                    })
+                    .sum(),
+            );
             let input_start = edits
                 .edits()
                 .iter()
@@ -1093,6 +1145,8 @@ impl BlockMap {
         let mut tab_point_cursor = wrap_snapshot.tab_point_cursor();
         let mut fold_point_cursor = wrap_snapshot.fold_point_cursor();
         let mut wrap_point_cursor = wrap_snapshot.wrap_point_cursor();
+        #[cfg(any(test, feature = "test-support"))]
+        let mut rebuilt_rows = 0u32;
 
         while let Some(edit) = edits.next() {
             let span = ztracing::debug_span!("while edits", edit = ?edit);
@@ -1156,15 +1210,55 @@ impl BlockMap {
             }
 
             // Decide where the edit ends
-            // * It should end at a transform boundary
+            // * It should end at a transform boundary, or inside an
+            //   isomorphic transform, which is split there
             // * Coalesce edits that intersect the same transform
             let mut old_end = edit.old.end;
             let mut new_end = edit.new.end;
+            // Rows of a split isomorphic transform that lie past the edit.
+            // They are pushed back unchanged once the edited region is
+            // rebuilt, and the cursor steps over the transform then.
+            let mut isomorphic_tail = RowDelta(0);
             loop {
                 let span = ztracing::debug_span!("decide where edit ends loop");
                 let _enter = span.enter();
-                // Seek to the transform starting at or after the end of the edit
+                // Seek to the transform containing the end of the edit
                 cursor.seek(&old_end, Bias::Left);
+
+                // An isomorphic transform carries no block, so the rows of
+                // it beyond the edit did not change and hold nothing that
+                // has to be rebuilt: it is split at the edit instead of
+                // being reconstructed whole. Widening to its end is what
+                // made every edit in a transcript span the document - a
+                // buffer whose blocks are folds has no block transforms at
+                // all, so the whole document is one isomorphic transform
+                // and an edit anywhere in it reached the end of the file.
+                // A transform that does carry a block is still widened to,
+                // because a block is rebuilt as a whole or not at all.
+                if cursor.end() > old_end
+                    && *cursor.start() <= old_end
+                    && cursor
+                        .item()
+                        .is_some_and(|transform| transform.block.is_none())
+                {
+                    let boundary = cursor.end();
+                    match edits.peek() {
+                        // Another edit inside the same transform: take it
+                        // in and decide again, so the split happens once,
+                        // past the last of them.
+                        Some(next_edit) if next_edit.old.start <= boundary => {
+                            old_end = next_edit.old.end;
+                            new_end = next_edit.new.end;
+                            edits.next();
+                            continue;
+                        }
+                        _ => {
+                            isomorphic_tail = boundary - old_end;
+                            break;
+                        }
+                    }
+                }
+
                 cursor.next();
 
                 // Extend edit to the end of the discarded transform so it is reconstructed in full
@@ -1247,16 +1341,20 @@ impl BlockMap {
                     .iter()
                     .filter_map(|block| {
                         let placement = block.placement.to_wrap_row(wrap_snapshot)?;
-                        if !matches!(placement, BlockPlacement::Replace(_))
-                            && wrap_snapshot.intersects_fold(Point::new(
-                                block
-                                    .placement
-                                    .start()
-                                    .to_point(wrap_snapshot.buffer_snapshot())
-                                    .row,
-                                0,
-                            ))
-                        {
+                        // A block above the permanent buffer-start anchor is
+                        // outside every fold, including one that begins later
+                        // on the first row.
+                        if !matches!(
+                            block.placement,
+                            BlockPlacement::Above(Anchor::Min) | BlockPlacement::Replace(_)
+                        ) && wrap_snapshot.intersects_fold(Point::new(
+                            block
+                                .placement
+                                .start()
+                                .to_point(wrap_snapshot.buffer_snapshot())
+                                .row,
+                            0,
+                        )) {
                             return None;
                         }
                         if let BlockPlacement::Above(row) = placement
@@ -1396,9 +1494,33 @@ impl BlockMap {
             let rows_after_last_block =
                 RowDelta(new_end.0).saturating_sub(RowDelta(new_transforms.summary().input_rows.0));
             push_isomorphic(&mut new_transforms, rows_after_last_block, wrap_snapshot);
+
+            // The tail of a transform the edit was split inside: unchanged
+            // rows with no block in them, pushed back as they were. The
+            // cursor still stands on that transform, so it steps over it
+            // here and what follows is appended untouched.
+            if isomorphic_tail > RowDelta(0) {
+                push_isomorphic(&mut new_transforms, isomorphic_tail, wrap_snapshot);
+                cursor.next();
+            }
+
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                rebuilt_rows += new_end.0.saturating_sub(new_start.0);
+            }
         }
 
+        #[cfg(any(test, feature = "test-support"))]
+        self.rebuilt_rows.set(rebuilt_rows);
+
         new_transforms.append(cursor.suffix(), ());
+        profile.walked_items(
+            cursor
+                .walked_items()
+                .saturating_add(inlay_point_cursor.walked_items())
+                .saturating_add(fold_point_cursor.walked_items())
+                .saturating_add(wrap_point_cursor.walked_items()),
+        );
         debug_assert_eq!(
             new_transforms.summary().input_rows,
             wrap_snapshot.max_point().row() + WrapRow(1),
@@ -3747,6 +3869,70 @@ mod tests {
         );
     }
 
+    /// An elision covers its own lines and stops there, on a document whose
+    /// lines soft-wrap.
+    ///
+    /// The rows it names are what `sync` widens an edit to, so an elision
+    /// that runs to the last row makes every edit that touches it rebuild
+    /// the document. Reading it from a wrapped document is the whole point:
+    /// the end used to come from `next_row_boundary`, which finds the next
+    /// transform boundary rather than the next line, and inside a wrapped
+    /// run there is no such boundary to find.
+    #[gpui::test]
+    fn an_elision_ends_at_its_own_last_line_on_a_wrapped_document(cx: &mut gpui::TestAppContext) {
+        cx.update(init_test);
+
+        let text = "one two\nthree four\nfive six\nseven eight";
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(text, cx));
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let (_inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot.clone());
+        let (_fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (_tab_map, tab_snapshot) = TabMap::new(fold_snapshot, 1.try_into().unwrap());
+        let font = test_font();
+        let font_size = px(14.);
+        let font_id = cx.update(|cx| cx.text_system().resolve_font(&font));
+        let wrap_width = cx.update(|cx| {
+            "one ".chars().fold(px(0.), |width, c| {
+                width
+                    + cx.text_system()
+                        .advance(font_id, font_size, c)
+                        .unwrap()
+                        .width
+            })
+        });
+        let (_wrap_map, wraps_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, font, font_size, Some(wrap_width), cx));
+        let mut block_map = BlockMap::new(wraps_snapshot.clone(), 1, 1);
+
+        let mut writer = block_map.write(wraps_snapshot.clone(), Default::default(), None);
+        writer.insert_elisions(vec![DisplayElisionProperties {
+            range: buffer_snapshot.anchor_before(Point::new(0, 0))
+                ..buffer_snapshot.anchor_after(Point::new(0, 7)),
+            tail_rows: 0,
+            height: Some(1),
+            style: BlockStyle::Flex,
+            render: Arc::new(|_| div().into_any()),
+            priority: 0,
+            type_tag: None,
+        }]);
+        drop(writer);
+
+        let elision = block_map.display_elisions[0].clone();
+        let rows = block_map
+            .elision_wrap_rows(&elision, &wraps_snapshot)
+            .expect("the elision covers rows");
+        let first_line_rows = wraps_snapshot
+            .make_wrap_point(Point::new(1, 0), Bias::Left)
+            .row();
+        assert_eq!(rows.start, WrapRow(0));
+        assert_eq!(rows.end, first_line_rows);
+        assert!(
+            rows.end < wraps_snapshot.max_point().row(),
+            "the elision covers the document, not one line: {rows:?} of {:?}",
+            wraps_snapshot.max_point().row()
+        );
+    }
+
     #[gpui::test]
     fn test_replace_with_heights(cx: &mut gpui::TestAppContext) {
         cx.update(init_test);
@@ -5515,6 +5701,57 @@ mod tests {
 
         let snapshot = block_map.read(new_wrap_snapshot, edits, None);
         assert_eq!(snapshot.snapshot.text(), "aaa\nbbb\nccc\nddd\neee\n");
+    }
+
+    /// A document with no blocks in it is one isomorphic transform, and an
+    /// edit inside it used to be widened to that transform's end - so a
+    /// keystroke three rows into a four hundred row buffer rebuilt all
+    /// four hundred, and the header and footer enumeration that follows
+    /// ran over the whole file (119 point conversions at 413 rows on the
+    /// transcript this was found on). An isomorphic transform holds no
+    /// block, so it is split at the edit instead.
+    #[gpui::test]
+    fn test_edit_does_not_rebuild_the_whole_document(cx: &mut gpui::TestAppContext) {
+        cx.update(init_test);
+
+        let text = (0..400)
+            .map(|row| format!("line {row}\n"))
+            .collect::<String>();
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+        let buffer_snapshot = cx.update(|cx| buffer.read(cx).snapshot(cx));
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let (mut fold_map, fold_snapshot) = FoldMap::new(inlay_snapshot);
+        let (mut tab_map, tab_snapshot) = TabMap::new(fold_snapshot, 4.try_into().unwrap());
+        let (wrap_map, wrap_snapshot) =
+            cx.update(|cx| WrapMap::new(tab_snapshot, test_font(), px(14.0), None, cx));
+        let block_map = BlockMap::new(wrap_snapshot, 0, 0);
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(3, 0)..Point::new(3, 0), "x")], None, cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (fold_snapshot, fold_edits) = fold_map.read(inlay_snapshot, inlay_edits);
+        let (tab_snapshot, tab_edits) =
+            tab_map.sync(fold_snapshot, fold_edits, 4.try_into().unwrap());
+        let (wrap_snapshot, wrap_edits) = wrap_map.update(cx, |wrap_map, cx| {
+            wrap_map.sync(tab_snapshot, tab_edits, cx)
+        });
+
+        let snapshot = block_map.read(wrap_snapshot, wrap_edits, None);
+        assert_eq!(
+            snapshot.snapshot.text().lines().nth(3),
+            Some("xline 3"),
+            "the edit is in the document the map produced",
+        );
+        assert!(
+            block_map.rebuilt_rows() <= 8,
+            "one edited row rebuilt {} rows of a 400 row document",
+            block_map.rebuilt_rows(),
+        );
     }
 
     fn init_test(cx: &mut gpui::App) {

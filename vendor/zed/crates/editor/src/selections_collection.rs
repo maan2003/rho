@@ -562,10 +562,11 @@ impl SelectionsCollection {
         snapshot: &DisplaySnapshot,
         change: impl FnOnce(&mut MutableSelectionsCollection<'_, '_>) -> R,
     ) -> (bool, R) {
+        let selections_changed = self.refresh_unresolvable_anchors(snapshot);
         let mut mutable_collection = MutableSelectionsCollection {
             snapshot,
             collection: self,
-            selections_changed: false,
+            selections_changed,
         };
 
         let result = change(&mut mutable_collection);
@@ -614,6 +615,30 @@ impl SelectionsCollection {
             }
         }
         (mutable_collection.selections_changed, result)
+    }
+
+    fn refresh_unresolvable_anchors(&mut self, snapshot: &DisplaySnapshot) -> bool {
+        let buffer = snapshot.buffer_snapshot();
+        let refresh = |anchor: &mut Anchor| {
+            if snapshot.can_resolve(anchor) {
+                return false;
+            }
+            let bias = anchor.bias();
+            let offset = anchor.to_offset(buffer);
+            *anchor = buffer.anchor_at(offset, bias);
+            true
+        };
+
+        let mut changed = false;
+        for selection in Arc::make_mut(&mut self.disjoint) {
+            changed |= refresh(&mut selection.start);
+            changed |= refresh(&mut selection.end);
+        }
+        if let Some(pending) = &mut self.pending {
+            changed |= refresh(&mut pending.selection.start);
+            changed |= refresh(&mut pending.selection.end);
+        }
+        changed
     }
 
     pub fn next_selection_id(&self) -> usize {

@@ -25,7 +25,7 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
     ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
+    PlatformWindow, Result, RunnableVariant, Task, ThermalState, UserIdleEvent, WindowAppearance,
     WindowButtonLayout, WindowParams,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -92,6 +92,7 @@ pub(crate) trait LinuxClient {
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
+    fn on_user_idle(&self, _timeout: Duration, _callback: Box<dyn FnMut(UserIdleEvent)>) {}
 
     #[cfg(any(feature = "wayland", feature = "x11"))]
     fn window_identifier(
@@ -111,6 +112,7 @@ pub(crate) struct PlatformHandlers {
     pub(crate) validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     pub(crate) keyboard_layout_change: Option<Box<dyn FnMut()>>,
     pub(crate) system_wake: Option<Box<dyn FnMut()>>,
+    pub(crate) user_idle: Option<Box<dyn FnMut(UserIdleEvent)>>,
 }
 
 pub(crate) struct LinuxCommon {
@@ -559,6 +561,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
             common.callbacks.system_wake = Some(callback);
             common.start_wake_listener();
         });
+    }
+
+    fn on_user_idle(&self, timeout: Duration, callback: Box<dyn FnMut(UserIdleEvent)>) {
+        self.inner.on_user_idle(timeout, callback);
     }
 
     fn set_app_identity(&self, _identifier: &str, name: &str) {
@@ -1068,6 +1074,21 @@ pub(super) fn keystroke_from_xkb(
         Keysym::Home => "home".to_owned(),
         Keysym::End => "end".to_owned(),
         Keysym::Insert => "insert".to_owned(),
+
+        Keysym::F13 => "f13".to_owned(),
+        Keysym::F14 => "f14".to_owned(),
+        Keysym::F15 => "f15".to_owned(),
+        Keysym::F16 => "f16".to_owned(),
+        Keysym::F17 => "f17".to_owned(),
+        Keysym::F18 => "f18".to_owned(),
+        Keysym::F19 => "f19".to_owned(),
+        Keysym::F20 => "f20".to_owned(),
+        Keysym::F21 => "f21".to_owned(),
+        Keysym::F22 => "f22".to_owned(),
+        Keysym::F23 => "f23".to_owned(),
+        Keysym::F24 => "f24".to_owned(),
+
+        Keysym::Shift_L | Keysym::Shift_R => "shift".to_owned(),
 
         _ => {
             let name = xkb::keysym_get_name(key_sym).to_lowercase();

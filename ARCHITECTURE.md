@@ -5,7 +5,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
 
 ## Crate layering
 
-- `rho-core` owns the shared vocabulary: transcript items, inference requests,
+- `rho-core` owns the shared vocabulary: transcript items, normalized image
+  content for user messages and tool results, inference requests,
   inference events and responses, tool calls/results, usage, agent identities,
   roles and dispositions, message delivery and phases, and opaque
   provider items. It should stay policy-light.
@@ -13,7 +14,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   daemon-wide `Inference` handle owns the complete ChatGPT runtime: persisted
   enabled-account settings and current selection, quota polling/history,
   automatic account routing, and session creation. `Inference::new` opens that
-  state from `RhoDb`. The private account manager makes selection decisions only
+  state from `RhoDb`. `Inference::new_with_config` can instead point
+  Responses sessions at an isolated provider; production defaults are
+  unchanged and the ChatGPT-only quota poller is suppressed. The private account manager makes selection decisions only
   when settings, quota, or rate-limit facts change; each new request snapshots
   the existing choice. Ordinary retries retain that choice and only explicit
   rate-limit failover replaces it. The
@@ -21,6 +24,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   ChatGPT quota observations are attributed to that daemon-local namespace;
   `Inference` polls every enabled configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.
+  The explicit `eng-gemini` binding is a narrow exception: its deep session
+  uses Antigravity `gemini-3.7-flash-low` with one manually configured profile,
+  full transcript replay, and function tools only. It never enters ChatGPT
+  account routing. Generated title/activity sidecars remain on ChatGPT.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. Loading restores that logical state cheaply; the
@@ -38,45 +45,60 @@ than by running a supervisor, extension protocol, or daemon process graph.
   routes a lease to the loaded runtime. `AgentPool` also owns persistent
   agent-response subscription edges: terminal successes and failures are
   delivered to current subscribers as normal agent mail.
+  Native agents expose a view-aware `view_image` tool. Image-producing nested
+  tools return opaque image items to the notebook, where `image(item)` explicitly
+  appends one to the enclosing `exec` result rather than implicitly
+  adding every nested result to model context.
 - `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
   parsing, polling cadence, and retry policy. The daemon only consumes parsed
   snapshots and persists them through its existing quota store.
-- `rho-agent2` is an isolated experimental harness with only native inference,
-  durable transcript/queue state, pull-based tool and peer-mail scheduling,
-  streaming observation, and cancellation. It intentionally has no code mode,
-  workspace/context discovery, collaboration, Claude runtime, or CLI/daemon/UI
-  integration. Its architecture and governing decisions are recorded under
-  `crates/rho-agent2/specs/`.
-- `rho-workset` owns daemon-managed clone stores, Worksets, Checkouts, and
-  filesystem namespaces. `Worksets::open_default` uses `~/src/.rho`: shared
-  append-only clone stores live under `stores/<repo>`, while each generated
-  Workset owns `worksets/<id>/src/`, private clone state, and one or more named
-  Checkouts. rho-db’s `worksets` table stores an explicit primary Checkout plus
-  append-only creation order, so cwd and context precedence survive daemon
-  restarts rather than depending on map or directory iteration. A Workset
-  grants a store through a relative `.stores/<repo>`
-  symlink, so checkout and Git/jj administrative pointers remain valid in both
-  the host frame and a mounted frame. `Workset::clone` creates a fresh checkout;
-  `fork_from` snapshots and imports a parent's exact commit, preserves that
-  source change as `@-`, and starts the child on a fresh change.
-  `Workset::enter` creates a per-agent `Namespace`. View mode builds a minimal
-  generated root and exposes Checkouts below `/src`; exposed mode retains the
-  host filesystem and temporarily mounts the same tree below the deployed
-  `/ws` stub. Namespace construction and refresh run only on dedicated threads
-  that exit after returning namespace/root fds—runtime pool threads must never
-  retain `unshare` or `setns` state. Entry zero is the primary Checkout and
-  supplies the default cwd. Agents joining a Checkout share its underlying
-  worktree but receive separate Namespace handles. The public `layout` module
-  owns the lower-level builders and mount primitives used by `Workset::enter`.
-  `rho-agent` owns turn-diff capture and loading over Checkouts. Sandbox start
-  remains explicitly refused until TODO(clone-store-sandbox) restores synthetic
-  Git/VCS masking on Worksets; the old unwired sandbox implementation was removed.
+- `rho-agent`'s runtime loop (`src/agent/`) is built around one decision,
+  asked after every event: should the next request start now? Tools, peer
+  mail and user input are pull-based sources it drains at that boundary; the
+  model paces its own check-ins with the notebook's `set_checkin`. Its
+  architecture and governing decisions are recorded under
+  `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
+  shape that loop consumes.
+- `rho-workspaces` owns checkout materialization and filesystem views. A
+  `Workspace` is one materialized checkout (a stable jj-managed bcachefs
+  subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a
+  plain directory). Managed workspace ids are repository-local prefix ids
+  rendered as `ws-<id>` and allocated by jj from a compact repository-local
+  `(seed, next-counter)` registry; generated IDs are derived rather than
+  stored individually. jj also dictates their stable per-repository paths,
+  rematerializes missing checkouts, and garbage-collects stale materialized
+  paths enumerated by jj's workspace store after snapshotting them. GC never
+  scans the prefix-id counter range. Snapshotting is commit-cone scoped: jj
+  snapshots the command workspace, workspaces sharing its working-copy commit,
+  and materialized descendant workspaces, but not ancestors or siblings.
+  Turn-boundary snapshots run `jj util snapshot` from the specific workspace
+  checkout so the correct cone is selected. Every live `Workspace`
+  holds a shared lock on its persistent sibling lease file; GC alone requests
+  the nonblocking exclusive lock, so any number of Rho processes can inhibit
+  collection without using the lease as a workspace-ownership mutex.
+  Repository caches retain only weak references, while agents and views own
+  live workspaces. Sandbox workspaces use the same managed checkout
+  lifecycle while masking their `.jj` and colocated `.git` metadata from child
+  commands, expose a separate synthetic Git baseline, and install a Landlock
+  filesystem/network policy on every prepared child command. A `View` is one agent's world: a working
+  set of workdir entries, fixed at spawn, realized as a private mount
+  namespace with each entry's checkout mounted over its origin path. Entry 0 is
+  the primary workdir (default cwd, prompt header).
+  Agents joining a workspace share the `Workspace`; each agent has its own
+  `View`. Each repository allocates its own managed workspace id, so a
+  multi-repository agent's prompt lists a separate `ws-<id>` handle for every
+  workdir.
+  Sandbox and ordinary workspaces cannot be mixed in one view.
+  Live-diff semantic barriers use the same vendored descendant-snapshot
+  implementation through an embedded `jj-cli` API under the repo lock. The
+  API returns the exact immutable repository epoch it wrote, so derived
+  manifests never reload a racing operation head.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
   the binaries, below project and user skills in precedence. Results are cached per
-  `rho-workset::Checkout` and merged across a namespace's Checkouts;
+  `rho-workspaces::Workspace` and merged across a view's workdirs;
   `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
@@ -84,34 +106,178 @@ than by running a supervisor, extension protocol, or daemon process graph.
   top of Claude Code's own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details. `rho-gui` uses
-  `rho-touch-keyboard` for the browser client's reusable in-canvas keyboard
+  `rho-touch-keyboard` for the phone's reusable in-canvas keyboard
   core (layout, key dispatch, repeat, and local calibration telemetry).
   Each attached daemon is a named GUI host. Host-scoped settings and new-agent
   creation route through that identity explicitly; choosing a project never
   silently changes a draft's selected host.
-  The Desk is one daemon-owned Zed CRDT text document per attached host. Its
-  org-like headings derive structure rather than receiving structural RPCs.
-  Visible agent-handle tags at the end of heading lines are the filing source
-  of truth; `:project:` properties inherit down the heading tree. Every
-  resolvable tag occurrence is an independent portal onto the exact named
-  agent, so one agent may appear in several places. The normal presentation is
-  a compact end-of-line hint; `g t` opens the complete runtime subtree as
-  transient, per-occurrence display state. GUI clients retain one hidden CRDT source buffer per host
-  and project shared read-only agent runtime buffers through occurrence-specific
-  multibuffer rows, interleaved with writable prose and draft buffers.
-  `space e` switches the Desk to a raw-source projection containing only those
-  editable CRDT buffers, with all generated rows, hints, folds, and conceals
-  removed until the user toggles the composed view back on.
+  User and tool images are decoded under fixed dimension/allocation limits,
+  resized to the selected high- or original-detail prompt patch budget, and
+  re-encoded as single-frame PNG pixels before persistence or provider upload.
+  Source metadata, profiles, animation, and encoding are intentionally
+  discarded.
+  The vendored editor owns fixed-cell image inlays as a common decoration
+  primitive: an anchored image reserves an explicit number of character cells,
+  scales and clips within one existing line height, and never enters buffer
+  text, selection, search, or clipboard semantics; cursor motion only steps
+  across its reserved span.
+  Native `rho-gui` enables GPUI's fixed-size frame and numeric editor-pipeline
+  timing rings by default. `rho-browser-wayland` also retains a small numeric
+  scene-pipeline ring spanning compositor scene production/coalescing, GUI
+  receipt and scheduling/paint, and the presentation command that releases
+  Chromium's Wayland frame callbacks. Scene and handoff barrier IDs correlate
+  these stages without retaining URLs or pixels. An explicit global action
+  serializes a capped, versioned JSON snapshot and sends it on a fresh
+  low-priority stream to the
+  selected agent's host (falling back to the existing primary-host rule). The
+  daemon, not the client, allocates a unique private file below
+  `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
+  This path is independent of the opt-in Dial9 CPU sampler and preserves the
+  existing `--cpu-profile` export.
+  The Desk is one store of the user's facts per host: a cell per
+  `(subject, property)`, LWW except for sets, synchronized by per-device
+  version vectors through the mandatory daemon hub, with a separate Zed text
+  CRDT for each note's body. A subject is an id its own source already
+  minted (an agent, a Slack unit, a page, a file, a pull request); rho mints
+  one only for a note or a label. Nothing is machine-owned, because the
+  daemon stores no facts of its own: where a thing is shown, what it is
+  called, and whether it is waiting are rules the GUI computes over the
+  store joined with the sources. GUI clients submit atomic cell mutations
+  or text operations. The native tree, its org-looking rendering, and the
+  `rho desk` command that printed it are gone.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
+  Native web pages are client-local first-class resources owned by `rho-browser`.
+  They use extension-generated UUID `PageId`s stored in typed Desk page nodes.
+  One embedded MV3 extension owns the durable page registry inside the ordinary
+  persistent Brave Origin profile. Rho launches the Brave executable selected by
+  the environment but does not own browser policy or profile preferences. The
+  NixOS Home Manager configuration supplies a dedicated wrapper which adds the
+  process-scoped switch that hides the native tab strip.
+  The native-messaging manifest is installed in Brave Origin's ordinary XDG config
+  tree. Ordinary Brave and Rho therefore have serial ownership of one browser
+  profile and must never run concurrently. The address toolbar remains visible.
+  `chrome.storage.local` retains page metadata while the allowlisted
+  `rhoPrivate.tabs` API attaches the UUID to browser-owned tab data. Session
+  restore persists that value in `SessionTab.extra_data`; runtime tab IDs are
+  never persisted and no tab groups encode Rho state.
+  The current set of typed Desk page bindings is authoritative. After the
+  browser starts and whenever that set changes, the GUI schedules extension
+  pages that no Desk tree references for collection after a ten-minute grace
+  period; restoring a binding cancels that collection.
+  Rho sends only direct create/focus/close requests and does not mirror or
+  receive an eager registry.
+  All pages share one normal Brave window and one private Smithay compositor
+  surface, so exactly one page is visible. Switching a Rho page activates its
+  tab. A generation-scoped handoff serializes extension focus requests and gates
+  input until a DMA-BUF commit acknowledges a deliberately changed
+  post-activation XDG configure. The previous atomic scene may remain visible
+  but non-interactive during that handoff; Wayland ordering establishes frame
+  readiness, not semantic pixel ownership by a Chrome tab.
+  Browser input separates pointer targeting from keyboard focus, following
+  niri's default click-to-focus policy. Mouse presses focus and activate the
+  portal under the pointer. Wheel, touchpad-axis, and pinch input activate and
+  target that portal without moving keyboard focus; a later key event reclaims
+  presentation for the keyboard-focused portal. Pointer motion alone never
+  activates an inactive portal, and leaving a presented portal sends an
+  explicit nested-Wayland pointer leave so website hover state cannot persist.
+  Valid compositor scenes continue to replace the displayed scene and receive
+  presentation callbacks from a GPUI paint hook in the current outer frame
+  while input is gated. This follows nested-compositor pacing and avoids both
+  application-readiness deadlocks and an extra outer-refresh delay. The extension
+  leaves registered page tabs auto-discardable and mandatory browser policy
+  enables Brave's maximum-savings Memory Saver mode. Brave therefore applies
+  its native eligibility checks and discards eligible background pages after
+  its aggressive inactivity interval, while retaining every page's tab,
+  history, and durable metadata.
+  Rho's custom Brave build registers the bundled control plane from the
+  client-state directory as a component extension, so its HTTP(S) worker and
+  page agent can change without rebuilding Brave. Each document-start content
+  script owns its Normal, Ignore, mark-capture, key-tree/count, and Hints state
+  and installs
+  an isolated-world capture listener on `window`. It synchronously consumes Vim
+  commands; unmatched top-level keys and conflicting focused-control keys retain
+  the original trusted browser event. Prefixes and counts expire together after
+  two seconds. The same agent selects focused or visible nested scroll containers
+  for native smooth scrolling, remembers text-input focus for `gi`, and performs
+  visible-element hint discovery, label/text matching, complementary and
+  overlapping marker handling, marker repositioning, and action-specific hint
+  activation. Page-local state also owns scroll marks/jumps, URL/path commands,
+  and an origin blacklist. Find and Caret commands remain disabled until the
+  Brave fork exposes their native Chromium controllers. Native tab/window commands remain
+  unavailable because they cannot bypass Desk-owned `PageId` creation and the
+  compositor handoff. `i` enters Ignore mode and Shift-Escape leaves it, while
+  Ctrl-Shift-Escape remains the compositor escape hatch back to the Desk.
+  Browser-native history and reload requests go through the component worker.
+  The extension emits URL-free tab lifecycle diagnostics (focus, replacement,
+  removal, loading, freezing, and discarding) through the native bridge so a
+  browser-level unload can be distinguished from a website player reset.
+  The compositor binds the sole unbound XDG top-level directly to the sole
+  browser session; no activation token or multi-window routing participates.
+  Extension native messaging reaches `rho-gui` through a tiny stdio relay and
+  a mode-0600 Unix socket beside the selected local daemon socket; no TCP
+  listener, CDP, remote debugging, or arbitrary website injection participates.
+  Browser content defaults to composition in GPUI/WGPU from an atomic Wayland
+  surface-tree scene. `RHO_BROWSER_PASSTHROUGH=1` enables the guarded fast path:
+  a single full-rect, untransformed DMA-BUF scene is attached directly to a
+  desynchronized host Wayland subsurface below the GPUI root, with an ordered
+  alpha hole at the portal's paint position. A dedicated queue and thread own
+  the child protocols. Outer explicit synchronization is used when available;
+  otherwise acquire fences are imported into DMA-BUF reservation objects and
+  the host's implicit completion fences are exported and waited after
+  `wl_buffer.release`. Promotion keeps a distinct previous texture visible
+  until the child is presented; other scene shapes demote to the texture path. Real host
+  frame and presentation events are then relayed to Chromium for the exact
+  nested scene. Every DMA-BUF surface has explicit acquire/release
+  synchronization, and GPUI retains each imported Vulkan image while its page
+  model owns the lease; Smithay does not render or flatten the tree. Synchronized
+  subsurface commits are reconciled only at their transaction anchor and the
+  compositor copies lock-bound Smithay state into an immutable tree snapshot;
+  the resulting bottom-to-top scene carries per-node position, viewport crop,
+  destination size, and input region. Popup and subsurface role registration
+  reapply the owning window's fractional scale in case the scale object preceded
+  the role.
+  Brave/Chromium SHM chrome and `xdg_popup` widgets use the bounded exception:
+  the compositor validates and snapshots ARGB/XRGB rows into owned memory for
+  GPUI/WGPU upload. Pointer hit-testing uses
+  the same versioned scene, stacking order, geometry, and input regions. Wayland
+  overlay delegation remains disabled; passthrough is a Rho compositor choice,
+  not Chromium overlay delegation.
+  The isolated `rho wayland` QA driver has a software-only exception for hosts
+  without a Vulkan DRM render node. It advertises neither DMA-BUF nor
+  DRM-syncobj to Brave, accepts the root through the existing checked,
+  bounded owned-SHM snapshot path, and uploads it through GPUI. Ordinary GUI
+  launches remain DMA-BUF-only and fail closed. This exercises real Brave/Chromium
+  lifecycle, focus, input, and restoration, but not production DMA-BUF import
+  or explicit synchronization.
+  The compositor is wake-driven, advertises per-surface fractional scale and a
+  viewporter while keeping its shared synthetic output stable, and forwards
+  raw physical keys, pointer axes, and pinch phases to Brave. Input timestamps
+  use the shared host `CLOCK_MONOTONIC` millisecond domain and the compositor
+  drains its per-window FIFO immediately in arrival order, so later motion,
+  button, pinch, or key events cannot overtake earlier input;
+  queued motions resolve their painted-scene target before scene history is
+  pruned. Tab focus and removal atomically freeze input admission, drain the FIFO,
+  synthesize releases from compositor-owned input state, and wait for an
+  acknowledgement before changing Brave tabs. Admission resumes only after the
+  new tab's frame handoff completes. It advertises
+  `wp_cursor_shape_v1` and projects Brave's named cursor requests onto the
+  GPUI browser region, letting the outer display server render the native
+  cursor rather than introducing a second cursor-surface renderer. `wl_shm`
+  remains available only for ancillary Brave surfaces; the root must remain
+  an explicitly synchronized DMA-BUF.
+  `rho-gui` only hosts the resulting GPUI page model/view. A full `:web-<uuid>:` tag
+  on an ordinary Desk heading is a portal to the client-local page, just as an
+  agent tag is a portal to an agent; selecting the heading uses the same
+  right-hand preview card. Daemons do not own browser state.
   The native GUI
   exposes two deliberately separate daemon-owned process surfaces: an
   editor-native, Comint-style shell for ordinary commands and a raw terminal
   for programs that require a terminal screen. The editor shell starts a
-  `rho-shell` sidecar inside the agent Namespace. That sidecar embeds one persistent,
+  `rho-shell` sidecar inside the agent View. That sidecar embeds one persistent,
   serialized Brush evaluator retaining cwd, variables, functions, aliases,
   Bash-compatible configuration, history, and jobs. The process boundary keeps
-  shell-global effects out of the daemon and preserves the agent Namespace;
+  shell-global effects out of the daemon and preserves the View's namespace;
   the neutral bounded `rho-shell-proto` sideband supplies execution and lifecycle
   boundaries.
   Each execution receives a fresh PTY whose slave is Brush's stdin, stdout, and
@@ -145,13 +311,20 @@ than by running a supervisor, extension protocol, or daemon process graph.
   controlling programs in isolated headless Sway sessions. It wraps the
   compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool
   paths and Mesa's software Vulkan driver rather than relying on the caller's
-  environment.
+  environment. Mixed key, text, and wait steps remain on one virtual keyboard
+  so compositor enter/leave cannot race application input or modal actions.
+  Chords are `+`-separated (`key:shift+s`, `key:ctrl+k`); the `-` spelling
+  the keymap uses is not a `wtype` key name and fails outright. That, not
+  the compositor, was the earlier "shift is undeliverable" limit recorded
+  here: with the right spelling a shifted binding does reach gpui, both as
+  a transient item (`space shift+s`) and as a vim key (`shift+g`), so
+  shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
-  explicitly to `rho-workset` for daemon-owned commands. Workspace-control
+  explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
   subprocesses use that environment directly; agent execution shells and
   Claude processes add the primary project's environment through `direnv exec`.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent
-  Namespace and lets Brush load normal Bash-compatible interactive configuration
+  View and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
   hook. Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
   `vendor/brush` as a squashed Git subtree and linked only into the sidecar.
@@ -160,10 +333,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   protocol as untrusted: it assigns execution ids, retains accepted command
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
-- `rho-rtc` owns only target-specific WebRTC media and audio devices: native
-  libwebrtc plus microphone/playback, and browser WebRTC plus `getUserMedia` and
-  HTML audio playback. They negotiate audio only and create no WebRTC data
-  channel. Audio capture remains disabled until the daemon confirms that the
+- `rho-rtc` owns native WebRTC media and microphone/playback audio devices.
+  It negotiates audio only and creates no WebRTC data channel. Audio capture remains disabled until the daemon confirms that the
   provider sideband is connected.
   `rho-openai-realtime` separately owns the typed OpenAI realtime wire protocol
   and authenticated sideband WebSocket. The daemon resolves OAuth, exchanges
@@ -209,16 +380,28 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
-- `rho-code-mode` is a tool crate: it runs model-authored JavaScript in an
-  in-process V8 isolate (deno_core) and exposes the `exec`/`wait` tool pair.
-  Nested tool calls made by scripts leave the crate through a `ToolDispatcher`
-  trait implemented by the assembling harness. Each cell retains the immutable
-  tool execution context from the `exec` call that created it, so nested tools
-  cannot observe a later turn's context; the crate depends only on `rho-core`
-  vocabulary. `rho-agent` exposes code mode as an optional runtime feature:
-  daemon-side assemblers enable it, while `rho-ui-proto` disables it so native
-  clients can share agent identifiers and wire-state projection without
-  linking V8.
+- `rho-python` owns an in-process RustPython notebook on one dedicated thread.
+  Each submitted execution carries a shared Rust host handle. Registration,
+  output, execution lifecycle, and patience callbacks update that handle
+  synchronously before Python continues; no Python object crosses threads.
+  Async host completions wake the interpreter through eventfd and resolve its
+  futures on the interpreter thread. Shared globals and ordinary asyncio remain.
+  Python runs with private cwd state inside the agent's workspace mount view;
+  this is path mapping, not a sandbox.
+- `rho-agent-tools` owns each `PythonExec` and its independently registered host
+  operations. The submitted code returning, remaining Python activity stopping,
+  operations finishing, and transcript delivery are separate facts. Async task
+  and callback tracking exists for attribution and cleanup, not wake policy.
+  `rho-agent`'s boundary consumes explicit `PythonExec` and `PythonOperation`
+  sources, without adapting them into generic tool urgency. It reads patience
+  directly from the latest response's execution handle, retained even after a
+  quiet completed transcript session is reaped. Older executions retain their
+  own settings but do not set the new response's pace.
+  Python exposes only `exec` and accepts at most one call per model response.
+  The notebook is the only tool surface for every native role: JavaScript code
+  mode, direct tools and the core `wait` tool are gone. A job is foreground or
+  background by which cell registered it, and each request's `Sent` event
+  records why it went out (`WakeFacts`).
 
 Claude Code MCP support follows the same boundary: `rho-claude` knows how to
 set per-agent MCP environment, but the MCP server that exposes Rho multi-agent
@@ -228,6 +411,23 @@ globally configured `rho mcp-agent-tools` stdio MCP server; that server reads
 daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
 wait against `AgentPool`. The MCP server must not reach into `rho-core` or
 provider crates.
+
+The Claude engineer roles (`eng-ultra`, `eng-alt`) give the agent Rho's Python
+notebook as its only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to
+Claude Code as an in-process MCP server (`py`, tool `exec`, so the model sees
+`mcp__py__exec`) over the same stdin/stdout control protocol: the loop sends the
+`initialize` control request naming the server, answers the CLI's `mcp_message`
+control requests, and holds each `tools/call` open until the native `boundary`
+decision — fed the notebook's own `PythonExec`/`PythonOperation` sources and
+the CLI's queued user input — says the model should look. Older cells' later
+output rides along with the next exec reply; an idle model is woken with it as
+a message. Claude's own tools are removed by a generated `settings.json`
+(the account's settings plus a hand-maintained `permissions.deny` list of every
+CLI tool, `ToolSearch` included, with `ENABLE_TOOL_SEARCH=false` set on the
+process) that the view namespace bind-mounts over the account's file, the same
+way the generated `CLAUDE.md` is. The notebook's host functions (images,
+collaboration, web search, papercuts) are the ones a native Python-mode agent
+gets, built by the same `host_tools` constructor.
 
 Claude turn cancellation uses Claude Code's streaming control protocol and
 keeps a healthy child process alive; queued Rho-authored messages are cancelled
@@ -240,60 +440,48 @@ pending descriptor reconstructs that view on load and rotates away from any
 partial destination transcript before retrying.
 
 Collaboration creation is role-specific while communication is shared.
-`spawn_engineer` gives owned jj-backed workdirs an isolated child Workset.
-Each child Checkout is forked from the parent's snapshotted commit and starts a
-fresh change above it; shared requests join the parent's existing Workset.
-Custom child revsets, host live-checkout joins, and sandboxed children are
-explicitly refused until their Workset-native semantics are implemented;
+`spawn_engineer` always gives jj-backed workdirs isolated child workspaces.
+Explicit child revsets resolve in the parent's corresponding workspace context
+(or the user checkout for a repository outside the parent's working set), so
+workspace-relative symbols and snapshot scope follow the spawning agent.
+Sandboxed parents create only sandboxed child workdirs;
 detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
-use `ask_advisor` to create an advisory session; PMs cannot. `message_agent` is
+use `ask_advisor` to create an advisory session. `message_agent` is
 an unrestricted bidirectional
 mail bus for any known role-prefixed handle, including Advisor context requests;
-`wait_agent` waits for incoming mail. Each agent record stores whether it was
-created directly, by a PM, or by an Engineer so prompt ownership context is an
-immutable creation-time fact rather than inferred later. Advisors retain normal
-shell/patch capabilities plus messaging/waiting but cannot spawn or interrupt.
-User-facing handles remain `eng-*`, `pm-*`, and `adv-*` over `AgentId`.
+an agent waits for mail with `set_checkin` inside its notebook. Each agent record
+stores whether it was created directly or by an Engineer so prompt ownership
+context is an immutable creation-time fact rather than inferred later. Advisors
+retain normal shell/patch capabilities plus messaging but cannot spawn or
+interrupt. User-facing handles remain `eng-*` and `adv-*` over `AgentId`.
 Mail delivery is an internal daemon operation, not a UI protocol lifecycle.
 It activates a parked recipient when necessary and awaits a per-delivery
 acceptance channel. Native Rho acknowledges after its queued event is committed;
 Claude acknowledges after its process-local input queue accepts the message,
 which intentionally may be lost if the daemon restarts before Claude records
 it.
-The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning,
-fast mode, and direct tools instead of code mode. Engineers spawned by an
+The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning
+and fast mode. Engineers spawned by an
 `eng-mini` parent are also `eng-mini`; Engineers spawned by an `eng-alt`
 parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
 `advisor-cheap` Advisors; `advisor-cheap` uses GPT-5.6 Terra with xhigh
 reasoning.
-PMs run with the normal direct tool surface (never code mode), coordinate
-exclusively through collaboration tools, and do not receive shell command,
-process-input, or patch tools. Their prompts omit repository `AGENTS.md` content
-and skills as well as the working-directory Environment section; technical
-requests are delegated to Engineers carrying the user's instructions verbatim.
-PMs use judgment when routing follow-ups: they may reuse the responsible
-Engineer, but spawn a fresh one when warranted or requested or suggested by the
-user.
-PMs do not receive `wait_agent`: they end their turn after delegation and agent
-mail wakes them for the next request. Their prompt states this asynchronous
-delegate, acknowledge, end-turn, wake-on-mail, and relay flow explicitly.
 
 The database also stores a global project registry, distinct from each agent's
 fixed execution `workdirs`. Projects are keyed by local repository path and
-carry a UI-only name plus a description. PM prompts receive only project paths
-and descriptions so they can route Engineers without repository access of
-their own; UI clients retain names for display and selection.
+carry a UI-only name plus a description; UI clients use the names for display
+and selection.
 
 `AgentRole` also carries a persistence-compatible workflow distinction:
-existing Engineer/PM variants are the default workflow, while appended
-workflow-bearing Engineer/PM variants carry `AgentWorkflow`. The
+the existing Engineer variants are the default workflow, while appended
+workflow-bearing Engineer variants carry `AgentWorkflow`. The
 `AgentWorkflow::PrFriendly` marker activates `github-workflow` guidance
 without changing the visible role label or model binding.
 
 `octo-server` is the daemon's authenticated GitHub API and constrained Git
-HTTP component. Rho runs it
-in-process on the fixed per-user Octo Unix socket. The user- and agent-facing
+HTTP component. Rho runs it in-process on an Octo Unix socket beside the
+daemon socket. The user- and agent-facing
 PR client is `rho pr` over the normal daemon socket. The daemon owns platform
 secret installation and fd-store resume, so Octo receives the GitHub token
 only through a RAM-only callback into the sealed platform secret store.
@@ -365,8 +553,8 @@ transitions. `rho-iroh-auth` owns the trusted-client table, temporary trust,
 and pending enrollments in `rho-db`; the daemon supplies only the application
 ALPN and retains approve/revoke command routing. Each post-authentication application direction is
 one streaming zstd frame with a 128 KiB maximum history window; Senax length
-limits apply to decompressed payloads. The iroh ALPN is `rho/ui/3` and Unix
-peers exchange the fixed `RHO-STREAM-3` preface before compression.
+limits apply to decompressed payloads. The iroh ALPN is `rho/ui/8` and Unix
+peers exchange the fixed `RHO-STREAM-4` preface before compression.
 The protocol crate owns only wire types, limits, and state diffs; `rho-daemon`
 projects the richer `rho-agent` runtime state into that wire shape. Consequently UI
 clients do not depend on the agent runtime or inherit its optional features.
@@ -409,14 +597,8 @@ ten-minute same-connection recovery window and raises the daemon's incoming
 bidirectional stream credit from its pre-authentication limit. Iroh already
 sends five-second transport heartbeats; after ten seconds without receiving an
 authenticated QUIC datagram, the native GUI presents a temporary bottom
-recovery strip until the same connection responds or finally closes. The
-browser client speaks the same native UI protocol over the same iroh ALPN, so
-both clients share one wire vocabulary and agent policy. It retains only its
-selected-agent subscription, accepts 16 concurrent daemon-initiated streams,
-and reserves decompressed frames against a 64 MiB aggregate allocation budget.
-The page is a static GPUI/wasm bundle (`crates/rho-gui-web`, its own Cargo
-workspace) which boots the portable `rho-gui` dashboard and connects as an iroh
-client from the browser.
+recovery strip until the same connection responds or finally closes. The web
+target was removed on 2026-09-03 because the phone runs the native app.
 
 Native GUI file and diff surfaces share one GUI-local remote-workspace registry
 per workspace, and therefore one Zed `language::Buffer` identity and dirty state

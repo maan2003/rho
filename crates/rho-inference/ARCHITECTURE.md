@@ -1,8 +1,10 @@
 # rho-inference architecture
 
 `rho-inference` provides concrete inference provider integrations for rho. Its
-public API is intentionally provider-neutral; the current private implementation
-module uses the OpenAI Responses WebSocket protocol.
+public API is intentionally provider-neutral. Normal deep, title, and status
+sessions use the OpenAI Responses WebSocket protocol. The explicit
+`gemini-3.7-flash-low` deep model instead dispatches to the reduced Antigravity
+GenerateContent backend.
 
 ## Public API boundary
 
@@ -11,14 +13,23 @@ The public surface is intentionally small:
 - `Inference::new(RhoDb)` opens the complete daemon-wide ChatGPT runtime:
   persisted disabled accounts and current selection, quota polling/history,
   automatic routing, and session creation.
+- `Inference::new_with_config` is the isolated-QA assembly path. It accepts
+  an explicit Responses base URL and does not start the ChatGPT-only quota
+  poller for non-default endpoints.
 - `InferenceSession` configures prompt-cache/thread behavior and owns one warm
   WebSocket. The session task snapshots the account manager's existing
   selection when it accepts each new request and reconnects when it differs
   from the socket account. Ordinary retries retain that snapshot; only an
   explicit rate-limit failover replaces it.
+- Antigravity sessions are deliberately outside that account runtime. They
+  resolve one manually configured credential profile, perform full transcript
+  replay with preserved thought signatures, and support text plus function
+  tools only.
 - `InferenceState` exposes disabled namespaces, namespace names, and quota
   summaries. The current account selected internally is not part of the public
   settings contract. Request setup never queries quota.
+- `Inference::route_probe_history` exposes the retained route measurements for
+  diagnostics without exposing provider account ids or credentials.
 - `InferenceSession::request` queues a `rho_core::InferenceRequest`;
   `InferenceSession::run` drives the concrete session and yields
   `rho_core::InferenceEvent` values ending in `InferenceEvent::Finished`.
@@ -45,6 +56,15 @@ configuration.
   WebSocket connection.
 - `responses/ws.rs` owns WebSocket request construction, connection reuse/reopen,
   WebSocket defaults, and event-loop timeouts/pings.
+- `responses/route.rs` owns the production-only ChatGPT edge comparison loop.
+  Every 30 minutes it measures DNS and two bounded direct-dial candidates with
+  authenticated `gpt-5.6-luna`, default-tier, `generate: false` requests. Its
+  score is send-to-first-`codex.rate_limits` latency; it still drains each probe
+  through completion before reusing the socket. Its account-scoped winner
+  applies only to Luna/default sessions; custom endpoints and every other
+  model/tier keep ordinary DNS routing. Each route result is retained for 30
+  days with its namespace, destination, validated Cloudflare colo, success
+  state, and both raw latency samples.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking.
 - `accounts.rs` is the deep account module: it owns the persisted current
@@ -54,6 +74,8 @@ configuration.
   or another enabled account's weekly reset is more than one hour earlier.
 - `auth_cli.rs` owns credential management and the single usage request made by
   the runtime's ten-minute poller.
+- `antigravity/` owns its distinct credential schema, bounded async HTTP
+  session, GenerateContent translation, and opaque thought-signature payload.
 
 ## Request and replay model
 
@@ -88,15 +110,17 @@ should treat a stream ending before `Finished` as an error.
 
 ## WebSocket connection ownership
 
-Each `InferenceSession` owns a single `Arc<tokio::sync::Mutex<Option<WebSocketConnection>>>`
-— one warm socket per session (i.e. per agent/thread), shared across clones of
-the session. A turn locks the slot for its whole duration: it reuses the socket
-when still valid, and reopens it when missing, when OAuth rotated the bearer, or
-when it is nearing the server's ~60-minute age cap. A failed turn drops the
-socket so the next turn reconnects. Because the slot is per session, distinct
-sessions (multiple agents, sub-agent delegations) each keep their own warm
-socket without a shared keyed pool; the number of live sessions bounds the
-number of open sockets.
+Each `InferenceSession` task owns one warm socket per session (i.e. per
+agent/thread). It reuses the socket when still valid, and reopens it when
+missing, when OAuth rotated the bearer, when it is nearing the server's
+~60-minute age cap, or when the Luna/default route selector changes. Route
+changes never interrupt an in-flight turn: an idle socket is replaced
+immediately, while a busy session changes routes after its terminal event and
+uses full transcript replay because provider response ids are connection-bound.
+A failed pinned connection falls back to DNS in the same connection attempt;
+401, 403, and 429 responses preserve their existing auth/rate-limit semantics.
+Distinct sessions each keep their own warm socket; the number of live sessions
+bounds the number of open sockets.
 
 Runtime ownership and cancellation must remain explicit: dropping a consumer
 stream or aborting the caller's task must not leave an unobserved inference turn
@@ -109,3 +133,9 @@ credentials. It stores access-token, refresh-token, expiry, and optional account
 id JSON under the rho auth directory or an explicit auth directory, protects
 refresh/save with a sibling lock file, and writes credentials with private
 filesystem permissions where supported.
+
+Antigravity credentials are isolated at
+`auth.d/antigravity/default.json`, outside the root JSON files scanned as
+ChatGPT namespaces. The file stores access token, refresh token, expiry, and
+Google project id. It uses private atomic writes and a cross-process refresh
+lock, but never participates in ChatGPT account selection or failover.

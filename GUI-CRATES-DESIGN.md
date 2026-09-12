@@ -1,0 +1,2459 @@
+# The GUI as vertical crates: one per source, owning connection to screen
+
+Agreed 6 Sep. This replaces slice 7 of `GUI-MODEL-DESIGN.md` (the window
+split) and is where the usability work happens. `GUI-MODEL-DESIGN.md`
+stays the record of the model layer and its rule (per-event work O(rows)
+plus O(log n); per-frame work O(what is drawn); nothing on the main thread
+but drawing). Proofs on a copy of the store only; never touch the live DB.
+
+## Why
+
+Usability broke for three reasons that no slice fixes:
+
+1. The rules have no spec and no visibility. Dealing priority, Find's
+   ranking and Slack's card rule were accreted one fix at a time; nothing
+   tells the user why a card is in front of them, so a bug and a rule look
+   the same.
+2. QA is not the user's world. Tests run on a seeded rig with a handful of
+   agents, driven by scripted keys and judged from screenshots. The user's
+   desk has ~10k rows, ~2,800 agents and a flooded Slack mirror.
+3. One object holds everything. `Workspace` is 10,685 lines and 106
+   fields; dealing, Slack, Find, creation, the map, undo and telemetry
+   reach into each other, so every fix touches it and only one engineer
+   can work in it safely.
+
+The boundary that lets engineers work apart is not a function boundary.
+It is vertical: one crate per source, owning everything from the
+connection to the screen, tested alone against its own fake server.
+
+## It feels like Emacs
+
+Ruling, 6 Sep, over every crate below. Rho is an editor the way Emacs is
+one, and every screen a source crate builds obeys that:
+
+- Every screen is a buffer. Agents, the map, a Slack conversation, a
+  thread, Find's results, a draft: text in an editor, drawn with the
+  editor primitives (buffers, inlays, the composition), with the point
+  in it. The user moves through it, searches it, selects and copies from
+  it, as in any buffer. There is no widget tree beside the editor; when
+  a screen needs a primitive the editor lacks, the primitive is built
+  from the ground up and the screen stays a buffer.
+- Keys do everything, and a key means one thing per context. Each buffer
+  kind has its key context; the same key does the same kind of thing in
+  every buffer (open, act, back, next, previous). Nothing needs the
+  mouse.
+- The minibuffer asks and the echo line answers. A question to the user
+  (Find, a name, a confirmation) is asked in the minibuffer; what just
+  happened is said in the echo line, in words, never in a modal.
+- Actions with choices are transients. A verdict, a filing, a reply with
+  options: a transient shows the keys and their meanings, as Magit does,
+  and goes away.
+- Surfaces have a history. Back is always a key away and returns to the
+  buffer as it was, point included.
+
+`rho-window` owns these primitives; source crates use them and add no
+others. A design that reaches for a different UI model for one screen is
+wrong at the design, not at the polish.
+
+## The crates
+
+- **`rho-hosts`.** The daemon connection per host and its handshake,
+  reachability (one status for the status line), the command channel and
+  the event fan-out by kind, workdir labels, quota. Every crate that
+  reaches a machine (agents, the DAG sync, file, diff, shell and terminal
+  surfaces) goes through it; it owns no agent state. Cut out of
+  `rho-agents` by eng-b8os as the first step of the move.
+
+  *Landed.* `connection.rs`, `hosts.rs` and `realtime_client.rs` moved out
+  of `rho-gui` whole, with `HostId`, `AttachTarget`, `HostSpec`, `HostPath`
+  and the workdir and quota state that goes with them. The base crate names
+  nothing above it: where the connection used to send onto the model
+  thread's queue by name, it now sends through a `HostSink` trait the shell
+  implements, and `attach` hands back the command channel rather than
+  posting a `ModelCommand` itself. The two event kinds that existed only
+  for tests went with that rule: `ConnEvent::Transcript` named a
+  `rho-registry` type and is gone (a test seeds a transcript through the
+  workspace instead), and `ConnEvent::Many` and the sent-command recorder
+  sit behind a `test-support` feature. `rho-registry` re-exports
+  `rho_hosts::HostId` rather than defining its own. Gate green: rho-gui 277,
+  rho-hosts 14, rho-registry 14.
+- **`rho-agents`.** The model thread (`Model::ingest`), the agent mirror
+  on disk, the agents map and its indexes (`rho-registry` is now part of
+  this crate), the transcript, creation, Find over agents, and the
+  agent screens. Tested end to end against a fake daemon. Selection and
+  the active pane are not agent state and go to `rho-window`. Owner:
+  eng-b8os.
+
+  *Landed, the transcript (5).* `Transcripts` owns what a transcript is:
+  the fold of an agent's mirror, the runtime's live tail, and the rendered
+  state a screen draws. The workspace held two fields (`store` and
+  `open_mirrors`) and four functions that walked between them; it now holds
+  one field and says which agent. Which agents are open is answered here
+  too, because it is the same question as which agents this client asks the
+  model thread for rows about. What crosses out is a state and a summary of
+  what changed — nothing above knows there is a fold underneath. Liveness
+  stayed in the shell: it is the map's fact about an agent, not the
+  transcript's. The mirror on disk (3) is still read by the workspace and
+  the events handed in, so this cut does not drag the model thread with it;
+  it follows with (4). Three tests run the crate alone. Gate green: rho-gui
+  277, rho-agents 3, rho-hosts 14, rho-registry 14.
+
+  *Landed, creation (6).* What a draft means is the crate's: the start
+  modes and the base they stand for, the role names and the cycle through
+  them, workdir resolution, and `parse_start` — the one place that decides
+  which host a new agent lands on and refuses, in the reader's words, every
+  way the four answers can fail to make one. The screen keeps its buffers
+  and its labels and re-exports the vocabulary rather than defining it. The
+  map's half of a base (which host an agent label is on, and the workspace
+  it works in) is looked up by the shell and handed in as `StartBase`, so
+  this cut does not pull the map in early; it goes when the map does. Seven
+  tests run the crate alone, including the two-host refusal and the default
+  base, which had no test before. Gate green: rho-gui 276, rho-agents 7,
+  rho-hosts 14, rho-registry 14.
+
+  *Landed, Find (7).* Which names an agent answers to is the crate's:
+  `find::hit` gives the title a row shows, the names it also answers to
+  (its label, and the last thing the user said to it when that is not the
+  title already), and how recently it was used. Where an agent sits in the
+  tree stays with the row that draws it, and the scorer and the prompt stay
+  one thing across sources — Find is not per-source, only its answers are.
+  A hit is its own type, as ruled: it answers a query where a card claims
+  attention. The reason type is deferred with dealing composition, and the
+  doc comment on `AgentHit` says so, so a hit gains one the day a card's
+  reason becomes a type. Three tests run the crate alone, over a registry
+  told an agent the way the model thread tells it one. Gate green: rho-gui
+  276, rho-agents 10, rho-hosts 14, rho-registry 14.
+
+  *Landed, the screens (8).* The agent screen and the transcript under it
+  are the crate's: `agent_view` (the screen — the transcript multibuffer
+  with a prompt buffer under it, the attachments, the status), `transcript`
+  (the incremental composition: per-turn excerpts, the highlights, inlays
+  and display elisions reconciled against every attached editor) and
+  `render` (the pure projection from a block to styled spans, and the
+  elision plans over it). `transcript.rs` from cut (5) became
+  `transcript/store.rs` and is re-exported, so a transcript's model and the
+  buffer that shows it are one module, as they read.
+
+  Every screen here is a buffer and stayed one: the transcript is a
+  multibuffer of per-turn excerpts with the point in it, the prompt is a
+  buffer in the same multibuffer, the fold state is display elisions, the
+  running-tool lines are inlays, and the status is an editor right prompt
+  anchored at the prompt's end rather than a strip drawn beside it. Nothing
+  in the move needed a widget tree. One thing to say rather than carry
+  quietly: that right prompt is a primitive of the *vendored editor*, not
+  of `rho-window` — the screen reaches it through `editor`, so today the
+  window does not own every primitive its screens draw with.
+
+  Two pieces went to `rho-window` rather than to `rho-agents`, because two
+  source crates need them and a source crate must not name another:
+  `markdown` (the Markdown grammars and what a Markdown buffer is
+  configured as — the transcript uses it, and so does the Slack
+  conversation through `configure_markdown`) and `languages` (the one
+  language registry for the app, built on first ask and re-themed with the
+  window; it was `zed_remote`'s `pub(crate)` global, and the file view, the
+  diff view and the transcript all read from it). `rho-window` modules
+  touched: `markdown` and `languages`, both new; the four chrome modules
+  were not touched. Its one test only ever built because `rho-gui` was in
+  the same invocation and turned on `gpui`'s `test-support` for the whole
+  graph; `rho-window` now asks for it itself, so `cargo test -p rho-window`
+  alone builds. The chrome cut's re-export line in `rho-gui/src/lib.rs`
+  had no readers left and is gone with this cut, so the "no alias" claim in
+  the note above is now true of the manifest as well as the use sites.
+
+  What the screens still reach for is small and upward-free: the store's
+  `FrameSummary`, `IncrementalUpdate` and `turn_open` come from
+  `rho-registry` where they live, and `now_ms` from there too rather than
+  from `Workspace`. `rho-gui` names `rho_agents::agent_view::AgentModel`
+  and nothing else of the screens, and lost five dependencies it only had
+  for them (`tree-sitter`, `tree-sitter-md`, `json-stream`, `languages`,
+  `node_runtime`).
+
+  Cost: no numbers, and this is why. The cut is a move — every code path,
+  allocation and edit is byte-identical to what main ran, so a measurement
+  here would measure main and be labelled as the screens'. The desk rig was
+  held by another session's run while this landed, so I did not take one
+  either. The transcript's own numbers are owed with the map (4), which is
+  the crate held to the rule from its first line, and they will be taken on
+  `user-2026-09-06` as `QA-HANDBOOK.md` sets out (`draw_ms` p99/max and
+  `dirty_to_draw_ms` p99 from `frames.json`, each touched stage's
+  `duration_ms` p99 against its `input_rows` from `editor.json`).
+
+  Gate green: rho-gui 246, rho-agents 42 (the 32 transcript, render and
+  screen tests moved with their modules; no test was added, dropped or
+  rewritten), rho-window 1, rho-hosts 14, rho-registry 14; clippy
+  `-D warnings` green over the three crates.
+
+  *Landed, the map and its indexes (4).* `rho-registry` is gone; what it
+  held is this crate's. The map is `AgentMap`: every agent the client
+  knows, what each one is and what happened to it, the user's filing over
+  the top, and the indexes the screens read it through. `fold`, `store`
+  and `session` came with it unchanged; the old `render` module is `state`
+  here, because this crate already has a `render` that turns a block into
+  spans and the two are not the same thing — one is what a client shows of
+  an agent, the other is how it is drawn.
+
+  This is the first crate held to the cost rule from its first line, so
+  the shape is the rule. What was there before made everything again on
+  every event: one told agent rebuilt every row, cloned every summary into
+  its host's snapshot, re-collected the parent and tag indexes, re-sorted
+  them, and swept the verdicts — and inside that pass, `order.contains`
+  per agent made a first sync quadratic. It is now one write per changed
+  agent into indexes that are kept, never remade.
+
+  What each event costs, for `k` changed in a map of `n`, all of it stated
+  at the top of `map.rs` where the next person will read it:
+
+  - told about agents (`told`, `restore`, `tell`): `k log n`, plus `k log
+    k` to sort the ones this client has never seen into the front of the
+    order.
+  - the user's filing (`set_agent_filings`): `k log n`, and nothing at all
+    when the filing offered is the filing already held.
+  - a verdict, an activity, a touch, a life change: one lookup.
+  - a host detaching or starting over: `k log n` in the agents that
+    departed, and nothing walks the agents that did not. `detach_host` and
+    `reset_host` now return the departed set rather than reaching into
+    the window to move the point.
+
+  And what each read a screen makes costs:
+
+  - a row's own facts (`agent_facts`, `attention`, `agent_display_label`,
+    `agent_human_name`, `agent_hidden`): one lookup each, so a frame costs
+    the rows it draws. The dashboard is synced on events and drawn from
+    its buffer, so a frame makes no pass over the map at all.
+  - `agent_children`: the children. `agent_subtree`: the subtree it
+    returns, plus sorting it.
+  - `next_agent`: a lookup and the agents it steps over. The order is an
+    index of keys handed out once — a newly discovered agent takes a key
+    below every key in use, so it goes to the front without renumbering
+    anyone, and stepping is a range on the visible set rather than
+    collecting the visible agents to find a position in them.
+  - `agent_by_tag`: a binary search of one host's agents of one role.
+    `host_agents`: the host's agents, from the host index rather than a
+    walk of the map asking each agent where it came from.
+
+  The one read still proportional to the map is `agent_by_label`, which
+  walks every agent asking what it is called; it answers what the user
+  typed in the minibuffer, and it is written down in `map.rs` rather than
+  indexed before anything is slow.
+
+  Two answers rather than quiet carrying. `HostSnapshot::agents` — a full
+  clone of every summary, per host, per event — was written and never
+  read: residue, deleted. `next_attention_agent` had no caller anywhere;
+  I built the attention index it would have read, found nothing reads it,
+  and deleted both rather than keep an index for decoration. The attention
+  reads the screens do make are per drawn row and per heading, and both
+  are lookups. One thing for the user rather than for me: `AgentNext` and
+  `AgentPrevious` have handlers and no key in the keymap, so the order
+  index serves an action the fingers cannot reach. Either they get keys or
+  they are residue.
+
+  `rho-window` modules touched: `selection`, new — `ActivePane` and the
+  point that goes with it are the window's, not the map's. The map no
+  longer knows which agent is selected: `next_agent` takes it as an
+  argument, and `Selection::forget` moves the point out of an agent that
+  departed. The workspace holds the `Selection` beside the map it reads.
+  `rho-window`'s other modules, `transient` included, were not touched.
+
+  The rig caught what no test could. On the user's snapshot the client
+  died on startup: redb records the Rust path of a table's value type, and
+  `gui_agent_verdict_v1` was written as
+  `rho-db::Sen<rho_registry::fold::Verdict>`. Renaming the crate renamed
+  the type, and every existing mirror — the user's included — would have
+  been refused with a `TableTypeMismatch` the first time the new client
+  opened it. The table now names itself through `rho_db::SenAs` with the
+  name it was written under, which is what that type exists for; the bytes
+  on disk never changed. Nothing in the unit tests could have found this,
+  because it only happens against a database written by an older build.
+
+  Measured on `user-2026-09-06`, desk rig session 8, moving through the
+  map on Home sixty times with the profiler on. The line `rig down`
+  printed, verbatim:
+
+  > 281 frames, draw p99 2.7 ms, 0 over 8 ms; worst gap 325 ms, p99 11 ms;
+  > 21798 events, slowest stage buffer_edit p99 0.12 ms at 2 rows; 192
+  > samples on rho-gui: `__syscall_cancel_arch_end` 5%,
+  > `__memcpy_avx512_unaligned_erms` 4%, `eq` 4%
+
+  Per frame: draw p99 2.7 ms, max 3.3 ms, nothing over the 8 ms bar. Per
+  event: the slowest editor stage in 21,798 events is the one that edited
+  two rows, and it cost 0.12 ms — time tracking what was touched and not
+  the 2.5 million rows behind it, which is the shape the rule asks for.
+  The worst gap of 325 ms is frame 4, the first sync of the whole desk
+  after startup; the p99 is 11 ms and every gap after frame 4 is under
+  5 ms. The map appears in the CPU profile only as B-tree searches for one
+  agent's row — `search_tree` over `AgentSummary` and `MirroredAgent` —
+  and never as a pass over the map. No map symbol is in the top three.
+
+  One number that fails, and it is not the map's. Session 7 opened and
+  closed an agent twenty times, one of them a 262k-token transcript: 281
+  frames, draw p99 12.3 ms, 5 over 8 ms, worst gap 500 ms, and the slowest
+  stage `wrap_map_update` p99 7,122 ms at 121,252 rows. That is the
+  editor wrapping a whole transcript buffer when the screen opens — it
+  predates this cut, nothing here touches it, and the wrap runs off the
+  frame loop so the window kept drawing. It is the transcript screen's
+  number and it fails the handbook's bar, so it is written down here
+  rather than left in a profile nobody reads.
+
+  Gate green: rho-agents 59 (the 14 that were rho-registry's, plus three
+  new ones over the order, the filing and what the indexes say after a
+  reparent and a host reset), rho-gui 243, rho-window 11 (`selection`
+  brought one), rho-hosts 14; workspace clippy `-D warnings` green; the
+  workspace has one crate fewer.
+  *Landed, the transcript opens on its tail (9).* Session 7's failing
+  number was this crate's: `wrap_map_update` p99 7,122 ms at 121,252 rows
+  when a 262k-token transcript opened. Measured before designing, as
+  ruled, and three things were true. The whole history was composed at
+  open: `prepare_initial` rendered every block the agent had ever produced
+  and `install_initial` put every one of them in the multibuffer before
+  the first frame — 121,252 rows to show about 41. The transcript's own
+  elisions could not help, because `DisplayElision` is a block-map
+  construct and the block map sits *above* the wrap map (buffer, inlay,
+  fold, tab, wrap, block), so eliding history hides rows that have already
+  been wrapped. And the wrap is not a one-off: `WrapMap::set_wrap_width`
+  rewraps the whole buffer on every width, so every resize paid the seven
+  seconds again.
+
+  Both halves are lazy now, in both senses the ruling asked for: history
+  above the opening tail is neither rendered nor composed until a reader
+  asks for it. The blocks themselves stay whole in memory — they are the
+  fold's, shared by pointer, so the model's own list of them copies no
+  text — and `records` and `buffers` cover `blocks[uncomposed..]`, growing
+  upward. A transcript opens on the last 200 rows of it (`OPENING_ROWS`),
+  which is a desk window twice over; reading upward composes another 400
+  rows (`HISTORY_CHUNK_ROWS`) each time the reader comes within 40 rows of
+  the top of what is composed. The separator a chunk's first block carries
+  is the one it would have carried with all of history above it, so
+  composing that history later leaves every chunk's text byte-identical —
+  no excerpt is replaced, no anchor moves, and nothing below the new rows
+  is laid out again.
+
+  The three verbs the ruling named, and what each one costs:
+
+  - **`gg`** composes everything, because the reader asked for everything,
+    and the point lands when the top exists. Composition runs off the
+    frame loop a chunk at a time — a step, then back to the window, which
+    keeps drawing — and the echo line says "composing history" while it
+    runs.
+  - **`/`** is the buffer's search, so it searches the whole transcript:
+    the history it has not composed yet is composed while the reader is
+    still typing the query, and the search runs when it is all there.
+    Worth saying plainly: `/` in a transcript did nothing at all before
+    this cut. Vim emits `EditorEvent::SearchRequested` because this app
+    has no zed pane, and the only listener was the dashboard's. The
+    surface now hosts one, the same minibuffer search the dashboard has.
+    `n` and `N` repeat it, landed straight after this cut: a search runs
+    from the point rather than from the top of the buffer, wraps once and
+    says so in the echo line when it does, and the query is the
+    workspace's — one search register, as vim has one, so a query typed in
+    a transcript repeats on the desk and the other way about. Vim's own
+    `n` does nothing in this app, because it goes through a pane's search
+    bar and there is no pane, which is the same reason `/` is the host's.
+    A key means one thing per context, and a context is named: `n` and `N`
+    are bound in `RhoTranscript` and `RhoDashboard`, the two surfaces that
+    have a search, and the Slack rooms keep `shift-n` for the next unread
+    by their own context rather than by being loaded later. A test asserts both halves; load order carrying a rule was the
+    fragility it replaces.
+  - **The point survives leaving and returning**, and it survives as a
+    store position — which block, and how far into it — never a buffer
+    offset. `AgentModel` remembers it whenever the point moves in the
+    transcript, and remembers `None` while the point is in the prompt, so
+    a surface left at the prompt comes back to the prompt and one left
+    deep in history composes what it needs and comes back to the same
+    block. A test asserts exactly that: open, `gg` to the top, close the
+    surface, open it again, the point is on the block it was left on.
+
+  The elision-covered fraction, measured because it was asked for even
+  though folds are the fallback and not the plan: on the same transcript,
+  off the rig's own mirror, 12,348 blocks, 121,114 rendered rows, 697
+  elision plans covering 118,403 of those rows — 97.8 per cent. So the
+  fallback would have worked, and it is still worth having later for a
+  different reason than this cut: after a `gg` the whole transcript is
+  composed and all 121k rows are wrapped again, and only a real fold, in
+  the fold map below the wrap, takes them out of the wrap's input. That is
+  the next thing to do here, not a thing this cut needed.
+
+  One sentence worth keeping because it is what makes the whole thing
+  safe: a chunk's first block is rendered with the separator it would have
+  carried with all of history above it, so composing that history later
+  leaves the chunk's text byte-identical.
+
+  Owed, and not this cut's to fix: the editor rewrapping the whole buffer
+  on every width change fails the cost rule on its own. Tail-first shrinks
+  what it sees but does not fix it, and it is a vendored-editor primitive,
+  so it goes on `rho-window`'s list beside the right prompt. And `y g g` —
+  a yank with an operator pending — stays vim's own, so it copies what is
+  composed rather than composing first; `gg` is bound only with
+  `vim_operator == none`.
+
+  Numbers, on the desk rig's `user-2026-09-06` snapshot, profiling
+  binaries, one run per thing measured so each number belongs to one
+  thing. Before, session 7 on the same agent: 281 frames, draw p99 12.3
+  ms, 5 over 8 ms, worst gap 500 ms, `wrap_map_update` p99 7,122 ms at
+  121,252 rows.
+
+  - *Twenty opens and closes of the 262k agent* (session 24): 621 frames,
+    draw p50 2.4 ms, p99 4.7 ms, max 8.1 ms, 1 frame over 8 ms and none
+    over 16; worst gap 290 ms, p99 15 ms; `wrap_map_update` p99 7.9 ms
+    over 432 input rows at its largest — the tail, not the history —
+    and `block_map_sync` p99 0.02 ms. The seven seconds are gone because
+    the rows are not there.
+  - *Four width changes with the transcript open* (session 21): 83
+    frames, draw p99 10.2 ms, 5 over 8 ms; the wrap still redoes the
+    whole buffer on every width, but the whole buffer is now 432 rows,
+    p99 7.5 ms. The primitive is still wrong and still owed; tail-first
+    is what makes it survivable meanwhile. Driven with sway's own ipc
+    socket (`output HEADLESS-1 mode WxH`), because `rho wayland` has no
+    resize for a running session — worth knowing, and now in the QA
+    handbook.
+  - *`gg`, composing the whole history* (session 22): 265 frames, draw
+    p99 16.3 ms, max 32.4 ms, 70 over 8 ms; worst gap 486 ms, p99 357
+    ms. This one fails the frame bars while it runs, and it is the only
+    one that does. Two things are true of it: the reader asked for
+    everything, and the layer it costs is not the wrap — the wrap never
+    saw more than 2,543 rows in one update, because composition arrives
+    in chunks — but `block_map_sync`, p99 18.3 ms over a p95 of 50,045
+    input rows. That is the argument for the real fold below the wrap
+    being the next change here, and it says which layer to watch.
+  - *A small agent, five opens* (session 23): draw p99 8.1 ms, wrap p99
+    3.0 ms over 213 rows. Unchanged, which was the point of measuring it.
+
+  Held by tests, not by the rig alone: a long transcript opens with
+  history uncomposed, scrolling into it composes it, `gg` composes every
+  row, a surface left deep in history returns to the same block, a search
+  composes the history it looks through, and the cheap "does this block
+  render to anything" predicate agrees with rendering it for every block
+  there is.
+
+  *Landed, the elisions are folds below the wrap map (10).* The tail-first
+  cut left one number failing its bars: after `gg` the whole transcript is
+  composed, and `block_map_sync` took a p95 of 50,045 input rows at p99
+  18.3 ms. The elisions were display elisions, which are a block-map
+  construct, and the block map sits above the wrap — so an elided turn was
+  a turn already wrapped and then hidden. They are folds now: a fold is
+  below the wrap, so an elided turn leaves the wrap's input and the block
+  map's entirely. The visible tail of a turn is the fold map's own
+  `ElisionPolicy::Tail`, the chip is the fold's placeholder — the same
+  chevron and count the reader saw before — and each fold is tagged
+  `HistoryFold`, so the thousands of concealment folds that live inside an
+  elided range survive it. Folds are reconciled by diffing the model's
+  specs against what an editor carries, skipping the common prefix and
+  suffix, so composing history folds only the run that is new.
+
+  A fold is gone once it is opened, so rho registers a crease beside every
+  fold: `z o` opens an elided turn and `z c` closes it again, which is what
+  a reader expects and what a display elision could not do at all.
+
+  Two changes to vendor/zed's editor were needed, each its own commit
+  before this one, under the user's ruling that we build editor primitives
+  when we must:
+
+  - **A fold in a multibuffer is a fold.** `z c`, `z o` and `toggle_fold`
+    acted on the folds under the selection only in a singleton buffer; in
+    a multibuffer they took the whole-buffer gesture instead, which is
+    zed's project search, where a multibuffer is a list of files and
+    folding one means folding that file. A transcript is a multibuffer
+    with one excerpt, so no fold key reached an elision. The keys now act
+    on the folds and creases under the point wherever they find them and
+    keep the whole-buffer gesture when there is none — a strict widening;
+    singleton behaviour is unchanged.
+  - **Every path to the wrap map carries the row scales.** Found on the
+    rig, not in a test: on the first open of a GUI process, `gg` composed
+    history whose user messages then drew wider than the window and stayed
+    that way. Measured off the pixels rather than guessed at — the row
+    broke at 131 characters where it should have broken at 117, a ratio of
+    1.12, which is `USER_MESSAGE_SCALE` exactly. A scaled row is wrapped at
+    `wrap_width / scale` by the sync that writes it, and the wrap map takes
+    the scales from the display map on each sync — but only
+    `sync_through_wrap` handed them over. `DisplayMap::fold` is another
+    path, and it consumes the buffer subscription itself, so when the
+    transcript composes history and then folds it, the fold's own sync
+    wraps the rows composition just wrote, at scales that do not yet name
+    them. Nothing rewrites a row once wrapped, so they stayed too wide
+    until a resize rewrapped the map. Sixteen call sites now go through one
+    helper. This is why the fold change is three commits and not one: main
+    is what the user builds at every commit, and the widening and the
+    scales each regress nothing alone.
+
+  The `Tail` policy had a bug of its own and it is fixed in the fold map
+  rather than worked around here: a tail-eliding fold ended at the tail's
+  first column, which swallowed the newline above it and glued the chip to
+  the first line of the tail (`⋯echo`). The elided head now ends at the end
+  of the row above the tail.
+
+  What the QA of it taught, and it belongs here because it nearly cost an
+  evening: a control that differs from the run in more than the variable is
+  not a control. The first control run opened a different agent first, so
+  the transcript under test was that process's *second* open — and the
+  second open is the case that works. Two runs described the same way, "open
+  the transcript and press `gg`", were two different runs.
+
+  Numbers, desk rig, `user-2026-09-06`, profiling binaries, first open of a
+  fresh GUI process then `gg`, the same drive on both builds:
+
+  - *`gg` on the 262k agent* (sessions 33 and 36): `block_map_sync` input
+    rows p95 55,144, max 128,710, 58.3M rows over the run at p99 21.97 ms
+    before; p95 337, max 1,468, 265k rows at p99 2.61 ms after. That is the
+    claim the cut was for: the rows are not there to be laid out. Draw p99
+    21.1 ms with 100 frames over 8 ms before, 14.4 ms with 75 over after;
+    `wrap_map_update` p99 29.2 ms at 2,564 rows before, 18.8 ms at 999
+    after.
+  - *Twenty opens and closes of the same agent* (session 37): 941 frames,
+    draw p99 5.6 ms, none over 8 ms; `wrap_map_update` p99 2.65 ms at 223
+    rows. Against the tail-first baseline of draw p99 4.7 ms and wrap p99
+    7.9 ms at 432 rows, the draw p99 is 0.9 ms higher and the wrap does
+    less. The 0.9 ms is reported rather than rounded away.
+
+  Said plainly: `gg` still fails the frame bars — 75 frames over 8 ms is
+  not a pass — and the layer to blame has moved. It is no longer the block
+  map; it is the wrap map's own background rewrap, p99 18.8 ms a batch at
+  999 rows, which is the whole-buffer rewrap primitive already owed to
+  `rho-window`'s list. The reader asked for everything, and everything is
+  what it costs.
+
+  Held by tests: eliding history leaves fewer rows to the wrap than the
+  buffer has, the rows a fold leaves still soft wrap, `z o` opens an elided
+  turn and `z c` closes it again, the folds an editor carries survive a
+  rebuild that does not touch their turns, and a fold that flushes a
+  pending edit wraps the rows it flushes at their scale — 18 characters
+  against 30 with the fix, 30 against 30 without it.
+
+- **`rho-slack`, a real Slack client.** The session, socket and mirror
+  that exist, plus what a client is: the channel and DM list with unreads,
+  a thread view that reads well, compose and reply, reactions, mark read
+  that sticks, search, and its own screens and keys. Tested against the
+  fake Slack server (`fake.rs`) and against a copy of the user's real
+  mirror. Read state: Slack's own cursor is one half of what has been dealt
+  with and rho's own local cursor is the other, and what has been dealt
+  with is the later of the two (8 Sep). Both live in the Slack mirror;
+  reading here writes neither, and `d` writes rho's half at once and
+  pushes Slack's through an outbox. Owner: eng-bgkw.
+  Ruling, 6 Sep: the Slack screens stay editor based. The conversation,
+  the thread, the list and compose are drawn with the editor primitives
+  the rest of Rho draws with (buffers, inlays, the composition), never a
+  separate widget tree beside them; where the editor lacks a primitive a
+  Slack screen needs, the primitive is built from the ground up and the
+  screen keeps using the editor.
+  Order, set 6 Sep after the inventory: the crate already had the list, the
+  thread view, compose and reply, and reactions on screen, so the work is
+  (1) mark read that sticks, (2) the card rule into the crate as Slack's own
+  notion of attention, which is the flood fix, (3) adding reactions, (4)
+  search, (5) the keys and the card-handing out of `rho-gui/src/slack.rs`,
+  once `rho-window` exists.
+  *1 landed.* Mark read that sticks. The fake first, because none of the
+  four client bugs could be caught without the server behaviour to catch
+  them with: `conversations.mark` works the badge out again from what is
+  left above the cursor and pushes the frame Slack sends every client the
+  user is signed in on; `subscriptions.thread.mark` keeps the thread's own
+  cursor, serves it back through `getView`, and pushes `thread_marked`;
+  `activity.feed` is newest-first and paged; `/control` gained `mark`, which
+  is the user reading on their phone. Then the client: the cursor rises and
+  never falls, so a reconnect cannot re-badge a conversation read a second
+  earlier; a thread is marked as a thread, so reading one no longer marks
+  the channel around it read; the cursor is written to the mirror wherever
+  it moves and read back at startup, so the unread rule is in place before
+  the network answers and at all when offline, with Slack's cursor still
+  overtaking it the moment the counts land; and a surface takes the first
+  cursor it is offered rather than only the one that existed when it was
+  built, which is why a restart used to show no rule at all. The read-state
+  rule above is unchanged and is now what the code does: Slack's cursor is
+  the truth, the mirror is a head start and never a second opinion, and
+  `SlackHandledThrough` was not touched. Six proofs against the fake, one
+  of them replacing a test that had been asserting the bug. Gate green:
+  rho-slack 144.
+  *2 landed.* The card rule, in the crate, as Slack's own notion of
+  attention. `Model::attention` is the one place the question is answered
+  and it asks Slack's own read state, not rho's dealing cursor: a unit is a
+  card when it is a DM or group DM with something unread, a mention, a reply
+  in a followed thread since the reader last looked, or unread traffic in a
+  channel the reader opted into. A channel with plain unreads is in the list
+  with its count and is never a card. Every card carries the fact of why —
+  `Attention`, not a sentence — and the words are made at draw time by
+  `reason_text` out of the roster's current label, so a conversation named
+  late reads `mentioned in #design` rather than a line written when the
+  message landed. `slack_thread_facts` no longer decides what a card is; it
+  carries the crate's answer, and `desk_view::slack_card` closes what the
+  crate says nothing for. The desk's two cursors are untouched.
+  On the record, because it reverses a documented behaviour: reading is a
+  fact about a message and Slack's cursor is the truth for it, so a card
+  read on the phone leaves. A verdict is the reader's key alone, and the
+  desk's cursors are untouched. The test that asserted the old behaviour is
+  rewritten to assert the new one and says why.
+  There is no opt-in any more (8 Sep): every channel with unread traffic
+  from someone else is a unit, on a curve that starts far below a direct
+  message or a thread and fades, so nothing has to be opted into for its
+  traffic to be seen. The `w` key, the `watched` word on the row and the
+  `rho_slack_watched_v1` table are gone with it.
+  Under the cost rule. The rule keeps `asking`, the set of units currently
+  a card, maintained by every event that can change it — a message, a mark,
+  a mute, a follow, an opt-in, Slack's counts — each touching only the units
+  it names; a channel-level event reaches its own units by a range scan over
+  one channel's keys and no further. Drawing the cards costs the cards. And
+  a start no longer reads history: the per-unit facts live in a typed
+  `rho_slack_units_v1` table, written on the event that moves them, so a
+  start is one range scan of one row per unit. History is walked exactly
+  once, on a mirror written before the table existed, and the mirror says
+  so afterwards so no later start pays it again.
+  Numbers, from `cargo run --example card_rule` over a reflinked copy of the
+  snapshot's `slack.redb` (5 conversations, 211 messages, 4 units): start
+  reading messages 3.20 ms, start reading units 156 µs — 20× on a fixture,
+  and the gap grows with history because one side is O(messages) and the
+  other O(units). One mark 1.3 µs. One draw of the cards 4.8 µs. One draw
+  of the conversation list 4.2 µs for 5 rows, which is the O(n log n) per
+  draw that change 2b removes. Card counts old rule 4, new rule 4: on this
+  fixture every unit is a mention or a DM, so there is no plain-traffic
+  channel for the new rule to drop, and the fixture cannot show the flood.
+  The real-mirror numbers wait for a snapshot taken after the mirror
+  persists — the file we have holds only the QA fixture, because no Slack
+  workspace is registered on the machine, so no session has ever run to
+  write it. Proven instead against the fake, which badges the way Slack
+  badges: `only_what_slack_would_badge_is_handed_over` serves three unread
+  conversations and gets two cards.
+  Found while looking for the flood, and left for the dealing composition
+  rather than patched here: **a Slack row can be shown Open by a client
+  that has no session**. `Sources` is in memory, so at a start with no
+  session it is empty; `slack_card` has no source to derive from and the
+  node falls back to the state the store holds, which no rule can then
+  move. The composition must make that impossible: a Slack card exists
+  while `rho-slack` asks and not otherwise, verdicts stay the desk's, and
+  the map never decides a source's attention. `Model::attention` and the
+  `asking` set are what it composes. This is also why the machine looked
+  flooded with no session running: the user's GUI runs on their own device
+  and its state, with the real credentials and the real mirror, is there
+  rather than on the devbox the snapshot was taken from. rho now says as
+  much at startup instead of deciding in silence that it has no Slack.
+  Wanted from `rho-window`, for change 3: a transient buffer — opens under
+  the point, lists keys and their meanings, takes one key, closes, leaves
+  the surface behind it undisturbed, and back returns to it. Reactions and
+  search are shaped around it and it is not built in `rho-slack`.
+  Gate green: rho-slack 153 (119 lib, 8 mirror, 26 transport), rho-gui 276.
+  **Change 2b, the conversation list.** The list is an index, not a sort.
+  `order` is a `BTreeMap<RowKey, ConversationRow>` whose own order is the
+  order on screen, `placed` remembers the key each conversation currently
+  has, and an event takes one row out and puts it back: no pass over the
+  list, no comparator run n log n times a draw. A first draw is O(n) once.
+  After it the buffer is never rebuilt; the model hands over a log of what
+  moved and the view edits those lines, one line out and one line in, as
+  rope edits at a `Point`.
+  An edit names conversations, never places. The line to take out is the
+  one the view put that conversation on, and the line to put back is the
+  one its new neighbour is on — `before`, the next key in the order, which
+  the tree finds in its own depth. This is not a detail: the first cut of
+  2b reported places as numbers, and a number costs the distance down the
+  list to count. Measured, that made every event O(position) and the
+  roster landing O(n²) — 678 ms at 20 000, startup-visible, exactly what
+  the cost rule exists to stop. Naming the neighbour instead is what the
+  numbers below are.
+  The point follows the conversation, not the line number. It is read
+  before the edits as the conversation it was on and put back on that
+  conversation's line afterwards, so rows arriving above the reader do not
+  move the reader. `rows_moving_above_the_point_leave_the_point_on_its_conversation`
+  in `rho-gui` asserts it against the fake, through a real session.
+  Narrowing stays model-side, so `/`, `n`, `G` and yank see the whole list.
+  A narrowed listing is not the model's list, so the log cannot be applied
+  to it and the view rebuilds; the same for a first draw, a health banner
+  appearing, and a log that reached its cap.
+  The journey this is measured against is **J5**, read and answer a Slack
+  conversation, whose rule is that mark read sticks and *the list row
+  moves once per event, not the list*. The second half is what this change
+  is: one event edits the lines it touches and leaves the rest of the
+  buffer alone. The first half landed in change 1. J5's `today` is still
+  pending measurement on the rig, and the rig's Slack numbers only became
+  meaningful at 9efbed8d, so the keystroke count is QA's to take, not
+  this note's to claim.
+  Numbers, `cargo run --release --example list_cost`, this machine:
+
+  | | 5 000 | 20 000 |
+  | --- | --- | --- |
+  | the first draw, once | 721 µs | 4.74 ms |
+  | one draw, sorted per draw (what it did) | 1.34 ms | 5.11 ms |
+  | one draw, a screenful of 50 | 3.03 µs | 3.20 µs |
+  | one badge, row unmoved | 1.04 µs | 910 ns |
+  | one row, bottom to top | 1.18 µs | 1.44 µs |
+  | one message arriving | 1.78 µs | 2.62 µs |
+  | the roster landing, once a session | 6.43 ms | 30.9 ms |
+
+  Read the shape, not the absolutes: a badge is flat in n, a move and a
+  message grow like log n, and the roster landing — the one event that
+  legitimately renames every row — grows like n log n and asks for the
+  list again rather than logging an edit per row, because n edits cost
+  more to replay than one draw. Before the neighbour fix the same three
+  rows read 31.7 µs, 16.5 µs and 35.7 µs at 20 000, growing with the list.
+  What is still O(n) per refresh and said so: `paint` re-anchors every
+  highlight in the buffer, and the view's `drawn` vector shifts on an
+  insert. Both are one pass over lines already in memory with no
+  allocation, and neither is on the frame path — but neither is O(log n)
+  either, and the next pass at this file is where they go.
+  Gate green on b6cb0dbe: rho-slack 157 (123 lib, 8 mirror, 26 transport)
+  and rho-gui, this change's live view test among them; clippy
+  `-D warnings` and `cargo fmt --check` clean across the workspace.
+  The live view test waits for the row to move rather than for the gpui
+  executor to park. The frame crosses a real socket into the session's own
+  tokio loop and comes back, and parking says nothing about whether that
+  has happened — under a loaded suite it had not, and the test's own
+  `assert_ne!` guard caught it. A loaded machine can now only make the
+  test slower, never make it lie.
+  Two things seen on the way in and now gone, recorded because they cost
+  a gate run each: on 2ac218a7 rho-gui's lib test binary segfaulted at
+  load, before enumerating a test, under both codegen backends; on
+  9efbed8d clippy stopped on `echo_text_for_test`, used only from
+  `src/tests.rs` and so dead to the plain lib build. Both reproduced on a
+  clean checkout of main with nothing of this change in the tree, and
+  both are fixed on 0bb4ffc9.
+  **Change 4, search.** The promise is word-prefix, not substring: `des`
+  reaches `#design`, `ops` reaches `dev-ops` and `ops-alerts`, `sig`
+  reaches neither. That is Emacs completion's style for names and, unlike
+  substring, it is a range scan. The index is a `BTreeSet<(word, id)>`
+  over every word start in every name — split on dash, underscore, space,
+  dot, comma, slash, `#`, `@`, `:` and on a lower→upper hump — kept up to
+  date per event in O(words of the one name that changed). A typed word is
+  answered by scanning from it to the first word that does not begin with
+  it, so one word costs the depth of the tree plus what it reaches. A
+  second typed word intersects, and the intersection walks the *rarest*
+  posting list first and asks the other words of each name it meets, so
+  two words cost the rarer word's matches and not the sum.
+  Narrowing edits the list; it does not draw it again. The match set is
+  kept as a sorted `Vec<(RowKey, ChannelId)>` in the list's own order, and
+  a keystroke diffs the old against the new in one two-pointer merge:
+  leavings first, then arrivals in descending order, so each arriving
+  row's neighbour is already on screen when it is named. Entering a
+  narrowing and leaving it are the two resyncs; every keystroke between
+  them is a diff. Traffic in a conversation the query does not reach logs
+  nothing at all.
+  Names are interned as `Arc<str>` in the sort key. This is not tidiness:
+  the per-keystroke cost is dominated by building keys for the matches,
+  and cloning two `String`s per match was 640 µs against 442 µs for two
+  pointer bumps at 1 885 matches.
+  The minibuffer offers the names a query reaches while the reader types
+  — `reached_by` off the same index, capped at 64, in the list's order.
+  Said plainly: **the narrowing runs on submit, not per keystroke**, and
+  that is the minibuffer's limit rather than this change's shape. Its
+  `CandidateSource` is handed only `&Workspace`, so a prompt can offer
+  completions per keystroke and cannot do anything per keystroke. The
+  index and the row edits are already the per-keystroke shape — the
+  numbers below are per keystroke, and the list narrows by editing the
+  rows that changed — so when eng-8gpr's on-change hook lands, wiring the
+  same `narrow` call to it is the whole of the next change.
+  Numbers, `cargo run --release --example list_cost`, this machine, over
+  a 256-word vocabulary so a query reaches a fraction of the workspace and
+  not all of it — the first benchmark named every channel `channel-N`,
+  every query reached all 20 000, and it measured nothing:
+
+  | one keystroke | 5 000 | 20 000 |
+  | --- | --- | --- |
+  | walked, every row every key (the before) | 179 µs | 753 µs |
+  | one letter | 54 µs (695 reached) | 282 µs (2 525 reached) |
+  | three letters | 93 µs (567 reached) | 442 µs (1 885 reached) |
+  | two words | 32 µs | 50 µs (1 reached) |
+  | the widen, a letter deleted | 91 µs | 443 µs (1 885 reached) |
+
+  Each row is the average of the query going on and coming off again —
+  `""`→`d`→`""`, `de`→`des`→`de` — so a keystroke and its undo are both
+  in every number and none of them is a lucky direction.
+  Read the shape: the walk grows with the workspace, and the index grows
+  with the matches. Four times the workspace is 3.3 times the matches and
+  4.7 times the time; a two-word query that reaches one conversation costs
+  50 µs at 20 000 against the walk's 753 µs, and the widen costs what the
+  narrowing it undoes costs, because it is the same diff run the other
+  way. The `matches` term is honest and unavoidable: a query reaching a
+  tenth of the workspace has to move a tenth of the workspace's rows.
+  One thing this change had to fix before it could be trusted: the two
+  `rho-gui` Slack tests were reading the **user's own mirror**. The fake
+  server starts empty and neither test seeded it, so the listing they
+  asserted against came from `~/.local/state/rho/slack.redb`, which
+  `Session::with_client` opens by default — the user's live Slack data,
+  and the file the running daemon holds. With a second such test in the
+  process it stopped being merely wrong and started failing outright:
+  redb allows one opener, so the second test panicked `DatabaseAlreadyOpen`.
+  The fix goes further than the tests, on eng-en1p's ruling: **a library
+  does not resolve the user's state directory.** `dirs::state_dir()` is
+  gone from `rho-slack` — from `open_mirror`, from `file_cache_path` and
+  from `CredentialStore::default_path`. In its place `config::Paths`
+  carries the three files (mirror, file cache, credentials), `Paths::under`
+  lays them out under a state directory the *caller* names, and
+  `Session::new` and `Session::with_client` both take it. `rho-gui`'s
+  `slack_paths` resolves it once from the directory `main` already
+  computes, keeping the `RHO_SLACK_CREDENTIALS` override the rig uses. A
+  test never sets that directory, so a test now has no Slack files at all
+  rather than the user's — there is no default left to fall into.
+  The tests pass a `tempfile::tempdir`, and the workspace they read is
+  seeded on the fake, server-side, where the mocking belongs: `#design`,
+  `#random`, `#dev-ops`, `#ops-alerts`, `@ada` and a group DM. They also
+  went from 20 s of socket waiting to 0.36 s, because what they wait for
+  now actually arrives — the old ones waited on a socket for rows that
+  were never coming, and passed on the mirror's.
+  This change's `rho-gui` tests are in their own file,
+  `crates/rho-gui/src/slack_tests.rs`, declared from `lib.rs` and not
+  appended to the end of `tests.rs`. Every agent was appending at that
+  same last line and every rebase collided there; five of 2b's conflicts
+  were nothing but append-vs-append. A test belongs to the surface it is
+  about.
+  Gate on 40e6bb00: the workspace suite green, `cargo fmt --check` clean.
+  Clippy stops on `tests.rs:10854`,
+  `clippy::type_complexity` on a `Rc<RefCell<Option<(usize, usize, u32,
+  Option<usize>)>>>` — main's line, present on a clean checkout with
+  nothing of this change in the tree, reported and not worked around.
+
+  **Change 3, reacting.** `r` on the message under the point opens a
+  transient rather than acting. Two groups, in the order a reader wants
+  them: what is already on the message first, because joining a reaction
+  is the commonest thing anyone does with one, and a row for one the
+  reader already has says "— remove", so the key is one state and not
+  two. Then what this reader reaches for, most recent first, never
+  repeating a row above it. Then `/`, any emoji by name, off the same
+  table the composer completes `:` from, so what a reader can type in a
+  message they can react with.
+  The emoji goes on locally the moment the key is pressed and the server
+  is told afterwards; if Slack refuses, the local one comes back off and
+  the echo line says so. `already_reacted` and `no_reaction` are not
+  refusals — they are the state the reader asked for, so both map to
+  `Ok(())` and pressing the same key twice from two places is not an
+  error. The recents are the reader's, not the workspace's: nine deep,
+  move-to-front, seeded with six an empty account can still use, kept in
+  the mirror under `rho_slack_reacted_with_v1` so a restart opens the
+  menu the reader left.
+  The cost. A reaction names one message, so it touches that message,
+  the reader's nine names, and the two mirror rows those live in — never
+  the mirror, the list or the loaded run. The message a reaction lands
+  on is found by binary search over the loaded run, the way `insert`
+  places one; it was a walk, and the walk is gone from both `Loaded::react`
+  and the reload the session does after it. Per frame the menu draws its
+  rows and no more: at most twelve emoji plus `/`, which is four rows in
+  each of four columns.
+  Numbers, `cargo run --release --example react_cost -- 20000`, this
+  machine, a workspace of 20 000 conversations and a conversation of
+  20 000 messages in the mirror:
+
+  | one toggle | cost |
+  | --- | --- |
+  | the recents list, move-to-front | 50 ns (9 remembered) |
+  | the message written back | 71 µs (one row of 20 000) |
+  | the recents written back | 57 µs (9 names) |
+  | reading the recents at a start | 794 ns |
+
+  Both writes are one redb commit each and neither reads the rows beside
+  it, which is why the workspace's size is absent from the table: the
+  same two numbers hold at 20 conversations and at 20 000.
+  What the tests prove is what the *server* holds, not what the client
+  drew: `reacting_puts_the_emoji_on_the_server_and_pressing_again_takes_it_off`
+  in `crates/rho-gui/src/slack_tests.rs` puts a reaction on through a real
+  session against the fake, waits for the fake to have it beside the one
+  someone else already put there, presses again and waits for the
+  reader's to be the only one gone. The fake gained `reactions.add` and
+  `reactions.remove`, one mutation shared with the socket path so a
+  reaction the API adds and a reaction a frame adds cannot disagree, and
+  the two refusals above. `rho-slack`'s transport tests cover the same
+  two shapes end to end.
+  One stop, and it is the tree's rather than this change's: the `rho-gui`
+  lib test binary under `cargo test --workspace` is 1.149 GB, and glibc's
+  loader segfaults in `dl_main` before a line of Rust runs. Main's own is
+  1.148 GB and loads; a single extra test tips it. It is not the test's
+  content — an empty one does it — and it is not this change's logic: the
+  crash is in `ld.so`, the core's only frames are `dl_main`,
+  `_dl_sysdep_start`, `_dl_start`, `_start`, and `CARGO_PROFILE_DEV_DEBUG=0`
+  makes it go away while `line-tables-only` and
+  `split-debuginfo=unpacked` do not. The gate for this change was run that
+  way: `CARGO_PROFILE_DEV_DEBUG=0 cargo test --workspace` green at 1 659
+  tests, clippy `-D warnings` clean, `cargo fmt --check` clean. It reads
+  here as a ceiling, and that reading is wrong: it is a linker laying a
+  large binary out badly, and it is fixed below in "The linker, not the
+  size".
+
+  **Change 4b, the narrowing runs per keystroke.** Change 4 landed with
+  the narrowing on submit, because the minibuffer's `CandidateSource` is
+  handed only `&Workspace` and so can suggest but not act. eng-8gpr's
+  `ChangeHandler` fixes that, and this is the wiring: `open_prompt_watching`
+  with a handler that narrows the list on every edit. The index and the
+  row edits were already the per-keystroke shape, so the change is the
+  hook, one narrowing path shared by keystroke, submit and escape, and the
+  state escape needs.
+  Escape is the prompt's, per eng-en1p's ruling: `prompt_slack_search`
+  saves the narrowing that stood when it opened and `minibuffer_cancel`
+  puts it back through the same `set_filter`, so cancelling costs what
+  narrowing cost and not a redraw. The primitive only says *when*.
+  Numbers, `cargo run --release --example list_cost`, this machine, p99
+  over 1 744 keystrokes — every prefix of every word in the vocabulary,
+  typed a letter at a time, each keystroke measured twice: the candidates
+  the minibuffer asks for and the narrowing behind it.
+
+  | per keystroke, p99 | 300 | 5 000 | 20 000 |
+  | --- | --- | --- | --- |
+  | the candidate lookup, 64 offered | 24 µs | 620 µs | 3.6 ms |
+  | the narrowing itself | 18 µs | 615 µs | 3.0 ms |
+  | rows edited | 168 | 3 067 | 2 397 |
+
+  Read the shape: the p99 keystroke is a *one-letter* query, which reaches
+  a tenth of the workspace, so the row count and the time are the matches
+  and not the list — a two-word query reaching one conversation is 50 µs
+  at 20 000. Entering a narrowing from the whole list and leaving it again
+  are resyncs by design (two lists with no common shape to diff); of the
+  1 744 keystrokes, 304 were those and 1 440 were diffs.
+  The user's workspace is hundreds of conversations, which is the 300
+  column: 24 µs to offer the names and 18 µs to narrow. The 20 000 column
+  is the stress figure and is where the honest limit shows — at that size
+  a letter reaching 2 400 rows has to move 2 400 rows.
+  One thing this change makes cheaper on the way past: `reached_by` sorted
+  every match to show the first 64. It now partitions with
+  `select_nth_unstable` and sorts only what it shows.
+  Test: `typing_narrows_the_list_per_keystroke_and_escape_puts_it_back` in
+  `slack_tests.rs`, through a workspace and a real session against the
+  fake — the prompt opens and nothing has narrowed yet (opening is not an
+  edit), one keystroke narrows, two more narrow again, and escape puts the
+  whole list back. The one test-only seam is
+  `install_slack_session_for_test`, which hands the workspace a session
+  built against the fake; everything after it is the code the reader runs.
+- **`rho-dag`** (today `rho-desk`). The store is a global DAG of cells
+  across hosts: notes, labels, parents, verdicts. The crate keeps the
+  store and gains the map screen and the note views. The screen is
+  called the map.
+- **`rho-shell`.** Window state and nothing about any source: focus, key
+  contexts, the echo line, surfaces and their history, transients and
+  the minibuffer, the shift tap, telemetry, chime. (`rho-shell` the crate
+  name is taken by the terminal shell; this one is `rho-window`.)
+  Its primitives are designed one at a time in `RHO-WINDOW-DESIGN.md`, held
+  against the user's ruling. First is the transient buffer, which `rho-slack`
+  needs for reactions: the note's finding is that today's transient has the
+  right data shape and the wrong everything else — it draws into the bottom
+  strip rather than under the point, its actions are `&mut Workspace`
+  closures, and 791 of its 2,101 lines are agent quota and cost charts that
+  are not a window primitive at all. The shape is kept, the primitive is
+  replaced. Owner: eng-8gpr, after eng-b8os's chrome cut creates the crate.
+
+  *Landed, the chrome (first cut of `rho-window`).* The vocabulary every
+  screen is drawn with, moved verbatim and nothing else: `style` (the
+  classes a span carries, the regions, the gutter and chip colours, the
+  attachment and refusal blocks), `highlights` over a multibuffer,
+  `editor_config` (what a buffer is opened as), and `visualization`. None
+  of the four reached into `Workspace`: they knew buffers, editors and the
+  theme and nothing above, which is why the move is verbatim and why the
+  cut is a manifest and a set of imports rather than a redesign. Every use
+  site names `rho_window::` now rather than `crate::`; no alias was left
+  behind, because a re-export would have let a screen keep believing the
+  chrome is its own. The rest of the window — focus, surfaces, history,
+  transients, the minibuffer, selection and the active pane — follows here.
+  Gate green: rho-gui 275 and rho-window 1 (the style test moved with its
+  module), workspace clippy `-D warnings` green.
+
+  *Landed, the transient buffer (`rho_window::transient`).* The primitive,
+  built the way the design note settled it and touching no other module in the
+  crate. A `Transient<A>` is a title and rows of key, meaning and an optional
+  value; `A` is the caller's own action type, so the crate names nothing above
+  it and a source crate puts an item in a menu without naming the workspace.
+  A press is answered rather than performed: `press` returns run this item,
+  take this digit as a count, dismiss, or nothing is bound, and the caller does
+  the doing — which is what lets the menu be tested without a window and drawn
+  by anything. It opens as a measured block under the point's anchor, with the
+  editor's own text style, the way `style::refusal_block` already does: buffer
+  text under the row the reader is on, not a strip at the bottom of the window.
+  One presentation path, `items()`; there is no by-index second API for the
+  phone. Applicability is at open — an item with nothing to act on is not in
+  the menu rather than in it and failing when pressed. `escape` and `ctrl-g`
+  dismiss, because they mean that everywhere else. An unbound key keeps the
+  menu: a mistype is not a reason to lose it.
+  The rule is one key and closed. `Kind::Infix` exists so an item can declare
+  itself a toggle and the press says `closes: false`, but no menu declares one
+  yet and none will until the user rules on the open question in
+  `RHO-WINDOW-DESIGN.md` — the mechanism is there, the chaining is not.
+  Cost: a press is one pass over the rows on screen, a draw is O(rows in the
+  menu); nothing behind either grows with the desk. Numbers come with the
+  wiring, because a primitive nothing opens has no frames to measure.
+  Not yet wired: `rho-gui`'s 19 menus still run through its own
+  `transient.rs`. The verdict menu moves first, on its own, and that is the
+  change the rig proves.
+  Gate green: rho-window 11 tests (10 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
+
+  *Landed, the verdict menu on it (`rho-gui`'s `transient` and `workspace`,
+  `rho_window::transient`).* The first menu wired, and the one a tap of
+  `shift` opens. `verdict_menu` and `verdict_snooze_menu` are now data over a
+  `VerdictAction` enum — done, mute, snooze, the room, todo, file, undo, pull,
+  and a unit — and `Workspace::run_verdict` is the only place in the program
+  that knows what those mean. The menu is a block under the point in the
+  active editor: the bottom strip holds nothing but the keyboard while it is
+  up, an element with the focus on it and no size of its own. `s` replaces the
+  menu with the snooze units over the same row and `escape` goes back to the
+  verdicts rather than out, so back returns here too; a second `escape` leaves.
+  The other 17 menus are untouched and still draw in the strip.
+  Two things the rig caught that no test could. The block was created with
+  `height: None`, and the menu painted over the rows below instead of moving
+  them down — `Block::has_height` is what turns the editor's measuring on, so
+  a block with no height starts at zero rows and stays there; it wants
+  `Some(1)` and the editor resizes it to what the element drew. (The same is
+  true of `style::refusal_block`, which is still `None`: that is a real defect
+  in the chrome, filed here rather than fixed in this change.) And the Magit
+  column layout was drawing as one column however it was chunked, so the
+  chunking went: one item per row, which is what a buffer is anyway.
+  (That last decision was wrong and is reversed: one item per row makes the
+  root menu's twenty-eight items the whole screen. The grid is back in
+  `rho_window::transient::render`, ported from the element tree that worked
+  before the move; see "The grid, put back" in `RHO-WINDOW-DESIGN.md`.)
+  Also removed: moving counts into the menu left `Workspace::transient_count`,
+  `take_transient_count` and `Transient::counted`/`takes_count` with no reader,
+  since the verdict menus were the only counted ones. The path is deleted
+  rather than left write-only, the count digit in the strip's render with it.
+  Proven on the desk rig, session 12, on `user-2026-09-06`: `shift` over a
+  running agent opens the verdicts under that row with the rest of Home
+  readable below them, `s` swaps in the units, `escape` `escape` leaves the
+  point exactly where it was, and `x` mutes the row the point was on and says
+  so in the echo line. Emacs-feel checks: the point survives back, nothing
+  needed the mouse, no modal appeared and nothing dimmed, one key ran and
+  closed. The rig-down line for that session:
+  `113 frames, draw p99 4.1 ms, 0 over 8 ms; worst gap 161 ms, p99 8 ms;
+  12909 events, slowest stage multi_buffer_sync p99 0.11 ms at 0 rows; 126
+  samples on rho-gui: __memcpy_avx512_unaligned_erms 9%,
+  __syscall_cancel_arch_end 5%, eq 5%`. Opening the menu costs one block
+  insert and one measured element of eight rows; a press is one pass over
+  those rows. Nothing here grows with the desk.
+  Gate green: rho-gui 245 passed and 3 ignored (248 total, against main's
+  246), rho-window 11, clippy `-D warnings` clean, `cargo fmt --check` clean.
+  *Landed, the root menu and the three under it (`rho-gui`'s `transient` and
+  `workspace`).* The second batch of the seventeen, and the one that turned
+  the verdict menu's private plumbing into the window's one way of showing a
+  menu. `root_menu`, `slack_menu`, `hosts_menu` and `projects_menu` are now
+  data over the same primitive: `MenuAction` is `Open(MenuId)`, `Verdict(..)`
+  or `Command(..)`, and `Workspace::run_command` is the single match that
+  knows what a menu item means, beside `run_verdict` which already did.
+  `VerdictBuffer` became `MenuBuffer` and `open_menu` is the way in for any
+  menu; `space` no longer touches the bottom strip at all.
+  Two shapes came out of doing the root menu rather than another leaf, both
+  written up in `RHO-WINDOW-DESIGN`. An item names a menu rather than opening
+  one, which is what lets the seventeen move in batches — the root menu says
+  "hosts", the workspace decides where hosts is drawn, and the four menus
+  still reached by name (`input`, `agent`, `new`, `status`) open in the strip
+  from the same arm until their batch. And back is a stack rather than a
+  parent: the verdicts were one deep so one parent sufficed, but `space s u`
+  is three, and an escape that leaves from the third step instead of
+  returning to the second is exactly what the design says never happens.
+  Also removed, because the primitive does it: `Transient::item_when`,
+  `retain_applicable` and the strip item's `when` field. Applicability is at
+  build time now — `root_menu(&subject)` — which is the same moment as before
+  and one fewer pass. `Workspace::echo_text_for_test` was missing its
+  `#[cfg(test)]`, so `clippy --all-targets -D warnings` on rho-gui failed on
+  main; the attribute is added here since the gate has to be green.
+  Proven on the desk rig, session 30, on `user-2026-09-06`: `space` on Home
+  with the point on a running agent's row opens `rho` as a block under that
+  row, with the rows below it moved down and the bottom strip empty; `h`
+  replaces it with `hosts` over the same row; `escape` comes back to `rho`
+  and `escape` leaves, the point on the row it started on. The screenshot
+  taken after the first `escape` is byte for byte the one taken when the
+  root menu first opened — back returns the buffer as it was, and two
+  identical frames is the strongest way to say so.
+  Two more pictures for the two claims that are not about one menu. `space
+  s` from the same row draws `status` in the bottom strip, which is the
+  mixed state working: a menu that has moved and a menu that has not, one
+  keystroke apart. And `space` on a transcript opens the same `rho` menu
+  under the point in that buffer, this time with `a agent…` and `d changes`
+  in it — the same key, the same menu, applicability answered by the surface
+  rather than by the menu. `l` there ran the message log and the menu closed:
+  one key, ran, closed. Emacs-feel checks: the point survives back, the same
+  key means the same thing in both buffers, nothing needed the mouse, no
+  modal appeared and nothing dimmed.
+  The rig-down line for that session:
+  `187 frames, draw p99 9.1 ms, 2 over 8 ms; worst gap 746 ms, p99 22 ms;
+  17875 events, slowest stage wrap_map_update p99 2.43 ms at 220 rows; 295
+  samples on rho-gui: __syscall_cancel_arch_end 14%,
+  __memcpy_avx512_unaligned_erms 4%, runtime 4%`. The two frames over budget
+  are the block insert and the rewrap it causes when a twenty-six row menu
+  opens into a 121k-row Home; opening a menu is one block insert and one
+  measured element, and a press is one pass over the rows on screen. Nothing
+  here grows with the desk, but a menu on screen is a real edit to the block
+  map and does not belong in a sample being measured for something else.
+  Gate green: rho-gui 259 passed and 3 ignored (against main's 258), clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+
+  *Landed, the draft's menus and the phone's one way in (`rho-gui`'s
+  `transient`, `workspace` and `workspace_phone`).* `new`, `input`,
+  `status`, `agent`, `snooze`, `phone_root_menu` and the phone's snooze
+  sheet: twelve of the seventeen have moved, and the five that have not are
+  the usage charts, which carry their series and want a screen of their own
+  rather than a mechanical move.
+  The part worth reading is the phone. The primitive's fifth complaint
+  about the old transient was that the phone had a second way in —
+  `phone_rows` and `action_at`, by index into a private `Vec`. The sheet
+  now draws from the same `Transient<A>` through `items()`, and a tap runs
+  the item a key would have run through the same `run_menu_action`. It is
+  not the same picture — a thumb needs a target, not a row — and that is
+  the point: one menu, one set of actions, two drawings.
+  Which made the block optional rather than conditional at the call site.
+  A menu on the phone is open the same way it is open on the desk; it just
+  has no block, so nothing in the buffer moves to make room for a sheet
+  that is drawn over the surface. `MenuBuffer::block` is an `Option`, and
+  the one place that decides is `show_menu`.
+  Proven on the desk, sessions 40 and 41, rebased onto main `1e04ecff` and
+  rebuilt, so the pictures are of b8os's fold trio with this batch on top.
+  On the desktop: `space` on Home with the point on the `eng-8gpr` row draws
+  the root menu as a block directly under the point, `n` replaces it with
+  `new` — **a** agent…, **p** page…, **n** note… — the rows below pushed
+  down and the bottom strip empty, and two escapes give Home back in a frame
+  byte-identical to the one the menu opened over. Three consecutive
+  open-and-dismiss round trips: two byte-identical, and the third differing
+  by 1,167 pixels which are all the `eng-b8os` name going from muted to
+  normal — that agent's own mirror row moving while they work, not the
+  buffer. A no-input control over the same span is byte-identical, which is
+  how the live row and the buffer were told apart.
+  The phone half could not be photographed, and the reason is the rig, not
+  the change. Every way into the sheet is a tap — the ☰, the deal card's
+  header, the empty feed's header — and the rig's headless seat has no
+  pointer: sway reports `capabilities: 0` with no devices, so
+  `seat seat0 cursor press` succeeds in the ipc and reaches no client, while
+  `wtype`'s virtual keyboard is a device and does. Keys do arrive at phone
+  width (`ctrl-shift-f` opens the minibuffer there), but nothing bound to a
+  key opens the phone's menu: `space` is bound for editors and the deal card
+  focuses none, and the one command that would leave the card for the
+  dashboard is itself an item in the menu being opened. So the phone half is
+  proven by `the_phone_sheet_is_the_same_menu_as_the_block` — 400x800, sheet
+  title `menu`, rows Map/Slack/Agents/Status, no block and no strip, `Status`
+  opening a submenu with a back, two dismissals to close — and not by a
+  picture. Giving `rho wayland` a virtual pointer is the rig's next item and
+  the handbook says so; until then the phone is a test, not a photograph, and
+  this note says which.
+  The block-insert re-measure asked for after the fold trio is session 41 and
+  nothing else: ten open-and-dismiss round trips on Home, `115 frames, draw
+  p99 5.8 ms, 0 over 8 ms; worst gap 290 ms, p99 8 ms; 13100 events, slowest
+  stage block_map_sync p99 0.08 ms at 1 rows`. Against the two frames over
+  8 ms and the rewrap of what was around the block measured before the trio,
+  the block insert now costs the block: one row of block-map work, and no
+  frame over budget on the whole run.
+  Removed, and named here so it can be asked for back. `phone_desk_menu`
+  was the Map screen's own sheet on the phone — **cycle folds**, **edit
+  notes**, **new** — and nothing opened it: the phone's ☰ opens the root
+  menu whichever root is showing, so the Map sheet had never been
+  reachable. A menu nothing opens is residue by the rule every dead item
+  here has been answered with, so it goes rather than being carried over as
+  data. If the map's own sheet is wanted on the phone it comes back as a
+  `Transient` over `MenuAction` like the rest, with one line in the bottom
+  bar, not as a strip. `phone_cycle_dashboard_folds` went with it, having
+  had no other caller; the desktop's fold cycling is untouched.
+  The block-insert cost from the batch above came off `rho-window`'s owed
+  list with the number above: the fold trio changed what Home's block map
+  holds, and a menu open is one row of it now. What is left on that list
+  beside the width-change rewrap is the wrap map's own whole-buffer rewrap,
+  which is eng-b8os's next task, not this crate's.
+  Gate green on the rebase: rho-gui 262 passed and 3 ignored — one test
+  added for the phone sheet and one removed with the menu it was about, so
+  the count is main's, which the fold trio moved from 259 to 262. Clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+
+  *Landed, the sheet the change above opened and never drew (`rho-gui`'s
+  `workspace` and `workspace_phone`).* The overlay at the bottom of
+  `render` matched on the bottom strip's `transient` alone, so once the
+  phone's menus stopped being strips the phone opened a menu into an empty
+  screen: `menu_buffer` was set, the sheet had a title and rows, and nothing
+  put them on the glass. The test that shipped with the change asked the
+  workspace what the sheet said and got the right answer, which is the
+  whole lesson — *open* and *drawn* are different claims, and a test that
+  reads state proves only the first. What found it is the rig's new
+  pointer: the first real tap on the phone's header did nothing, and the
+  cursor turning into a hand over that same header is what said the tap was
+  landing and the screen was empty on purpose.
+  The fix is one arm — a menu on the phone draws the same sheet — and two
+  corrections that came with it: the backdrop's keys go to `menu_key` when
+  the sheet is a menu, and a tap outside closes the menu rather than a
+  strip that is not there. The new test taps the bottom of a 400x800 window
+  where the last row lands and asserts the row ran; it fails without the
+  arm, which is the only kind of test that could have caught this one.
+
+  *Landed, the rig can tap (`rho-cli`'s `wayland` driver, `QA-HANDBOOK`'s
+  driving notes).* `click` and `move` were sway ipc `seat cursor` commands,
+  which move a cursor belonging to a pointer device the headless seat does
+  not have: the ipc answered `success: true` and no client ever saw a thing.
+  The driver now creates a `zwlr_virtual_pointer_v1` on the session's own
+  seat for the length of the tap, which is the shape `wtype` already had for
+  keys — `swaymsg -t get_seats` shows `capabilities: 0` with no devices at
+  rest and `1` with a `wlr_virtual_pointer_v1` while a tap is in flight, and
+  the seat is bare again afterwards, so no run changes what the next run
+  finds. Coordinates are logical pixels read off a screenshot and checked
+  against the output's size *now*, from `get_outputs`, not the size in
+  `session.json`: a resize goes through sway's ipc without touching that
+  file, and every session the phone is driven on has been resized. That is
+  its own unit test.
+  Proven on desk session 45, first open of the session, at 800x1600 with
+  scale 2 — a phone. A tap on the note card's header at (200, 16) drew the
+  sheet: **menu** with **close**, and Map / Slack / Agents / Status, the
+  same menu the desk draws as a block under the point. A tap on Status at
+  (100, 772) ran that row and the sheet became **status** with a **back** —
+  upload GUI performance snapshot, usage…, version. A tap on back gave a
+  frame byte-identical to the sheet before it, and a tap on the backdrop
+  closed it into a frame byte-identical to the one before the first tap:
+  the surface underneath never moved, which is what the sheet drawing with
+  no block is for. A no-input control over the same span is byte-identical,
+  so those are the buffer and not the desk. Keys are unharmed: back at
+  2560x1664, `space` still opens the root menu as a block.
+  The session line is `179 frames, draw p99 24.6 ms, 15 over 8 ms; worst gap
+  307 ms, p99 135 ms; 15620 events, slowest stage multi_buffer_sync p99
+  104.32 ms at 0 rows`, and it is not a menu number: that session is two
+  resizes and a card pull, and a resize is the whole-buffer rewrap on the
+  owed list. The menu's own cost is session 41's, ten round trips and
+  nothing else, none over 8 ms.
+
+- **The rig proof for surfaces and history, and what `S` is** (`rho-window`
+  `history` doc; `RHO-WINDOW-DESIGN.md` the section). Desk session 84, first
+  open of a fresh process on the user's snapshot at 2560x1664 scale 2, main
+  0caf8671. Frames compared byte for byte by md5; every claim below has a
+  no-input control taken over the same span on the same surface, because a
+  frame of Home is not equal to itself — the agent ages tick and the row
+  moves between "next" and "running" while you watch.
+  **The question first, because it decides whether the rest matters.**
+  eng-en1p read `back` dropping the surface it leaves and asked whether that
+  destroys the view, which would break the Emacs rule on the ordinary path:
+  leaving a buffer never kills it. It does not. `S` is a handle — every
+  `SurfaceView` variant is a refcounted `Entity`, and the context's buffer
+  list (`surfaces: HashMap<ContextId, Vec<Surface>>`) holds a clone that
+  `make_surface` returns rather than building a second view — so dropping the
+  entry drops a handle. The machine's doc now says `S` must be a handle and
+  why, and the design section says it in the same words. The one path that
+  really destroys a view is eviction, `release_agent`, and it already has the
+  warm store: `warm_surface` rebuilds the transcript if back reaches it.
+  **Proven on the rig, three pairs, each against its control.**
+  (1) A desk node with the point set, the usage screen opened over it, back:
+  the frame on the node is byte-identical to the frame before leaving
+  (`5c4ebc6b`… twice; the usage frame in between `2e3f345a`). Control: the
+  node frame is stable over 5 s with no input.
+  (2) The same node scrolled twenty-five rows down, left for the usage
+  screen, back: byte-identical again, same digest.
+  (3) A transcript — 275k, eng-en1p's, scrolled eighty rows up into history
+  with a fold opened so the display map is not its default — left for the
+  usage screen in the same context and returned to: byte-identical
+  (`f39e9e01`… twice), control clean.
+  **And the case en1p added: the surface back drops, reopened.** The node was
+  dropped by a second back, then reopened from Home. 1,512 pixels of
+  4,259,840 differ, 0.036%, in exactly two bands eighteen pixels wide and one
+  text row tall: the cursor leaving the row it was on and arriving on the row
+  Home named. The scroll — twenty-five rows into the document — is identical,
+  which is the whole answer: a rebuilt view would have started at the top.
+  The point moves because opening from Home *is* "go to this node", so the
+  open path places it; history did not lose it.
+  **The one case not run, and why.** "The thing behind B is deleted while it
+  is in the stack" is not reachable from the keyboard now that history is per
+  context: an agent's transcript lives in that agent's context, and
+  `prune_contexts` drops the whole context when the agent goes, so there is
+  no stack left to walk. I checked that rather than assuming it — the
+  workspace test for it passes with the `forget` call commented out. The
+  invariant is proven on the machine instead, where a key can be forgotten
+  under a stack that outlives it: `a_forgotten_surface_is_never_shown_again`
+  and `forgetting_removes_every_entry_for_that_key`.
+  **Cost.** Nothing in the profile belongs to the history machine, which is
+  what O(1) with nothing walked at draw time looks like from outside. The
+  session's own numbers, reported as they came: 1,404 frames, draw p99 9.4 ms
+  with 29 frames over 8 ms, dirty-to-draw p99 82 ms and a worst gap of
+  275 ms, 88,507 editor events. That fails the handbook on both counts and
+  the drive is why — it is a first open of a 275k transcript and of the whole
+  desk tree with eighty-key scroll bursts, not a controlled comparison. One
+  number in it is worth someone's time and is not mine: `wrap_map_update`,
+  30 calls, `input_rows` p50 and p99 both 1,048, `duration_ms` p50 2.84 ms
+  and max 1,519 ms. A 500× spread at constant input size is not the row
+  count, and b8os's `wrap_map_rewrap` puts 500 rows at 2.1 ms, so it is a
+  cold or contended path inside the update rather than work proportional to
+  anything. Filed for cut B's owner rather than fixed here.
+  **Two drive details for whoever runs the next one.** `ctrl-k` does not
+  reach the application through the rig's driver — `f21`, bound to the same
+  `SurfaceBack`, does, and every back above was driven with it. And the
+  leader menu draws past the bottom of the screen: `space` then `s` shows
+  entries clipped by the window edge, which is a defect for the sweep, not
+  for this note.
+
+- **Landed, surfaces and history are one machine** (`rho-window` module
+  added: `history`; `rho-gui` `pane` cut down to `SurfaceKey`, `workspace`,
+  `workspace_phone`, and `create` and `slack` where they read the viewport;
+  `RHO-WINDOW-DESIGN.md` the section this cuts against).
+  There were two histories and that was the defect: `Pane<S>`'s per-context
+  `Vec<S>`, whose `show` ran `retain` over the whole stack, and the
+  workspace's global `surface_history: Vec<WarmSurface>` with a
+  `history_cursor`, which is the one the keys actually reached. A push was
+  O(entries) twice over in two places that had to agree, and closing a
+  surface or forgetting an agent scanned both. Both are gone. What replaces
+  them is `rho_window::history::History<K, S>` — generic over the key the way
+  `Pane<S>` was, naming no source type — held once per context in
+  `contexts: HashMap<ContextId, SurfaceHistory>`. Per context is eng-en1p's
+  ruling under the Emacs rule and is named in the design section so the user
+  can reverse it by name.
+  The shape, and its cost. Entries are appended and never removed from the
+  middle; a `HashMap<Key, usize>` holds each key's newest index, so showing a
+  surface that is already in the stack leaves the older entry stale instead
+  of paying a scan and a memmove, and back skips any entry the map no longer
+  points at. Each stale entry is skipped at most once in the life of the
+  stack, which is the amortised bound. The numbers the tests pin, at the
+  size the note quotes: at 1,000 entries a push touches one entry and
+  rebuilds nothing, a back touches one, a forget touches none at all — only
+  the map — and 1,000 distinct pushes rebuild zero times. The rebuild is the
+  only O(n) event; the worst case for staleness, two surfaces alternating
+  over 2,000 pushes, rebuilds 142 times, once per fourteen pushes, and
+  leaves twelve entries for three reachable surfaces. Nothing walks the
+  stack at draw time: the viewport draws `current()`.
+  Death is one call. The four paths — close, discard a draft, forget an
+  agent's transcript, forget a detached daemon's agents — hand a key to
+  `forget`, and the invariant that back never shows a dead entry is two
+  tests on the machine rather than four places agreeing about a cursor. The
+  workspace test for the daemon case asks only for the result and says so:
+  it is kept twice over, once by `forget` and once because an agent's
+  context dies with the agent, and no path has to know which saved it.
+  **Two behaviour changes, both deliberate, both flagged for the user.** `q`
+  on a standalone draft now goes back one surface instead of to Home — it is
+  a close like any other close, and Home was the old global cursor's answer.
+  And there is no forward step: a stack walked past is shorter, which is
+  what "history is a stack" means and what the old cursor did not do.
+  Eviction is not a death: `release_agent` leaves the entry alone and
+  `warm_surface` rebuilds the transcript if back reaches it, which is what
+  the old code did in the path that was live.
+  Gate green: rho-window 24 passed (the machine's own tests, from 11),
+  rho-gui 259 passed and 3 ignored, rho-agents 68 passed, clippy
+  `-D warnings` clean on both crates, `cargo fmt --check` clean.
+  **Owed, and not in this note:** the rig proof — A, B, back byte-identical
+  to A against a no-input control, again scrolled with a fold closed, again
+  after the thing behind B is deleted while it is in the stack, first open
+  named. The desk is with b8os for Cut A; the numbers follow in their own
+  note when the seat frees.
+
+- **Landed, the usage charts are a screen** (`rho-agents` module added:
+  `usage`; `rho-gui` modules touched: `usage` (new), `transient`,
+  `workspace`, `workspace_phone`, `pane`, `telemetry`, `journal`). The five
+  chart items under `space s u` were the last thing the bottom strip was
+  for, so they became plain `MenuAction`s that open a screen and the strip's
+  element tree went with them: `Transient`, `TransientRun`, `TransientItem`,
+  `quota_usage`, `active_auth_namespaces`, `global_usage`,
+  `agent_cost_usage`, `usage_days`, the workspace's `transient` and
+  `transient_stack`, and the phone's `phone_transient_action`. `transient.rs`
+  is 2115 lines down to 601 and holds menus, which are values and nothing
+  else.
+  The summary lives in `rho-agents`' `usage` and the painting in `rho-gui`'s.
+  The line between them is that the reduction takes a *count* of columns, not
+  a pixel: nothing in it is about gpui, so it sits with the rest of what the
+  client knows about agents and is unit-tested without a window. `usage.rs`
+  in the GUI only paints. The screen is a buffer — the title and the totals
+  are its text and the chart is a block below them, the way a menu is a block
+  below its row — so `:buffer`, `escape`, history and search work because
+  there is nothing new for them to work on. `SurfaceKey::Usage` is one
+  screen: `c` after `r` redraws it rather than opening a second place to be,
+  which is what the new test asserts.
+  The cost rule is met by where the arithmetic happens, not by how fast it
+  is. A summary is built when a series arrives, once per arrival, and reduced
+  there to the chart's width, so a frame walks at most one point per column
+  per line and the percentile buckets are already bucketed. `render()`
+  computes nothing over samples. A window that gets wider than the summary
+  was reduced to rebuilds it — that is a resize, not a frame, and the same
+  goes for a window that gets taller, since the chart's height follows the
+  viewport now.
+  **The before, on the desk snapshot's own rows.** The two defects were that
+  the strip recomputed its summary inside `render` from every sample it held,
+  and that the transient carried the series to do it with. What that walked
+  here, counted against `/home/maan2003/src/rho-rigs/desk/state/rho/rho.redb`
+  with the daemon down: 279 Claude quota samples over seven days (124 opus,
+  155 fable) and 807 over thirty, and 23041 gpt samples in
+  `chatgpt_quota_observations`, which keeps thirty days and nothing older.
+  So a frame of the thirty-day rate limit chart on main recomputed over
+  roughly twenty-four thousand samples, and the seven-day one over some
+  thousands of them; after the change a frame walks at most the chart's
+  width per line, which the unit test pins at 833 points for a week of
+  minute-by-minute polls on an 832-column chart.
+  **The after, and it is not a win per frame.** Both runs are the first open
+  of a fresh session on the same desk snapshot at 2560x1664 scale 2, driven
+  by the same twenty opens of the rate limit chart (`escape`, `space`, `s`,
+  `u`, `r`). Session 58 on main 98ca1835: 206 frames, draw p50 1.93, p95
+  3.65, p99 4.27 ms, prepaint p99 2.77, paint p99 1.68, 0 frames over 8 ms.
+  Session 62 on this change: 296 frames, draw p50 3.08, p95 5.92, p99 6.14
+  ms, prepaint p99 4.02, paint p99 2.39, 0 over 8 ms. The change costs about
+  1.8 ms of p99 draw and it stays inside the budget.
+  The obvious suspect was the picture's size — the strip drew 1280x240 and
+  the screen draws 1280x682 — and it is not the cause. Session 63 is the
+  control for it: the same binaries with the chart pinned to the strip's 240
+  px and the identical drive script, 263 frames, draw p99 6.07 ms, prepaint
+  p99 4.03. Holding the picture's height changes nothing, so what is left is
+  that a screen redraws the viewport where a strip redrew a strip. That is
+  the cost the change takes on, in exchange for the bound above and for the
+  charts being a place you can go rather than a strip that appears. Sessions
+  62 and 63 ran the identical script; session 58's pauses I cannot swear were
+  the same to the millisecond, so the frame *counts* between main and the
+  change are not like for like and the per-frame percentiles are what the
+  comparison rests on.
+  Two things the screenshots caught that no assertion here would have. The
+  block went in as `BlockStyle::Fixed`, which the editor measures at
+  min-content: the chart drew across 60% of the screen with the rest blank,
+  and the test asserting the block exists passed the whole time. It is `Flex`
+  now. And a chart sized for a strip on a screen of its own is a quarter of
+  the glass in use, so the height is the viewport's less the header, floored
+  at the strip's 220. Inserted, drawn, and drawn at the right size are three
+  different claims.
+  The docs that named the wrong crate are fixed in the same commit:
+  RHO-WINDOW-DESIGN.md lines 83 and 143 and this file above said the charts
+  were "drawn by `rho-visualizations`". They are not and were never going to
+  be — that crate is the daemon-side store of immutable SVG blobs an agent
+  recorded, and a live quota chart through it would be O(events) per refresh
+  plus a store round trip for a series the GUI already holds.
+  Gate green: rho-gui 258 passed and 3 ignored (main's 263 less the eight
+  tests that moved to `rho-agents`, plus two pchip tests in the GUI's
+  `usage` and one new test for the screen), rho-agents 68 passed (eight
+  moved and two added for the reduction), rho-window 11 passed, clippy
+  `-D warnings` clean, `cargo fmt --check` clean.
+  One housekeeping line, since the restart truncated three of these files to
+  zero bytes mid-change: `workspace.rs`, `usage.rs` and `tests.rs` were
+  restored by reading operation `52a22986d0df`'s working-copy snapshot with
+  `jj --at-op … file show`, nothing was written to the store, and after the
+  gate passed they were re-read against that operation. They differ from it
+  by exactly the six edits deliberately re-applied on top and nothing else.
+
+- **Landed, the refusal block is measured too** (`rho-window` module touched:
+  `style`; `QA-HANDBOOK` C9 and the driving notes). `style::refusal_block` was
+  the other `height: None` in the chrome, filed in the change above and fixed
+  here with the same word: `Some(1)`, and the editor resizes it to the two or
+  three rows a jj failure actually draws.
+  What the rig said about it is worth more than the fix. The picture asked for
+  — a refused draft pushing the rows below it down — cannot exist on that
+  surface. The refusal anchors at the end of the draft body, so nothing is
+  under it; the attachment chip that shares the anchor has the lower priority
+  and takes the row above. I drove the same script twice on the desk, once on
+  a build with `height: None` restored (session 19) and once on the fix
+  (session 25) — new agent, three-line body, a workdir the daemon refuses, an
+  image pasted so the chip is there too — and the two screenshots are
+  byte-identical. So this defect is invisible until something is drawn below
+  the block: the verdict transient had rows under it and showed it at once,
+  this one would have waited for whatever is added under a refusal next. That
+  is now C9 in the handbook, with the rule that finds it — read `rho-window`
+  for `height: None` — rather than the picture that does not.
+  Three driving facts came out of taking it, and are in the handbook's
+  "Running anything": `rho wayland` has no resize for a running session, so
+  sway's own ipc socket and `output HEADLESS-1 mode 1024x600@60Hz` is the way
+  (eng-b8os, who measured the resize case with it); an image reaches the
+  clipboard with `wl-copy --type image/png` against the session's `runtime`
+  dir, and the paste is `ctrl+shift+v` because `ctrl+v` is visual block; and
+  `rho-qa build` does not build `rho-qa`, so a stale `target/profiling/rho-qa`
+  silently writes no summary into the session — sessions 23 to 25 have none
+  for that reason.
+  The rig-down line for session 25, the fixed build:
+  `969 frames, draw p99 2.6 ms, 0 over 8 ms; worst gap 278 ms, p99 8 ms;
+  53355 events, slowest stage buffer_edit p99 0.12 ms at 2 rows; 458 samples
+  on rho-gui: __memcpy_avx512_unaligned_erms 8%, __syscall_cancel_arch_end 4%,
+  compare 2%`. A refusal costs one block insert and one measured element;
+  nothing here grows with the desk.
+  Gate green on main dca5c374 (rebased onto b8os's transcript tail): rho-gui
+  250 passed and 3 ignored, rho-window 11, clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
+- **Landed, the sweep for blocks that are never measured** (`rho-window`
+  modules touched: `style`, `transient`). The rule the refusal left behind
+  — read `rho-window` for `height: None` — read once, and then made
+  something a reader does not have to remember. The sweep found nothing to
+  fix: the three blocks the chrome hands out (the attachment chips, the
+  refusal, a transient's menu) all start at `Some(1)` and are resized to
+  what the element draws, and no `BlockProperties` built anywhere in
+  `crates/` is missing a height. So the change is two tests rather than a
+  fix. Each asserts that the block a constructor returns starts with a
+  height, which is the whole of the defect: `Block::has_height` is
+  `height.is_some()`, and a block without one is painted over the rows
+  below instead of moving them down — invisible on a surface with nothing
+  under it, which is why the refusal's took a rig session and a reading to
+  find. Proven by putting `refusal_block` back to `None` and watching the
+  test fail. Gate: rho-window 13 passed, `cargo fmt --check` clean.
+- **Dealing is composition, not a crate of its own.** Each source crate
+  hands the dealer cards: the facts a card is ranked by and the reason
+  it claims attention. A Find hit shares the reason type with a card but
+  is its own type: a card claims attention, a hit answers a query. The
+  map never touches another crate's store: a verdict on an agent card
+  is a command routed by the card's source to `rho-agents`, and a filing
+  of an agent is told to `rho-agents` the same way. The dealer ranks across sources with one visible
+  rule set, Home and the lamp read it, and a verdict goes back to the
+  crate that owns the card. Every card carries its reason to the screen.
+- `rho-browser` already has this shape and stays.
+
+## What a source crate promises the window, and nothing more
+
+- Its screens (gpui entities) and the key bindings they own.
+- Its cards, with facts and a reason, and the handlers for verdicts on
+  them.
+- A fake server, and tests that run the crate alone against it.
+- Its own state on disk under the state dir, in its own file.
+
+Nothing else crosses. No crate reads another crate's state; the window
+holds no source state; `&mut Workspace` appears in no crate.
+
+### The cost rule holds in every crate, from the first line
+
+Ruling, 6 Sep. The rule of GUI-MODEL-DESIGN is not the agents crate's
+rule, it is every source crate's, and it is designed in rather than
+fixed after: per event, O(rows the event touches) plus O(log n) to place
+them; per frame, O(rows drawn); never a pass over a crate's whole mirror,
+list or set on an event, a keypress or a frame. Agents were built the
+other way and cost a 163 s start; Slack is not built that way at all.
+
+What it means when a crate is written:
+
+- The mirror is indexed for every question a screen asks (by
+  conversation, by time, by thread, by read cursor), so an answer is a
+  lookup and a bounded scan, not a walk.
+- Counts, badges, the unread rule and the ranked list are maintained on
+  the event that changes them and read when a screen draws; nothing is
+  recomputed from the mirror to draw.
+- The card rule is incremental: an event moves the cards it touches and
+  no others. A rule that needs the whole mirror to decide is the wrong
+  rule.
+- Screens draw the rows in view and fold the rest; a conversation of
+  fifty thousand messages opens as fast as one of fifty.
+- Every one of these is proven, not assumed, on the user's snapshot in
+  the rig, with the per-event and per-frame numbers in the landing note.
+  A landing note without the numbers is not a landing.
+
+## QA that is the user's world
+
+Owner: eng-8gpr, first deliverable, because the other two prove their
+work on it.
+
+- **The snapshot.** On demand, a copy of the user's live state: store,
+  agent mirror, Slack mirror, and the GUI's own files, taken while the
+  daemon runs (a proof does not need a quiesced copy). Kept under a name
+  and a date; a bug report becomes "this snapshot, this action".
+- **The rig runs on the snapshot.** The daemon on the copied store with
+  its own XDG dirs, the fakes for Slack and the browser fed from the
+  copied mirrors, the GUI headless in the isolated Wayland session, the
+  same release binaries the user runs, with the profiler on.
+- **Accumulated state, never empty.** The QA desk is persistent: it
+  starts from the user's snapshot and every QA session adds to it (agents
+  created, verdicts given, notes filed, threads read), the way the user's
+  own state accumulates. A fresh empty state is not a test of anything.
+- **Agent QA with a handbook.** A QA agent drives the GUI through the rig
+  (keys, screenshots, the journal), following a handbook of the tricky
+  cases: dealing after a restart, verdicts on Home rows, a Slack thread
+  marked read that comes back, an agent that stops appearing, creation
+  into a managed workspace, Find for an agent by what the user last said
+  to it, shift held versus tapped, the map after a reparent. The handbook
+  grows with every bug the user reports; a case is closed by a run, not
+  by a claim.
+- **Proof numbers come from here.** Per-event and per-frame costs, frame
+  gaps and main-thread samples, on the user's data.
+
+### Landed
+
+- **The prompt can act per keystroke: `ChangeHandler`** (`rho-gui`
+  `minibuffer`, `workspace`). eng-bgkw found the gap while landing Slack
+  search and reported it rather than working around it: `CandidateSource` is
+  `Fn(&Workspace, &str, &App) -> Vec<Candidate>` and runs on every edit, so a
+  prompt could offer completions per keystroke and could not *do* anything per
+  keystroke. Slack's `s` wants the list itself to narrow as the reader types —
+  which is the whole of an Emacs-style narrowing read — and could only narrow
+  on submit.
+  *What it widens.* One new type beside `SubmitHandler` and shaped like it:
+  `ChangeHandler = Rc<dyn Fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>)>`,
+  optional per prompt, called once after each edit with the input as it then
+  stands. The two callbacks stay two questions rather than merging into one
+  that does both: completion answers *what could this become* and may only
+  read, the change handler answers *what should the reader be looking at now*
+  and may act. The handler runs after that edit's candidates are recomputed
+  and the minibuffer is back in the workspace, so it sees what the reader
+  sees, including its own prompt, which it may read, replace or close.
+  *What it costs a prompt that does not want it.* One `None` check per
+  keystroke. `open_prompt` keeps its signature and all twenty-six of its
+  callers are untouched; `open_prompt_watching` is the one that takes a
+  handler. The editor subscription moves from `subscribe` to `subscribe_in`,
+  because acting needs a window; that is the only change to a shared path, and
+  `refresh_minibuffer` — which has exactly one caller, that subscription —
+  takes a window with it.
+  *Not included, on purpose.* Saving and restoring what stood before escape.
+  Only the prompt knows what "back" means for the thing it narrows, so the
+  prompt saves it on open; the primitive's job is to say *when*, once per
+  keystroke, exactly.
+  Two tests in `crates/rho-gui/src/tests/minibuffer.rs`: that a keystroke
+  reaches the handler once and with the input as it then stands — opening is
+  not an edit and a redraw is not an edit, both asserted — and that a prompt
+  without a handler is untouched, still completing on open and after each edit
+  and still receiving the typed input on submit.
+  Gate green: rho-gui 272 passed (2 new), 3 ignored, `cargo fmt --check` clean.
+
+- **The two state-directory defaults, moved to the path `main` resolves**
+  (`rho-gui` `desk_view`, `rho-workspaces`, `rho-agent` `pool`, `rho-daemon`).
+  The rule, from a breach eng-bgkw found on main: a library never resolves the
+  user's state directory; only a binary's `main` does, and everything below
+  takes the path as configuration. A rho-gui Slack test had been opening the
+  user's own `~/.local/state/rho/slack.redb` because `rho-slack`'s `Session`
+  resolved that path by default and the test named none.
+  *`desk_view::desk_device`* asked `dirs::state_dir()` and had a
+  `#[cfg(test)]` branch beside it generating a fresh id so tests would not
+  collide. The guard was the rule written twice; deleting it is the whole
+  simplification. The id is now a row in the client's database
+  (`mirror::desk::device`), which only `main` names the directory of, so a
+  test — which names none — has no database and gets a fresh id per GUI.
+  *`rho-workspaces::sandbox_base`* did the same, and one of its own tests —
+  `creates_provenance_free_git_sandbox` — was making a sandbox under the
+  user's state directory as a result. `Repo` now holds
+  `state_dir: Option<Utf8PathBuf>`, named by `Repo::with_state_dir`, and
+  `sandbox_base` errors when it is absent with a message that names the rule
+  rather than falling back to a default. The daemon resolves it once beside
+  the database it already resolves and hands it down through `AgentRegistry`
+  and `AgentPool` to every `Repo` it opens. The test names a tempdir and now
+  asserts the sandbox is made under the directory the caller gave; it failed
+  before the fix, which is what makes it a test of the rule and not of the
+  path.
+  *Not a default that errors quietly:* a repo with no state directory cannot
+  make a sandbox at all, and says so. A `None` that silently fell back would
+  put the mistake back in the user's files, which is the thing being fixed.
+  Gate green: rho-gui 273 (2 new), rho-workspaces 11, rho-window 28,
+  rho-agent 100, `cargo fmt --check` clean.
+  Also in this commit, a correction to the history note above rather than a
+  landing of its own: eng-b8os has since found the rig crash's origin and it
+  is not what that note said.
+
+- **History under the golden rule, which is TikTok** (`rho-window`
+  `history`, `rho-gui` `workspace`, rig sessions 99 and 100 on main
+  `5c10ee56`). The user's rule, in their words: up (`f21`, `SurfaceBack`)
+  moves back through history; down (`f20`, `DealOpen`) moves forward through
+  history if there is anything forward, and only when the reader is at the
+  newest entry does down deal, opening the next thing that asks for attention
+  and appending it. Dealing and history are the only next and previous.
+  *Two faults, and they are not the same fault.* The first: history was one
+  list per context, so dealing into a new agent's context started a fresh
+  list and back had nothing behind it. That was eng-en1p's ruling under the
+  Emacs rule and the user has withdrawn it — history is one list across
+  contexts again, as the old one was, so back walks into the context you came
+  from. The second, which the first was hiding: a dealt note's surface is not
+  its own view. `open_card` wraps a `SurfaceKey::DeskNode` around **the
+  dashboard's own editor** and moves the dashboard's point to the node, so
+  the whole of what distinguishes one note surface from another is where that
+  one shared point stands; `enter_warm_surface` restored the key, the title,
+  the focus and the journal record and never moved the point. Back and
+  forward changed the title bar and left the reader on the rows they were
+  already reading. On the rig the frames at each stop differed in the title
+  row alone — 1,749 pixels of 4,259,840, rows 17..45 — with the buffer
+  beneath pixel-identical. On a desk where most cards are notes that is what
+  "history is broken" looks like. Fixed by making a step do what the open
+  does: `move_to_tree_node_when_ready(host, node_id)`, addressed by node
+  rather than by position, so it is right after the tree changed underneath.
+  *What a new open does with the cursor in the middle, named.* The old
+  `append_history` at `81318e26` deduped by key, pushed at the end and set
+  the cursor to the end. It **appended and did not truncate**: what was ahead
+  of the reader stayed behind them, still reachable. The machine restores
+  that. `step_surface_forward` and `cmd_surface_forward_or_deal` existed and
+  were deleted by `0707dff59a6` on 4 September, which is when down stopped
+  meaning forward; this is a restoration, not an invention.
+  *The machine.* A list with a cursor held as a slab — entries
+  `{key, surface, prev, next, order}` in a `Vec<Option<Entry>>` with a free
+  list, `live: HashMap<Key, usize>` for the dedupe. O(1) open, O(1) up, O(1)
+  down, O(1) forget by key, nothing per frame, and no forward step lost by
+  the machine on its own. 1,001 distinct opens make 1,001 entries; 2,000
+  opens alternating between two surfaces make **three**. Down at the newest
+  entry is the only place the two halves meet: the machine reports
+  `at_newest()` and the workspace deals.
+  *The proof, session 99, first opens named, against a no-input control.*
+  Three cards dealt with `f20` — note 174 (A), note 38 (B), note 138 (C).
+  Control on C, two frames 1.5 s apart: **byte-identical**. Then `f21`,
+  `f21`, `f20`, `f20`: **up1 == B, up2 == A, dn1 == B, dn2 == C, every one
+  byte-identical**, and the journal reads back/back/forward/forward at
+  positions 2, 1, 2, 3 of 4. `f20` once more at C deals — journal `dealer`
+  verdict on 138 then `surface_shown transcript qws41uh6dpog method deal` —
+  and in session 97, the same drive on the same code, `f21` from there is C
+  **byte-identical**.
+  *The same across a context change, session 100.* Home, `enter` into agent
+  `8gpri7fqusxg`'s transcript, control byte-identical; `space shift-s o` to
+  the Slack list, `gg`, `enter` into Slack conversation `G1`; `f21` is the
+  Slack list **byte-identical**, `f21` again is the agent's transcript
+  **byte-identical**. The journal names each one and reads back to position 2
+  then 1 of 4. Back walked out of Slack and into the agent, which is the
+  withdrawn ruling's opposite and the user's rule.
+  *Which key reaches which action.* `lib.rs` binds `f21` only under
+  `"RhoGui"`, while `f20`, `f16`, `ctrl-k` and `ctrl-j` are bound under both
+  `"RhoGui"` and `"RhoGui > Editor"`. **The difference does not matter in
+  practice**, and the reason is worth writing down: bare `"RhoGui"` matches
+  only where `RhoGui` is innermost, which is the root node, so a key bound
+  there is reached by bubbling; `"RhoGui > Editor"` matches wherever an
+  `Editor` is innermost under `RhoGui`, which is every editor-hosting
+  surface, and gpui prefers the deeper match. The Editor-depth bindings exist
+  for `ctrl-k` and `ctrl-j` *because the bundled keymaps bind them there* —
+  `default-linux.json:405-406` and `vim.json:1290-1291` bind them to
+  `AgentPrevious` and `AgentNext` under `"RhoGui > Editor"` — and the
+  override must be at the same depth to win. `f20` and `f16` have no bundled
+  binding at any depth, so their Editor-depth bindings are redundant, and
+  `f21`'s absence there costs nothing: nothing between an editor and the root
+  binds or consumes it. When `AgentNext` and `AgentPrevious` are deleted the
+  Editor-depth overrides for the two chords can go with them.
+
+  | context | f21 | f20 | f16 | ctrl-k | ctrl-j |
+  | --- | --- | --- | --- | --- | --- |
+  | `RhoGui` alone | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoGui > Editor` | SurfaceBack (at the root) | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoDashboard`, `RhoNote` (the map, a dealt note) | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | `RhoTranscript` (an agent) | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoHome` | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoSlackList` | SurfaceBack ✓ | DealOpen ✓ | DealCloseAndNext | SurfaceBack | DealOpen |
+  | Slack conversation (no context of its own; an `Editor`) | SurfaceBack ✓ | DealOpen | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | messages | SurfaceBack ✓ | DealOpen | DealCloseAndNext | SurfaceBack ✓ | DealOpen |
+  | `RhoUsage` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoDraft` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoMinibuffer` | SurfaceBack (bubbles past it) | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoTerminalNormal` | SurfaceBack | DealOpen | DealCloseAndNext | SurfaceBack | DealOpen |
+  | `RhoTerminal` (raw) | **nothing** | **nothing** | **nothing** | **nothing** | **nothing** |
+
+  ✓ marks a row driven on the rig and read back from the action journal
+  (sessions 95, 97, 99, 100); the rest are read from the bindings and gpui's
+  dispatch rule. The raw-terminal row is read from `terminal_view.rs:159`
+  and `:732`: in raw mode every `f<number>` and every `ctrl-<ascii>` matches
+  `probably_produces_bytes`, so the keystroke goes to the pty and
+  `cx.stop_propagation()` is called. All five keys are swallowed alike, which
+  is the terminal doing its job — a raw terminal that stole `f21` for the
+  window could not run a program that wants it. That row is the one in the
+  table not yet driven and is worth a case.
+  *A crash seen on the rig, not this change's and not fixed here.* Twice out
+  of three runs, the deal at the end of the drive killed the GUI:
+  `editor::element: bug: line_ix 38 is out of bounds - row_infos.len(): 39,
+  line_layouts.len(): 6, crease_trailers.len(): 39`, then a panic at
+  `vendor/zed/crates/editor/src/element.rs:1118` indexing `line_layouts` for
+  the cursor row, preceded by a burst of `rope::chunk: point Point(0:49)
+  extends beyond row` into a row about 33 characters wide. Every frame after
+  it is solid black, which is why a drive must read `application.log` and not
+  only its frames. Logs kept at `rho-rigs/desk/logs/gui-20260907T101459.log`
+  and `/tmp/app-crash-session99.log`. The origin is eng-b8os's and it is
+  theirs to fix: the block map's `block_map.rs:1406` assertion,
+  `new_transforms.summary().input_rows == wrap_snapshot.max_point().row() + 1`,
+  fails 60 against 62 — the transforms are built from wrap edits whose input
+  rows come up two short of the snapshot handed over beside them, and by the
+  time that reaches the element it is the 39 rows against 6 layouts above.
+  The assertion is compiled out of a profiling build, which is why the rig
+  sees the panic and not the assert. The `rope::chunk` errors and the
+  unsigned subtraction in `WrapSnapshot::line_len` are downstream of that
+  disagreement, not its cause; an earlier version of this note had them as
+  the mechanism and was wrong. It reproduces on `98ca1835`, so the
+  reader-rows commits reverted by `733a06c6` did not introduce it, and
+  streaming alone reproduces it with no width change at all. The drive above
+  is the acceptance test for the fix, at two failures in three runs.
+  *Journeys.* J1 and J2 measured; see `USER-JOURNEYS.md`.
+  Gate green: rho-gui 271 tests (5 new, in `crates/rho-gui/src/tests/history.rs`
+  rather than appended to `tests.rs`), rho-window 28 (26 in `history`),
+  `cargo fmt --check` clean.
+
+- **The pictures for the transient at the bottom and the usage charts**
+  (rig session 93, main `d671995e`, frames in
+  `rho-rigs/sweep/frames/s93-*.png`). Owed with the two commits before this
+  one; the desk was held for the panic repro when they landed.
+  *The round trip.* On Home, with the point on a running agent's row: a
+  no-input control two frames 3 s apart is byte-identical, and `space` then
+  `escape` is byte-identical before to after, three times over. Two deep —
+  `space h`, `escape`, `escape` — is byte-identical too, against its own
+  control taken the same way. So the menu leaves nothing behind, and the
+  desk was still enough for that to mean something.
+  *What the open changes.* Against the frame before it, opening the `hosts`
+  menu differs in exactly two bands: rows 1446–1663, which is the menu, and
+  rows 350–391, which is the point's cursor block ceasing to be drawn while
+  the transient holds the keyboard. Every Home row is unmoved to the pixel.
+  That is the ruling's invariant in a measurement: the buffer above is
+  untouched. The row highlight stays, so the reader can still see where they
+  are; the cursor itself does not, which is what focus moving means here and
+  was as true of the block as it is of the bottom.
+  *The picture.* `s93-menu-hosts.png` is the one the ruling asked for: five
+  rows of `hosts` against the bottom edge, the Home buffer above exactly
+  where it was, the point's row visible mid-buffer with a screenful of empty
+  space between the two. `s93-open-1.png` is the root menu, 25 rows, which
+  reaches further up but still sits on the bottom edge. Neither is clipped:
+  the last row's ink ends 15 px above the window's bottom.
+  *The charts.* All four — rate limit, model cost, usage share, agent cost —
+  read by eye and by count. Not one pixel in any of the four is darker than
+  the background: axis labels, end labels, legend and the p50/p90/p99 labels
+  are all light on dark and all in the buffer's face. The header is buffer
+  text and always was.
+
+- **The usage screen's words get a colour and a font.** Two user reports:
+  text drawing black on the dark background, and fonts wrong in several
+  places. One cause under both. The charts are a block under the header, and
+  a `div` inside a block is not inside the editor's text: it inherits gpui's
+  defaults, which are black and not the buffer's face. The header — the
+  title and the totals — was never affected, because it is buffer text on
+  purpose; everything inside the block was.
+  Drawing black: the axis value labels (`100%`/`50%`/`0%`, `full`/`½`/`0%`,
+  and the agent-cost ticks) and the two end labels under every chart
+  (`−{days}d` and `now`). The legend entries and the `p50`/`p90`/`p99`
+  labels set their own series colour and were never black — which is why
+  only some of the text looked wrong.
+  In the wrong face: all of those, the coloured ones included.
+  The fix is one place rather than five. `render_chart` now takes the
+  editor's text style and wraps every chart in a root that sets the family,
+  the weight, the size and the colour, so the labels inherit them and a
+  child that wants its own colour still overrides its parent. That is what
+  makes it true of the next label somebody adds, not just of these. The axis
+  keeps its explicitly smaller size — an axis is read past, not read — and
+  now wears it in the buffer's face.
+  The transient had the same defect from the same cause and loses it in the
+  commit before this one: its rows had no colour of their own, and at the
+  bottom of the window it inherits the strip's, which is the editor's.
+
+- **The transient goes back to the bottom of the window.** The user's ruling,
+  and it overturns eng-en1p's earlier one: the menu was drawn as a block in
+  the buffer under the point, and Magit's transient sits at the bottom of the
+  frame with the point where it was. What the earlier specification got wrong
+  is that it made the menu something that happens to the reader's text —
+  opening one reflowed the surface, and near the bottom of the viewport it
+  drew off the edge of the screen with nothing scrolling it into view (the
+  defect that started this, first on the sweep's list).
+  Only the drawing changed. `Transient<A>`, the items, the keys, the count,
+  the back stack and the phone sheet are exactly as they were.
+  `Menu::block` is gone and `Menu::render` takes its place: an element in the
+  editor's text style, with no opinion about where it goes. The desk pins it
+  to the bottom edge — `absolute().bottom_0()` over the window, not another
+  row in the column — so nothing above it reflows, and it wears the same
+  chrome as the minibuffer (`bottom_strip`) because it is the same piece of
+  furniture in the same place. If the ruling meant no shared chrome either,
+  that is a one-line change.
+  `MenuBuffer` no longer carries a block id, a weak editor or an anchor: it
+  is the menu, the count and the way back, and it now says nothing at all
+  about where the menu is drawn. `show_menu` cannot fail, so it returns
+  nothing; `reinsert_menu_block` and `remove_menu_block` are gone (a count
+  is a redraw, a close is a `None`).
+  The test that read the block's height back is gone with the block.
+  `the_root_menu_opens_at_the_bottom_and_escape_retraces_it` now measures the
+  surface's drawn rows before, during and after: opening the menu adds no row
+  to the buffer, which is the invariant the ruling is about, and the point is
+  unmoved at every step as before.
+
+- **The snapshot and the rig** (`crates/rho-qa`). `rho-qa snapshot` copies the
+  live state while the daemon runs and verifies the copy by opening it and
+  counting rows; the live directory is read from and never written, never
+  opened by a database. The first snapshot, `user-2026-09-06`, is 42.8 GiB and
+  holds 2,582,646 rows across 38 tables of store, plus the agent mirror, the
+  action journal, the inbox and the Slack mirror. What is not copied is an
+  allow list with reasons: no `auth.d` or iroh key, because a rig daemon is its
+  own node and runs without `--iroh`; no logs; no `sandboxes`, which is dead
+  bubblewrap scaffolding the user does not use.
+  `rho-qa rig new` clones a snapshot into a runnable rig — a reflink clone on
+  bcachefs, so 42.8 GiB costs 16s and no disk, and the base snapshot stays
+  pristine. `rho-qa rig up` stands the rig up: the daemon on the copied store
+  under the rig's own XDG dirs, the fake Slack with its API base read back from
+  its log, the fake browser as the client's Brave, and `rho-gui` headless in
+  the `rho wayland` session with the CPU profiler on, from `target/profiling`
+  by default or the nix binaries the user runs with `--binaries nix`.
+  The desk accumulates: `rig new` refuses to overwrite a rig, nothing resets
+  one, and every `rig up` appends a session line to its `rig.json`.
+  `rho-qa build` builds the five binaries a rig runs in one command, with the
+  shell's own rustflags; `RHO_QA_LD` replaces the linker when a dev shell pins
+  one that cannot link an optimised binary.
+  Proven end to end on the desk: daemon, fake Slack, headless GUI and profiler
+  up on the 42.8 GiB copy, Home drawing the user's real agents and desk cells
+  with the fake's Slack cards beside them, and a CPU profile and frame log
+  written on the way down.
+
+- **The fake Slack fed from a real mirror.** `rho-qa fake-slack --mirror` reads
+  a copy of a `slack.redb` and hands the fake what it holds — roster,
+  conversations with their kinds, each history, the threads under it, Slack's
+  own read cursor — using the same `add_*` calls the fixture uses, so `fake.rs`
+  is untouched. `rig up` feeds the fake from the rig's own mirror whenever it
+  has one and falls back to the fixture with a line in the log. The user's own
+  id is remapped onto the fake's `ME`, so "me" stays "me"; the mirror is copied
+  before it is opened, because the rig's GUI holds that same file. `rho-slack`
+  gains one additive accessor, `Mirror::workspaces`.
+  What this turned up: the snapshot's Slack mirror holds only the fixture
+  workspace — 5 conversations, 211 messages, the fake's own `acme` — so the
+  flood the QA premise names is not in the mirror on disk. The loader is right
+  and the data is not there yet; a snapshot taken after a real Slack session
+  will carry it.
+  Also fixed here: `rig up` started its daemon before the last one had let go
+  of the store, so the new daemon died with `DatabaseAlreadyOpen` after its
+  socket was already on disk and the GUI sat on "reconnecting". It now waits
+  for the old process to exit, kills it if it will not, and checks the new one
+  is alive rather than trusting the socket.
+
+- **The handbook** (`QA-HANDBOOK.md`). Every case in the bullet above, written
+  so an agent runs it without asking what was meant: why it is tricky, the
+  exact keys and commands, what passes, what fails, and a "Closed by" line that
+  is empty until a run fills it in. Three sections beyond the cases. The rig's
+  own preconditions, because a rig that lies to you invalidates everything that
+  ran after it — the daemon alive and not just its socket, the GUI holding a
+  Slack session, and the mirror being the user's rather than QA's. The
+  Emacs-feel checks, run over whatever case is already running: the point
+  survives back, the same key means the same thing in every buffer, nothing
+  needs the mouse, no modal appears, a transient takes one key and closes. And
+  the scale proofs: which snapshot (`user-2026-09-06`, 42.8 GiB, 2,583,116 rows
+  across 55 tables), which numbers (`draw_ms` and `dirty_to_draw_ms` p99 from
+  the frame log, `duration_ms` against `input_rows` per stage from the editor
+  log — that pair is the per-event O(touched) evidence), and what fails: 8 ms
+  p99 draw, 50 ms p99 dirty-to-draw, any stage whose time grows with the
+  snapshot while its `input_rows` does not, any main-thread sample in ingest,
+  dealing or the store.
+  Two limits are recorded in the handbook rather than left to be rediscovered:
+  the snapshot is daemon-side only, because the user's GUI runs on their own
+  device, so no Slack case runs at flood scale yet (answered since by
+  `--gui-state`, below); and `rig up` still starts
+  the GUI when the fake did not register as the workspace, which looks exactly
+  like a dealing bug. Both have a case with an open "Closed by".
+  Also learned while writing it: the CPU profile is symbolized where it is
+  written — the frames in `.0.bin.gz` carry Rust names, not addresses — so the
+  worst-frame-gap summary line on `rig down` needs the trace decoder only, not
+  the binary the profile came from.
+
+- **The summary line on rig down** (`crates/rho-qa/src/profile.rs`, and the
+  session entry in `rig.rs`). Every landing note from here needs numbers off a
+  run, and getting them meant standing a viewer up over a directory of
+  sidecars. `rig down` now stops the GUI, waits for what it writes on the way
+  out, reads all three files and prints one line: frames drawn, `draw_ms` p99,
+  how many went over the 8 ms budget, the worst dirty-to-draw gap and its p99,
+  the editor stage with the worst p99 with the rows it had in hand — the pair
+  that is the per-event side of the cost rule — and where the GUI thread's
+  samples landed, three symbols with their share. The same line is written into
+  the rig's session entry in `rig.json`, so a note quotes the run instead of
+  re-deriving it, and `rho-qa profile <name>.bin` prints it again for any
+  session, including the ones already on disk. `rig status` shows the last.
+  The CPU profile needs no binary and no `addr2line`: Dial9 symbolizes each
+  segment against its own `/proc/self/maps` before compressing it, so the names
+  are in the file. A sample is attributed to its leaf frame, and the thread is
+  the GUI's own (`rho-gui`) rather than the profiler's flush and worker
+  threads, which are always in the file and never the answer.
+  A session with no profile says nothing rather than summarizing nothing.
+  Proven on the desk, session 5, driving Home with the keys and nothing else:
+  `81 frames, draw p99 3.6 ms, 0 over 8 ms; worst gap 11 ms, p99 11 ms; 11471
+  events, slowest stage buffer_edit p99 0.04 ms at 2 rows; 90 samples on
+  rho-gui: __memcpy_avx512_unaligned_erms 13%, parse.constprop.0 3%, runtime
+  3%`. That is the user's own 42.8 GiB desk with the fake's Slack rows beside
+  the real agents, and the cost rule holds on it: the worst editor stage is
+  40 µs against the two rows it touched, and no frame came near the budget.
+  Reading a profile is O(events in it) once per `rig down`, off the GUI's own
+  path entirely — the rig reads what the run already wrote.
+
+- **A snapshot of two devices** (`rho-qa snapshot --gui-state <dir>`, with
+  `paths`, `rig new` and the handbook). The limit the handbook recorded — the
+  snapshot is daemon-side only, because the GUI runs on the user's own device
+  — is now a flag. `--gui-state` names a client's state directory and copies
+  its half beside the daemon's, into `gui-state/rho/` in the snapshot, with
+  its own manifest entries (`gui_source`, `gui_files`, `gui_databases`) and
+  its own verification: every copied database is opened and its rows counted,
+  and a torn file is copied once more before the snapshot is called failed.
+  It is a second allow list with reasons, not a second deny list. What it
+  takes is what a screen reads: the agent mirror, the inbox, the action
+  journal so undo survives a restart, the desk device because a rig that lies
+  about which device it is deals the wrong hand, the client's own store, and
+  the Slack mirror. The mirror is on this list because it is the client's
+  file: `rho-slack`'s session writes every arriving message into it under the
+  client's state directory and the daemon never touches it, so the real flood
+  is on whichever device ran the GUI and the copy beside a daemon is whatever
+  that box happens to hold — on this one, QA's own `acme` fixture. It stays on
+  the daemon list as the fallback for a snapshot taken without `--gui-state`,
+  and the overlay in `rig new` is what makes the client's copy win.
+  What it refuses is what it refused before: no `auth.d`, no `iroh-secret.key`,
+  no `sessions` — a rig is never the user, on any device — and no `rho.redb`,
+  the daemon's store, which a client never has. Two tests hold both rules to
+  the lists themselves rather than to a comment.
+  `rig new` lays the GUI half over the daemon's state after the clone, because
+  a rig runs one state directory and the GUI reads its files from the same
+  place the daemon does; it says which files came from the other device.
+  Proven end to end on copies, never on live state: a snapshot of a fabricated
+  two-device pair copied and read back 1,197,254 agent-mirror rows on both
+  halves, copied neither of the two credentials planted as decoys in the GUI
+  source (an `auth.d/token` and an `iroh-secret.key`), listed as
+  `1198457 rows + gui 1198141 rows from …`, and a rig cloned from it came up
+  with the six GUI files overlaid — including a Slack mirror that differed on
+  the two sides, where the rig's copy is byte for byte the client's and not
+  the daemon-side one.
+  Also here, and the reason it is here: `rho-qa build` now builds `rho-qa`
+  itself alongside the rig's binaries. A stale copy in `target/profiling`
+  wrote no summary line into desk sessions 23 to 25 and looked like a rig
+  fault; the tool that reads a run can no longer be older than the run.
+  Gate green: rho-qa 4 tests (2 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
+- **The rig's GUI has a Slack session, and a rig that is up says who holds
+  it** (`crates/rho-qa`, `rig.rs`). No rig's GUI has ever had a Slack
+  session. `rig up` wrote `credentials.json` for a workspace it named
+  itself, `rig`, while the fake comes up as `acme`, and the credential
+  store is keyed by workspace name — so the lookup missed and the client
+  ran sessionless on every rig that has existed. Nothing said so: the fake
+  was listening, the daemon was up, the GUI dealt, and Slack rows simply
+  stayed Open forever, which reads as a dealing bug. `rig up` now reads
+  the workspace out of what the fake printed and writes credentials for
+  that name, and refuses to start the GUI at all when the fake never
+  reports one, saying that a sessionless client shows every row as Open
+  and no rule can close them. Proven on desk sessions 26 and 27: `slack
+  fake on … as workspace `acme``, credentials keyed by `acme`, and a
+  `#design` row taking a `done` verdict — leaving `next` and being
+  replaced by the next row of the flood, which no rig could do before.
+  This closes handbook R2.
+  The other half: `rig up` refuses when the rig is already up and names
+  the session, whoever started it (`RHO_MCP_AGENT_ID`, falling back to
+  `RHO_AGENT_ID` then `USER`) and the daemon pid that holds it, with
+  `--take` to stop what is running and take it. The lock is the live
+  daemon pid recorded in the last `rig.json` session, not a poll. Two of
+  us drove the same desk twice in one evening, seconds apart, in both
+  directions; an overlapped run's numbers are noise and the screenshots
+  do not show it.
+  Gate green: rho-qa 6 tests (2 new), clippy `-D warnings` clean,
+  `cargo fmt --check` clean.
+- **`gg` gives the reader the top, not the transcript** (`crates/rho-agents`,
+  `transcript/mod.rs`, `transcript/gap.rs`, `agent_view.rs`). Going to the
+  top used to compose every block between the tail and the first one before
+  the point could land: the whole history wrapped, folded and blocked to
+  show one screen. Composition now serves the end the reader asked for. The
+  transcript keeps a head and a tail with a gap between them — `blocks[..head]`
+  composed for a reader at the top, `blocks[uncomposed..]` the tail it opened
+  on — and both edges splice into the same records and buffers, which the
+  multibuffer already allowed because its excerpts are keyed by start block
+  and so stay ordered whatever order they arrive in.
+  The fill is reading-aware, like the wrap: it closes from the head downward,
+  because that is where reading goes, and a reader who reaches the gap is
+  served their own edge instead of the head's.
+  The step is sized to the frame budget, and the unit that matters is not the
+  one the code counts: `HISTORY_CHUNK_ROWS` is buffer rows, but a step costs
+  display rows, and on the desk snapshot at 1280 logical columns a transcript
+  buffer row is about 3.4 display rows once wrapped. 400 buffer rows was a
+  step of some 1,400 wrapped rows; 40 is a median step of 171 rows and 3.1 ms.
+  Desk sessions 71–73 against 79–81, `gg` on the longest transcript on the
+  snapshot (eng-2cjj's, 235k tokens), three runs a side, first open of a
+  fresh process, 2560x1664 scale 2:
+  before, the reader waits 5.7 s for 85 steps of 486 rows, step p50 10.3 ms,
+  draw p99 15.5 ms with 36 frames over 8 ms of 458;
+  after, the first step is 2.8 ms and it *is* the top — the point lands on
+  block 0 there — and the gap closes 9.6 to 10.3 s later over 143 to 162
+  steps, step p50 3.1 ms, draw p99 7.9, 8.0 and 8.8 ms with 7, 7 and 13
+  frames over 8 ms of about 730.
+  Two of the three runs are inside the budget and the third is not, and what
+  is left over is one thing: a single history block larger than the whole
+  step, up to 2,300 rows and 34 ms, which the composition cannot divide
+  because a block is its unit. That is what cut B removes by eliding before
+  the wrap sees the rows, and it is the reason this note does not claim the
+  budget is met.
+  The inlay map's share of the fill fell from 1,054–1,114 ms to 242–313 ms,
+  not because that defect is fixed — it is on rho-window's owed list, 3.2 to
+  13.3 µs a row as the buffer grows — but because it is no longer handed a
+  history to walk.
+  The gap says so in the buffer: one block, `height: Some(1)`, above the
+  tail's first block, "N blocks still composing", gone when the gap closes.
+  It sits above a block that does not move while the head grows towards it,
+  so a fill step that serves a reader at the top rewrites nothing, and the
+  count is read at paint time so a closing gap counts down without touching
+  the buffer. Nothing blocks scrolling.
+  Proven three ways, because they are three claims: a test asserts the block
+  is inserted in the gap and removed when it closes; a screenshot shows it
+  drawn, one row, "2444 blocks still composing"; and the drawn shot needed a
+  rig-only build with the step slowed to 300 ms to catch it at all, because
+  on the real build the gap is gone in ten seconds — which is also why the
+  mid-fill shot of a normal run shows the top of the transcript and no
+  marker.
+  The failing-without test is rows laid out, not blocks composed: `escape g g`
+  on a 200-turn history, summing the wrap map's sync traces at the moment the
+  point lands. 961 rows before, 144 after.
+  Main-side runs were on 79142ea6 and the change is on 8ac59765; the
+  difference between them is the usage axis label and two handbook entries,
+  nothing the editor or the transcript touches.
+  Gate green: rho-gui 260 tests (1 new), rho-agents 68, `cargo fmt --check`
+  clean.
+
+## Landed: the inlay map seeks instead of walking
+
+Found in three telemetry reports the user sent from their own machine, and
+found only because the CPU profile inside them had never been read: **45%,
+48% and 56% of all main-thread samples were inside one function**,
+`InlaySnapshot::output_span_for_buffer_offset`. The caller attribution was
+unanimous — of the 273, 754 and 1,202 samples in it, **100% arrived through
+`refresh_dashboard` → `sync_tree` → `Editor::splice_inlays` →
+`InlayMap::splice`**, under `handle_model_events`. So the GUI spent over half
+its main thread in that function whenever an agent was streaming.
+
+The mechanism is one line of shape. `transforms` is a `SumTree`, and every
+other method in `inlay_map.rs` reaches into it with a cursor; this one alone
+ran `for transform in self.transforms.iter()` over the whole tree.
+`InlayMap::splice` then calls it **twice for every affected offset**
+(inlay_map.rs, the `old:`/`new:` pair), so a splice cost the offsets times
+the transforms — and both grow with the document. The dashboard's `sync_tree`
+re-splices the prefix set of the whole agent tree on a model event, so the
+offsets are the rows: N against N, quadratic, per streamed event.
+
+The change is a seek. The transforms are ordered by input offset, so the ones
+touching a target are contiguous: seek to the first, walk forward while the
+input start is still at or before it. The body of each arm is untouched. One
+subtlety earns its comment in the code: a `Bias::Left` seek can land past
+transforms that still touch the target, because an inlay sitting *on* the
+target has no input width at all and so is never sought to — the cursor steps
+back over that run first, which is bounded by the inlays on one offset.
+
+**Whether it is ours.** The function handles `Transform::Concealed`, which is
+rho's own layer — the module doc describes the `source -> concealment ->
+inlay` flattening as this fork's design — and a concealed range maps a
+non-zero input span to zero output, which is exactly why a *span* is needed
+here where a point would do upstream. The evidence says the walk is ours,
+added with concealment. I could not reach upstream zed from the rig to
+confirm it, and say so rather than implying I checked.
+
+**What it widens:** nothing. Same answer, proven differentially — the walk was
+kept as a debug-only reference and cross-checked on every call across the
+whole `rho-gui` suite: **274 tests green with the assert live**. That the
+suite reaches the function at all was established by a negative control: a
+deliberately wrong reference failed **148 tests**, so the green run is a
+proof and not an absence of coverage.
+
+**Numbers**, per batch splice on the desk host, at the batch shape the
+dashboard actually uses (offsets scaling with the tree):
+
+| transforms | walk    | seek    |
+|------------|---------|---------|
+| 500        | 0.089 s | 0.041 s |
+| 4 000      | 3.683 s | 0.413 s |
+
+**8.9× faster at 4,000**, and the growth for 8× the transforms and 8× the
+batch falls from **41.4× to 10.0×** — from quadratic to the batch's own
+linear cost. A single-inlay splice shows none of this, because the rest of
+`splice` swamps two lookups; the test measures the batch for that reason and
+says so.
+
+The test is `crates/rho-gui/src/tests/inlay_cost.rs`, and it asserts the
+shape rather than a duration: a threshold of 20× sits far above the honest
+linear cost of a bigger batch and far below anything a walk can reach.
+
+Two things this does *not* fix, both still on the board. `splice` keeps other
+linear terms — `inlays.retain` over every inlay, the `Vec::insert`, and
+`sync` rebuilding the transforms — which is why 10× and not 1×; the real
+repair for the dashboard is to stop splicing the whole prefix set on every
+event, which is the next commit. And the transcript's own prepaint, p50
+5.1 ms, is still unexplained: the profile cannot see it because this function
+swamped it, and no frame in the report records how many rows it drew.
+
+
+- **The fake model is now a provider, not a mocked agent loop**
+  (`rho-fake-model`, `rho-inference`, `rho-daemon`, and the
+  `rho-qa fake-model-proof` harness). The fake speaks the same Responses
+  WebSocket/HTTP and Anthropic Messages SSE protocols as production clients.
+  Its seeded personas stream reasoning, text, compaction and function/custom
+  tool calls, including large code-mode programs and shell results; terminal
+  faults and pacing are typed configuration. The output-size generator is a
+  chosen synthetic heavy tail, not an inferred corpus histogram: the source
+  survey established a roughly 227-byte median, mean/median near 18 and
+  p90/max landmarks, but no distribution between them. Parallel calls are an
+  explicit stress setting and default to one because the one-user survey's
+  1.01 results per Sent chiefly says batching was rare.
+  The proof creates no fake runtime path. It starts the fake binary and the
+  real daemon with an isolated synthetic credential, creates 20 native agents
+  through the real UI protocol, lets their real code-mode exec tools run in a
+  temporary jj workspace for one minute, follows the daemon journal, reads
+  every reply body back through `Detail`, and compares the follower's final
+  head with a fresh daemon reader. Global journal sequence and every per-agent
+  story position were dense through head 9,895; the client observed 1,975
+  completed agent replies. The whole process ran in a fresh network namespace
+  whose procfs network view contained only loopback, with no other TCP server,
+  so no live model or other outbound connection was possible.
+  On the required 60-second, 20-agent run the server completed 3,950 requests,
+  sustained **65.83 turns/s**, and streamed **14,807,204 bytes**.
+  End-to-end `Sent`-to-`Replied` request latency was **53 ms p50** and
+  **132 ms p99**. At 20 active agents the fake's RSS was **42,476 KiB** and
+  the daemon's was **194,100 KiB**. A 10-second preflight independently
+  completed 700 requests at 70.00 turns/s, streamed 2,520,506 bytes, measured
+  46/157 ms p50/p99, and ended at journal head 1,770.
+  Gate green: rho-fake-model 2 tests, rho-qa proof helpers 2 tests, clippy
+  `-D warnings` for both crates, and `cargo fmt --check` clean.
+
+- **The linker, not the size** (`.cargo/config.toml`, `flake.nix`). The
+  `rho-gui` lib test binary built by `cargo test --workspace` did not start:
+  no test line, no Rust frame, the failure inside `ld.so` before `main`.
+  `cargo test -p rho-gui --lib` was fine. It read as a size ceiling — main's
+  binary at 1.148 GB started, one added empty test at 1.149 GB did not — and
+  it is not one. It is the linker.
+  *What is actually wrong with the file.* In the binary that does not start,
+  the `PT_DYNAMIC` program header's `p_offset` is sixteen bytes short of
+  where `.dynamic`'s bytes are: header `0x1539d3e0`, section `0x1539d3f0`,
+  the same `p_vaddr` and `sh_addr`. The loader reads the dynamic array at
+  the header's offset, finds sixteen zero bytes — a `DT_NULL` — stops there,
+  and every entry of its `l_info` table stays empty; the first thing glibc
+  does after that is look up the string table through that empty table,
+  which is the fault at startup. The auxiliary vector is right (`AT_PHDR` is
+  the load address plus `0x40`, `AT_PHNUM` 14, `AT_PHENT` 56), so nothing
+  but the file is wrong.
+  *Where the drift starts, and the one line that checks it.* Inside the RW
+  `LOAD` segment the sections' offsets track the segment's by `0x2000` up to
+  and including `.tdata`, and then drift: `.init_array` by `0x1ff8`,
+  `.data.rel.ro` and `.dynamic` by `0x1ff0`. What sits between them is
+  `.tbss`, which is `NOBITS` — it takes address space and no file bytes, and
+  the layout stops accounting for it consistently. So the check on any
+  future toolchain is one line:
+  `readelf -lW BIN | awk '$1=="DYNAMIC"{print $2}'` against
+  `readelf -SW BIN | awk '$2==".dynamic"{print $5}'` — those two must be the
+  same number.
+  *Which linker.* Not rustc's default: `flake.nix`'s `shellHook` exports
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` naming wild by store
+  path, and a target-specific `RUSTFLAGS` environment variable shadows both
+  `build.rustflags` and `[target.…]` in `.cargo/config.toml` outright. The
+  linker was wild 0.10.0.
+  *The three linkers, same rustc command, same inputs, on the 1,149,986,234
+  byte reproducer.*
+
+  | linker | link | binary | `PT_DYNAMIC` vs `.dynamic` | starts |
+  | --- | --- | --- | --- | --- |
+  | wild 0.10.0 | 5.7–5.9 s | 1,149,973,138 B | `0x1539d3e0` vs `0x1539d3f0` | no |
+  | mold 2.41 | 5.9–9.8 s | 1,530,686,496 B | `0x15c05f00` vs `0x15c05f00` | yes, 278 tests |
+  | GNU ld.bfd 2.46 | 71.7 s | 2,986,342,400 B | `0x15208510` vs `0x15208510` | yes, 278 tests |
+
+  bfd is correct and it is twelve times the link, and this bfd is not built
+  with zstd, so `--compress-debug-sections=zstd` has to come off and the
+  binary is twice mold's. mold is correct and not materially slower than
+  what we had, so mold it is. It is not free: mold's compressed output is
+  about a third larger than wild's, 1.52 GB against 1.15 GB for the same
+  unit, which the build cache pays for.
+  *Where the change is.* Both places, because either one alone is a
+  half-fix: `flake.nix` names mold by store path in the same exported
+  variable (nixpkgs' `mold` is the wrapped one, so the `-rpath` flags nix
+  adds survive and binaries still find `libstdc++`), and `.cargo/config.toml`
+  gains a `[target.x86_64-unknown-linux-gnu]` section with
+  `-Clink-arg=-fuse-ld=mold` for builds outside the dev shell — a target
+  section replaces `build.rustflags` rather than adding to it, so the
+  `tokio_unstable` and frame-pointer flags are repeated in it. **Everyone
+  has to re-enter the dev shell** (`direnv reload`, or leave and re-enter
+  `nix develop`); until they do, their shell still exports wild.
+  *What the user runs is not affected.* The flake's package build sets its
+  own `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` (`--cfg
+  tokio_unstable -Cforce-frame-pointers=yes`) with no linker in it, so
+  `nix build .#rho` links with GNU bfd, as it always did. The installed
+  `rho` is 268 MB with `PT_DYNAMIC` and `.dynamic` both at `0xc40cfa8`:
+  correct, and nowhere near the size where the fault appears.
+  *Proof both ways.* The reproducer was made deliberately by adding one
+  empty test to `rho-gui`'s Slack tests: at 1,149,939,026 and 1,149,964,426
+  bytes the binary starts, at 1,149,986,234 it does not. eng-8gpr saw the
+  same thing from the other side: the workspace-unified build (`45e03a78…`,
+  1.15 GB) failed to start three times of three, run through cargo and run
+  directly, while the per-package build (`7de270bd…`) passed 276. After the
+  change, the workspace form is what it should be: `cargo test --workspace`
+  builds the `rho-gui` lib test binary at 1,523,220,536 bytes, `PT_DYNAMIC`
+  and `.dynamic` agree at `0x15c4c360`, and it lists and runs its tests.
+  *Housekeeping.* This is also why the reactions note above says the crate
+  is at a ceiling; that sentence now points here.
+  Gate green the ordinary way, no environment variable in front of it:
+  `cargo test --workspace` 1 679 tests, 0 failed, and the binary it ran
+  `rho-gui`'s 278 in is the 1.52 GB one above; clippy `-D warnings` clean
+  and `cargo fmt --check` clean. Clippy needed three `.into()` calls
+  removed in `crates/rho-gui/src/tests/scene_fuzz.rs`
+  (`useless_conversion` on `AnyWindowHandle`, already on main and unrelated
+  to this change); they are in this commit because the gate does not pass
+  without them.
+
+- **`rho-fake-slack`, first landing: the store, the seed and the read side**
+  (new crate). The fake was a type inside `rho-slack` — the client library
+  carrying the server it is tested against. This is the first of three
+  landings that make it a server: the typed store, the world one number
+  builds, every read-side method rho calls, and one client's first full sync
+  measured against it. The socket and the living schedule come next, then
+  several clients at once with the server checking that what they see agrees.
+  The design is in SLACK-DESIGN.md, "The fake is a server, not a test double".
+  *Typed, and derived.* Conversations, users, messages, threads, reactions and
+  read cursors are types, and the wire shapes are made from them at the edge,
+  so Slack's oddities — three booleans for one kind, `ts` as a string with six
+  decimals, `dm_count` rather than `unread_count`, a `next_cursor` that is
+  empty rather than absent — live in one file. Unread counts are derived from
+  the cursors rather than stored beside them: a server that keeps both can say
+  four while its own history shows three, and a client written against that is
+  being taught something Slack does not do.
+  *The cost rule, on the server.* A conversation is one sorted vector, so a
+  window of history is two binary searches and a slice. The counts a client
+  asks for on every poll are an index subtraction against a prefix sum of
+  mentions built as each conversation arrives — never a walk of the messages
+  behind the cursor. The activity feed is the tail of a mention index, so it
+  is a slice rather than a search of the workspace.
+  *The numbers, at the default 300 conversations and 450,000 messages*
+  (`cargo run --release --example full_sync`):
+
+  | | |
+  | --- | --- |
+  | seed the world | 194 ms |
+  | resident, world in hand | 179 MiB |
+  | a client's first full sync | 136–148 ms, 306 requests, 15,000 messages |
+  | of which the list | 5–6 ms for 300 conversations |
+  | history, one client | 1,894 requests/s |
+  | history, eight clients | 23,235 requests/s |
+
+  The full sync is a real `rho-slack` client from cold, not a script pretending
+  to be one: the list, the badge counts, the mutes, the custom emoji, the
+  followed threads, and then the first page of every conversation, which is
+  what fills the rows. 136 ms is the number a reader feels between starting rho
+  and seeing their list, against a workspace the size of the user's own.
+  *The message count is a budget.* 450,000 means 450,000 messages in the world,
+  replies included — a thread of four comes out of its conversation's share
+  rather than on top of it — because a seed whose count means "top-level only"
+  quietly builds a bigger world than it says.
+  *Where the generator goes.* The world is behind one call, so eng-8gpr's
+  generator replaces it as a library call without anything else in the crate
+  moving; until it hands back typed conversations and messages rather than
+  seeding a `Fake` directly, this crate builds its own from the same kind of
+  seed (splitmix64, deterministic from the number alone). Stated because it is
+  a difference from the design: today one seed means one world *here*, and the
+  point of a single generator is that it means one world everywhere.
+  Gate green: rho-fake-slack 7 tests and 1 doc test, clippy `-D warnings`
+  clean, `cargo fmt --check` clean, workspace suite green.
+
+## Landed: one agent's news no longer composes the map
+
+The inlay-map seek made each splice cheaper. It did not stop the dashboard
+splicing itself whole, which is what the splices were *for*, and that is this
+change.
+
+An agent that is streaming says so constantly: every turn, every tool, every
+title the model generates arrives as a `Changed` naming that agent and no
+other. The desk's own delta path has answered such an event correctly for a
+while — `redraw_tree_rows` draws the rows the delta named and leaves the rest
+of the map standing. The model-event path did not share it. `ModelMsg::Changed`
+went to `schedule_desk_sync`, which on the next frame called `sync_tree_rows`,
+which called `refresh_dashboard`, which called `Dashboard::sync`, which called
+`sync_tree` — the full composition. That takes every inlay off the tree
+(`splice_inlays(&old, Vec::new())`), replaces every row buffer, re-anchors
+every excerpt, rebuilds every fold and re-highlights every row, for one
+agent's title.
+
+That is the path the user's telemetry named. Of the samples inside
+`output_span_for_buffer_offset` — 45%, 48% and 56% of the whole main thread in
+the three reports — **100%** arrived through `refresh_dashboard` → `sync_tree`
+→ `splice_inlays` → `InlayMap::splice`.
+
+The change is that a model event may take the delta path too. `set_tree_source`
+now answers whether the map's *shape* survived: the same rows, in the same
+order, under the same parents, each drawn from the same buffer. A shape that
+held is the licence to patch — the excerpts, their order and their folds are
+all still what the editor has, so the only things that can have moved are the
+marker in front of a row, the hint at the end of it, and the words of a machine
+row, which is exactly what `redraw_tree_rows` draws. If the shape moved, or if
+the rows the event names were never drawn, it composes as before.
+
+### The numbers
+
+Per event, 32 successive renames of one agent on a map of filed agents, mean.
+A debug build, so the milliseconds are the machine's and only the shape is
+ours:
+
+| agents | before | after | compositions | rows drawn again |
+| --- | --- | --- | --- | --- |
+| 16 | 21.6 ms | 14.1 ms | 32 → 0 | 0 → 32 |
+| 128 | 116.2 ms | 58.1 ms | 32 → 0 | 0 → 32 |
+
+Thirty-two events draw thirty-two rows again: one row per event, whatever the
+map's size. That is the part that is now O(touched), and it is the part that
+was doing the splicing.
+
+### What this does not fix, stated plainly
+
+It is not yet O(agents touched) + O(log n) end to end. Eight times the agents
+still costs 4.1× the time per event, down from 5.4× but not flat, and the
+residual is upstream of the dashboard: `sync_tree_rows` calls
+`refresh_desk_sources`, `desk_cells.rebuild_map`, `reconcile_buffers` and
+`tree_source`, and each walks the host's nodes before the dashboard is reached
+at all. `set_tree_source`'s own shape comparison is another walk, though a
+cheap one over ids and entity handles that touches no editor — it is paid for
+by a `nodes` vector the sources rebuild every time regardless.
+
+So the composition is gone and the walk is not. Making the desk source
+incremental is the next cut, and it is a change to `desk_view`, not to the
+dashboard.
+
+### The test, and why it can be believed
+
+`crates/rho-gui/src/tests/dashboard_cost.rs` asserts shapes rather than
+milliseconds: compositions must be zero and rows drawn again must be one per
+event.
+
+The first assertion is that a row *was* drawn again, and it is there because
+the test was wrong first. Written as a loop over several sizes it passed on the
+unfixed code, because `schedule_desk_sync` defers to `on_next_frame` and
+`run_until_parked` never draws one — the event reached nothing and every other
+assertion held trivially. Then, with the frame added, only the first size in
+the loop did any work at all. Both readings were the harness, not the subject.
+Each size is now its own test with its own workspace, and the known-answer
+check comes first, which is b8os's rule from the fold cut applied to a cost
+test: give the harness a question whose answer you already know.
+
+## Landed: a call's results are asked for by the chunk that draws it
+
+The story carries every tool call and its arguments but never its output. On
+the user's own transcripts the results are 1.73 GiB against a client mirror of
+1028 MiB with the calls alone, and most are never read, so they can neither
+travel with the story nor be held for the whole transcript.
+
+So the chunk that draws a call asks for it. A call closed by an event keeps
+that event's position, and a chunk, as it composes, asks the daemon for the
+bodies at the positions its calls name: one request per chunk however many
+positions, answered one message per position, each naming what it answers.
+Composing is the only thing that asks, so history nobody has scrolled to costs
+nothing. An answer is drawn into the blocks that asked and nowhere else, and a
+chunk that went away while its answer was in flight is not waiting for it — the
+answer is dropped and the chunk asks again when it composes again. Nothing is
+cached, because a cache would be a second copy of the results the reader did
+not ask for.
+
+A daemon too old to read the extra positions answers one body, and a story
+written before the field leaves it unset. Both draw the call and its arguments
+and nothing under them, which is also what a call still running looks like. The
+client draws what it gets.
+
+*Numbers, and what they are not.* The frame numbers in the landing commit are
+185 frames, draw p50 1.80 ms, p90 3.69, p99 27.20, 9 over the 4 ms bound, with
+the two worst a transcript opening at 27 and 32 ms almost entirely in prepaint,
+and the composer keystrokes at 4.1 to 6.1 ms each. The commit message names
+those as measured on `ced14f55`. **They were not.** Every rig session that
+afternoon launched a `target/profiling/rho-gui` built at 13:29 from
+`ecdec381`, because the rebuilds named `rho-cli` and `rho-daemon` and the rig
+launches the GUI from a third binary that nobody rebuilt. The measurements are
+real and the tip they name is wrong; they describe `ecdec381`, which predates
+the second fold fix and the dashboard patch. The commit message stays as
+history and this is the record. The frame on a folded turn opened by unfolding
+is still owed and is in neither.
+
+- **`rho-fake-slack`, second landing: the socket and the living schedule**
+  The workspace no longer sits still while a client is connected. Other
+  people post, reply in threads, react, edit what they said and read what was
+  said to them, and every one of those becomes a frame on the socket that
+  every connected client sees.
+  *The vocabulary is the client's, not an invention.* The frames are exactly
+  what `rho-slack`'s `events::parse` reads: `hello`, `pong` naming the ping it
+  answers, `reconnect_url`, `message` and its `message_changed` /
+  `message_deleted` subtypes, `reaction_added` / `reaction_removed` with the
+  message named inside `item`, `channel_marked` / `im_marked` /
+  `group_marked` by kind of conversation, and the three thread frames through
+  their `subscription` object. A test asserts that no frame the server sends
+  parses as `Ignored`, so a shape rho would drop on the floor is a failing
+  test rather than a quiet hole.
+  *The write side came with it.* `chat.postMessage`, `chat.update`,
+  `reactions.add` / `.remove`, `conversations.mark` and the three
+  `subscriptions.thread.*` calls, with `already_reacted` and `no_reaction`
+  said the way Slack says them — the client reads those two as "already in
+  the state you asked for", which is only true if the server actually says
+  them. A write takes the store exclusively and ends in a frame, which is how
+  one client's action reaches the others; reads take it shared. Slack takes
+  some of these as a form and some as JSON, so both arrive at one flat field
+  map and no handler knows which it was.
+  *One sequence, two ways to run it.* `advance(n)` applies the next n
+  happenings immediately — no sleeping, no timer, no flake — and hands back
+  what they were as typed `Happening`s, so a test asserts against what the
+  server did rather than against what it guessed. `live(per_second)` runs the
+  same sequence on a clock for the rig. Same seed, same hour: a test asserts
+  two servers' `advance(200)` are equal. Time stops on drop along with the
+  listener and the sockets.
+  *One clock.* The store hands out every new timestamp, so a message the
+  schedule wrote and a message a client sent cannot land out of order in a
+  conversation both touched, and a history stays append-only.
+  *The cost.* Per happening: one draw, a binary search to find the message it
+  lands on, and an append or an in-place write — no pass over the
+  conversation and none over the workspace. Measured: **1.518 µs** in a world
+  of 8 conversations / 16,798 messages and **1.815 µs** in one of 300 /
+  464,720 — the same number, which is the claim. Per frame: rendered once and
+  handed to every socket as a pointer, so eight sockets cost **7.3 µs** a
+  happening rather than eight serialisations. A deletion is a tombstone and
+  an edit's mention flag is a Fenwick update, both in log time, because
+  removing a row or rewriting a prefix sum would move every row after it and
+  those positions are what make the unread counts cheap.
+  *The numbers a reader feels.* Eight `rho-slack` clients on the socket at
+  the default 450,000 messages: a happening reaches all eight in **1.25 ms**
+  median, **1.49 ms** at the 99th (both dominated by the measuring loop's own
+  50 µs poll). Sustained: asked for 2,000 happenings/s, got 2,013, 44,811
+  frames delivered, all eight still connected; asked for 200,000/s, got
+  210,666, 4.67 M frames delivered, all eight still connected. Resident 193
+  MiB with the world in hand, 373 MiB after three seconds at that rate. A
+  client that genuinely stops reading is cut with an error frame after 8,192
+  frames of backlog rather than being queued for forever, which is what makes
+  it reconnect and resync instead of carrying a hole.
+  Gate green: rho-fake-slack 14 tests and 1 doc test, clippy `-D warnings`
+  clean, `cargo fmt --check` clean, workspace suite green.
+
+## Order
+
+1. eng-8gpr: the snapshot rig and the accumulated QA desk, so it exists
+   before the crates land on it. Then the handbook and the QA agent.
+   Then `rho-window`, taking the shell out of the workspace.
+2. eng-b8os: `GUI-MODEL-DESIGN` slice 6 (small), then `rho-agents`. The
+   public surface is the list of what the workspace touches today; the
+   move is first mechanical, then the reach is cut.
+3. eng-bgwk: `rho-slack` as a client, on the fake server first, then on a
+   copy of the user's mirror. The flood is fixed inside the crate with
+   client rules (DMs, mentions, threads the user took part in, channels
+   opted into become cards; the rest is readable, never dealt).
+4. Dealing composition once `rho-agents` and `rho-slack` both hand cards;
+   then the rules, one source at a time, with the user's data on the
+   table.
+
+Each engineer works serially in their own crate. Every change starts with
+`jj new main` on the current main commit, not on whatever the workspace
+was last on. Land through eng-en1p: gate green, `cargo fmt --check`
+clean, a landing note in this document under the crate.
+
+## Symptoms of the wrong shape
+
+- A source's state read from the workspace or from another crate.
+- A screen that needs the workspace to render.
+- A test that seeds an empty state and calls it a QA run.
+- A card without a reason.
+- A fix proven on the seeded rig only.

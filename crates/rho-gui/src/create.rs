@@ -1,0 +1,315 @@
+//! Creating things: one verb, one place to extend.
+//!
+//! `n` opens the `new` transient anywhere: `a` agent, `p` page, `n` note.
+//! Every flow starts with the area picker, so a new thing is always
+//! somewhere the user chose and there is no unfiled pile to guard with a
+//! dealer curve. The picker's first row is `here` — the row under the
+//! cursor, or the thing behind the surface in view — so Enter alone is
+//! create-from-here: the new thing takes the labels that thing carries and
+//! says it is about it, rather than asking the reader for a place they are
+//! already standing in. The labels come next, `root` last, and typing
+//! narrows to any label there is or mints one that is not.
+
+use std::rc::Rc;
+
+use gpui::{App, Context, Window};
+use rho_agents::HostId;
+use rho_window::style::StyleClass;
+
+use crate::find::rank;
+use crate::minibuffer::Candidate;
+use crate::workspace::Workspace;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewKind {
+    Agent,
+    Page,
+    Note,
+}
+
+impl NewKind {
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Agent => "new agent in:",
+            Self::Page => "new page in:",
+            Self::Note => "new note in:",
+        }
+    }
+}
+
+/// The label of the row that files at the root. A path, so it reads like
+/// every other row and cannot collide with a node's own path.
+const ROOT_ROW: &str = "root";
+/// The row that makes the new thing from what is on screen.
+const HERE_ROW: &str = "here";
+/// Ranking keys that put `here` first, the labels the thing on screen
+/// carries next and `root` last among equal matches, which is what an
+/// empty query makes everything.
+const HERE_RECENCY: i64 = i64::MAX;
+const CONTEXT_RECENCY: i64 = i64::MAX - 1;
+const ROOT_RECENCY: i64 = i64::MAX - 2;
+
+/// One place a new node can be filed.
+struct Area {
+    path: String,
+    kind: &'static str,
+    /// `None` files at the root.
+    target: Option<(HostId, rho_desk::cells::Id)>,
+    recency: i64,
+}
+
+impl Workspace {
+    /// The node the reader is looking at: the row under the cursor on
+    /// Home or the desk, else the node behind the surface in view.
+    pub(crate) fn context_area(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
+        // Home is a window onto the same nodes, so its cursor names an
+        // area exactly as the desk's does.
+        if self.active_surface().key == crate::pane::SurfaceKey::Home
+            && let Some(view) = self.home_view()
+        {
+            match view.update(cx, |view, cx| view.cursor_target(cx)) {
+                crate::home::HomeTarget::Card(card) => return Some((card.host, card.node_id)),
+                crate::home::HomeTarget::Agent(agent_id) => {
+                    if let Some(card) = self.dashboard.agent_card_id(agent_id) {
+                        return Some((card.host, card.node_id));
+                    }
+                    // An agent the user has not filed has no row on the
+                    // desk, so there is no node to name it by; the row on
+                    // Home still names the agent itself. Falling through
+                    // to the surface left it naming nothing, because Home
+                    // is a list and stands for no node of its own.
+                    if let Some(host) = self.registry.host_of_agent(agent_id) {
+                        return Some((host, rho_desk::cells::Id::Agent(agent_id)));
+                    }
+                }
+                crate::home::HomeTarget::None => {}
+            }
+        }
+        self.surface_node(cx)
+    }
+
+    /// Where a new thing can go: what is on screen, the labels, and the
+    /// root. A place is not among them — a thing is placed by the labels
+    /// it carries and carries no parent — so the picker offers the label
+    /// paths and nothing else, and a path nobody has made yet is minted by
+    /// choosing it.
+    ///
+    /// `here` is the first row: the thing in view, which files the new
+    /// thing exactly where that thing is and says what it is about. So
+    /// Enter alone is create-from-here, and the picker is left for a thing
+    /// that belongs somewhere else.
+    fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {
+        let _ = cx;
+        let mut areas = vec![Area {
+            path: ROOT_ROW.to_owned(),
+            kind: "root",
+            target: None,
+            recency: ROOT_RECENCY,
+        }];
+        if let Some((host, node_id)) = context.clone() {
+            areas.push(Area {
+                path: HERE_ROW.to_owned(),
+                kind: "what is on screen",
+                target: Some((host, node_id)),
+                recency: HERE_RECENCY,
+            });
+        }
+        let carried = context
+            .as_ref()
+            .and_then(|(host, node_id)| self.desk_cells.facts(*host, node_id))
+            .map(|facts| facts.labels)
+            .unwrap_or_default();
+        for host in self.desk_cells.hosts().collect::<Vec<_>>() {
+            for (label, path) in self.desk_cells.label_paths(host) {
+                let recency = if carried.contains(&label) {
+                    CONTEXT_RECENCY
+                } else {
+                    0
+                };
+                areas.push(Area {
+                    path,
+                    kind: "label",
+                    target: Some((host, label)),
+                    recency,
+                });
+            }
+        }
+        areas
+    }
+
+    #[cfg(test)]
+    pub(crate) fn areas_for_test(&mut self, cx: &mut Context<Self>) -> Vec<(String, String)> {
+        let context = self.context_area(cx);
+        self.areas(context, cx)
+            .into_iter()
+            .map(|area| (area.path, area.kind.to_owned()))
+            .collect()
+    }
+
+    /// `n a`, `n p`, `n n`: ask for the area, then make the thing.
+    pub(crate) fn begin_new(&mut self, kind: NewKind, window: &mut Window, cx: &mut Context<Self>) {
+        let context = self.context_area(cx);
+        let submit_context = context.clone();
+        let complete = Rc::new(move |workspace: &Workspace, input: &str, cx: &App| {
+            let areas = workspace.areas(context.clone(), cx);
+            let paths = areas
+                .iter()
+                .map(|area| (area.path.clone(), area.recency))
+                .collect::<Vec<_>>();
+            rank(&paths, input)
+                .into_iter()
+                .filter_map(|index| areas.get(index))
+                .take(AREA_LIMIT)
+                .map(|area| Candidate {
+                    value: area.path.clone(),
+                    description: area.kind.to_owned(),
+                })
+                .collect()
+        });
+        let on_submit = Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.new_in_area(kind, submit_context.clone(), &input, window, cx);
+            },
+        );
+        self.open_prompt(kind.prompt(), complete, on_submit, window, cx);
+        if let Some(minibuffer) = &mut self.minibuffer {
+            // A path has spaces in it, so completion replaces the whole
+            // input rather than the last word.
+            minibuffer.set_complete_whole_input();
+        }
+    }
+
+    /// Resolves what the reader typed to an area, then creates in it. An
+    /// empty submission is Enter on the first row: the context.
+    fn new_in_area(
+        &mut self,
+        kind: NewKind,
+        context: Option<(HostId, rho_desk::cells::Id)>,
+        input: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = input.trim();
+        let areas = self.areas(context, cx);
+        let paths = areas
+            .iter()
+            .map(|area| (area.path.clone(), area.recency))
+            .collect::<Vec<_>>();
+        let chosen = areas
+            .iter()
+            .position(|area| area.path == input)
+            .or_else(|| rank(&paths, input).first().copied());
+        let Some(index) = chosen else {
+            self.notice_on(
+                None,
+                &format!("nothing matching `{input}`"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let area = areas[index].target.clone();
+        match kind {
+            NewKind::Agent => self.new_agent_in_area(area, window, cx),
+            NewKind::Page => self.prompt_new_page(area, window, cx),
+            NewKind::Note => self.new_note_in_area(area, window, cx),
+        }
+    }
+
+    fn prompt_new_page(
+        &mut self,
+        area: Option<(HostId, rho_desk::cells::Id)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_submit = Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if input.is_empty() {
+                    return;
+                }
+                let url = if input.contains("://") {
+                    input.to_owned()
+                } else {
+                    format!("https://{input}")
+                };
+                workspace.create_browser_page(url, area.clone(), window, cx);
+            },
+        );
+        self.open_prompt(
+            "new page:",
+            Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
+    fn new_note_in_area(
+        &mut self,
+        area: Option<(HostId, rho_desk::cells::Id)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = area
+            .as_ref()
+            .map(|(host, _)| *host)
+            .or_else(|| self.hosts.primary())
+        else {
+            self.notice_on(
+                None,
+                "new note: no daemon is connected",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        // A note carries no parent either: the area is a label, and the
+        // note is created at the root wearing it.
+        let Some((created, mut writes)) = self.desk_cells.create_note_writes(host, None) else {
+            return;
+        };
+        writes.extend(
+            self.new_thing_cells(host, area.as_ref())
+                .into_iter()
+                .map(|property| rho_desk::cells::CellWrite {
+                    id: created.clone(),
+                    property,
+                }),
+        );
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
+            return;
+        }
+        rho_journal::record(rho_journal::Event::Created {
+            node_id: created.clone().into(),
+            kind: rho_journal::CreatedKind::Note,
+            method: rho_journal::CreateMethod::New,
+            at_root: area.is_none(),
+        });
+        self.sync_tree_dashboard(host, window, cx);
+        // A note is its own surface now, so the note itself is where the
+        // reader has to be to type it. Opening it is what makes the title
+        // land somewhere; without this the characters went into whatever
+        // was in view and the note read as "nothing happened".
+        self.open_note(host, created.clone(), window, cx);
+        // The note is ready for its first line immediately, rather than
+        // reading the title's characters as normal-mode commands.
+        self.enter_insert_when_shown(window, cx);
+    }
+}
+
+/// The prompt shows a window of areas; ranking past that is work the
+/// reader never sees.
+const AREA_LIMIT: usize = 50;

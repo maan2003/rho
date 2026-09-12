@@ -1,0 +1,30 @@
+# The client's mirror of its hosts' agents (a cache in the client's own
+# database, replayed on start) and the model that turns connection events
+# into the events a screen reacts to. Owned by no surface; the workspace
+# reads the model, the mirror is opened by the model thread.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-mirror"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+futures.workspace = true
+prefix-id = { workspace = true, features = ["redb"] }
+redb = { workspace = true }
+rho-agents = { workspace = true }
+rho-db = { workspace = true }
+rho-hosts = { workspace = true }
+rho-ui-proto.workspace = true
+senax-encoder = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rho-core.workspace = true
+tempfile = { workspace = true }

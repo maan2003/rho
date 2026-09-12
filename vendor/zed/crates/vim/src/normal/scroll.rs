@@ -111,6 +111,7 @@ impl Vim {
             let display_snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
             let old_top = editor.scroll_top_display_point(&display_snapshot, cx);
 
+            #[cfg(feature = "zed-workspace")]
             if editor.scroll_hover(amount, window, cx) {
                 return;
             }

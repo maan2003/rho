@@ -95,6 +95,7 @@ impl Vim {
                     MotionKind::Exclusive
                 };
                 vim.copy_selections_content(editor, kind, window, cx);
+                #[cfg(feature = "zed-workspace")]
                 let linked_edits = editor.linked_edits_for_selections(Arc::from(""), cx);
                 let selections = editor
                     .selections
@@ -102,6 +103,7 @@ impl Vim {
                     .into_iter();
                 let edits = selections.map(|selection| (selection.start..selection.end, ""));
                 editor.edit(edits, cx);
+                #[cfg(feature = "zed-workspace")]
                 linked_edits.apply(cx);
             });
         });

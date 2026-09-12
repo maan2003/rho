@@ -1,0 +1,32 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-browser"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel = "2"
+dirs.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+image = { version = "0.25", default-features = false }
+libc.workspace = true
+rho-browser-wayland.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec = "1"
+theme = { path = "../../vendor/zed/crates/theme" }
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+futures-lite = "2"
+tempfile.workspace = true
+# The fake browser example is a Wayland client: rho's browser compositor
+# tears a page down if no top-level window ever binds.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

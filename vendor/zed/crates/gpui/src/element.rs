@@ -470,6 +470,11 @@ impl<E: Element> Drawable<E> {
                 ..
             } => {
                 if let Some(element_id) = self.element.id() {
+                    #[cfg(any(test, feature = "test-support"))]
+                    window
+                        .next_frame
+                        .scene
+                        .push_recording_element(element_id.clone());
                     window.element_id_stack.push(element_id);
                     debug_assert_eq!(&*global_id.as_ref().unwrap().0, &*window.element_id_stack);
                 }
@@ -486,6 +491,8 @@ impl<E: Element> Drawable<E> {
                 );
 
                 if global_id.is_some() {
+                    #[cfg(any(test, feature = "test-support"))]
+                    window.next_frame.scene.pop_recording_element();
                     window.element_id_stack.pop();
                 }
 

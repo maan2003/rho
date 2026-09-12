@@ -1,11 +1,75 @@
-use std::sync::Arc;
-
 use rho_core::{ContentPart, UnixMs};
-use rho_db::{RhoDb, SenValue};
+use rho_db::RhoDb;
 use rho_inference::PromptCacheKey;
-use rho_workset::WorkspaceInfo;
+use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
 use super::*;
+
+#[test]
+fn astra_bindings_round_trip() {
+    for binding in [
+        SessionBinding::ResponsesAstra(InferenceProfile::default()),
+        SessionBinding::AdvisorAstra(InferenceProfile::default()),
+    ] {
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&binding, &mut encoded).unwrap();
+        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded, binding);
+    }
+}
+
+#[test]
+fn python_suffixed_bindings_fold_into_their_models() {
+    #[derive(Encode)]
+    #[allow(dead_code)]
+    enum LegacySessionBinding {
+        ResponsesSolPython(InferenceProfile),
+        ClaudeFablePython { effort: ClaudeEffort },
+    }
+    let profile = InferenceProfile {
+        effort: ReasoningEffort::Medium,
+        fast_mode: false,
+    };
+    for (legacy, expected) in [
+        (
+            LegacySessionBinding::ResponsesSolPython(profile),
+            SessionBinding::ResponsesSol(profile),
+        ),
+        (
+            LegacySessionBinding::ClaudeFablePython {
+                effort: ClaudeEffort::High,
+            },
+            SessionBinding::ClaudeFable {
+                effort: ClaudeEffort::High,
+            },
+        ),
+    ] {
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
+        let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[test]
+fn legacy_high_engineer_binding_stays_on_sol() {
+    let binding = SessionBinding::ResponsesSol(InferenceProfile {
+        effort: ReasoningEffort::Xhigh,
+        fast_mode: false,
+    });
+    let mut encoded = bytes::BytesMut::new();
+    senax_encoder::encode_to(&binding, &mut encoded).unwrap();
+    let decoded = <SessionBinding as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+
+    assert_eq!(decoded, binding);
+    assert_eq!(decoded.deep_model(), Some(InferenceModel::Gpt56Sol));
+    assert_eq!(
+        decoded.agent_role(),
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        }
+    );
+}
 
 #[test]
 fn quota_observation_decodes_before_auth_namespaces() {
@@ -43,6 +107,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ResponsesSol(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -68,6 +133,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         claude_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ClaudeFable {
             effort: ClaudeEffort::High,
         },
@@ -89,6 +155,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         opus_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ClaudeOpus {
             effort: ClaudeEffort::Medium,
         },
@@ -110,6 +177,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         terra_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ResponsesTerra(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -129,6 +197,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         luna_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ResponsesLuna(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -259,7 +328,6 @@ fn agent_role_resolves_opinionated_bindings() {
         SessionBinding::ResponsesLuna(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: true,
-            code_mode: false,
         })
     ));
     assert!(matches!(
@@ -273,7 +341,6 @@ fn agent_role_resolves_opinionated_bindings() {
         profile(EngineerIntelligence::Cheap),
         SessionBinding::ResponsesTerra(InferenceProfile {
             effort: ReasoningEffort::High,
-            code_mode: true,
             ..
         })
     ));
@@ -285,32 +352,12 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
-        AgentRole::WorkflowEngineer {
-            intelligence: EngineerIntelligence::Medium,
-            workflow: AgentWorkflow::PrFriendly,
-        }
-        .session_profile()
-        .unwrap(),
-        SessionBinding::ResponsesSol(InferenceProfile {
-            effort: ReasoningEffort::High,
-            ..
-        })
-    ));
-    assert!(matches!(
         profile(EngineerIntelligence::High),
-        SessionBinding::ResponsesSol(InferenceProfile {
-            effort: ReasoningEffort::Xhigh,
+        SessionBinding::ResponsesAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
             ..
         })
     ));
-    for intelligence in [
-        EngineerIntelligence::Low,
-        EngineerIntelligence::Cheap,
-        EngineerIntelligence::Medium,
-        EngineerIntelligence::High,
-    ] {
-        assert!(profile(intelligence).deep_config().unwrap().code_mode);
-    }
     assert_eq!(
         profile(EngineerIntelligence::Ultra),
         SessionBinding::ClaudeFable {
@@ -323,16 +370,34 @@ fn agent_role_resolves_opinionated_bindings() {
             effort: ClaudeEffort::Medium
         }
     );
+    for intelligence in [EngineerIntelligence::Ultra, EngineerIntelligence::Alt] {
+        assert!(
+            profile(intelligence).claude_python(),
+            "every Claude engineer works in the Python notebook"
+        );
+    }
+    assert!(matches!(
+        profile(EngineerIntelligence::Gemini),
+        SessionBinding::AntigravityFlashLow(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+        })
+    ));
     assert_eq!(
+        profile(EngineerIntelligence::Gemini).deep_model(),
+        Some(InferenceModel::Gemini37FlashLow)
+    );
+    assert!(matches!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,
         }
         .session_profile()
         .unwrap(),
-        SessionBinding::ClaudeAdvisor {
-            effort: ClaudeEffort::High
-        }
-    );
+        SessionBinding::AdvisorAstra(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+        })
+    ));
     assert!(matches!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
@@ -340,7 +405,7 @@ fn agent_role_resolves_opinionated_bindings() {
         .session_profile()
         .unwrap(),
         SessionBinding::AdvisorSol(InferenceProfile {
-            effort: ReasoningEffort::Xhigh,
+            effort: ReasoningEffort::High,
             fast_mode: false,
             ..
         })
@@ -354,67 +419,50 @@ fn agent_role_resolves_opinionated_bindings() {
         SessionBinding::AdvisorTerra(InferenceProfile {
             effort: ReasoningEffort::Xhigh,
             fast_mode: false,
-            code_mode: true,
         })
     ));
-    assert!(matches!(
-        AgentRole::pm().session_profile().unwrap(),
-        SessionBinding::CoordinatorSol(InferenceProfile {
-            effort: ReasoningEffort::Low,
-            code_mode: false,
-            ..
-        })
-    ));
-    assert!(matches!(
-        AgentRole::Iris.session_profile().unwrap(),
-        SessionBinding::ResponsesTerra(InferenceProfile {
-            effort: ReasoningEffort::Medium,
-            fast_mode: true,
-            code_mode: false,
-        })
-    ));
-    assert!(AgentRole::Iris.is_pm());
-    assert_eq!(AgentRole::Iris.handle_prefix(), "iris");
 }
 
-use crate::{MessageDelivery, MessageSender, QueuedItem, QueuedItemKind};
+use crate::{InputKind, MessageDelivery, MessageSender, QueuedInput};
 
-fn user_event(text: &str) -> AgentEvent<'static> {
-    AgentEvent::Queued(QueuedItem {
-        kind: QueuedItemKind::UserMessage {
-            sender: MessageSender::User,
-            content: Arc::new(vec![ContentPart::Text {
+pub(crate) fn user_event(text: &str) -> AgentEvent<'static> {
+    AgentEvent::Accepted(QueuedInput {
+        source: MessageSender::User,
+        kind: InputKind::Message {
+            content: vec![ContentPart::Text {
                 text: text.to_owned(),
-            }]),
-            source_id: None,
+            }],
         },
         delivery: MessageDelivery::Immediate,
+        at: UnixMs(0),
     })
 }
 
 fn event_text(event: &AgentEvent<'_>) -> String {
     match event {
-        AgentEvent::Queued(QueuedItem {
-            kind: QueuedItemKind::UserMessage { content, .. },
+        AgentEvent::Accepted(QueuedInput {
+            kind: InputKind::Message { content },
             ..
         }) => match &content[0] {
             ContentPart::Text { text } => text.clone(),
             ContentPart::Image { .. } => panic!("expected text content"),
         },
+        // Every agent's log opens with its creation.
+        AgentEvent::Created { .. } => "created".to_owned(),
+        AgentEvent::Rewound { .. } => "rewound".to_owned(),
         _ => unreachable!(),
     }
 }
 
 /// Tests exercise agent records only; any workspace info will do.
-fn test_workspace() -> WorkspaceInfo {
-    WorkspaceInfo::Checkout {
-        workset: "test-workset".into(),
-        repo: "rho".into(),
-        name: "rho".into(),
+pub(crate) fn test_workspace() -> WorkspaceInfo {
+    WorkspaceInfo::Workspace {
+        repo: "/home/user/src/rho".into(),
+        id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
     }
 }
 
-fn test_agent_runtime() -> AgentRuntime {
+pub(crate) fn test_agent_runtime() -> AgentRuntime {
     AgentRuntime::Rho {
         prompt_cache_key: PromptCacheKey::generate(),
     }
@@ -435,6 +483,7 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         AgentRuntime::Claude {
             session_id: source_session_id,
@@ -449,40 +498,17 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
     write.set_agent_claude_rewind(agent_id, Some(rewind.clone()));
     write.commit();
 
-    assert_eq!(db.read().get_agent(agent_id).claude_rewind, Some(rewind));
+    assert_eq!(
+        db.read().get_agent(agent_id).config.claude_rewind,
+        Some(rewind)
+    );
 
     let mut write = db.write().await;
     write.complete_agent_claude_rewind(agent_id, session_id);
     write.commit();
     let record = db.read().get_agent(agent_id);
-    assert_eq!(record.runtime, AgentRuntime::Claude { session_id });
-    assert_eq!(record.claude_rewind, None);
-}
-
-#[tokio::test]
-async fn labels_toggle_without_duplicates() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    write.agent_label(UnixMs(5), agent_id, "urgent", true);
-    write.agent_label(UnixMs(6), agent_id, "urgent", true);
-    write.agent_label(UnixMs(7), agent_id, "review", true);
-    write.agent_label(UnixMs(8), agent_id, "urgent", false);
-    write.commit();
-
-    let read = db.read();
-    assert_eq!(read.get_agent(agent_id).labels, ["review"]);
+    assert_eq!(record.config.runtime, AgentRuntime::Claude { session_id });
+    assert_eq!(record.config.claude_rewind, None);
 }
 
 #[tokio::test]
@@ -497,7 +523,8 @@ async fn agent_spawned_by_is_stored_at_creation() {
         pm,
         None,
         vec![test_workspace()],
-        AgentRole::pm().session_profile().unwrap(),
+        AgentRole::default(),
+        AgentRole::default().session_profile().unwrap(),
         test_agent_runtime(),
         None,
     );
@@ -507,14 +534,21 @@ async fn agent_spawned_by_is_stored_at_creation() {
         engineer,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         AgentRole::default().session_profile().unwrap(),
         test_agent_runtime(),
         Some(pm),
     );
     write.commit();
 
-    assert_eq!(db.read().get_agent(pm).spawned_by, AgentSpawnedBy::Direct);
-    assert_eq!(db.read().get_agent(engineer).spawned_by, AgentSpawnedBy::PM);
+    assert_eq!(
+        db.read().get_agent(pm).config.spawned_by,
+        AgentSpawnedBy::Direct
+    );
+    assert_eq!(
+        db.read().get_agent(engineer).config.spawned_by,
+        AgentSpawnedBy::Engineer
+    );
 }
 
 #[test]
@@ -523,44 +557,6 @@ fn deep_default_uses_default_deep_config() {
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         SessionBinding::ResponsesGpt55(InferenceProfile::default())
     );
-}
-
-#[tokio::test]
-async fn agent_event_positions_sort_by_lineage_then_seq() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    {
-        let mut timeline = write.open_table(AGENT_EVENTS);
-        for seq in [2, 0, 1] {
-            timeline.insert(
-                &AgentEventPos {
-                    lineage_id: AgentLineageId(7),
-                    seq,
-                },
-                SenValue::owned(user_event("seq")),
-            );
-        }
-    }
-    write.commit();
-
-    let read = db.read();
-    let timeline = read.open_table(AGENT_EVENTS);
-    let seqs = timeline
-        .range(
-            AgentEventPos {
-                lineage_id: AgentLineageId(7),
-                seq: 0,
-            }..=AgentEventPos {
-                lineage_id: AgentLineageId(7),
-                seq: u32::MAX,
-            },
-        )
-        .map(|(key, _)| key.value().seq)
-        .collect::<Vec<_>>();
-
-    assert_eq!(seqs, [0, 1, 2]);
 }
 
 #[tokio::test]
@@ -588,338 +584,6 @@ async fn init_agent_tables_rejects_unsupported_db_format() {
 }
 
 #[tokio::test]
-async fn create_agent_and_append_events_with_cursor() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let next = write.append_agent_event(next, &user_event("hello"));
-    write.append_agent_event(next, &user_event("again"));
-    write.commit();
-
-    let read = db.read();
-    let agent = read.get_agent(agent_id);
-    assert_eq!(agent.display_name.as_deref(), Some("main"));
-
-    let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.seq, 2);
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0], user_event("hello"));
-}
-
-#[tokio::test]
-async fn agent_events_read_lineage_parents() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let fork_at = write.append_agent_event(next, &user_event("parent"));
-    write.append_agent_event(fork_at, &user_event("sibling"));
-
-    let child_lineage = AgentLineageId(99);
-    {
-        write
-            .open_table(LINEAGE_PARENTS)
-            .insert(&child_lineage, &fork_at);
-    }
-    {
-        let mut agents = write.open_table(AGENTS);
-        let mut agent = agents.get(&agent_id).unwrap().value().into_owned();
-        agent.current_lineage = child_lineage;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-    write.append_agent_event(AgentEventPos::root(child_lineage), &user_event("child"));
-    write.commit();
-
-    let read = db.read();
-    let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.lineage_id, child_lineage);
-    assert_eq!(next.seq, 1);
-    let texts = events
-        .into_iter()
-        .map(|event| event_text(&event))
-        .collect::<Vec<_>>();
-    assert_eq!(texts, ["parent", "child"]);
-}
-
-#[tokio::test]
-async fn fork_agent_lineage_repoints_current_branch() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let next = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        Some("main".to_owned()),
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let fork_at = write.append_agent_event(next, &user_event("parent"));
-    write.append_agent_event(fork_at, &user_event("old branch"));
-
-    let child_next = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
-    write.append_agent_event(child_next, &user_event("new branch"));
-    write.commit();
-
-    let (_, events) = db.read().agent_events(agent_id);
-    let texts = events
-        .into_iter()
-        .map(|event| event_text(&event))
-        .collect::<Vec<_>>();
-    assert_eq!(texts, ["parent", "new branch"]);
-}
-
-#[tokio::test]
-async fn presentation_history_folds_by_source_reachability_after_rewind() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    let first = write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    let second = write.append_agent_event(first, &user_event("first"));
-    let third = write.append_agent_event(second, &user_event("later"));
-    let update = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("first-subject".to_owned()),
-        activity: PresentationField::Set("reading first request".to_owned()),
-        through: first,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(2), agent_id, &update)
-            .is_some()
-    );
-    write.append_agent_presentation_history(third, &update);
-    let fourth = write.append_agent_event(
-        third,
-        &AgentEvent::PresentationUpdated {
-            update: update.clone(),
-        },
-    );
-    write.append_agent_event(fourth, &user_event("even later"));
-
-    // Rewind before the second input. The update itself is on the abandoned
-    // branch, but its source (`first`) remains selected and must survive.
-    write.fork_agent_lineage(UnixMs(3), agent_id, second);
-    let cache = write.rebuild_agent_presentation_cache(UnixMs(3), agent_id);
-    assert_eq!(cache.generated_title.as_deref(), Some("first-subject"));
-    assert_eq!(cache.activity.as_deref(), Some("reading first request"));
-
-    // A completion based on the discarded input cannot write into the new
-    // lineage, even if it reaches the serialized loop after the rewind.
-    let stale = AgentPresentationUpdate {
-        generated_title: PresentationField::Set("discarded".to_owned()),
-        activity: PresentationField::Unchanged,
-        through: second,
-    };
-    assert!(
-        write
-            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
-            .is_none()
-    );
-    write.commit();
-
-    let record = db.read().get_agent(agent_id);
-    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
-}
-
-#[tokio::test]
-async fn turn_end_and_user_message_set_dispositions() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    write.record_agent_turn_end(UnixMs(2), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().get_agent(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-
-    let mut write = db.write().await;
-    write.record_agent_user_message(UnixMs(5), agent_id, "  please\ncheck the   claims  ");
-    write.commit();
-    let agent = db.read().get_agent(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert_eq!(agent.last_user_message, UnixMs(5));
-    assert_eq!(agent.last_user_message_text, "please check the claims");
-    assert!(agent.user_interacted);
-
-    // An unexpired snooze holds across a turn end; an expired one does not.
-    let mut write = db.write().await;
-    write.set_agent_disposition(agent_id, AgentDisposition::Snoozed { until: UnixMs(100) });
-    write.record_agent_turn_end(UnixMs(50), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().get_agent(agent_id).disposition,
-        AgentDisposition::Snoozed { until: UnixMs(100) }
-    );
-    let mut write = db.write().await;
-    write.record_agent_turn_end(UnixMs(150), agent_id);
-    write.commit();
-    assert_eq!(
-        db.read().get_agent(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-
-    // A needs-you report leaves the verdict alone; an FYI settles like a
-    // pressed Done while the summary stays for the row.
-    let mut write = db.write().await;
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: true,
-            summary: "which migration to drop?".to_owned(),
-        },
-    );
-    write.commit();
-    assert_eq!(
-        db.read().get_agent(agent_id).disposition,
-        AgentDisposition::Pending
-    );
-    let mut write = db.write().await;
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: false,
-            summary: "tests pass".to_owned(),
-        },
-    );
-    write.commit();
-    let agent = db.read().get_agent(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert!(agent.turn_report.is_some());
-
-    // A new user message overrides any verdict: snooze and the stale turn
-    // report both give way to Done.
-    let mut write = db.write().await;
-    write.set_agent_disposition(
-        agent_id,
-        AgentDisposition::Snoozed {
-            until: UnixMs(1_000),
-        },
-    );
-    write.record_agent_turn_report(
-        agent_id,
-        &crate::db::TurnReport {
-            needs_you: true,
-            summary: "which migration to drop?".to_owned(),
-        },
-    );
-    write.record_agent_user_message(UnixMs(200), agent_id, "next task");
-    write.commit();
-    let agent = db.read().get_agent(agent_id);
-    assert_eq!(agent.disposition, AgentDisposition::Done);
-    assert_eq!(agent.turn_report, None);
-}
-
-#[tokio::test]
-async fn view_config_round_trips_and_defaults_empty() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.commit();
-    assert_eq!(db.read().view_config(), Vec::<u8>::new());
-
-    let mut write = db.write().await;
-    write.set_view_config(vec![1, 2, 3]);
-    write.commit();
-    assert_eq!(db.read().view_config(), [1, 2, 3]);
-}
-
-#[tokio::test]
-async fn projects_upsert_by_path_and_remove() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.upsert_project(
-        UnixMs(1),
-        "/home/user/src/rho",
-        "rho".to_owned(),
-        "agents".to_owned(),
-    );
-    write.upsert_project(
-        UnixMs(2),
-        "/home/user/src/zed",
-        "zed".to_owned(),
-        "editor".to_owned(),
-    );
-    // Re-adding the same path renames it and keeps created_at.
-    write.upsert_project(
-        UnixMs(3),
-        "/home/user/src/rho",
-        "rho-main".to_owned(),
-        "runtime".to_owned(),
-    );
-    write.commit();
-
-    let projects = db.read().list_projects();
-    assert_eq!(projects.len(), 2);
-    let rho = projects
-        .iter()
-        .find(|(path, _)| path == std::path::Path::new("/home/user/src/rho"))
-        .unwrap();
-    assert_eq!(rho.1.name, "rho-main");
-    assert_eq!(rho.1.description, "runtime");
-    assert_eq!(rho.1.created_at, UnixMs(1));
-
-    let mut write = db.write().await;
-    write.remove_project("/home/user/src/zed");
-    write.commit();
-    assert_eq!(db.read().list_projects().len(), 1);
-}
-
-#[tokio::test]
 async fn agent_ids_allocate_before_records_exist() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
@@ -936,6 +600,7 @@ async fn agent_ids_allocate_before_records_exist() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -943,7 +608,10 @@ async fn agent_ids_allocate_before_records_exist() {
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.get_agent(agent_id).workdirs, vec![test_workspace()]);
+    assert_eq!(
+        read.get_agent(agent_id).config.workdirs,
+        vec![test_workspace()]
+    );
     assert_eq!(read.list_agents().len(), 1);
 }
 
@@ -967,4 +635,258 @@ async fn response_subscriptions_are_persistent_edges() {
     write.commit();
     assert!(!db.read().is_agent_response_subscribed(subscriber, target));
     assert!(db.read().agent_response_subscribers(target).is_empty());
+}
+
+fn create(
+    write: &mut rho_db::WriteTxn,
+    spawn_name: Option<&str>,
+    parent: Option<AgentId>,
+) -> AgentId {
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        spawn_name.map(str::to_owned),
+        vec![test_workspace()],
+        AgentRole::default(),
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        parent,
+    );
+    agent_id
+}
+
+#[tokio::test]
+async fn positions_are_dense_per_agent_and_creation_is_row_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = create(&mut write, Some("main"), None);
+    let second = create(&mut write, None, Some(first));
+    assert_eq!(
+        write.append_agent_event(first, &user_event("hello")),
+        AgentEventPos::new(1)
+    );
+    assert_eq!(
+        write.append_agent_event(second, &user_event("hi")),
+        AgentEventPos::new(1)
+    );
+    assert_eq!(
+        write.append_agent_event(first, &user_event("again")),
+        AgentEventPos::new(2)
+    );
+    write.commit();
+
+    let read = db.read();
+    let agent = read.get_agent(first);
+    assert_eq!(agent.config.spawn_name.as_deref(), Some("main"));
+    assert_eq!(agent.next, AgentEventPos::new(3));
+    assert_eq!(read.get_agent(second).parent, Some(first));
+    assert_eq!(read.agent_parent(second), Some(first));
+    let mut ids = read.list_agent_ids();
+    ids.sort();
+    let mut expected = [first, second];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    let (next, events) = read.agent_events(first);
+    assert_eq!(next, AgentEventPos::new(3));
+    let texts = events.iter().map(event_text).collect::<Vec<_>>();
+    assert_eq!(texts, ["created", "hello", "again"]);
+    assert_eq!(
+        read.agent_event(first, AgentEventPos::new(2)),
+        Some(user_event("again"))
+    );
+    assert_eq!(read.agent_event(first, AgentEventPos::new(3)), None);
+}
+
+#[tokio::test]
+async fn a_rewind_hides_rows_and_is_itself_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = create(&mut write, None, None);
+    write.append_agent_event(agent_id, &user_event("parent"));
+    write.append_agent_event(agent_id, &user_event("old branch"));
+    // Take back everything from row 2 on; the rewind lands at row 3.
+    assert_eq!(
+        write.rewind_agent(UnixMs(2), agent_id, AgentEventPos::new(2)),
+        AgentEventPos::new(3)
+    );
+    write.append_agent_event(agent_id, &user_event("new branch"));
+    write.commit();
+
+    let read = db.read();
+    let (next, records) = read.agent_event_records(agent_id);
+    assert_eq!(next, AgentEventPos::new(5));
+    let seen = records
+        .iter()
+        .map(|(pos, event)| (pos.pos, event_text(event)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seen,
+        [
+            (0, "created".to_owned()),
+            (1, "parent".to_owned()),
+            (3, "rewound".to_owned()),
+            (4, "new branch".to_owned()),
+        ]
+    );
+    // The hidden row is still there for anyone who asks by position.
+    assert_eq!(
+        read.agent_event(agent_id, AgentEventPos::new(2)),
+        Some(user_event("old branch"))
+    );
+    // The tail walk backward skips it too.
+    let tail = read
+        .agent_presentation_source_tail(agent_id, usize::MAX)
+        .into_iter()
+        .map(|(pos, _)| pos.pos)
+        .collect::<Vec<_>>();
+    assert_eq!(tail, [1, 4]);
+}
+
+#[tokio::test]
+async fn a_presentation_update_is_rejected_when_its_source_was_rewound_away() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = create(&mut write, None, None);
+    let first = write.append_agent_event(agent_id, &user_event("first"));
+    let second = write.append_agent_event(agent_id, &user_event("later"));
+    let update = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("first-subject".to_owned()),
+        activity: PresentationField::Set("reading first request".to_owned()),
+        through: first,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(2), agent_id, &update)
+            .is_some()
+    );
+    write.append_agent_event(agent_id, &user_event("even later"));
+
+    write.rewind_agent(UnixMs(3), agent_id, second);
+
+    // A completion based on the discarded input cannot write after the
+    // rewind, even if it reaches the serialized loop late.
+    let stale = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("discarded".to_owned()),
+        activity: PresentationField::Unchanged,
+        through: second,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
+            .is_none()
+    );
+    write.commit();
+
+    let record = db.read().get_agent(agent_id);
+    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
+    assert_eq!(record.activity.as_deref(), Some("reading first request"));
+}
+
+#[tokio::test]
+async fn the_head_folds_title_activity_turns_and_user_contact() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let root = create(&mut write, None, None);
+    let child = create(&mut write, Some("named"), Some(root));
+    write.tell_turn(UnixMs(2), child, TurnEdge::Started);
+    write.append_agent_event(
+        child,
+        &AgentEvent::Presented {
+            title: PresentationField::Set("story-log".to_owned()),
+            activity: PresentationField::Set("writing the fold".to_owned()),
+            at: UnixMs(3),
+        },
+    );
+    write.commit();
+
+    let head = db.read().get_agent(child);
+    // The spawner's name beats the sidecar's title.
+    assert_eq!(head.title(), Some("named"));
+    assert_eq!(head.generated_title.as_deref(), Some("story-log"));
+    assert_eq!(head.activity.as_deref(), Some("writing the fold"));
+    assert!(head.turn_running);
+    assert!(!head.user_interacted);
+    assert_eq!(head.last_turn_ended, None);
+
+    let mut write = db.write().await;
+    write.tell_turn(UnixMs(5), child, TurnEdge::Ended(TurnOutcome::Completed));
+    write.append_agent_event(child, &user_event("the user speaks"));
+    write.tell_wants(UnixMs(6), child, AgentWant::Ask, Some("which?".to_owned()));
+    write.commit();
+
+    // The label described work that just stopped.
+    let head = db.read().get_agent(child);
+    assert!(!head.turn_running);
+    assert_eq!(head.activity, None);
+    assert_eq!(head.last_turn_ended, Some(UnixMs(5)));
+    assert!(head.user_interacted);
+    assert!(!db.read().get_agent(root).user_interacted);
+}
+
+#[tokio::test]
+async fn the_journal_names_every_row_in_write_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut feed = crate::mirror::feed(&db);
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let first = create(&mut write, None, None);
+    let second = create(&mut write, None, None);
+    write.append_agent_event(first, &user_event("one"));
+    write.append_agent_event(second, &user_event("two"));
+    write.append_agent_event(first, &user_event("three"));
+    write.commit();
+
+    let read = db.read();
+    assert_eq!(read.journal_head(), Seq(5));
+    let named = read
+        .journal_since(Seq(0), 100)
+        .into_iter()
+        .map(|(seq, agent_id, pos, event)| (seq.0, agent_id, pos.pos, event_text(&event)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        [
+            (1, first, 0, "created".to_owned()),
+            (2, second, 0, "created".to_owned()),
+            (3, first, 1, "one".to_owned()),
+            (4, second, 1, "two".to_owned()),
+            (5, first, 2, "three".to_owned()),
+        ]
+    );
+    // Paged: `since` is exclusive, `limit` bounds the page.
+    let page = read.journal_since(Seq(3), 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, Seq(4));
+    assert!(read.journal_since(Seq(5), 100).is_empty());
+
+    // Every row was announced after commit, in the same order.
+    let mut announced = Vec::new();
+    while let Ok(crate::mirror::Feed::Appended(appended)) = feed.try_recv() {
+        announced.push((appended.seq.0, appended.agent_id, appended.pos.0));
+    }
+    assert_eq!(
+        announced,
+        [
+            (1, first, 0),
+            (2, second, 0),
+            (3, first, 1),
+            (4, second, 1),
+            (5, first, 2)
+        ]
+    );
 }

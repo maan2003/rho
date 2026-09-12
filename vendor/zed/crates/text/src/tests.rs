@@ -63,8 +63,6 @@ fn test_random_edits(mut rng: StdRng) {
         BufferId::new(1).unwrap(),
         reference_string.clone(),
     );
-    LineEnding::normalize(&mut reference_string);
-
     buffer.set_group_interval(Duration::from_millis(rng.random_range(0..=200)));
     let mut buffer_versions = Vec::new();
     log::info!(
@@ -203,14 +201,18 @@ fn test_line_endings() {
         BufferId::new(1).unwrap(),
         "one\r\ntwo\rthree",
     );
-    assert_eq!(buffer.text(), "one\ntwo\nthree");
+    assert_eq!(buffer.text(), "one\r\ntwo\rthree");
     assert_eq!(buffer.line_ending(), LineEnding::Windows);
     buffer.check_invariants();
 
     buffer.edit([(buffer.len()..buffer.len(), "\r\nfour")]);
     buffer.edit([(0..0, "zero\r\n")]);
-    assert_eq!(buffer.text(), "zero\none\ntwo\nthree\nfour");
+    assert_eq!(buffer.text(), "zero\r\none\r\ntwo\rthree\r\nfour");
     assert_eq!(buffer.line_ending(), LineEnding::Windows);
+    assert_eq!(
+        chunks_with_line_ending(buffer.as_rope(), buffer.line_ending()).collect::<String>(),
+        buffer.text()
+    );
     buffer.check_invariants();
 }
 

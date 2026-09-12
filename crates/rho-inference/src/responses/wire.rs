@@ -124,6 +124,8 @@ senax_encoder::__private::inventory::submit! {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ResponsesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate: Option<bool>,
     pub model: String,
     pub instructions: Arc<str>,
     pub input: Vec<Value>,
@@ -173,6 +175,37 @@ pub(crate) struct ContextManagementRequest {
 }
 
 impl ResponsesRequest {
+    pub(crate) fn luna_default_probe(prompt_cache_key: uuid::Uuid) -> Self {
+        Self {
+            generate: Some(false),
+            model: "gpt-5.6-luna".to_owned(),
+            instructions: Arc::from(""),
+            input: vec![json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [],
+            })],
+            store: Some(false),
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: Some(false),
+            text: Some(TextRequest { verbosity: "low" }),
+            reasoning: Some(ReasoningRequest {
+                context: "all_turns",
+                effort: "medium",
+                summary: "auto",
+            }),
+            service_tier: Some("default"),
+            include: vec!["reasoning.encrypted_content"],
+            prompt_cache_key,
+            context_management: Vec::new(),
+            previous_response_id: None,
+            client_metadata: Some(json!({
+                "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            })),
+        }
+    }
+
     pub(crate) fn from_inference_request(
         session: &SessionConfig,
         request: InferenceRequest,
@@ -214,6 +247,22 @@ impl ResponsesRequest {
         request: InferenceRequest,
         previous_response: Option<(String, usize)>,
     ) -> Self {
+        // Resolve names before incremental replay or compaction hides calls.
+        let tool_names = request
+            .input
+            .iter()
+            .filter_map(|block| match &**block {
+                ContextBlock::InferenceResponse { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|item| match item {
+                InferenceResponseItem::ToolCall { id, name, .. } => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
@@ -239,7 +288,7 @@ impl ResponsesRequest {
             .iter()
             .filter(|item| !matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(item.clone(), &mut input);
+            convert_timeline_item(item.clone(), &tool_names, &mut input);
         }
         // The Responses API requires a manual compaction trigger to be the
         // final input item. Multiple queued requests are equivalent, so
@@ -248,7 +297,7 @@ impl ResponsesRequest {
             .iter()
             .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(WireTimelineItem::CompactionTrigger, &mut input);
+            convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_names, &mut input);
         }
 
         let prompt_cache_key = session
@@ -305,6 +354,7 @@ impl ResponsesRequest {
             .unwrap_or_default();
 
         Self {
+            generate: None,
             model: config.model.as_str().to_owned(),
             instructions,
             input,
@@ -395,14 +445,24 @@ fn append_block_items(
     }
 }
 
-fn convert_timeline_item(item: WireTimelineItem, out: &mut Vec<Value>) {
+fn convert_timeline_item(
+    item: WireTimelineItem,
+    tool_names: &std::collections::HashMap<ToolCallId, ToolName>,
+    out: &mut Vec<Value>,
+) {
     match item {
         WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
         WireTimelineItem::CompactionTrigger => out.push(json!({
             "type": "compaction_trigger",
         })),
-        WireTimelineItem::ToolResult(result) => out.push(convert_tool_result(result)),
-        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(&update)),
+        WireTimelineItem::ToolResult(result) => {
+            let name = tool_names.get(&result.call_id);
+            out.push(convert_tool_result(result, name));
+        }
+        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(
+            &update,
+            tool_names.get(&update.call_id),
+        )),
         WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }
 }
@@ -668,30 +728,58 @@ fn message_phase_wire(phase: MessagePhase) -> &'static str {
     }
 }
 
-fn convert_tool_result(result: ToolResult) -> Value {
+fn convert_tool_result(result: ToolResult, name: Option<&ToolName>) -> Value {
     let output_type = match result.tool_type {
         ToolType::Function => "function_call_output",
         ToolType::Custom => "custom_tool_call_output",
     };
-    json!({
+    let output = if result.body.images.is_empty() {
+        json!(result.body.output.as_ref())
+    } else {
+        use base64::Engine as _;
+        let mut content = Vec::with_capacity(result.body.images.len() + 1);
+        if !result.body.output.is_empty() {
+            content.push(json!({
+                "type": "input_text",
+                "text": result.body.output.as_ref(),
+            }));
+        }
+        content.extend(result.body.images.iter().map(|image| {
+            json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{};base64,{}",
+                    image.media_type,
+                    base64::engine::general_purpose::STANDARD.encode(&image.data)
+                ),
+                "detail": image.detail,
+            })
+        }));
+        Value::Array(content)
+    };
+    let mut item = json!({
         "type": output_type,
         "call_id": result.call_id.as_str(),
-        "output": result.body.output.as_ref(),
-    })
+        "output": output,
+    });
+    if let Some(name) = name {
+        item["name"] = json!(name.as_str());
+    }
+    item
 }
 
-/// An update replays as an extra output item for its call; the API accepts
-/// multiple output items per call_id.
-fn convert_tool_update(update: &rho_core::ToolUpdate) -> Value {
-    let output_type = match update.tool_type {
-        ToolType::Function => "function_call_output",
-        ToolType::Custom => "custom_tool_call_output",
-    };
-    json!({
-        "type": output_type,
-        "call_id": update.call_id.as_str(),
+/// Updates are standalone events, not additional replies to a historical call.
+/// They retain their name even when compaction removes the call from the input.
+fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -> Value {
+    let mut item = json!({
+        "type": "function_call_output",
+        "namespace": "functions",
         "output": update.output.as_ref(),
-    })
+    });
+    if let Some(name) = name {
+        item["name"] = json!(name.as_str());
+    }
+    item
 }
 
 fn convert_tool_spec(tool: ToolSpec) -> Value {

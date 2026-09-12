@@ -49,7 +49,7 @@ fn test_line_endings(cx: &mut gpui::App) {
 
     cx.new(|cx| {
         let mut buffer = Buffer::local("one\r\ntwo\rthree", cx).with_language(rust_lang(), cx);
-        assert_eq!(buffer.text(), "one\ntwo\nthree");
+        assert_eq!(buffer.text(), "one\r\ntwo\rthree");
         assert_eq!(buffer.line_ending(), LineEnding::Windows);
 
         buffer.check_invariants();
@@ -59,7 +59,7 @@ fn test_line_endings(cx: &mut gpui::App) {
             cx,
         );
         buffer.edit([(0..0, "zero\r\n")], None, cx);
-        assert_eq!(buffer.text(), "zero\none\ntwo\nthree\nfour");
+        assert_eq!(buffer.text(), "zero\r\none\r\ntwo\rthree\r\nfour");
         assert_eq!(buffer.line_ending(), LineEnding::Windows);
         buffer.check_invariants();
 
@@ -3867,11 +3867,11 @@ async fn test_preview_edits(cx: &mut TestAppContext) {
     });
 
     let insertion_style = HighlightStyle {
-        background_color: Some(cx.read(|cx| cx.theme().status().created_background)),
+        background_color: Some(cx.read(|cx| cx.theme().status().created_background.into())),
         ..Default::default()
     };
     let deletion_style = HighlightStyle {
-        background_color: Some(cx.read(|cx| cx.theme().status().deleted_background)),
+        background_color: Some(cx.read(|cx| cx.theme().status().deleted_background.into())),
         ..Default::default()
     };
 

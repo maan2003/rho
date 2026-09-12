@@ -420,6 +420,7 @@ impl WebWindowInner {
                     callback(RequestFrameOptions {
                         require_presentation: false,
                         force_render: false,
+                        host_vsync: None,
                     })
                 },
             );

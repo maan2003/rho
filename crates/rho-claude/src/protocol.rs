@@ -147,6 +147,7 @@ impl InputContent {
 pub enum ClaudeEvent {
     Assistant(AssistantMessage),
     CommandLifecycle(CommandLifecycleMessage),
+    ControlRequest(ControlRequestMessage),
     ControlResponse(ControlResponseMessage),
     RateLimitEvent(RateLimitEvent),
     Result(ResultMessage),
@@ -176,6 +177,25 @@ pub struct CommandLifecycleMessage {
     pub state: String,
 }
 
+/// A request the CLI makes of the process driving it. With an SDK-hosted
+/// MCP server registered, every JSON-RPC message for that server arrives
+/// this way and is answered through a `control_response` carrying the same
+/// `request_id`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ControlRequestMessage {
+    pub request_id: String,
+    pub request: ControlRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum ControlRequest {
+    /// A JSON-RPC message for the SDK-hosted MCP server `server_name`.
+    McpMessage { server_name: String, message: Value },
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ControlResponseMessage {
     pub response: ControlResponse,
@@ -195,6 +215,7 @@ pub struct AssistantMessage {
     pub message: AssistantConversationMessage,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
+    pub timestamp: Option<String>,
 }
 
 impl AssistantMessage {
@@ -213,9 +234,12 @@ impl AssistantMessage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssistantConversationMessage {
+    /// The API message's id; every block of the message carries it.
+    pub id: Option<String>,
     pub role: Option<Role>,
     #[serde(default)]
     pub content: Vec<AssistantContent>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -444,7 +468,7 @@ pub enum ContentBlockDelta {
     Other,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -453,7 +477,7 @@ pub struct TokenUsage {
     pub cache_creation: Option<CacheCreationUsage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CacheCreationUsage {
     pub ephemeral_5m_input_tokens: Option<u64>,
     pub ephemeral_1h_input_tokens: Option<u64>,
@@ -488,6 +512,7 @@ pub struct UserOutputMessage {
     pub is_replay: Option<bool>,
     #[serde(rename = "isSynthetic")]
     pub is_synthetic: Option<bool>,
+    pub timestamp: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -508,6 +533,9 @@ pub enum OutputContent {
         content: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+    },
+    Image {
+        source: Value,
     },
     #[serde(other)]
     Other,

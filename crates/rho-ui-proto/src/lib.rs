@@ -8,20 +8,20 @@ use anyhow::{Context as _, bail};
 use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 pub use rho_core::{
-    AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    MessageDelivery,
+    AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
 };
-pub use rho_workset_types::{
+pub use rho_workspaces_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
-    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
+    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
-pub mod desk;
+#[doc(hidden)]
+pub use rho_desk as desk_tree;
+pub mod mirror;
 pub mod realtime;
-pub mod remote;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;
 pub mod shell;
@@ -32,18 +32,94 @@ pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, Worksp
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// Window represented by each point in the agent-cost distribution graph.
+pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
+/// Maximum encoded GUI performance snapshot accepted by the daemon.
+pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/3";
+pub const IROH_ALPN: &[u8] = b"rho/ui/12";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
+const PROTOCOL_LOG_MAGIC: &[u8; 5] = b"RUP12";
 
-/// Fixed per-user daemon socket used by normal CLI and Git helper clients.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePaths {
+    socket: std::path::PathBuf,
+    directory: std::path::PathBuf,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl RuntimePaths {
+    pub const SOCKET_ENV: &'static str = "RHO_SOCKET_PATH";
+
+    pub fn new(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        let socket = match socket {
+            Some(socket) => {
+                let socket = socket.into();
+                if socket.is_absolute() {
+                    socket
+                } else {
+                    std::env::current_dir()
+                        .context("resolve current directory for relative socket path")?
+                        .join(socket)
+                }
+            }
+            None => {
+                let base = dirs::runtime_dir()
+                    .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
+                base.join("rho").join("rho.sock")
+            }
+        };
+        let directory = socket
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_owned();
+        Ok(Self { socket, directory })
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::new(std::env::var_os(Self::SOCKET_ENV).map(std::path::PathBuf::from))
+    }
+
+    pub fn resolve(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        match socket {
+            Some(socket) => Self::new(Some(socket)),
+            None => Self::from_env(),
+        }
+    }
+
+    pub fn socket(&self) -> &std::path::Path {
+        &self.socket
+    }
+
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    pub fn octo_socket(&self) -> std::path::PathBuf {
+        self.directory.join("octo.sock")
+    }
+
+    pub fn browser_socket(&self) -> std::path::PathBuf {
+        self.directory.join("rho-browser.sock")
+    }
+
+    pub fn pr_logs(&self) -> std::path::PathBuf {
+        self.directory.join("pr-logs")
+    }
+
+    pub fn daemon_lock(&self) -> std::path::PathBuf {
+        self.directory.join(".rho-daemon.lock")
+    }
+}
+
+/// Fixed per-user daemon socket used by normal clients.
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
-    let base = dirs::runtime_dir()
-        .or_else(dirs::state_dir)
-        .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
-    Ok(base.join("rho").join("rho.sock"))
+    Ok(RuntimePaths::new(None::<std::path::PathBuf>)?
+        .socket()
+        .to_owned())
 }
 
 /// Message sent from a UI client to the rho daemon.
@@ -51,20 +127,37 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
 pub enum ClientMessage {
     Ping,
     Subscribe,
-    /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
-    DeskSubscribe,
-    /// Fetches the current Desk document text without allocating a replica.
-    DeskGet,
-    /// Subscribes like `DeskSubscribe`, but attributes the allocated replica
-    /// to an agent, so its edits are distinguishable in the CRDT history.
-    DeskSubscribeAgent {
-        agent_id: AgentId,
+    DeskSync {
+        device: desk_tree::cells::DeviceId,
+        known: desk_tree::cells::Version,
+        /// Which store the client counted `known` in, when it holds a
+        /// replica at all. A version is a count of writes per device inside
+        /// one store; carried to another store the same numbers name writes
+        /// that never happened. So a client that comes back holding one
+        /// says whose numbers these are, and a daemon that does not
+        /// recognise the name answers with the whole store rather than a
+        /// difference from a number that was never its own.
+        store: Option<desk_tree::cells::DeviceId>,
+        /// How much of each note's text the client already holds, by note.
+        /// The daemon answers with the operations these lack and leaves
+        /// out the bodies with nothing new in them; a note missing from
+        /// the map is one the client has never held, and comes whole.
+        bodies: std::collections::BTreeMap<desk_tree::cells::Id, desk_tree::cells::BodyVersion>,
     },
-    /// Appends an ordinary Zed text-buffer operation. The operation's
-    /// replica id must match the id assigned by `DeskSnapshot`.
+    /// The client's half of a sync: the cells it holds that the daemon's
+    /// frontier does not cover. The store is the client's, so the daemon
+    /// catches up from it the same way it is caught up from.
+    DeskCellsApply {
+        cells: desk_tree::cells::Snapshot,
+    },
+    DeskMutationApply {
+        mutation: desk_tree::cells::CellMutation,
+    },
+    /// An edit to a note's body, which is the only text the store holds.
     DeskTextApply {
-        operation: desk::DeskOperation,
-        transaction: Option<desk::DeskTransaction>,
+        id: desk_tree::cells::Id,
+        operation: desk_tree::TextOperation,
+        transaction: Option<desk_tree::TextTransaction>,
     },
     NewAgent {
         role: AgentRole,
@@ -72,12 +165,6 @@ pub enum ClientMessage {
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// When present, tag the Desk heading containing this anchor with
-        /// the newly allocated agent's handle.
-        desk_anchor: Option<desk::DeskAnchor>,
-    },
-    SubscribeAgent {
-        agent_id: AgentId,
     },
     SendUserMessage {
         agent_id: AgentId,
@@ -87,10 +174,6 @@ pub enum ClientMessage {
     CompactAgent {
         agent_id: AgentId,
         delivery: MessageDelivery,
-    },
-    RenameAgent {
-        agent_id: AgentId,
-        name: String,
     },
     ChangeAgentRole {
         agent_id: AgentId,
@@ -106,38 +189,10 @@ pub enum ClientMessage {
     ContinueTurn {
         agent_id: AgentId,
     },
-    /// Adds or removes one free-form label on an agent.
-    AgentLabel {
-        agent_id: AgentId,
-        label: String,
-        add: bool,
-    },
-    /// Replaces the stored client view configuration; the daemon keeps the
-    /// bytes opaque and hands them back on [`ServerMessage::Ready`].
-    ViewConfigSet {
-        data: Vec<u8>,
-    },
     /// Enables or disables one provider account namespace on this host.
     SetAuthAccountEnabled {
         name: String,
         enabled: bool,
-    },
-    /// The user's verdict on an agent's last finished turn. Attention is
-    /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
-    /// replying, landing, or hiding do.
-    SetAgentDisposition {
-        agent_id: AgentId,
-        disposition: AgentDisposition,
-    },
-    /// Registers a project, or updates it if `path` is already registered.
-    /// `name` defaults to the path's basename.
-    ProjectSet {
-        path: Utf8PathBuf,
-        name: Option<String>,
-        description: String,
-    },
-    ProjectRemove {
-        path: Utf8PathBuf,
     },
     AcquireLandLease {
         repo: Utf8PathBuf,
@@ -201,10 +256,37 @@ pub enum ClientMessage {
     RealtimeOpen {
         offer_sdp: String,
     },
-    /// Selects the high-weight agent state stream on an iroh connection.
-    /// Ignored on transports that carry agent state in the control session.
+    /// The agents whose live frames this connection wants: the ones on
+    /// screen. Everything durable arrives on the journal regardless, so
+    /// this only decides who streams partial text and tools in flight.
+    /// Replaces the set wholesale; an empty set asks for none.
     AgentStreamFocus {
-        agent_id: Option<AgentId>,
+        agent_ids: Vec<AgentId>,
+    },
+    /// Sent once after [`ServerMessage::Ready`]: the last journal entry
+    /// this client holds for this host (zero for none). The daemon answers
+    /// [`ServerMessage::Log`] pages for everything past it, then follows:
+    /// every later append on any agent is pushed on this connection.
+    Follow {
+        since: mirror::Seq,
+    },
+    /// The bodies of raw events: tool output, a response whole.
+    ///
+    /// One request per chunk of transcript rather than one per call: a
+    /// chunk's tool calls are one `Sent` each (measured at 1.01 results per
+    /// `Sent` over the whole corpus), so asking per call would ask the same
+    /// events over again. The daemon answers one [`ServerMessage::Detail`]
+    /// per position, each naming its own `pos`, so the answers need no order
+    /// and no correlation id.
+    ///
+    /// `pos` is the first position and `more` the rest. A daemon older than
+    /// `more` skips the field it does not know and answers `pos` alone; the
+    /// client draws the bodies it is given and leaves the rest folded.
+    Detail {
+        agent_id: AgentId,
+        pos: mirror::AgentPos,
+        #[senax(default)]
+        more: Vec<mirror::AgentPos>,
     },
     /// Spawns a daemon-owned terminal for an agent: sent as the *first*
     /// message on a fresh stream, like [`ClientMessage::ChannelOpen`].
@@ -299,15 +381,29 @@ pub enum ClientMessage {
         /// snapshot. The daemon supplies their immutable parent side.
         include_paths: Vec<Utf8PathBuf>,
     },
+    /// One-shot request on a fresh stream. The daemon persists this bounded,
+    /// client-produced performance snapshot under its state directory.
+    GuiTelemetryUpload {
+        snapshot: Vec<u8>,
+    },
     /// Requests the daemon account's weekly ChatGPT Codex allowance.
     ChatGptUsage,
     QuotaHistory,
-    AgentUsage {
-        agent_id: AgentId,
-        since_ms: u64,
-    },
     GlobalUsage {
         since_ms: u64,
+    },
+    /// Raw per-agent usage needed to form cost distributions beginning at
+    /// `since_ms`. The daemon includes the fixed trailing-window lookback.
+    AgentCostDistribution {
+        since_ms: u64,
+    },
+    /// Asks which Claude accounts exist and which one agents run on, and
+    /// replies with [`ServerMessage::ClaudeAccounts`].
+    ClaudeAccounts,
+    /// Puts every agent on `name` from its next turn, replying with
+    /// [`ServerMessage::ClaudeAccounts`] as it stands after the switch.
+    SetClaudeAccount {
+        name: String,
     },
     /// Stores an immutable visualization snapshot and replies with
     /// [`ServerMessage::VisualizationRecorded`].
@@ -319,15 +415,6 @@ pub enum ClientMessage {
     /// requested artifact, if it exists, then closes the stream.
     VisualizationGet {
         id: String,
-    },
-    /// Subscribe this UI connection to state snapshots and updates for these
-    /// agents. Loading the backing runtime, when necessary, is daemon policy.
-    SubscribeAgents {
-        agent_ids: Vec<AgentId>,
-    },
-    /// Stop state updates for these agents on this UI connection.
-    UnsubscribeAgents {
-        agent_ids: Vec<AgentId>,
     },
     /// Loads parent-side contents from the immutable operation returned by
     /// [`ClientMessage::DiffSnapshot`]. Replies are bounded and never
@@ -431,9 +518,6 @@ pub enum McpAgentToolRequest {
         advisor_id: String,
         message: String,
     },
-    Wait {
-        timeout_seconds: Option<u64>,
-    },
 }
 
 /// One spawn `workdirs` entry, passed through as the tool surface received
@@ -458,23 +542,21 @@ pub struct McpAgentToolResponse {
 pub enum StartMode {
     /// A fresh workspace in `repo` with a new change on top of the revset.
     /// Clients resolve agent targets to `<workspace name>@` themselves
-    /// (workspace names arrive on [`UiAgentSummary`]).
+    /// (workspace names arrive on the mirror's `Created` event).
     NewOn { repo: Utf8PathBuf, revset: String },
     /// A fresh restricted workspace in `repo` on top of the revset.
     Sandbox { repo: Utf8PathBuf, revset: String },
     /// The SAME workspace as the target: no new checkout — agents share the
     /// directory (and namespace), seeing each other's edits instantly.
-    /// `JoinTarget::User` remains wire-compatible but is rejected until the
-    /// Workset model can fork the host checkout's current change.
+    /// Joining the user means working directly in the user's checkout.
     Join(JoinTarget),
 }
 
 /// Whose workspace [`StartMode::Join`] joins.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum JoinTarget {
-    /// A known workspace, sent back verbatim from [`UiAgentSummary`].
+    /// A known workspace, sent back verbatim from the mirror's `Created`.
     Workspace(WorkspaceInfo),
-    /// Reserved for a future host-checkout-to-Workset fork primitive.
     /// The user's own checkout of `repo`.
     User { repo: Utf8PathBuf },
 }
@@ -500,37 +582,36 @@ pub struct LandLeaseHolder {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
-    DeskSnapshot {
-        snapshot: desk::DeskSnapshot,
-        /// Zed replica id assigned to this user connection. Replica ids make
-        /// body-operation attribution intrinsic to the CRDT history.
-        replica_id: u16,
+    DeskSynced {
+        /// The store this delta was counted in, so a client holding a
+        /// replica can tell whether what it kept is behind this store or
+        /// about a different one. When it does not match what the client
+        /// holds, `delta` is the whole store, not a difference.
+        store: desk_tree::cells::DeviceId,
+        node_namespace: u16,
+        delta: desk_tree::cells::Snapshot,
+        bodies: Vec<desk_tree::cells::BodySnapshot>,
+    },
+    DeskCellsAvailable {
+        frontier: desk_tree::cells::Version,
     },
     DeskTextApplied {
-        record: desk::DeskTextOpRecord,
+        id: desk_tree::cells::Id,
+        operation: desk_tree::TextOperation,
+        transaction: Option<desk_tree::TextTransaction>,
     },
-    /// Reply to `DeskGet`: the materialized document, without a subscription.
-    DeskDocument {
-        text: String,
-    },
+    DeskResyncRequired,
     Ready {
-        agents: Vec<UiAgentSummary>,
-        /// The daemon's hidden Iris coordinator, when it has been created.
-        /// Kept separate from `agents` so clients can render Iris as a
-        /// synthetic surface without admitting it to ordinary agent lists.
-        #[senax(default)]
-        iris_agent: Option<AgentId>,
-        projects: Vec<UiProject>,
         auth: AuthState,
-        /// The client-owned view configuration blob, verbatim from the last
-        /// [`ClientMessage::ViewConfigSet`] (empty if never set).
-        view_config: Vec<u8>,
         /// The daemon database's machine seed; clients need it to encode
         /// agent IDs (see [`AgentIdDomain`]).
         machine_seed: u64,
         /// Last allocated agent-id counter; clients use it for uniform
         /// short-prefix rendering.
         agent_counter: u64,
+        /// How far this host's journal runs, so a client knows how far
+        /// behind it is before it follows.
+        journal_head: mirror::Seq,
     },
     Error {
         message: String,
@@ -544,30 +625,29 @@ pub enum ServerMessage {
         running: bool,
         detail: String,
     },
-    Agent {
+    /// What a runtime has past the log, as it changes, for every agent
+    /// any client is looking at.
+    Live {
         agent_id: AgentId,
-        frame: remote::AgentRemoteFrame,
+        live: mirror::Live,
     },
     AgentCreated {
-        agent_id: AgentId,
-    },
-    AgentSubscribed {
         agent_id: AgentId,
     },
     TurnCancelled {
         agent_id: AgentId,
     },
-    /// An agent's attention level changed; broadcast to every connection so
-    /// rails stay truthful without loading the agent.
-    AgentAttention {
-        agent_id: AgentId,
-        attention: UiAttention,
+    /// A run of the host's journal in order: the answer to
+    /// [`ClientMessage::Follow`], paged, and afterwards every append as it
+    /// lands. Entries never repeat and never skip within one connection.
+    Log {
+        entries: Vec<mirror::LogEntry>,
     },
-    /// The turn-report one-shot classified an agent's finished turn.
-    /// Broadcast so rails can split pending rows into needs-you and FYI.
-    AgentTurnReport {
+    /// The answer to [`ClientMessage::Detail`].
+    Detail {
         agent_id: AgentId,
-        report: UiTurnReport,
+        pos: mirror::AgentPos,
+        body: mirror::DetailBody,
     },
     LandLeaseQueued {
         repo: Utf8PathBuf,
@@ -609,11 +689,6 @@ pub enum ServerMessage {
     },
     RealtimeRefused {
         reason: String,
-    },
-    /// First frame on a daemon-opened iroh unidirectional stream. Every later
-    /// frame on that stream is [`ServerMessage::Agent`] for this agent.
-    AgentStreamOpened {
-        agent_id: AgentId,
     },
     /// Handshake reply on a terminal stream (see
     /// [`ClientMessage::TerminalCreate`] and
@@ -686,6 +761,12 @@ pub enum ServerMessage {
     DiffRefused {
         reason: String,
     },
+    GuiTelemetryStored {
+        path: String,
+    },
+    GuiTelemetryRefused {
+        reason: String,
+    },
     ChatGptUsage {
         used_percent: f64,
         reset_at_unix: i64,
@@ -696,14 +777,15 @@ pub enum ServerMessage {
     QuotaHistory {
         series: Vec<QuotaSeries>,
     },
-    AgentUsage {
-        agent_id: AgentId,
-        model: String,
-        buckets: Vec<AgentUsageBucket>,
-        total: AgentUsageBucket,
-    },
     GlobalUsage {
         series: Vec<AgentUsageSeries>,
+    },
+    AgentCostDistribution {
+        series: Vec<AgentCostSeries>,
+    },
+    ClaudeAccounts {
+        accounts: Vec<String>,
+        current: String,
     },
     VisualizationRecorded {
         id: String,
@@ -716,23 +798,9 @@ pub enum ServerMessage {
     VisualizationRefused {
         reason: String,
     },
-    /// The daemon stopped this connection's live state stream for an agent.
-    /// Clients may retain the last snapshot and subscribe again on demand.
-    AgentUnloaded {
-        agent_id: AgentId,
-        reason: AgentUnloadReason,
-    },
     DiffBaseContents {
         contents: Vec<WorkspaceDiffBaseContent>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum AgentUnloadReason {
-    /// This connection released its subscription.
-    Unsubscribed,
-    /// The daemon evicted a settled runtime under its idle policy.
-    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -781,90 +849,13 @@ pub struct AgentUsageSeries {
     pub buckets: Vec<AgentUsageBucket>,
 }
 
-/// Enough about an agent to list and label it without loading it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiAgentSummary {
+pub struct AgentCostSeries {
+    /// Host-local identity. Clients combining hosts must keep the host in the
+    /// distribution key rather than merging equal counters.
     pub agent_id: AgentId,
-    /// The agent that spawned this one. The GUI uses parent edges to
-    /// present delegated work inline beneath its parent.
-    pub parent_agent: Option<AgentId>,
-    pub display_name: Option<String>,
-    pub created_at: rho_core::UnixMs,
-    pub updated_at: rho_core::UnixMs,
-    /// The opinionated configuration represented by this agent's pinned session
-    /// profile.
-    pub role: AgentRole,
-    /// Where the agent works. Clients resolve start targets against this
-    /// themselves: "on top of agent" is the revset `<ws-id>@`, and
-    /// joining sends the info back verbatim.
-    pub workspace: WorkspaceInfo,
-    /// Attention level at summary time; kept current afterwards by
-    /// [`ServerMessage::AgentAttention`].
-    pub attention: UiAttention,
-    /// When the agent last finished a turn (creation time if it never ran).
-    /// Recency tiebreak for rail sorting; clients keep it current from
-    /// Working broadcasts.
-    pub last_active: rho_core::UnixMs,
-    /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
-    /// immediately instead of waiting out the rail's idle window.
-    pub hidden: bool,
-    /// Durable verdict used by Desk bindings to distinguish replies from
-    /// restaffing without hidden identity state.
-    pub disposition: AgentDisposition,
-    /// One-line snippet of the user's last message; empty if none yet.
-    /// What the work is about, for summaries and naming.
-    #[senax(default)]
-    pub last_user_message_text: String,
-    /// Durable, model-derived current activity. `None` means the agent is
-    /// idle or the sidecar has not produced a label yet.
-    #[senax(default)]
-    pub activity: Option<String>,
-    /// Model-derived classification of the last finished turn; kept current
-    /// afterwards by [`ServerMessage::AgentTurnReport`]. `None` until the
-    /// one-shot lands or after the user re-engages.
-    #[senax(default)]
-    pub turn_report: Option<UiTurnReport>,
-    /// Free-form markers ("pin", …); semantics live in the client's view
-    /// layer.
-    pub labels: Vec<String>,
-}
-
-/// What a finished turn asks of the user, derived by a small model from the
-/// turn's final message. `needs_you` splits the Pending lamp in two: a lit
-/// row that wants engagement versus a dim, dismissable FYI.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiTurnReport {
-    pub needs_you: bool,
-    /// Activity-shaped few-word label of the turn's outcome.
-    pub summary: String,
-}
-
-/// How urgently an agent wants the user, in ascending order — the rail's
-/// whole vocabulary for "which agent needs my focus". Derived by the daemon
-/// from agent state × the persisted disposition; never sent finer-grained
-/// than this (Streaming vs ToolCalling is transcript detail, not attention).
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack,
-)]
-pub enum UiAttention {
-    /// Done, snoozed, never finished a turn, or an unengaged sub-agent
-    /// (whose turns are its parent's court, not the user's).
-    #[default]
-    Quiet,
-    /// A turn is running; the agent's court.
-    Working,
-    /// A turn finished and awaits the user's disposition.
-    Pending,
-    /// Blocked on the user: the turn errored or stopped unfinished.
-    NeedsInput,
-}
-
-/// A registered project available for agent routing, keyed by path.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiProject {
-    pub path: Utf8PathBuf,
-    pub name: String,
-    pub description: String,
+    pub model: String,
+    pub buckets: Vec<AgentUsageBucket>,
 }
 
 /// Daemon-wide authentication settings presented by a GUI host.
@@ -895,6 +886,18 @@ where
     rho_rpc::read_frame(reader, MAX_FRAME_LEN)
         .await
         .map(|(value, _)| value)
+}
+
+/// Read and decode one frame, returning `None` after a cleanly finished
+/// compressed stream at a frame boundary.
+pub async fn read_frame_optional<R, T>(reader: &mut R) -> anyhow::Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+    T: Unpacker,
+{
+    rho_rpc::read_frame_optional(reader, MAX_FRAME_LEN)
+        .await
+        .map(|frame| frame.map(|(value, _)| value))
 }
 
 /// Read and decode one frame with a protocol-specific bound smaller than the
@@ -1083,7 +1086,7 @@ pub fn print_protocol_log(
 fn read_protocol_log_record(
     input: &mut impl std::io::Read,
 ) -> anyhow::Result<Option<(u64, ProtocolLogDirection, Vec<u8>)>> {
-    let mut magic = [0; 4];
+    let mut magic = [0; 5];
     match input.read_exact(&mut magic) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -1119,6 +1122,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_runtime_paths_share_an_absolute_directory() {
+        let paths = RuntimePaths::new(Some("qa/rho.sock")).unwrap();
+
+        assert!(paths.socket().is_absolute());
+        assert_eq!(paths.socket().parent(), Some(paths.directory()));
+        assert_eq!(paths.octo_socket(), paths.directory().join("octo.sock"));
+        assert_eq!(
+            paths.browser_socket(),
+            paths.directory().join("rho-browser.sock")
+        );
+        assert_eq!(paths.pr_logs(), paths.directory().join("pr-logs"));
+        assert_eq!(
+            paths.daemon_lock(),
+            paths.directory().join(".rho-daemon.lock")
+        );
+    }
+
+    #[test]
     fn protocol_log_records_full_length_prefixed_frame() {
         let frame = protocol_frame_bytes(&ClientMessage::Ping).unwrap();
         let mut log = Vec::new();
@@ -1135,6 +1156,88 @@ mod tests {
         let mut payload = &recorded_frame[4..];
         let message: ClientMessage = senax_encoder::unpack(&mut payload).unwrap();
         assert_eq!(message, ClientMessage::Ping);
+    }
+
+    #[test]
+    fn protocol_log_rejects_previous_wire_epoch() {
+        // The previous epoch's magic followed by a record's worth of bytes.
+        let mut old = &b"RUP9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"[..];
+        assert!(read_protocol_log_record(&mut old).is_err());
+    }
+
+    #[test]
+    fn desk_cells_messages_round_trip() {
+        use desk_tree::cells::{
+            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, Uuid, Version,
+        };
+
+        let device = DeviceId([7; 16]);
+        let id = Id::Note(Uuid([9; 16]));
+        let mutation = CellMutation {
+            stamp: Stamp {
+                device,
+                version: 12,
+            },
+            writes: vec![CellWrite {
+                id: id.clone(),
+                property: Property::Labeled {
+                    label: Id::Label(Uuid([3; 16])),
+                    present: true,
+                },
+            }],
+            verdict: None,
+        };
+        let text_operation = desk_tree::TextOperation::Edit {
+            timestamp: desk_tree::TreeClock {
+                value: 1,
+                replica_id: 4,
+            },
+            version: Vec::new(),
+            ranges: vec![(0, 0)],
+            new_text: vec!["note".into()],
+        };
+        for message in [
+            ClientMessage::DeskSync {
+                device,
+                known: Version::from([(device, 11)]),
+                store: Some(device),
+                bodies: std::collections::BTreeMap::from([(
+                    id.clone(),
+                    desk_tree::cells::BodyVersion::from([(4, 1)]),
+                )]),
+            },
+            ClientMessage::DeskMutationApply { mutation },
+            ClientMessage::DeskTextApply {
+                id: id.clone(),
+                operation: text_operation.clone(),
+                transaction: None,
+            },
+        ] {
+            let bytes = senax_encoder::pack(&message).unwrap();
+            let mut slice: &[u8] = &bytes;
+            let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
+            assert_eq!(decoded, message);
+        }
+        let message = ServerMessage::DeskSynced {
+            store: device,
+            node_namespace: 4,
+            delta: desk_tree::cells::Snapshot::default(),
+            bodies: Vec::new(),
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
+
+        let message = ServerMessage::DeskTextApplied {
+            id,
+            operation: text_operation,
+            transaction: None,
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]
@@ -1198,6 +1301,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_cost_distribution_response_round_trips() {
+        let request = ClientMessage::AgentCostDistribution { since_ms: 42 };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
+        let message = ServerMessage::AgentCostDistribution {
+            series: vec![AgentCostSeries {
+                agent_id,
+                model: "gpt".to_owned(),
+                buckets: vec![AgentUsageBucket {
+                    bucket_start_ms: 3_600_000,
+                    output_tokens: 10,
+                    requests: 1,
+                    ..AgentUsageBucket::default()
+                }],
+            }],
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
     fn visualization_messages_round_trip() {
         let request = ClientMessage::RecordVisualization {
             mime_type: "image/svg+xml".to_owned(),
@@ -1224,14 +1354,16 @@ mod tests {
         let agent_id = AgentId::from_counter(1, &AgentIdDomain(7)).unwrap();
         for message in [
             ClientMessage::AgentStreamFocus {
-                agent_id: Some(agent_id),
-            },
-            ClientMessage::AgentStreamFocus { agent_id: None },
-            ClientMessage::SubscribeAgents {
                 agent_ids: vec![agent_id],
             },
-            ClientMessage::UnsubscribeAgents {
-                agent_ids: vec![agent_id],
+            ClientMessage::AgentStreamFocus { agent_ids: vec![] },
+            ClientMessage::Follow {
+                since: mirror::Seq(9),
+            },
+            ClientMessage::Detail {
+                agent_id,
+                pos: mirror::AgentPos(3),
+                more: vec![mirror::AgentPos(4), mirror::AgentPos(9)],
             },
         ] {
             let bytes = senax_encoder::pack(&message).unwrap();
@@ -1240,13 +1372,25 @@ mod tests {
             assert_eq!(message, decoded);
         }
 
-        for message in [
-            ServerMessage::AgentStreamOpened { agent_id },
-            ServerMessage::AgentUnloaded {
-                agent_id,
-                reason: AgentUnloadReason::Idle,
+        for live in [
+            mirror::Live::Requesting,
+            mirror::Live::Item {
+                index: 0,
+                item: mirror::Item::Text {
+                    text: "hel".to_owned(),
+                    phase: Some(mirror::TextPhase::FinalAnswer),
+                },
             },
+            mirror::Live::Appended {
+                index: 0,
+                text: "lo".to_owned(),
+            },
+            mirror::Live::Waiting {
+                until: Some(rho_core::UnixMs(5)),
+            },
+            mirror::Live::Idle,
         ] {
+            let message = ServerMessage::Live { agent_id, live };
             let bytes = senax_encoder::pack(&message).unwrap();
             let mut slice: &[u8] = &bytes;
             let decoded = senax_encoder::unpack(&mut slice).unwrap();
@@ -1359,10 +1503,8 @@ mod tests {
 
     #[test]
     fn diff_manifest_messages_round_trip() {
-        let workspace = WorkspaceInfo::Checkout {
-            workset: "test-workset".into(),
-            repo: "repo".into(),
-            name: "repo".into(),
+        let workspace = WorkspaceInfo::UserCheckout {
+            repo: Utf8PathBuf::from("/repo"),
         };
         let request = ClientMessage::DiffSnapshot {
             workspace,
@@ -1375,10 +1517,8 @@ mod tests {
         assert_eq!(request, decoded);
 
         let request = ClientMessage::DiffBaseContents {
-            workspace: WorkspaceInfo::Checkout {
-                workset: "test-workset".into(),
-                repo: "repo".into(),
-                name: "repo".into(),
+            workspace: WorkspaceInfo::UserCheckout {
+                repo: Utf8PathBuf::from("/repo"),
             },
             operation_id: "operation".to_owned(),
             commit_id: "commit".to_owned(),
@@ -1403,6 +1543,25 @@ mod tests {
                 }],
                 truncated: false,
             },
+        };
+        let bytes = senax_encoder::pack(&response).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn gui_telemetry_messages_round_trip() {
+        let request = ClientMessage::GuiTelemetryUpload {
+            snapshot: br#"{"version":1}"#.to_vec(),
+        };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let response = ServerMessage::GuiTelemetryStored {
+            path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
         };
         let bytes = senax_encoder::pack(&response).unwrap();
         let mut slice: &[u8] = &bytes;

@@ -6,7 +6,8 @@
 //! we display as spaces and where to display custom blocks (like diagnostics).
 //! Seems like a lot? That's because it is. [`DisplayMap`] is conceptually made up
 //! of several smaller structures that form a hierarchy (starting at the bottom):
-//! - [`InlayMap`] that decides where the [`Inlay`]s should be displayed.
+//! - A concealment projection that omits syntax-derived source ranges.
+//! - [`InlayMap`] that composes that projection with the [`Inlay`]s to display.
 //! - [`FoldMap`] that decides where the fold indicators should be; it also tracks parts of a source file that are currently folded.
 //! - [`TabMap`] that keeps track of hard tabs in a buffer.
 //! - [`WrapMap`] that handles soft wrapping.
@@ -25,6 +26,8 @@
 //!   that has two variants:
 //!     - `Isomorphic`, representing a region of text that has no inlay hints (i.e.
 //!       is passed through the map transparently)
+//!     - `Concealed`, representing source text omitted before inlays are
+//!       inserted
 //!     - `Inlay`, representing a location where an inlay hint is to be inserted.
 //! - a `TransformSummary` type, which is usually a struct with two fields:
 //!   [`input: TextSummary`][`TextSummary`] and [`output: TextSummary`][`TextSummary`]. Here,
@@ -70,6 +73,7 @@
 mod dimensions;
 
 mod block_map;
+mod conceal_map;
 mod crease_map;
 mod custom_highlights;
 mod fold_map;
@@ -87,16 +91,23 @@ pub use block_map::{
     StickyHeaderExcerpt,
 };
 pub use crease_map::*;
+#[cfg(feature = "wrap-test-support")]
+pub use fold_map::widening_violation;
 pub use fold_map::{
-    CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId,
-    FoldPlaceholder, FoldPoint,
+    CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder,
+    FoldPoint,
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
 #[cfg(feature = "wrap-test-support")]
 pub use tab_map::TabEdit;
 #[cfg(feature = "wrap-test-support")]
+pub use wrap_map::WrapSyncRecord;
+#[cfg(feature = "wrap-test-support")]
 pub use wrap_map::WrapSyncTrace;
+pub use wrap_map::set_wrap_batch_clock_enabled;
+#[cfg(feature = "wrap-test-support")]
+pub use wrap_map::set_wrap_rows_check_enabled;
 pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
 
 use collections::{HashMap, HashSet, IndexSet};
@@ -395,6 +406,42 @@ impl DisplayMap {
             .update(cx, |wrap_map, _| wrap_map.take_wrap_width_changes())
     }
 
+    /// See [`wrap_map::WrapSyncRecord`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn wrap_sync_records(&self, cx: &gpui::App) -> Vec<wrap_map::WrapSyncRecord> {
+        self.wrap_map.read(cx).sync_records().to_vec()
+    }
+
+    /// Every widened fold edit that stopped describing a range since the
+    /// last time this was asked. See [`FoldMap::take_widening_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_widening_violations(&mut self) -> Vec<String> {
+        self.fold_map.take_widening_violations()
+    }
+
+    /// Every fold sync whose edits did not account for the change in the
+    /// fold map's own output extent since the last time this was asked.
+    /// See [`FoldMap::take_accounting_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_accounting_violations(&mut self) -> Vec<String> {
+        self.fold_map.take_accounting_violations()
+    }
+
+    /// How many fold edits had both ends widened to the end of one and the
+    /// same fold since the last time this was asked. See
+    /// [`FoldMap::take_end_convergences`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_fold_end_convergences(&mut self) -> usize {
+        self.fold_map.take_end_convergences()
+    }
+
+    /// See [`wrap_map::WrapMap::take_sync_violations`].
+    #[cfg(feature = "wrap-test-support")]
+    pub fn take_wrap_sync_violations(&mut self, cx: &mut gpui::App) -> Vec<String> {
+        self.wrap_map
+            .update(cx, |wrap_map, _| wrap_map.take_sync_violations())
+    }
+
     pub fn new(
         buffer: Entity<MultiBuffer>,
         font: Font,
@@ -491,15 +538,13 @@ impl DisplayMap {
             let (snapshot, edits) = self.inlay_map.sync(snapshot, edits.into_inner());
             let (mut writer, snapshot, edits) = self.fold_map.write(snapshot, edits);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-            let (_snapshot, _edits) = self
-                .wrap_map
-                .update(cx, |wrap_map, cx| wrap_map.sync(snapshot, edits, cx));
+            let (_snapshot, _edits) =
+                Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
             let (snapshot, edits) = writer.unfold_intersecting([Anchor::Min..Anchor::Max], true);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-            let (snapshot, _edits) = self
-                .wrap_map
-                .update(cx, |wrap_map, cx| wrap_map.sync(snapshot, edits, cx));
+            let (snapshot, _edits) =
+                Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
             self.block_map.retain_blocks_raw(&mut |block| {
                 !matches!(block.placement, BlockPlacement::Replace(_))
@@ -607,6 +652,27 @@ impl DisplayMap {
         self.row_scales = row_scale_map::RowScaleSnapshot::new(row_scales, &snapshot);
     }
 
+    /// Syncs the wrap map with the row scales this display map holds.
+    ///
+    /// A row takes its scale from the sync that writes it, so every path
+    /// that reaches the wrap map has to hand over the scales first. Folding,
+    /// creasing and unfolding all rewrite rows, and rows a fold rewrites
+    /// between two scale changes would otherwise be laid out at the scale
+    /// the wrap map was last told about — and nothing rewrites them again.
+    fn sync_wrap(
+        wrap_map: &Entity<WrapMap>,
+        row_scales: &row_scale_map::RowScaleSnapshot,
+        snapshot: TabSnapshot,
+        edits: Vec<tab_map::TabEdit>,
+        cx: &mut App,
+    ) -> (WrapSnapshot, WrapPatch) {
+        let row_scales = row_scales.clone();
+        wrap_map.update(cx, |map, cx| {
+            map.set_row_scales(row_scales);
+            map.sync(snapshot, edits, cx)
+        })
+    }
+
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
         let tab_size = Self::tab_size(&self.buffer, cx);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
@@ -615,11 +681,7 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let row_scales = self.row_scales.clone();
-        self.wrap_map.update(cx, |map, cx| {
-            map.set_row_scales(row_scales);
-            map.sync(snapshot, edits, cx)
-        })
+        Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx)
     }
 
     fn with_synced_companion_mut<R>(
@@ -762,7 +824,6 @@ impl DisplayMap {
                         fold.range.to_offset(other.buffer_snapshot()),
                         fold.placeholder.clone(),
                     )
-                    .with_elision_policy(fold.elision_policy)
                 })
                 .collect(),
             cx,
@@ -791,20 +852,16 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot.clone(), edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let inline = creases.iter().filter_map(|crease| {
             if let Crease::Inline {
-                range,
-                placeholder,
-                elision_policy,
-                ..
+                range, placeholder, ..
             } = crease
             {
-                Some((range.clone(), placeholder.clone(), *elision_policy))
+                Some((range.clone(), placeholder.clone()))
             } else {
                 None
             }
@@ -812,9 +869,8 @@ impl DisplayMap {
         let (snapshot, edits) = fold_map.fold(inline);
 
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         let blocks = creases
             .into_iter()
@@ -869,16 +925,14 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) = fold_map.remove_folds(ranges, type_id);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .write(self_new_wrap_snapshot, self_new_wrap_edits, None);
@@ -901,25 +955,56 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let inline = creases.into_iter().filter_map(|crease| match crease {
             Crease::Inline {
-                range,
-                placeholder,
-                elision_policy,
-                ..
-            } => Some((range, placeholder, elision_policy)),
+                range, placeholder, ..
+            } => Some((range, placeholder)),
             Crease::Block { .. } => None,
         });
         let (snapshot, edits) = fold_map.replace_folds_with_type(type_id, inline);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        self.block_map.write(snapshot, edits, None);
+    }
+
+    /// Replaces syntax-derived source concealments. These are composed before
+    /// inlays and user folds, so tab stops and wrapping are calculated from the
+    /// text the user actually sees.
+    pub fn replace_concealments(
+        &mut self,
+        ranges: Vec<Range<MultiBufferOffset>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.companion().is_some() {
+            return;
+        }
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        if self.inlay_map.concealments_match(ranges.clone()) {
+            return;
+        }
+        let buffer_edits = self.buffer_subscription.consume().into_inner();
+        let tab_size = Self::tab_size(&self.buffer, cx);
+
+        let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, buffer_edits);
+        let (snapshot, edits) = self.fold_map.read(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
+        self.block_map.read(snapshot, edits, None);
+
+        let (snapshot, edits) = self.inlay_map.replace_concealments(ranges);
+        if edits.is_empty() {
+            return;
+        }
+        let (snapshot, edits) = self.fold_map.read(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.write(snapshot, edits, None);
     }
 
@@ -942,17 +1027,15 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) =
             fold_map.unfold_intersecting(offset_ranges.iter().cloned(), inclusive);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .write(self_new_wrap_snapshot.clone(), self_new_wrap_edits, None)
@@ -1383,6 +1466,61 @@ impl DisplayMap {
         }
     }
 
+    /// Replaces a key's highlights inside one anchor range, leaving the
+    /// rest of the key's list alone.
+    ///
+    /// [`Self::highlight_text`] replaces a key's whole list, so a caller
+    /// that re-highlights one page of a document has to hand over every
+    /// range in the document to keep the others. This takes the page: the
+    /// existing ranges lying within `within` go, the new ones take their
+    /// place, and the list stays sorted without being sorted again. Cost
+    /// is a binary search and the ranges spliced, not the list.
+    ///
+    /// The style is the key's, as it is for `highlight_text`: the last
+    /// caller's style wins for every range under the key.
+    ///
+    /// The list is assumed sorted by start and non-overlapping, which is
+    /// what `highlight_text` leaves behind. A key whose ranges nest would
+    /// need a scan rather than the second binary search.
+    #[instrument(skip_all)]
+    pub fn highlight_text_in_range(
+        &mut self,
+        key: HighlightKey,
+        within: Range<Anchor>,
+        mut ranges: Vec<Range<Anchor>>,
+        style: HighlightStyle,
+        cx: &App,
+    ) {
+        let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        ranges.sort_by(|a, b| a.start.cmp(&b.start, &multi_buffer_snapshot));
+        match Arc::make_mut(&mut self.text_highlights).entry(key) {
+            Entry::Occupied(mut slot) => match Arc::get_mut(slot.get_mut()) {
+                Some((previous_style, previous_ranges)) => {
+                    *previous_style = style;
+                    splice_highlights_within(
+                        previous_ranges,
+                        &within,
+                        ranges,
+                        &multi_buffer_snapshot,
+                    );
+                }
+                None => {
+                    let mut previous_ranges = slot.get().1.clone();
+                    splice_highlights_within(
+                        &mut previous_ranges,
+                        &within,
+                        ranges,
+                        &multi_buffer_snapshot,
+                    );
+                    slot.insert(Arc::new((style, previous_ranges)));
+                }
+            },
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::new((style, ranges)));
+            }
+        }
+    }
+
     #[instrument(skip_all)]
     pub(crate) fn highlight_inlays(
         &mut self,
@@ -1472,17 +1610,15 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
         self.block_map.read(snapshot, edits, None);
 
         let (snapshot, edits) = fold_map.update_fold_widths(widths);
         let widths_changed = !edits.is_empty();
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         self.block_map
             .read(self_new_wrap_snapshot, self_new_wrap_edits, None);
@@ -1517,9 +1653,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (snapshot, edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (snapshot, edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         {
             let companion_ref = self.companion.as_ref().map(|(_, c)| c.read(cx));
@@ -1534,9 +1669,8 @@ impl DisplayMap {
         let (snapshot, edits) = self.inlay_map.splice(to_remove, to_insert);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let (self_new_wrap_snapshot, self_new_wrap_edits) = self
-            .wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        let (self_new_wrap_snapshot, self_new_wrap_edits) =
+            Self::sync_wrap(&self.wrap_map, &self.row_scales, snapshot, edits, cx);
 
         let (self_wrap_snapshot, self_wrap_edits) =
             (self_new_wrap_snapshot.clone(), self_new_wrap_edits.clone());
@@ -1582,14 +1716,31 @@ impl DisplayMap {
         }
     }
 
-    #[cfg(test)]
-    pub fn is_rewrapping(&self, cx: &gpui::App) -> bool {
+    pub(crate) fn is_rewrapping(&self, cx: &gpui::App) -> bool {
         self.wrap_map.read(cx).is_rewrapping()
     }
 
     pub fn invalidate_semantic_highlights(&mut self, buffer_id: BufferId) {
         Arc::make_mut(&mut self.semantic_token_highlights).remove(&buffer_id);
     }
+}
+
+/// Replaces the ranges lying within `within` with `ranges`, in place.
+///
+/// Both lists are sorted by start. The first bound is the first existing
+/// range starting at or after `within.start`; the second is the first one
+/// after it that reaches past `within.end`. A range straddling either end
+/// of `within` is not within it and stays.
+fn splice_highlights_within(
+    existing: &mut Vec<Range<Anchor>>,
+    within: &Range<Anchor>,
+    ranges: Vec<Range<Anchor>>,
+    snapshot: &MultiBufferSnapshot,
+) {
+    let start = existing.partition_point(|range| range.start.cmp(&within.start, snapshot).is_lt());
+    let end = start
+        + existing[start..].partition_point(|range| range.end.cmp(&within.end, snapshot).is_le());
+    existing.splice(start..end, ranges);
 }
 
 #[derive(Debug, Default)]
@@ -1662,7 +1813,9 @@ impl<'a> HighlightedChunk<'a> {
                 chunks.next();
                 let (prefix, suffix) = text.split_at(chunk.len());
                 text = suffix;
-                if let Some(replacement) = replacement(ch) {
+                if renderer.is_none()
+                    && let Some(replacement) = replacement(ch)
+                {
                     let invisible_highlight = HighlightStyle {
                         background_color: Some(editor_style.status.hint_background.into()),
                         underline: Some(UnderlineStyle {
@@ -1971,7 +2124,15 @@ impl DisplaySnapshot {
     }
 
     /// The multiple of the editor's font size this row renders at.
+    ///
+    /// Which row of the buffer a display row came from is a walk down every
+    /// map, and the caller asks for one per visible row per frame. A surface
+    /// that scales no row -- every surface but the agent transcript -- has
+    /// the same answer for all of them, so it does not take the walk.
     pub fn row_scale(&self, row: DisplayRow) -> f32 {
+        if self.row_scales.is_empty() {
+            return 1.0;
+        }
         let point = self.display_point_to_point(DisplayPoint::new(row, 0), Bias::Left);
         self.row_scales
             .scale_for_buffer_row(self.buffer_snapshot(), point.row)
@@ -2456,10 +2617,9 @@ impl DisplaySnapshot {
         for _ in 0..8 {
             let mut stepped = None;
             for fold in self.folds_in_range(
-                buffer_snapshot.clip_offset(
-                    MultiBufferOffset(offset.0.saturating_sub(1)),
-                    Bias::Left,
-                )..offset,
+                buffer_snapshot
+                    .clip_offset(MultiBufferOffset(offset.0.saturating_sub(1)), Bias::Left)
+                    ..offset,
             ) {
                 let range = fold.range.start.to_offset(buffer_snapshot)
                     ..fold.range.end.to_offset(buffer_snapshot);
@@ -2735,14 +2895,12 @@ impl DisplaySnapshot {
                 Crease::Inline {
                     range,
                     placeholder,
-                    elision_policy,
                     render_toggle,
                     render_trailer,
                     metadata,
                 } => Some(Crease::Inline {
                     range: range.to_point(self.buffer_snapshot()),
                     placeholder: placeholder.clone(),
-                    elision_policy: *elision_policy,
                     render_toggle: render_toggle.clone(),
                     render_trailer: render_trailer.clone(),
                     metadata: metadata.clone(),
@@ -2832,7 +2990,6 @@ impl DisplaySnapshot {
             Some(Crease::Inline {
                 range: start..end,
                 placeholder: self.fold_placeholder.clone(),
-                elision_policy: ElisionPolicy::Hidden,
                 render_toggle: None,
                 render_trailer: None,
                 metadata: None,
@@ -4733,6 +4890,112 @@ pub mod tests {
             ),
             None,
         );
+    }
+
+    /// Re-highlighting one page leaves the other pages' ranges standing.
+    ///
+    /// This is the whole point of the call: a caller with a highlight over
+    /// a long document and a page of it to redo hands over the page, not
+    /// the document.
+    #[gpui::test]
+    fn test_highlight_text_in_range_replaces_only_that_range(cx: &mut gpui::App) {
+        init_test(cx, &|_| {});
+        let text = "aaaa\nbbbb\ncccc\ndddd\neeee";
+        let buffer = MultiBuffer::build_simple(text, cx);
+        let snapshot = buffer.read(cx).snapshot(cx);
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer.clone(),
+                font("Courier"),
+                px(16.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+
+        // One range on each of the five rows.
+        let row = |row: u32, start: u32, end: u32| {
+            snapshot.anchor_before(Point::new(row, start))
+                ..snapshot.anchor_after(Point::new(row, end))
+        };
+        let starts = |map: &DisplayMap| {
+            map.text_highlights
+                .get(&HighlightKey::Editor)
+                .expect("the key was highlighted")
+                .1
+                .iter()
+                .map(|range| range.start.to_point(&snapshot))
+                .collect::<Vec<_>>()
+        };
+
+        map.update(cx, |map, cx| {
+            map.highlight_text(
+                HighlightKey::Editor,
+                vec![
+                    row(0, 0, 1),
+                    row(1, 0, 1),
+                    row(2, 0, 1),
+                    row(3, 0, 1),
+                    row(4, 0, 1),
+                ],
+                gpui::red().to_rgb().into(),
+                false,
+                cx,
+            );
+        });
+
+        // Redo the middle row only, with two ranges where there was one.
+        map.update(cx, |map, cx| {
+            map.highlight_text_in_range(
+                HighlightKey::Editor,
+                snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 4)),
+                vec![row(2, 1, 2), row(2, 3, 4)],
+                gpui::red().to_rgb().into(),
+                cx,
+            );
+        });
+
+        map.update(cx, |map, _| {
+            assert_eq!(
+                starts(map),
+                vec![
+                    Point::new(0, 0),
+                    Point::new(1, 0),
+                    Point::new(2, 1),
+                    Point::new(2, 3),
+                    Point::new(3, 0),
+                    Point::new(4, 0),
+                ],
+                "the page's ranges are replaced, the rows around it stand, and the list stays sorted"
+            );
+        });
+
+        // A page with nothing new in it empties that page and only it.
+        map.update(cx, |map, cx| {
+            map.highlight_text_in_range(
+                HighlightKey::Editor,
+                snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 4)),
+                Vec::new(),
+                gpui::red().to_rgb().into(),
+                cx,
+            );
+        });
+
+        map.update(cx, |map, _| {
+            assert_eq!(
+                starts(map),
+                vec![
+                    Point::new(0, 0),
+                    Point::new(1, 0),
+                    Point::new(3, 0),
+                    Point::new(4, 0),
+                ],
+            );
+        });
     }
 
     #[test]

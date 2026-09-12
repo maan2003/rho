@@ -1,0 +1,36 @@
+# The files a daemon-owned workspace shows: buffers opened over rho's bounded
+# file protocol (the daemon owns disk IO, the GUI owns unsaved edits) and the
+# diff of a workspace against its base. Owned by no workspace; the window
+# shows both.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-files"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+buffer_diff.workspace = true
+camino.workspace = true
+clock = { path = "../../vendor/zed/crates/clock" }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+futures.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+language = { path = "../../vendor/zed/crates/language" }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+path = { path = "../../vendor/zed/crates/path" }
+rho-hosts = { workspace = true }
+rho-rpc = { workspace = true, features = ["native-client"] }
+rho-ui-proto.workspace = true
+rho-window = { workspace = true }
+text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
+tracing.workspace = true
+
+[dev-dependencies]
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }

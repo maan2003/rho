@@ -747,9 +747,8 @@ impl FromIterator<char> for LineIndent {
 
 impl Buffer {
     pub fn new(replica_id: ReplicaId, remote_id: BufferId, base_text: impl Into<String>) -> Buffer {
-        let mut base_text = base_text.into();
+        let base_text = base_text.into();
         let line_ending = LineEnding::detect(&base_text);
-        LineEnding::normalize(&mut base_text);
         Self::new_normalized(replica_id, remote_id, line_ending, Rope::from(&*base_text))
     }
 
@@ -1803,8 +1802,6 @@ impl Buffer {
             fragment_summary.text.deleted,
             self.snapshot.deleted_text.len()
         );
-
-        assert!(!self.text().contains("\r\n"));
     }
 
     pub fn random_byte_range(&self, start_offset: usize, rng: &mut impl rand::Rng) -> Range<usize> {
@@ -1965,7 +1962,6 @@ impl BufferSnapshot {
 
         let mut fragment_start = old_fragments.start().visible;
         for (range, new_text) in edits {
-            let new_text: Arc<str> = LineEnding::normalize_arc(new_text);
             let fragment_end = old_fragments.end().visible;
 
             if fragment_end < range.start {
@@ -2135,6 +2131,50 @@ impl BufferSnapshot {
         }
 
         rope
+    }
+
+    /// Returns whether sorted CRDT full offsets exist at `version` and fall on
+    /// UTF-8 boundaries. Remote edit ranges must be checked before they are
+    /// used to slice the fragment tree.
+    pub fn are_valid_full_offsets_for_version(
+        &self,
+        offsets: impl IntoIterator<Item = FullOffset>,
+        version: &clock::Global,
+    ) -> bool {
+        let mut offsets = offsets.into_iter().peekable();
+        let mut cursor = self.fragments.cursor::<FragmentTextSummary>(&None);
+        cursor.next();
+        let mut versioned_start = 0;
+        while let Some(fragment) = cursor.item() {
+            if version.observed(fragment.timestamp) {
+                let versioned_end = versioned_start + fragment.len as usize;
+                while offsets
+                    .peek()
+                    .is_some_and(|offset| offset.0 <= versioned_end)
+                {
+                    let offset = offsets.next().unwrap();
+                    if offset.0 < versioned_start {
+                        return false;
+                    }
+                    if offset.0 == versioned_start || offset.0 == versioned_end {
+                        continue;
+                    }
+                    let local = offset.0 - versioned_start;
+                    let start = cursor.start();
+                    let boundary = if fragment.visible {
+                        self.visible_text.is_char_boundary(start.visible + local)
+                    } else {
+                        self.deleted_text.is_char_boundary(start.deleted + local)
+                    };
+                    if !boundary {
+                        return false;
+                    }
+                }
+                versioned_start = versioned_end;
+            }
+            cursor.next();
+        }
+        offsets.all(|offset| offset.0 == versioned_start)
     }
 
     pub fn remote_id(&self) -> BufferId {
@@ -3666,8 +3706,15 @@ impl LineEnding {
     }
 }
 
-pub fn chunks_with_line_ending(rope: &Rope, line_ending: LineEnding) -> impl Iterator<Item = &str> {
-    rope.chunks().flat_map(move |chunk| {
+pub fn chunks_with_line_ending(
+    rope: &Rope,
+    line_ending: LineEnding,
+) -> Box<dyn Iterator<Item = &str> + Send + '_> {
+    if rope.chunks().any(|chunk| chunk.contains('\r')) {
+        return Box::new(rope.chunks());
+    }
+
+    Box::new(rope.chunks().flat_map(move |chunk| {
         let mut newline = false;
         let end_with_newline = chunk.ends_with('\n').then_some(line_ending.as_str());
         chunk
@@ -3682,7 +3729,7 @@ pub fn chunks_with_line_ending(rope: &Rope, line_ending: LineEnding) -> impl Ite
                 ending.into_iter().chain([line])
             })
             .chain(end_with_newline)
-    })
+    }))
 }
 
 #[cfg(debug_assertions)]

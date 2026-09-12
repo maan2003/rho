@@ -31,6 +31,17 @@ pub struct Paste {
 
 impl Vim {
     pub fn paste(&mut self, action: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_editor(cx, |_, editor, cx| {
+            editor.dispatch_semantic_row_action(
+                editor::SemanticRowAction::Paste {
+                    before: action.before,
+                },
+                cx,
+            )
+        }) == Some(true)
+        {
+            return;
+        }
         self.record_current_action(cx);
         self.store_visual_marks(window, cx);
         let count = Vim::take_count(cx).unwrap_or(1);

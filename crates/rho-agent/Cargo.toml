@@ -6,32 +6,29 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-default = ["code-mode"]
-code-mode = ["dep:rho-code-mode"]
-
 [dependencies]
 anyhow.workspace = true
 async-stream.workspace = true
+base64.workspace = true
 bytes = "1"
 camino.workspace = true
 chrono = "0.4"
 dirs.workspace = true
 futures.workspace = true
-jj-cli.workspace = true
-jj-lib.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
 redb-derive = "0.1"
+rho-agent-tools.workspace = true
 rho-claude.workspace = true
-rho-code-mode = { workspace = true, optional = true }
 rho-context-config.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
+rho-image.workspace = true
 rho-tool-shell.workspace = true
-rho-workset.workspace = true
+rho-ui-proto.workspace = true
+rho-workspaces.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }
 serde.workspace = true
@@ -41,3 +38,4 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

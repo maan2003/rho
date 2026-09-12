@@ -13,13 +13,20 @@ struct DeskFixture {
     multi_buffer: Entity<MultiBuffer>,
     composition: Composition,
     spec: CompositionSpec,
+    row_buffers: Vec<Entity<Buffer>>,
 }
 
 fn desk_sizes() -> Vec<usize> {
-    vec![10, 50, 150]
+    // 1,000 headings × (three document rows + two generated rows) matches the
+    // roughly 4,850 displayed rows in the largest production capture.
+    vec![10, 150, 500, 1_000]
 }
 
-fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppContext) -> DeskFixture {
+fn build_desk(
+    heading_count: usize,
+    rows_per_heading: usize,
+    cx: &mut BenchAppContext,
+) -> DeskFixture {
     let mut text = String::new();
     let mut cut_positions = Vec::new();
     for index in 0..heading_count {
@@ -34,20 +41,27 @@ fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppCo
     let host = cx.update(|cx| cx.new(|cx| Buffer::local(text, cx)));
 
     let mut cuts = Vec::new();
+    let mut row_buffers = Vec::new();
     for (index, position) in cut_positions.iter().enumerate() {
         let rows = (0..rows_per_heading)
-            .map(|row| RowSpec {
-                id: (index * rows_per_heading + row + 1) as u64,
-                buffer: cx.update(|cx| {
+            .map(|row| {
+                let buffer = cx.update(|cx| {
                     cx.new(|cx| {
                         let mut buffer = Buffer::local(
-                            format!("· agent-{index}-{row} — working on part {row} of topic {index}"),
+                            format!(
+                                "· agent-{index}-{row} — working on part {row} of topic {index}"
+                            ),
                             cx,
                         );
                         buffer.set_capability(Capability::Read, cx);
                         buffer
                     })
-                }),
+                });
+                row_buffers.push(buffer.clone());
+                RowSpec {
+                    id: (index * rows_per_heading + row + 1) as u64,
+                    buffer,
+                }
             })
             .collect();
         cuts.push(CutSpec {
@@ -70,6 +84,8 @@ fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppCo
     let spec = CompositionSpec {
         sections: vec![SectionSpec {
             host,
+            start: 0,
+            end: None,
             lead: Vec::new(),
             cuts,
         }],
@@ -90,6 +106,7 @@ fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppCo
         multi_buffer,
         composition,
         spec,
+        row_buffers,
     }
 }
 
@@ -128,6 +145,29 @@ fn desk_composition_render(heading_count: &usize, cx: &mut BenchAppContext) {
             editor.move_up(&MoveUp, window, cx);
         }
         move_down = !move_down;
+    });
+}
+
+#[gpui::bench(
+    inputs = desk_sizes(),
+    group = "Desk composition offscreen streaming",
+    input_name = "headings",
+    sample_size = 10
+)]
+fn desk_composition_offscreen_streaming(heading_count: &usize, cx: &mut BenchAppContext) {
+    init_context(cx);
+    let fixture = build_desk(*heading_count, 2, cx);
+    let row = fixture.row_buffers.last().unwrap().clone();
+    let mut window = cx.add_empty_window();
+    let editor = build_editor(&mut window, fixture.multi_buffer.clone());
+
+    let mut tick = false;
+    cx.bench_renderer(editor, move |_, _, cx| {
+        tick = !tick;
+        row.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(len - 1..len, if tick { "x" } else { "y" })], None, cx);
+        });
     });
 }
 
@@ -216,6 +256,7 @@ fn init_context(cx: &mut BenchAppContext) {
 gpui::bench_group!(
     benches,
     desk_composition_render,
+    desk_composition_offscreen_streaming,
     desk_composition_typing,
     desk_composition_resync_noop,
     desk_composition_structural

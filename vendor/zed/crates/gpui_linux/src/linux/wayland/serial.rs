@@ -1,6 +1,6 @@
 use collections::HashMap;
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum SerialKind {
     DataDevice,
     InputMethod,
@@ -34,6 +34,12 @@ pub(crate) struct SerialTracker {
     selection_serial: Option<SelectionSerial>,
 }
 
+pub(crate) struct SerialSnapshot {
+    kind: SerialKind,
+    serial: Option<Serial>,
+    selection_serial: Option<SelectionSerial>,
+}
+
 impl SerialTracker {
     pub fn new() -> Self {
         Self {
@@ -50,6 +56,26 @@ impl SerialTracker {
         }
 
         self.serials.insert(kind, serial);
+    }
+
+    pub fn update_scoped(&mut self, kind: SerialKind, value: u32) -> SerialSnapshot {
+        let serial = self.serials.get(&kind).copied();
+        let selection_serial = self.selection_serial;
+        self.update(kind, value);
+        SerialSnapshot {
+            kind,
+            serial,
+            selection_serial,
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: SerialSnapshot) {
+        if let Some(serial) = snapshot.serial {
+            self.serials.insert(snapshot.kind, serial);
+        } else {
+            self.serials.remove(&snapshot.kind);
+        }
+        self.selection_serial = snapshot.selection_serial;
     }
 
     /// Returns the latest tracked serial of the provided [`SerialKind`].

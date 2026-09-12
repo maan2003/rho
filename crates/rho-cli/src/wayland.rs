@@ -13,11 +13,20 @@ use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
+mod pointer;
+
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTPUT_WIDTH: u32 = 2560;
 const DEFAULT_OUTPUT_HEIGHT: u32 = 1664;
 const DEFAULT_OUTPUT_SCALE: u32 = 2;
+// A new wtype process creates a new virtual keyboard. Give the compositor time
+// to advertise its keymap and keyboard-enter before sending the first press;
+// otherwise that press is represented only in wl_keyboard.enter and clients
+// such as GPUI (correctly) never receive it as a key event.
+const VIRTUAL_KEYBOARD_SETTLE_MS: u32 = 50;
+const KEY_SEQUENCE_DELAY_MS: u32 = 30;
+const VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS: u32 = 50;
 const SWAY: &str = match option_env!("RHO_WAYLAND_SWAY") {
     Some(path) => path,
     None => "sway",
@@ -83,8 +92,17 @@ enum DriverCommand {
     },
     /// Type literal text through the virtual keyboard protocol.
     Type { text: String },
-    /// Send a key or chord, for example `enter` or `ctrl+shift+p`.
+    /// Run key, text, and wait steps through one persistent virtual keyboard.
+    /// Steps use `key:CHORD`, `text:TEXT`, `down:MODIFIER`, `up:MODIFIER`,
+    /// or `wait:MILLISECONDS`. `down:`/`up:` hold a modifier across the
+    /// steps between them, which is how a held `shift` is driven.
+    Input { steps: Vec<String> },
+    /// Send keys or chords in one keyboard session, for example `enter`,
+    /// `ctrl+shift+p`, or `escape g g`.
     Key { chord: String },
+    /// Name the drive that follows. Every step after this line is counted
+    /// against this name, so a report can say which recipe produced it.
+    Drive { name: String },
     /// Stop the application and compositor and remove the session directory.
     Stop,
 }
@@ -97,11 +115,14 @@ enum MouseButton {
 }
 
 impl MouseButton {
-    fn sway_name(self) -> &'static str {
+    /// The `linux/input-event-codes.h` code the virtual pointer protocol
+    /// wants. Sway's own names (`button1`) belong to its ipc, which is not
+    /// how a click reaches a client here.
+    fn code(self) -> u32 {
         match self {
-            Self::Left => "button1",
-            Self::Right => "button3",
-            Self::Middle => "button2",
+            Self::Left => pointer::BTN_LEFT,
+            Self::Right => pointer::BTN_RIGHT,
+            Self::Middle => pointer::BTN_MIDDLE,
         }
     }
 }
@@ -181,31 +202,88 @@ pub(crate) fn run(args: WaylandArgs) -> Result<()> {
         DriverCommand::Screenshot { output } => screenshot(&root, &output),
         DriverCommand::Move { x, y } => {
             let session = load_live_session(&root)?;
-            move_pointer(&session, x, y)
+            let mut pointer = virtual_pointer(&session, x, y)?;
+            record_step(&base, &args.session, &format!("move {x} {y}"));
+            pointer.move_to(x as u32, y as u32)
         }
         DriverCommand::Click { x, y, button } => {
             let session = load_live_session(&root)?;
-            move_pointer(&session, x, y)?;
-            sway_command(
-                &session,
-                &format!("seat seat0 cursor press {}", button.sway_name()),
-            )?;
-            sway_command(
-                &session,
-                &format!("seat seat0 cursor release {}", button.sway_name()),
-            )
+            let mut pointer = virtual_pointer(&session, x, y)?;
+            pointer.move_to(x as u32, y as u32)?;
+            record_step(&base, &args.session, &format!("click {x} {y}"));
+            pointer.click(button.code())
         }
         DriverCommand::Type { text } => {
             let session = load_live_session(&root)?;
-            run_wayland_command(&session, WTYPE, [OsString::from("--"), text.into()])
+            record_step(
+                &base,
+                &args.session,
+                &format!("type {} chars", text.chars().count()),
+            );
+            run_wayland_command(&session, WTYPE, wtype_text_args(text))
+        }
+        DriverCommand::Input { steps } => {
+            let session = load_live_session(&root)?;
+            let wtype = wtype_input_args(&steps)?;
+            // One `input` is one step of a drive however many keys it holds:
+            // it is one thing the reader did.
+            record_step(&base, &args.session, &format!("input {}", steps.join(" ")));
+            run_wayland_command(&session, WTYPE, wtype)
         }
         DriverCommand::Key { chord } => {
             let session = load_live_session(&root)?;
-            let args = wtype_key_args(&chord)?;
-            run_wayland_command(&session, WTYPE, args)
+            let wtype = wtype_key_args(&chord)?;
+            record_step(&base, &args.session, &format!("key {chord}"));
+            run_wayland_command(&session, WTYPE, wtype)
+        }
+        DriverCommand::Drive { name } => {
+            record_drive(&base, &args.session, &name);
+            Ok(())
         }
         DriverCommand::Stop => stop(&root),
     }
+}
+
+/// Where a session's drive log lives: beside the session directory, not
+/// inside it, because `stop` removes the directory and the log is the part
+/// that has to outlive the run.
+fn drive_log(base: &Path, session: &str) -> PathBuf {
+    base.join(format!("{session}-drive.log"))
+}
+
+/// One line per thing the reader did, so a report can say how long a drive
+/// was rather than only how fast its frames were. A number with no drive
+/// behind it cannot be compared with another number, and two runs of
+/// different lengths are not two readings of the same thing.
+///
+/// Recording a step must never fail a step: a driver that refuses to press a
+/// key because it could not write a log line is worse than a log with a gap
+/// in it, so every error here is dropped on purpose.
+fn record_step(base: &Path, session: &str, step: &str) {
+    append_drive_line(base, session, "step", step);
+}
+
+/// The name of the drive the steps after it belong to. A run may name
+/// several in turn; the report reads the last one and the steps under it.
+fn record_drive(base: &Path, session: &str, name: &str) {
+    append_drive_line(base, session, "drive", name);
+}
+
+fn append_drive_line(base: &Path, session: &str, kind: &str, what: &str) {
+    use std::io::Write as _;
+
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    // Escaped by hand rather than through serde: this is two strings and a
+    // number, and the driver is on the path of every key press.
+    let what = what.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!("{{\"at_ms\":{at_ms},\"{kind}\":\"{what}\"}}\n");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(drive_log(base, session))
+        .and_then(|mut file| file.write_all(line.as_bytes()));
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -471,9 +549,16 @@ fn screenshot(root: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn move_pointer(session: &Session, x: i32, y: i32) -> Result<()> {
-    let logical_width = session.width / session.scale;
-    let logical_height = session.height / session.scale;
+/// A virtual pointer on the session's seat, with the coordinates checked
+/// against the output first so a typo is an error rather than a click on the
+/// nearest edge.
+///
+/// The device lives as long as the returned value, which is one command: a
+/// headless seat has no pointer of its own, and leaving one attached between
+/// commands would mean every run of the driver changed what the seat's
+/// capabilities said.
+fn virtual_pointer(session: &Session, x: i32, y: i32) -> Result<pointer::Pointer> {
+    let (logical_width, logical_height) = logical_output_size(session)?;
     if x < 0 || y < 0 || x >= logical_width as i32 || y >= logical_height as i32 {
         bail!(
             "coordinates ({x}, {y}) are outside {}x{} output",
@@ -481,15 +566,55 @@ fn move_pointer(session: &Session, x: i32, y: i32) -> Result<()> {
             logical_height
         );
     }
-    sway_command(session, &format!("seat seat0 cursor set {x} {y}"))
+    let socket = session.runtime_dir.join(&session.wayland_display);
+    pointer::Pointer::open(&socket, (logical_width, logical_height))
+}
+
+/// The output's size *now*, not the size the session started at. A resize
+/// goes through sway's own ipc — the driver has no resize — so `session.json`
+/// is the size at startup and a click placed against it lands somewhere else
+/// entirely on a session that has been resized, which is exactly the session
+/// the phone is driven on. Falls back to the recorded size when sway cannot
+/// be asked, so a click still works on a session whose ipc is gone.
+fn logical_output_size(session: &Session) -> Result<(u32, u32)> {
+    let recorded = (
+        session.width / session.scale,
+        session.height / session.scale,
+    );
+    let Ok(outputs) = swaymsg(session, ["-t", "get_outputs", "-r"]) else {
+        return Ok(recorded);
+    };
+    Ok(logical_size_from_outputs(
+        &outputs,
+        &session.output,
+        recorded,
+    ))
+}
+
+/// The `rect` sway reports for the named output, which is already logical —
+/// sway divides by the scale for the layout — falling back to the recorded
+/// size for anything it cannot read. A fallback rather than an error: a
+/// click on a session that has never been resized is right either way, and
+/// the driver refusing to click because it could not parse an unrelated
+/// field would be worse than clicking where the session started.
+fn logical_size_from_outputs(outputs: &str, name: &str, recorded: (u32, u32)) -> (u32, u32) {
+    let Ok(outputs) = serde_json::from_str::<Vec<serde_json::Value>>(outputs) else {
+        return recorded;
+    };
+    let Some(rect) = outputs
+        .iter()
+        .find(|output| output["name"].as_str() == Some(name))
+        .map(|output| &output["rect"])
+    else {
+        return recorded;
+    };
+    let width = rect["width"].as_u64().unwrap_or(recorded.0 as u64) as u32;
+    let height = rect["height"].as_u64().unwrap_or(recorded.1 as u64) as u32;
+    (width, height)
 }
 
 const fn default_output_scale() -> u32 {
     1
-}
-
-fn sway_command(session: &Session, command: &str) -> Result<()> {
-    swaymsg(session, [command]).map(|_| ())
 }
 
 fn swaymsg<const N: usize>(session: &Session, args: [&str; N]) -> Result<String> {
@@ -518,6 +643,10 @@ fn run_wayland_command(
 }
 
 fn configure_software_rendering(command: &mut Command) {
+    // The isolated driver has no DRM render node on software-only hosts. This
+    // exact marker enables rho-browser's bounded owned-SHM QA transport; normal
+    // rho-gui launches remain DMA-BUF-only and fail closed.
+    command.env("RHO_BROWSER_SOFTWARE_SHM", "1");
     if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
         command.env("LIBGL_ALWAYS_SOFTWARE", "1");
     }
@@ -540,21 +669,63 @@ fn checked_output(program: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8
 }
 
 fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
-    let mut parts: Vec<_> = chord.split('+').collect();
-    let key = parts
-        .pop()
-        .filter(|key| !key.is_empty())
-        .context("key chord is empty")?;
+    let chords = chord.split_ascii_whitespace().collect::<Vec<_>>();
+    if chords.is_empty() {
+        bail!("key sequence is empty");
+    }
+    let mut args = vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+    ];
+    for (index, chord) in chords.into_iter().enumerate() {
+        if index > 0 {
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(KEY_SEQUENCE_DELAY_MS.to_string()),
+            ]);
+        }
+        append_wtype_chord(&mut args, chord)?;
+    }
+    args.extend([
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS.to_string()),
+    ]);
+    Ok(args)
+}
+
+fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
+    // Modifiers come off the front, separated by either `+` or `-`. The `-`
+    // spelling is the one every keymap in this repo uses (`ctrl-k` in
+    // `bind_rho_key_overrides`), so a drive script written from a binding
+    // has to work; taking only `+` meant `key:ctrl-k` reached wtype as one
+    // key name and failed with "Unknown key". A leading segment that is not
+    // a modifier ends the scan, so a key whose own name has a dash is left
+    // whole.
+    let mut rest = chord;
     let mut modifiers = Vec::new();
-    for modifier in parts {
-        let modifier = match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => "ctrl",
-            "alt" => "alt",
-            "shift" => "shift",
-            "super" | "logo" | "meta" => "logo",
-            _ => bail!("unsupported key modifier {modifier:?}"),
+    while let Some(position) = rest.find(['+', '-']) {
+        let Ok(modifier) = wtype_modifier(&rest[..position]) else {
+            break;
         };
         modifiers.push(modifier);
+        rest = &rest[position + 1..];
+    }
+    let key = Some(rest)
+        .filter(|key| !key.is_empty())
+        .context("key chord is empty")?;
+    // A bare modifier is pressed and released as a modifier, not typed as a
+    // keysym: an app that decides a tap from the modifier state has to see
+    // it go down and come back up, which `-k Shift_L` never does.
+    if modifiers.is_empty()
+        && let Ok(modifier) = wtype_modifier(key)
+    {
+        args.extend([
+            OsString::from("-M"),
+            OsString::from(modifier),
+            OsString::from("-m"),
+            OsString::from(modifier),
+        ]);
+        return Ok(());
     }
     let key = match key.to_ascii_lowercase().as_str() {
         "enter" | "return" => "Return".to_owned(),
@@ -563,6 +734,12 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
         "backspace" => "BackSpace".to_owned(),
         "delete" | "del" => "Delete".to_owned(),
         "space" => "space".to_owned(),
+        // A modifier inside a chord is the chord's own last key, so it is
+        // typed as a keysym.
+        "shift" => "Shift_L".to_owned(),
+        "ctrl" | "control" => "Control_L".to_owned(),
+        "alt" => "Alt_L".to_owned(),
+        "super" | "logo" | "meta" => "Super_L".to_owned(),
         "up" => "Up".to_owned(),
         "down" => "Down".to_owned(),
         "left" => "Left".to_owned(),
@@ -574,7 +751,6 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
         other => other.to_owned(),
     };
 
-    let mut args = Vec::new();
     for modifier in &modifiers {
         args.extend([OsString::from("-M"), OsString::from(modifier)]);
     }
@@ -582,6 +758,77 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
     for modifier in modifiers.iter().rev() {
         args.extend([OsString::from("-m"), OsString::from(modifier)]);
     }
+    Ok(())
+}
+
+/// wtype's name for a modifier, or an error for anything that is a key.
+fn wtype_modifier(name: &str) -> Result<&'static str> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "ctrl",
+        "alt" => "alt",
+        "shift" => "shift",
+        "super" | "logo" | "meta" => "logo",
+        other => bail!("unsupported key modifier {other:?}"),
+    })
+}
+
+fn wtype_text_args(text: String) -> Vec<OsString> {
+    vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+        OsString::from("--"),
+        OsString::from(text),
+    ]
+}
+
+fn wtype_input_args(steps: &[String]) -> Result<Vec<OsString>> {
+    if steps.is_empty() {
+        bail!("input requires at least one step");
+    }
+    let mut args = vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+    ];
+    for (index, step) in steps.iter().enumerate() {
+        if index > 0 {
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(KEY_SEQUENCE_DELAY_MS.to_string()),
+            ]);
+        }
+        if let Some(chord) = step.strip_prefix("key:") {
+            append_wtype_chord(&mut args, chord)?;
+        } else if let Some(text) = step.strip_prefix("text:") {
+            if text.starts_with('-') {
+                bail!("input text beginning with '-' is not supported by wtype step mode");
+            }
+            args.push(OsString::from(text));
+        } else if let Some(modifier) = step.strip_prefix("down:") {
+            args.extend([
+                OsString::from("-M"),
+                OsString::from(wtype_modifier(modifier)?),
+            ]);
+        } else if let Some(modifier) = step.strip_prefix("up:") {
+            args.extend([
+                OsString::from("-m"),
+                OsString::from(wtype_modifier(modifier)?),
+            ]);
+        } else if let Some(milliseconds) = step.strip_prefix("wait:") {
+            let milliseconds = milliseconds
+                .parse::<u32>()
+                .context("input wait is not a millisecond integer")?;
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(milliseconds.to_string()),
+            ]);
+        } else {
+            bail!("input step must begin with key:, text:, down:, up:, or wait:");
+        }
+    }
+    args.extend([
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS.to_string()),
+    ]);
     Ok(args)
 }
 
@@ -593,14 +840,13 @@ fn stop(root: &Path) -> Result<()> {
     {
         terminate_process_group(application.pid, libc::SIGTERM);
     }
-    if process_is_running(session.compositor) {
-        terminate_process_group(session.compositor.pid, libc::SIGTERM);
-    }
 
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline
-        && (process_is_running(session.compositor)
-            || session.application.is_some_and(process_is_running))
+    // Keep Wayland alive while the application handles SIGTERM. GPUI uses
+    // that signal to close its windows and release their retained entities;
+    // stopping Sway at the same time tears down the event loop first.
+    let application_deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < application_deadline
+        && session.application.is_some_and(process_is_running)
     {
         thread::sleep(Duration::from_millis(50));
     }
@@ -610,15 +856,53 @@ fn stop(root: &Path) -> Result<()> {
     {
         terminate_process_group(application.pid, libc::SIGKILL);
     }
+
+    if process_is_running(session.compositor) {
+        terminate_process_group(session.compositor.pid, libc::SIGTERM);
+    }
+
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while Instant::now() < deadline && process_is_running(session.compositor) {
+        thread::sleep(Duration::from_millis(50));
+    }
     if process_is_running(session.compositor) {
         terminate_process_group(session.compositor.pid, libc::SIGKILL);
     }
+    // The logs are the only thing in here worth more than the session, and
+    // they are worth most at exactly this moment: whatever the application
+    // said on its way out is already in them. Move them beside the
+    // directory before it goes, or a panic is gone with the run that had it.
+    let kept = keep_logs(root, &session.name);
     fs::remove_dir_all(root).context("remove session directory")?;
     println!(
         "{}",
-        serde_json::json!({ "session": session.name, "stopped": true })
+        serde_json::json!({ "session": session.name, "stopped": true, "logs": kept })
     );
     Ok(())
+}
+
+/// Move a stopped session's logs out of the directory that is about to be
+/// removed, to `<state dir>/<session>-<log>`. Returns what was kept, in the
+/// order they were named, so a caller that files them can find them.
+///
+/// Best effort by design: a session with no log to keep, or a directory that
+/// will not take the rename, must not turn stopping into an error.
+fn keep_logs(root: &Path, session: &str) -> Vec<PathBuf> {
+    let Some(beside) = root.parent() else {
+        return Vec::new();
+    };
+    let mut kept = Vec::new();
+    for name in ["application.log", "sway.log"] {
+        let from = root.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = beside.join(format!("{session}-{name}"));
+        if fs::rename(&from, &to).is_ok() {
+            kept.push(to);
+        }
+    }
+    kept
 }
 
 fn set_new_session(command: &mut Command) {
@@ -718,6 +1002,78 @@ fn load_live_session(root: &Path) -> Result<Session> {
 mod tests {
     use super::*;
 
+    /// A click is placed against the output as it is now. The session file
+    /// says what it was at startup, and a resize goes through sway's ipc
+    /// without touching it, so trusting the file puts every tap on a resized
+    /// session in the wrong place — the phone is only ever driven resized.
+    #[test]
+    fn a_resized_output_is_measured_from_sway_and_not_from_the_session_file() {
+        let outputs = r#"[{"name":"HEADLESS-1","rect":{"x":0,"y":0,"width":400,"height":800}}]"#;
+        assert_eq!(
+            logical_size_from_outputs(outputs, "HEADLESS-1", (1280, 832)),
+            (400, 800)
+        );
+    }
+
+    /// And it falls back rather than failing: an output sway does not know
+    /// about, or a reply it cannot parse, leaves the recorded size in place.
+    #[test]
+    fn an_unreadable_output_list_leaves_the_recorded_size() {
+        let recorded = (1280, 832);
+        let outputs = r#"[{"name":"HEADLESS-2","rect":{"width":400,"height":800}}]"#;
+        assert_eq!(
+            logical_size_from_outputs(outputs, "HEADLESS-1", recorded),
+            recorded
+        );
+        assert_eq!(
+            logical_size_from_outputs("not json", "HEADLESS-1", recorded),
+            recorded
+        );
+    }
+
+    /// Stopping a session removes its directory, and the logs are inside it.
+    /// They have to come out first: whatever the application said on its way
+    /// out — a panic, an error line — is in there, and it is the only copy.
+    #[test]
+    fn stopping_keeps_the_logs_and_leaves_nothing_else_behind() {
+        let beside =
+            std::env::temp_dir().join(format!("rho-wayland-keep-logs-{}", std::process::id()));
+        let root = beside.join("desk");
+        fs::create_dir_all(&root).expect("session directory");
+        fs::write(root.join("application.log"), "panicked at ...").expect("an application log");
+        fs::write(root.join("sway.log"), "sway said").expect("a compositor log");
+        fs::write(root.join("session.json"), "{}").expect("a session file");
+
+        let kept = keep_logs(&root, "desk");
+
+        assert_eq!(
+            kept,
+            vec![
+                beside.join("desk-application.log"),
+                beside.join("desk-sway.log")
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(beside.join("desk-application.log")).expect("kept"),
+            "panicked at ..."
+        );
+        assert!(!root.join("application.log").exists(), "moved, not copied");
+        // Only the logs: the session file goes with the directory.
+        assert!(root.join("session.json").exists());
+        fs::remove_dir_all(&beside).ok();
+    }
+
+    /// A session with nothing to keep still stops.
+    #[test]
+    fn keeping_logs_that_are_not_there_is_not_an_error() {
+        let beside =
+            std::env::temp_dir().join(format!("rho-wayland-no-logs-{}", std::process::id()));
+        let root = beside.join("desk");
+        fs::create_dir_all(&root).expect("session directory");
+        assert!(keep_logs(&root, "desk").is_empty());
+        fs::remove_dir_all(&beside).ok();
+    }
+
     #[test]
     fn session_names_are_path_components() {
         assert!(validate_session_name("gui-1_test").is_ok());
@@ -732,7 +1088,116 @@ mod tests {
         assert_eq!(
             args,
             [
-                "-M", "ctrl", "-M", "shift", "-k", "Return", "-m", "shift", "-m", "ctrl"
+                "-s", "50", "-M", "ctrl", "-M", "shift", "-k", "Return", "-m", "shift", "-m",
+                "ctrl", "-s", "50"
+            ]
+        );
+    }
+
+    /// The keymap spells a chord `ctrl-k`, so the driver has to take it.
+    /// Before this, `-` was not a separator and the whole chord went to
+    /// wtype as one key name: `Unknown key 'ctrl-k'`, exit 1, which is loud
+    /// but only if the drive script is reading stderr.
+    #[test]
+    fn a_chord_may_be_spelled_the_way_the_keymap_spells_it() {
+        let dashed = wtype_key_args("ctrl-k").unwrap();
+        let plussed = wtype_key_args("ctrl+k").unwrap();
+        assert_eq!(dashed, plussed);
+        let args: Vec<_> = dashed.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "ctrl", "-k", "k", "-m", "ctrl", "-s", "50"
+            ]
+        );
+        assert_eq!(
+            wtype_key_args("ctrl-shift-backspace").unwrap(),
+            wtype_key_args("ctrl+shift+backspace").unwrap()
+        );
+    }
+
+    /// The scan stops at the first segment that is not a modifier, so a key
+    /// whose own name holds a dash is still one key.
+    #[test]
+    fn a_dash_that_is_not_a_modifier_stays_part_of_the_key() {
+        let args = wtype_key_args("some-key").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "-k", "some-key", "-s", "50"]);
+    }
+
+    /// And a chord whose key *is* the dash still names it.
+    #[test]
+    fn the_minus_key_survives_being_the_separator() {
+        let args = wtype_key_args("ctrl+-").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "ctrl", "-k", "-", "-m", "ctrl", "-s", "50"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_modifier_is_pressed_and_released_as_a_modifier() {
+        let args = wtype_key_args("shift").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "-M", "shift", "-m", "shift", "-s", "50"]);
+    }
+
+    #[test]
+    fn down_and_up_steps_hold_a_modifier_across_the_steps_between_them() {
+        let steps = ["down:shift", "key:a", "wait:400", "up:shift"].map(str::to_owned);
+        let args = wtype_input_args(&steps).unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "shift", "-s", "30", "-k", "a", "-s", "30", "-s", "400", "-s",
+                "30", "-m", "shift", "-s", "50"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_keys_wait_for_keyboard_enter_before_pressing() {
+        for (chord, key) in [("escape", "Escape"), ("space", "space")] {
+            let args = wtype_key_args(chord).unwrap();
+            let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+            assert_eq!(args, ["-s", "50", "-k", key, "-s", "50"]);
+        }
+    }
+
+    #[test]
+    fn text_waits_for_keyboard_enter_before_its_first_character() {
+        let args = wtype_text_args("abc".into());
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "--", "abc"]);
+    }
+
+    #[test]
+    fn vim_and_leader_sequences_share_one_virtual_keyboard() {
+        let args = wtype_key_args("escape g g space").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-k", "Escape", "-s", "30", "-k", "g", "-s", "30", "-k", "g", "-s",
+                "30", "-k", "space", "-s", "50"
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_input_workflow_uses_one_virtual_keyboard() {
+        let steps = ["key:escape", "text:* QA", "key:enter"].map(str::to_owned);
+        let args = wtype_input_args(&steps).unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-k", "Escape", "-s", "30", "* QA", "-s", "30", "-k", "Return", "-s",
+                "50"
             ]
         );
     }

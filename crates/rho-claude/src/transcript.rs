@@ -4,8 +4,9 @@ use anyhow::{Context as _, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, BufReader};
 use uuid::Uuid;
+
+use crate::protocol::{AssistantMessage, SystemCompactMetadata, UserOutputMessage};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SessionMessagesOptions {
@@ -62,6 +63,9 @@ struct TranscriptEntry {
     #[serde(alias = "isSynthetic")]
     is_synthetic: Option<bool>,
     is_sidechain: Option<bool>,
+    /// The summary Claude writes after compacting, in the user's seat.
+    is_compact_summary: Option<bool>,
+    is_visible_in_transcript_only: Option<bool>,
     team_name: Option<String>,
     subtype: Option<String>,
     compact_metadata: Option<CompactMetadata>,
@@ -120,6 +124,8 @@ impl TranscriptEntry {
             && !self.is_replay.unwrap_or(false)
             && !self.is_synthetic.unwrap_or(false)
             && !self.is_sidechain.unwrap_or(false)
+            && !self.is_compact_summary.unwrap_or(false)
+            && !self.is_visible_in_transcript_only.unwrap_or(false)
             && self.team_name.is_none()
     }
 }
@@ -133,18 +139,20 @@ pub async fn read_session_messages(
 }
 
 async fn read_transcript_entries(transcript_path: &Utf8Path) -> Result<Vec<TranscriptEntry>> {
-    let file = tokio::fs::File::open(transcript_path)
+    let text = tokio::fs::read_to_string(transcript_path)
         .await
-        .with_context(|| format!("open Claude transcript {transcript_path}"))?;
-    let mut lines = BufReader::new(file).lines();
+        .with_context(|| format!("read Claude transcript {transcript_path}"))?;
+    parse_transcript_entries(&text, transcript_path.as_str())
+}
+
+fn parse_transcript_entries(text: &str, source: &str) -> Result<Vec<TranscriptEntry>> {
     let mut entries = Vec::new();
-    while let Some(line) = lines.next_line().await? {
+    for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line).with_context(|| {
-            format!("parse Claude transcript line in {transcript_path}: {line}")
-        })?;
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse Claude transcript line in {source}: {line}"))?;
         let Some(kind) = value.get("type").and_then(Value::as_str) else {
             continue;
         };
@@ -154,9 +162,8 @@ async fn read_transcript_entries(transcript_path: &Utf8Path) -> Result<Vec<Trans
         ) {
             continue;
         }
-        let entry: TranscriptEntry = serde_json::from_value(value).with_context(|| {
-            format!("parse Claude transcript message in {transcript_path}: {line}")
-        })?;
+        let entry: TranscriptEntry = serde_json::from_value(value)
+            .with_context(|| format!("parse Claude transcript message in {source}: {line}"))?;
         if entry.is_message_like() {
             entries.push(entry);
         }
@@ -164,12 +171,100 @@ async fn read_transcript_entries(transcript_path: &Utf8Path) -> Result<Vec<Trans
     Ok(entries)
 }
 
+/// One line of a session's active branch, in the shape the stream's
+/// event for it has: what a reader of the file gets where a listener
+/// of the stream got an event.
+#[derive(Clone, Debug)]
+pub enum SessionLine {
+    User(UserOutputMessage),
+    Assistant(AssistantMessage),
+    Compacted {
+        uuid: Uuid,
+        timestamp: Option<String>,
+        metadata: SystemCompactMetadata,
+    },
+}
+
+/// The file's active branch, oldest first, as `SessionLine`s.
+pub async fn read_session_lines(transcript_path: &Utf8Path) -> Result<Vec<SessionLine>> {
+    let entries = read_transcript_entries(transcript_path).await?;
+    session_lines(&entries)
+}
+
+/// `read_session_lines` over the file's text.
+pub fn parse_session_lines(text: &str) -> Result<Vec<SessionLine>> {
+    let entries = parse_transcript_entries(text, "<text>")?;
+    session_lines(&entries)
+}
+
+fn session_lines(entries: &[TranscriptEntry]) -> Result<Vec<SessionLine>> {
+    latest_chain(entries)
+        .into_iter()
+        .filter(|entry| entry.visible(true))
+        .filter_map(|entry| to_session_line(entry).transpose())
+        .collect()
+}
+
+fn to_session_line(entry: &TranscriptEntry) -> Result<Option<SessionLine>> {
+    let Some(uuid) = entry.uuid else {
+        return Ok(None);
+    };
+    Ok(Some(match entry.kind {
+        TranscriptEntryKind::Assistant => {
+            if entry.message.is_null() {
+                return Ok(None);
+            }
+            SessionLine::Assistant(AssistantMessage {
+                session_id: entry.session_id,
+                message: serde_json::from_value(entry.message.clone())
+                    .with_context(|| format!("assistant line {uuid}"))?,
+                parent_tool_use_id: entry.parent_tool_use_id.clone(),
+                uuid: Some(uuid.to_string()),
+                timestamp: entry.timestamp.clone(),
+            })
+        }
+        TranscriptEntryKind::User => {
+            if entry.message.is_null() {
+                return Ok(None);
+            }
+            SessionLine::User(UserOutputMessage {
+                session_id: entry.session_id,
+                message: Some(
+                    serde_json::from_value(entry.message.clone())
+                        .with_context(|| format!("user line {uuid}"))?,
+                ),
+                parent_tool_use_id: entry.parent_tool_use_id.clone(),
+                uuid: Some(uuid.to_string()),
+                is_replay: entry.is_replay,
+                is_synthetic: entry.is_synthetic,
+                timestamp: entry.timestamp.clone(),
+            })
+        }
+        TranscriptEntryKind::System if entry.subtype.as_deref() == Some("compact_boundary") => {
+            SessionLine::Compacted {
+                uuid,
+                timestamp: entry.timestamp.clone(),
+                metadata: SystemCompactMetadata {
+                    trigger: None,
+                    pre_tokens: None,
+                    post_tokens: entry
+                        .compact_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.post_tokens),
+                },
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
 pub async fn read_session_messages_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
     options: SessionMessagesOptions,
 ) -> Result<Vec<SessionMessage>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(Vec::new());
     };
     read_session_messages(&transcript_path, options).await
@@ -178,10 +273,11 @@ pub async fn read_session_messages_by_id(
 /// Reads every recorded assistant usage snapshot, including forked and
 /// sidechain entries that are intentionally omitted from the visible chat.
 pub async fn read_session_usage_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Vec<SessionUsageSample>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(Vec::new());
     };
     let entries = read_transcript_entries(&transcript_path).await?;
@@ -249,23 +345,26 @@ fn merge_max_usage(base: &mut crate::protocol::TokenUsage, update: &crate::proto
 }
 
 pub async fn read_session_context_used_by_id(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Option<u64>> {
-    let Some(transcript_path) = find_session_transcript(session_id, cwd).await? else {
+    let Some(transcript_path) = find_session_transcript(projects, session_id, cwd).await? else {
         return Ok(None);
     };
     let entries = read_transcript_entries(&transcript_path).await?;
     Ok(latest_context_used(&entries))
 }
 
+/// Where a session's transcript is, under the `projects/` tree the caller
+/// names. The tree is passed in rather than resolved here: this crate does
+/// not decide which Claude configuration a process is running against.
 pub async fn find_session_transcript(
+    projects: &Utf8Path,
     session_id: Uuid,
     cwd: &Utf8Path,
 ) -> Result<Option<Utf8PathBuf>> {
-    let Some(projects_dir) = claude_projects_dir() else {
-        return Ok(None);
-    };
+    let projects_dir = projects;
     let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
     let project_key = project_key(&cwd);
     let direct = projects_dir
@@ -305,18 +404,6 @@ pub async fn find_session_transcript(
 }
 
 const MAX_PROJECT_KEY_LEN: usize = 200;
-
-fn claude_projects_dir() -> Option<Utf8PathBuf> {
-    let config_dir = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .map(Utf8PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| Utf8PathBuf::from(home).join(".claude"))
-        })?;
-    Some(config_dir.join("projects"))
-}
 
 async fn canonical_utf8(path: &Utf8Path) -> Option<Utf8PathBuf> {
     let path = tokio::fs::canonicalize(path).await.ok()?;
@@ -550,6 +637,8 @@ mod tests {
             is_replay: None,
             is_synthetic: None,
             is_sidechain: None,
+            is_compact_summary: None,
+            is_visible_in_transcript_only: None,
             team_name: None,
             subtype: None,
             compact_metadata: None,

@@ -1,0 +1,33 @@
+# The chrome every screen is drawn with: the style vocabulary, the
+# highlights over it, the editor configuration a buffer is opened with,
+# and the visualization surface. Owned by the window, used by every source
+# crate, naming none of them (`GUI-CRATES-DESIGN.md`).
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-window"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+fs = { path = "../../vendor/zed/crates/fs" }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+language = { path = "../../vendor/zed/crates/language" }
+languages = { path = "../../vendor/zed/crates/languages", features = ["load-grammars"] }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
+rho-core.workspace = true
+rho-hosts = { workspace = true }
+text = { path = "../../vendor/zed/crates/text" }
+theme = { path = "../../vendor/zed/crates/theme" }
+tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
+
+[dev-dependencies]
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }

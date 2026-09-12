@@ -15,6 +15,11 @@ use std::{
     slice,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::test::{RecordedPrimitive, SceneOwner};
+#[cfg(any(test, feature = "test-support"))]
+use std::time::Instant;
+
 #[allow(non_camel_case_types, unused)]
 #[expect(missing_docs)]
 pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
@@ -44,12 +49,59 @@ pub struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
+    /// Transparent regions which are written after all ordinary primitives.
+    ///
+    /// These allow a compositor-owned child surface below the GPUI surface to
+    /// remain visible without constraining the ordering of ordinary GPUI paint.
+    pub holes: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_primitives: Vec<RecordedPrimitive>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_operations: Vec<Option<RecordedPrimitive>>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_hash: u64,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_views: Vec<crate::EntityId>,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_elements: Vec<crate::ElementId>,
+    #[cfg(any(test, feature = "test-support"))]
+    recorded_owner_elapsed: Vec<(SceneOwner, std::time::Duration)>,
+    #[cfg(any(test, feature = "test-support"))]
+    recording_last_at: Option<Instant>,
+}
+
+/// Whether a scene records every primitive it is handed.
+///
+/// Recording is not free and is not a thing the reader pays for: it
+/// fingerprints each primitive by formatting its `Debug` into a hash,
+/// clones the record twice, clones the owner path (two `String`s), and
+/// reads the clock once, all per primitive. It was unconditional in
+/// `test` and `test-support` builds, which meant a harness measuring a
+/// frame's wall clock measured mostly this.
+#[cfg(any(test, feature = "test-support"))]
+static SCENE_RECORDERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one recorder as attached. Paired with [`scene_recorder_detached`].
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn scene_recorder_attached() {
+    SCENE_RECORDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counts one recorder as gone.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn scene_recorder_detached() {
+    SCENE_RECORDERS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn scene_recording_enabled() -> bool {
+    SCENE_RECORDERS.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 #[expect(missing_docs)]
@@ -61,11 +113,22 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.holes.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.recorded_primitives.clear();
+            self.recorded_operations.clear();
+            self.recorded_hash = 0xcbf29ce484222325;
+            self.recording_views.clear();
+            self.recording_elements.clear();
+            self.recorded_owner_elapsed.clear();
+            self.recording_last_at = None;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -77,13 +140,18 @@ impl Scene {
         self.layer_stack.push(order);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
+        #[cfg(any(test, feature = "test-support"))]
+        self.recorded_operations.push(None);
     }
 
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+        #[cfg(any(test, feature = "test-support"))]
+        self.recorded_operations.push(None);
     }
 
+    #[cfg(not(any(test, feature = "test-support")))]
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
         let clipped_bounds = primitive
@@ -107,6 +175,10 @@ impl Scene {
             Primitive::Quad(quad) => {
                 quad.order = order;
                 self.quads.push(*quad);
+            }
+            Primitive::Hole(hole) => {
+                hole.order = order;
+                self.holes.push(*hole);
             }
             Primitive::Path(path) => {
                 path.order = order;
@@ -138,6 +210,94 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
+        self.insert_primitive_recorded(primitive.into(), None);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn insert_primitive_recorded(
+        &mut self,
+        mut primitive: Primitive,
+        recorded: Option<RecordedPrimitive>,
+    ) {
+        let clipped_bounds = primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds);
+
+        if clipped_bounds.is_empty() {
+            return;
+        }
+
+        let order = self
+            .layer_stack
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        match &mut primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.order = order;
+                self.shadows.push(*shadow);
+            }
+            Primitive::Quad(quad) => {
+                quad.order = order;
+                self.quads.push(*quad);
+            }
+            Primitive::Hole(hole) => {
+                hole.order = order;
+                self.holes.push(*hole);
+            }
+            Primitive::Path(path) => {
+                path.order = order;
+                path.id = PathId(self.paths.len());
+                self.paths.push(path.clone());
+            }
+            Primitive::Underline(underline) => {
+                underline.order = order;
+                self.underlines.push(*underline);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.order = order;
+                self.monochrome_sprites.push(*sprite);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.order = order;
+                self.subpixel_sprites.push(*sprite);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.order = order;
+                self.polychrome_sprites.push(*sprite);
+            }
+            Primitive::Surface(surface) => {
+                surface.order = order;
+                self.surfaces.push(surface.clone());
+            }
+        }
+        if scene_recording_enabled() {
+            let recorded = recorded.unwrap_or_else(|| self.record_primitive(&primitive));
+            let owner = recorded.owner.clone();
+            self.recorded_hash ^= recorded.fingerprint;
+            self.recorded_hash = self.recorded_hash.wrapping_mul(0x100000001b3);
+            self.recorded_primitives.push(recorded.clone());
+            self.recorded_operations.push(Some(recorded));
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+            self.record_owner_elapsed(&owner);
+        } else {
+            // The slot is still filled so that `replay` stays index-aligned
+            // with `paint_operations`; a replayed primitive that was never
+            // recorded is recorded then, by the scene replaying it.
+            self.recorded_operations.push(recorded);
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+        }
+    }
+
+    pub(crate) fn insert_hole(&mut self, hole: Quad) {
+        self.insert_primitive(Primitive::Hole(hole));
+    }
+
+    #[cfg(not(any(test, feature = "test-support")))]
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -148,9 +308,27 @@ impl Scene {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
+        for (index, operation) in prev_scene.paint_operations[range.clone()]
+            .iter()
+            .enumerate()
+        {
+            match operation {
+                PaintOperation::Primitive(primitive) => self.insert_primitive_recorded(
+                    primitive.clone(),
+                    prev_scene.recorded_operations[range.start + index].clone(),
+                ),
+                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
+        self.holes.sort_by_key(|hole| hole.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -175,6 +353,8 @@ impl Scene {
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            holes_start: 0,
+            holes_iter: self.holes.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -188,6 +368,166 @@ impl Scene {
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_primitive(&self, primitive: &Primitive) -> RecordedPrimitive {
+        use std::{fmt::Write as _, hash::Hasher as _};
+
+        struct Fingerprint(u64);
+        impl std::fmt::Write for Fingerprint {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                self.write(value.as_bytes());
+                Ok(())
+            }
+        }
+        impl std::hash::Hasher for Fingerprint {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for byte in bytes {
+                    self.0 ^= u64::from(*byte);
+                    self.0 = self.0.wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+
+        let mut fingerprint = Fingerprint(0xcbf29ce484222325);
+        match primitive {
+            Primitive::Shadow(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "shadow:{value:?}")
+            }
+            Primitive::Quad(value) | Primitive::Hole(value) => {
+                let kind = if matches!(primitive, Primitive::Hole(_)) {
+                    "hole"
+                } else {
+                    "quad"
+                };
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "{kind}:{value:?}")
+            }
+            Primitive::Path(value) => {
+                let mut value = value.clone();
+                value.order = 0;
+                value.id = PathId(0);
+                write!(&mut fingerprint, "path:{value:?}")
+            }
+            Primitive::Underline(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "underline:{value:?}")
+            }
+            Primitive::MonochromeSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "monochrome:{value:?}")
+            }
+            Primitive::SubpixelSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "subpixel:{value:?}")
+            }
+            Primitive::PolychromeSprite(value) => {
+                let mut value = *value;
+                value.order = 0;
+                write!(&mut fingerprint, "polychrome:{value:?}")
+            }
+            Primitive::Surface(value) => {
+                let mut value = value.clone();
+                value.order = 0;
+                write!(&mut fingerprint, "surface:{value:?}")
+            }
+        }
+        .expect("formatting a primitive cannot fail");
+        let fingerprint = fingerprint.finish();
+        let bounds = primitive
+            .bounds()
+            .intersect(&primitive.content_mask().bounds);
+        RecordedPrimitive {
+            fingerprint,
+            bounds,
+            owner: SceneOwner {
+                view: self.recording_views.last().copied(),
+                elements: self.recording_elements.clone().into(),
+                vertical_band: bounds.origin.y.0.floor() as i32,
+            },
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_primitives(&self) -> Vec<RecordedPrimitive> {
+        self.recorded_primitives.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_hash(&self) -> u64 {
+        self.recorded_hash
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn recorded_owner_elapsed(&self) -> &[(SceneOwner, std::time::Duration)] {
+        &self.recorded_owner_elapsed
+    }
+
+    /// Starts coarse paint attribution. Time between primitive emissions is
+    /// charged to the owner of the primitive that follows it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn begin_recording_owner_elapsed(&mut self) {
+        self.recorded_owner_elapsed.clear();
+        self.recording_last_at = Some(Instant::now());
+    }
+
+    /// Charges paint work after the final primitive to its final owner.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn end_recording_owner_elapsed(&mut self) {
+        let Some(started_at) = self.recording_last_at.take() else {
+            return;
+        };
+        if let Some((_, total)) = self.recorded_owner_elapsed.last_mut() {
+            let elapsed = started_at.elapsed();
+            *total += elapsed;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_owner_elapsed(&mut self, owner: &SceneOwner) {
+        let now = Instant::now();
+        if let Some(started_at) = self.recording_last_at.replace(now) {
+            let elapsed = now.duration_since(started_at);
+            if let Some((_, total)) = self
+                .recorded_owner_elapsed
+                .last_mut()
+                .filter(|(previous, _)| previous == owner)
+            {
+                *total += elapsed;
+            } else {
+                self.recorded_owner_elapsed.push((owner.clone(), elapsed));
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn push_recording_view(&mut self, view: crate::EntityId) {
+        self.recording_views.push(view);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pop_recording_view(&mut self) {
+        self.recording_views.pop();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn push_recording_element(&mut self, element: crate::ElementId) {
+        self.recording_elements.push(element);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn pop_recording_element(&mut self) {
+        self.recording_elements.pop();
     }
 }
 
@@ -203,6 +543,7 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    Hole,
     Path,
     Underline,
     MonochromeSprite,
@@ -222,6 +563,7 @@ pub(crate) enum PaintOperation {
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
+    Hole(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -236,6 +578,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Hole(hole) => &hole.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -249,6 +592,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Hole(hole) => &hole.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -271,6 +615,8 @@ struct BatchIterator<'a> {
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    holes_start: usize,
+    holes_iter: Peekable<slice::Iter<'a, Quad>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -295,6 +641,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Shadow,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (self.holes_iter.peek().map(|q| q.order), PrimitiveKind::Hole),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -355,6 +702,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.quads_start = quads_end;
                 Some(PrimitiveBatch::Quads(quads_start..quads_end))
+            }
+            PrimitiveKind::Hole => {
+                let holes_start = self.holes_start;
+                let mut holes_end = holes_start + 1;
+                self.holes_iter.next();
+                while self
+                    .holes_iter
+                    .next_if(|hole| (hole.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    holes_end += 1;
+                }
+                self.holes_start = holes_end;
+                Some(PrimitiveBatch::Holes(holes_start..holes_end))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -477,6 +838,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
+    Holes(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -501,6 +863,7 @@ impl PrimitiveBatch {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Holes(range) => format!("holes ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {
@@ -771,6 +1134,10 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    #[cfg(target_os = "linux")]
+    pub dma_buf: crate::LinuxDmaBufSurface,
+    #[cfg(target_os = "linux")]
+    pub source_rect: ((f32, f32), (f32, f32)),
 }
 
 impl From<PaintSurface> for Primitive {

@@ -4,6 +4,7 @@
 mod test;
 
 mod change_list;
+#[cfg(feature = "zed-workspace")]
 mod command;
 mod digraph;
 mod helix;
@@ -37,9 +38,11 @@ use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
 use multi_buffer::ToPoint as _;
+#[cfg(feature = "zed-workspace")]
 use normal::search::SearchSubmit;
 use object::Object;
 use schemars::JsonSchema;
+#[cfg(feature = "zed-workspace")]
 use search::BufferSearchBar;
 use serde::Deserialize;
 use settings::RegisterSetting;
@@ -55,12 +58,17 @@ use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
+#[cfg(feature = "zed-workspace")]
 use workspace::{self, Pane, Workspace};
 
-use crate::{
-    normal::{GoToPreviousTab, GoToTab},
-    state::ReplayableAction,
-};
+#[cfg(feature = "zed-workspace")]
+use crate::normal::{GoToPreviousTab, GoToTab};
+use crate::state::ReplayableAction;
+
+#[cfg(not(feature = "zed-workspace"))]
+pub(crate) use language::Direction;
+#[cfg(feature = "zed-workspace")]
+pub(crate) use workspace::searchable::Direction;
 
 enum HelixJumpNavigationOverlay {}
 
@@ -180,6 +188,16 @@ actions!(
         SwitchToVisualBlockMode,
         /// Switches to Helix-style normal mode.
         SwitchToHelixNormalMode,
+        /// Enters application-owned deal review mode.
+        EnterDealMode,
+        /// Leaves deal review mode for the corresponding normal mode.
+        ExitDealMode,
+        /// Starts inserting at the current deal heading.
+        DealInsert,
+        /// Starts inserting after the cursor while preserving DEAL on escape.
+        DealAppend,
+        /// Opens a line below while preserving DEAL on escape.
+        DealOpenLine,
         /// Clears any pending operators.
         ClearOperators,
         /// Clears the exchange register.
@@ -288,6 +306,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(Vim::register).detach();
 
+    #[cfg(feature = "zed-workspace")]
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleVimMode, _, cx| {
             let fs = workspace.app_state().fs.clone();
@@ -497,6 +516,14 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Consumes the count accumulated by normal-style modal key bindings.
+///
+/// Application-owned modes can use this to give their commands the same
+/// count semantics as built-in Vim and Helix actions.
+pub fn take_count(cx: &mut App) -> Option<usize> {
+    Vim::take_count(cx)
+}
+
 #[derive(Clone)]
 pub(crate) struct VimAddon {
     pub(crate) entity: Entity<Vim>,
@@ -519,6 +546,7 @@ pub(crate) struct Vim {
     pub temp_mode: bool,
     pub status_label: Option<SharedString>,
     pub exit_temporary_mode: bool,
+    allow_deal_transition: bool,
 
     operator_stack: Vec<Operator>,
     pub(crate) replacements: Vec<(Range<editor::Anchor>, String)>,
@@ -558,6 +586,81 @@ impl Render for Vim {
     }
 }
 
+/// Enters mode for an application-owned Deal surface without relying
+/// on focus-chain action routing during a surface promotion.
+pub fn enter_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let mode = if HelixModeSetting::get_global(cx).0 {
+            Mode::HelixDeal
+        } else {
+            Mode::Deal
+        };
+        vim.update_editor(cx, |_, editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.move_with(&mut |_, selection| {
+                    selection.collapse_to(selection.head(), SelectionGoal::None);
+                });
+            });
+        });
+        vim.allow_deal_transition = true;
+        vim.switch_mode(mode, true, window, cx);
+    });
+    true
+}
+
+/// Leaves Deal mode for normal editing on an application-owned surface.
+/// Deal refuses ordinary mode switches on purpose, so the application asks
+/// for the transition directly rather than dispatching to whatever holds
+/// focus, which during a surface promotion is not the dealt editor.
+pub fn exit_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let mode = match vim.mode {
+            Mode::HelixDeal => Mode::HelixNormal,
+            Mode::Deal => Mode::Normal,
+            _ => return false,
+        };
+        vim.allow_deal_transition = true;
+        vim.switch_mode(mode, true, window, cx);
+        true
+    })
+}
+
+/// Returns whether an application-owned editor is still in a Deal mode.
+pub fn editor_in_deal_mode(editor: &Entity<Editor>, cx: &App) -> bool {
+    editor
+        .read(cx)
+        .addon::<VimAddon>()
+        .is_some_and(|addon| matches!(addon.entity.read(cx).mode, Mode::Deal | Mode::HelixDeal))
+}
+
+/// Enters insert mode for an application-owned Deal surface without relying
+/// on focus-chain action routing during a surface promotion.
+pub fn enter_deal_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let deal_mode = if HelixModeSetting::get_global(cx).0 {
+            Mode::HelixDeal
+        } else {
+            Mode::Deal
+        };
+        vim.allow_deal_transition = true;
+        vim.switch_mode(deal_mode, true, window, cx);
+        vim.start_recording(cx);
+        vim.prepare_for_insert(window, cx);
+        vim.allow_deal_transition = true;
+        vim.switch_mode(Mode::Insert, false, window, cx);
+    });
+    true
+}
+
 enum VimEvent {
     Focused,
 }
@@ -589,6 +692,7 @@ impl Vim {
             last_mode,
             temp_mode: false,
             exit_temporary_mode: false,
+            allow_deal_transition: false,
             operator_stack: Vec::new(),
             replacements: Vec::new(),
 
@@ -683,7 +787,11 @@ impl Vim {
 
         vim.update(cx, |_, cx| {
             Vim::action(editor, cx, |vim, _: &SwitchToNormalMode, window, cx| {
-                vim.switch_mode(Mode::Normal, false, window, cx)
+                let mode = match vim.last_mode {
+                    Mode::Deal | Mode::HelixDeal if vim.mode == Mode::Insert => vim.last_mode,
+                    _ => Mode::Normal,
+                };
+                vim.switch_mode(mode, false, window, cx)
             });
 
             Vim::action(editor, cx, |vim, _: &SwitchToInsertMode, window, cx| {
@@ -703,6 +811,7 @@ impl Vim {
                 vim.switch_mode(Mode::VisualLine, false, window, cx)
             });
 
+            #[cfg(feature = "zed-workspace")]
             Vim::action(
                 editor,
                 cx,
@@ -718,6 +827,65 @@ impl Vim {
                     vim.switch_mode(Mode::HelixNormal, true, window, cx)
                 },
             );
+            Vim::action(editor, cx, |vim, _: &EnterDealMode, window, cx| {
+                let mode = if HelixModeSetting::get_global(cx).0 {
+                    Mode::HelixDeal
+                } else {
+                    Mode::Deal
+                };
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.move_with(&mut |_, selection| {
+                            selection.collapse_to(selection.head(), SelectionGoal::None);
+                        });
+                    });
+                });
+                vim.switch_mode(mode, true, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &ExitDealMode, window, cx| {
+                let mode = match vim.mode {
+                    Mode::HelixDeal => Mode::HelixNormal,
+                    Mode::Deal => Mode::Normal,
+                    _ => return,
+                };
+                vim.allow_deal_transition = true;
+                vim.switch_mode(mode, true, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &DealInsert, window, cx| {
+                let helix = vim.mode == Mode::HelixDeal;
+                if !helix && vim.mode != Mode::Deal {
+                    return;
+                }
+                vim.start_recording(cx);
+                vim.prepare_for_insert(window, cx);
+                if helix {
+                    vim.update_editor(cx, |_, editor, cx| {
+                        editor.change_selections(Default::default(), window, cx, |s| {
+                            s.move_with(&mut |_map, selection| {
+                                if !selection.is_empty() {
+                                    selection.collapse_to(selection.start, SelectionGoal::None);
+                                }
+                            });
+                        });
+                    });
+                }
+                vim.allow_deal_transition = true;
+                vim.switch_mode(Mode::Insert, false, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &DealAppend, window, cx| {
+                if !matches!(vim.mode, Mode::Deal | Mode::HelixDeal) {
+                    return;
+                }
+                vim.allow_deal_transition = true;
+                vim.insert_after(&crate::normal::InsertAfter, window, cx);
+            });
+            Vim::action(editor, cx, |vim, _: &DealOpenLine, window, cx| {
+                if !matches!(vim.mode, Mode::Deal | Mode::HelixDeal) {
+                    return;
+                }
+                vim.allow_deal_transition = true;
+                vim.insert_line_below(&crate::normal::InsertLineBelow, window, cx);
+            });
             Vim::action(editor, cx, |_, _: &PushForcedMotion, _, cx| {
                 Vim::globals(cx).forced_motion = true;
             });
@@ -934,6 +1102,7 @@ impl Vim {
             Vim::action(editor, cx, |vim, _: &Tab, window, cx| {
                 vim.input_ignored(" ".into(), window, cx)
             });
+            #[cfg(feature = "zed-workspace")]
             Vim::action(
                 editor,
                 cx,
@@ -996,6 +1165,7 @@ impl Vim {
             insert::register(editor, cx);
             helix::register(editor, cx);
             motion::register(editor, cx);
+            #[cfg(feature = "zed-workspace")]
             command::register(editor, cx);
             replace::register(editor, cx);
             indent::register(editor, cx);
@@ -1056,10 +1226,12 @@ impl Vim {
         self.editor.upgrade()
     }
 
+    #[cfg(feature = "zed-workspace")]
     pub fn workspace(&self, window: &Window, cx: &App) -> Option<Entity<Workspace>> {
         Workspace::for_window(window, cx)
     }
 
+    #[cfg(feature = "zed-workspace")]
     pub fn pane(&self, window: &Window, cx: &Context<Self>) -> Option<Entity<Pane>> {
         let pane = self
             .workspace(window, cx)
@@ -1213,6 +1385,12 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
+            if !self.allow_deal_transition {
+                return;
+            }
+            self.allow_deal_transition = false;
+        }
         if self.temp_mode && mode == Mode::Normal {
             self.temp_mode = false;
             self.switch_mode(Mode::Normal, leave_selections, window, cx);
@@ -1234,6 +1412,7 @@ impl Vim {
         });
         self.operator_stack.clear();
         self.selected_register.take();
+        #[cfg(feature = "zed-workspace")]
         self.cancel_running_command(window, cx);
         if mode == Mode::Normal || mode != last_mode {
             self.current_tx.take();
@@ -1406,7 +1585,7 @@ impl Vim {
     pub fn cursor_shape(&self, cx: &App) -> CursorShape {
         let cursor_shape = VimSettings::get_global(cx).cursor_shape;
         match self.mode {
-            Mode::Normal => {
+            Mode::Normal | Mode::Deal => {
                 if let Some(operator) = self.operator_stack.last() {
                     match operator {
                         // Vim jump labels are transient navigation, so keep the
@@ -1429,7 +1608,7 @@ impl Vim {
                     cursor_shape.normal
                 }
             }
-            Mode::HelixNormal => cursor_shape.normal,
+            Mode::HelixNormal | Mode::HelixDeal => cursor_shape.normal,
             Mode::Replace => cursor_shape.replace,
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::HelixSelect => {
                 cursor_shape.visual
@@ -1465,6 +1644,8 @@ impl Vim {
             }
             Mode::Normal
             | Mode::HelixNormal
+            | Mode::Deal
+            | Mode::HelixDeal
             | Mode::Replace
             | Mode::Visual
             | Mode::VisualLine
@@ -1486,7 +1667,7 @@ impl Vim {
             | Mode::Replace
             | Mode::HelixNormal
             | Mode::HelixSelect => false,
-            Mode::Normal => true,
+            Mode::Normal | Mode::Deal | Mode::HelixDeal => true,
         }
     }
 
@@ -1498,8 +1679,13 @@ impl Vim {
             Mode::Replace => "replace",
             Mode::HelixNormal => "helix_normal",
             Mode::HelixSelect => "helix_select",
+            Mode::Deal | Mode::HelixDeal => "normal",
         }
         .to_string();
+
+        if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
+            context.add("VimDeal");
+        }
 
         let mut operator_id = "none";
 
@@ -1555,6 +1741,7 @@ impl Vim {
         // If editor gains focus while search bar is still open (not dismissed),
         // the user has explicitly navigated away - clear prior_selections so we
         // don't restore to the old position if they later dismiss the search.
+        #[cfg(feature = "zed-workspace")]
         if !self.search.prior_selections.is_empty() {
             if let Some(pane) = self.pane(window, cx) {
                 let search_still_open = pane
@@ -1581,11 +1768,16 @@ impl Vim {
         let editor = editor.read(cx);
         let editor_mode = editor.mode();
 
+        #[cfg(feature = "zed-workspace")]
+        let is_following = editor.leader_id().is_some();
+        #[cfg(not(feature = "zed-workspace"))]
+        let is_following = false;
+
         if editor_mode.is_full()
             && !newest_selection_empty
             && self.mode == Mode::Normal
             // When following someone, don't switch vim mode.
-            && editor.leader_id().is_none()
+            && !is_following
         {
             if preserve_selection {
                 self.switch_mode(Mode::Visual, true, window, cx);
@@ -2009,7 +2201,7 @@ impl Vim {
                 });
                 self.switch_mode(Mode::Normal, true, window, cx)
             }
-            Mode::Normal => {
+            Mode::Normal | Mode::Deal => {
                 self.update_editor(cx, |_, editor, cx| {
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                         s.move_with(&mut |map, selection| {
@@ -2019,13 +2211,14 @@ impl Vim {
                     })
                 });
             }
-            Mode::Insert | Mode::Replace | Mode::HelixNormal => {}
+            Mode::Insert | Mode::Replace | Mode::HelixNormal | Mode::HelixDeal => {}
         }
     }
 
     fn local_selections_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else { return };
 
+        #[cfg(feature = "zed-workspace")]
         if editor.read(cx).leader_id().is_some() {
             return;
         }
@@ -2285,6 +2478,7 @@ impl Vim {
                     self.multi_replace(text, window, cx)
                 }
 
+                #[cfg(feature = "zed-workspace")]
                 if self.mode == Mode::Normal {
                     self.update_editor(cx, |_, editor, cx| {
                         editor.accept_edit_prediction(
@@ -2336,6 +2530,7 @@ impl Vim {
         editor.set_autoindent(state.autoindent);
         editor.set_cursor_offset_on_selection(state.cursor_offset_on_selection);
         editor.selections.set_line_mode(state.line_mode);
+        #[cfg(feature = "zed-workspace")]
         editor.set_edit_predictions_hidden_for_vim_mode(state.hide_edit_predictions, window, cx);
     }
 

@@ -14,9 +14,9 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Focusable as _, SharedString, Subscription, Window, div, px,
 };
+use rho_window::style::StyleClass;
 use theme::ActiveTheme as _;
 
-use crate::style::StyleClass;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,15 +37,22 @@ pub fn token_start(text_before_cursor: &str) -> usize {
         .unwrap_or(0)
 }
 
+pub fn completion_start(text_before_cursor: &str, whole_input: bool) -> usize {
+    if whole_input {
+        0
+    } else {
+        token_start(text_before_cursor)
+    }
+}
+
 /// How long an echoed message stays visible.
-pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(6);
+pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 /// Long messages (`:help`) are capped in the echo area; the transcript
 /// keeps the full copy.
 const ECHO_MAX_LINES: usize = 12;
 
-/// The emacs echo area: the most recent system notice, flashed in the
-/// bottom strip. The durable copy lives in the transcript log; this is
-/// the at-a-glance one. Dropping it (replacement or timer) dismisses it.
+/// The most recent system notice, temporarily substituted into the shared
+/// status line. Dropping it (replacement or timer) dismisses it.
 pub struct Echo {
     text: String,
     class: StyleClass,
@@ -54,7 +61,6 @@ pub struct Echo {
 }
 
 impl Echo {
-    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -97,7 +103,7 @@ impl Echo {
 /// editors above it — it reads as the vim command line, not a panel. The
 /// background is the editor's, nudged a few percent in lightness so the
 /// strip reads as its own region without a border.
-pub(crate) fn bottom_strip(text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> gpui::Div {
+pub(crate) fn bottom_strip(text_style: &gpui::TextStyle, cx: &gpui::App) -> gpui::Div {
     let mut background: gpui::Hsla = cx.theme().colors().editor_background.into();
     if background.l < 0.5 {
         background.l += 0.04;
@@ -123,17 +129,30 @@ pub type CandidateSource = Rc<dyn Fn(&Workspace, &str, &App) -> Vec<Candidate>>;
 /// Receives the typed input (tab-completions applied) after the
 /// minibuffer has closed.
 pub type SubmitHandler = Rc<dyn Fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)>;
+/// Receives the input as it now stands, after each edit, while the
+/// minibuffer is still open.
+///
+/// [`CandidateSource`] answers "what could this become" and may only read;
+/// this answers "what should the reader be looking at now" and may act. It is
+/// what makes a prompt narrow the thing behind it as the reader types, which
+/// is the whole of an Emacs-style narrowing read and is not something
+/// completion can do. Optional per prompt: a prompt that sets none pays a
+/// `None` check per keystroke and nothing else.
+pub type ChangeHandler = Rc<dyn Fn(&mut Workspace, &str, &mut Window, &mut Context<Workspace>)>;
 
 pub struct Minibuffer {
     prompt: SharedString,
     editor: Entity<Editor>,
     complete: CandidateSource,
+    on_change: Option<ChangeHandler>,
     on_submit: SubmitHandler,
     candidates: Vec<Candidate>,
     selected: usize,
     /// The user moved the selection since the last edit, making the
     /// highlighted candidate an explicit choice even on empty input.
     selection_moved: bool,
+    complete_whole_input: bool,
+    completed_selection: Option<(Candidate, usize)>,
     _edits: Subscription,
 }
 
@@ -142,10 +161,15 @@ pub struct Minibuffer {
 const VISIBLE_CANDIDATES: usize = 8;
 
 impl Minibuffer {
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
     pub fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
         complete: CandidateSource,
+        on_change: Option<ChangeHandler>,
         on_submit: SubmitHandler,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -163,20 +187,29 @@ impl Minibuffer {
             });
             editor
         });
-        let edits = cx.subscribe(&editor, |this: &mut Workspace, _, event, cx| {
-            if matches!(event, editor::EditorEvent::BufferEdited) {
-                this.refresh_minibuffer(cx);
-            }
-        });
+        // `subscribe_in` rather than `subscribe`: the change handler may act
+        // on the workspace, and acting needs a window. One edit, one call.
+        let edits = cx.subscribe_in(
+            &editor,
+            window,
+            |this: &mut Workspace, _, event, window, cx| {
+                if matches!(event, editor::EditorEvent::BufferEdited) {
+                    this.refresh_minibuffer(window, cx);
+                }
+            },
+        );
         window.focus(&editor.focus_handle(cx), cx);
         Self {
             prompt: prompt.into(),
             editor,
             complete,
+            on_change,
             on_submit,
             candidates: Vec::new(),
             selected: 0,
             selection_moved: false,
+            complete_whole_input: false,
+            completed_selection: None,
             _edits: edits,
         }
     }
@@ -185,13 +218,35 @@ impl Minibuffer {
         self.editor.read(cx).text(cx)
     }
 
+    /// The prompt's change handler, if it set one. Cloned rather than
+    /// borrowed because running it needs the workspace mutably, and the
+    /// minibuffer lives in the workspace.
+    pub fn on_change(&self) -> Option<ChangeHandler> {
+        self.on_change.clone()
+    }
+
     /// Recomputes candidates against `workspace`; called by the workspace
     /// on open and after every edit.
     pub fn refresh(&mut self, workspace: &Workspace, cx: &App) {
         let input = self.input(cx);
         self.candidates = (self.complete)(workspace, &input, cx);
-        self.selected = 0;
-        self.selection_moved = false;
+        if let Some((candidate, occurrence)) = self.completed_selection.clone()
+            && input == candidate.value
+            && let Some(index) = self
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| **other == candidate)
+                .nth(occurrence)
+                .map(|(index, _)| index)
+        {
+            self.selected = index;
+            self.selection_moved = true;
+        } else {
+            self.completed_selection = None;
+            self.selected = 0;
+            self.selection_moved = false;
+        }
     }
 
     pub fn select_by_delta(&mut self, delta: isize) {
@@ -203,25 +258,37 @@ impl Minibuffer {
         self.selection_moved = true;
     }
 
+    pub fn select(&mut self, index: usize) {
+        if index < self.candidates.len() {
+            self.selected = index;
+            self.selection_moved = true;
+        }
+    }
+
     /// Enter accepts the highlighted candidate, emacs `completing-read`
     /// style: it replaces the last token before submission whenever the
     /// user has typed something or explicitly moved the selection. A bare
     /// enter on an untouched minibuffer still submits the empty input.
     pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
-        if !self.input(cx).trim().is_empty() || self.selection_moved {
+        if self.accepts_selected(cx) {
             self.complete_selected(window, cx);
         }
+    }
+
+    pub fn accepts_selected(&self, cx: &App) -> bool {
+        !self.input(cx).trim().is_empty() || self.selection_moved
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with
     /// the selected candidate.
     pub fn complete_selected(&mut self, window: &mut Window, cx: &mut App) {
-        let Some(candidate) = self.candidates.get(self.selected).cloned() else {
+        let Some((candidate, occurrence)) = self.selected_candidate() else {
             return;
         };
+        self.completed_selection = Some((candidate.clone(), occurrence));
         self.editor.update(cx, |editor, cx| {
             let text = editor.text(cx);
-            let start = token_start(&text);
+            let start = completion_start(&text, self.complete_whole_input);
             let new_text = format!("{}{}", &text[..start], candidate.value);
             let end = multi_buffer::MultiBufferOffset(new_text.len());
             editor.set_text(new_text, window, cx);
@@ -229,6 +296,25 @@ impl Minibuffer {
                 selections.select_ranges([end..end]);
             });
         });
+    }
+
+    pub fn set_complete_whole_input(&mut self) {
+        self.complete_whole_input = true;
+    }
+
+    /// Which row is highlighted, for a caller that needs the row itself
+    /// rather than the text on it.
+    pub fn selected_row(&self) -> usize {
+        self.selected
+    }
+
+    pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
+        let candidate = self.candidates.get(self.selected)?.clone();
+        let occurrence = self.candidates[..self.selected]
+            .iter()
+            .filter(|other| *other == &candidate)
+            .count();
+        Some((candidate, occurrence))
     }
 
     /// Consumes the minibuffer into its input and handler; the caller
@@ -283,6 +369,65 @@ impl Minibuffer {
                     .flex_row()
                     .items_center()
                     .px_2()
+                    .child(div().child(self.prompt.clone()))
+                    .child(div().flex_grow(1.0).child(self.editor.clone())),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    pub(crate) fn render_phone(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Workspace>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let window_start = self
+            .selected
+            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
+        let rows = self
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(VISIBLE_CANDIDATES)
+            .map(|(index, candidate)| {
+                let mut row = div()
+                    .id(("phone-minibuffer-candidate", index))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_h(px(48.))
+                    .px_3()
+                    .child(div().child(candidate.value.clone()));
+                if !candidate.description.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(colors.text_muted)
+                            .child(candidate.description.clone()),
+                    );
+                }
+                if index == self.selected {
+                    row = row.bg(colors.element_selected);
+                }
+                row.on_click(cx.listener(move |workspace, _, window, cx| {
+                    workspace.phone_choose_minibuffer(index, window, cx);
+                }))
+            });
+        bottom_strip(text_style, cx)
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(48.))
+            .key_context("RhoMinibuffer")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_h(px(48.))
+                    .px_3()
                     .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )

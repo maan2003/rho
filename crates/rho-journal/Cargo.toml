@@ -1,0 +1,30 @@
+# The typed journal of what the user did in the GUI: one event per action,
+# written to the client's own database and dumped for the regression tester.
+# Owned by no surface; every surface records into it.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-journal"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes = { workspace = true }
+futures.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+redb = { workspace = true }
+rho-db = { workspace = true }
+rho-desk.workspace = true
+rho-ui-proto.workspace = true
+senax-encoder = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
