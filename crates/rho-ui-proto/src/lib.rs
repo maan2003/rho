@@ -343,6 +343,16 @@ pub enum ClientMessage {
     GitTransportQuery {
         host: String,
     },
+    /// One-shot request on a fresh local stream: move an agent that
+    /// predates worksets into one (`rho debug migrate-agent`). Answered
+    /// with `AgentMigrated` or `Error`.
+    MigrateAgent {
+        /// The agent, as `eng-xxxx` or a bare id prefix.
+        agent: String,
+        /// What to clone; the repository's `origin` remote by default.
+        origin: Option<String>,
+        mode: WorksetMode,
+    },
     /// Starts the daemon-owned Comint-style shell for an agent. This travels
     /// on the main UI control stream; attachment is a separate stream.
     ShellStart {
@@ -673,6 +683,10 @@ pub enum ServerMessage {
     },
     GitTransportPolicy {
         pat_available: bool,
+    },
+    /// `MigrateAgent` done; what was done, for a person.
+    AgentMigrated {
+        report: String,
     },
     /// An approval race completed or expired. Deliberately carries no result
     /// or winner information.

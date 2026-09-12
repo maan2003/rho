@@ -63,11 +63,11 @@ enum DebugCommand {
     /// restore on load (event log for Rho agents, session transcript for
     /// Claude agents).
     Context,
-    /// Move an agent that predates worksets into one: clone its
-    /// repository's origin, check out the old jj workspace's parent commit
-    /// with the working copy's changes staged on top, and record the new
-    /// place at the tail of the agent's log. The old workspace is left as
-    /// it is. Stop the daemon first.
+    /// Ask the running daemon to move an agent that predates worksets
+    /// into one: clone its repository's origin, check out the old jj
+    /// workspace's parent commit (detached) with the working copy's
+    /// changes staged on top, and record the new place at the tail of the
+    /// agent's log. The old workspace is left as it is.
     MigrateAgent {
         /// The agent, as `eng-xxxx` or a bare id prefix.
         agent: String,
@@ -78,6 +78,9 @@ enum DebugCommand {
         /// default: that is what a jj workspace on the host was.
         #[arg(long, value_enum, default_value_t = crate::WorksetModeArg::Exposed)]
         mode: crate::WorksetModeArg,
+        /// The daemon's socket; the usual one by default.
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
     },
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
@@ -108,7 +111,8 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
             agent,
             origin,
             mode,
-        } => migrate_agent(args.db_path, &agent, origin, mode.into()).await,
+            socket_path,
+        } => migrate_agent(socket_path, agent, origin, mode.into()).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
 }
@@ -133,184 +137,6 @@ fn hold_daemon_lock(daemon_lock: &Path, what: &str) -> anyhow::Result<std::fs::F
         return Err(error).with_context(|| format!("lock {}", daemon_lock.display()));
     }
     Ok(lock)
-}
-
-/// An agent id from its display form (`eng-xxxx`) or a bare prefix.
-fn resolve_agent_id(db: &RhoDb, text: &str) -> anyhow::Result<rho_core::AgentId> {
-    let text = text.trim();
-    let raw = text.split_once('-').map_or(text, |(_, raw)| raw);
-    let read = db.read();
-    let domain = rho_agent::db::AgentIdDomain(read.machine_seed());
-    let resolved = rho_core::AgentId::from_prefix(raw, read.last_agent_counter() + 1, &domain)?;
-    let agent_id = match resolved {
-        prefix_id::PrefixResolution::Unique(agent_id) => agent_id,
-        prefix_id::PrefixResolution::Ambiguous { .. } => anyhow::bail!("ambiguous agent id {text}"),
-        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {text}"),
-    };
-    anyhow::ensure!(read.agent_exists(agent_id), "no agent with id {text}");
-    Ok(agent_id)
-}
-
-/// Runs a command to completion for its trimmed stdout.
-async fn output(mut command: tokio::process::Command) -> anyhow::Result<String> {
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("run {:?}", command.as_std()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{:?} failed ({}): {}",
-        command.as_std(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
-}
-
-async fn migrate_agent(
-    db_path: Option<PathBuf>,
-    agent: &str,
-    origin: Option<String>,
-    mode: rho_fs_view::WorksetMode,
-) -> anyhow::Result<()> {
-    let named = db_path.is_some();
-    let path = db_path
-        .map(Ok)
-        .unwrap_or_else(default_db_path)
-        .context("resolve rho db path")?;
-    let _lock = match named {
-        true => None,
-        false => Some(hold_daemon_lock(
-            &rho_ui_proto::RuntimePaths::from_env()?.daemon_lock(),
-            "migrate an agent",
-        )?),
-    };
-    // The worksets root is the database's directory, as for the daemon.
-    let state_dir = camino::Utf8PathBuf::try_from(
-        path.parent()
-            .context("the database path has no directory")?
-            .to_owned(),
-    )
-    .context("the state directory is not valid UTF-8")?;
-    let db = RhoDb::open(&path);
-    let agent_id = resolve_agent_id(&db, agent)?;
-    let head = db.read().get_agent(agent_id);
-    let (repo, workspace) = match head.config.workdirs.first() {
-        Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }) => {
-            (repo.clone(), format!("ws-{}", id.encoded()))
-        }
-        Some(WorkspaceInfo::Workset { workset, .. }) => {
-            anyhow::bail!("{agent} is already in workset {workset}")
-        }
-        Some(WorkspaceInfo::UserCheckout { repo }) => {
-            anyhow::bail!("{agent} works in the user's own checkout {repo}; nothing to migrate")
-        }
-        None => anyhow::bail!("{agent} has no working directory"),
-    };
-
-    // The old workspace's commits, read from the repository without
-    // materializing (or snapshotting) any checkout.
-    let jj = |args: &[&str]| {
-        let mut command = tokio::process::Command::new("jj");
-        command
-            .arg("-R")
-            .arg(&repo)
-            .arg("--ignore-working-copy")
-            .args(args);
-        command
-    };
-    let log =
-        |revset: String, template: &str| jj(&["log", "--no-graph", "-r", &revset, "-T", template]);
-    let tip = output(log(format!("{workspace}@"), "commit_id")).await?;
-    let base = output(log(format!("{workspace}@-"), "commit_id")).await?;
-    anyhow::ensure!(
-        tip.len() == 40 && base.len() == 40,
-        "{workspace} in {repo} does not resolve to one working-copy commit and one parent"
-    );
-    let empty = output(log(format!("{workspace}@"), r#"if(empty, "1", "0")"#)).await? == "1";
-    let description = output(log(format!("{workspace}@"), "description")).await?;
-    let git_dir = output(jj(&["git", "root"])).await?;
-    let origin = match origin {
-        Some(origin) => origin,
-        None => output(jj(&["git", "remote", "list"]))
-            .await?
-            .lines()
-            .find_map(|line| line.strip_prefix("origin "))
-            .map(|url| url.trim().to_owned())
-            .with_context(|| format!("{repo} has no origin remote; pass --origin"))?,
-    };
-    let name = repo
-        .file_name()
-        .with_context(|| format!("{repo} has no name"))?
-        .to_owned();
-
-    let worksets = rho_fs_view::Worksets::open(
-        &state_dir,
-        rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
-        Default::default(),
-        rho_fs_view::StoreService::Serve(rho_fs_view::StoreRefresh::default()),
-    )
-    .await?;
-    let workset = worksets.create().await?;
-    let checkout = workset.clone_repo(&origin, Some(&name)).await?;
-    let git = |args: &[&str]| {
-        let mut command = worksets.command(rho_fs_view::GIT);
-        command.current_dir(&checkout).args(args);
-        command
-    };
-    // Every commit the workspace had, straight from the shared git store:
-    // the working copy is a commit there too, and the parent comes with it.
-    output(git(&[
-        "-c",
-        "uploadpack.allowAnySHA1InWant=true",
-        "fetch",
-        "-q",
-        &git_dir,
-        &tip,
-    ]))
-    .await?;
-    output(git(&["checkout", "-q", "-B", "migrated", &base])).await?;
-    if !empty {
-        // Tip's tree in the index and working tree, HEAD at the parent:
-        // the working copy's changes, staged.
-        output(git(&["reset", "-q", "--hard", &tip])).await?;
-        output(git(&["reset", "-q", "--soft", &base])).await?;
-    }
-
-    let info = WorkspaceInfo::Workset {
-        workset: workset.id().to_owned(),
-        cwd: camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT).join(&name),
-        mode,
-        origin: Some(camino::Utf8PathBuf::from(&origin)),
-    };
-    let mut write = db.write().await;
-    rho_agent::db::AgentWriteTxnExt::append_agent_event(
-        &mut write,
-        agent_id,
-        &rho_agent::AgentEvent::WorkdirMigrated {
-            workdir: info,
-            at: rho_core::UnixMs::now(),
-        },
-    );
-    write.commit();
-
-    println!(
-        "{agent}: {workspace} in {repo} -> workset {} at {checkout}",
-        workset.id()
-    );
-    println!("  origin {origin}");
-    println!("  mode {mode:?}");
-    println!("  branch migrated at {base}");
-    if !empty {
-        println!("  working copy {tip} staged on top");
-    }
-    if !description.trim().is_empty() {
-        println!(
-            "  the working copy's description was not carried over:\n    {}",
-            description.trim().replace('\n', "\n    ")
-        );
-    }
-    Ok(())
 }
 
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
@@ -804,6 +630,34 @@ async fn rollback(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     let hop = rho_agent::db::rollback(&db).await?;
     println!("{}: migration {hop} undone", path.display());
     Ok(())
+}
+
+/// Sends the migration to the daemon and prints its account of it.
+async fn migrate_agent(
+    socket_path: Option<PathBuf>,
+    agent: String,
+    origin: Option<String>,
+    mode: rho_fs_view::WorksetMode,
+) -> anyhow::Result<()> {
+    let paths = rho_ui_proto::RuntimePaths::resolve(socket_path)?;
+    let mut client = rho_ui_proto::client::Client::connect(paths.socket())
+        .await
+        .with_context(|| format!("connect to rho daemon at {}", paths.socket().display()))?;
+    client
+        .send(&rho_ui_proto::ClientMessage::MigrateAgent {
+            agent,
+            origin,
+            mode,
+        })
+        .await?;
+    match client.recv().await? {
+        rho_ui_proto::ServerMessage::AgentMigrated { report } => {
+            print!("{report}");
+            Ok(())
+        }
+        rho_ui_proto::ServerMessage::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
 }
 
 fn config_name(config: rho_agent::db::AgentRole) -> String {

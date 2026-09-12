@@ -408,6 +408,18 @@ impl AgentPool {
         }
     }
 
+    /// Drops a loaded agent so its next load folds its log afresh: for a
+    /// record changed under it, such as a migrated workdir. Handles others
+    /// still hold keep the old loop until they let go.
+    pub async fn unload(&self, agent_id: AgentId) -> bool {
+        let removed = self.agents.lock().await.remove(&agent_id).is_some();
+        self.recent
+            .lock()
+            .expect("poison")
+            .retain(|id| *id != agent_id);
+        removed
+    }
+
     pub async fn create(
         self: &Arc<Self>,
         config: AgentRole,

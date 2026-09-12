@@ -44,12 +44,15 @@ agent; a directory outside the root can be adopted for one process
 
 Agents recorded before worksets (`WorkspaceInfo::Workspace`, a jj
 managed workspace) still load: their transcripts read, but they cannot
-run. `rho debug migrate-agent <agent>` moves one into a workset by hand:
-a clone of the repository's origin through the mirror store, checked out
-at the old workspace's parent commit with the working copy's changes
-staged, recorded as a `WorkdirMigrated` event at the tail of the agent's
-log. The agent is exposed unless `--mode view` says otherwise, since a jj
-workspace on the host was. The old workspace is left as it is.
+run. `rho debug migrate-agent <agent>` asks the running daemon to move
+one into a workset: a clone of the repository's origin through the mirror
+store (the daemon's, since `octo://` remotes need its transport), checked
+out (detached) at the old workspace's parent commit with the working
+copy's changes staged, recorded as a `WorkdirMigrated` event at the tail
+of the agent's log, after which the loaded agent is dropped so its next
+load reads the new place. The agent is exposed unless `--mode view` says
+otherwise, since a jj workspace on the host was. The old workspace is
+left as it is.
 
 `Workset::enter(mode, cwd)` is one agent's `Namespace` over the
 directory: its mount namespace is built on the first command (so loading

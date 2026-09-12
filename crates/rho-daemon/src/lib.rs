@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast
 pub mod debug;
 mod desk_cells;
 mod detail;
+mod migrate;
 mod realtime;
 mod secret_store;
 #[doc(hidden)]
@@ -674,6 +675,7 @@ async fn run_iroh_listener(
                                 | ClientMessage::GitTransportRequest { .. }
                                 | ClientMessage::GitTransportProvide { .. }
                                 | ClientMessage::GitTransportQuery { .. }
+                                | ClientMessage::MigrateAgent { .. }
                         );
                         let control = if !dedicated {
                             anyhow::ensure!(
@@ -1320,6 +1322,22 @@ where
             &ServerMessage::GitTransportPolicy { pat_available },
         )
         .await?;
+        return Ok(());
+    }
+    if let ClientMessage::MigrateAgent {
+        agent,
+        origin,
+        mode,
+    } = first
+    {
+        let reply = match migrate::migrate_agent(&services, &agent, origin, mode).await {
+            Ok(report) => ServerMessage::AgentMigrated { report },
+            Err(error) => ServerMessage::Error {
+                message: format!("{error:#}"),
+            },
+        };
+        let mut writer = writer;
+        write_frame(&mut writer, &reply).await?;
         return Ok(());
     }
 
@@ -2687,7 +2705,8 @@ async fn handle_message(
         | ClientMessage::ShellAttach { .. }
         | ClientMessage::GitTransportRequest { .. }
         | ClientMessage::GitTransportProvide { .. }
-        | ClientMessage::GitTransportQuery { .. } => {
+        | ClientMessage::GitTransportQuery { .. }
+        | ClientMessage::MigrateAgent { .. } => {
             anyhow::bail!("channel messages must be the first frame on a dedicated stream")
         }
     }

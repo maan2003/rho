@@ -1414,7 +1414,8 @@ async fn run(
             | ServerMessage::PrCommandResult { .. }
             | ServerMessage::GitTransportReady
             | ServerMessage::GitTransportRefused { .. }
-            | ServerMessage::GitTransportPolicy { .. } => None,
+            | ServerMessage::GitTransportPolicy { .. }
+            | ServerMessage::AgentMigrated { .. } => None,
             // Dedicated-stream handshake replies never belong to the UI session.
             ServerMessage::ChannelOpened
             | ServerMessage::ChannelClosed { .. }
