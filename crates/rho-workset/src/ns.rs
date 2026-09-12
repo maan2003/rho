@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use camino::Utf8Path;
 
-use crate::{Checkout, PathOverrides, UserEnvironment, Workset};
+use crate::{PathOverrides, UserEnvironment, Workset};
 
 #[derive(Clone, Debug)]
 pub enum Mode {
@@ -48,11 +48,13 @@ pub struct Namespace {
     root: OwnedFd,
     // Declared after namespace fds so their mount references close first.
     _view_root: Option<tempfile::TempDir>,
-    primary: String,
-    checkouts: Vec<Arc<Checkout>>,
-    host_paths: Vec<(PathBuf, PathBuf)>,
+    /// Where the workset directory appears inside the namespace.
+    visible_root: &'static str,
+    /// The workset directory on the host.
+    src: PathBuf,
     environment: UserEnvironment,
     path_overrides: PathOverrides,
+    store_environment: Vec<(OsString, OsString)>,
     view_path: Option<OsString>,
     /// The Claude home currently mounted, keyed by the visible path it sits
     /// on so a replacement can detach it first.
@@ -62,27 +64,17 @@ pub struct Namespace {
 impl Namespace {
     pub(crate) async fn create(workset: Workset, mode: Mode) -> anyhow::Result<Arc<Self>> {
         let owner = workset.owner()?;
-        let checkouts = workset.checkouts().await;
-        let mounts = workset.mounts().await;
-        let primary = workset.primary_name().await?;
-        anyhow::ensure!(
-            checkouts.iter().any(|checkout| checkout.name() == primary),
-            "workset primary checkout is not materialized: {primary}"
-        );
+        let mounts = crate::layout::Mounts {
+            src: workset.root().as_std_path().to_owned(),
+            store_root: owner.store_root().into_std_path_buf(),
+            store_socket: Some(owner.store_socket().into_std_path_buf()),
+        };
         let visible_root = match &mode {
             Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
             Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
         };
-        let host_paths = mounts
-            .workspaces
-            .iter()
-            .map(|checkout| {
-                (
-                    Path::new(visible_root).join(&checkout.name),
-                    checkout.source.clone(),
-                )
-            })
-            .collect();
+        let src = mounts.src.clone();
+        let store_environment = owner.store_environment();
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
         let view_path = matches!(&mode, Mode::View { .. })
@@ -131,11 +123,11 @@ impl Namespace {
             mount_ns,
             root,
             _view_root: view_root,
-            primary,
-            checkouts,
-            host_paths,
+            visible_root,
+            src,
             environment,
             path_overrides,
+            store_environment,
             view_path,
             claude_home: tokio::sync::Mutex::new(None),
         }))
@@ -193,15 +185,17 @@ impl Namespace {
         Ok(())
     }
 
-    /// Reads a file inside a checkout, refusing symlinks that escape it and
-    /// files larger than `max_len` (capped at [`MAX_BOUNDED_READ`]). `path` is
-    /// a visible path (`/src/<name>/...`) or relative to the primary checkout.
+    /// Reads a file below the workset directory, refusing symlinks that
+    /// escape it and files larger than `max_len` (capped at
+    /// [`MAX_BOUNDED_READ`]). `path` is a visible path (`/src/...`) or
+    /// relative to the visible root.
     pub async fn read_file_bounded(&self, path: &Path, max_len: usize) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
             max_len <= MAX_BOUNDED_READ,
             "read limit {max_len} exceeds {MAX_BOUNDED_READ} bytes"
         );
-        let (root, relative) = self.split_checkout_path(path)?;
+        let relative = self.src_relative(path)?;
+        let root = self.src.clone();
         let display = path.to_owned();
         tokio::task::spawn_blocking(move || {
             let mut file = open_beneath(&root, &relative)
@@ -233,24 +227,13 @@ impl Namespace {
         .context("bounded read task panicked")?
     }
 
-    /// Splits a visible or primary-relative path into the host checkout root
-    /// it belongs to and the path below it.
-    fn split_checkout_path(&self, path: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
-        if path.is_absolute() {
-            for (visible, host) in &self.host_paths {
-                if let Ok(relative) = path.strip_prefix(visible) {
-                    return Ok((host.clone(), relative.to_owned()));
-                }
-            }
-            anyhow::bail!("path is outside every checkout: {}", path.display())
-        }
-        let host = self
-            .host_paths
-            .iter()
-            .find(|(visible, _)| visible.file_name() == Some(self.primary.as_ref()))
-            .map(|(_, host)| host.clone())
-            .context("primary checkout is unavailable")?;
-        Ok((host, path.to_owned()))
+    /// The path below the workset directory that a visible or relative path
+    /// denotes.
+    fn src_relative(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let path = Utf8Path::from_path(path).context("path is not valid UTF-8")?;
+        Ok(crate::visible_relative(self.visible_root, path)?
+            .as_std_path()
+            .to_owned())
     }
 
     /// Where a host path appears inside the namespace: view mode relocates
@@ -270,37 +253,14 @@ impl Namespace {
         &self.workset
     }
 
-    pub fn primary(&self) -> Arc<Checkout> {
-        Arc::clone(&self.checkouts[0])
+    /// Where the workset directory appears inside this namespace.
+    pub fn visible_root(&self) -> &'static str {
+        self.visible_root
     }
 
-    pub fn entries(&self) -> &[Arc<Checkout>] {
-        &self.checkouts
-    }
-
-    pub async fn snapshot(&self) -> anyhow::Result<()> {
-        for checkout in &self.checkouts {
-            checkout.snapshot().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn refresh(&self, mounts: crate::layout::Mounts) -> anyhow::Result<()> {
-        let mount_ns = self.mount_ns.try_clone()?;
-        let root = self.root.try_clone()?;
-        let visible_root = match &self.mode {
-            Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
-            Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
-        };
-        namespace_thread("rho-workset-refresh", move || {
-            crate::layout::unshare_mount_namespace()?;
-            let mounts = crate::layout::prepare_mounts(&mounts)?;
-            enter(&mount_ns, &root)?;
-            crate::layout::mount_prepared_in_place(&mounts, Path::new("/"), visible_root)
-        })
-        .await
-    }
-
+    /// Configures `command` to run inside the namespace. `cwd` is a visible
+    /// path (absolute below the visible root, or relative to it) and
+    /// defaults to the visible root.
     pub fn prepare_command(
         &self,
         command: &mut tokio::process::Command,
@@ -336,11 +296,8 @@ impl Namespace {
                 }
             }
         }
-        let visible_root = match &self.mode {
-            Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
-            Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
-        };
-        let cwd = namespace_cwd(visible_root, &self.primary, cwd)?;
+        command.envs(self.store_environment.iter().map(|(name, value)| (name, value)));
+        let cwd = namespace_cwd(self.visible_root, cwd)?;
         let cwd = CString::new(cwd).context("namespace cwd contains NUL")?;
         let mount_ns = self.mount_ns.as_raw_fd();
         let root = self.root.as_raw_fd();
@@ -416,22 +373,10 @@ impl Namespace {
         Ok(())
     }
 
+    /// The host path behind a visible or relative path, without touching
+    /// the filesystem: a lexical mapping that refuses `.` and `..`.
     pub fn resolve_host_path_checked(&self, path: &Path) -> anyhow::Result<PathBuf> {
-        if path.is_absolute() {
-            for (visible, host) in &self.host_paths {
-                if let Ok(relative) = path.strip_prefix(visible) {
-                    return Ok(host.join(relative));
-                }
-            }
-            anyhow::bail!("path is outside every checkout: {}", path.display())
-        }
-        let host = self
-            .host_paths
-            .iter()
-            .find(|(visible, _)| visible.file_name() == Some(self.primary.as_ref()))
-            .map(|(_, host)| host)
-            .context("primary checkout is unavailable")?;
-        Ok(host.join(path))
+        Ok(self.src.join(self.src_relative(path)?))
     }
 }
 
@@ -482,16 +427,12 @@ fn filtered_view_path(
     ))
 }
 
-fn namespace_cwd(
-    visible_root: &str,
-    primary: &str,
-    requested: Option<&Utf8Path>,
-) -> anyhow::Result<String> {
+fn namespace_cwd(visible_root: &str, requested: Option<&Utf8Path>) -> anyhow::Result<String> {
     let visible_root = Utf8Path::new(visible_root);
     let cwd = match requested {
         Some(path) if path.is_absolute() => path.to_owned(),
-        Some(path) => visible_root.join(primary).join(path),
-        None => visible_root.join(primary),
+        Some(path) => visible_root.join(path),
+        None => visible_root.to_owned(),
     };
     anyhow::ensure!(
         !cwd.as_str()
@@ -586,22 +527,17 @@ mod tests {
 
     #[test]
     fn cwd_stays_lexically_below_the_visible_root() {
-        assert!(namespace_cwd("/ws", "project", Some(Utf8Path::new("/ws/../tmp"))).is_err());
-        assert!(namespace_cwd("/ws", "project", Some(Utf8Path::new("/wsfoo"))).is_err());
-        assert!(namespace_cwd("/ws", "project", Some(Utf8Path::new("../x"))).is_err());
-        assert!(namespace_cwd("/ws", "project", Some(Utf8Path::new("src/./x"))).is_err());
+        assert!(namespace_cwd("/ws", Some(Utf8Path::new("/ws/../tmp"))).is_err());
+        assert!(namespace_cwd("/ws", Some(Utf8Path::new("/wsfoo"))).is_err());
+        assert!(namespace_cwd("/ws", Some(Utf8Path::new("../x"))).is_err());
+        assert!(namespace_cwd("/ws", Some(Utf8Path::new("src/./x"))).is_err());
         assert_eq!(
-            namespace_cwd("/ws", "project", Some(Utf8Path::new("src/nested"))).unwrap(),
+            namespace_cwd("/ws", Some(Utf8Path::new("project/src/nested"))).unwrap(),
             "/ws/project/src/nested"
         );
-        assert_eq!(namespace_cwd("/src", "zeta", None).unwrap(), "/src/zeta");
+        assert_eq!(namespace_cwd("/src", None).unwrap(), "/src");
         assert_eq!(
-            namespace_cwd(
-                "/ws",
-                "project",
-                Some(Utf8Path::new("/ws/project/src/nested"))
-            )
-            .unwrap(),
+            namespace_cwd("/ws", Some(Utf8Path::new("/ws/project/src/nested"))).unwrap(),
             "/ws/project/src/nested"
         );
     }

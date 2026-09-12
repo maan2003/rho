@@ -1,6 +1,7 @@
 //! The agent filesystem view: a private mount namespace whose root is a
 //! fresh tmpfs holding only what an agent works with — `/nix/store`, a
-//! generated `/etc`, an empty `$HOME`, and the `/src` workspace tree.
+//! generated `/etc`, an empty `$HOME`, the workset directory at `/src`, and
+//! the read-only clone-store root at its host path.
 //!
 //! This is a layout, not a sandbox: everything runs as the invoking user,
 //! and no security boundary is claimed.
@@ -9,7 +10,7 @@ use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::{fs, io};
 
@@ -18,25 +19,17 @@ use anyhow::{Context as _, bail, ensure};
 pub const VIEW_MOUNT_ROOT: &str = "/src";
 pub const EXPOSED_MOUNT_ROOT: &str = "/ws";
 
+/// What a namespace mounts: the workset directory at the visible root, and
+/// the clone-store root plus its server socket at their host paths, so the
+/// absolute paths clones record (alternates, `JJ_STORE`) hold inside.
 #[derive(Clone, Debug)]
-pub struct WorkspaceMount {
-    pub name: String,
-    pub source: PathBuf,
-}
-
-#[derive(Clone, Debug)]
-pub struct StoreMount {
-    pub name: String,
-    pub source: PathBuf,
-    /// The id below `source/clones` owned by this workset. That subtree is
-    /// mounted read-write over the otherwise read-only store.
-    pub writable_clone: String,
-}
-
-#[derive(Clone, Debug, Default)]
 pub struct Mounts {
-    pub workspaces: Vec<WorkspaceMount>,
-    pub stores: Vec<StoreMount>,
+    /// The workset directory, mounted read-write at the visible root.
+    pub src: PathBuf,
+    /// The clone-store root, mounted read-only at its own host path.
+    pub store_root: PathBuf,
+    /// The store server's socket, mounted at its own host path.
+    pub store_socket: Option<PathBuf>,
 }
 
 /// Host-derived files captured before the namespace is constructed.
@@ -164,9 +157,10 @@ impl FsViewBuilder {
     }
 }
 
-/// Exposed mode: the full host view as the invoking user, plus the same
-/// `/ws` mount-list tree, mounted over the host's permanently empty `/ws` stub.
-/// Environment, `$HOME`, and every host path stay exactly as they are.
+/// Exposed mode: the full host view as the invoking user, plus the workset
+/// directory mounted over the host's permanently empty `/ws` stub and the
+/// store root made read-only. Environment, `$HOME`, and every other host
+/// path stay exactly as they are.
 pub struct ExposedBuilder {
     mounts: Mounts,
 }
@@ -177,24 +171,11 @@ impl ExposedBuilder {
         Ok(Self { mounts })
     }
 
-    /// Mounts the mount-list tmpfs at `root/ws` in the current mount
+    /// Mounts the workset directory over `root/ws` in the current mount
     /// namespace without forking, unsharing, or changing cwd/environment.
     pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
         let ws = mount_root(root, EXPOSED_MOUNT_ROOT);
-        ensure!(
-            ws.is_dir(),
-            "mount-list mount stub is missing: {}",
-            ws.display()
-        );
-        mount_fs(
-            Some(OsStr::new("tmpfs")),
-            &ws,
-            Some("tmpfs"),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            Some("mode=0755"),
-        )
-        .with_context(|| format!("mount tmpfs over {}", ws.display()))?;
-        fs::create_dir(ws.join(".stores")).context("create mount-list .stores")?;
+        ensure!(ws.is_dir(), "workset mount stub is missing: {}", ws.display());
         mount_in_place(&self.mounts, root, EXPOSED_MOUNT_ROOT)
     }
 
@@ -246,55 +227,26 @@ unsafe fn spawn_setup(setup: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Res
 }
 
 fn validate_mounts(set: &Mounts) -> anyhow::Result<()> {
-    let mut targets = std::collections::HashSet::new();
-    for workspace in &set.workspaces {
-        validate_name(&workspace.name)?;
-        ensure!(
-            workspace.source.is_dir(),
-            "workspace is not a directory: {}",
-            workspace.source.display()
-        );
-        ensure!(
-            targets.insert(format!("w/{}", workspace.name)),
-            "duplicate workspace name: {}",
-            workspace.name
-        );
-    }
-    for store in &set.stores {
-        validate_name(&store.name)?;
-        validate_name(&store.writable_clone)?;
-        ensure!(
-            store.source.is_dir(),
-            "store is not a directory: {}",
-            store.source.display()
-        );
-        ensure!(
-            store
-                .source
-                .join("clones")
-                .join(&store.writable_clone)
-                .is_dir(),
-            "writable clone is not a directory: {}/clones/{}",
-            store.source.display(),
-            store.writable_clone
-        );
-        ensure!(
-            targets.insert(format!("s/{}", store.name)),
-            "duplicate store name: {}",
-            store.name
-        );
-    }
-    Ok(())
-}
-
-fn validate_name(name: &str) -> anyhow::Result<()> {
-    ensure!(!name.is_empty(), "mount name is empty");
     ensure!(
-        Path::new(name)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-            && !name.contains('/'),
-        "mount name is not one path component: {name}"
+        set.src.is_dir(),
+        "workset directory is missing: {}",
+        set.src.display()
+    );
+    for (what, path) in [("store root", &set.store_root)]
+        .into_iter()
+        .chain(set.store_socket.iter().map(|socket| ("store socket", socket)))
+    {
+        ensure!(
+            path.is_absolute(),
+            "{what} must be an absolute path: {}",
+            path.display()
+        );
+        ensure!(path.exists(), "{what} is missing: {}", path.display());
+    }
+    ensure!(
+        set.store_root.is_dir(),
+        "store root is not a directory: {}",
+        set.store_root.display()
     );
     Ok(())
 }
@@ -430,7 +382,7 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         "tmp",
         "proc",
         "dev",
-        "src/.stores",
+        "src",
         "old-root",
     ] {
         fs::create_dir_all(root.join(dir)).with_context(|| format!("create /{dir}"))?;
@@ -499,52 +451,6 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
     fs::create_dir(dev.join("shm"))?;
     fs::set_permissions(dev.join("shm"), fs::Permissions::from_mode(0o1777))?;
     Ok(())
-}
-
-struct PreparedEntry {
-    name: String,
-    source: OwnedFd,
-}
-struct PreparedStore {
-    name: String,
-    source: OwnedFd,
-    writable_clone: String,
-    clone_source: OwnedFd,
-}
-/// Detached mount trees captured before entering a target mount namespace.
-pub struct PreparedMounts {
-    workspaces: Vec<PreparedEntry>,
-    stores: Vec<PreparedStore>,
-}
-
-/// Captures mount sources in detached trees that survive a namespace switch.
-pub fn prepare_mounts(set: &Mounts) -> anyhow::Result<PreparedMounts> {
-    validate_mounts(set)?;
-    let workspaces = set
-        .workspaces
-        .iter()
-        .map(|entry| {
-            Ok(PreparedEntry {
-                name: entry.name.clone(),
-                source: clone_mount(&entry.source)?,
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-    let stores = set
-        .stores
-        .iter()
-        .map(|entry| {
-            Ok(PreparedStore {
-                name: entry.name.clone(),
-                source: clone_mount(&entry.source)?,
-                writable_clone: entry.writable_clone.clone(),
-                clone_source: clone_mount(
-                    &entry.source.join("clones").join(&entry.writable_clone),
-                )?,
-            })
-        })
-        .collect::<anyhow::Result<_>>()?;
-    Ok(PreparedMounts { workspaces, stores })
 }
 
 /// Captures one host directory or file as a detached mount tree that can be
@@ -629,56 +535,34 @@ fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Res
     set_mount_attributes(Path::new(OsStr::from_bytes(target.as_bytes())), readonly)
 }
 
-/// Installs previously captured mount trees below a visible root.
-pub fn mount_prepared_in_place(
-    set: &PreparedMounts,
-    root: &Path,
-    visible_root: &str,
-) -> anyhow::Result<()> {
+/// Mounts a validated workset below `root` in the current mount namespace:
+/// the workset directory at `visible_root`, the store root read-only at its
+/// host path, and the store socket at its host path.
+pub fn mount_in_place(set: &Mounts, root: &Path, visible_root: &str) -> anyhow::Result<()> {
+    validate_mounts(set)?;
     let ws = mount_root(root, visible_root);
-    for store in &set.stores {
-        let target = ws.join(".stores").join(&store.name);
-        fs::create_dir(&target)?;
-        install_mount(&store.source, &target, true)?;
-        install_mount(
-            &store.clone_source,
-            &target.join("clones").join(&store.writable_clone),
-            false,
-        )?;
-    }
-    for entry in &set.workspaces {
-        let target = ws.join(&entry.name);
-        fs::create_dir(&target)?;
-        install_mount(&entry.source, &target, false)?;
+    bind(&set.src, &ws, false)?;
+    let store_root = host_path_in(root, &set.store_root);
+    fs::create_dir_all(&store_root)
+        .with_context(|| format!("create {}", store_root.display()))?;
+    bind(&set.store_root, &store_root, true)?;
+    if let Some(socket) = &set.store_socket {
+        let target = host_path_in(root, socket);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        if !target.exists() {
+            fs::File::create(&target)
+                .with_context(|| format!("create socket mount point {}", target.display()))?;
+        }
+        bind(socket, &target, false)?;
     }
     Ok(())
 }
 
-/// Adds a validated working set below the selected visible root in the current
-/// mount namespace. This is also the primitive used to refresh a live namespace
-/// after a daemon grants another store or creates another workspace. For
-/// refresh, pass a `Mounts` containing only the newly added entries; collisions
-/// with already-mounted names fail when their target directory is created.
-pub fn mount_in_place(set: &Mounts, root: &Path, visible_root: &str) -> anyhow::Result<()> {
-    validate_mounts(set)?;
-    let ws = mount_root(root, visible_root);
-    for store in &set.stores {
-        let target = ws.join(".stores").join(&store.name);
-        fs::create_dir(&target)?;
-        bind(&store.source, &target, true)?;
-        let clone_target = target.join("clones").join(&store.writable_clone);
-        bind(
-            &store.source.join("clones").join(&store.writable_clone),
-            &clone_target,
-            false,
-        )?;
-    }
-    for workspace in &set.workspaces {
-        let target = ws.join(&workspace.name);
-        fs::create_dir(&target)?;
-        bind(&workspace.source, &target, false)?;
-    }
-    Ok(())
+/// Where the host path `path` lands below the namespace root being built.
+fn host_path_in(root: &Path, path: &Path) -> PathBuf {
+    root.join(path.strip_prefix("/").unwrap_or(path))
 }
 
 fn pivot_into(root: &Path) -> anyhow::Result<()> {

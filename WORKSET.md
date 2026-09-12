@@ -1,27 +1,48 @@
-# Worksets and filesystem views
+# Worksets and the agent filesystem view
 
-A Workset is the unit Rho gives an agent: an ordered collection of named
-Checkouts backed by daemon-managed clone stores. `rho-workset` owns the full
-lifecycle—rho-db records, clone/fork orchestration, mount mapping, tmpfs layout,
-and the live namespace. Shared stores live under `~/src/.rho/stores`; each
-Workset's host-frame files live under `~/src/.rho/worksets/<id>/src`, while its
-explicit primary Checkout and append-only Checkout order live in rho-db.
+A workset is the unit Rho gives an agent: one plain directory, presented
+at `/src` inside the agent's private mount namespace. The daemon does not
+interpret what is in it. The agent clones repositories into it with
+ordinary `jj git clone`, adds jj workspaces with `jj workspace add`, and
+keeps whatever else it wants there; the directory is the truth and there
+is no separate record of its contents.
 
-`Workset::enter(Mode)` turns that durable host-frame collection into one of the
-runtime views below. The lower-level layout builders remain public for direct
+`rho-workset` owns the state root, `~/.local/state/rho`:
+
+```
+~/.local/state/rho/
+  stores/            # clone-store root (CLONES.md), URL-keyed
+  store.sock         # the store server's socket
+  worksets/<id>/src  # one directory per workset
+```
+
+`Worksets::open` creates the root and starts `jj store serve` on the
+socket. That server is the only writer of `stores/`: it initializes a
+store on first request, refetches every store in the background so new
+clones are born on the remote's current state, and serves the same
+store to concurrent requests under one lock. Everything else — the
+daemon's own `Workset::clone_repo`, an agent's `jj git clone` and
+`jj git fetch` — is a client that reads a store and never touches the
+network. `Worksets::discard_workset` deletes the workset directory;
+stores are shared and never removed.
+
+Several agents can work in one workset: a child agent joins its parent's
+workset and gets its own jj workspace inside it, made by the parent.
+Every agent carries its own working directory below `/src`; loading
+`AGENTS.md`-style context is a function of that directory, not of a
+"primary" repository.
+
+`Workset::enter(Mode)` turns the directory into one of the runtime views
+below. The lower-level layout builders remain public for direct
 inspection and development tooling (`rho-workset-dev`).
-
-How a Rho agent's filesystem is laid out: a private mount namespace
-whose root is built fresh for each agent. The clone store that
-provides the repositories in it is described in `CLONES.md`.
 
 **This is a layout, not a sandbox.** Everything runs as the invoking
 user in an unprivileged user namespace; no security boundary is
-claimed or implied. What the view buys is hygiene: agents get an identical, minimal,
-disposable environment; they see only the Checkouts their Workset grants, not
-the rest of the host or other Worksets; and everything outside those
-host-backed Checkouts—the root, `$HOME`, and `/tmp`—is tmpfs that evaporates
-with the namespace.
+claimed or implied. What the view buys is hygiene: agents get an
+identical, minimal, disposable environment; they see only their workset,
+not the rest of the host or other worksets; and everything outside it —
+the root, `$HOME`, and `/tmp` — is tmpfs that evaporates with the
+namespace.
 
 ## What's in the view
 
@@ -35,10 +56,15 @@ a plain directory or file except a handful of real mounts:
   optional skeleton. The host home is not mounted at all.
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
-- `/src`: the working set, below. The command starts here.
+- `/src`: the workset directory, read-write. The command starts here.
+- The clone-store root, read-only, and the store socket, at the same
+  absolute paths they have on the host. Clones record the store by
+  absolute path (git alternates), so the path must not change between
+  the daemon's frame and the agent's.
 
-The environment is an explicit allowlist (plus HOME/USER/LOGNAME);
-inherited fds are closed on exec.
+The environment is an explicit allowlist (PATH, TERM, plus
+HOME/USER/LOGNAME) and `JJ_STORE` / `JJ_STORE_SOCKET` pointing jj at the
+store server; inherited fds are closed on exec.
 
 `Namespace::set_claude_home` mounts an agent's Claude Code home over its
 `~/.claude` inside the live namespace: the per-account state directory,
@@ -47,40 +73,21 @@ a shared `projects/` directory, the prompt as `CLAUDE.md`, and an optional
 relative `config_home` lands under `/home/agent`. Setting a different home
 detaches the previous stack first.
 
-`Namespace::read_file_bounded` reads a file from a checkout by visible or
-primary-relative path with `openat2(RESOLVE_BENEATH)`, so symlinks that
-leave the checkout are refused, and returns at most 64 MiB.
-
-## /src: the working set
-
-Workspaces appear at `/src/<name>`, read-write. Clone stores appear at
-`/src/.stores/<repo>`, read-only, with the agent's own clone
-(`clones/<id>`) bind-mounted read-write over it — so the store's
-never-prune invariant is at least mount-enforced against accidents,
-while the agent's own refs, op log, and fetches work normally.
-
-Because clone-store pointers are relative and never leave the tree
-(`CLONES.md`), this layout is the entire filesystem contract: a
-workspace plus its store, mounted in the same relative positions,
-works identically from any mount root. The host locations of the
-backing directories are bookkeeping the launcher owns.
-
-A store is initialized on first use and refreshed with `jj store fetch`
-before every later clone into it, so a new Checkout always starts from
-the remote's current state; forks transfer by sha and need no refresh.
-`Worksets::discard_workset` removes a Workset's Checkouts, its clone in
-every store and its rho-db record, never the store's `git/` or
-`template/`.
+`Namespace::read_file_bounded` reads a file below `/src` by visible or
+relative path with `openat2(RESOLVE_BENEATH)`, so symlinks that leave the
+workset are refused, and returns at most 64 MiB.
+`Namespace::prepare_command` takes the working directory as a visible
+path and refuses anything outside `/src`.
 
 ## Exposed mode
 
 Some work genuinely needs the real system. Exposed mode is the full
 host view as the user — environment, `$HOME`, every path unchanged —
-plus the same working-set tree mounted at `/ws` over the host's existing
-`/ws` stub. View mode presents checkouts at `/src`; exposed mode temporarily
-keeps `/ws` until the deployed host stub migrates. The store plumbing remains
-dot-hidden at `/src/.stores` or `/ws/.stores`, with identical relative pointer
-depth. Exposed access is granted per agent by the user.
+plus the workset directory mounted at `/ws` over the host's existing
+`/ws` stub and the store root made read-only. View mode presents the
+workset at `/src`; exposed mode temporarily keeps `/ws` until the
+deployed host stub migrates. Exposed access is granted per agent by the
+user.
 
 The stub is the one host prerequisite this implies: an unprivileged
 mount namespace can only mount over a directory that already exists,
@@ -91,6 +98,12 @@ unmounted.
 
 ## Deliberately not here
 
+- No workset table: the directory is the record. Opening a workset is
+  checking that its directory exists.
+- No forking of checkouts between agents: children join the parent's
+  workset; separate work happens in jj workspaces the parent creates.
+- No namespace refresh: `/src` is one bind mount, so anything cloned
+  into the workset is visible immediately.
 - No uid separation, no role users, no setgroups/setuid machinery:
   same user inside and out. Rejected as complexity without an honest
   boundary — a mount namespace shared with the host uid cannot

@@ -15006,15 +15006,10 @@ name = "rho-workset"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "camino",
  "dirs",
  "libc",
- "redb",
- "rho-context-config",
- "rho-db",
  "rho-workset-types",
- "senax-encoder",
  "serde_json",
  "tempfile",
  "tokio",

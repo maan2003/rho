@@ -2,13 +2,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use rho_workset::{
-    ExposedBuilder, FsViewBuilder, FsViewConfig, Mounts, StoreMount, WorkspaceMount,
-};
+use rho_workset::{ExposedBuilder, FsViewBuilder, FsViewConfig, Mounts};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
-    let mut set = Mounts::default();
+    let mut src = None;
+    let mut stores = None;
+    let mut socket = None;
     let mut skeleton = None;
     let mut exposed = false;
     let mut command = Vec::new();
@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         let value = match arg.to_str() {
-            Some("--workspace" | "--store" | "--skeleton") => args
+            Some("--src" | "--stores" | "--socket" | "--skeleton") => args
                 .next()
                 .with_context(|| format!("missing value for {}", arg.to_string_lossy()))?,
             Some("--exposed") => {
@@ -32,31 +32,21 @@ fn main() -> anyhow::Result<()> {
             _ => bail!("unknown argument: {}", arg.to_string_lossy()),
         };
         match arg.to_str().unwrap() {
-            "--workspace" => {
-                let (name, path) = pair(&value, "workspace")?;
-                set.workspaces.push(WorkspaceMount {
-                    name,
-                    source: path.into(),
-                });
-            }
-            "--store" => {
-                let text = value.to_string_lossy();
-                let mut fields = text.splitn(3, '=');
-                let (Some(name), Some(path), Some(clone)) =
-                    (fields.next(), fields.next(), fields.next())
-                else {
-                    bail!("store must be NAME=PATH=CLONE_ID")
-                };
-                set.stores.push(StoreMount {
-                    name: name.into(),
-                    source: path.into(),
-                    writable_clone: clone.into(),
-                });
-            }
+            "--src" => src = Some(PathBuf::from(value)),
+            "--stores" => stores = Some(PathBuf::from(value)),
+            "--socket" => socket = Some(PathBuf::from(value)),
             "--skeleton" => skeleton = Some(PathBuf::from(value)),
             _ => unreachable!(),
         }
     }
+    let src = std::path::absolute(src.context("--src is required")?)?;
+    let store_root = std::path::absolute(stores.context("--stores is required")?)?;
+    let store_socket = socket.map(std::path::absolute).transpose()?;
+    let set = Mounts {
+        src,
+        store_root,
+        store_socket,
+    };
     let mut command = if command.is_empty() {
         vec![
             std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("bash")),
@@ -84,17 +74,9 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(128));
 }
 
-fn pair(value: &OsString, kind: &str) -> anyhow::Result<(String, String)> {
-    let value = value.to_string_lossy();
-    value
-        .split_once('=')
-        .map(|(a, b)| (a.into(), b.into()))
-        .with_context(|| format!("{kind} must be NAME=PATH"))
-}
-
 fn usage() {
     eprintln!(
-        "usage: rho-workset-dev [--exposed] [--workspace NAME=PATH] [--store REPO=PATH=CLONE_ID] [--skeleton PATH] [-- COMMAND ...]"
+        "usage: rho-workset-dev [--exposed] --src PATH --stores PATH [--socket PATH] [--skeleton PATH] [-- COMMAND ...]"
     );
 }
 

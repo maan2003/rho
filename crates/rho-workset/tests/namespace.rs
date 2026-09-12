@@ -1,15 +1,16 @@
-//! Live-namespace behaviour: bounded reads through the checkout map and the
-//! Claude home mount stack. Runs without the libtest harness because the
-//! identity user namespace must be created while the process is still
-//! single-threaded.
+//! Live-namespace behaviour: bounded reads below `/src`, cloning through
+//! the store server from inside the namespace, and the Claude home mount
+//! stack. Runs without the libtest harness because the identity user
+//! namespace must be created while the process is still single-threaded.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use camino::Utf8Path;
 use rho_workset::{ClaudeHome, MAX_BOUNDED_READ, Mode};
 
 mod common;
-use common::{jj_binary, open_worksets, setup_remote};
+use common::{jj_binary, only_store, open_worksets, setup_remote};
 
 fn main() {
     let unshare = Command::new("unshare").args(["-U", "true"]).status();
@@ -40,29 +41,30 @@ fn host_binary(name: &str) -> PathBuf {
 async fn run(jj_bin: PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let (_source, remote) = setup_remote(temp.path());
-    let root = open_worksets(temp.path(), &jj_bin);
+    let root = open_worksets(temp.path(), &jj_bin).await;
     let workset = root.create().await.unwrap();
     let checkout = workset
-        .clone(
-            "repo",
-            remote.to_str().unwrap(),
-            Some("project"),
-            Some("main@origin"),
-        )
+        .clone_repo(remote.to_str().unwrap(), Some("project"))
         .await
         .unwrap();
     let outside = temp.path().join("outside.txt");
     std::fs::write(&outside, "secret\n").unwrap();
-    std::os::unix::fs::symlink(&outside, checkout.checkout().join("escape")).unwrap();
-    std::fs::create_dir(checkout.checkout().join("sub")).unwrap();
-    std::os::unix::fs::symlink("../file.txt", checkout.checkout().join("sub/inside")).unwrap();
+    std::os::unix::fs::symlink(&outside, checkout.join("escape")).unwrap();
+    std::fs::create_dir(checkout.join("sub")).unwrap();
+    std::os::unix::fs::symlink("../file.txt", checkout.join("sub/inside")).unwrap();
 
+    // The view holds only /nix/store binaries; carry jj in through the
+    // home skeleton like the dev launcher does.
+    let skeleton = temp.path().join("skeleton");
+    std::fs::create_dir(&skeleton).unwrap();
+    std::fs::copy(&jj_bin, skeleton.join("jj")).unwrap();
     let ns = workset
         .enter(Mode::View {
-            home_skeleton: None,
+            home_skeleton: Some(skeleton),
         })
         .await
         .unwrap();
+    assert_eq!(ns.visible_root(), "/src");
 
     // Bounded reads: visible and relative paths, limits, and escapes.
     assert_eq!(
@@ -72,30 +74,30 @@ async fn run(jj_bin: PathBuf) {
         b"one\n"
     );
     assert_eq!(
-        ns.read_file_bounded(Path::new("file.txt"), 4)
+        ns.read_file_bounded(Path::new("project/file.txt"), 4)
             .await
             .unwrap(),
         b"one\n"
     );
     assert_eq!(
-        ns.read_file_bounded(Path::new("sub/inside"), 1024)
+        ns.read_file_bounded(Path::new("project/sub/inside"), 1024)
             .await
             .unwrap(),
         b"one\n",
-        "symlinks staying inside the checkout resolve"
+        "symlinks staying inside the workset resolve"
     );
     assert!(
-        ns.read_file_bounded(Path::new("file.txt"), 3)
+        ns.read_file_bounded(Path::new("project/file.txt"), 3)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("file.txt"), MAX_BOUNDED_READ + 1)
+        ns.read_file_bounded(Path::new("project/file.txt"), MAX_BOUNDED_READ + 1)
             .await
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("escape"), 1024)
+        ns.read_file_bounded(Path::new("project/escape"), 1024)
             .await
             .is_err()
     );
@@ -110,11 +112,67 @@ async fn run(jj_bin: PathBuf) {
             .is_err()
     );
     assert!(
-        ns.read_file_bounded(Path::new("/src/other/file.txt"), 1024)
+        ns.read_file_bounded(Path::new("/etc/passwd"), 1024)
             .await
             .is_err()
     );
-    assert!(ns.read_file_bounded(Path::new("sub"), 1024).await.is_err());
+    assert!(ns.read_file_bounded(Path::new("project/sub"), 1024).await.is_err());
+    assert_eq!(
+        ns.resolve_host_path_checked(Path::new("/src/project/x")).unwrap(),
+        checkout.join("x")
+    );
+
+    // Inside the namespace the agent clones through the server, works in
+    // the clone, and cannot write the store. The command starts in /src.
+    let sh = host_binary("sh");
+    let store = only_store(temp.path());
+    let script = format!(
+        r#"
+set -eu
+test "$PWD" = /src
+test -d /src/project
+test "$JJ_STORE" = {stores}
+test "$JJ_STORE_SOCKET" = {socket}
+test -S "$JJ_STORE_SOCKET"
+/home/agent/jj git clone -- {remote} second >/dev/null 2>&1
+test -f /src/second/file.txt
+/home/agent/jj -R /src/second git fetch >/dev/null 2>&1
+touch /src/second/written
+if touch {store}/clone-store 2>/dev/null; then echo "store is writable"; exit 1; fi
+if mkdir {stores}/x 2>/dev/null; then echo "store root is writable"; exit 1; fi
+test ! -e /src/.stores
+"#,
+        stores = root.store_root(),
+        socket = root.store_socket(),
+        remote = remote.display(),
+        store = store.display(),
+    );
+    let mut command = tokio::process::Command::new(&sh);
+    command.arg("-c").arg(&script);
+    ns.prepare_command(&mut command, None).unwrap();
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workset.root().join("second/written").exists());
+    assert_eq!(workset.repos().unwrap(), vec!["project", "second"]);
+    assert_eq!(only_store(temp.path()), store);
+
+    // cwd is a visible path below /src.
+    let mut command = tokio::process::Command::new(&sh);
+    command.arg("-c").arg("pwd");
+    ns.prepare_command(&mut command, Some(Utf8Path::new("second")))
+        .unwrap();
+    let output = command.output().await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "/src/second\n");
+    let mut command = tokio::process::Command::new(&sh);
+    assert!(
+        ns.prepare_command(&mut command, Some(Utf8Path::new("/tmp")))
+            .is_err()
+    );
 
     // Claude home: mounted into the live namespace, replaceable.
     let host_home = dirs::home_dir().unwrap();
@@ -147,7 +205,6 @@ async fn run(jj_bin: PathBuf) {
         settings: None,
     };
 
-    let sh = host_binary("sh");
     let script = r#"
         read -r line < "$HOME/.claude/CLAUDE.md"; echo "prompt=$line"
         read -r line < "$HOME/.claude/settings.json" || true; echo "settings=$line"
