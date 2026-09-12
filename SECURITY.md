@@ -575,9 +575,8 @@ AI APIs.
   thereby outlive the shell, just as it can deliberately start a user service;
   this is accepted because editor-shell commands are trusted with the workspace's
   authority rather than sandboxed.
-- Rho-owned agent variables (`RHO_AGENT_ID` and `RHO_MCP_AGENT_ID`) are supplied
-  explicitly to agent commands rather than copied
-  incidentally from the daemon environment.
+- The Rho-owned agent variable `RHO_AGENT_ID` is supplied explicitly to agent
+  commands rather than copied incidentally from the daemon environment.
 - Rho forces all daemon-owned agent, terminal, and internal workspace
   subprocesses through process-local Git URL rewrites for the exact
   `git@github.com:`, `ssh://git@github.com/`, `git@git.sr.ht:`, and
@@ -657,14 +656,12 @@ therefore disclosed to the configured inference provider. Project UI names are
 not included in model context. Treat descriptions as prompt input rather than
 trusted instructions.
 
-Claude Code MCP support is bound to the active Rho agent through
-`RHO_MCP_AGENT_ID`, which Rho sets when spawning the Claude process. A globally
-configured `rho mcp-agent-tools` stdio server inherits that environment and
-treats tool calls as provider-controlled input: the daemon validates
-role-prefixed handles and Engineer workdir choices;
-preserves the same spawn-depth/live-child limits as
-in-process Rho tools, bounds wait operations, and returns tool errors as data
-instead of panicking.
+Claude Code reaches Rho only through the in-process Python notebook server
+that the daemon serves over Claude's control channel; every built-in Claude
+tool is denied in the generated settings. The multi-agent host functions it
+gets there are the same ones native roles use, with the same handle
+validation, spawn-depth and live-child limits, and tool errors returned as
+data instead of panicking.
 
 Agent mail intentionally has no ownership or ancestry authorization: any agent
 that knows another agent's unambiguous role-prefixed handle may inject mail into

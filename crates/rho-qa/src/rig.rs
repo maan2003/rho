@@ -997,7 +997,7 @@ fn touch_line(root: &Path, name: &str) -> String {
 /// Who is running this rig, for the session line. The agent handle if this is
 /// an agent's shell, the user otherwise, and nothing rather than a guess.
 fn holder() -> Option<String> {
-    ["RHO_MCP_AGENT_ID", "RHO_AGENT_ID", "USER"]
+    ["RHO_AGENT_ID", "USER"]
         .into_iter()
         .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }

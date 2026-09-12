@@ -390,14 +390,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   background by which cell registered it, and each request's `Sent` event
   records why it went out (`WakeFacts`).
 
-Claude Code MCP support follows the same boundary: `rho-claude` knows how to
-set per-agent MCP environment, but the MCP server that exposes Rho multi-agent
-operations lives at the CLI/daemon control boundary. Claude Code can launch a
-globally configured `rho mcp-agent-tools` stdio MCP server; that server reads
-`RHO_MCP_AGENT_ID` from the Claude process environment, relays tool calls to the
-daemon, and the daemon executes parent-scoped spawn, agent mail, interrupt, and
-wait against `AgentPool`. The MCP server must not reach into `rho-core` or
-provider crates.
+Claude Code follows the same boundary: the notebook is served to it as an
+in-process SDK MCP server over the CLI's control channel, and the multi-agent
+operations are the same `agents.*` host functions the native roles get. There
+is no separate stdio MCP server and no per-agent MCP configuration in the
+account; an earlier `rho mcp-agent-tools` registration is removed from an
+account's `.claude.json` when the account is prepared.
 
 The Claude engineer roles (`eng-ultra`, `eng-alt`) give the agent Rho's Python
 notebook as its only tool. `rho-agent`'s Claude loop hosts the notebook itself and serves it to

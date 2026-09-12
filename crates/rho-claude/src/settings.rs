@@ -54,10 +54,10 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "Write",
 ];
 
-/// `base` with every built-in tool and every tool of the named MCP servers
-/// added to `permissions.deny`, leaving the account's other settings alone.
+/// `base` with every built-in tool added to `permissions.deny`, leaving the
+/// account's other settings alone.
 /// A non-object base is replaced rather than merged.
-pub fn deny_all_but_own_tools(base: &Value, deny_mcp_servers: &[&str]) -> Value {
+pub fn deny_all_but_own_tools(base: &Value) -> Value {
     let mut settings = match base {
         Value::Object(map) => map.clone(),
         _ => serde_json::Map::new(),
@@ -75,12 +75,7 @@ pub fn deny_all_but_own_tools(base: &Value, deny_mcp_servers: &[&str]) -> Value 
         *deny = json!([]);
     }
     let deny = deny.as_array_mut().expect("deny is an array");
-    let wanted = BUILTIN_TOOLS.iter().map(|tool| (*tool).to_owned()).chain(
-        deny_mcp_servers
-            .iter()
-            .map(|server| format!("mcp__{server}")),
-    );
-    for rule in wanted {
+    for rule in BUILTIN_TOOLS.iter().map(|tool| (*tool).to_owned()) {
         if !deny.iter().any(|existing| existing.as_str() == Some(&rule)) {
             deny.push(Value::String(rule));
         }
@@ -98,7 +93,7 @@ mod tests {
             "model": "opus",
             "permissions": { "allow": ["Bash(git:*)"], "deny": ["Bash", "Read"] },
         });
-        let settings = deny_all_but_own_tools(&base, &["rho"]);
+        let settings = deny_all_but_own_tools(&base);
         assert_eq!(settings["model"], "opus");
         assert_eq!(settings["permissions"]["allow"], json!(["Bash(git:*)"]));
         let deny = settings["permissions"]["deny"].as_array().unwrap();
@@ -109,19 +104,18 @@ mod tests {
             1,
             "existing rules are not repeated"
         );
-        assert_eq!(deny.len(), BUILTIN_TOOLS.len() + 1);
-        assert!(deny.contains(&json!("mcp__rho")));
+        assert_eq!(deny.len(), BUILTIN_TOOLS.len());
         assert!(deny.contains(&json!("ToolSearch")));
     }
 
     #[test]
     fn replaces_malformed_sections() {
-        let settings = deny_all_but_own_tools(&json!({"permissions": "no"}), &[]);
+        let settings = deny_all_but_own_tools(&json!({"permissions": "no"}));
         assert_eq!(
             settings["permissions"]["deny"].as_array().unwrap().len(),
             BUILTIN_TOOLS.len()
         );
-        let settings = deny_all_but_own_tools(&json!([1]), &[]);
+        let settings = deny_all_but_own_tools(&json!([1]));
         assert!(settings["permissions"]["deny"].is_array());
     }
 }

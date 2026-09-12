@@ -1408,7 +1408,6 @@ async fn run(
             | ServerMessage::LandLeaseQueued { .. }
             | ServerMessage::LandLeaseGranted { .. }
             | ServerMessage::LandStatus { .. }
-            | ServerMessage::McpAgentToolResult(_)
             | ServerMessage::PlatformStatus { .. }
             | ServerMessage::IrohApproved { .. }
             | ServerMessage::IrohRevoked { .. }

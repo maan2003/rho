@@ -1297,7 +1297,6 @@ impl ClaudeLoop {
         options.session = session;
         if let Some(tools) = &self.multi_agent {
             options.set_env("RHO_AGENT_ID", tools.self_id().encoded());
-            options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
         if self.python_mode {
             self.ensure_python(&view)?;
@@ -1401,10 +1400,7 @@ impl ClaudeLoop {
         // generated file covers the account's `settings.json`.
         let settings = if self.python_mode {
             let base = self.claude.account_settings(account)?;
-            let settings = rho_claude::settings::deny_all_but_own_tools(
-                &base,
-                &[rho_claude::accounts::MCP_SERVER_NAME],
-            );
+            let settings = rho_claude::settings::deny_all_but_own_tools(&base);
             let text = serde_json::to_string_pretty(&settings)?;
             Some(
                 write_generated_source(

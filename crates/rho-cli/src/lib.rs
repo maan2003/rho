@@ -17,7 +17,6 @@ use rho_ui_proto::{ClientMessage, ServerMessage};
 
 mod eval;
 mod land;
-mod mcp_agent_tools;
 mod pr;
 mod visualization;
 mod wayland;
@@ -95,7 +94,6 @@ async fn run(command: Command) -> Result<()> {
         Command::Eval(args) => eval::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
-        Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Pr(args) => pr::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
@@ -142,25 +140,6 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     }
 }
 
-/// Resolves an agent handle — role-prefixed (`eng-j2qk`) or a raw encoded id
-/// as found in `$RHO_AGENT_ID` — against the daemon's id domain.
-pub(crate) fn resolve_agent_id(
-    text: &str,
-    machine_seed: u64,
-    agent_counter: u64,
-) -> Result<rho_ui_proto::AgentId> {
-    let text = text.trim();
-    let raw = text.split_once('-').map_or(text, |(_, raw)| raw);
-    let domain = rho_ui_proto::AgentIdDomain(machine_seed);
-    match rho_ui_proto::AgentId::from_prefix(raw, agent_counter + 1, &domain)? {
-        prefix_id::PrefixResolution::Unique(agent_id)
-        | prefix_id::PrefixResolution::Ambiguous {
-            first: agent_id, ..
-        } => Ok(agent_id),
-        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {text}"),
-    }
-}
-
 pub(crate) async fn connect_or_start_daemon(socket_path: &std::path::Path) -> Result<UiClient> {
     if let Ok(client) = UiClient::connect(socket_path).await {
         return Ok(client);
@@ -203,7 +182,6 @@ enum Command {
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
-    McpAgentTools(McpAgentToolsArgs),
     Pr(PrArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
@@ -232,7 +210,6 @@ enum CliCommand {
     Eval(eval::EvalArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
-    McpAgentTools(McpAgentToolsArgs),
     Pr(PrArgs),
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
@@ -387,14 +364,6 @@ pub(crate) enum PrCliCommand {
 }
 
 #[derive(Clone, clap::Args)]
-pub(crate) struct McpAgentToolsArgs {
-    #[arg(long = "agent-id")]
-    agent_id: Option<String>,
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
-}
-
-#[derive(Clone, clap::Args)]
 pub(crate) struct LandArgs {
     /// Checkout path to land from (defaults to the current directory).
     #[arg(default_value = ".")]
@@ -423,7 +392,6 @@ impl Args {
             CliCommand::Eval(args) => Command::Eval(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Land(args) => Command::Land(args),
-            CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),
             CliCommand::Pr(args) => Command::Pr(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),

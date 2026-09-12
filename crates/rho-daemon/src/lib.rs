@@ -19,9 +19,8 @@ use rho_inference::Inference;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
-    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
-    McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
-    WorksetMode, WorkspaceInfo, read_frame, write_frame,
+    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, QuotaPoint, QuotaSeries, QuotaSummary,
+    ServerMessage, StartMode, WorksetMode, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
@@ -1102,129 +1101,6 @@ impl Services {
         Ok((agent_id, agent))
     }
 
-    async fn mcp_agent_tool(
-        &self,
-        self_agent_id: AgentId,
-        request: McpAgentToolRequest,
-    ) -> anyhow::Result<String> {
-        if !self.pool.agent_exists(self_agent_id) {
-            anyhow::bail!("agent is not known: {self_agent_id:?}");
-        }
-        let (_, self_agent, _) = self.load(self_agent_id).await?;
-        let role = self_agent.head().config.role;
-        if matches!(role, AgentRole::Advisor { .. })
-            && !matches!(
-                &request,
-                McpAgentToolRequest::MessageAgent { .. }
-                    | McpAgentToolRequest::FollowupAdvisor { .. }
-            )
-        {
-            anyhow::bail!("Advisors may only message agents");
-        }
-        match request {
-            McpAgentToolRequest::SpawnEngineer { task_name, prompt } => {
-                if prompt.trim().is_empty() {
-                    anyhow::bail!("prompt must not be empty");
-                }
-                let child_id = self
-                    .pool
-                    .spawn_child(
-                        self_agent_id,
-                        task_name.clone(),
-                        prompt,
-                        AgentRole::default(),
-                    )
-                    .await?;
-                let child_record = self.load(child_id).await?.1.head();
-                let workspace_note =
-                    format!(" It works in {}.", child_record.primary_workdir().repo());
-                Ok(format!(
-                    "Spawned Engineer {} for task \"{}\". Its results will arrive as mail.{}",
-                    self.display_agent_id(child_id),
-                    task_name,
-                    workspace_note,
-                ))
-            }
-            McpAgentToolRequest::MessageAgent { agent_id, message } => {
-                if message.trim().is_empty() {
-                    anyhow::bail!("message must not be empty");
-                }
-                let recipient = self.resolve_display_agent_id(&agent_id).await?;
-                if recipient == self_agent_id {
-                    anyhow::bail!("cannot send a message to yourself");
-                }
-                self.pool
-                    .deliver_mail(
-                        self_agent_id,
-                        recipient,
-                        message,
-                        MessageDelivery::NextRequest,
-                    )
-                    .await?;
-                Ok(format!(
-                    "Message sent to agent {}.",
-                    self.display_agent_id(recipient)
-                ))
-            }
-            McpAgentToolRequest::InterruptEngineer {
-                engineer_id: agent_id,
-            } => {
-                let target = self.resolve_display_agent_id(&agent_id).await?;
-                if target == self_agent_id {
-                    anyhow::bail!("cannot interrupt yourself");
-                }
-                let (_, agent, _) = self.pool.load(target).await?;
-                agent.cancel();
-                Ok(format!(
-                    "Agent {} interrupted. It remains available for follow-up messages.",
-                    self.display_agent_id(target)
-                ))
-            }
-            McpAgentToolRequest::AskAdvisor { message } => {
-                // The advisor reads what the asker sees: same directory.
-                let advisor = self
-                    .pool
-                    .spawn_child(
-                        self_agent_id,
-                        "advisor".to_owned(),
-                        message,
-                        AgentRole::Advisor {
-                            intelligence: rho_agent::db::AdvisorIntelligence::Medium,
-                        },
-                    )
-                    .await?;
-                Ok(format!(
-                    "Advisor {} is considering the question.",
-                    self.display_agent_id(advisor)
-                ))
-            }
-            McpAgentToolRequest::FollowupAdvisor {
-                advisor_id,
-                message,
-            } => {
-                let advisor = self.resolve_display_agent_id(&advisor_id).await?;
-                let record = self.load(advisor).await?.1.head();
-                anyhow::ensure!(
-                    matches!(record.config.role, AgentRole::Advisor { .. }),
-                    "target is not an Advisor"
-                );
-                anyhow::ensure!(
-                    self.db.read().agent_parent(advisor) == Some(self_agent_id),
-                    "Advisor belongs to another agent"
-                );
-                self.pool
-                    .deliver_mail(
-                        self_agent_id,
-                        advisor,
-                        message,
-                        MessageDelivery::NextRequest,
-                    )
-                    .await?;
-                Ok(format!("Follow-up sent to Advisor {advisor_id}."))
-            }
-        }
-    }
-
     async fn resolve_display_agent_id(&self, agent_id: &str) -> anyhow::Result<AgentId> {
         let text = agent_id.trim();
         let (prefix, raw_agent_id) = match text.split_once('-') {
@@ -1258,10 +1134,6 @@ impl Services {
             );
         }
         Ok(resolved)
-    }
-
-    fn display_agent_id(&self, agent_id: AgentId) -> String {
-        self.pool.agent_handle(agent_id)
     }
 
     async fn load(&self, agent_id: AgentId) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
@@ -2742,27 +2614,6 @@ async fn handle_message(
         ClientMessage::ContinueTurn { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.retry();
-            Ok(Refresh::None)
-        }
-        ClientMessage::McpAgentTool {
-            request_id,
-            self_agent_id,
-            request,
-        } => {
-            let result = services.mcp_agent_tool(self_agent_id, request).await;
-            let response = match result {
-                Ok(output) => McpAgentToolResponse {
-                    request_id,
-                    output,
-                    is_error: false,
-                },
-                Err(error) => McpAgentToolResponse {
-                    request_id,
-                    output: error.to_string(),
-                    is_error: true,
-                },
-            };
-            let _ = outgoing_tx.send(ServerMessage::McpAgentToolResult(response));
             Ok(Refresh::None)
         }
         ClientMessage::IrohApprove { code } => {

@@ -208,11 +208,6 @@ pub enum ClientMessage {
         repo: Utf8PathBuf,
         agent_id: Option<AgentId>,
     },
-    McpAgentTool {
-        request_id: u64,
-        self_agent_id: AgentId,
-        request: McpAgentToolRequest,
-    },
     /// Install platform secrets into the daemon's RAM-only store.
     PlatformSecretsSet {
         secrets: Vec<(String, String)>,
@@ -496,36 +491,6 @@ pub enum PrCommand {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum McpAgentToolRequest {
-    /// A child in the spawning agent's workset and working directory.
-    SpawnEngineer {
-        task_name: String,
-        prompt: String,
-    },
-    MessageAgent {
-        agent_id: String,
-        message: String,
-    },
-    InterruptEngineer {
-        engineer_id: String,
-    },
-    AskAdvisor {
-        message: String,
-    },
-    FollowupAdvisor {
-        advisor_id: String,
-        message: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct McpAgentToolResponse {
-    pub request_id: u64,
-    pub output: String,
-    pub is_error: bool,
-}
-
 /// Where a new agent works. Each mode carries exactly the data it needs.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
@@ -648,7 +613,6 @@ pub enum ServerMessage {
         agent_id: Option<AgentId>,
         status: LandStatus,
     },
-    McpAgentToolResult(McpAgentToolResponse),
     /// Reply to [`ClientMessage::IrohApprove`]: the enrolled client's
     /// endpoint id.
     IrohApproved {

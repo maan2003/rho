@@ -138,7 +138,7 @@ impl ClaudePaths {
                     .with_context(|| format!("create Claude prompt mount target {prompt}"));
             }
         }
-        ensure_mcp_server(&dir)?;
+        remove_stale_mcp_server(&dir)?;
         ensure_settings_target(&dir)?;
         Ok(dir)
     }
@@ -172,9 +172,6 @@ impl ClaudePaths {
     }
 }
 
-/// Rho's own MCP server, under the name Claude records it by.
-pub const MCP_SERVER_NAME: &str = "rho";
-
 /// The account's settings file, which a generated one may cover.
 pub const SETTINGS_FILE: &str = "settings.json";
 
@@ -199,40 +196,28 @@ fn ensure_settings_target(dir: &Utf8Path) -> Result<()> {
     }
 }
 
-/// Registers Rho's MCP server in the account, if it is not there already.
-///
-/// Claude keeps MCP registrations in `.claude.json`, the same file that
-/// carries the login, so the registration is per account: an account made by
-/// `rho claude-account login` would otherwise start its agents without their
-/// Rho tools. Written by rename and only when missing, since Claude writes
-/// that file too.
-fn ensure_mcp_server(dir: &Utf8Path) -> Result<()> {
+/// Drops the `rho` stdio MCP server that earlier versions registered in the
+/// account's `.claude.json`. Agent tools now reach Claude through the
+/// in-process Python notebook server, so a leftover entry would only make
+/// Claude spawn a subcommand that no longer exists. Written by rename and
+/// only when present, since Claude writes that file too.
+fn remove_stale_mcp_server(dir: &Utf8Path) -> Result<()> {
     let path = dir.join(".claude.json");
     let mut config: serde_json::Value = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("parse Claude account configuration {path}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("read {path}")),
     };
-    let servers = config
-        .as_object_mut()
-        .with_context(|| format!("Claude account configuration {path} is not an object"))?
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .with_context(|| format!("mcpServers in {path} is not an object"))?;
-    if servers.contains_key(MCP_SERVER_NAME) {
+    let Some(servers) = config
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    if servers.remove("rho").is_none() {
         return Ok(());
     }
-    servers.insert(
-        MCP_SERVER_NAME.to_owned(),
-        serde_json::json!({
-            "type": "stdio",
-            "command": "rho",
-            "args": ["mcp-agent-tools"],
-            "env": {},
-        }),
-    );
     let staged = dir.join(".claude.json.rho-staged");
     std::fs::write(&staged, serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("stage {staged}"))?;
