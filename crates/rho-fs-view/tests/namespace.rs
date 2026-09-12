@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use camino::Utf8Path;
-use rho_workset::{ClaudeHome, MAX_BOUNDED_READ, Mode};
+use rho_fs_view::{ClaudeHome, MAX_BOUNDED_READ, Mode};
 
 mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
@@ -19,7 +19,7 @@ fn main() {
         return;
     }
     // SAFETY: no threads exist yet.
-    unsafe { rho_workset::init_daemon_namespace() }.unwrap();
+    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -236,7 +236,7 @@ test ! -e /src/.stores
         for entry in "$HOME"/.claude/projects/*; do echo "project=${entry##*/}"; done
         echo "home=$HOME"
     "#;
-    let observe = async |ns: &rho_workset::Namespace| {
+    let observe = async |ns: &rho_fs_view::Namespace| {
         let mut command = tokio::process::Command::new(&sh);
         command.arg("-c").arg(script);
         ns.prepare_command(&mut command, None).await.unwrap();

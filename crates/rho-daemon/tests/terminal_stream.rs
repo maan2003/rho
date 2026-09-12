@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         std::env::set_var("XDG_STATE_HOME", state_dir.path());
         std::env::set_var("SHELL", "bash");
-        rho_workset::init_daemon_namespace()?;
+        rho_fs_view::init_daemon_namespace()?;
     }
     let result = tokio::runtime::Runtime::new()?
         .block_on(terminal_survives_detach_and_echoes(state_dir.path()));

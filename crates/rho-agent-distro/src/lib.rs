@@ -31,7 +31,7 @@ impl Program {
     }
 }
 
-/// The static userland. `git` is intentionally runtime-owned: rho-workset
+/// The static userland. `git` is intentionally runtime-owned: rho-fs-view
 /// places Rho's patched git (`CLONES.md`) first on the agent's path.
 pub const PROGRAMS: &[Program] = &[
     Program::new("coreutils", "env"),

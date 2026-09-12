@@ -979,7 +979,7 @@ fn python_tool(directory: &tempfile::TempDir) -> rho_agent_tools::PythonTool {
         rho_tool_shell::ShellTools::in_directory(
             Duration::from_secs(20),
             directory.path().to_str().unwrap().into(),
-            rho_workset::PathOverrides::default(),
+            rho_fs_view::PathOverrides::default(),
         ),
         Vec::new(),
     )

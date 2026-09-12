@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use camino::Utf8Path;
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
+use rho_fs_view::{Mode, StoreRefresh, StoreService, UserEnvironment, Worksets};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
-use rho_workset::{Mode, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
@@ -32,7 +32,7 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 
 fn main() -> anyhow::Result<()> {
     // SAFETY: top of main, single-threaded.
-    unsafe { rho_workset::init_daemon_namespace() }?;
+    unsafe { rho_fs_view::init_daemon_namespace() }?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run())
 }

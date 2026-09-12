@@ -20,7 +20,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
-rho-workset.workspace = true
+rho-fs-view.workspace = true
 
 [[test]]
 name = "python_workspace"

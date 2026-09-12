@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use rho_agent_tools::{PythonTool, SourceWaker, Tool};
 use rho_core::{ToolCall, ToolType};
+use rho_fs_view::{Mode, PathOverrides, StoreService, UserEnvironment, Worksets};
 use rho_tool_shell::ShellTools;
-use rho_workset::{Mode, PathOverrides, StoreService, UserEnvironment, Worksets};
 
 fn main() {
     let unshare = std::process::Command::new("unshare")
@@ -15,7 +15,7 @@ fn main() {
         eprintln!("skipping python_workspace: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    unsafe { rho_workset::init_daemon_namespace() }.unwrap();
+    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let daemon_cwd = std::env::current_dir().unwrap();
         let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();

@@ -98,7 +98,7 @@ test ! -e {temp}/source
         git = git_bin.display(),
         unshare = unshare.display(),
     );
-    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
+    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
     let inherited = std::fs::File::open(temp.path().join("remote.git")).unwrap();
     // SAFETY: dup2 is async-signal-safe and the captured fd remains open.
     unsafe {
@@ -153,7 +153,7 @@ touch /src/project/writable
         temp = temp.path().display(),
         store = store.display(),
     );
-    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
+    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
     view.env("RHO_FS_VIEW_TEST_ENV", "kept")
         .args(["--exposed"])
         .arg("--src")

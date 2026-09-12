@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rho_workset::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_fs_view::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

@@ -574,7 +574,7 @@ impl WorksetPrompt {
             root: view.visible_root().to_string(),
             cwd: view.cwd().to_string(),
             git,
-            view: matches!(view.mode(), rho_workset::Mode::View { .. }),
+            view: matches!(view.mode(), rho_fs_view::Mode::View { .. }),
             spawned: multi_agent.is_some_and(|tools| tools.parent().is_some()),
         }
     }

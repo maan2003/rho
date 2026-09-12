@@ -28,7 +28,7 @@ rho-inference.workspace = true
 rho-image.workspace = true
 rho-tool-shell.workspace = true
 rho-ui-proto.workspace = true
-rho-workset.workspace = true
+rho-fs-view.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }
 serde.workspace = true

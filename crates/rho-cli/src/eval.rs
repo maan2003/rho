@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
 use rho_agent::{AgentEvent, MessageDelivery, StartPlace};
 use rho_core::{ContextBlock, InferenceResponseItem};
-use rho_workset::{UserEnvironment, Worksets};
+use rho_fs_view::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
 #[derive(Clone, clap::Args)]
@@ -96,14 +96,14 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         temp.path().join("state"),
         env,
         Default::default(),
-        rho_workset::StoreService::None,
+        rho_fs_view::StoreService::None,
     )
     .await?;
     let view = worksets.adopt(&workdir)?.enter(
-        rho_workset::Mode::View {
+        rho_fs_view::Mode::View {
             home_skeleton: None,
         },
-        camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
     )?;
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
     rho_inference::ensure_crypto_provider();

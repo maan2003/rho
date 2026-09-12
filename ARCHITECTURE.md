@@ -60,7 +60,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   architecture and governing decisions are recorded under
   `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
   shape that loop consumes.
-- `rho-workset` owns the state root (`~/.local/state/rho`) and the agent
+- `rho-fs-view` owns the state root (`~/.local/state/rho`) and the agent
   filesystem view; `WORKSET.md` is its design note and `VIEW.md` the
   requirements the view is built towards. A workset is one plain
   directory per agent group, presented at `/src`: the daemon does not
@@ -308,7 +308,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   a transient item (`space shift+s`) and as a vim key (`shift+g`), so
   shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
-  explicitly to `rho-workset` for daemon-owned commands. Workset-control
+  explicitly to `rho-fs-view` for daemon-owned commands. Workset-control
   subprocesses use that environment directly; agent execution shells and
   Claude processes add the working directory's environment through `direnv exec`.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent

@@ -8,8 +8,8 @@ use rho_agent::db::{
     AdvisorIntelligence, AgentReadTxnExt as _, AgentRole, AgentRuntime, EngineerIntelligence,
 };
 use rho_db::RhoDb;
+use rho_fs_view::WorkspaceInfo;
 use rho_inference::Inference;
-use rho_workset::WorkspaceInfo;
 
 use crate::default_db_path;
 
@@ -96,18 +96,18 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
     // A rendering runs on the invoking directory adopted as a workset. It
     // never runs a command, so no namespace is built and no store server
     // is needed; the state root only has to exist.
-    let worksets = rho_workset::Worksets::open(
-        rho_workset::Worksets::default_root()?,
-        rho_workset::UserEnvironment::new(std::env::vars_os().collect()),
+    let worksets = rho_fs_view::Worksets::open(
+        rho_fs_view::Worksets::default_root()?,
+        rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
         Default::default(),
-        rho_workset::StoreService::None,
+        rho_fs_view::StoreService::None,
     )
     .await?;
     let view = worksets.adopt(&cwd)?.enter(
-        rho_workset::Mode::View {
+        rho_fs_view::Mode::View {
             home_skeleton: None,
         },
-        camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+        camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
     )?;
     let surface = rho_agent::render_agent_surface(view, role)?;
 

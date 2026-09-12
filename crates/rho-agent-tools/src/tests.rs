@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
+use rho_fs_view::PathOverrides;
 use rho_tool_shell::ShellTools;
-use rho_workset::PathOverrides;
 use serde_json::json;
 use tokio::sync::Notify;
 

@@ -12759,12 +12759,12 @@ dependencies = [
  "rho-context-config",
  "rho-core",
  "rho-db",
+ "rho-fs-view",
  "rho-image",
  "rho-inference",
  "rho-tool-shell",
  "rho-ui-proto",
  "rho-web-search",
- "rho-workset",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -12791,10 +12791,10 @@ dependencies = [
  "camino",
  "futures",
  "rho-core",
+ "rho-fs-view",
  "rho-python",
  "rho-tool-shell",
  "rho-web-search",
- "rho-workset",
  "serde",
  "serde_json",
  "tempfile",
@@ -12890,7 +12890,7 @@ dependencies = [
  "bytes",
  "camino",
  "rho-core",
- "rho-workset",
+ "rho-fs-view",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -12928,10 +12928,10 @@ dependencies = [
  "rho-daemon",
  "rho-db",
  "rho-desk",
+ "rho-fs-view",
  "rho-inference",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workset",
  "serde",
  "serde_json",
  "tempfile",
@@ -12995,6 +12995,7 @@ dependencies = [
  "rho-core",
  "rho-db",
  "rho-desk",
+ "rho-fs-view",
  "rho-image",
  "rho-inference",
  "rho-iroh-auth",
@@ -13006,7 +13007,6 @@ dependencies = [
  "rho-shell-proto",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workset",
  "rustix-openpty",
  "senax-encoder",
  "serde",
@@ -13104,6 +13104,23 @@ dependencies = [
  "text",
  "theme",
  "tracing",
+]
+
+[[package]]
+name = "rho-fs-view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "dirs",
+ "libc",
+ "rho-git-client",
+ "rho-git-proto",
+ "rho-git-server",
+ "rho-workspaces-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -13558,7 +13575,7 @@ dependencies = [
  "camino",
  "rho-core",
  "rho-db",
- "rho-workset",
+ "rho-fs-view",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -13665,23 +13682,6 @@ dependencies = [
  "text",
  "theme",
  "tree-sitter-md 0.3.2 (git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539)",
-]
-
-[[package]]
-name = "rho-workset"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "camino",
- "dirs",
- "libc",
- "rho-git-client",
- "rho-git-proto",
- "rho-git-server",
- "rho-workspaces-types",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

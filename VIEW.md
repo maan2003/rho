@@ -1,7 +1,7 @@
 # The agent view: Rho's own distro
 
 `WORKSET.md` describes what the agent's filesystem view is today and how
-`rho-workset` builds it. This note records where the view is going and,
+`rho-fs-view` builds it. This note records where the view is going and,
 more importantly, why: the requirements behind it and the principles
 that follow from them. When a change to the view is proposed, it should
 be checked against this list.
@@ -182,7 +182,7 @@ image versus runtime:
   variables. It knows nothing about namespaces or mounts, so it is
   tested with plain file assertions, and a nix build of Rho can run it
   as a derivation step to produce the static part of the image.
-- `rho-workset` is the **runtime**: it takes an image and mounts it,
+- `rho-fs-view` is the **runtime**: it takes an image and mounts it,
   then adds what only the running daemon knows (passwd with the real
   uid, resolv.conf, the user's identity, state-root paths) and what is
   per agent (the workset at `/src`, the store, the Claude home, the

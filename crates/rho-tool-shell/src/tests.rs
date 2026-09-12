@@ -1,5 +1,5 @@
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolOutputStatus, ToolType};
-use rho_workset::PathOverrides;
+use rho_fs_view::PathOverrides;
 
 use super::*;
 

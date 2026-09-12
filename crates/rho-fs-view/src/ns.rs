@@ -199,14 +199,14 @@ impl Namespace {
             let view_root = matches!(&self.mode, Mode::View { .. })
                 .then(|| {
                     tempfile::Builder::new()
-                        .prefix("rho-workset-view-")
+                        .prefix("rho-fs-view-view-")
                         .tempdir()
                         .context("create namespace root")
                 })
                 .transpose()?;
             let view_root_path = view_root.as_ref().map(|root| root.path().to_owned());
             let mode = self.mode.clone();
-            let (user_ns, mount_ns, root) = namespace_thread("rho-workset-namespace", move || {
+            let (user_ns, mount_ns, root) = namespace_thread("rho-fs-view-namespace", move || {
                 crate::layout::unshare_mount_namespace()?;
                 match mode {
                     Mode::View { home_skeleton } => {
@@ -253,7 +253,7 @@ impl Namespace {
             let root = live.root.try_clone()?;
             let install_target = target.clone();
             let mounting = home.clone();
-            namespace_thread("rho-workset-claude-home", move || {
+            namespace_thread("rho-fs-view-claude-home", move || {
                 use crate::layout::{capture_mount, detach_mount, install_captured_mount};
                 crate::layout::unshare_mount_namespace()?;
                 let account = capture_mount(&mounting.account)?;

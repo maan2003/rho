@@ -1,7 +1,7 @@
 use rho_core::{ContentPart, UnixMs};
 use rho_db::RhoDb;
+use rho_fs_view::WorkspaceInfo;
 use rho_inference::PromptCacheKey;
-use rho_workset::WorkspaceInfo;
 
 use super::*;
 

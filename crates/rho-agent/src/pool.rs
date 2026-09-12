@@ -10,8 +10,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use rho_db::RhoDb;
+use rho_fs_view::{Mode, Workset, Worksets};
 use rho_inference::Inference;
-use rho_workset::{Mode, Workset, Worksets};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::agent::AgentHandle;

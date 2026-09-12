@@ -17,7 +17,7 @@ use rho_core::{
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
-pub use rho_workset::{WorksetMode, WorkspaceInfo};
+pub use rho_fs_view::{WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::db::{
@@ -577,7 +577,7 @@ pub struct FailedInferenceResponse {
 /// An agent's view of its workset. One value per agent: the mount
 /// namespace inside is built on the first command and shared by every
 /// process the agent runs.
-pub type View = rho_workset::Namespace;
+pub type View = rho_fs_view::Namespace;
 
 /// Where a new agent starts: its view, the workspace record describing
 /// it, and the workset this creation made for it, which the pool discards

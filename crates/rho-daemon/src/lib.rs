@@ -305,8 +305,8 @@ fn start_runtime_sockets(
 
 /// Re-exported so daemon entry points can set up the user+mount namespace
 /// before the async runtime starts (see
-/// [`rho_workset::init_daemon_namespace`]).
-pub use rho_workset::{PathOverrides, init_daemon_namespace};
+/// [`rho_fs_view::init_daemon_namespace`]).
+pub use rho_fs_view::{PathOverrides, init_daemon_namespace};
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
 const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
@@ -464,7 +464,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         set_environment_value(&mut user_environment, "ANTHROPIC_BASE_URL", endpoint);
     }
     apply_daemon_directories(&mut user_environment, &state_dir, &claude);
-    let user_environment = rho_workset::UserEnvironment::new(user_environment);
+    let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
     // One-off (7 Sep), before any agent loop can append: every Claude
@@ -498,11 +498,11 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // The mirror keeper keeps every mirror fetched so new agents start on
     // the remote's latest state; without it (no git on PATH, say) agents
     // get plain git and nothing is shared.
-    let worksets = match rho_workset::Worksets::open(
+    let worksets = match rho_fs_view::Worksets::open(
         &state_dir,
         user_environment.clone(),
         path_overrides.clone(),
-        rho_workset::StoreService::Serve(rho_workset::StoreRefresh::default()),
+        rho_fs_view::StoreService::Serve(rho_fs_view::StoreRefresh::default()),
     )
     .await
     {
@@ -511,11 +511,11 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             eprintln!(
                 "rho daemon: clone store server unavailable, clones fetch for themselves: {error:#}"
             );
-            rho_workset::Worksets::open(
+            rho_fs_view::Worksets::open(
                 &state_dir,
                 user_environment.clone(),
                 path_overrides,
-                rho_workset::StoreService::None,
+                rho_fs_view::StoreService::None,
             )
             .await?
         }
@@ -944,7 +944,7 @@ struct Services {
     /// Daemon-owned terminal sessions, keyed per agent.
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
-    user_environment: rho_workset::UserEnvironment,
+    user_environment: rho_fs_view::UserEnvironment,
     /// How agents this daemon creates see the filesystem.
     workset_mode: WorksetMode,
     /// The Claude configuration this daemon runs against, resolved in `run`.
@@ -961,7 +961,7 @@ impl Services {
         inference: Inference,
         pool: Arc<AgentPool>,
         claude: rho_claude::accounts::ClaudePaths,
-        user_environment: rho_workset::UserEnvironment,
+        user_environment: rho_fs_view::UserEnvironment,
         workset_mode: WorksetMode,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
@@ -1067,7 +1067,7 @@ impl Services {
                 // checkout's name is known before the clone, so the record
                 // is complete from the start.
                 let origin = expand_home(&repo).unwrap_or(repo);
-                let name = rho_workset::repo_name(origin.as_str())
+                let name = rho_fs_view::repo_name(origin.as_str())
                     .with_context(|| format!("no repository name in {origin}"))?;
                 let worksets = self.pool.worksets();
                 let workset = worksets.create().await?;
@@ -1078,7 +1078,7 @@ impl Services {
                     mode: self.workset_mode,
                     origin: Some(origin.clone()),
                 };
-                let mode = rho_workset::Mode::from_workset_mode(self.workset_mode);
+                let mode = rho_fs_view::Mode::from_workset_mode(self.workset_mode);
                 rho_agent::StartPlace::pending(info, move || {
                     let workset = workset.clone();
                     let origin = origin.clone();
@@ -3052,7 +3052,7 @@ fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyho
 
 /// Serves one working-copy diff snapshot and its bounded parent-side
 /// manifest on a dedicated stream, avoiding control-session head-of-line
-/// blocking. (Taking the snapshot itself is a TODO in `rho-workset`.)
+/// blocking. (Taking the snapshot itself is a TODO in `rho-fs-view`.)
 async fn serve_diff_snapshot<W>(
     services: Arc<Services>,
     mut writer: W,
@@ -3601,21 +3601,21 @@ async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()
 async fn open_checkout(
     services: &Services,
     workspace: &WorkspaceInfo,
-) -> anyhow::Result<(rho_workset::Workset, Utf8PathBuf)> {
+) -> anyhow::Result<(rho_fs_view::Workset, Utf8PathBuf)> {
     let (workset, _, host_cwd) = services.pool.open_workset(workspace).await?;
-    let (root, _) = rho_workset::resolve_workdir_root(host_cwd.as_std_path())?;
+    let (root, _) = rho_fs_view::resolve_workdir_root(host_cwd.as_std_path())?;
     Ok((workset, root))
 }
 
 /// Where a host directory inside `workset` appears to its agents.
 fn visible_path(
-    workset: &rho_workset::Workset,
+    workset: &rho_fs_view::Workset,
     host_path: &Utf8Path,
 ) -> anyhow::Result<Utf8PathBuf> {
     let relative = host_path
         .strip_prefix(workset.root())
         .with_context(|| format!("{host_path} is outside workset {}", workset.id()))?;
-    Ok(Utf8Path::new(rho_workset::MOUNT_ROOT).join(relative))
+    Ok(Utf8Path::new(rho_fs_view::MOUNT_ROOT).join(relative))
 }
 
 fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
@@ -4434,12 +4434,12 @@ mod tests {
         let claude = rho_claude::accounts::ClaudePaths::at(
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
         );
-        let user_environment = rho_workset::UserEnvironment::new(Default::default());
-        let worksets = rho_workset::Worksets::open(
+        let user_environment = rho_fs_view::UserEnvironment::new(Default::default());
+        let worksets = rho_fs_view::Worksets::open(
             root.join("state"),
             user_environment.clone(),
             Default::default(),
-            rho_workset::StoreService::None,
+            rho_fs_view::StoreService::None,
         )
         .await
         .unwrap();
@@ -4451,7 +4451,7 @@ mod tests {
                 pool,
                 claude,
                 user_environment,
-                rho_workset::WorksetMode::View,
+                rho_fs_view::WorksetMode::View,
                 PlatformSecrets::default(),
                 root.join("octo.sock"),
             )

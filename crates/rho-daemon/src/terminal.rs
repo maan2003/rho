@@ -65,7 +65,7 @@ const MAX_DIM: u16 = 1000;
 /// Everything needed to spawn a terminal's child process; built by the
 /// caller (which knows agents and views), used when no session is running.
 pub struct TerminalSpawn {
-    pub view: Arc<rho_workset::Namespace>,
+    pub view: Arc<rho_fs_view::Namespace>,
     /// Program run through `direnv exec .` in the agent's working directory.
     pub shell: String,
 }

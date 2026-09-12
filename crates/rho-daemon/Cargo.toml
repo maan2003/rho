@@ -40,7 +40,7 @@ rho-profiling.workspace = true
 rho-rpc = { workspace = true, features = ["server"] }
 rho-ui-proto.workspace = true
 rho-visualizations.workspace = true
-rho-workset.workspace = true
+rho-fs-view.workspace = true
 rustix-openpty.workspace = true
 serde.workspace = true
 serde_json.workspace = true

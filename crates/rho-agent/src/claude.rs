@@ -1423,7 +1423,7 @@ impl ClaudeLoop {
         } else {
             None
         };
-        view.set_claude_home(rho_workset::ClaudeHome {
+        view.set_claude_home(rho_fs_view::ClaudeHome {
             account: account_dir.into_std_path_buf(),
             shared_projects: config_home.join("projects").into_std_path_buf(),
             config_home: config_home.into_std_path_buf(),

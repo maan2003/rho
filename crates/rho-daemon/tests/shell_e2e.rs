@@ -30,7 +30,7 @@ fn main() {
         return;
     }
     // SAFETY: top of main, before the runtime: no threads exist yet.
-    unsafe { rho_workset::init_daemon_namespace() }.unwrap();
+    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(shell_end_to_end_over_registry());
@@ -48,7 +48,7 @@ async fn shell_end_to_end_over_registry() {
          trap 'printf fired >/src/brush-exit-hook' EXIT\n",
     )
     .unwrap();
-    let environment = rho_workset::UserEnvironment::new(vec![
+    let environment = rho_fs_view::UserEnvironment::new(vec![
         ("PATH".into(), std::env::var_os("PATH").unwrap()),
         ("HOME".into(), home.clone().into_os_string()),
         ("USER".into(), "rho-test".into()),
@@ -57,11 +57,11 @@ async fn shell_end_to_end_over_registry() {
     ]);
     let work = temp.path().join("work");
     std::fs::create_dir(&work).unwrap();
-    let worksets = rho_workset::Worksets::open(
+    let worksets = rho_fs_view::Worksets::open(
         temp.path().join("state"),
         environment,
         Default::default(),
-        rho_workset::StoreService::None,
+        rho_fs_view::StoreService::None,
     )
     .await
     .unwrap();
@@ -71,10 +71,10 @@ async fn shell_end_to_end_over_registry() {
         .adopt(&work)
         .unwrap()
         .enter(
-            rho_workset::Mode::View {
+            rho_fs_view::Mode::View {
                 home_skeleton: Some(home.clone()),
             },
-            camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+            camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
         )
         .unwrap();
     let registry = Arc::new(ShellRegistry::default());

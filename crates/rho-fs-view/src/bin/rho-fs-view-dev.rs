@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 use camino::Utf8Path;
-use rho_workset::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
+use rho_fs_view::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
     // SAFETY: top of main, before the runtime: no threads exist yet.
-    unsafe { rho_workset::init_daemon_namespace() }?;
+    unsafe { rho_fs_view::init_daemon_namespace() }?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         let workset = worksets.adopt(&src)?;
-        let namespace = workset.enter(mode, Utf8Path::new(rho_workset::MOUNT_ROOT))?;
+        let namespace = workset.enter(mode, Utf8Path::new(rho_fs_view::MOUNT_ROOT))?;
         let mut child = tokio::process::Command::new(&command[0]);
         child.args(&command[1..]);
         namespace.prepare_command(&mut child, None).await?;
@@ -103,7 +103,7 @@ fn main() -> anyhow::Result<()> {
 
 fn usage() {
     eprintln!(
-        "usage: rho-workset-dev [--exposed] [--store] --src PATH --state PATH [--skeleton PATH] [-- COMMAND ...]"
+        "usage: rho-fs-view-dev [--exposed] [--store] --src PATH --state PATH [--skeleton PATH] [-- COMMAND ...]"
     );
 }
 

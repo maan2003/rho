@@ -104,11 +104,11 @@ mod tests {
         let work = temp.path().join("work");
         std::fs::create_dir(&work).unwrap();
         source.save(work.join("image.png")).unwrap();
-        let worksets = rho_workset::Worksets::open(
+        let worksets = rho_fs_view::Worksets::open(
             temp.path().join("state"),
             Default::default(),
             Default::default(),
-            rho_workset::StoreService::None,
+            rho_fs_view::StoreService::None,
         )
         .await
         .unwrap();
@@ -117,10 +117,10 @@ mod tests {
             .adopt(&work)
             .unwrap()
             .enter(
-                rho_workset::Mode::View {
+                rho_fs_view::Mode::View {
                     home_skeleton: None,
                 },
-                camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+                camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
             )
             .unwrap();
         let output = ImageTools::new(view)

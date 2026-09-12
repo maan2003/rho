@@ -7,7 +7,7 @@ ordinary `git clone`, adds checkouts with `git worktree add`, and keeps
 whatever else it wants there; the directory is the truth and there is
 no separate record of its contents.
 
-`rho-workset` owns the state root, `~/.local/state/rho`:
+`rho-fs-view` owns the state root, `~/.local/state/rho`:
 
 ```
 ~/.local/state/rho/
@@ -46,7 +46,7 @@ an agent never fails on a namespace it does not use) and then kept for
 the life of the value. `prepare_command` enters it for a child process;
 `enter_interpreter_thread` moves a dedicated thread into it for the
 in-process Python notebook. There are two modes, view and exposed, and
-in both the workset is at `/src`; `rho-workset-dev` enters one from the
+in both the workset is at `/src`; `rho-fs-view-dev` enters one from the
 command line the way the daemon does.
 `VIEW.md` records the requirements and principles the view is being
 built towards, and why.
