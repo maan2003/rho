@@ -1,0 +1,222 @@
+name: "Command substitution"
+cases:
+  - name: "Command substitution"
+    stdin: |
+      var="value"
+
+      echo "1:"
+      echo $(echo hi)
+      echo "2:"
+      echo "$(echo hi)"
+      echo "3:"
+      echo "$(echo "hi")"
+      echo "4:"
+      echo "$(var="updated"; echo ${var})"
+      echo "var=${var}"
+
+  - name: "Command substitution with embedded parens"
+    stdin: |
+      x=$(echo foo | (wc -l; echo hi))
+      echo "\$x: $x"
+
+  - name: "Command substitution with subshell"
+    stdin: |
+      x=$( (echo hi) )
+      echo "\$x: $x"
+
+  - name: "Command substitution exit code"
+    stdin: |
+      x=$(false) && echo "1. Made it past false"
+      y=$(true) && echo "2. Made it past true"
+
+  - name: "Command substitution with exec"
+    stdin: |
+      x=$(exec echo hi)
+      echo "x: $x"
+
+  - name: "Backtick command substitution"
+    stdin: |
+      echo `echo hi`
+
+  - name: "Backtick command substitution with escaping"
+    stdin: |
+      echo `echo \`echo hi\``
+
+  - name: "Backtick command substitution with backslashes"
+    stdin: |
+      echo `echo \\`
+
+  - name: "Backtick command substitution in double quotes"
+    stdin: |
+      echo "`echo First line`"
+      echo " `echo Second line` "
+      echo "Third`echo line`here"
+
+  - name: "Ignore single quote in comment in command substitution"
+    stdin: |
+      var=$(
+        # I'm
+        echo "Batman"
+      )
+      echo $var
+
+  - name: "Ignore double quote in comment in command substitution"
+    stdin: |
+      var=$(
+        # This " is not being
+        echo "parsed"
+      )
+      echo $var
+
+  - name: "Ignore parentheses in comment in command substitution"
+    stdin: |
+      var=$(
+        # :(
+        echo "Sad"
+      )
+      echo $var
+
+  - name: "Ignore dollar in comment in command substitution"
+    stdin: |
+      var=$(
+        #               $
+        echo "Mr. Crabs ^"
+      )
+      echo $var
+
+  - name: "Positional parameter count not mistaken for comment"
+    stdin: |
+      echo $(echo $#)
+
+  - name: "Ignore single quote in comment in command substitution (backticks)"
+    stdin: |
+      var=`
+        # I'm
+        echo "Batman"
+      `
+      echo $var
+
+  - name: "Ignore double quote in comment in command substitution (backticks)"
+    stdin: |
+      var=`
+        # This " is not being
+        echo "parsed"
+      `
+      echo $var
+
+  - name: "Ignore parentheses in comment in command substitution (backticks)"
+    stdin: |
+      var=`
+        # :(
+        echo "Sad"
+      `
+      echo $var
+
+  - name: "Ignore dollar in comment in command substitution (backticks)"
+    stdin: |
+      var=`
+        #               $
+        echo "Mr. Crabs ^"
+      `
+      echo $var
+
+  - name: "Positional parameter count not mistaken for comment (backticks)"
+    stdin: |
+      echo `echo $#`
+
+  - name: "Command substitution with only input redir"
+    stdin: |
+      echo "Some text" >file.txt
+      x=$(<file.txt)
+      echo "x: $x"
+
+  - name: "Command substitution with only input redir in pipeline"
+    known_failure: true
+    ignore_stderr: true
+    test_files:
+      - path: file.txt
+        contents: |
+          File Contents
+    stdin: |
+      x=$(<non-existent-file.txt) || x=$(<file.txt)
+      echo "\$?: $?"
+      echo "x: $x"
+
+  - name: "Backquote with only input redir"
+    stdin: |
+      echo "Some text" >file.txt
+      x=`<file.txt`
+      echo "x: $x"
+
+  - name: "Command substitution as simple command preserves exit code"
+    stdin: |
+      $(false)
+      echo "exit code: $?"
+
+      $(true)
+      echo "exit code: $?"
+
+      $(exit 42)
+      echo "exit code: $?"
+
+  - name: "Backtick substitution as simple command preserves exit code"
+    stdin: |
+      `false`
+      echo "exit code: $?"
+
+      `true`
+      echo "exit code: $?"
+
+  - name: "Command substitution with exec as simple command"
+    stdin: |
+      $(exec true)
+      echo "exit code: $?"
+
+      $(exec false)
+      echo "exit code: $?"
+
+  - name: "Command substitution strips null bytes"
+    ignore_stderr: true
+    stdin: |
+      echo "$(echo -e 'a\x00b')" | hexdump -C
+
+  - name: "Backtick substitution strips null bytes"
+    ignore_stderr: true
+    stdin: |
+      echo "`echo -e 'a\x00b'`" | hexdump -C
+
+  - name: "Command substitution strips multiple null bytes"
+    ignore_stderr: true
+    stdin: |
+      echo "$(echo -e 'hello\x00world\x00end')" | hexdump -C
+
+  - name: "Command substitution with only null bytes produces empty string"
+    ignore_stderr: true
+    stdin: |
+      echo "$(echo -e '\x00\x00\x00')" | hexdump -C
+
+  - name: "Variable assignment from command substitution strips null bytes"
+    ignore_stderr: true
+    stdin: |
+      x=$(echo -e 'a\x00b')
+      echo "$x" | hexdump -C
+
+  - name: "Input redirection substitution strips null bytes"
+    ignore_stderr: true
+    stdin: |
+      printf 'a\x00b' > file.txt
+      x=$(<file.txt)
+      echo "$x" | hexdump -C
+
+  - name: "Nested command substitution strips null bytes"
+    ignore_stderr: true
+    stdin: |
+      echo "$(echo "$(echo -e 'a\x00b')")" | hexdump -C
+
+  - name: "Nested command substitution exit code"
+    stdin: |
+      $($(false))
+      echo "exit code: $?"
+
+      $($(:))
+      echo "exit code: $?"

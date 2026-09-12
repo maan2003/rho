@@ -1,0 +1,36 @@
+name: "Builtins: export"
+cases:
+  - name: "Basic export usage"
+    stdin: |
+      MY_TEST_VAR="value"
+      echo "Looking for unexported variable..."
+      env | grep MY_TEST_VAR
+
+      echo "Exporting and looking for it again..."
+      export MY_TEST_VAR
+      env | grep MY_TEST_VAR
+
+      echo "Exporting with new value..."
+      export MY_TEST_VAR="changed value"
+      env | grep MY_TEST_VAR
+
+  - name: "Exporting array"
+    stdin: |
+      export arr=(a 1 2)
+      declare -p arr
+
+  - name: "Unexporting variable"
+    stdin: |
+      MY_TEST_VAR="value"
+      export MY_TEST_VAR="value"
+      export -n MY_TEST_VAR
+
+      env | grep MY_TEST_VAR
+
+  - name: "Export with assignment through nameref"
+    known_failure: true
+    stdin: |
+      declare -n ref=MY_EXPORT_VAR
+      export ref="exported_value"
+      echo "MY_EXPORT_VAR: $MY_EXPORT_VAR"
+      env | grep MY_EXPORT_VAR
