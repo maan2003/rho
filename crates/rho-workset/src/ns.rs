@@ -542,6 +542,9 @@ impl Namespace {
     /// polled on that same thread throughout.
     pub async unsafe fn enter_interpreter_thread(&self) -> anyhow::Result<()> {
         if matches!(self.mode, Mode::Plain) {
+            // The cwd is per fs_struct, which threads share until unshared:
+            // without this the whole daemon would change directory.
+            crate::layout::unshare_fs_attributes()?;
             std::env::set_current_dir(self.host_cwd())?;
             return Ok(());
         }

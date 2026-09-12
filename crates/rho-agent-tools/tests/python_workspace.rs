@@ -47,6 +47,26 @@ fn main() {
         assert!(output.output.contains("/src/project"), "{output:?}");
         assert_eq!(std::fs::read_to_string(work.join("project/value")).unwrap(), "python");
         assert_eq!(std::env::current_dir().unwrap(), daemon_cwd);
+
+        // Plain mode: the notebook's cwd is the host directory, still private
+        // to the interpreter thread.
+        let plain = workset.enter(Mode::Plain, camino::Utf8Path::new("project")).unwrap();
+        let tool = PythonTool::new(ShellTools::new(Duration::from_secs(5), plain), vec![]).unwrap();
+        let mut cell = tool.run(ToolCall {
+            id: "plain".try_into().unwrap(),
+            name: "exec".try_into().unwrap(),
+            tool_type: ToolType::Custom,
+            arguments: "assert Path('value').read_text() == 'python'\nprint(Path.cwd())".into(),
+        }, SourceWaker::new(wake.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !cell.python_exec().unwrap().quiescent() {
+                wake.notified().await;
+            }
+        }).await.unwrap();
+        let output = cell.first_output();
+        assert_eq!(output.status, rho_core::ToolOutputStatus::Success, "{output:?}");
+        assert!(output.output.contains(work.join("project").to_str().unwrap()), "{output:?}");
+        assert_eq!(std::env::current_dir().unwrap(), daemon_cwd);
         assert!(std::process::Command::new("kill")
             .args(["-INT", &std::process::id().to_string()])
             .status().unwrap().success());
