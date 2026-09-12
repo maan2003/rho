@@ -5,10 +5,18 @@ use std::time::Duration;
 
 use common::{git, push_commit, setup_remote};
 use rho_git_proto::{Request, Response};
-use rho_git_server::MirrorStore;
+use rho_git_server::{MirrorStore, Refresh};
 
 fn store(root: &std::path::Path, debounce: Duration) -> Arc<MirrorStore> {
-    MirrorStore::new(root, "git", Vec::new(), debounce)
+    MirrorStore::new(
+        root,
+        "git",
+        Vec::new(),
+        Refresh {
+            debounce,
+            ..Refresh::default()
+        },
+    )
 }
 
 #[tokio::test]
@@ -79,12 +87,39 @@ async fn refresh_all_covers_every_store() {
         "an empty root is fine"
     );
     let mirror = store.ensure(url).await.unwrap();
+    let used = store.last_used(url).unwrap();
     let second = push_commit(&source, "two\n");
     assert!(store.refresh_all().await.is_empty());
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
         second
     );
+    assert_eq!(
+        store.last_used(url),
+        Some(used),
+        "the background loop is not a request"
+    );
+
+    // A mirror nobody asked for in `idle` is left alone until asked again.
+    std::fs::write(
+        store.store_dir(url).join("used"),
+        format!("{}\n", used - 10 * 24 * 3600),
+    )
+    .unwrap();
+    let third = push_commit(&source, "three\n");
+    assert!(store.refresh_all().await.is_empty());
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
+        second,
+        "idle mirrors are skipped"
+    );
+    store.ensure(url).await.unwrap();
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
+        third
+    );
+    assert!(store.last_used(url).unwrap() >= used);
+    assert!(store.refresh_all().await.is_empty());
 }
 
 #[tokio::test]

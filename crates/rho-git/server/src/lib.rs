@@ -14,6 +14,9 @@
 //!                     refspecs behaves exactly like one from the remote.
 //! <root>/<key>/url    the remote URL; written last, so its presence means
 //!                     the mirror is complete
+//! <root>/<key>/used   unix time of the last request for this mirror; the
+//!                     background loop leaves mirrors nobody asked for in
+//!                     `idle` alone, and the next request refetches them
 //! ```
 //!
 //! **The mirror never prunes objects.** Clones borrow them through
@@ -32,12 +35,14 @@ use rho_git_proto::{Request, Response, store_key};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixListener;
 
-/// How the keeper keeps mirrors fresh: every mirror is refetched each
-/// `interval`, and a mirror fetched within `debounce` is served as is.
+/// How the keeper keeps mirrors fresh: every mirror requested within
+/// `idle` is refetched each `interval`, and a mirror fetched within
+/// `debounce` is served as is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refresh {
     pub interval: Duration,
     pub debounce: Duration,
+    pub idle: Duration,
 }
 
 impl Default for Refresh {
@@ -45,6 +50,7 @@ impl Default for Refresh {
         Self {
             interval: Duration::from_secs(60),
             debounce: Duration::from_secs(30),
+            idle: Duration::from_secs(3 * 24 * 3600),
         }
     }
 }
@@ -55,7 +61,7 @@ pub struct MirrorStore {
     root: PathBuf,
     git: PathBuf,
     environment: Vec<(OsString, OsString)>,
-    debounce: Duration,
+    refresh: Refresh,
     entries: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Instant>>>>>,
 }
 
@@ -71,21 +77,26 @@ impl std::fmt::Debug for MirrorStore {
 impl MirrorStore {
     /// A keeper for `root`, running `git` with `environment` (the user's,
     /// so credential helpers and ssh work as they do for them; empty
-    /// inherits the process environment). `debounce` is how recently a
-    /// mirror must have been fetched for a request to skip fetching it.
+    /// inherits the process environment). `refresh` says how recently a
+    /// mirror must have been fetched for a request to skip fetching it,
+    /// and how the background loop behaves.
     pub fn new(
         root: impl Into<PathBuf>,
         git: impl Into<PathBuf>,
         environment: Vec<(OsString, OsString)>,
-        debounce: Duration,
+        refresh: Refresh,
     ) -> Arc<Self> {
         Arc::new(Self {
             root: root.into(),
             git: git.into(),
             environment,
-            debounce,
+            refresh,
             entries: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn refresh(&self) -> Refresh {
+        self.refresh
     }
 
     pub fn root(&self) -> &Path {
@@ -109,15 +120,26 @@ impl MirrorStore {
 
     /// The mirror for `url`, initialized if missing and fetched unless it
     /// was fetched within the debounce window. Concurrent requests for one
-    /// URL wait on the same lock and share one fetch.
+    /// URL wait on the same lock and share one fetch. This is a request:
+    /// it marks the mirror used, so the background loop keeps it fresh.
     pub async fn ensure(&self, url: &str) -> anyhow::Result<PathBuf> {
+        let mirror = self.fetch(url).await?;
+        std::fs::write(
+            self.store_dir(url).join("used"),
+            format!("{}\n", unix_now()),
+        )
+        .with_context(|| format!("mark {} used", self.store_dir(url).display()))?;
+        Ok(mirror)
+    }
+
+    async fn fetch(&self, url: &str) -> anyhow::Result<PathBuf> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "empty remote URL");
         let entry = self.entry(url);
         let mut last = entry.lock().await;
         let store = self.store_dir(url);
         if store.join("url").is_file() {
-            if last.is_none_or(|at| at.elapsed() >= self.debounce) {
+            if last.is_none_or(|at| at.elapsed() >= self.refresh.debounce) {
                 self.fetch_mirror(&store.join("git")).await?;
                 *last = Some(Instant::now());
             }
@@ -126,6 +148,15 @@ impl MirrorStore {
             *last = Some(Instant::now());
         }
         Ok(store.join("git"))
+    }
+
+    /// When `url`'s mirror was last requested, if it ever was.
+    pub fn last_used(&self, url: &str) -> Option<u64> {
+        std::fs::read_to_string(self.store_dir(url).join("used"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Initializes `url`'s store in a staging directory and renames it into
@@ -268,16 +299,25 @@ impl MirrorStore {
         Ok(stores)
     }
 
-    /// Fetches every mirror under the root that is due, returning the
-    /// failures. Meant for the background loop.
+    /// Fetches every mirror under the root that was requested within
+    /// `idle` and is due, returning the failures. Meant for the background
+    /// loop: a mirror nobody has asked for lately stays as it is until the
+    /// next request fetches it.
     pub async fn refresh_all(&self) -> Vec<(PathBuf, anyhow::Error)> {
         let stores = match self.list() {
             Ok(stores) => stores,
             Err(error) => return vec![(self.root.clone(), error.into())],
         };
+        let now = unix_now();
         let mut failures = Vec::new();
         for (dir, url) in stores {
-            if let Err(error) = self.ensure(&url).await {
+            let active = self
+                .last_used(&url)
+                .is_some_and(|used| now.saturating_sub(used) < self.refresh.idle.as_secs());
+            if !active {
+                continue;
+            }
+            if let Err(error) = self.fetch(&url).await {
                 failures.push((dir, error));
             }
         }
@@ -285,8 +325,9 @@ impl MirrorStore {
     }
 
     /// Runs `refresh_all` every `interval` for as long as the task lives.
-    pub fn spawn_refresh_loop(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_refresh_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let store = Arc::clone(self);
+        let interval = self.refresh.interval;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -348,4 +389,11 @@ impl MirrorStore {
             });
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }

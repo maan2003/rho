@@ -5,8 +5,9 @@
 //! real remote URL, so the agent's `git remote -v`, `git push` and any
 //! tooling see exactly what a plain clone would. What differs is only
 //! where the bytes come from: objects are borrowed from the mirror through
-//! `objects/info/alternates` (`CLONES.md`), and the wrapper routes
-//! `fetch`/`pull` to the mirror after asking the keeper to refresh it.
+//! `objects/info/alternates` (`CLONES.md`), and the wrapper routes every
+//! `fetch`/`pull` to the mirror of whatever URL it names after asking the
+//! keeper to refresh it, adding that mirror to the alternates on the way.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -183,22 +184,7 @@ pub fn clone_from_mirror(git: &Git, mirror: &Path, url: &str, dest: &Path) -> an
     }
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     git.output(Some(dest), ["init", "--quiet"])?;
-    let objects = dest.join(".git").join("objects");
-    let objects = if objects.is_dir() {
-        objects
-    } else {
-        // `git init` honoured a template or GIT_DIR; ask where it put things.
-        PathBuf::from(
-            git.output(Some(dest), ["rev-parse", "--git-path", "objects"])?
-                .trim(),
-        )
-    };
-    std::fs::create_dir_all(objects.join("info"))?;
-    std::fs::write(
-        objects.join("info").join("alternates"),
-        format!("{}\n", mirror.join("objects").display()),
-    )
-    .context("write alternates")?;
+    ensure_alternate(git, &[OsString::from("-C"), dest.into()], mirror)?;
     git.output(Some(dest), ["remote", "add", "origin", url])?;
     let mirror_arg = mirror.as_os_str();
     git.output(
@@ -269,15 +255,152 @@ pub fn clone_from_mirror(git: &Git, mirror: &Path, url: &str, dest: &Path) -> an
     Ok(())
 }
 
-/// `remote.origin.url` of the repository git would operate on with
-/// `globals` (`-C`, `--git-dir`, ...), or `None` when there is no origin
-/// or no repository.
-pub fn origin_url(git: &Git, globals: &[OsString]) -> Option<String> {
-    let mut args: Vec<OsString> = globals.to_vec();
-    args.extend(["config", "--get", "remote.origin.url"].map(OsString::from));
-    let url = git.output(None, args).ok()?;
-    let url = url.trim();
-    (!url.is_empty()).then(|| url.to_owned())
+/// Adds `mirror`'s objects to the alternates of the repository `globals`
+/// select (`-C`, `--git-dir`, ...), so a fetch from that mirror borrows
+/// its objects instead of copying them into a pack of the clone's own.
+/// Idempotent; a clone fetching from several mirrors lists them all.
+pub fn ensure_alternate(git: &Git, globals: &[OsString], mirror: &Path) -> anyhow::Result<()> {
+    let mut args = globals.to_vec();
+    args.extend(
+        [
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects/info/alternates",
+        ]
+        .map(OsString::from),
+    );
+    let path = PathBuf::from(git.output(None, args)?.trim());
+    let objects = mirror.join("objects");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    if existing.lines().any(|line| Path::new(line) == objects) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = String::new();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("{}\n", objects.display()));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// What a `git fetch`/`git pull` command line names as its source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchTarget {
+    /// No repository argument: the current branch's upstream remote,
+    /// else `origin`, as git does.
+    Default,
+    /// The first positional: a remote name, a URL or a path.
+    Named(String),
+    /// `--all`, `--multiple`, or arguments the wrapper does not read.
+    Unrouted,
+}
+
+impl FetchTarget {
+    /// Reads `rest` (the words after `fetch`/`pull`), skipping options and
+    /// the values of those that take one.
+    pub fn parse(rest: &[OsString]) -> Self {
+        const WITH_VALUE: &[&str] = &[
+            "--depth",
+            "--deepen",
+            "--shallow-since",
+            "--shallow-exclude",
+            "--negotiation-tip",
+            "--refmap",
+            "--submodule-prefix",
+            "-j",
+            "--jobs",
+            "--upload-pack",
+            "-o",
+            "--server-option",
+            "--filter",
+            // pull's merge options
+            "-s",
+            "--strategy",
+            "-X",
+            "--strategy-option",
+            "--cleanup",
+        ];
+        let mut positionals = Vec::new();
+        let mut index = 0;
+        let mut options_done = false;
+        while index < rest.len() {
+            let Some(text) = rest[index].to_str() else {
+                return Self::Unrouted;
+            };
+            index += 1;
+            if options_done || !text.starts_with('-') || text == "-" {
+                positionals.push(text);
+                continue;
+            }
+            match text {
+                "--" => options_done = true,
+                "--all" | "--multiple" => return Self::Unrouted,
+                _ if WITH_VALUE.contains(&text) => index += 1,
+                _ => {}
+            }
+        }
+        match positionals.first() {
+            None => Self::Default,
+            Some(name) => Self::Named((*name).to_owned()),
+        }
+    }
+}
+
+/// The URL the `git fetch`/`git pull` given by `globals` and `rest` would
+/// read from: a named remote's URL, a literal URL or path, or the current
+/// branch's upstream remote (else `origin`). `None` when the command does
+/// not read one place (`--all`), names nothing git could resolve, or
+/// there is no repository.
+pub fn fetch_url(git: &Git, globals: &[OsString], rest: &[OsString]) -> Option<String> {
+    let name = match FetchTarget::parse(rest) {
+        FetchTarget::Unrouted => return None,
+        FetchTarget::Named(name) => name,
+        FetchTarget::Default => git_line(git, globals, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .and_then(|branch| {
+                git_line(git, globals, ["config", "--get", &format!("branch.{branch}.remote")])
+            })
+            .filter(|remote| remote != ".")
+            .unwrap_or_else(|| "origin".to_owned()),
+    };
+    if let Some(url) = git_line(git, globals, ["remote", "get-url", &name]) {
+        return Some(url);
+    }
+    looks_like_url(&name).then_some(name)
+}
+
+/// Something git would take as a repository rather than a remote name.
+fn looks_like_url(name: &str) -> bool {
+    !name.starts_with('-')
+        && (name.contains("://")
+            || name.contains(':')
+            || name.starts_with('/')
+            || name.starts_with("./")
+            || name.starts_with("../")
+            || name.starts_with('~')
+            || Path::new(name).join("HEAD").is_file())
+}
+
+/// One non-empty line of git's stdout, or `None` on failure.
+fn git_line<const N: usize>(git: &Git, globals: &[OsString], args: [&str; N]) -> Option<String> {
+    let mut all: Vec<OsString> = globals.to_vec();
+    all.extend(args.map(OsString::from));
+    let out = git.output(None, all).ok()?;
+    let line = out.lines().next()?.trim();
+    (!line.is_empty()).then(|| line.to_owned())
 }
 
 #[cfg(test)]
@@ -375,11 +498,78 @@ mod tests {
                 .next()
                 .is_none()
         );
+        let globals: Vec<OsString> = vec!["-C".into(), dest.clone().into()];
         assert_eq!(
-            origin_url(&git, &["-C".into(), dest.clone().into()]).as_deref(),
+            fetch_url(&git, &globals, &[]).as_deref(),
             Some(remote.to_str().unwrap())
         );
-        assert_eq!(origin_url(&git, &["-C".into(), temp.path().into()]), None);
+        assert_eq!(fetch_url(&git, &["-C".into(), temp.path().into()], &[]), None);
+
+        // A second mirror joins the alternates once, whatever the order.
+        let other = temp.path().join("other-mirror");
+        std::fs::create_dir_all(&other).unwrap();
+        run(&other, &["init", "-q", "--bare"]);
+        ensure_alternate(&git, &globals, &other).unwrap();
+        ensure_alternate(&git, &globals, &other).unwrap();
+        ensure_alternate(&git, &globals, &mirror).unwrap();
+        let alternates =
+            std::fs::read_to_string(dest.join(".git/objects/info/alternates")).unwrap();
+        assert_eq!(
+            alternates.lines().collect::<Vec<_>>(),
+            vec![
+                mirror.join("objects").to_str().unwrap(),
+                other.join("objects").to_str().unwrap()
+            ]
+        );
+
+        // Naming a remote, a path or the upstream remote of the branch.
+        run(&dest, &["remote", "add", "upstream", other.to_str().unwrap()]);
+        assert_eq!(
+            fetch_url(&git, &globals, &["-q".into(), "upstream".into(), "main".into()]).as_deref(),
+            Some(other.to_str().unwrap())
+        );
+        assert_eq!(
+            fetch_url(&git, &globals, &["--depth".into(), "1".into(), mirror.clone().into()])
+                .as_deref(),
+            Some(mirror.to_str().unwrap())
+        );
+        assert_eq!(fetch_url(&git, &globals, &["nosuch".into()]), None);
+        assert_eq!(fetch_url(&git, &globals, &["--all".into()]), None);
+        run(&dest, &["config", "branch.main.remote", "upstream"]);
+        assert_eq!(
+            fetch_url(&git, &globals, &[]).as_deref(),
+            Some(other.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn fetch_targets_skip_option_values() {
+        let words = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(FetchTarget::parse(&[]), FetchTarget::Default);
+        assert_eq!(
+            FetchTarget::parse(&words(&["-q", "--prune", "-j", "4", "--depth=1"])),
+            FetchTarget::Default
+        );
+        assert_eq!(
+            FetchTarget::parse(&words(&["--depth", "1", "up", "main"])),
+            FetchTarget::Named("up".into())
+        );
+        assert_eq!(
+            FetchTarget::parse(&words(&["--rebase", "-Xtheirs", "-s", "ort", "https://x/y", "main"])),
+            FetchTarget::Named("https://x/y".into())
+        );
+        assert_eq!(
+            FetchTarget::parse(&words(&["--", "-odd"])),
+            FetchTarget::Named("-odd".into())
+        );
+        assert_eq!(
+            FetchTarget::parse(&words(&["--all", "-q"])),
+            FetchTarget::Unrouted
+        );
+        assert_eq!(
+            FetchTarget::parse(&words(&["--multiple", "a", "b"])),
+            FetchTarget::Unrouted
+        );
     }
 
     #[test]

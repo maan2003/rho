@@ -387,7 +387,7 @@ fn start_store(
         root.join("stores").into_std_path_buf(),
         git.clone(),
         keeper_environment(environment, path_overrides),
-        refresh.debounce,
+        refresh,
     );
     let socket = root.join("store.sock");
     let listener = MirrorStore::bind(socket.as_std_path())
@@ -400,7 +400,7 @@ fn start_store(
             }
         }
     });
-    let refresh_loop = keeper.spawn_refresh_loop(refresh.interval);
+    let refresh_loop = keeper.spawn_refresh_loop();
     Ok(StoreHandle {
         keeper,
         socket,

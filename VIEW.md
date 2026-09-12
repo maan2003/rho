@@ -110,7 +110,9 @@ security boundary (see `WORKSET.md`); it is a distribution.
    `CLONES.md`): `git clone` births the clone from the daemon's mirror
    store through git alternates and leaves an ordinary repository with
    `origin` at the real remote; `git fetch` and `git pull` read the
-   refreshed mirror; every other command is the real git, `exec`ed
+   refreshed mirror of whatever remote or URL they name, and a clone
+   fetching from a new remote borrows that mirror too; every other
+   command is the real git, `exec`ed
    with its arguments untouched. Further checkouts are `git worktree
    add`, which agents run for themselves when they want a child in its
    own checkout. There is no second VCS in the view and no daemon-side

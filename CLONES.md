@@ -35,10 +35,15 @@ for everything else, arguments untouched:
   `--branch`, `--bare`, `--mirror`, `--reference`, `--filter`, ...) go
   to the real git unchanged: the store serves the common case, not
   every case.
-- `git fetch ...` and `git pull ...` ask the keeper to *refresh* the
-  mirror of `origin`'s URL, then run the real git with
-  `url.<mirror>.insteadOf=<origin url>` so the fetch reads the mirror.
-  Refspecs, options and remote names pass through.
+- `git fetch ...` and `git pull ...` work out which URL git would read
+  (a named remote's URL, a literal URL or path, else the current branch's
+  upstream remote or `origin`), ask the keeper to *refresh* that mirror,
+  add the mirror to the clone's alternates if it is new there, then run
+  the real git with `url.<mirror>.insteadOf=<url>` so the fetch reads
+  the mirror. Refspecs and options pass through. So a second remote
+  (`git remote add upstream ...; git fetch upstream`) gets a mirror of
+  its own on first fetch and the clone borrows from both. `--all` and
+  `--multiple` name several remotes at once and go to the real git.
 
 If the keeper cannot be reached the wrapper says so on stderr and runs
 the real git against the network. Without the socket variable it is
@@ -66,8 +71,9 @@ guarded, or banned.
 ### Shared artifact: git object bytes (alternates)
 
 Every clone has its own private `.git` whose `objects/info/alternates`
-points at the mirror's object database, by absolute path. This is
-git's first-class borrowing mechanism:
+points at the mirror's object database, by absolute path, one line per
+mirror the clone has fetched from. This is git's first-class borrowing
+mechanism:
 
 - Fetch negotiation counts alternate objects as local — a fetch from the
   mirror transfers nothing that the mirror already has, which is
@@ -113,10 +119,12 @@ git with the user's environment, so credential helpers, ssh and
 The keeper serializes work per mirror: one `tokio` mutex per URL, so
 concurrent requests for one URL share a single fetch. A mirror fetched
 within the *debounce* window (30 s by default) is served as is; a
-background loop refetches every mirror each *interval* (60 s), so new
-clones are born on the remote's current state without waiting. There is
-no file locking: the daemon is one process, and git takes its own locks
-inside a mirror.
+background loop refetches each *interval* (60 s) every mirror that was
+requested within *idle* (3 days; each request records its time in the
+store's `used` file), so new clones are born on the remote's current
+state without waiting, and a mirror nobody asks for stops costing
+network until the next request fetches it. There is no file locking: the
+daemon is one process, and git takes its own locks inside a mirror.
 
 The protocol is one line each way on a unix socket, so a client needs
 nothing but a socket:
@@ -174,6 +182,6 @@ commits live in its own odb until pushed.
 | Cost | When | Why it's fine |
 |---|---|---|
 | Full fetch of the repo | mirror init, once | O(repo), one-time, off the clone path |
-| Mirror refresh | every ensure past the debounce, and every interval | delta-sized, off the clone path |
+| Mirror refresh | every ensure past the debounce, and every interval while in use | delta-sized, off the clone path |
 | Per-ref work at clone birth | every clone | local refs copy, no object transfer |
 | Store growth | as history grows | O(repo), append-only |

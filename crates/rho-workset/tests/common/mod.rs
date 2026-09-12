@@ -120,6 +120,7 @@ pub async fn open_worksets(temp: &Path, wrapper: &Path) -> Arc<Worksets> {
         StoreService::Serve(StoreRefresh {
             interval: Duration::from_secs(3600),
             debounce: Duration::ZERO,
+            ..StoreRefresh::default()
         }),
     )
     .await

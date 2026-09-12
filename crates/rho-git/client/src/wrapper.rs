@@ -7,9 +7,12 @@
 //!   (`--depth`, `--branch`, `--bare`, `--mirror`, `--reference`, ...) send it
 //!   to the real git unchanged: the store serves the common case, not every
 //!   case.
-//! - `git fetch ...` and `git pull ...` ask the keeper to refresh `origin`'s
-//!   mirror, then run the real git with `url.<mirror>.insteadOf=<origin url>`,
-//!   so the fetch reads the mirror and never the network.
+//! - `git fetch ...` and `git pull ...` work out which URL git would read
+//!   (the named remote's, a literal URL or path, else the branch's upstream
+//!   remote or `origin`), ask the keeper to refresh that mirror, add the
+//!   mirror to the clone's alternates, then run the real git with
+//!   `url.<mirror>.insteadOf=<url>`, so the fetch reads the mirror and
+//!   never the network. `--all`/`--multiple` go to the real git as is.
 //!
 //! The wrapper is exec-transparent: git's own exit status, output and
 //! signals pass straight through, and git's global options before the
@@ -21,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::{Git, Store, clone_from_mirror, origin_url};
+use crate::{Git, Store, clone_from_mirror, ensure_alternate, fetch_url};
 
 /// A git command line split at its subcommand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -243,9 +246,14 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             }
         }
         (Some("fetch" | "pull"), Some(store)) => {
-            if let Some(url) = origin_url(&git, &invocation.globals) {
+            if let Some(url) = fetch_url(&git, &invocation.globals, &invocation.rest) {
                 match store.refresh(&url) {
                     Ok(mirror) => {
+                        if let Err(error) = ensure_alternate(&git, &invocation.globals, &mirror) {
+                            eprintln!(
+                                "rho-git: cannot borrow the mirror's objects, fetching copies ({error:#})"
+                            );
+                        }
                         let mut args = invocation.globals.clone();
                         args.push("-c".into());
                         args.push(insteadof(&mirror, &url));
@@ -403,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn insteadof_rewrites_the_origin_url() {
+    fn insteadof_rewrites_the_fetched_url() {
         assert_eq!(
             insteadof(Path::new("/s/r/git"), "https://x/y"),
             OsString::from("url./s/r/git.insteadOf=https://x/y")

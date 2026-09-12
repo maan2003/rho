@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{git, push_commit, setup_remote};
 use rho_git_proto::SOCKET_ENV;
-use rho_git_server::MirrorStore;
+use rho_git_server::{MirrorStore, Refresh};
 
 const WRAPPER: &str = env!("CARGO_BIN_EXE_rho-git");
 
@@ -55,7 +55,15 @@ impl Drop for Keeper {
 }
 
 fn keeper(temp: &Path) -> Keeper {
-    let store = MirrorStore::new(temp.join("stores"), "git", Vec::new(), Duration::ZERO);
+    let store = MirrorStore::new(
+        temp.join("stores"),
+        "git",
+        Vec::new(),
+        Refresh {
+            debounce: Duration::ZERO,
+            ..Refresh::default()
+        },
+    );
     let socket = temp.join("store.sock");
     let listener = MirrorStore::bind(&socket).unwrap();
     let task = tokio::spawn(Arc::clone(&store).serve(listener));
@@ -146,6 +154,104 @@ async fn clone_and_fetch_go_through_the_store() {
         git(&remote, &["rev-parse", "main"]).trim(),
         git(&clone, &["rev-parse", "HEAD"]).trim()
     );
+}
+
+fn no_own_pack(clone: &Path) -> bool {
+    clone
+        .join(".git/objects/pack")
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, remote) = setup_remote(temp.path());
+    let url = remote.to_str().unwrap();
+    // A second remote: a fork with a branch of its own.
+    let fork = temp.path().join("fork.git");
+    git(temp.path(), &["init", "-q", "--bare", "fork.git"]);
+    git(&source, &["remote", "add", "fork", fork.to_str().unwrap()]);
+    git(&source, &["push", "-q", "fork", "main:main"]);
+    std::fs::write(source.join("fork.txt"), "fork\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "fork"]);
+    let fork_tip = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&source, &["push", "-q", "fork", "HEAD:refs/heads/feature"]);
+    let fork_url = fork.to_str().unwrap();
+    let keeper = keeper(temp.path());
+    let work = temp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    ok(wrapper(&work, Some(&keeper.socket), &["clone", "-q", url]));
+    let clone = work.join("remote");
+    ok(wrapper(&clone, Some(&keeper.socket), &["remote", "add", "fork", fork_url]));
+
+    // Fetching a named remote: its mirror is made, joins the alternates,
+    // and the objects are borrowed rather than packed.
+    ok(wrapper(&clone, Some(&keeper.socket), &["fetch", "-q", "fork"]));
+    assert_eq!(git(&clone, &["rev-parse", "fork/feature"]).trim(), fork_tip);
+    let fork_mirror = keeper.store.mirror_dir(fork_url);
+    assert!(fork_mirror.join("HEAD").is_file());
+    let alternates = std::fs::read_to_string(clone.join(".git/objects/info/alternates")).unwrap();
+    assert_eq!(
+        alternates.lines().collect::<Vec<_>>(),
+        vec![
+            keeper.store.mirror_dir(url).join("objects").to_str().unwrap(),
+            fork_mirror.join("objects").to_str().unwrap(),
+        ]
+    );
+    assert!(no_own_pack(&clone));
+    assert_eq!(keeper.store.list().unwrap().len(), 2);
+
+    // A literal URL, with a refspec, after the fork moved.
+    std::fs::write(source.join("fork.txt"), "more\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-q", "-m", "more"]);
+    let fork_next = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&source, &["push", "-q", "fork", "HEAD:refs/heads/feature"]);
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["fetch", "-q", fork_url, "feature"],
+    ));
+    assert_eq!(git(&clone, &["rev-parse", "FETCH_HEAD"]).trim(), fork_next);
+    assert_eq!(
+        git(&fork_mirror, &["rev-parse", "refs/heads/feature"]).trim(),
+        fork_next
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone.join(".git/objects/info/alternates"))
+            .unwrap()
+            .lines()
+            .count(),
+        2,
+        "a known mirror is not listed twice"
+    );
+    assert!(no_own_pack(&clone));
+
+    // No argument: the branch's upstream remote, not origin.
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["checkout", "-q", "-b", "feature", "--track", "fork/feature"],
+    ));
+    std::fs::write(source.join("fork.txt"), "again\n").unwrap();
+    git(&source, &["commit", "-q", "-am", "again"]);
+    let fork_last = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&source, &["push", "-q", "fork", "HEAD:refs/heads/feature"]);
+    ok(wrapper(&clone, Some(&keeper.socket), &["pull", "-q", "--ff-only"]));
+    assert_eq!(git(&clone, &["rev-parse", "HEAD"]).trim(), fork_last);
+    assert!(no_own_pack(&clone));
+    assert_eq!(
+        git(&clone, &["rev-parse", "origin/main"]).trim(),
+        git(&remote, &["rev-parse", "main"]).trim()
+    );
+
+    // --all is many remotes at once: the real git, over the wire.
+    ok(wrapper(&clone, Some(&keeper.socket), &["fetch", "-q", "--all"]));
 }
 
 #[tokio::test(flavor = "multi_thread")]
