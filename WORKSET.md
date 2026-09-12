@@ -11,9 +11,11 @@ no separate record of its contents.
 
 ```
 ~/.local/state/rho/
-  stores/            # mirror store root (CLONES.md), URL-keyed
-  store.sock         # the mirror keeper's socket
-  worksets/<id>/src  # one directory per workset
+  stores/              # mirror store root (CLONES.md), URL-keyed
+  store.sock           # the mirror keeper's socket
+  cache/               # every agent's ~/.cache (VIEW.md)
+  worksets/<id>/src    # one directory per workset
+  worksets/<id>/state  # its direnv layout and nix GC roots
 ```
 
 `Worksets::open` creates the root and starts the mirror keeper
@@ -39,6 +41,14 @@ checkout containing it), not of a "primary" repository. The daemon runs
 one `Worksets` for its state root and hands the pool a `Workset` per
 agent; a directory outside the root can be adopted for one process
 (`Worksets::adopt`), which is how tests and `rho eval` work in place.
+
+Agents recorded before worksets (`WorkspaceInfo::Workspace`, a jj
+managed workspace) still load: their transcripts read, but they cannot
+run. `rho debug migrate-agent <agent>` moves one into a workset by hand:
+a clone of the repository's origin through the mirror store, checked out
+at the old workspace's parent commit with the working copy's changes
+staged, recorded as a `WorkdirMigrated` event at the tail of the agent's
+log. The old workspace is left as it is.
 
 `Workset::enter(mode, cwd)` is one agent's `Namespace` over the
 directory: its mount namespace is built on the first command (so loading
@@ -68,7 +78,10 @@ a plain directory or file except a handful of real mounts:
 - `/proc`: the host's, bound (same pid namespace).
 - A generated `/etc`: passwd, DNS, TLS certs — written, not bound.
 - `/home/agent`: `$HOME`, empty tmpfs directory seeded from an
-  optional skeleton. The host home is not mounted at all.
+  optional skeleton. The host home is not mounted at all; `~/.cache` is
+  the shared persistent cache.
+- The workset's state directory, read-write at its host path, so the
+  nix GC roots direnv registers there resolve on the host.
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
 - `/src`: the workset directory, read-write. The command starts here.
@@ -81,10 +94,11 @@ a plain directory or file except a handful of real mounts:
   then launch its sibling sidecars (`rho-shell`, `rho-pager`). A nix
   build adds nothing.
 
-The environment is an explicit allowlist: PATH is the agent's nix
-profile then the base (`VIEW.md`), plus TERM, HOME/USER/LOGNAME, LANG,
-the XDG directories, `NIX_REMOTE=daemon` when the host has a nix daemon
-and `RHO_GIT_STORE_SOCKET` pointing git at the keeper. Exposed mode
+The environment is an explicit allowlist, listed in `VIEW.md`: PATH is
+the agent's nix profile then the base, and the rest names the home, the
+caches, git's identity and configuration, direnv's configuration,
+`NIX_REMOTE=daemon` when the host has a nix daemon and
+`RHO_GIT_STORE_SOCKET` pointing git at the keeper. Exposed mode
 passes the user's environment through with Rho's git first on PATH.
 Variables the caller sets on the command survive in both modes, and
 inherited fds are closed on exec.

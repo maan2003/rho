@@ -146,6 +146,9 @@ pub struct Worksets {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store: Option<StoreHandle>,
+    /// `GIT_AUTHOR_*` and `GIT_COMMITTER_*` for agents: the user's, from
+    /// their environment or their git config. Empty when unknown.
+    identity: Vec<(OsString, OsString)>,
     worksets: Mutex<BTreeMap<String, Weak<WorksetInner>>>,
     /// Host directories adopted as worksets for this process's lifetime.
     adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
@@ -181,17 +184,21 @@ impl Worksets {
             .with_context(|| format!("create mirror store root at {root}"))?;
         std::fs::create_dir_all(root.join("worksets"))
             .with_context(|| format!("create workset root at {root}"))?;
+        std::fs::create_dir_all(root.join("cache"))
+            .with_context(|| format!("create shared cache at {root}"))?;
         let store = match service {
             StoreService::Serve(refresh) => {
                 Some(start_store(&root, &environment, &path_overrides, refresh)?)
             }
             StoreService::None => None,
         };
+        let identity = git_identity(&environment, &path_overrides).await;
         Ok(Arc::new(Self {
             root,
             environment,
             path_overrides,
             store,
+            identity,
             worksets: Mutex::new(BTreeMap::new()),
             adopted: std::sync::Mutex::new(BTreeMap::new()),
         }))
@@ -226,6 +233,18 @@ impl Worksets {
     /// The mirror store root; read-only for everyone but the keeper.
     pub fn store_root(&self) -> Utf8PathBuf {
         self.root.join("stores")
+    }
+
+    /// The cache every agent shares as `~/.cache` (VIEW.md): nix
+    /// evaluation and fetcher caches, cargo, uv, npm. Persistent.
+    pub fn cache_dir(&self) -> Utf8PathBuf {
+        self.root.join("cache")
+    }
+
+    /// The user's git identity as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, when
+    /// known.
+    pub fn identity_environment(&self) -> &[(OsString, OsString)] {
+        &self.identity
     }
 
     /// The keeper's socket, when one runs.
@@ -362,6 +381,46 @@ fn base_command(
     command
 }
 
+/// The user's name and email for commits: `GIT_AUTHOR_*` from their
+/// environment when set, else their git config, read with Rho's git in the
+/// user's environment. Warns and leaves agents without an identity when
+/// neither says.
+async fn git_identity(
+    environment: &UserEnvironment,
+    path_overrides: &PathOverrides,
+) -> Vec<(OsString, OsString)> {
+    let mut identity = Vec::new();
+    for (author, committer, key) in [
+        ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME", "user.name"),
+        ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "user.email"),
+    ] {
+        let value = match environment.get(author) {
+            Some(value) => Some(value.to_owned()),
+            None => {
+                let mut command = base_command(GIT, environment, path_overrides);
+                command.args(["config", "--get", key]);
+                match command.output().await {
+                    Ok(output) if output.status.success() => {
+                        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                        (!value.is_empty()).then(|| OsString::from(value))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        match value {
+            Some(value) => {
+                identity.push((author.into(), value.clone()));
+                identity.push((committer.into(), value));
+            }
+            None => {
+                eprintln!("git identity: {key} is not set; agents' commits will lack it");
+            }
+        }
+    }
+    identity
+}
+
 /// The environment the keeper runs git with: the user's, with the PATH
 /// overrides applied and no store socket, so a patched git never asks the
 /// keeper for the mirror it is fetching.
@@ -434,6 +493,19 @@ impl Workset {
     /// Host path of the directory presented at `/src`.
     pub fn root(&self) -> &Utf8Path {
         &self.0.root
+    }
+
+    /// The workset's state directory, `<state>/worksets/<id>/state`,
+    /// bound into the view at this same path: direnv's layout and the nix
+    /// GC roots it registers live here, so they resolve on the host and die
+    /// with the workset.
+    pub fn state_dir(&self) -> anyhow::Result<Utf8PathBuf> {
+        Ok(self
+            .owner()?
+            .root
+            .join("worksets")
+            .join(&self.0.id)
+            .join("state"))
     }
 
     pub(crate) fn owner(&self) -> anyhow::Result<Arc<Worksets>> {

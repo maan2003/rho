@@ -79,6 +79,11 @@ pub struct FsViewConfig {
     /// The base userland (`crate::AGENT_BASE`): shebang targets, the CA
     /// bundle and the flake registry come from it.
     pub base: PathBuf,
+    /// The shared persistent cache, mounted read-write as `~/.cache`.
+    pub cache: Option<PathBuf>,
+    /// The workset's state directory, mounted read-write at its host path
+    /// (direnv layout, nix GC roots).
+    pub workset_state: Option<PathBuf>,
     /// The directory holding this process's own executable when it lies
     /// outside `/nix/store` (a cargo build), bound read-only at its host
     /// path so a development daemon can launch its sibling sidecars.
@@ -92,6 +97,8 @@ impl FsViewConfig {
             mounts,
             host_etc: HostEtc::discover()?,
             base: PathBuf::from(crate::AGENT_BASE),
+            cache: None,
+            workset_state: None,
             own_binaries: own_binaries_dir()?,
         })
     }
@@ -291,9 +298,17 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     }
     // The XDG directories the environment names; some tools fail rather
     // than create them.
-    for dir in [".config", ".local/state", ".local/share"] {
+    for dir in [".config", ".local/state", ".local/share", ".cache"] {
         fs::create_dir_all(root.join("home/agent").join(dir))
             .with_context(|| format!("create ~/{dir}"))?;
+    }
+    if let Some(cache) = &config.cache {
+        bind(cache, &root.join("home/agent/.cache"), false)?;
+    }
+    if let Some(state) = &config.workset_state {
+        let target = host_path_in(root, state);
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        bind(state, &target, false)?;
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
@@ -339,6 +354,48 @@ fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     if registry.exists() {
         symlink(registry, etc.join("nix/registry.json"))?;
     }
+    // Git's behaviour (VIEW.md 6); identity is environment.
+    fs::write(
+        etc.join("gitconfig"),
+        "[core]\n\tpager = cat\n[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n[init]\n\tdefaultBranch = main\n",
+    )?;
+    // direnv under Rho's configuration (VIEW.md 3): everything under /src
+    // is trusted, the layout lives in the workset's state directory, and
+    // `use flake` puts the daemon's find fork and cargo's bin first.
+    fs::create_dir_all(etc.join("rho/direnv"))?;
+    fs::write(
+        etc.join("rho/direnv/direnv.toml"),
+        "[whitelist]\nprefix = [ \"/src\" ]\n",
+    )?;
+    fs::write(
+        etc.join("rho/direnv/direnvrc"),
+        format!(
+            r#"source {base}/share/nix-direnv/direnvrc
+eval "$(declare -f use_flake | sed '1s/use_flake/rho_nix_direnv_use_flake/')"
+
+direnv_layout_dir() {{
+    local checkout key
+    checkout="$(pwd -P)"
+    key="$(printf '%s' "$checkout" | sha256sum)"
+    printf '%s/%s
+' "${{RHO_DIRENV_LAYOUT_DIR:?RHO_DIRENV_LAYOUT_DIR is not set}}" "${{key%% *}}"
+}}
+
+use_flake() {{
+    rho_nix_direnv_use_flake "$@" || return
+    PATH="${{RHO_DIRENV_PATH_BEFORE:+${{RHO_DIRENV_PATH_BEFORE}}:}}${{CARGO_HOME:-$HOME/.cache/cargo}}/bin:${{PATH}}"
+    export PATH
+}}
+"#,
+            base = config.base.display()
+        ),
+    )?;
+    // The nixpkgs bash reads these itself (SYS_BASHRC).
+    fs::write(
+        etc.join("bashrc"),
+        "eval \"$(direnv hook bash)\"\nPS1='agent:\\w\\$ '\n",
+    )?;
+    fs::write(etc.join("profile"), "[ -r /etc/bashrc ] && . /etc/bashrc\n")?;
     Ok(())
 }
 

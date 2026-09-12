@@ -1605,6 +1605,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         | AgentEvent::Created { .. }
         | AgentEvent::RoleChanged { .. }
         | AgentEvent::WorkdirAdded { .. }
+        | AgentEvent::WorkdirMigrated { .. }
         | AgentEvent::RuntimeRebound { .. } => 0,
     }
 }
@@ -1684,6 +1685,10 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             }
         }
         AgentEvent::WorkdirAdded { workdir, .. } => head.config.workdirs.push(workdir.clone()),
+        AgentEvent::WorkdirMigrated { workdir, .. } => match head.config.workdirs.first_mut() {
+            Some(primary) => *primary = workdir.clone(),
+            None => head.config.workdirs.push(workdir.clone()),
+        },
         AgentEvent::RuntimeRebound { change, .. } => match change {
             crate::RuntimeChange::ClaudeRewindPending(rewind) => {
                 head.config.claude_rewind = rewind.clone();

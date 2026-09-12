@@ -112,6 +112,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
             | AgentEvent::WorkdirAdded { .. }
+            | AgentEvent::WorkdirMigrated { .. }
             | AgentEvent::RuntimeRebound { .. } => {}
         }
     }

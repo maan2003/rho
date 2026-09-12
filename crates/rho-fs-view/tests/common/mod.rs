@@ -57,7 +57,15 @@ pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
 pub fn environment() -> UserEnvironment {
     UserEnvironment::new(
         std::env::vars_os()
-            .filter(|(name, _)| name != "RHO_GIT_STORE_SOCKET")
+            .filter(|(name, _)| {
+                name != "RHO_GIT_STORE_SOCKET"
+                    && name != "GIT_AUTHOR_NAME"
+                    && name != "GIT_AUTHOR_EMAIL"
+            })
+            .chain([
+                ("GIT_AUTHOR_NAME".into(), "Test Agent".into()),
+                ("GIT_AUTHOR_EMAIL".into(), "agent@example.test".into()),
+            ])
             .collect(),
     )
 }

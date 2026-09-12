@@ -432,6 +432,7 @@ mod tests {
                     AgentEvent::Created { .. } => "created",
                     AgentEvent::RoleChanged { .. } => "role",
                     AgentEvent::WorkdirAdded { .. } => "workdir",
+                    AgentEvent::WorkdirMigrated { .. } => "migrated",
                     AgentEvent::RuntimeRebound { .. } => "rebound",
                 };
                 *kinds.entry(kind).or_default() += 1;

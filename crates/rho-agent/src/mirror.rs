@@ -284,6 +284,10 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             workdir: workdir.clone(),
             at: *at,
         },
+        AgentEvent::WorkdirMigrated { workdir, at } => MirrorEvent::WorkdirMigrated {
+            workdir: workdir.clone(),
+            at: *at,
+        },
         AgentEvent::Turn { edge, at } => MirrorEvent::Turn {
             edge: edge.clone(),
             at: *at,

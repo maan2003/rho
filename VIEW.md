@@ -169,15 +169,18 @@ security boundary (see `WORKSET.md`); it is a distribution.
 
 ## Environment
 
-Today: `PATH=/home/agent/.nix-profile/bin:<base>/bin`; `HOME`, `USER`,
-`LOGNAME`; `TERM`; `LANG=C.UTF-8`; `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`,
-`XDG_STATE_HOME` under the home; `NIX_REMOTE=daemon` when the host has
-a nix daemon; `RHO_GIT_STORE_SOCKET`. Variables the caller sets on a
-command survive.
-Still to come: `TZ`, `COLORTERM`; `DIRENV_CONFIG=/etc/rho/direnv`;
-`GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*`, `GIT_COMMITTER_*`;
-`INSIDE_AGENT=1`; `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the
-shared cache.
+`PATH=/home/agent/.nix-profile/bin:<base>/bin`; `HOME`, `USER`,
+`LOGNAME`; `LANG=C.UTF-8`; `COLORTERM=truecolor`; `INSIDE_AGENT=1`;
+`XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` under the home;
+`CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under `~/.cache`;
+`GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
+from the user's environment or git config, read once when the daemon
+starts; `DIRENV_CONFIG=/etc/rho/direnv` and `RHO_DIRENV_LAYOUT_DIR`
+under the workset's state directory; `FIND_DENY_ROOTS` for Rho's find;
+`NIX_REMOTE=daemon` when the host has a nix daemon;
+`RHO_GIT_STORE_SOCKET`. Passed through from the user: `TERM`, `TZ`,
+`RHO_DIRENV_PATH_BEFORE`. Variables the caller sets on a command
+survive.
 
 ## Where it lives
 
@@ -191,8 +194,10 @@ All of it is `rho-fs-view`, in two places:
 - `layout.rs` builds the view per agent: the root tmpfs, the two shebang
   links, the generated `/etc` (passwd with the real uid, resolv.conf and
   localtime from the host, the CA bundle and registry from the base,
-  nix.conf), the home with its XDG directories, and the mounts (`/src`,
-  the store, the sockets). `ns.rs` sets the environment above.
+  nix.conf, gitconfig, direnv's configuration and `direnvrc`, bashrc and
+  profile), the home with its XDG directories, and the mounts (`/src`,
+  the shared cache at `~/.cache`, the workset's state directory, the
+  store, the sockets). `ns.rs` sets the environment above.
 
 Nothing is assembled at daemon start and nothing is persisted: the
 base is a store path, and the rest is a few files per agent.

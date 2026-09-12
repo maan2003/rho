@@ -191,6 +191,13 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
+    /// The agent's first workdir replaced by a workset, by `rho debug
+    /// migrate-agent`: an agent that predates worksets moved into one.
+    WorkdirMigrated {
+        workdir: WorkspaceInfo,
+        #[senax(default)]
+        at: UnixMs,
+    },
     /// The runtime itself changing under the agent: a Claude rewind before
     /// and after its destination transcript is verified, or a new prompt
     /// cache key for the Rho runtime.
@@ -747,6 +754,7 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
             | AgentEvent::WorkdirAdded { .. }
+            | AgentEvent::WorkdirMigrated { .. }
             | AgentEvent::RuntimeRebound { .. } => None,
         })
         .collect()

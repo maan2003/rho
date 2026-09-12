@@ -77,6 +77,11 @@ pub struct Namespace {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store_environment: Vec<(OsString, OsString)>,
+    identity: Vec<(OsString, OsString)>,
+    /// The shared cache, mounted as the view's `~/.cache`.
+    cache: Utf8PathBuf,
+    /// The workset's state directory, mounted at its host path.
+    workset_state: Utf8PathBuf,
     state: tokio::sync::Mutex<NsState>,
 }
 
@@ -113,6 +118,9 @@ impl Namespace {
             workset.id()
         );
         let store_environment = owner.store_environment();
+        let identity = owner.identity_environment().to_vec();
+        let cache = owner.cache_dir();
+        let workset_state = workset.state_dir()?;
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
         Ok(Arc::new(Self {
@@ -123,6 +131,9 @@ impl Namespace {
             environment,
             path_overrides,
             store_environment,
+            identity,
+            cache,
+            workset_state,
             state: tokio::sync::Mutex::new(NsState::default()),
         }))
     }
@@ -195,13 +206,19 @@ impl Namespace {
                 .transpose()?;
             let view_root_path = view_root.as_ref().map(|root| root.path().to_owned());
             let mode = self.mode.clone();
+            let cache = self.cache.clone();
+            let workset_state = self.workset_state.clone();
             let (user_ns, mount_ns, root) = namespace_thread("rho-fs-view-namespace", move || {
                 crate::layout::unshare_mount_namespace()?;
                 match mode {
                     Mode::View { home_skeleton } => {
                         let root = view_root_path.context("view mode has no namespace root")?;
+                        std::fs::create_dir_all(&workset_state)
+                            .with_context(|| format!("create workset state {workset_state}"))?;
                         let mut config = crate::layout::FsViewConfig::new(mounts)?;
                         config.home_skeleton = home_skeleton;
+                        config.cache = Some(cache.into_std_path_buf());
+                        config.workset_state = Some(workset_state.into_std_path_buf());
                         let builder = crate::layout::FsViewBuilder::new(config)?;
                         builder.build_in_place(&root)?;
                         builder.pivot_into(&root)?;
@@ -389,8 +406,12 @@ impl Namespace {
                 // The agent's own nix profile first, then the base userland
                 // (VIEW.md). Nothing of the host's PATH.
                 let home = crate::AGENT_HOME;
-                if let Some(value) = self.environment.get("TERM") {
-                    command.env("TERM", value);
+                // Passed through from the user: the terminal, the timezone,
+                // and the daemon's own find-fork directory for direnvrc.
+                for name in ["TERM", "TZ", "RHO_DIRENV_PATH_BEFORE"] {
+                    if let Some(value) = self.environment.get(name) {
+                        command.env(name, value);
+                    }
                 }
                 command
                     .env(
@@ -401,9 +422,21 @@ impl Namespace {
                     .env("USER", "agent")
                     .env("LOGNAME", "agent")
                     .env("LANG", "C.UTF-8")
+                    .env("COLORTERM", "truecolor")
+                    .env("INSIDE_AGENT", "1")
                     .env("XDG_CACHE_HOME", format!("{home}/.cache"))
                     .env("XDG_CONFIG_HOME", format!("{home}/.config"))
-                    .env("XDG_STATE_HOME", format!("{home}/.local/state"));
+                    .env("XDG_STATE_HOME", format!("{home}/.local/state"))
+                    .env("CARGO_HOME", format!("{home}/.cache/cargo"))
+                    .env(
+                        "CARGO_BUILD_TARGET_DIR",
+                        format!("{home}/.cache/cargo-target"),
+                    )
+                    .env("GIT_CONFIG_SYSTEM", "/etc/gitconfig")
+                    .env("DIRENV_CONFIG", "/etc/rho/direnv")
+                    .env("RHO_DIRENV_LAYOUT_DIR", self.workset_state.join("direnv"))
+                    .env("FIND_DENY_ROOTS", format!("/:/nix/store:{home}"));
+                command.envs(self.identity.iter().map(|(name, value)| (name, value)));
                 if Path::new(crate::layout::NIX_DAEMON_SOCKET).exists() {
                     command.env("NIX_REMOTE", "daemon");
                 }

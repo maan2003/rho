@@ -223,6 +223,7 @@ impl Digest {
             | MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
             | MirrorEvent::WorkdirAdded { .. }
+            | MirrorEvent::WorkdirMigrated { .. }
             | MirrorEvent::CompactionRequested { .. }
             | MirrorEvent::QueueCleared { .. }
             | MirrorEvent::Sent { .. }
@@ -320,6 +321,12 @@ impl MirroredAgent {
             }
             MirrorEvent::WorkdirAdded { workdir, .. } => {
                 self.identity.workdirs.push(workdir.clone());
+            }
+            MirrorEvent::WorkdirMigrated { workdir, .. } => {
+                match self.identity.workdirs.first_mut() {
+                    Some(primary) => *primary = workdir.clone(),
+                    None => self.identity.workdirs.push(workdir.clone()),
+                }
             }
             _ => {}
         }
@@ -663,6 +670,7 @@ impl TranscriptFold {
             MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
             | MirrorEvent::WorkdirAdded { .. }
+            | MirrorEvent::WorkdirMigrated { .. }
             | MirrorEvent::Presented { .. }
             | MirrorEvent::Wants { .. } => {}
         }

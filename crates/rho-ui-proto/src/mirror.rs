@@ -202,6 +202,11 @@ pub enum MirrorEvent {
         workdir: WorkspaceInfo,
         at: UnixMs,
     },
+    /// The first workdir replaced by a workset (`rho debug migrate-agent`).
+    WorkdirMigrated {
+        workdir: WorkspaceInfo,
+        at: UnixMs,
+    },
     /// The person or another agent spoke. Queued until a later `Sent`
     /// carries it; a `QueueCleared` before that drops it.
     Message {
@@ -288,6 +293,7 @@ impl MirrorEvent {
             Self::Created { at, .. }
             | Self::RoleChanged { at, .. }
             | Self::WorkdirAdded { at, .. }
+            | Self::WorkdirMigrated { at, .. }
             | Self::Message { at, .. }
             | Self::CompactionRequested { at }
             | Self::QueueCleared { at }
