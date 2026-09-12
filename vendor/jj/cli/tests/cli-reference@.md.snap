@@ -106,6 +106,10 @@ This document contains the help content for the `jj` command-line program.
 * [`jj split`↴](#jj-split)
 * [`jj squash`↴](#jj-squash)
 * [`jj status`↴](#jj-status)
+* [`jj store`↴](#jj-store)
+* [`jj store fetch`↴](#jj-store-fetch)
+* [`jj store list`↴](#jj-store-list)
+* [`jj store serve`↴](#jj-store-serve)
 * [`jj subtree`↴](#jj-subtree)
 * [`jj subtree add`↴](#jj-subtree-add)
 * [`jj subtree list`↴](#jj-subtree-list)
@@ -195,6 +199,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `split` — Split a revision in two
 * `squash` — Move changes from a revision into another revision
 * `status` — Show high-level repo status [default alias: st]
+* `store` — Manage clone stores: shared mirrors that make `jj git clone` instant and `jj git fetch` local
 * `subtree` — Manage imported directory trees
 * `tag` — Manage tags
 * `undo` — Undo the last operation
@@ -3337,6 +3342,64 @@ Note: You can use `jj diff --summary -r <rev>` to see the changed files for a sp
 ###### **Arguments:**
 
 * `<FILESETS>` — Restrict the status display to these paths
+
+
+
+## `jj store`
+
+Manage clone stores: shared mirrors that make `jj git clone` instant and `jj git fetch` local
+
+With `git.clone-store` (or `JJ_STORE`) set to a directory, `jj git clone` keeps one store per remote URL there: a bare git mirror that never prunes plus a jj index template. Clones borrow the mirror's objects through `objects/info/alternates` and reflink the template's index, so they are born in well under a second at the store's last-fetched state, and `jj git fetch` in them transfers from the mirror instead of the network. Everything else about a clone — refs, remotes, operation log, working copy — is a stock private jj repo.
+
+These commands maintain the stores; nothing here is needed for a clone to work.
+
+**Usage:** `jj store <COMMAND>`
+
+###### **Subcommands:**
+
+* `fetch` — Fetch the remote into each store (all stores, or the given URLs; a URL without a store yet gets one)
+* `list` — List the stores under the store root
+* `serve` — Serve the store root over a unix socket, keeping every store fetched in the background
+
+
+
+## `jj store fetch`
+
+Fetch the remote into each store (all stores, or the given URLs; a URL without a store yet gets one)
+
+**Usage:** `jj store fetch [URLS]...`
+
+###### **Arguments:**
+
+* `<URLS>` — Remote URLs to fetch (default: every existing store)
+
+
+
+## `jj store list`
+
+List the stores under the store root
+
+**Usage:** `jj store list`
+
+
+
+## `jj store serve`
+
+Serve the store root over a unix socket, keeping every store fetched in the background
+
+Clients with `git.clone-store-socket` (or `JJ_STORE_SOCKET`) set to the socket ask the server for a store instead of touching the store root themselves, so the root can be read-only for them.
+
+**Usage:** `jj store serve [OPTIONS] --socket <SOCKET>`
+
+###### **Options:**
+
+* `--socket <SOCKET>` — Unix socket path to listen on (replaced if it exists)
+* `--interval <INTERVAL>` — Seconds between background fetches of every store
+
+  Default value: `60`
+* `--debounce <DEBOUNCE>` — Seconds within which a fetched store is served without fetching again
+
+  Default value: `30`
 
 
 

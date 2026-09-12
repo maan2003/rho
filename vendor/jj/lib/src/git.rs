@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::iter;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -3099,6 +3100,53 @@ impl<'a> GitFetch<'a> {
     pub fn fetch(
         &mut self,
         remote_name: &RemoteName,
+        expanded: ExpandedFetchRefSpecs,
+        callback: &mut dyn GitSubprocessCallback,
+        depth: Option<NonZeroU32>,
+    ) -> Result<(), GitFetchError> {
+        self.fetch_from(remote_name, None, expanded, callback, depth)
+    }
+
+    /// Like [`Self::fetch`], but transfers from a clone store mirror of the
+    /// remote instead of the network. The mirror keeps the remote's
+    /// branches under `refs/remotes/origin/*`, so branch refspec sources
+    /// are rewritten to that namespace; everything else, including which
+    /// remote-tracking refs are updated and pruned, is unchanged.
+    #[tracing::instrument(skip(self, callback))]
+    pub fn fetch_from_mirror(
+        &mut self,
+        remote_name: &RemoteName,
+        mirror_git_dir: &Path,
+        mut expanded: ExpandedFetchRefSpecs,
+        callback: &mut dyn GitSubprocessCallback,
+    ) -> Result<(), GitFetchError> {
+        let rewrite = |name: &str| -> String {
+            match name.strip_prefix("refs/heads/") {
+                Some(branch) => format!("refs/remotes/origin/{branch}"),
+                None => name.to_owned(),
+            }
+        };
+        for refspec in &mut expanded.refspecs {
+            if let Some(source) = &refspec.source {
+                refspec.source = Some(rewrite(source));
+            }
+        }
+        for refspec in &mut expanded.negative_refspecs {
+            refspec.source = rewrite(&refspec.source);
+        }
+        let source = mirror_git_dir.to_str().ok_or_else(|| {
+            GitFetchError::Subprocess(GitSubprocessError::External(format!(
+                "clone store mirror path is not valid UTF-8: {}",
+                mirror_git_dir.display()
+            )))
+        })?;
+        self.fetch_from(remote_name, Some(source), expanded, callback, None)
+    }
+
+    fn fetch_from(
+        &mut self,
+        remote_name: &RemoteName,
+        source: Option<&str>,
         ExpandedFetchRefSpecs {
             expr,
             refspecs: mut remaining_refspecs,
@@ -3108,6 +3156,7 @@ impl<'a> GitFetch<'a> {
         depth: Option<NonZeroU32>,
     ) -> Result<(), GitFetchError> {
         validate_remote_name(remote_name)?;
+        let source = source.unwrap_or(remote_name.as_str());
 
         // check the remote exists
         if self
@@ -3133,7 +3182,7 @@ impl<'a> GitFetch<'a> {
         // meaning that the below cycle runs in O(#failed refspecs)
         let updates = loop {
             let status = self.git_ctx.spawn_fetch(
-                remote_name,
+                source,
                 &remaining_refspecs,
                 &negative_refspecs,
                 callback,
@@ -3146,7 +3195,10 @@ impl<'a> GitFetch<'a> {
             tracing::debug!(failing_refspec, "failed to fetch ref");
             remaining_refspecs.retain(|r| r.source.as_ref() != Some(&failing_refspec));
 
-            if let Some(branch_name) = failing_refspec.strip_prefix("refs/heads/") {
+            if let Some(branch_name) = failing_refspec
+                .strip_prefix("refs/heads/")
+                .or_else(|| failing_refspec.strip_prefix("refs/remotes/origin/"))
+            {
                 branches_to_prune.push(format!(
                     "{remote_name}/{branch_name}",
                     remote_name = remote_name.as_str()

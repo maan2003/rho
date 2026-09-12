@@ -1,69 +1,45 @@
 ---
 name: clone-store
-description: Create instant private jj clones and workspaces from a shared clone store — for sub-agents, experiments, or any task needing an isolated full checkout.
+description: Make jj git clone instant and jj git fetch local through the shared clone store, for sub-agents, experiments, or any task needing an isolated full checkout.
 ---
 
-# Clone-store workspaces
+# Clone stores
 
-A clone store gives every agent a full private clone—own refs, op log, config,
-and fetch/push/gc freedom—without O(repo) disk or network per clone. Design:
-`CLONES.md`; the Rho Workset/runtime contract is in `WORKSET.md` and implemented
-by `rho-workset`; the storage primitive is `jj_lib::clone_store` plus the rho
-fork's `jj store` CLI.
+A clone store gives every clone a full private repo — own refs, op log,
+config, and fetch/push/gc freedom — without O(repo) disk or network per
+clone. Design: `CLONES.md`. It is a cache behind the ordinary commands;
+there is no separate workflow to learn.
 
-Requires a jj build with `jj store`. If `jj store --help` fails, use rho's
-bundled jj or ask for a redeploy.
+## Inside a Rho agent
 
-## Daemon-managed workflow (normal)
-
-Do not manually allocate paths for Rho agents. The daemon's `Worksets` manager
-owns `~/src/.rho`:
-
-- shared stores: `~/src/.rho/stores/<repo>`;
-- generated Worksets: `~/src/.rho/worksets/<id>/src/`;
-- durable primary/order record: the `worksets` table in rho-db;
-- host-frame Checkouts: `.../src/<name>` with `.stores/<repo>` plumbing;
-- view-mode agent paths: `/src/<name>` and `/src/.stores/<repo>`;
-- exposed-mode paths: temporarily `/ws/<name>` and `/ws/.stores/<repo>`.
-
-Use the normal spawn/agent tools. A child needing its own checkout is forked by
-Worksets from the parent's snapshotted commit and starts on a fresh jj change.
-A shared checkout request joins the existing Workset. Never pass or derive
-`~/src/.rho` bookkeeping paths as model-facing workdirs.
-
-## Manual CLI workflow (out of daemon only)
-
-The commands below remain useful for experiments, debugging the jj primitive,
-or other workflows that do not run through the daemon. Choose an isolated root;
-these paths are examples, not daemon conventions:
+The daemon has already set `JJ_STORE_SOCKET` (and mounted the store root
+read-only). Just use jj:
 
 ```sh
-root=~/src/.jj-stores/rho
-checkout=~/src/ws/fix-index-race
-
-jj store init "$root" octo://github.com/maan2003/rho.git
-jj store fetch "$root"                    # optional prefetch
-jj store clone "$root" fix-index-race
-jj store workspace "$root" fix-index-race "$checkout" \
-    --name fix-index-race                  # optional: --at COMMIT_HEX
+jj git clone https://github.com/org/repo      # instant, born on latest main
+jj git fetch                                  # from the local mirror
+jj git push                                   # to the real remote
+jj workspace add ../repo-child                # more workspaces of the same clone
 ```
 
-Each command prints a JSON record. `--at` defaults to the clone's trunk. Final
-paths only hold complete artifacts, so interrupted commands are safe to retry.
-Inside the checkout, plain `jj` and `git` work normally.
+`/src` is your working directory; clone whatever you need into it. Fetches
+never touch the network from your namespace: the daemon keeps every store
+fetched in the background, and a fetch asks it to refresh first. Clone the
+real upstream URL, not a local path, so `origin` is pushable.
 
-Manual clones collaborate through the remote. For a local handoff without a
-push, fetch from the clone's private Git directory:
+## Outside the daemon
 
-```sh
-git fetch "$root/clones/fix-index-race/git" <ref>
-```
+Set `JJ_STORE` (or `git.clone-store`) to a directory and use the same
+commands; the first clone of a URL initializes its store, later ones reuse
+it. Optionally run `jj store serve --socket PATH` and point
+`JJ_STORE_SOCKET` at it so stores stay fetched and clients never write them.
+`jj store fetch [URL...]` and `jj store list` maintain a root by hand.
 
 ## Rules
 
-- Never delete or prune a store's shared `git` object database; clones borrow
-  those objects. Store configuration disables auto-gc—do not override it.
-- Everything inside a private clone is fair game (`jj op undo`, `git gc`,
+- Never delete or prune a store's `git` object database; clones borrow
+  those objects. Store configuration disables auto-gc — do not override it.
+- Everything inside your own clone is fair game (`jj op undo`, `git gc`,
   reindexing); its blast radius is that clone.
-- Delete manual clone/checkouts only after their work is pushed or abandoned.
-- Do not manually mutate daemon-owned `~/src/.rho`; use Worksets/agent APIs.
+- A clone is not tied to its store's location by relative paths, but it is
+  by absolute path: do not move a store root while clones exist.

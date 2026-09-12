@@ -15,7 +15,7 @@
 //! Clone-store acceptance. The oracle: a clone behaves like a standard jj
 //! repo cloned from the remote on its own machine. The constraints:
 //! storage O(repo + per-clone work) — object bytes shared via alternates,
-//! index bytes via hardlinks, nothing else shared at all.
+//! index bytes via reflinks or hardlinks, nothing else shared at all.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,9 +23,15 @@ use std::process::Command;
 use std::sync::Arc;
 
 use jj_lib::clone_store::CloneStore;
+use jj_lib::clone_store::StoreRoot;
+use jj_lib::clone_store::store_key;
 use jj_lib::clone_store::trunk_of;
+use jj_lib::git;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo::RepoLoader;
+use jj_lib::repo::StoreFactories;
 use pollster::FutureExt as _;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -117,12 +123,39 @@ async fn store_from(root: &Path, remote: &Path) -> CloneStore {
     .unwrap()
 }
 
+/// Materializes a clone at `path` and returns its repo.
+async fn clone_at(store: &CloneStore, path: &Path, colocate: bool) -> Arc<ReadonlyRepo> {
+    std::fs::create_dir_all(path).unwrap();
+    let (_workspace, repo) = store.materialize(path, colocate).await.unwrap();
+    repo
+}
+
+/// The private git dir of a clone made by [`clone_at`].
+fn git_dir_of(workspace: &Path, colocate: bool) -> PathBuf {
+    if colocate {
+        workspace.join(".git")
+    } else {
+        workspace.join(".jj/repo/store/git")
+    }
+}
+
+async fn reload(workspace: &Path) -> Arc<ReadonlyRepo> {
+    RepoLoader::init_from_file_system(
+        &testutils::user_settings(),
+        &workspace.join(".jj/repo"),
+        &StoreFactories::default(),
+    )
+    .unwrap()
+    .load_at_head()
+    .await
+    .unwrap()
+}
+
 async fn new_commit_in(
-    store: &CloneStore,
-    id: &str,
-) -> (Arc<jj_lib::repo::ReadonlyRepo>, jj_lib::commit::Commit) {
-    let repo = store.open_clone(id).await.unwrap();
-    let trunk = trunk_of(&repo).unwrap();
+    repo: &Arc<ReadonlyRepo>,
+    what: &str,
+) -> (Arc<ReadonlyRepo>, jj_lib::commit::Commit) {
+    let trunk = trunk_of(repo).unwrap();
     let trunk_commit = repo.store().get_commit_async(&trunk).await.unwrap();
     let mut tx = repo.start_transaction();
     let commit = tx
@@ -131,8 +164,36 @@ async fn new_commit_in(
         .write()
         .await
         .unwrap();
-    let repo = tx.commit(format!("work in {id}")).await.unwrap();
+    let repo = tx.commit(format!("work in {what}")).await.unwrap();
     (repo, commit)
+}
+
+struct NullCallback;
+
+impl git::GitSubprocessCallback for NullCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+
+    fn progress(&mut self, _progress: &git::GitProgress) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn local_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn remote_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -142,13 +203,13 @@ fn clones_are_independent_and_born_current() {
         let root = temp.path();
         let (source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        store.create_clone("b").await.unwrap();
+        let repo_a = clone_at(&store, &root.join("a"), false).await;
+        clone_at(&store, &root.join("b"), false).await;
 
-        let (_, commit) = new_commit_in(&store, "a").await;
+        let (_, commit) = new_commit_in(&repo_a, "a").await;
 
         // a's work is a's alone until pushed, like separate machines.
-        let repo_b = store.open_clone("b").await.unwrap();
+        let repo_b = reload(&root.join("b")).await;
         assert!(!repo_b.index().has_id(commit.id()).unwrap());
         assert!(!repo_b.view().heads().contains(commit.id()));
         // Shared history and tags came along at birth.
@@ -159,6 +220,18 @@ fn clones_are_independent_and_born_current() {
                 .view()
                 .get_local_tag(jj_lib::ref_name::RefName::new("v1"))
                 .is_present()
+        );
+        // And origin is the real remote, so pushes go to the right place.
+        assert_eq!(
+            git_stdout(
+                &git_dir_of(&root.join("b"), false),
+                &["config", "remote.origin.url"]
+            ),
+            remote.to_str().unwrap()
+        );
+        assert_eq!(
+            store.default_branch().unwrap().unwrap().as_str(),
+            "main"
         );
     }
     .block_on();
@@ -172,31 +245,32 @@ fn object_storage_is_borrowed_not_copied() {
         let (_source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
         let store_git = root.join("store/git");
-        store.create_clone("a").await.unwrap();
-        store.create_clone("b").await.unwrap();
-        let a_git = root.join("store/clones/a/git");
-        let b_git = root.join("store/clones/b/git");
+        let repo_a = clone_at(&store, &root.join("a"), false).await;
+        clone_at(&store, &root.join("b"), false).await;
+        let a_git = git_dir_of(&root.join("a"), false);
+        let b_git = git_dir_of(&root.join("b"), false);
 
-        // The O(repo) bytes exist exactly once: newborn clones own zero
-        // objects, borrowing everything through alternates.
-        assert_eq!(owned_objects(&a_git), 0, "clone a owns objects at birth");
-        assert_eq!(owned_objects(&b_git), 0, "clone b owns objects at birth");
+        // The O(repo) bytes exist exactly once: a newborn clone owns only
+        // its working-copy commit (and that commit's empty tree), borrowing
+        // everything else through alternates.
+        assert_eq!(owned_objects(&a_git), 2, "clone a owns objects at birth");
+        assert_eq!(owned_objects(&b_git), 2, "clone b owns objects at birth");
         // But they resolve everything.
         let trunk = git_stdout(&store_git, &["rev-parse", "refs/remotes/origin/main"]);
         assert!(has_object(&a_git, &trunk));
 
         // New work lands in the author's own odb — not the store, not
         // siblings.
-        let (_, commit) = new_commit_in(&store, "a").await;
+        let (_, commit) = new_commit_in(&repo_a, "a").await;
         let sha = commit.id().hex();
         assert!(has_object(&a_git, &sha));
-        assert!(owned_objects(&a_git) > 0);
+        assert!(owned_objects(&a_git) > 2);
         assert!(
             !has_object(&store_git, &sha),
             "clone wrote into the store odb"
         );
         assert!(!has_object(&b_git, &sha), "clone wrote into a sibling odb");
-        assert_eq!(owned_objects(&b_git), 0);
+        assert_eq!(owned_objects(&b_git), 2);
     }
     .block_on();
 }
@@ -208,34 +282,35 @@ fn per_clone_gc_is_safe_for_siblings_and_store() {
         let root = temp.path();
         let (_source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        store.create_clone("b").await.unwrap();
+        let repo_a = clone_at(&store, &root.join("a"), false).await;
+        let repo_b = clone_at(&store, &root.join("b"), false).await;
 
-        let (_, commit_b) = new_commit_in(&store, "b").await;
+        let (_, commit_b) = new_commit_in(&repo_b, "b").await;
 
         // gc in a — both jj's backend gc and aggressive raw git gc —
-        // touches only a's private odb. This used to be the data-loss
-        // scenario; with private git dirs it's just stock behavior.
-        let repo_a = store.open_clone("a").await.unwrap();
+        // touches only a's private odb.
         repo_a
             .store()
             .gc(repo_a.index(), std::time::SystemTime::now())
             .unwrap();
         git(
-            &root.join("store/clones/a/git"),
+            &git_dir_of(&root.join("a"), false),
             &["gc", "--aggressive", "--prune=now"],
         );
 
-        let repo_b = store.open_clone("b").await.unwrap();
+        let repo_b = reload(&root.join("b")).await;
         assert!(repo_b.index().has_id(commit_b.id()).unwrap());
         assert!(has_object(
-            &root.join("store/clones/b/git"),
+            &git_dir_of(&root.join("b"), false),
             &commit_b.id().hex()
         ));
         let trunk = trunk_of(&repo_b).unwrap();
         assert!(has_object(&root.join("store/git"), &trunk.hex()));
         // And a still resolves shared history through its alternates.
-        assert!(has_object(&root.join("store/clones/a/git"), &trunk.hex()));
+        assert!(has_object(
+            &git_dir_of(&root.join("a"), false),
+            &trunk.hex()
+        ));
     }
     .block_on();
 }
@@ -252,20 +327,19 @@ fn template_is_lazy_and_amortized() {
         // Store init builds no template — it's a plain git mirror.
         assert!(!template.exists(), "store init built a template eagerly");
 
-        // First clone creation builds it; the clone seeds from it.
-        store.create_clone("first").await.unwrap();
+        // First clone builds it and seeds from it.
+        clone_at(&store, &root.join("first"), false).await;
         assert!(template.join("store").is_dir());
 
-        // The remote moves; the store prefetches (plain git fetch, no
-        // template work); the next creation refreshes the template as a
-        // delta and the clone is born at the new trunk.
+        // The remote moves; the store fetches (refreshing the template as a
+        // delta where freshness is produced); the next clone is born at
+        // the new trunk without touching the store.
         std::fs::write(source.join("file.txt"), "three\n").unwrap();
         git(&source, &["commit", "-am", "three"]);
         git(&source, &["push", remote.to_str().unwrap(), "main"]);
         let new_sha = git_stdout(&source, &["rev-parse", "main"]);
         store.fetch().await.unwrap();
-        store.create_clone("second").await.unwrap();
-        let repo = store.open_clone("second").await.unwrap();
+        let repo = clone_at(&store, &root.join("second"), false).await;
         let new_commit = jj_lib::backend::CommitId::try_from_hex(&new_sha).unwrap();
         assert!(repo.index().has_id(&new_commit).unwrap());
         assert_eq!(trunk_of(&repo).unwrap(), new_commit);
@@ -280,17 +354,14 @@ fn clone_index_is_seeded_from_template_not_rebuilt() {
         let root = temp.path();
         let (_source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
+        clone_at(&store, &root.join("a"), false).await;
 
         // Every template segment is present in the clone with identical
-        // bytes: shared by reflink where the filesystem supports it (a new
-        // inode), by hardlink otherwise (the same inode). Either way the
-        // clone did not rebuild them, which the second check proves: the
-        // clone owns no segment the template does not have, so nothing was
-        // indexed from scratch (the root-only segment every fresh repo
-        // writes identically is in both sets).
+        // bytes (reflinked or hardlinked), and the only segment the clone
+        // has beyond them is the one for its working-copy commit, so
+        // nothing was indexed from scratch.
         let template_segments = root.join("store/template/repo/index/segments");
-        let clone_segments = root.join("store/clones/a/repo/index/segments");
+        let clone_segments = root.join("a/.jj/repo/index/segments");
         let mut template_names = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(&template_segments).unwrap() {
             let entry = entry.unwrap();
@@ -304,13 +375,14 @@ fn clone_index_is_seeded_from_template_not_rebuilt() {
             );
         }
         assert!(!template_names.is_empty(), "template has no index segments");
-        for entry in std::fs::read_dir(&clone_segments).unwrap() {
-            let name = entry.unwrap().file_name();
-            assert!(
-                template_names.contains(&name),
-                "clone rebuilt a segment the template lacks: {name:?}"
-            );
-        }
+        let extra = std::fs::read_dir(&clone_segments)
+            .unwrap()
+            .filter(|entry| !template_names.contains(&entry.as_ref().unwrap().file_name()))
+            .count();
+        assert!(
+            extra <= 1,
+            "clone rebuilt {extra} segments the template lacks"
+        );
     }
     .block_on();
 }
@@ -322,24 +394,22 @@ fn reindex_in_one_clone_leaves_others_intact() {
         let root = temp.path();
         let (_source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        store.create_clone("b").await.unwrap();
+        clone_at(&store, &root.join("a"), false).await;
+        clone_at(&store, &root.join("b"), false).await;
 
-        // Destroy a's index wholesale (stock `jj debug reindex` semantics:
-        // unlink segments and op links, rebuild from own op history on
-        // load).
+        // Destroy a's index wholesale (stock `jj debug reindex` semantics).
         let index_store =
-            jj_lib::default_index::DefaultIndexStore::load(&root.join("store/clones/a/repo/index"));
+            jj_lib::default_index::DefaultIndexStore::load(&root.join("a/.jj/repo/index"));
         index_store.reinit().unwrap();
 
-        // Hardlink semantics: unlinking a's files never touches b's.
-        let repo_b = store.open_clone("b").await.unwrap();
+        // Unlinking a's files never touches b's.
+        let repo_b = reload(&root.join("b")).await;
         let trunk = trunk_of(&repo_b).unwrap();
         assert!(repo_b.index().has_id(&trunk).unwrap());
 
         // And a rebuilds itself from its op log, stock jj, no store
         // involvement.
-        let repo_a = store.open_clone("a").await.unwrap();
+        let repo_a = reload(&root.join("a")).await;
         assert!(repo_a.index().has_id(&trunk).unwrap());
     }
     .block_on();
@@ -352,14 +422,14 @@ fn coworkers_coordinate_through_the_remote() {
         let root = temp.path();
         let (_source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        store.create_clone("b").await.unwrap();
+        let repo_a = clone_at(&store, &root.join("a"), false).await;
+        clone_at(&store, &root.join("b"), false).await;
 
         // a commits and pushes a branch to the remote from its own git —
         // objects stream through the alternates.
-        let (_, commit) = new_commit_in(&store, "a").await;
+        let (_, commit) = new_commit_in(&repo_a, "a").await;
         let sha = commit.id().hex();
-        let a_git = root.join("store/clones/a/git");
+        let a_git = git_dir_of(&root.join("a"), false);
         git(
             root,
             &[
@@ -371,9 +441,9 @@ fn coworkers_coordinate_through_the_remote() {
             ],
         );
 
-        // b fetches (into its own git; the store's buffer is irrelevant
-        // here) and sees feat@origin, like any coworker.
-        let b_git = root.join("store/clones/b/git");
+        // b fetches from the remote directly and sees feat@origin, like any
+        // coworker.
+        let b_git = git_dir_of(&root.join("b"), false);
         git(
             root,
             &[
@@ -385,16 +455,14 @@ fn coworkers_coordinate_through_the_remote() {
                 "+refs/heads/*:refs/remotes/origin/*",
             ],
         );
-        let repo_b = store.open_clone("b").await.unwrap();
+        let repo_b = reload(&root.join("b")).await;
         let mut tx = repo_b.start_transaction();
-        let options = jj_lib::git::GitImportOptions {
+        let options = git::GitImportOptions {
             abandon_unreachable_commits: false,
             record_synthetic_predecessors: false,
             remote_auto_track_bookmarks: std::collections::HashMap::new(),
         };
-        jj_lib::git::import_refs(tx.repo_mut(), &options)
-            .await
-            .unwrap();
+        git::import_refs(tx.repo_mut(), &options).await.unwrap();
         let repo_b = tx.commit("fetch").await.unwrap();
         assert!(repo_b.index().has_id(commit.id()).unwrap());
         let symbol = jj_lib::ref_name::RemoteRefSymbol {
@@ -418,346 +486,34 @@ fn coworkers_coordinate_through_the_remote() {
 }
 
 #[test]
-fn workspaces_are_real_colocated_git_checkouts() {
+fn colocated_clone_is_a_real_git_repo() {
     async {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let (source, remote) = setup_remote(root);
         let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        let ws = root.join("store/ws");
-        store
-            .create_workspace("a", &ws, "default", None)
-            .await
-            .unwrap();
+        let ws = root.join("ws");
+        clone_at(&store, &ws, true).await;
 
         let trunk_sha = git_stdout(&source, &["rev-parse", "main"]);
-        // A real git checkout: everything works, because it is one.
-        assert_eq!(git_stdout(&ws, &["rev-parse", "HEAD"]), trunk_sha);
-        assert_eq!(
-            git_stdout(&ws, &["rev-parse", "--show-toplevel"]),
-            ws.to_str().unwrap()
-        );
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "");
+        assert_eq!(git_stdout(&ws, &["rev-parse", "--git-dir"]), ".git");
         assert_eq!(git_stdout(&ws, &["rev-parse", "origin/main"]), trunk_sha);
         assert_eq!(
-            git_stdout(&ws, &["describe", "--tags"]),
+            git_stdout(&ws, &["describe", "--tags", "origin/main"]),
             format!("v1-1-g{}", &trunk_sha[..7])
         );
-        assert_eq!(git_stdout(&ws, &["ls-files"]), "file.txt");
-        assert_eq!(git_stdout(&ws, &["log", "-1", "--format=%s"]), "two");
-
-        // jj-side edits appear as unstaged changes.
-        std::fs::write(ws.join("file.txt"), "three\n").unwrap();
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "M file.txt");
-
-        // Colocated for real: the worktree's common dir is the clone's git.
-        let common = git_stdout(&ws, &["rev-parse", "--git-common-dir"]);
         assert_eq!(
-            std::fs::canonicalize(ws.join(&common)).unwrap(),
-            std::fs::canonicalize(root.join("store/clones/a/git")).unwrap()
+            git_stdout(&ws, &["ls-remote", "--get-url", "origin"]),
+            remote.to_str().unwrap()
         );
-    }
-    .block_on();
-}
-
-#[test]
-fn interrupted_workspace_creation_leaves_path_usable() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        let clone_git = root.join("store/clones/a/git");
-        let sha = git_stdout(&clone_git, &["rev-parse", "refs/remotes/origin/main"]);
-
-        // Wreckage of a creation that died before its rename: a staging
-        // sibling of the target, and a worktree registration whose target
-        // path no longer exists (the back-pointer is written for the final
-        // path before the rename, so a crash leaves it dangling).
-        let ws = root.join("store/ws");
-        let staging = root.join("store/.incoming-ws-1234-5678");
-        std::fs::create_dir_all(staging.join(".jj")).unwrap();
-        let gone = root.join("store/gone");
-        git(
-            root,
-            &[
-                "--git-dir",
-                clone_git.to_str().unwrap(),
-                "worktree",
-                "add",
-                "--no-checkout",
-                "--detach",
-                gone.to_str().unwrap(),
-                &sha,
-            ],
-        );
-        std::fs::remove_dir_all(&gone).unwrap();
-
-        // The target path stays usable: creation prunes the dangling
-        // registration and builds in its own staging dir.
-        store
-            .create_workspace("a", &ws, "default", None)
-            .await
-            .unwrap();
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "");
-        assert_eq!(git_stdout(&ws, &["rev-parse", "HEAD"]), sha);
-        assert!(
-            staging.exists(),
-            "stale staging is left for gc, not adopted"
-        );
-
-        // A complete workspace refuses to be overwritten.
-        let err = store
-            .create_workspace("a", &ws, "other", None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("already exists"), "got: {err}");
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "");
-
-        // Creation onto a pre-created *empty* dir works (rename replaces
-        // it), matching store-init semantics.
-        let ws2 = root.join("store/ws2");
-        std::fs::create_dir(&ws2).unwrap();
-        store
-            .create_workspace("a", &ws2, "second", None)
-            .await
-            .unwrap();
-        assert_eq!(git_stdout(&ws2, &["rev-parse", "HEAD"]), sha);
-    }
-    .block_on();
-}
-
-#[test]
-fn workspace_retry_after_committed_add_operation() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-        store.create_clone("a").await.unwrap();
-        let clone_git = root.join("store/clones/a/git");
-
-        // A creation that died after committing its "add workspace"
-        // operation leaves the name in the clone's view with no working
-        // copy on disk. Simulate exactly that state: build a workspace,
-        // then delete its directory and prune the worktree registration.
-        let ws = root.join("store/ws");
-        store
-            .create_workspace("a", &ws, "revived", None)
-            .await
-            .unwrap();
-        std::fs::remove_dir_all(&ws).unwrap();
-        git(
-            root,
-            &[
-                "--git-dir",
-                clone_git.to_str().unwrap(),
-                "worktree",
-                "prune",
-            ],
-        );
-
-        // Retrying the same name and path must succeed (this attaches to
-        // the recorded name rather than re-initializing it).
-        store
-            .create_workspace("a", &ws, "revived", None)
-            .await
-            .unwrap();
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "");
-
-        // The same name can also be re-pointed at a different path.
-        let ws2 = root.join("store/ws2");
-        store
-            .create_workspace("a", &ws2, "revived", None)
-            .await
-            .unwrap();
-        assert_eq!(git_stdout(&ws2, &["status", "--porcelain"]), "");
-    }
-    .block_on();
-}
-
-#[test]
-fn workspace_for_missing_clone_reports_clearly() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-
-        let err = store
-            .create_workspace("nope", &root.join("ws"), "default", None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("does not exist"), "got: {err}");
-        assert!(!root.join("ws").exists());
-    }
-    .block_on();
-}
-
-#[test]
-fn family_workspaces_share_one_clone_view() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-        store.create_clone("family").await.unwrap();
-
-        let ws_parent = root.join("store/ws-parent");
-        let ws_child = root.join("store/ws-child");
-        store
-            .create_workspace("family", &ws_parent, "parent", None)
-            .await
-            .unwrap();
-        store
-            .create_workspace("family", &ws_child, "child", None)
-            .await
-            .unwrap();
-
-        let repo = store.open_clone("family").await.unwrap();
-        assert_eq!(repo.view().wc_commit_ids().len(), 2);
+        // Only the working-copy commit is owned; history is borrowed.
+        assert_eq!(owned_objects(&ws.join(".git")), 2);
+        // jj knows it as colocated: the backend points at the sibling .git.
         assert_eq!(
-            std::fs::read_to_string(ws_child.join("file.txt")).unwrap(),
-            "two\n"
-        );
-        assert_eq!(
-            git_stdout(&ws_parent, &["rev-parse", "HEAD"]),
-            git_stdout(&ws_child, &["rev-parse", "HEAD"]),
-        );
-    }
-    .block_on();
-}
-
-#[test]
-fn store_and_contents_survive_moving_wholesale() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (source, remote) = setup_remote(root);
-        let site = root.join("site");
-        std::fs::create_dir(&site).unwrap();
-        let store = CloneStore::init_from_remote(
-            &site.join("store"),
-            remote.to_str().unwrap(),
-            &testutils::user_settings(),
-        )
-        .await
-        .unwrap();
-        store.create_clone("a").await.unwrap();
-        let ws = site.join("store/ws");
-        store
-            .create_workspace("a", &ws, "default", None)
-            .await
-            .unwrap();
-
-        // Alternates and worktree pointers are all layout-relative: the
-        // store moving wholesale (workspace inside) keeps everything
-        // resolving. The same property lets a namespace expose the tree at
-        // any mount root, as long as relative positions are preserved.
-        let moved = root.join("moved");
-        std::fs::rename(&site, &moved).unwrap();
-        let ws = moved.join("store/ws");
-        assert_eq!(git_stdout(&ws, &["status", "--porcelain"]), "");
-        assert_eq!(
-            git_stdout(&ws, &["rev-parse", "HEAD"]),
-            git_stdout(&source, &["rev-parse", "main"])
-        );
-        let store = CloneStore::open(&moved.join("store"), &testutils::user_settings()).unwrap();
-        let repo = store.open_clone("a").await.unwrap();
-        assert!(trunk_of(&repo).is_some());
-    }
-    .block_on();
-}
-
-#[test]
-fn workspace_pointers_preserve_symlinked_store_frame() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let stores = root.join("stores");
-        std::fs::create_dir(&stores).unwrap();
-        let store_path = stores.join("repo");
-        CloneStore::init_from_remote(
-            &store_path,
-            remote.to_str().unwrap(),
-            &testutils::user_settings(),
-        )
-        .await
-        .unwrap();
-
-        let frame = root.join("frame");
-        std::fs::create_dir_all(frame.join(".stores")).unwrap();
-        std::os::unix::fs::symlink("../../stores/repo", frame.join(".stores/repo")).unwrap();
-        let store =
-            CloneStore::open(&frame.join(".stores/repo"), &testutils::user_settings()).unwrap();
-        store.create_clone("agent").await.unwrap();
-        let workspace = frame.join("work");
-        store
-            .create_workspace("agent", &workspace, "default", None)
-            .await
-            .unwrap();
-
-        let git_pointer = std::fs::read_to_string(workspace.join(".git")).unwrap();
-        assert!(
-            git_pointer.contains("../.stores/repo/"),
-            "pointer escaped the symlink frame: {git_pointer}"
-        );
-        let jj_pointer = std::fs::read_to_string(workspace.join(".jj/repo")).unwrap();
-        assert!(
-            jj_pointer.contains("../../.stores/repo/"),
-            "pointer escaped the symlink frame: {jj_pointer}"
-        );
-        assert!(
-            workspace.join(".jj").join(jj_pointer.trim()).exists(),
-            "jj pointer does not resolve: {jj_pointer}"
-        );
-        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
-        let output = Command::new("jj")
-            .arg("log")
-            .arg("-r")
-            .arg("@")
-            .arg("--no-graph")
-            .current_dir(&workspace)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "jj failed through original frame: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        // Model the namespace's reassembled `/ws` tree without requiring
-        // mount privileges: copy the workspace to a second same-shaped frame
-        // and expose the same store at its sibling `.stores/repo` path.
-        let reassembled = root.join("reassembled");
-        std::fs::create_dir_all(reassembled.join(".stores")).unwrap();
-        std::os::unix::fs::symlink("../../stores/repo", reassembled.join(".stores/repo")).unwrap();
-        let status = Command::new("cp")
-            .args([
-                "-a",
-                workspace.to_str().unwrap(),
-                reassembled.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let workspace = reassembled.join("work");
-        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
-        let output = Command::new("jj")
-            .arg("log")
-            .arg("-r")
-            .arg("@")
-            .arg("--no-graph")
-            .current_dir(&workspace)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "jj failed through reassembled frame: {}",
-            String::from_utf8_lossy(&output.stderr)
+            std::fs::read_to_string(ws.join(".jj/repo/store/git_target"))
+                .unwrap()
+                .trim(),
+            "../../../.git"
         );
     }
     .block_on();
@@ -772,7 +528,7 @@ fn fetch_prunes_and_advances_the_mirror() {
         let store = store_from(root, &remote).await;
         let store_git = root.join("store/git");
         // Build the template so fetch has one to refresh.
-        store.create_clone("t").await.unwrap();
+        clone_at(&store, &root.join("t"), false).await;
 
         git(&source, &["push", remote.to_str().unwrap(), "main:doomed"]);
         store.fetch().await.unwrap();
@@ -788,22 +544,159 @@ fn fetch_prunes_and_advances_the_mirror() {
             git_stdout(&store_git, &["rev-parse", "refs/remotes/origin/main"]),
             git_stdout(&source, &["rev-parse", "main"])
         );
-        // Fetch refreshed the template in the same stroke: freshness is
-        // produced where refs change, so clone creation only reads.
+        // Fetch refreshed the template in the same stroke.
         let ref_state = std::fs::read_to_string(root.join("store/template/ref-state")).unwrap();
         assert!(
             ref_state.contains(&git_stdout(&source, &["rev-parse", "main"])),
             "template ref-state not refreshed by fetch: {ref_state}"
         );
-        // The mirror's namespaces stay pure: no refs/heads, tags only under
-        // refs/tags (plus remote-tracking); nothing is anybody's local
-        // state.
+        // The mirror's namespaces stay pure: no refs/heads.
         assert_eq!(
             git_stdout(
                 &store_git,
                 &["for-each-ref", "--format=%(refname)", "refs/heads"]
             ),
             ""
+        );
+    }
+    .block_on();
+}
+
+#[test]
+fn clone_fetches_from_the_mirror_without_the_network() {
+    async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (source, remote) = setup_remote(root);
+        let store = store_from(root, &remote).await;
+        let ws = root.join("ws");
+        clone_at(&store, &ws, false).await;
+        let owned_at_birth = owned_objects(&git_dir_of(&ws, false));
+
+        // The remote moves and the store (the server, in practice) fetches.
+        std::fs::write(source.join("file.txt"), "three\n").unwrap();
+        git(&source, &["commit", "-am", "three"]);
+        git(&source, &["push", remote.to_str().unwrap(), "main"]);
+        git(&source, &["push", remote.to_str().unwrap(), "main:topic"]);
+        let new_sha = git_stdout(&source, &["rev-parse", "main"]);
+        store.fetch().await.unwrap();
+        // Then the remote vanishes: whatever the clone learns now came
+        // from the mirror.
+        std::fs::remove_dir_all(&remote).unwrap();
+
+        let repo = reload(&ws).await;
+        let mut tx = repo.start_transaction();
+        let import_options = git::GitImportOptions {
+            abandon_unreachable_commits: false,
+            record_synthetic_predecessors: false,
+            remote_auto_track_bookmarks: std::collections::HashMap::new(),
+        };
+        let subprocess = git::GitSubprocessOptions::from_settings(&testutils::user_settings())
+            .unwrap();
+        let origin = jj_lib::ref_name::RemoteName::new("origin");
+        let mut fetch = git::GitFetch::new(tx.repo_mut(), subprocess, &import_options).unwrap();
+        let expanded = git::expand_fetch_refspecs(
+            origin,
+            git::GitFetchRefExpression {
+                bookmark: jj_lib::str_util::StringExpression::all(),
+                tag: jj_lib::str_util::StringExpression::all(),
+            },
+        )
+        .unwrap();
+        fetch
+            .fetch_from_mirror(origin, &store.git_dir(), expanded, &mut NullCallback)
+            .unwrap();
+        let stats = fetch.import_refs().await.unwrap();
+        assert!(!stats.changed_remote_bookmarks.is_empty());
+        let repo = tx.commit("fetch").await.unwrap();
+
+        let new_commit = jj_lib::backend::CommitId::try_from_hex(&new_sha).unwrap();
+        assert_eq!(trunk_of(&repo).unwrap(), new_commit);
+        let topic = jj_lib::ref_name::RemoteRefSymbol {
+            name: jj_lib::ref_name::RefName::new("topic"),
+            remote: origin,
+        };
+        assert_eq!(
+            repo.view().get_remote_bookmark(topic).target.as_normal(),
+            Some(&new_commit)
+        );
+        // Nothing was copied: the new objects are still borrowed.
+        assert_eq!(owned_objects(&git_dir_of(&ws, false)), owned_at_birth);
+    }
+    .block_on();
+}
+
+#[test]
+fn stale_template_is_still_a_valid_seed() {
+    async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (source, remote) = setup_remote(root);
+        let store = store_from(root, &remote).await;
+        clone_at(&store, &root.join("first"), false).await;
+
+        // The mirror advances without the template following (a fetch by
+        // hand), and the template cannot be refreshed here: its lock is
+        // not writable, as for a client of a read-only store.
+        std::fs::write(source.join("file.txt"), "three\n").unwrap();
+        git(&source, &["commit", "-am", "three"]);
+        git(&source, &["push", remote.to_str().unwrap(), "main"]);
+        let new_sha = git_stdout(&source, &["rev-parse", "main"]);
+        git(
+            &root.join("store/git"),
+            &[
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        let lock = root.join("store/template.lock");
+        let original = std::fs::metadata(&lock).unwrap().permissions();
+        let mut permissions = original.clone();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&lock, permissions).unwrap();
+
+        let repo = clone_at(&store, &root.join("second"), false).await;
+        let new_commit = jj_lib::backend::CommitId::try_from_hex(&new_sha).unwrap();
+        assert_eq!(trunk_of(&repo).unwrap(), new_commit);
+        assert!(repo.index().has_id(&new_commit).unwrap());
+        // The template itself was left alone.
+        let ref_state = std::fs::read_to_string(root.join("store/template/ref-state")).unwrap();
+        assert!(!ref_state.contains(&new_sha));
+
+        std::fs::set_permissions(&lock, original).unwrap();
+    }
+    .block_on();
+}
+
+#[test]
+fn store_root_keys_urls_and_ensures_freshness() {
+    async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (source, remote) = setup_remote(root);
+        let url = remote.to_str().unwrap();
+        let stores = StoreRoot::new(root.join("stores"), testutils::user_settings());
+        assert!(stores.open(url).unwrap().is_none());
+        assert!(stores.list().unwrap().is_empty());
+
+        let store = stores.ensure(url).await.unwrap();
+        assert_eq!(store.root(), root.join("stores").join(store_key(url)));
+        assert_eq!(store.remote_url().unwrap(), url);
+        assert_eq!(stores.list().unwrap().len(), 1);
+        assert!(stores.open(&format!("{url}/")).unwrap().is_some());
+        assert!(stores.open("https://example.com/other").unwrap().is_none());
+
+        // ensure on an existing store fetches it.
+        std::fs::write(source.join("file.txt"), "three\n").unwrap();
+        git(&source, &["commit", "-am", "three"]);
+        git(&source, &["push", url, "main"]);
+        let new_sha = git_stdout(&source, &["rev-parse", "main"]);
+        let store = stores.ensure(url).await.unwrap();
+        assert_eq!(
+            git_stdout(&store.git_dir(), &["rev-parse", "refs/remotes/origin/main"]),
+            new_sha
         );
     }
     .block_on();
@@ -829,7 +722,7 @@ fn interrupted_store_init_leaves_root_usable() {
         )
         .await
         .unwrap();
-        store.create_clone("a").await.unwrap();
+        clone_at(&store, &root.join("a"), false).await;
         assert!(
             staging.exists(),
             "stale staging is left for gc, not adopted"
@@ -862,76 +755,104 @@ fn interrupted_store_init_leaves_root_usable() {
         .await
         .unwrap();
         CloneStore::open(&empty, &testutils::user_settings()).unwrap();
-    }
-    .block_on();
-}
 
-#[test]
-fn interrupted_creation_leaves_id_usable() {
-    async {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-
-        // Wreckage of a creation that died mid-build, and of a template
-        // build that died mid-way: both inert, both ids/paths stay usable.
-        let clone_staging = root.join("store/clones/.incoming-crashseed-1234-5678");
-        std::fs::create_dir_all(clone_staging.join("repo")).unwrap();
+        // Wreckage of a template build that died mid-way is inert too.
         let template_staging = root.join("store/.incoming-template-1234-5678");
         std::fs::create_dir_all(template_staging.join("repo")).unwrap();
-
-        let repo_path = store.create_clone("crashseed").await.unwrap();
-        assert!(
-            repo_path.join("store/git_target").exists(),
-            "clone is complete"
-        );
-        let repo = store.open_clone("crashseed").await.unwrap();
-        assert!(trunk_of(&repo).is_some());
-        assert!(
-            clone_staging.exists(),
-            "stale staging is left for gc, not adopted"
-        );
+        clone_at(&store, &root.join("b"), false).await;
         assert!(template_staging.exists());
     }
     .block_on();
 }
 
+#[cfg(unix)]
 #[test]
-fn traversal_clone_ids_are_rejected_without_side_effects() {
+fn server_owns_the_root_and_clients_share_one_store() {
+    use std::time::Duration;
+
+    use jj_lib::clone_store_server::StoreServer;
+    use jj_lib::clone_store_server::request;
+
     async {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let (_source, remote) = setup_remote(root);
-        let store = store_from(root, &remote).await;
-        let store_root = root.join("store");
-
-        for id in [
-            "../../outside",
-            "../escaped",
-            "",
-            ".",
-            "..",
-            ".hidden",
-            "a/b",
-            "-flag",
-        ] {
-            let before: Vec<_> = std::fs::read_dir(root)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert!(
-                store.create_clone(id).await.is_err(),
-                "id {id:?} should be rejected"
-            );
-            let after: Vec<_> = std::fs::read_dir(root)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert_eq!(before, after, "id {id:?} left filesystem debris");
-            assert!(!root.join("outside").exists());
-            assert!(!store_root.join("escaped").exists());
+        let (source, remote) = setup_remote(root);
+        let url = remote.to_str().unwrap().to_owned();
+        let stores = StoreRoot::new(root.join("stores"), testutils::user_settings());
+        let server = StoreServer::new(stores, Duration::from_secs(3600));
+        let socket = root.join("store.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || server.serve(listener).unwrap());
         }
+
+        // Two clients ask for the same URL at once: one store, initialized
+        // once, with its template built by the server.
+        let clients: Vec<_> = (0..2)
+            .map(|_| {
+                let socket = socket.clone();
+                let url = url.clone();
+                std::thread::spawn(move || request(&socket, "ensure", &url))
+            })
+            .collect();
+        let paths: Vec<PathBuf> = clients
+            .into_iter()
+            .map(|client| client.join().unwrap().unwrap())
+            .collect();
+        assert_eq!(paths[0], paths[1]);
+        assert_eq!(paths[0], root.join("stores").join(store_key(&url)));
+        assert!(paths[0].join("template/repo/store").is_dir());
+        assert_eq!(
+            std::fs::read_dir(root.join("stores"))
+                .unwrap()
+                .filter(|entry| !entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.'))
+                .count(),
+            1
+        );
+
+        // A client clones from the served store without writing to it.
+        let store = CloneStore::open(&paths[0], &testutils::user_settings()).unwrap();
+        let repo = clone_at(&store, &root.join("ws"), false).await;
+        assert_eq!(
+            trunk_of(&repo).unwrap().hex(),
+            git_stdout(&source, &["rev-parse", "main"])
+        );
+
+        // Within the debounce window a request does not fetch; a refresh
+        // after the window does. (The server's own clock, so expire it by
+        // asking through a zero-debounce server on the same root.)
+        std::fs::write(source.join("file.txt"), "three\n").unwrap();
+        git(&source, &["commit", "-am", "three"]);
+        git(&source, &["push", &url, "main"]);
+        let new_sha = git_stdout(&source, &["rev-parse", "main"]);
+        request(&socket, "refresh", &url).unwrap();
+        assert_ne!(
+            git_stdout(&store.git_dir(), &["rev-parse", "refs/remotes/origin/main"]),
+            new_sha,
+            "debounced request must not fetch"
+        );
+        let eager = StoreServer::new(
+            StoreRoot::new(root.join("stores"), testutils::user_settings()),
+            Duration::ZERO,
+        );
+        eager.ensure(&url).unwrap();
+        assert_eq!(
+            git_stdout(&store.git_dir(), &["rev-parse", "refs/remotes/origin/main"]),
+            new_sha
+        );
+        let ref_state = std::fs::read_to_string(paths[0].join("template/ref-state")).unwrap();
+        assert!(ref_state.contains(&new_sha), "server did not refresh the template");
+
+        // Malformed and failing requests are reported, not dropped.
+        assert!(server.handle_request("bogus\n").starts_with("error "));
+        let err = request(&socket, "ensure", root.join("nowhere").to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("clone store server"), "{err}");
     }
     .block_on();
 }

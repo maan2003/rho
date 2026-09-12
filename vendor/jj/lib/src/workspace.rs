@@ -119,7 +119,7 @@ pub struct Workspace {
     working_copy: Box<dyn WorkingCopy>,
 }
 
-fn create_jj_dir(workspace_root: &Path) -> Result<PathBuf, WorkspaceInitError> {
+pub(crate) fn create_jj_dir(workspace_root: &Path) -> Result<PathBuf, WorkspaceInitError> {
     let jj_dir = workspace_root.join(".jj");
     match std::fs::create_dir(&jj_dir).context(&jj_dir) {
         Ok(()) => Ok(jj_dir),
@@ -130,7 +130,7 @@ fn create_jj_dir(workspace_root: &Path) -> Result<PathBuf, WorkspaceInitError> {
     }
 }
 
-async fn init_working_copy(
+pub(crate) async fn init_working_copy(
     repo: &Arc<ReadonlyRepo>,
     workspace_root: &Path,
     jj_dir: &Path,

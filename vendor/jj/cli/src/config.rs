@@ -896,6 +896,12 @@ fn env_overrides_layer(environment: &HashMap<String, String>) -> ConfigLayer {
     if let Some(value) = environment.get("JJ_PAGER") {
         layer.set_value("ui.pager", value).unwrap();
     }
+    if let Some(value) = environment.get("JJ_STORE") {
+        layer.set_value("git.clone-store", value).unwrap();
+    }
+    if let Some(value) = environment.get("JJ_STORE_SOCKET") {
+        layer.set_value("git.clone-store-socket", value).unwrap();
+    }
     layer
 }
 

@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io;
 
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
+use jj_lib::clone_store::CloneStoreConfig;
+use jj_lib::clone_store::prepare_store;
 use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::git;
 use jj_lib::git::GitFetch;
@@ -36,6 +39,7 @@ use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
 use crate::commands::git::get_single_remote;
 use crate::complete;
 use crate::git_util::GitSubprocessUi;
@@ -225,6 +229,34 @@ pub async fn cmd_git_fetch(
         }
     }
 
+    // Remotes with a clone store are fetched from the store's mirror, which
+    // the store (or its server) refreshes first: no network from here.
+    let store_config = CloneStoreConfig::from_settings(tx.settings())?;
+    let mirrors = if store_config.is_enabled() {
+        let git_repo = get_git_backend(tx.repo_mut().store())?.git_repo();
+        let settings = tx.settings().clone();
+        let mut mirrors = HashMap::new();
+        for (remote, _) in &expansions {
+            let Some(url) = remote_fetch_url(&git_repo, remote) else {
+                continue;
+            };
+            let store = prepare_store(&store_config, &settings, &url)
+                .await
+                .map_err(|err| {
+                    user_error_with_message(
+                        format!("Failed to prepare clone store for {}", remote.as_symbol()),
+                        err,
+                    )
+                })?;
+            if let Some(store) = store {
+                mirrors.insert((*remote).to_owned(), store.git_dir());
+            }
+        }
+        mirrors
+    } else {
+        HashMap::new()
+    };
+
     let git_settings = GitSettings::from_settings(tx.settings())?;
     let import_options = load_git_import_options(ui, &git_settings, &remote_settings)?;
     let mut git_fetch = GitFetch::new(
@@ -235,7 +267,10 @@ pub async fn cmd_git_fetch(
 
     for (remote, expanded) in expansions {
         let mut callback = GitSubprocessUi::new(ui);
-        git_fetch.fetch(remote, expanded, &mut callback, None)?;
+        match mirrors.get(remote) {
+            Some(mirror) => git_fetch.fetch_from_mirror(remote, mirror, expanded, &mut callback)?,
+            None => git_fetch.fetch(remote, expanded, &mut callback, None)?,
+        }
     }
 
     let import_stats = git_fetch.import_refs().await?;
@@ -257,6 +292,13 @@ pub async fn cmd_git_fetch(
 }
 
 const DEFAULT_REMOTE: &RemoteName = RemoteName::new("origin");
+
+/// The URL `git fetch <remote>` would use, if the remote has one.
+fn remote_fetch_url(git_repo: &gix::Repository, remote: &RemoteName) -> Option<String> {
+    let remote = git_repo.try_find_remote(remote.as_str())?.ok()?;
+    let url = remote.url(gix::remote::Direction::Fetch)?;
+    Some(url.to_bstring().to_string())
+}
 
 fn get_default_fetch_remotes(
     ui: &Ui,

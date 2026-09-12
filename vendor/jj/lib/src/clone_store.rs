@@ -25,26 +25,34 @@
 //!   treats alternate objects as present-but-not-mine: fetches negotiate
 //!   against them, pushes read them, and `git gc` in a clone prunes only its
 //!   own odb (repack `-l` even dedups a clone against the store).
-//! - **Index**: clones hardlink the immutable, content-addressed segment files
-//!   of a template jj repo's index. A jj index may be a superset of any
-//!   operation's visible set, and reindexing only unlinks your own links, so
-//!   sharing is safe and blast radius stays per-clone.
+//! - **Index**: clones reflink (or hardlink) the immutable, content-addressed
+//!   segment files of a template jj repo's index. A jj index may be a
+//!   superset of any operation's visible set, and reindexing only unlinks
+//!   your own links, so sharing is safe and blast radius stays per-clone.
 //!
-//! Everything else — refs, config, remotes, op store, keep refs — is
+//! Everything else — refs, config, remotes, op store, working copy — is
 //! per-clone private state. A clone is a completely stock jj repo cloned
 //! from `origin` (the real remote) that happens to borrow bytes; no jj
-//! behavior is modified, no command is banned, and colocated workspaces
-//! (real git worktrees) are fine because their git repo is private.
+//! behavior is modified, no command is banned, and colocated clones are
+//! fine because their git repo is private.
+//!
+//! Stores are a cache keyed by remote URL, living under one root directory
+//! (`git.clone-store`, or `JJ_STORE`). `jj git clone` consults it
+//! transparently: ensure the URL's store exists and is fresh, then
+//! materialize the clone at the destination. `jj git fetch` in a clone
+//! whose remote has a store refreshes the store and fetches from its
+//! mirror instead of the network. A store server (`git.clone-store-socket`,
+//! or `JJ_STORE_SOCKET`; see [`crate::clone_store_server`]) can own the
+//! root: it keeps every store fetched in the background and is the only
+//! writer, so clients can run against a read-only store.
 //!
 //! The store is a plain bare git mirror plus a lazily built template. Its
 //! one invariant: **the store never prunes** — clones borrow its objects,
 //! so it is append-only (auto-gc is disabled at init). Store fetch is
-//! plain `git fetch`; the template refreshes at clone creation, where its
-//! freshness is consumed, so the first clone after a store init pays the
-//! one full index build and later clones pay a usually-empty delta.
+//! plain `git fetch`; the template refreshes there too, where freshness is
+//! produced, so clone creation only reads.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -53,8 +61,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
+use blake2::Blake2b512;
+use blake2::Digest as _;
+
+use crate::backend::BackendInitError;
 use crate::backend::CommitId;
-use crate::commit::Commit;
+use crate::config::ConfigGetError;
+use crate::config::ConfigGetResultExt as _;
 use crate::git;
 use crate::git::GitImportOptions;
 use crate::git::GitSettings;
@@ -62,9 +75,10 @@ use crate::git_backend::GitBackend;
 use crate::object_id::ObjectId as _;
 use crate::op_store::RefTarget;
 use crate::ref_name::RefName;
+use crate::ref_name::RefNameBuf;
 use crate::ref_name::RemoteName;
 use crate::ref_name::RemoteRefSymbol;
-use crate::ref_name::WorkspaceNameBuf;
+use crate::ref_name::WorkspaceName;
 use crate::repo::ReadonlyRepo;
 use crate::repo::Repo as _;
 use crate::repo::RepoLoader;
@@ -75,6 +89,10 @@ use crate::workspace::Workspace;
 use crate::workspace::default_working_copy_factory;
 use crate::workspace_store::SimpleWorkspaceStore;
 use crate::workspace_store::WorkspaceStore as _;
+
+/// The remote name every store mirrors under. Clones are born with the
+/// same name, so a store only ever serves a clone's `origin`.
+pub const STORE_REMOTE: &RemoteName = RemoteName::new("origin");
 
 /// Error from a clone store operation: a context message wrapping whatever
 /// lower-level failure caused it.
@@ -87,7 +105,7 @@ pub struct CloneStoreError {
 }
 
 impl CloneStoreError {
-    fn msg(message: impl Into<String>) -> Self {
+    pub(crate) fn msg(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             source: None,
@@ -97,7 +115,7 @@ impl CloneStoreError {
 
 type Result<T, E = CloneStoreError> = std::result::Result<T, E>;
 
-trait Context<T> {
+pub(crate) trait Context<T> {
     fn ctx<S: Into<String>>(self, message: impl FnOnce() -> S) -> Result<T>;
 }
 
@@ -113,8 +131,183 @@ where
     }
 }
 
-/// A repository's store: the shared object mirror, the lazy index
-/// template, and the clones borrowing from both.
+/// How `jj` reaches clone stores, from settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloneStoreConfig {
+    /// `git.clone-store`: the directory holding one store per remote URL.
+    pub root: Option<PathBuf>,
+    /// `git.clone-store-socket`: a store server that owns that directory.
+    /// When set, clients never write to the store themselves.
+    pub socket: Option<PathBuf>,
+}
+
+impl CloneStoreConfig {
+    /// Reads `git.clone-store` and `git.clone-store-socket`.
+    pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
+        Ok(Self {
+            root: settings.get::<PathBuf>("git.clone-store").optional()?,
+            socket: settings
+                .get::<PathBuf>("git.clone-store-socket")
+                .optional()?,
+        })
+    }
+
+    /// Whether clones and fetches should go through a store at all.
+    pub fn is_enabled(&self) -> bool {
+        self.root.is_some() || self.socket.is_some()
+    }
+}
+
+/// Gets `remote_url`'s store, initialized and fresh, through whatever the
+/// config names: the server over its socket, or the local root directly.
+/// `None` when no store is configured.
+pub async fn prepare_store(
+    config: &CloneStoreConfig,
+    settings: &UserSettings,
+    remote_url: &str,
+) -> Result<Option<CloneStore>> {
+    if let Some(socket) = &config.socket {
+        #[cfg(unix)]
+        {
+            let path = crate::clone_store_server::request(socket, "ensure", remote_url)?;
+            return CloneStore::open(&path, settings).map(Some);
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(CloneStoreError::msg(format!(
+                "clone store sockets are not supported on this platform ({})",
+                socket.display()
+            )));
+        }
+    }
+    let Some(root) = &config.root else {
+        return Ok(None);
+    };
+    let stores = StoreRoot::new(root.clone(), settings.clone());
+    stores.ensure(remote_url).await.map(Some)
+}
+
+/// Strips the noise that makes one remote look like two: surrounding
+/// whitespace, trailing slashes, and a `.git` suffix.
+pub fn normalize_remote_url(url: &str) -> String {
+    let mut url = url.trim();
+    while let Some(stripped) = url.strip_suffix('/') {
+        url = stripped;
+    }
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    url.to_owned()
+}
+
+/// The directory name of `url`'s store under a store root: a readable
+/// slug from the URL's last component plus a hash of the normalized URL,
+/// so distinct remotes never collide and the same remote spelled two
+/// ways lands in one store.
+pub fn store_key(url: &str) -> String {
+    let normalized = normalize_remote_url(url);
+    let last = normalized
+        .rsplit(['/', ':', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or("repo");
+    let slug: String = last
+        .chars()
+        .take(40)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let slug = slug.trim_start_matches(['.', '-']).to_owned();
+    let slug = if slug.is_empty() { "repo".to_owned() } else { slug };
+    let digest = Blake2b512::digest(normalized.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for byte in &digest[..6] {
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    format!("{slug}-{hex}")
+}
+
+/// A directory of stores, one per remote URL.
+#[derive(Clone, Debug)]
+pub struct StoreRoot {
+    root: PathBuf,
+    settings: UserSettings,
+}
+
+impl StoreRoot {
+    /// A root at `root`; nothing is created until a store is.
+    pub fn new(root: PathBuf, settings: UserSettings) -> Self {
+        Self { root, settings }
+    }
+
+    /// The directory holding the stores.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Where `url`'s store lives, whether or not it exists yet.
+    pub fn store_dir(&self, url: &str) -> PathBuf {
+        self.root.join(store_key(url))
+    }
+
+    /// Opens `url`'s store if it has been initialized.
+    pub fn open(&self, url: &str) -> Result<Option<CloneStore>> {
+        let dir = self.store_dir(url);
+        if !dir.join("clone-store").is_file() {
+            return Ok(None);
+        }
+        CloneStore::open(&dir, &self.settings).map(Some)
+    }
+
+    /// Initializes `url`'s store, tolerating a concurrent init that won
+    /// the race.
+    pub async fn init(&self, url: &str) -> Result<CloneStore> {
+        let dir = self.store_dir(url);
+        match CloneStore::init_from_remote(&dir, url, &self.settings).await {
+            Ok(store) => Ok(store),
+            Err(err) => match self.open(url)? {
+                Some(store) => Ok(store),
+                None => Err(err),
+            },
+        }
+    }
+
+    /// `url`'s store, initialized if missing and fetched if not: the state
+    /// a clone should be born from.
+    pub async fn ensure(&self, url: &str) -> Result<CloneStore> {
+        match self.open(url)? {
+            Some(store) => {
+                store.fetch().await?;
+                Ok(store)
+            }
+            None => self.init(url).await,
+        }
+    }
+
+    /// Every initialized store under the root.
+    pub fn list(&self) -> Result<Vec<CloneStore>> {
+        let mut stores = Vec::new();
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(stores),
+            Err(err) => return Err(err).ctx(|| format!("list store root {:?}", self.root)),
+        };
+        for entry in entries {
+            let entry = entry.ctx(|| "read store root entry".to_string())?;
+            let dir = entry.path();
+            if dir.join("clone-store").is_file() {
+                stores.push(CloneStore::open(&dir, &self.settings)?);
+            }
+        }
+        stores.sort_by(|a, b| a.root.cmp(&b.root));
+        Ok(stores)
+    }
+}
+
+/// A remote's store: the shared object mirror and the lazy index template
+/// that clones borrow from.
 pub struct CloneStore {
     root: PathBuf,
     settings: UserSettings,
@@ -147,49 +340,52 @@ impl CloneStore {
             // --no-tags: git's tag auto-following would race the explicit
             // refspec; tags are fetched exactly once, explicitly.
             store.store_git(["remote", "add", "--no-tags", "origin", remote_url])?;
-            store.store_git([
-                "fetch",
-                "--no-tags",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-                "+refs/tags/*:refs/tags/*",
-            ])?;
-            // Packed refs carry precomputed peeled targets, which keeps ref
-            // listing free of per-tag object reads on the clone path.
-            store.store_git(["pack-refs", "--all"])
+            store.fetch_mirror()
         })
         .await?;
         Ok(store)
     }
 
-    /// Fetches `origin` into the store: plain `git fetch`, nothing else.
-    /// An under-the-hood prefetch so clones' own fetches find every object
-    /// already local. Serialized per store by a lock file; correctness
-    /// never depends on this having run.
+    /// Fetches `origin` into the store and refreshes the template (if one
+    /// has been built) in the same stroke, so clone creation only reads.
+    /// Serialized per store by a lock file; correctness never depends on
+    /// this having run.
     pub async fn fetch(&self) -> Result<()> {
         {
             let _lock = flock_exclusive(&self.root.join("fetch.lock"))?;
-            self.store_git([
-                "fetch",
-                "--prune",
-                "--no-tags",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-                "+refs/tags/*:refs/tags/*",
-            ])?;
-            self.store_git(["pack-refs", "--all"])?;
+            self.fetch_mirror()?;
         }
-        // Refresh the template (if one has been built) where freshness is
-        // produced rather than lazily where it is consumed: clone creation
-        // then only reads the template, so store writes — fetch and
-        // template alike — stay with whoever runs fetches, and clone
-        // creation can run under a principal with no store write access.
-        // The lazy refresh at clone creation remains as a fallback.
         if self.template_repo_dir().is_dir() {
-            let gix_repo = self.store_gix()?;
-            let ref_state = self.store_ref_state(&gix_repo)?;
-            drop(self.ensure_template_fresh(&ref_state).await?);
+            self.prepare_template().await?;
         }
+        Ok(())
+    }
+
+    /// The network half of a fetch: branches, tags, the remote's default
+    /// branch, then packed refs so ref listing stays object-free.
+    fn fetch_mirror(&self) -> Result<()> {
+        self.store_git([
+            "fetch",
+            "--prune",
+            "--no-tags",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+            "+refs/tags/*:refs/tags/*",
+        ])?;
+        // Records refs/remotes/origin/HEAD, which is what clones check out.
+        // Best effort: a remote without HEAD (an empty repo) has no default.
+        drop(self.store_git(["remote", "set-head", "origin", "--auto"]));
+        self.store_git(["pack-refs", "--all"])
+    }
+
+    /// Builds or refreshes the template to the mirror's current ref state.
+    /// The store server calls this after init and fetch so that clients
+    /// find a fresh template without writing to the store.
+    pub async fn prepare_template(&self) -> Result<()> {
+        let gix_repo = self.store_gix()?;
+        let ref_state = self.store_ref_state(&gix_repo)?;
+        drop(gix_repo);
+        drop(self.ensure_template_fresh(&ref_state).await?);
         Ok(())
     }
 
@@ -225,11 +421,10 @@ impl CloneStore {
         let result = (|| {
             fs::create_dir(&staging).ctx(|| format!("create store staging dir {staging:?}"))?;
             init_git(&staged)?;
-            fs::create_dir(staged.clones_dir()).ctx(|| "create clones dir".to_string())?;
             // Completion token: only ever written here, inside a staged
             // init that then renames into place, so open() can use it to
             // reject look-alike and truncated directories.
-            fs::write(staging.join("clone-store"), "jj clone store v2\n")
+            fs::write(staging.join("clone-store"), "jj clone store v3\n")
                 .ctx(|| "write store marker".to_string())?;
             Ok(())
         })();
@@ -269,18 +464,19 @@ impl CloneStore {
         })
     }
 
+    /// The store's directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The store's bare git mirror — the shared object database every
-    /// clone's alternates point at.
+    /// clone's alternates point at, and the source clones fetch from.
     pub fn git_dir(&self) -> PathBuf {
         self.root.join("git")
     }
 
     fn template_repo_dir(&self) -> PathBuf {
         self.root.join("template").join("repo")
-    }
-
-    fn clones_dir(&self) -> PathBuf {
-        self.root.join("clones")
     }
 
     /// Opens the store's git repo with gix, isolated from user and system
@@ -293,12 +489,34 @@ impl CloneStore {
         .ctx(|| format!("open store git repo {:?}", self.git_dir()))
     }
 
-    fn remote_url(&self, store_git: &gix::Repository) -> Result<String> {
+    /// The URL this store mirrors.
+    pub fn remote_url(&self) -> Result<String> {
+        let store_git = self.store_gix()?;
+        self.remote_url_of(&store_git)
+    }
+
+    fn remote_url_of(&self, store_git: &gix::Repository) -> Result<String> {
         let url = store_git
             .config_snapshot()
             .string("remote.origin.url")
             .ok_or_else(|| CloneStoreError::msg("store git repo has no remote.origin.url"))?;
         Ok(String::from_utf8_lossy(&url).into_owned())
+    }
+
+    /// The remote's default branch as recorded at the last fetch
+    /// (`refs/remotes/origin/HEAD`), if the remote has one.
+    pub fn default_branch(&self) -> Result<Option<RefNameBuf>> {
+        let store_git = self.store_gix()?;
+        let Ok(reference) = store_git.find_reference("refs/remotes/origin/HEAD") else {
+            return Ok(None);
+        };
+        let target = match reference.target() {
+            gix::refs::TargetRef::Symbolic(name) => name.as_bstr().to_string(),
+            gix::refs::TargetRef::Object(_) => return Ok(None),
+        };
+        Ok(target
+            .strip_prefix("refs/remotes/origin/")
+            .map(|name| RefNameBuf::from(name.to_owned())))
     }
 
     /// The store's git ref state: one `sha refname [peeled-sha]` line per
@@ -323,8 +541,8 @@ impl CloneStore {
                 })?;
                 let name = reference.inner.name.as_bstr().to_string();
                 let Some(target) = reference.inner.target.try_id().map(|id| id.to_owned()) else {
-                    // A symbolic ref in a mirror namespace (e.g. a mirrored
-                    // HEAD) is nothing a clone should be born with.
+                    // A symbolic ref in a mirror namespace (origin/HEAD) is
+                    // nothing a clone should be born with.
                     continue;
                 };
                 let peeled = match reference.inner.peeled {
@@ -358,37 +576,14 @@ impl CloneStore {
         Ok(state)
     }
 
-    /// Resolves a clone id to its repo dir, rejecting anything that isn't a
-    /// single normal path component — ids reach this from callers we don't
-    /// control, and a traversal id would mutate paths outside the store.
-    pub fn clone_repo_path(&self, id: &str) -> Result<PathBuf> {
-        if !(!id.is_empty()
-            && id.len() <= 80
-            && !id.starts_with(['.', '-'])
-            && id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        {
-            return Err(CloneStoreError::msg(format!(
-                "invalid clone id {id:?}: alphanumerics plus '-', '_', '.'; must not start with \
-                 '.' or '-'"
-            )));
-        }
-        Ok(self.clones_dir().join(id).join("repo"))
-    }
-
-    fn clone_git_dir(&self, id: &str) -> Result<PathBuf> {
-        Ok(self.clone_repo_path(id)?.parent().unwrap().join("git"))
-    }
-
     /// The template is an amortized cache: built on first use (the one
     /// full O(repo) index build a store ever pays), refreshed with a delta
-    /// import on later clone creations, and skipped entirely when the
-    /// store's ref state hasn't moved since the last refresh — jj's ref
-    /// import pays a per-ref cost (annotated tags especially), so the
-    /// common no-change case must not walk refs at all. Serialized by a
-    /// lock file; staleness or a crashed refresh only ever means more work
-    /// for the next refresh, never incorrect clones.
+    /// import later, and skipped entirely when the store's ref state
+    /// hasn't moved since the last refresh — jj's ref import pays a
+    /// per-ref cost (annotated tags especially), so the common no-change
+    /// case must not walk refs at all. Serialized by a lock file;
+    /// staleness or a crashed refresh only ever means more work for the
+    /// next refresh, never incorrect clones.
     async fn ensure_template_fresh(&self, ref_state: &str) -> Result<Arc<ReadonlyRepo>> {
         let _lock = flock_exclusive(&self.root.join("template.lock"))?;
         let template = self.template_repo_dir();
@@ -434,85 +629,123 @@ impl CloneStore {
         Ok(repo)
     }
 
-    /// Creates a clone: a private git repo borrowing the store's objects
-    /// through alternates, plus a stock jj repo over it with a seeded
-    /// index. Born at the store's last-fetched state — `main@origin`,
-    /// tags, the works — exactly like a fresh clone on its own machine.
-    /// No workspace is attached; workspaces are separate.
-    pub async fn create_clone(&self, id: &str) -> Result<PathBuf> {
-        let repo_path = self.clone_repo_path(id)?;
-        let clone_dir = self.clones_dir().join(id);
-        if clone_dir.exists() {
-            return Err(CloneStoreError::msg(format!(
-                "clone {id} already exists at {repo_path:?}"
-            )));
+    /// The template to seed a clone from, and whether it lags `ref_state`.
+    /// A fresh template is used without taking the lock, so a client of a
+    /// read-only store (one a server keeps fetched) never writes. When the
+    /// template is stale and cannot be refreshed here, the stale one is
+    /// still a valid seed: the clone imports the difference itself.
+    async fn template_for_clone(&self, ref_state: &str) -> Result<(Arc<ReadonlyRepo>, bool)> {
+        let template = self.template_repo_dir();
+        let state_path = self.root.join("template").join("ref-state");
+        let built = template.join("store").is_dir();
+        if built && fs::read_to_string(&state_path).ok().as_deref() == Some(ref_state) {
+            return Ok((open_repo_at(&template, &self.settings).await?, false));
         }
-        let store_git = self.store_gix()?;
-        let ref_state = self.store_ref_state(&store_git)?;
-        let remote_url = self.remote_url(&store_git)?;
-        drop(store_git);
-        let template = self.ensure_template_fresh(&ref_state).await?;
-        // Build in a staging dir and rename into place: the final path only
-        // ever holds complete clones, so an interrupted creation leaves the
-        // id free and the wreckage inert. Dot-prefixed so it can't collide
-        // with a valid id; same directory depth so relative links need no
-        // fixup.
-        let staging = self.clones_dir().join(format!(
-            ".incoming-{id}-{}-{}",
-            std::process::id(),
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .map(|t| t.as_nanos())
-                .unwrap_or(0),
-        ));
-        if let Err(err) = self
-            .build_clone_in(&staging, &ref_state, &remote_url, &template)
-            .await
-        {
-            drop(fs::remove_dir_all(&staging));
-            return Err(err);
-        }
-        match fs::rename(&staging, &clone_dir) {
-            Ok(()) => Ok(repo_path),
-            Err(rename_err) => {
-                drop(fs::remove_dir_all(&staging));
-                if clone_dir.exists() {
-                    return Err(CloneStoreError::msg(format!(
-                        "clone {id} already exists at {repo_path:?}"
-                    )));
-                }
-                Err(rename_err).ctx(|| format!("move clone into place at {clone_dir:?}"))
+        match self.ensure_template_fresh(ref_state).await {
+            Ok(repo) => Ok((repo, false)),
+            Err(err) if built => {
+                tracing::warn!(?err, "clone store template could not be refreshed; seeding stale");
+                Ok((open_repo_at(&template, &self.settings).await?, true))
             }
+            Err(err) => Err(err),
         }
     }
 
-    /// Builds a complete clone (`git/` + `repo/`) under `staging`, which
-    /// sits at the same depth as its final location. `ref_state` is the
-    /// store's current ref listing (the state `template` was refreshed to).
-    async fn build_clone_in(
+    /// Creates a clone at `workspace_root`: a stock jj workspace whose
+    /// private git repo borrows the store's objects through alternates and
+    /// whose index is seeded from the template. Born at the store's
+    /// last-fetched state — `main@origin`, tags, the works — exactly like
+    /// a fresh clone on its own machine, with `origin` pointing at the real
+    /// remote. The directory must exist and be empty; on failure the
+    /// caller removes what was written (`.jj`, and `.git` when colocated).
+    pub async fn materialize(
         &self,
-        staging: &Path,
-        ref_state: &str,
-        remote_url: &str,
-        template: &Arc<ReadonlyRepo>,
-    ) -> Result<()> {
-        let git_dir = staging.join("git");
-        let repo_path = staging.join("repo");
-        fs::create_dir(staging).ctx(|| format!("create staging dir {staging:?}"))?;
-        write_clone_git_dir(&git_dir, remote_url, ref_state)?;
+        workspace_root: &Path,
+        colocate: bool,
+    ) -> Result<(Workspace, Arc<ReadonlyRepo>)> {
+        let store_git = self.store_gix()?;
+        let ref_state = self.store_ref_state(&store_git)?;
+        let remote_url = self.remote_url_of(&store_git)?;
+        drop(store_git);
+        let (template, stale) = self.template_for_clone(&ref_state).await?;
+        // Absolute: the store's location is configuration, not something a
+        // clone's position implies. A server-owned store is mounted at the
+        // same path wherever clones run.
+        let alternates = dunce::canonicalize(self.git_dir())
+            .ctx(|| format!("resolve store git dir {:?}", self.git_dir()))?
+            .join("objects");
 
-        // The jj repo over it. <clone>/repo/store -> ../../git.
-        fs::create_dir(&repo_path).ctx(|| format!("create staging repo dir {repo_path:?}"))?;
-        let repo = init_repo_at(&repo_path, Path::new("../../git"), &self.settings).await?;
+        let jj_dir = crate::workspace::create_jj_dir(workspace_root)
+            .ctx(|| format!("create .jj in {workspace_root:?}"))?;
+        let repo_dir = jj_dir.join("repo");
+        fs::create_dir(&repo_dir).ctx(|| format!("create repo dir {repo_dir:?}"))?;
+        let git_target: PathBuf = if colocate {
+            let git_dir = workspace_root.join(".git");
+            write_clone_git_dir(&git_dir, &remote_url, &ref_state, &alternates, false)?;
+            PathBuf::from("../../../.git")
+        } else {
+            PathBuf::from("git")
+        };
+        let repo = ReadonlyRepo::init(
+            &self.settings,
+            &repo_dir,
+            &|settings, store_path| {
+                if !colocate {
+                    write_clone_git_dir(
+                        &store_path.join("git"),
+                        &remote_url,
+                        &ref_state,
+                        &alternates,
+                        true,
+                    )
+                    .map_err(|err| BackendInitError(Box::new(err)))?;
+                }
+                Ok(Box::new(GitBackend::init_external(
+                    settings,
+                    store_path,
+                    &git_target,
+                )?))
+            },
+            Signer::from_settings(&self.settings).ctx(|| "init signer".to_string())?,
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            ReadonlyRepo::default_index_store_initializer(),
+            ReadonlyRepo::default_submodule_store_initializer(),
+        )
+        .await
+        .ctx(|| format!("init repo at {repo_dir:?}"))?;
         let init_op_hex = repo.op_id().hex();
         drop(repo);
-        self.seed_index_from_template(&repo_path, &init_op_hex, &template.op_id().hex())?;
+        self.seed_index_from_template(&repo_dir, &init_op_hex, &template.op_id().hex())?;
 
         // Reload from disk so the seeded op link is what the next op builds
         // on; the handle from init still holds the unseeded root-only index.
-        let repo = open_repo_at(&repo_path, &self.settings).await?;
-        seed_view_from_template(&repo, template).await?;
-        Ok(())
+        let repo = open_repo_at(&repo_dir, &self.settings).await?;
+        let repo = seed_view_from_template(&repo, &template).await?;
+        let repo = if stale {
+            import_git_refs(&repo).await?
+        } else {
+            repo
+        };
+
+        let workspace_store =
+            SimpleWorkspaceStore::load(&repo_dir).ctx(|| "load workspace store".to_string())?;
+        let (working_copy, repo) = crate::workspace::init_working_copy(
+            &repo,
+            workspace_root,
+            &jj_dir,
+            default_working_copy_factory().as_ref(),
+            WorkspaceName::DEFAULT.to_owned(),
+        )
+        .await
+        .ctx(|| "init working copy".to_string())?;
+        let repo_dir = dunce::canonicalize(&repo_dir).ctx(|| "resolve repo dir".to_string())?;
+        let workspace = Workspace::new(workspace_root, repo_dir, working_copy, repo.loader().clone())
+            .ctx(|| "open workspace".to_string())?;
+        workspace_store
+            .add(workspace.workspace_name(), workspace.workspace_root())
+            .ctx(|| "record workspace".to_string())?;
+        Ok((workspace, repo))
     }
 
     /// Gives a fresh clone the template's index: share every immutable,
@@ -524,10 +757,9 @@ impl CloneStore {
     ///
     /// Sharing prefers reflink (a new copy-on-write inode) over hardlink:
     /// the clone's segment files then have their own ownership and
-    /// metadata, so nothing the clone's owner does — and no ownership
-    /// scheme layered above the store — can couple back to the template's
-    /// inodes. Filesystems without reflink (tmpfs, ext4) fall back to
-    /// hardlinks; both share the bytes.
+    /// metadata, so nothing the clone's owner does can couple back to the
+    /// template's inodes. Filesystems without reflink (tmpfs, ext4) fall
+    /// back to hardlinks; both share the bytes.
     fn seed_index_from_template(
         &self,
         repo_path: &Path,
@@ -572,285 +804,6 @@ impl CloneStore {
         Ok(())
     }
 
-    /// Loads a clone at its current op heads.
-    pub async fn open_clone(&self, id: &str) -> Result<Arc<ReadonlyRepo>> {
-        let repo_path = self.clone_repo_path(id)?;
-        if !repo_path.is_dir() {
-            return Err(CloneStoreError::msg(format!(
-                "clone {id} does not exist in store {:?}",
-                self.root
-            )));
-        }
-        open_repo_at(&repo_path, &self.settings).await
-    }
-
-    /// Attaches a working directory to a clone at `target` (or the clone's
-    /// trunk): a real git worktree of the clone's git plus a jj workspace,
-    /// colocated — stock jj keeps HEAD/index in sync, and every git tool
-    /// works because this *is* a git checkout. jj materializes the files;
-    /// the worktree is created without a checkout and its index set after.
-    ///
-    /// Like store init and clone creation, the workspace is built in a
-    /// same-depth staging sibling and renamed into place: the final path
-    /// only ever holds complete workspaces, and an interrupted creation
-    /// leaves the path free for a clean retry. Every path baked into the
-    /// staged workspace is written for the *final* location before the
-    /// rename — the worktree pointer and jj repo pointer are relative and
-    /// depth-invariant, and the two files that do embed the workspace's
-    /// name (git's worktree back-pointer, jj's workspace-store entry) are
-    /// pointed at the final path explicitly.
-    ///
-    /// Relative pointers make a store and its workspaces one relocatable
-    /// tree: created side by side (say `<root>/.stores/<repo>` and
-    /// `<root>/<name>`), they can be exposed in a mount namespace at any
-    /// other root (say `/ws`) — wholly or as selected bind mounts — and
-    /// every pointer keeps resolving, as long as the mounts preserve the
-    /// workspace's position relative to its store. No pointer escapes the
-    /// tree, so the namespace needs nothing else mounted.
-    pub async fn create_workspace(
-        &self,
-        clone_id: &str,
-        workspace_root: &Path,
-        workspace_name: &str,
-        target: Option<CommitId>,
-    ) -> Result<()> {
-        let repo = self.open_clone(clone_id).await?;
-        let target = match target {
-            Some(id) => id,
-            None => trunk_of(&repo)
-                .ok_or_else(|| CloneStoreError::msg("clone has no trunk to check out"))?,
-        };
-        let target = repo
-            .store()
-            .get_commit_async(&target)
-            .await
-            .ctx(|| "load target commit".to_string())?;
-
-        let clone_git = self.clone_git_dir(clone_id)?;
-        // Serializes workspace creation per clone: the cleanup prune below
-        // must not race another creation's not-yet-renamed registration
-        // (whose back-pointer targets a final path that doesn't exist yet).
-        let _lock = flock_exclusive(&self.clones_dir().join(clone_id).join("workspace.lock"))?;
-        // Registrations left by creations that died before their rename
-        // point at never-created final paths; git considers them prunable.
-        self.git([
-            Path::new("--git-dir"),
-            &clone_git,
-            Path::new("worktree"),
-            Path::new("prune"),
-        ])?;
-
-        let parent = workspace_root.parent().ok_or_else(|| {
-            CloneStoreError::msg(format!("workspace root {workspace_root:?} has no parent"))
-        })?;
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).ctx(|| format!("create workspace parent {parent:?}"))?;
-        }
-        let file_name = workspace_root.file_name().ok_or_else(|| {
-            CloneStoreError::msg(format!(
-                "workspace root {workspace_root:?} has no directory name"
-            ))
-        })?;
-        let staging = parent.join(format!(
-            ".incoming-ws-{}-{}",
-            std::process::id(),
-            std::time::UNIX_EPOCH
-                .elapsed()
-                .map(|t| t.as_nanos())
-                .unwrap_or(0),
-        ));
-        let result = self
-            .build_workspace_in(
-                &staging,
-                file_name,
-                clone_id,
-                &clone_git,
-                &repo,
-                workspace_name,
-                &target,
-            )
-            .await;
-        if let Err(err) = result {
-            drop(fs::remove_dir_all(&staging));
-            drop(self.git([
-                Path::new("--git-dir"),
-                &clone_git,
-                Path::new("worktree"),
-                Path::new("prune"),
-            ]));
-            return Err(err);
-        }
-        match fs::rename(&staging, workspace_root) {
-            Ok(()) => Ok(()),
-            Err(rename_err) => {
-                drop(fs::remove_dir_all(&staging));
-                drop(self.git([
-                    Path::new("--git-dir"),
-                    &clone_git,
-                    Path::new("worktree"),
-                    Path::new("prune"),
-                ]));
-                if workspace_root.exists() {
-                    return Err(CloneStoreError::msg(format!(
-                        "workspace path already exists at {workspace_root:?}"
-                    )));
-                }
-                Err(rename_err).ctx(|| format!("move workspace into place at {workspace_root:?}"))
-            }
-        }
-    }
-
-    /// Builds a complete workspace under `staging`, a same-depth sibling of
-    /// its final location `<parent>/<file_name>`.
-    #[expect(clippy::too_many_arguments)]
-    async fn build_workspace_in(
-        &self,
-        staging: &Path,
-        file_name: &OsStr,
-        clone_id: &str,
-        clone_git: &Path,
-        repo: &Arc<ReadonlyRepo>,
-        workspace_name: &str,
-        target: &Commit,
-    ) -> Result<()> {
-        let target_hex = target.id().hex();
-        let add_args: Vec<&OsStr> = vec![
-            "--git-dir".as_ref(),
-            clone_git.as_os_str(),
-            "worktree".as_ref(),
-            "add".as_ref(),
-            "--no-checkout".as_ref(),
-            "--detach".as_ref(),
-            staging.as_os_str(),
-            target_hex.as_ref(),
-        ];
-        self.git(add_args)?;
-
-        // `git worktree add` writes absolute paths into the `.git` pointer
-        // file and the admin dir's back-pointer. Rewrite both to relative:
-        // the pointer relative to the workspace (identical from any
-        // same-depth sibling, so it survives the rename), the back-pointer
-        // relative to the admin dir but naming the *final* workspace path
-        // (it embeds the directory name, so it is written for where the
-        // workspace will live, not where it is being built). Relative
-        // pointers keep the store-plus-workspaces tree relocatable and
-        // bind-mountable; see [`Self::create_workspace`].
-        let pointer_path = staging.join(".git");
-        let content =
-            fs::read_to_string(&pointer_path).ctx(|| "read git worktree pointer".to_string())?;
-        let gitdir = content
-            .strip_prefix("gitdir:")
-            .map(str::trim)
-            .ok_or_else(|| CloneStoreError::msg("unexpected .git pointer format"))?;
-        // Preserve symlinks in the caller's frame. In particular, Rho exposes
-        // stores through a sibling `.stores/<name>` symlink; resolving that
-        // symlink here would bake the host store location into these relative
-        // pointers and make the workspace unusable when the same frame is
-        // assembled under `/ws`.
-        let staging_abs = std::path::absolute(staging)
-            .ctx(|| "make workspace staging path absolute".to_string())?;
-        // Git resolves the `--git-dir` symlink before writing `gitdir`, so
-        // recover the admin directory under the path by which the caller
-        // reached the clone instead of absolutizing Git's already-resolved
-        // spelling.
-        let admin_name = Path::new(gitdir)
-            .file_name()
-            .ok_or_else(|| CloneStoreError::msg("worktree admin path has no directory name"))?;
-        let admin_abs = std::path::absolute(clone_git.join("worktrees").join(admin_name))
-            .ctx(|| "make worktree admin path absolute".to_string())?;
-        let final_abs = staging_abs.parent().unwrap().join(file_name);
-        let to_admin = relative_path(&staging_abs, &admin_abs);
-        fs::write(&pointer_path, format!("gitdir: {}\n", to_admin.display()))
-            .ctx(|| "rewrite git worktree pointer".to_string())?;
-        let to_pointer = relative_path(&admin_abs, &final_abs.join(".git"));
-        fs::write(
-            admin_abs.join("gitdir"),
-            format!("{}\n", to_pointer.display()),
-        )
-        .ctx(|| "rewrite git worktree back-pointer".to_string())?;
-
-        let name = WorkspaceNameBuf::from(workspace_name.to_owned());
-        let clone_repo_path = self.clone_repo_path(clone_id)?;
-        let (mut workspace, repo) = if repo.view().get_wc_commit_id(&name).is_some() {
-            // The name is already in the view: a previous creation died
-            // after committing its "add workspace" operation, or the
-            // caller is deliberately re-pointing the name. Attach the
-            // working-copy machinery without minting a working-copy commit
-            // (init would check out fresh over the recorded commit and
-            // trip the transaction's rebase assertion); the checkout below
-            // replaces the recorded commit properly.
-            let workspace = Workspace::attach_workspace_with_existing_repo(
-                staging,
-                &clone_repo_path,
-                repo,
-                default_working_copy_factory().as_ref(),
-                name.clone(),
-            )
-            .ctx(|| "attach workspace".to_string())?;
-            (workspace, repo.clone())
-        } else {
-            Workspace::init_workspace_with_existing_repo(
-                staging,
-                &clone_repo_path,
-                repo,
-                default_working_copy_factory().as_ref(),
-                name.clone(),
-            )
-            .await
-            .ctx(|| "init workspace".to_string())?
-        };
-        // Workspace initialization canonicalizes the repository path before
-        // writing `.jj/repo`. Rewrite that pointer in the caller's symlink
-        // frame for the same reason as the Git pointers above.
-        let clone_repo_abs = std::path::absolute(&clone_repo_path)
-            .ctx(|| "make clone repository path absolute".to_string())?;
-        let to_repo = relative_path(&staging_abs.join(".jj"), &clone_repo_abs);
-        let repo_pointer = crate::file_util::path_to_bytes(&to_repo)
-            .ctx(|| "encode jj repository pointer".to_string())?;
-        fs::write(staging.join(".jj/repo"), repo_pointer)
-            .ctx(|| "rewrite jj repository pointer".to_string())?;
-
-        let mut tx = repo.start_transaction();
-        let wc_commit = tx
-            .repo_mut()
-            .check_out(name.clone(), target)
-            .await
-            .ctx(|| "check out target commit".to_string())?;
-        // check_out abandons the placeholder working-copy commit created at
-        // workspace init; settle its (empty) descendants before committing.
-        tx.repo_mut()
-            .rebase_descendants()
-            .await
-            .ctx(|| "rebase descendants after checkout".to_string())?;
-        let repo = tx
-            .commit(format!(
-                "check out {} in {workspace_name}",
-                target.id().hex()
-            ))
-            .await
-            .ctx(|| "commit checkout".to_string())?;
-        workspace
-            .check_out(repo.op_id().clone(), None, &wc_commit)
-            .await
-            .ctx(|| "materialize working copy".to_string())?;
-        // jj wrote the files; give the worktree a matching git index so
-        // `git status` starts clean and jj-side edits show as unstaged.
-        self.git([
-            Path::new("-C"),
-            &staging_abs,
-            Path::new("read-tree"),
-            Path::new("HEAD"),
-        ])?;
-        // Workspace init recorded the staging path in the clone's
-        // workspace store; re-point the entry at the final location (the
-        // last of the pre-rename fixups).
-        SimpleWorkspaceStore::load(&clone_repo_path)
-            .ctx(|| "load workspace store".to_string())?
-            .add(&name, &final_abs)
-            .ctx(|| "record workspace path".to_string())?;
-        Ok(())
-    }
-
     /// Runs git (the executable from settings) against the store's git dir.
     fn store_git<const N: usize>(&self, args: [&str; N]) -> Result<()> {
         let git_dir = self.git_dir();
@@ -864,14 +817,14 @@ impl CloneStore {
     }
 }
 
-/// Picks the clone's trunk: the first of main/master/trunk at `origin`,
+/// Picks a repo's trunk: the first of main/master/trunk at `origin`,
 /// falling back to any visible head.
 pub fn trunk_of(repo: &Arc<ReadonlyRepo>) -> Option<CommitId> {
     let view = repo.view();
     for name in ["main", "master", "trunk"] {
         let symbol = RemoteRefSymbol {
             name: RefName::new(name),
-            remote: RemoteName::new("origin"),
+            remote: STORE_REMOTE,
         };
         if let Some(id) = view.get_remote_bookmark(symbol).target.as_normal() {
             return Some(id.clone());
@@ -880,14 +833,20 @@ pub fn trunk_of(repo: &Arc<ReadonlyRepo>) -> Option<CommitId> {
     view.heads().iter().next().cloned()
 }
 
-/// Writes a clone's bare git dir directly — the same files `git init
-/// --bare` plus `git remote add --no-tags origin <url>` would produce,
-/// without paying two subprocess spawns per clone. Private refs, private
-/// config, origin pointing at the real remote: indistinguishable from the
-/// .git of a fresh workstation clone, except that it owns no object bytes
+/// Writes a clone's git dir directly — the same files `git init` plus
+/// `git remote add --no-tags origin <url>` would produce, without paying
+/// two subprocess spawns per clone. Private refs, private config, origin
+/// pointing at the real remote: indistinguishable from the git dir of a
+/// fresh workstation clone, except that it owns no object bytes
 /// (alternates borrow the store's) and its refs come verbatim from the
 /// store's last-fetched state.
-fn write_clone_git_dir(git_dir: &Path, remote_url: &str, ref_state: &str) -> Result<()> {
+fn write_clone_git_dir(
+    git_dir: &Path,
+    remote_url: &str,
+    ref_state: &str,
+    alternates: &Path,
+    bare: bool,
+) -> Result<()> {
     for dir in [
         "objects/info",
         "objects/pack",
@@ -902,23 +861,26 @@ fn write_clone_git_dir(git_dir: &Path, remote_url: &str, ref_state: &str) -> Res
     fs::write(
         git_dir.join("config"),
         format!(
-            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n[remote \
-             \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\ttagOpt = \
-             --no-tags\n",
-            git_config_quote(remote_url)
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = {bare}\n\
+             \tlogallrefupdates = {logs}\n[remote \"origin\"]\n\turl = {url}\n\tfetch = \
+             +refs/heads/*:refs/remotes/origin/*\n\ttagOpt = --no-tags\n",
+            logs = !bare,
+            url = git_config_quote(remote_url)
         ),
     )
     .ctx(|| "write clone git config".to_string())?;
     // What colocated `jj git init` writes: keep jj's metadata out of git's
-    // view in every worktree of this clone.
+    // view.
     fs::write(git_dir.join("info").join("exclude"), "/.jj/\n")
         .ctx(|| "write clone git exclude".to_string())?;
-    // Borrow the store's objects. Relative (resolved against the objects
-    // dir holding the file), so the store moving wholesale keeps working:
-    // clones/<id>/git/objects -> ../../../../git/objects.
+    // Borrow the store's objects.
+    let alternates_line = crate::file_util::path_to_bytes(alternates)
+        .ctx(|| "encode alternates path".to_string())?;
+    let mut alternates_file = alternates_line.to_vec();
+    alternates_file.push(b'\n');
     fs::write(
         git_dir.join("objects").join("info").join("alternates"),
-        "../../../../git/objects\n",
+        alternates_file,
     )
     .ctx(|| "write alternates".to_string())?;
     // Born at the store's last-fetched ref state, verbatim: the same
@@ -996,7 +958,7 @@ async fn open_repo_at(repo_path: &Path, settings: &UserSettings) -> Result<Arc<R
 /// Imports the backing git repo's refs into the repo's view — stock jj
 /// import: `refs/remotes/origin/*` become `@origin` bookmarks, `refs/tags`
 /// become tags — indexing any commits the index doesn't cover yet.
-async fn import_git_refs(repo: &Arc<ReadonlyRepo>) -> Result<()> {
+async fn import_git_refs(repo: &Arc<ReadonlyRepo>) -> Result<Arc<ReadonlyRepo>> {
     let mut tx = repo.start_transaction();
     let options = GitImportOptions {
         abandon_unreachable_commits: false,
@@ -1008,8 +970,7 @@ async fn import_git_refs(repo: &Arc<ReadonlyRepo>) -> Result<()> {
         .ctx(|| "import refs".to_string())?;
     tx.commit("import git refs")
         .await
-        .ctx(|| "commit ref import".to_string())?;
-    Ok(())
+        .ctx(|| "commit ref import".to_string())
 }
 
 /// Gives a newborn clone the template's view without walking git refs or
@@ -1027,7 +988,7 @@ async fn import_git_refs(repo: &Arc<ReadonlyRepo>) -> Result<()> {
 async fn seed_view_from_template(
     repo: &Arc<ReadonlyRepo>,
     template: &Arc<ReadonlyRepo>,
-) -> Result<()> {
+) -> Result<Arc<ReadonlyRepo>> {
     let mut tx = repo.start_transaction();
     let mut data = template.view().store_view().clone();
     data.wc_commit_ids.clear();
@@ -1036,8 +997,7 @@ async fn seed_view_from_template(
     tx.repo_mut().set_view(data);
     tx.commit("import refs from template")
         .await
-        .ctx(|| "commit view seed".to_string())?;
-    Ok(())
+        .ctx(|| "commit view seed".to_string())
 }
 
 /// Shares `src`'s bytes at `dst` without copying them: reflink where the
@@ -1062,25 +1022,6 @@ fn share_file(src: &Path, dst: &Path) -> io::Result<()> {
         }
     }
     fs::hard_link(src, dst)
-}
-
-/// Computes the relative path from `from_dir` to `to`. Both must be
-/// absolute and canonical (no symlink or `..` components).
-fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
-    let from: Vec<_> = from_dir.components().collect();
-    let to: Vec<_> = to.components().collect();
-    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
-    let mut rel = PathBuf::new();
-    for _ in common..from.len() {
-        rel.push("..");
-    }
-    for component in &to[common..] {
-        rel.push(component);
-    }
-    if rel.as_os_str().is_empty() {
-        rel.push(".");
-    }
-    rel
 }
 
 fn flock_exclusive(path: &Path) -> Result<fs::File> {
@@ -1116,4 +1057,22 @@ fn run_git(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_keys_are_stable_and_normalized() {
+        let a = store_key("https://github.com/example/repo.git");
+        assert_eq!(a, store_key("https://github.com/example/repo"));
+        assert_eq!(a, store_key(" https://github.com/example/repo/ "));
+        assert!(a.starts_with("repo-"), "{a}");
+        assert_ne!(a, store_key("https://github.com/other/repo"));
+        assert_ne!(a, store_key("git@github.com:example/repo.git"));
+        let weird = store_key("/tmp/some dir/x y.git");
+        assert!(weird.starts_with("x_y-"), "{weird}");
+        assert!(store_key("").starts_with("repo-"));
+    }
 }

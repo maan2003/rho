@@ -34,6 +34,8 @@ pub mod backend;
 pub mod bisect;
 #[cfg(feature = "git")]
 pub mod clone_store;
+#[cfg(all(feature = "git", unix))]
+pub mod clone_store_server;
 pub mod commit;
 pub mod commit_builder;
 pub mod config;

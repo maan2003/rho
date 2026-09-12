@@ -19,6 +19,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use itertools::Itertools as _;
+use jj_lib::clone_store::CloneStoreConfig;
+use jj_lib::clone_store::prepare_store;
 use jj_lib::file_util;
 use jj_lib::git;
 use jj_lib::git::GitFetch;
@@ -219,7 +221,27 @@ pub async fn cmd_git_clone(
     let canonical_wc_path = dunce::canonicalize(&wc_path)
         .map_err(|err| user_error_with_message(format!("Failed to create {wc_path_str}"), err))?;
 
+    // A clone store serves whole-remote clones of `origin`; anything narrower
+    // or shallower takes the network path.
+    let store_config = CloneStoreConfig::from_settings(command.settings())?;
+    let use_store = store_config.is_enabled()
+        && !is_specific
+        && args.depth.is_none()
+        && remote_name == RemoteName::new("origin");
+
     let clone_result: Result<_, CommandError> = async {
+        if use_store {
+            return clone_from_store(
+                ui,
+                command,
+                &canonical_wc_path,
+                colocate,
+                remote_name,
+                &source,
+                &store_config,
+            )
+            .await;
+        }
         let (workspace_command, config_env) = init_workspace(
             ui,
             command,
@@ -320,6 +342,56 @@ pub async fn cmd_git_clone(
     }
 
     Ok(())
+}
+
+/// Clones through the remote's clone store: no network, objects and index
+/// borrowed, refs as of the store's last fetch. Ends in the same state as
+/// the network path (default branch tracked and reported for checkout).
+async fn clone_from_store(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    wc_path: &Path,
+    colocate: bool,
+    remote_name: &RemoteName,
+    source: &str,
+    store_config: &CloneStoreConfig,
+) -> Result<(WorkspaceCommandHelper, (Option<RefNameBuf>, bool), ConfigEnv), CommandError> {
+    let (settings, config_env) = command.settings_for_new_workspace(ui, wc_path)?;
+    let store = prepare_store(store_config, &settings, source)
+        .await
+        .map_err(|err| user_error_with_message("Failed to prepare clone store", err))?
+        .expect("store config is enabled");
+    writeln!(
+        ui.status(),
+        r#"Cloning from store into "{}""#,
+        wc_path.display()
+    )?;
+    let (workspace, repo) = store
+        .materialize(wc_path, colocate)
+        .await
+        .map_err(|err| user_error_with_message("Failed to clone from store", err))?;
+    let workspace_command = command.for_workable_repo(ui, workspace, repo)?;
+    maybe_add_gitignore(&workspace_command)?;
+    let default_branch = store
+        .default_branch()
+        .map_err(|err| user_error_with_message("Failed to read store default branch", err))?;
+    let should_track_default = settings.get_bool("git.track-default-bookmark-on-clone")?;
+
+    let mut workspace_command = workspace_command;
+    let mut tx = workspace_command.start_transaction();
+    let working_branch = default_branch.filter(|name| {
+        let symbol = name.to_remote_symbol(remote_name);
+        tx.repo().view().get_remote_bookmark(symbol).is_present()
+    });
+    if let Some(name) = &working_branch
+        && should_track_default
+    {
+        // For convenience, create local bookmark as Git would do.
+        tx.repo_mut()
+            .track_remote_bookmark(name.to_remote_symbol(remote_name))?;
+    }
+    tx.finish(ui, "clone from store").await?;
+    Ok((workspace_command, (working_branch, true), config_env))
 }
 
 async fn init_workspace(

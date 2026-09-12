@@ -1450,3 +1450,107 @@ fn test_git_clone_auto_track_bookmarks() {
 fn get_bookmark_output(work_dir: &TestWorkDir) -> CommandOutput {
     work_dir.run_jj(["bookmark", "list", "--all-remotes"])
 }
+
+#[test]
+fn test_git_clone_with_store() {
+    let mut test_env = TestEnvironment::default();
+    let store_root = test_env.env_root().join("stores");
+    test_env.add_env_var("JJ_STORE", &store_root);
+    let root_dir = test_env.work_dir("");
+    let git_repo_path = test_env.env_root().join("source");
+    let git_repo = git::init_bare(&git_repo_path);
+    set_up_non_empty_git_repo(&git_repo);
+
+    // The first clone initializes the store; nothing is fetched into the
+    // clone itself.
+    let output = root_dir.run_jj(["git", "clone", "source", "first"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Cloning from store into "$TEST_ENV/first"
+    Setting the revset alias `trunk()` to `main@origin`.
+    Working copy  (@) now at: sqpuoqvx 1ca44815 (empty) (no description set)
+    Parent commit (@-)      : qomsplrm ebeb70d8 main | message
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let first = test_env.work_dir("first");
+    assert!(first.root().join("file").exists());
+    let stores: Vec<_> = std::fs::read_dir(&store_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    assert_eq!(stores.len(), 1, "{stores:?}");
+    let store = store_root.join(&stores[0]);
+    let alternates =
+        std::fs::read_to_string(first.root().join(".jj/repo/store/git/objects/info/alternates"))
+            .unwrap();
+    assert_eq!(
+        alternates.trim(),
+        store.join("git/objects").to_str().unwrap()
+    );
+
+    // A second clone shares the store and is identical.
+    let output = root_dir.run_jj(["git", "clone", "source", "second"]);
+    insta::assert_snapshot!(output, @r#"
+    ------- stderr -------
+    Cloning from store into "$TEST_ENV/second"
+    Setting the revset alias `trunk()` to `main@origin`.
+    Working copy  (@) now at: uuqppmxq 3711b3b5 (empty) (no description set)
+    Parent commit (@-)      : qomsplrm ebeb70d8 main | message
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    let second = test_env.work_dir("second");
+    assert_eq!(
+        std::fs::read_dir(&store_root)
+            .unwrap()
+            .filter(|entry| !entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.'))
+            .count(),
+        1
+    );
+
+    // The remote moves on; a fetch in a clone goes through the store's
+    // mirror and sees it.
+    let output = second.run_jj(["bookmark", "list", "--all-remotes"]);
+    insta::assert_snapshot!(output, @"
+    main: qomsplrm ebeb70d8 message
+      @origin: qomsplrm ebeb70d8 message
+    [EOF]
+    ");
+    let parent = git_repo
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_id()
+        .unwrap()
+        .detach();
+    git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "second-file",
+        b"content",
+        "second message",
+        &[parent],
+    );
+    let output = second.run_jj(["git", "fetch"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    bookmark: main@origin [updated] tracked
+    [EOF]
+    ");
+    let output = second.run_jj(["log", "-r", "main@origin", "--no-graph", "-T", "description"]);
+    insta::assert_snapshot!(output, @"
+    second message[EOF]
+    ");
+    // The clone's origin is still the real remote.
+    let output = second.run_jj(["git", "remote", "list"]);
+    insta::assert_snapshot!(output, @"
+    origin $TEST_ENV/source
+    [EOF]
+    ");
+}

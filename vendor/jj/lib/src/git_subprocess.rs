@@ -165,9 +165,12 @@ impl GitSubprocessContext {
     ///
     /// [`GitFetchStatus::NoRemoteRef`] is returned if ref doesn't exist. Note
     /// that `git` only returns one failed ref at a time.
+    ///
+    /// `source` is what git fetches from: the remote's name, or a URL or
+    /// path standing in for it (a clone store mirror).
     pub(crate) fn spawn_fetch(
         &self,
-        remote_name: &RemoteName,
+        source: &str,
         refspecs: &[RefSpec],
         negative_refspecs: &[NegativeRefSpec],
         callback: &mut dyn GitSubprocessCallback,
@@ -189,7 +192,7 @@ impl GitSubprocessContext {
         }
         // Tags should be fetched explicitly by the refspecs
         command.arg("--no-tags");
-        command.arg("--").arg(remote_name.as_str());
+        command.arg("--").arg(source);
         command.args(
             refspecs
                 .iter()

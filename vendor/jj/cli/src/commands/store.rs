@@ -12,87 +12,84 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Clone store commands: a shared bare mirror of a remote plus instant,
-//! cheap jj clones that borrow its object and index bytes. See
-//! `jj_lib::clone_store` for the design.
+//! Clone store commands: manage the store root that `jj git clone` and
+//! `jj git fetch` use transparently. See `jj_lib::clone_store` for the
+//! design.
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use jj_lib::backend::CommitId;
-use jj_lib::clone_store::CloneStore;
+use jj_lib::clone_store::CloneStoreConfig;
+use jj_lib::clone_store::StoreRoot;
 use serde_json::json;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
 use crate::ui::Ui;
 
-/// Manage a clone store: one shared mirror of a remote, many instant
-/// cheap clones borrowing its bytes
+/// Manage clone stores: shared mirrors that make `jj git clone` instant
+/// and `jj git fetch` local
 ///
-/// A store is a bare git mirror that never prunes, plus a lazily built
-/// index template. A clone is a completely stock jj repo born at the
-/// store's last-fetched state in well under 100ms: its git repo borrows
-/// the store's objects through `objects/info/alternates` and its jj index
-/// is hardlinked from the template. Everything else — refs, remotes,
-/// config, operation log — is private to the clone, so any jj or git
-/// command is safe inside it.
+/// With `git.clone-store` (or `JJ_STORE`) set to a directory, `jj git
+/// clone` keeps one store per remote URL there: a bare git mirror that
+/// never prunes plus a jj index template. Clones borrow the mirror's
+/// objects through `objects/info/alternates` and reflink the template's
+/// index, so they are born in well under a second at the store's
+/// last-fetched state, and `jj git fetch` in them transfers from the
+/// mirror instead of the network. Everything else about a clone — refs,
+/// remotes, operation log, working copy — is a stock private jj repo.
+///
+/// These commands maintain the stores; nothing here is needed for a clone
+/// to work.
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum StoreCommand {
-    /// Create a store: mirror a remote into a bare git repo clones will
-    /// borrow objects from
-    Init(InitArgs),
-    /// Fetch the remote into the store's mirror (a prefetch; clones fetch
-    /// on their own regardless)
+    /// Fetch the remote into each store (all stores, or the given URLs;
+    /// a URL without a store yet gets one)
     Fetch(FetchArgs),
-    /// Create a clone: a private jj repo born at the store's last-fetched
-    /// state
-    Clone(CloneArgs),
-    /// Attach a colocated workspace (a real git worktree plus a jj
-    /// workspace) to a clone
-    Workspace(WorkspaceArgs),
-}
-
-#[derive(clap::Args, Clone, Debug)]
-pub struct InitArgs {
-    /// Store root directory to create
-    store: PathBuf,
-    /// URL or path of the remote to mirror
-    remote: String,
+    /// List the stores under the store root
+    List(ListArgs),
+    /// Serve the store root over a unix socket, keeping every store
+    /// fetched in the background
+    ///
+    /// Clients with `git.clone-store-socket` (or `JJ_STORE_SOCKET`) set to
+    /// the socket ask the server for a store instead of touching the store
+    /// root themselves, so the root can be read-only for them.
+    Serve(ServeArgs),
 }
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct FetchArgs {
-    /// Store root directory
-    store: PathBuf,
+    /// Remote URLs to fetch (default: every existing store)
+    urls: Vec<String>,
 }
 
 #[derive(clap::Args, Clone, Debug)]
-pub struct CloneArgs {
-    /// Store root directory
-    store: PathBuf,
-    /// Clone id: a single path component (alphanumerics plus `-`, `_`,
-    /// `.`; must not start with `.` or `-`)
-    id: String,
-}
+pub struct ListArgs {}
 
 #[derive(clap::Args, Clone, Debug)]
-pub struct WorkspaceArgs {
-    /// Store root directory
-    store: PathBuf,
-    /// Clone id
-    id: String,
-    /// Directory to materialize the working copy in
-    workspace_root: PathBuf,
-    /// Workspace name within the clone
-    #[arg(long, default_value = "default")]
-    name: String,
-    /// Full hex commit id to check out (defaults to the clone's trunk:
-    /// main/master/trunk at origin)
+pub struct ServeArgs {
+    /// Unix socket path to listen on (replaced if it exists)
     #[arg(long)]
-    at: Option<String>,
+    socket: PathBuf,
+    /// Seconds between background fetches of every store
+    #[arg(long, default_value_t = 60)]
+    interval: u64,
+    /// Seconds within which a fetched store is served without fetching
+    /// again
+    #[arg(long, default_value_t = 30)]
+    debounce: u64,
+}
+
+fn store_root(command: &CommandHelper) -> Result<StoreRoot, CommandError> {
+    let config = CloneStoreConfig::from_settings(command.settings())?;
+    let root = config
+        .root
+        .ok_or_else(|| user_error("No clone store root configured (set git.clone-store or JJ_STORE)"))?;
+    Ok(StoreRoot::new(root, command.settings().clone()))
 }
 
 #[instrument(skip_all)]
@@ -101,51 +98,68 @@ pub async fn cmd_store(
     command: &CommandHelper,
     sub: &StoreCommand,
 ) -> Result<(), CommandError> {
-    let settings = command.settings();
+    let stores = store_root(command)?;
     match sub {
-        StoreCommand::Init(args) => {
-            let store = CloneStore::init_from_remote(&args.store, &args.remote, settings)
-                .await
-                .map_err(user_error)?;
-            writeln!(
-                ui.stdout(),
-                "{}",
-                json!({"store": args.store, "git": store.git_dir()})
-            )?;
-            Ok(())
-        }
         StoreCommand::Fetch(args) => {
-            let store = CloneStore::open(&args.store, settings).map_err(user_error)?;
-            store.fetch().await.map_err(user_error)?;
-            writeln!(ui.stdout(), "{}", json!({"store": args.store}))?;
+            let urls = if args.urls.is_empty() {
+                stores
+                    .list()
+                    .map_err(user_error)?
+                    .iter()
+                    .map(|store| store.remote_url())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(user_error)?
+            } else {
+                args.urls.clone()
+            };
+            for url in urls {
+                let store = stores
+                    .ensure(&url)
+                    .await
+                    .map_err(|err| user_error_with_message(format!("Failed to fetch {url}"), err))?;
+                store.prepare_template().await.map_err(user_error)?;
+                writeln!(ui.stdout(), "{}", json!({"url": url, "store": store.root()}))?;
+            }
             Ok(())
         }
-        StoreCommand::Clone(args) => {
-            let store = CloneStore::open(&args.store, settings).map_err(user_error)?;
-            let repo_path = store.create_clone(&args.id).await.map_err(user_error)?;
-            writeln!(ui.stdout(), "{}", json!({"id": args.id, "repo": repo_path}))?;
+        StoreCommand::List(_) => {
+            for store in stores.list().map_err(user_error)? {
+                let url = store.remote_url().map_err(user_error)?;
+                writeln!(ui.stdout(), "{}", json!({"url": url, "store": store.root()}))?;
+            }
             Ok(())
         }
-        StoreCommand::Workspace(args) => {
-            let store = CloneStore::open(&args.store, settings).map_err(user_error)?;
-            let target = args
-                .at
-                .as_ref()
-                .map(|hex| {
-                    CommitId::try_from_hex(hex)
-                        .ok_or_else(|| user_error(format!("invalid commit id {hex:?}")))
-                })
-                .transpose()?;
-            store
-                .create_workspace(&args.id, &args.workspace_root, &args.name, target)
-                .await
-                .map_err(user_error)?;
-            writeln!(
-                ui.stdout(),
-                "{}",
-                json!({"id": args.id, "root": args.workspace_root, "name": args.name})
-            )?;
-            Ok(())
-        }
+        StoreCommand::Serve(args) => serve(ui, stores, args),
     }
+}
+
+#[cfg(unix)]
+fn serve(ui: &mut Ui, stores: StoreRoot, args: &ServeArgs) -> Result<(), CommandError> {
+    use jj_lib::clone_store_server::StoreServer;
+
+    std::fs::create_dir_all(stores.root())
+        .map_err(|err| user_error_with_message("Failed to create store root", err))?;
+    match std::fs::remove_file(&args.socket) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(user_error_with_message("Failed to replace socket", err)),
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&args.socket)
+        .map_err(|err| user_error_with_message("Failed to bind socket", err))?;
+    let server = StoreServer::new(stores, Duration::from_secs(args.debounce));
+    drop(server.spawn_refresh_loop(Duration::from_secs(args.interval)));
+    writeln!(
+        ui.status(),
+        "Serving clone stores in {} on {}",
+        server.stores().root().display(),
+        args.socket.display()
+    )?;
+    server
+        .serve(listener)
+        .map_err(|err| user_error_with_message("Store server failed", err))
+}
+
+#[cfg(not(unix))]
+fn serve(_ui: &mut Ui, _stores: StoreRoot, _args: &ServeArgs) -> Result<(), CommandError> {
+    Err(user_error("`jj store serve` needs unix sockets"))
 }

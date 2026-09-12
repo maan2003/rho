@@ -544,6 +544,14 @@
                     "description": "Whether to colocate the working copy with the git repository",
                     "default": true
                 },
+                "clone-store": {
+                    "type": "string",
+                    "description": "Directory of clone stores, one per remote URL. `jj git clone` borrows objects and index from the URL's store and `jj git fetch` fetches from its mirror. Also set by the JJ_STORE environment variable."
+                },
+                "clone-store-socket": {
+                    "type": "string",
+                    "description": "Unix socket of a `jj store serve` process owning the clone stores; clients then never write to the stores themselves. Also set by the JJ_STORE_SOCKET environment variable."
+                },
                 "object-hash": {
                     "enum": ["sha1", "sha256"],
                     "description": "Object hash algorithm used when initializing a new Git repository",
