@@ -48,7 +48,8 @@ run. `rho debug migrate-agent <agent>` moves one into a workset by hand:
 a clone of the repository's origin through the mirror store, checked out
 at the old workspace's parent commit with the working copy's changes
 staged, recorded as a `WorkdirMigrated` event at the tail of the agent's
-log. The old workspace is left as it is.
+log. The agent is exposed unless `--mode view` says otherwise, since a jj
+workspace on the host was. The old workspace is left as it is.
 
 `Workset::enter(mode, cwd)` is one agent's `Namespace` over the
 directory: its mount namespace is built on the first command (so loading

@@ -74,6 +74,10 @@ enum DebugCommand {
         /// What to clone; the repository's `origin` remote by default.
         #[arg(long)]
         origin: Option<String>,
+        /// How the agent sees the filesystem from now on. Exposed by
+        /// default: that is what a jj workspace on the host was.
+        #[arg(long, value_enum, default_value_t = crate::WorksetModeArg::Exposed)]
+        mode: crate::WorksetModeArg,
     },
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
@@ -100,9 +104,11 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
         DebugCommand::ForgetSavepoints => forget_savepoints(args.db_path).await,
         DebugCommand::Stats => stats(args.db_path),
         DebugCommand::Context => print_context(args.db_path, &claude).await,
-        DebugCommand::MigrateAgent { agent, origin } => {
-            migrate_agent(args.db_path, &agent, origin).await
-        }
+        DebugCommand::MigrateAgent {
+            agent,
+            origin,
+            mode,
+        } => migrate_agent(args.db_path, &agent, origin, mode.into()).await,
         DebugCommand::RenderPrompt { role } => render_prompt(&role).await,
     }
 }
@@ -165,6 +171,7 @@ async fn migrate_agent(
     db_path: Option<PathBuf>,
     agent: &str,
     origin: Option<String>,
+    mode: rho_fs_view::WorksetMode,
 ) -> anyhow::Result<()> {
     let named = db_path.is_some();
     let path = db_path
@@ -273,7 +280,7 @@ async fn migrate_agent(
     let info = WorkspaceInfo::Workset {
         workset: workset.id().to_owned(),
         cwd: camino::Utf8PathBuf::from(rho_fs_view::MOUNT_ROOT).join(&name),
-        mode: rho_fs_view::WorksetMode::default(),
+        mode,
         origin: Some(camino::Utf8PathBuf::from(&origin)),
     };
     let mut write = db.write().await;
@@ -292,6 +299,7 @@ async fn migrate_agent(
         workset.id()
     );
     println!("  origin {origin}");
+    println!("  mode {mode:?}");
     println!("  branch migrated at {base}");
     if !empty {
         println!("  working copy {tip} staged on top");
