@@ -12774,16 +12774,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-agent-distro"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "rho-agent-tools"
 version = "0.1.0"
 dependencies = [
