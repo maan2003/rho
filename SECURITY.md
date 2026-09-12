@@ -782,6 +782,34 @@ own tools denied.
   existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
   the JavaScript runtime for all other code-mode roles.
 
+## Native context rotation and notes
+
+- Full transcripts and original call identities remain durable; rotation changes
+  only the provider-visible suffix through a typed transcript activation item.
+  Inference derives the cutoff from that item and excludes pre-activation provider
+  continuation, rather than trusting a separate request offset. Python and
+  jobs continue live. Preparation holds new input, mail, and unrelated updates,
+  while still satisfying mandatory tool results. One failed preparation cell may
+  receive one repair response if 8000 tokens of reported headroom remain. Explicit
+  cancellation stops preparation; restart does not replay it autonomously.
+- Notes live in `worksets/<id>/state/notes`, created with mode 0700 outside
+  code checkouts. All agents in the workset, including children, share the files;
+  there is no per-agent isolation or write arbitration. The path is included in
+  instructions, not prebound in Python. The existing workset state mount exposes
+  notes to Python and shell commands. Files survive restart and are deleted when
+  the workset is discarded; there is no separate retention policy or disk quota.
+- Notes are model-authored data, not privileged instructions. No content is
+  automatically injected. The rotation inventory lists at most five recent regular
+  files with JSON-escaped relative paths, line counts, and byte counts. Traversal
+  is limited to 10000 entries and depth 16, and line scans to 1 MiB per file, with
+  explicit partial/truncation notices. Symlinks are skipped and leaf opens use
+  no-follow/nonblocking flags. Concurrent same-user directory replacement is not
+  an isolation boundary. Bounded filesystem work runs off the async executor;
+  a stalled filesystem can still delay a boundary and its cancellation handling.
+- Tests cover queue/replay transitions, bounded repair, cancellation, live Python
+  preservation, old background jobs, provider replay, inventory ordering, escaping,
+  symlink exclusion, byte/line counts, and bounded scans.
+
 ## Headless evaluations (`rho eval`)
 
 The CLI runs the production agent loop with the selected native engineer role

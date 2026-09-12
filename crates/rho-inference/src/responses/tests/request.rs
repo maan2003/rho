@@ -451,7 +451,7 @@ fn configured_compaction_threshold_overrides_provider_default() {
         auth,
         "gpt-test",
         PromptCacheKey::from_bytes(*b"testkey1"),
-        Some(AutoCompaction::Threshold(42_000)),
+        Some(42_000),
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
@@ -471,7 +471,7 @@ fn chatgpt_codex_with_compaction_requests_configured_threshold() {
         auth,
         "gpt-test",
         PromptCacheKey::from_bytes(*b"testkey1"),
-        Some(AutoCompaction::Threshold(232_560)),
+        Some(232_560),
     );
     let request = inference_request(vec![user_block("hello")], Vec::new());
 
@@ -490,7 +490,7 @@ fn compaction_trigger_is_the_last_provider_input_item() {
         auth,
         "gpt-test",
         PromptCacheKey::from_bytes(*b"testkey1"),
-        Some(AutoCompaction::Threshold(42_000)),
+        Some(42_000),
     );
     let request = inference_request(
         vec![
@@ -966,4 +966,161 @@ fn current_exec_reply_precedes_background_updates_and_is_only_paired_once() {
             })
         );
     }
+}
+
+#[test]
+fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_calls() {
+    let old_call = inference_response(
+        Some("old-response"),
+        vec![InferenceResponseItem::ToolCall {
+            provider_specific: provider_specific(
+                "custom_tool_call",
+                json!({
+                    "type": "custom_tool_call", "id": "old-item", "call_id": "old-call",
+                    "name": "exec", "input": "old code",
+                }),
+            ),
+            id: tool_call_id("old-call"),
+            name: tool_name("exec"),
+            tool_type: ToolType::Custom,
+            arguments: "old code".into(),
+        }],
+    );
+    let mut result = tool_result_success(tool_call_id("old-call"), "late output");
+    result.tool_type = ToolType::Custom;
+    result.body.images = Arc::new(vec![rho_core::ImageContent {
+        media_type: "image/png".into(),
+        data: vec![1, 2, 3],
+        detail: rho_core::ImageDetail::High,
+    }]);
+    let mut request = inference_request(
+        vec![
+            user_block("discard this old request"),
+            old_call,
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "retention boundary".into(),
+            }),
+            Arc::new(ContextBlock::ToolResults {
+                results: vec![result],
+            }),
+            Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+                call_id: tool_call_id("old-call"),
+                tool_type: ToolType::Custom,
+                output: Arc::new("later update".into()),
+                full_output: None,
+                at: UnixMs(1),
+            })),
+        ],
+        Vec::new(),
+    );
+    request
+        .input
+        .push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
+    let body = ResponsesRequest::from_inference_request(
+        &test_inference_service("gpt-test").config,
+        request,
+        Some("old-response"),
+    );
+    let json = serde_json::to_value(body).unwrap();
+    assert!(json.get("previous_response_id").is_none());
+    let input = json["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[0]["role"], "developer");
+    assert_eq!(input[0]["content"][0]["text"], "retention boundary");
+    assert_eq!(input[1]["type"], "function_call_output");
+    assert_eq!(input[1]["name"], "exec");
+    assert!(input[1].get("call_id").is_none());
+    assert_eq!(input[1]["output"][0]["text"], "late output");
+    assert_eq!(input[1]["output"][1]["type"], "input_image");
+    assert_eq!(input[2]["name"], "exec");
+    assert!(input[2].get("call_id").is_none());
+}
+
+#[test]
+fn rotated_context_preserves_retained_call_result_pairs() {
+    let mut request = inference_request(
+        vec![
+            user_block("discard"),
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "boundary".into(),
+            }),
+            inference_response(
+                None,
+                vec![InferenceResponseItem::ToolCall {
+                    provider_specific: provider_specific(
+                        "function_call",
+                        json!({
+                            "type": "function_call", "id": "item", "call_id": "call",
+                            "name": "exec", "arguments": "{}",
+                        }),
+                    ),
+                    id: tool_call_id("call"),
+                    name: tool_name("exec"),
+                    tool_type: ToolType::Function,
+                    arguments: "{}".into(),
+                }],
+            ),
+            Arc::new(ContextBlock::ToolResults {
+                results: vec![tool_result_success(tool_call_id("call"), "done")],
+            }),
+        ],
+        Vec::new(),
+    );
+    request
+        .input
+        .push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
+    let body = ResponsesRequest::from_inference_request(
+        &test_inference_service("gpt-test").config,
+        request,
+        None,
+    );
+    let json = serde_json::to_value(body).unwrap();
+    assert_eq!(json["input"].as_array().unwrap().len(), 3);
+    assert_eq!(json["input"][1]["call_id"], "call");
+    assert_eq!(json["input"][2]["call_id"], "call");
+}
+
+#[test]
+fn rotation_activation_invalidates_retained_old_continuations_but_not_new_ones() {
+    let session = test_inference_service("gpt-test");
+    let mut request = inference_request(
+        vec![
+            user_block("old context"),
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "early marker".into(),
+            }),
+            inference_response(Some("prepared-in-old-window"), Vec::new()),
+        ],
+        Vec::new(),
+    );
+    // Merely announcing the boundary must not discard anything.
+    let before = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
+    assert_eq!(before.input[0]["content"][0]["text"], "old context");
+
+    request
+        .input
+        .push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
+    request.input.push(user_block("resume"));
+    let rotated = ResponsesRequest::from_inference_request(
+        &session.config,
+        request.clone(),
+        Some("prepared-in-old-window"),
+    );
+    assert!(rotated.previous_response_id.is_none());
+    assert_eq!(rotated.input.len(), 2);
+    assert_eq!(rotated.input[0]["content"][0]["text"], "early marker");
+    assert_eq!(rotated.input[1]["content"][0]["text"], "resume");
+
+    request
+        .input
+        .push(inference_response(Some("fresh-window"), Vec::new()));
+    request.input.push(user_block("next"));
+    let continued =
+        ResponsesRequest::from_inference_request(&session.config, request, Some("fresh-window"));
+    assert_eq!(
+        continued.previous_response_id.as_deref(),
+        Some("fresh-window")
+    );
+    assert_eq!(continued.input.len(), 1);
+    assert_eq!(continued.input[0]["content"][0]["text"], "next");
 }

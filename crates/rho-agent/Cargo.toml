@@ -18,6 +18,7 @@ futures.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
+rustix = { version = "1", features = ["fs"] }
 redb-derive = "0.1"
 rho-agent-tools.workspace = true
 rho-claude.workspace = true

@@ -141,8 +141,8 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             InputKind::Message { content } => message(source, content, *delivery, *at),
             InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
         },
-        AgentEvent::Sent { blocks, at, .. } => MirrorEvent::Sent {
-            results: blocks
+        AgentEvent::Sent { blocks, at, .. } | AgentEvent::ContextSent { blocks, at, .. } => {
+            let results = blocks
                 .iter()
                 .flat_map(|block| match block {
                     ContextBlock::ToolResults { results } => {
@@ -156,12 +156,28 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                     }],
                     _ => Vec::new(),
                 })
-                .collect(),
-            compaction: blocks
-                .iter()
-                .any(|block| matches!(block, ContextBlock::CompactionTrigger)),
-            at: *at,
-        },
+                .collect();
+            if matches!(
+                event,
+                AgentEvent::ContextSent {
+                    change: crate::ContextChange::Preparing { .. },
+                    ..
+                }
+            ) {
+                MirrorEvent::Results { results, at: *at }
+            } else {
+                MirrorEvent::Sent {
+                    results,
+                    compaction: blocks.iter().any(|block| {
+                        matches!(
+                            block,
+                            ContextBlock::CompactionTrigger | ContextBlock::ContextRotation { .. }
+                        )
+                    }),
+                    at: *at,
+                }
+            }
+        }
         AgentEvent::Replied {
             blocks,
             context_used,

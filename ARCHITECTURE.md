@@ -58,7 +58,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   mail and user input are pull-based sources it drains at that boundary; the
   model paces its own check-ins with the notebook's `set_checkin`. Its
   architecture and governing decisions are recorded under
-  `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
+  `crates/rho-agent/specs/`. Native context rotation persists an active suffix
+  boundary without deleting history, pauses ordinary drains for a dedicated
+  notes-preparation exchange, and resets provider continuation without replacing
+  Python or live jobs. Notes are shared workset files outside code checkouts; rotation
+  injects only a bounded metadata inventory, not their contents. See
+  [DESIGN-context-rotation](specs/DESIGN-context-rotation.md).
+  `rho-agent-tools` is the real tools in the
   shape that loop consumes.
 - `rho-fs-view` owns the state root (`~/.local/state/rho`) and the agent
   filesystem view; `WORKSET.md` is its design note and `VIEW.md` the

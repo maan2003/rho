@@ -95,6 +95,12 @@ pub(crate) fn build_request(
             ContextBlock::ToolUpdate(_) => {
                 bail!("Antigravity agents do not support tool updates")
             }
+            ContextBlock::ContextRotation { .. } => {
+                bail!("Antigravity agents do not support context rotation")
+            }
+            ContextBlock::DeveloperMessage { .. } => {
+                bail!("Antigravity agents do not support developer context messages")
+            }
             ContextBlock::CompactionTrigger => {
                 bail!("Antigravity agents do not support compaction")
             }
@@ -444,6 +450,18 @@ mod tests {
 
     #[test]
     fn rejects_custom_tools_and_images_before_transport() {
+        let rotation = InferenceRequest {
+            instructions: Arc::from(""),
+            input: vec![Arc::new(ContextBlock::ContextRotation { retain_from: 0 })],
+            agent_id_labels: Default::default(),
+            tools: Arc::from([]),
+        };
+        assert!(
+            build_request("1", "project", &rotation)
+                .unwrap_err()
+                .to_string()
+                .contains("context rotation")
+        );
         let image = InferenceRequest {
             instructions: Arc::from(""),
             input: vec![Arc::new(ContextBlock::UserMessage {

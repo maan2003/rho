@@ -3451,7 +3451,10 @@ fn agent_detail(
 ) -> rho_ui_proto::mirror::DetailBody {
     use rho_ui_proto::mirror::DetailBody;
     match db.read().agent_event(agent_id, pos.into()) {
-        Some(rho_agent::AgentEvent::Sent { blocks, .. }) => DetailBody::Results(
+        Some(
+            rho_agent::AgentEvent::Sent { blocks, .. }
+            | rho_agent::AgentEvent::ContextSent { blocks, .. },
+        ) => DetailBody::Results(
             blocks
                 .iter()
                 .flat_map(|block| match block {

@@ -306,6 +306,7 @@ impl Agent {
         let mut item = stream.item.clone();
         set_source(&mut item, stream.source[..stream.admitted].to_owned());
         stream.canonical = true;
+        self.context.replied(std::slice::from_ref(&item));
         let block = ContextBlock::InferenceResponse {
             items: vec![item],
             provider_response_id: None,
@@ -325,11 +326,15 @@ impl Agent {
 
     /// Called only after the boundary's Sent has committed its output and
     /// notes.
-    pub(super) async fn acknowledge_streams(&mut self, now: UnixMs) {
+    pub(super) async fn acknowledge_streams(
+        &mut self,
+        now: UnixMs,
+        delivered: &std::collections::BTreeSet<ToolCallId>,
+    ) {
         let mut ids = self
             .streams
             .iter()
-            .filter(|(_, stream)| stream.closed && stream.canonical)
+            .filter(|(id, stream)| delivered.contains(*id) && stream.closed && stream.canonical)
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         ids.extend(std::mem::take(&mut self.recovery_streams));
@@ -345,8 +350,14 @@ impl Agent {
         }
     }
 
-    pub(super) fn collect_stream_notes(&mut self) {
+    pub(super) fn collect_stream_notes(
+        &mut self,
+        delivered: Option<&std::collections::BTreeSet<ToolCallId>>,
+    ) {
         for (id, stream) in &mut self.streams {
+            if delivered.is_some_and(|ids| !ids.contains(id)) {
+                continue;
+            }
             if !stream.interrupted
                 && (stream.recovery || (stream.closed && stream.completed != stream.source.len()))
             {
@@ -370,13 +381,13 @@ impl Agent {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::agent) mod tests {
     use rho_core::{AppendString, ContextItemEvent, ProviderResponseItemId, ToolType};
     use rho_inference::OpenAiResponsesProviderData;
 
     use super::*;
 
-    async fn agent(directory: &std::path::Path) -> Agent {
+    pub(in crate::agent) async fn agent(directory: &std::path::Path) -> Agent {
         let db = RhoDb::open(directory.join("agent.redb"));
         let inference = Inference::new_with_config(
             db.clone(),
@@ -439,6 +450,7 @@ mod tests {
         );
         let surface = Surface {
             instructions: Arc::from("test"),
+            notes: None,
             tools: BTreeMap::from([(tool.spec().name, tool)]),
         };
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -456,6 +468,7 @@ mod tests {
             },
             model,
             history: Vec::new(),
+            context: Default::default(),
             session: inference.deep_session(profile, model, key),
             phase: Phase::Requesting(InFlight::default()),
             user: Vec::new(),
@@ -784,6 +797,24 @@ mod tests {
                 .iter()
                 .any(|note| note.contains(&format!("bytes 0..{}", source.len())))
         );
+        let old = ToolCallId::try_from("one").unwrap();
+        agent
+            .acknowledge_streams(UnixMs::now(), &Default::default())
+            .await;
+        assert!(
+            agent.streams.contains_key(&old),
+            "held stream evidence must survive preparation"
+        );
+        agent
+            .acknowledge_streams(
+                UnixMs::now(),
+                &std::collections::BTreeSet::from([old.clone()]),
+            )
+            .await;
+        assert!(
+            !agent.streams.contains_key(&old),
+            "delivered settled evidence may be retired"
+        );
     }
     #[tokio::test]
     async fn rewind_rebuilds_recovery_state_instead_of_carrying_abandoned_notes() {
@@ -870,7 +901,7 @@ mod tests {
                     },
                 );
                 if await_job {
-                    agent.collect_stream_notes();
+                    agent.collect_stream_notes(None);
                     assert!(agent.recovery_notes.is_empty());
                 }
                 std::fs::write(directory.path().join("release"), "").unwrap();

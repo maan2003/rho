@@ -1608,6 +1608,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         AgentEvent::Transcript { .. }
         | AgentEvent::Accepted(_)
         | AgentEvent::Sent { .. }
+        | AgentEvent::ContextSent { .. }
         | AgentEvent::QueueCleared
         | AgentEvent::Cleared { .. }
         | AgentEvent::Turn { .. }
@@ -1734,6 +1735,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
         }
         AgentEvent::Accepted(_)
         | AgentEvent::Sent { .. }
+        | AgentEvent::ContextSent { .. }
         | AgentEvent::Replied { .. }
         | AgentEvent::QueueCleared
         | AgentEvent::Cleared { .. }

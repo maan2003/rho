@@ -223,6 +223,37 @@ pub enum ContextBlock {
         provider_response_id: Option<ProviderResponseId>,
     },
     CompactionTrigger,
+    /// Activate a new provider window without deleting transcript history.
+    /// `retain_from` is an inclusive index into the complete block history
+    /// (including control blocks), no later than this block. Cutoffs may only
+    /// advance. This item emits no provider content and invalidates all
+    /// provider continuations established before it.
+    ContextRotation {
+        retain_from: u64,
+    },
+    /// Harness-authored context, distinct from user input and tool output.
+    DeveloperMessage {
+        text: String,
+    },
+}
+
+/// Interpret harness-authored rotation items in complete, append-only history.
+/// Earlier blocks remain available for tool identity lookup, not model replay.
+/// Panics for invalid forward references or a cutoff that reopens discarded
+/// history: these are caller contract violations, not provider input.
+pub fn context_window_start(history: &[Arc<ContextBlock>]) -> usize {
+    let mut start = 0;
+    for (index, block) in history.iter().enumerate() {
+        if let ContextBlock::ContextRotation { retain_from } = &**block {
+            let next = usize::try_from(*retain_from).expect("context index fits usize");
+            assert!(
+                next >= start && next <= index,
+                "invalid context rotation boundary"
+            );
+            start = next;
+        }
+    }
+    start
 }
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
@@ -716,6 +747,38 @@ pub fn text_content(parts: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_rotation_is_an_append_only_window_boundary() {
+        let mut history = vec![
+            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
+            Arc::new(ContextBlock::DeveloperMessage {
+                text: "early marker".into(),
+            }),
+        ];
+        assert_eq!(context_window_start(&history), 0);
+        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
+        assert_eq!(context_window_start(&history), 1);
+        history.push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
+        assert_eq!(context_window_start(&history), 2);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid context rotation boundary")]
+    fn rotation_rejects_forward_references() {
+        context_window_start(&[Arc::new(ContextBlock::ContextRotation { retain_from: 1 })]);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid context rotation boundary")]
+    fn rotation_cannot_reopen_discarded_history() {
+        context_window_start(&[
+            Arc::new(ContextBlock::DeveloperMessage { text: "old".into() }),
+            Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
+            Arc::new(ContextBlock::ContextRotation { retain_from: 0 }),
+        ]);
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
     struct TestProviderSpecificData {

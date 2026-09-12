@@ -173,7 +173,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             continue;
         };
         match event {
-            AgentEvent::Sent { blocks, .. } => {
+            AgentEvent::Sent { blocks, .. } | AgentEvent::ContextSent { blocks, .. } => {
                 requests += 1;
                 emit(json!({"type":"request", "number":requests}))?;
                 for block in blocks.iter() {

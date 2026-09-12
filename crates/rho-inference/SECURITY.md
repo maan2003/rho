@@ -85,7 +85,18 @@ GenerateContent requests for the explicit Gemini agent mode.
   not cancel in-flight turns. Replacing an idle connection deliberately clears
   its connection-bound response id, so the next request safely full-replays its
   transcript.
-- Antigravity rejects images, custom tools, tool updates, and compaction before
+- Native Responses context rotation disables automatic server summary compaction.
+  Requests carry full local history. Harness-authored `ContextRotation` items
+  select the active suffix, while earlier history remains available for tool-name
+  lookup. Forward or decreasing cutoffs violate the trusted caller contract and
+  are rejected, not clamped. Activation items emit no provider content and
+  invalidate any cached response preceding activation, including retained
+  preparation responses. This does not depend on the caller aborting its session.
+  Developer notices remain developer-role input and never activate rotation.
+  Late results from dropped calls become standalone named outputs, preserving
+  images without emitting orphan call ids. Tests cover retained call/result pairs,
+  late output projection, pre-activation cache rejection, and post-activation chaining.
+- Antigravity rejects rotation items, developer notices, images, custom tools, tool updates, and compaction before
   network I/O. Remote function names and ids pass through validated `rho-core`
   types, while thought signatures persist as tagged opaque provider data.
 

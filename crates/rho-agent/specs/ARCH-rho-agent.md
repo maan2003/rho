@@ -63,7 +63,8 @@ the suffix as EOF or replaying earlier units. An admitted prefix becomes the
 original call's accepted source and ends the model turn normally; its cell and
 commands retain ordinary boundary waiting and check-in semantics. Only failures
 before admission use transport retry backoff. Continuations rebuild input by
-draining every source, rather than resending a cached provider request. Its shared Rust execution
+draining sources, rather than resending a cached provider request (with the
+dedicated-preparation exception in DECISION-pull-based-sources). Its shared Rust execution
 handle and each host operation report distinct source facts; a provider reply
 does not mean that Python finished. Native callbacks synchronously update the
 handle from the interpreter thread, including its model-authored patience.
@@ -91,6 +92,16 @@ walks back to the root and replays forwards
 ([DECISION-history-only-branches](DECISION-history-only-branches.md)).
 Instructions are deliberately not among the stored fields
 ([DECISION-instructions-are-code](DECISION-instructions-are-code.md)).
+
+Native context rotation retains a verbatim suffix of full history; the active
+window boundary is a typed `ContextRotation` transcript item, persisted with
+its ordinary drain. Early marker and preparation events describe scheduling, not
+a separate active-window authority. Preparation supplies response/cell-completion facts to `boundary`; it
+holds unrelated sources without cancelling their work. Provider continuation is
+reset at rotation, not the Python surface. Shared workset filesystem notes are outside
+code checkouts and transcript lineage; children inherit the same directory,
+and only a bounded metadata inventory is injected.
+See [DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md).
 
 ## Invariants
 

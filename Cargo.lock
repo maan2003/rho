@@ -12765,6 +12765,7 @@ dependencies = [
  "rho-tool-shell",
  "rho-ui-proto",
  "rho-web-search",
+ "rustix 1.1.4",
  "senax-encoder",
  "serde",
  "serde_json",

@@ -95,6 +95,16 @@ takes.
 Required by
 [REQ-provider-transcript-protocol](REQ-provider-transcript-protocol.md).
 
+### Context rotation
+
+A live rotation preserves Python and jobs; a restart never does. Replay retains
+the last committed active-window boundary but abandons an unfinished preparation
+exchange. The next independently triggered request explains that note writes may
+already have happened; it must not automatically replay them. Preparing sends do
+not acknowledge held input or unrelated streaming evidence. A committed rotation
+clears old occupancy along with advancing the window. Notes are ordinary external
+filesystem effects and are not rewound with conversation.
+
 ### Live stream failure
 
 Transport failure is not source EOF. Stop admitting Python units, discard the

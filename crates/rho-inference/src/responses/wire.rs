@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::session::{
-    AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, SessionConfig, TextVerbosity,
+    ReasoningContext, ResponsesEffort, ServiceTier, SessionConfig, TextVerbosity,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,9 +211,15 @@ impl ResponsesRequest {
         request: InferenceRequest,
         cached_response_id: Option<&str>,
     ) -> Self {
+        let context_start = rho_core::context_window_start(&request.input);
         let mut previous_response = None;
         if let Some(cached_response_id) = cached_response_id {
-            for (index, block) in request.input.iter().enumerate() {
+            for (index, block) in request.input.iter().enumerate().skip(context_start) {
+                if matches!(&**block, ContextBlock::ContextRotation { .. }) {
+                    // Even retained preparation responses still contain the
+                    // old server context. Only post-activation chains are safe.
+                    previous_response = None;
+                }
                 let ContextBlock::InferenceResponse {
                     provider_response_id,
                     items,
@@ -239,12 +245,18 @@ impl ResponsesRequest {
             }
         }
 
-        Self::from_inference_request_with_previous(session, request, previous_response)
+        Self::from_inference_request_with_previous(
+            session,
+            request,
+            context_start,
+            previous_response,
+        )
     }
 
     fn from_inference_request_with_previous(
         session: &SessionConfig,
         request: InferenceRequest,
+        context_start: usize,
         previous_response: Option<(String, usize)>,
     ) -> Self {
         // Resolve names before incremental replay or compaction hides calls.
@@ -263,10 +275,22 @@ impl ResponsesRequest {
                 _ => None,
             })
             .collect::<std::collections::HashMap<_, _>>();
+        let retained_calls = request.input[context_start..]
+            .iter()
+            .filter_map(|block| match &**block {
+                ContextBlock::InferenceResponse { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|item| match item {
+                InferenceResponseItem::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
         let input_blocks = if let Some((_, next_block_index)) = previous_response.as_ref() {
             &request.input[*next_block_index..]
         } else {
-            request.input.as_slice()
+            &request.input[context_start..]
         };
 
         // Flatten the heterogeneous blocks into a single item timeline, then
@@ -288,7 +312,23 @@ impl ResponsesRequest {
             .iter()
             .filter(|item| !matches!(item, WireTimelineItem::CompactionTrigger))
         {
-            convert_timeline_item(item.clone(), &tool_names, &mut input);
+            if let WireTimelineItem::ToolResult(result) = item
+                && context_start > 0
+                && !retained_calls.contains(&result.call_id)
+            {
+                // The original call is outside this window. Deliver its real
+                // output as a standalone update, not an orphan result. Keep
+                // image content and the original callable name.
+                let mut output =
+                    convert_tool_result(result.clone(), tool_names.get(&result.call_id));
+                let object = output.as_object_mut().unwrap();
+                object.remove("call_id");
+                object.insert("type".into(), json!("function_call_output"));
+                object.insert("namespace".into(), json!("functions"));
+                input.push(output);
+            } else {
+                convert_timeline_item(item.clone(), &tool_names, &mut input);
+            }
         }
         // The Responses API requires a manual compaction trigger to be the
         // final input item. Multiple queued requests are equivalent, so
@@ -343,9 +383,7 @@ impl ResponsesRequest {
             .auto_compaction
             .as_ref()
             .map(|compaction| {
-                let compact_threshold = match compaction {
-                    AutoCompaction::Threshold(value) => *value,
-                };
+                let compact_threshold = *compaction;
                 vec![ContextManagementRequest {
                     ty: "compaction",
                     compact_threshold: Some(compact_threshold),
@@ -399,6 +437,7 @@ impl ResponsesRequest {
 #[derive(Clone)]
 enum WireTimelineItem {
     UserMessage(Vec<ContentPart>),
+    DeveloperMessage(String),
     CompactionTrigger,
     ToolResult(ToolResult),
     ToolUpdate(rho_core::ToolUpdate),
@@ -411,6 +450,10 @@ fn append_block_items(
     out: &mut Vec<WireTimelineItem>,
 ) {
     match block {
+        ContextBlock::ContextRotation { .. } => {}
+        ContextBlock::DeveloperMessage { text } => {
+            out.push(WireTimelineItem::DeveloperMessage(text.clone()));
+        }
         ContextBlock::UserMessage { sender, content } => match sender {
             rho_core::MessageSender::User => {
                 out.push(WireTimelineItem::UserMessage(content.clone()));
@@ -452,6 +495,10 @@ fn convert_timeline_item(
 ) {
     match item {
         WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
+        WireTimelineItem::DeveloperMessage(text) => out.push(json!({
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": text}],
+        })),
         WireTimelineItem::CompactionTrigger => out.push(json!({
             "type": "compaction_trigger",
         })),

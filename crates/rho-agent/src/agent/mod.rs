@@ -12,7 +12,11 @@
 //! `specs/ARCH-rho-agent.md` has the shape and the invariants.
 
 pub(crate) mod boundary;
+mod context;
+mod notes;
 pub(crate) mod replay;
+#[cfg(test)]
+mod rotation_tests;
 mod streaming;
 #[cfg(test)]
 mod tests;
@@ -88,6 +92,7 @@ pub(crate) struct MailItem {
 struct Surface {
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
     instructions: Arc<str>,
+    notes: Option<std::path::PathBuf>,
 }
 
 /// What a surface is built from; kept so a role change can build another.
@@ -289,6 +294,7 @@ impl AgentHandle {
             surface_inputs,
             model,
             history: replayed.history,
+            context: replayed.context,
             session,
             // The same phase a fresh agent starts in. Being loaded from a
             // log is not its own kind of state, and coming up is never by
@@ -677,6 +683,7 @@ struct Agent {
 
     /// The transcript. Append-only, and this struct is its sole writer.
     history: Vec<Arc<ContextBlock>>,
+    context: context::Window,
 
     session: InferenceSession,
     phase: Phase,
@@ -863,6 +870,23 @@ impl Agent {
                 latest: true,
             });
         }
+        if let Some(preparation) = &self.context.preparation {
+            let returned = preparation.call.as_ref().is_none_or(|id| {
+                self.tools.get(id).is_none_or(|tool| {
+                    tool.session
+                        .sources()
+                        .iter()
+                        .all(|(_, source)| match source {
+                            rho_agent_tools::SourceFacts::Cell(facts) => facts.returned.is_some(),
+                            rho_agent_tools::SourceFacts::Job(_) => true,
+                        })
+                })
+            });
+            sources.push(SourceKind::Preparation {
+                replied: preparation.replied,
+                returned,
+            });
+        }
         sources
     }
 
@@ -1010,6 +1034,7 @@ impl Agent {
                 }
             }
             Control::Cancel => {
+                self.context.preparation = None;
                 // Ask every tool to wind down, then keep reading it: the core
                 // does not kill tools, so a tool still chooses its own last
                 // words.
@@ -1061,6 +1086,9 @@ impl Agent {
     /// follows its row.
     async fn fail(&mut self, now: UnixMs, partial: PendingInferenceResponse, error: String) {
         self.abandon_stream(now).await;
+        // A terminal failure must not leave an unreplied preparation gate
+        // blocking fresh input or an explicit retry.
+        self.context.preparation = None;
         self.persist(AgentEvent::Failed {
             partial,
             error: std::borrow::Cow::Borrowed(error.as_str()),
@@ -1190,6 +1218,7 @@ impl Agent {
         let (_, events) = self.db.read().agent_events(self.agent_id);
         let replayed = replay::replay(events);
         self.history = replayed.history;
+        self.context = replayed.context;
         self.recovery_notes = replayed.recovery_notes;
         self.recovery_blocks = replayed.recovery_blocks;
         self.recovery_streams = replayed.recovery_streams;
@@ -1302,6 +1331,7 @@ impl Agent {
             .values()
             .map(|tool| tool.spec())
             .collect::<Arc<[ToolSpec]>>();
+        let notes_path = surface.notes.clone();
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
         let previous_failure = match &self.phase {
@@ -1321,12 +1351,78 @@ impl Agent {
             } => Some((*since, *attempts)),
             _ => None,
         };
+        let prior_preparation = self.context.preparation.clone();
+        let limit = self.session.auto_compact_token_limit();
+        let manual = self
+            .user
+            .iter()
+            .any(|input| matches!(input.kind, InputKind::Compaction));
+        let mut rotate = None;
+        let mut change = if let Some(preparation) = &prior_preparation {
+            if !preparation.replied {
+                Some(crate::ContextChange::Preparing {
+                    retain_from: preparation.retain_from as u64,
+                    repair: preparation.repair,
+                })
+            } else {
+                let failed = preparation.call.as_ref().is_some_and(|id| {
+                    self.tools.get(id).is_some_and(|tool| {
+                        tool.session.sources().iter().any(|(_, source)| {
+                        matches!(source, rho_agent_tools::SourceFacts::Cell(facts) if facts.failed)
+                    })
+                    })
+                });
+                let headroom = self
+                    .session
+                    .context_window()
+                    .zip(self.context_used)
+                    .is_some_and(|(window, used)| {
+                        window.saturating_sub(used) >= context::REPAIR_HEADROOM
+                    });
+                if failed && !preparation.repair && headroom {
+                    Some(crate::ContextChange::Preparing {
+                        retain_from: preparation.retain_from as u64,
+                        repair: true,
+                    })
+                } else {
+                    rotate = Some(preparation.retain_from);
+                    None
+                }
+            }
+        } else if manual
+            || limit
+                .zip(self.context_used)
+                .is_some_and(|(limit, used)| used >= limit)
+        {
+            Some(crate::ContextChange::Preparing {
+                retain_from: self
+                    .context
+                    .marker
+                    .unwrap_or_else(|| self.context.fallback_start(&self.history))
+                    as u64,
+                repair: false,
+            })
+        } else {
+            None
+        };
+        let preparing = matches!(change, Some(crate::ContextChange::Preparing { .. }));
+        let preparation_call = prior_preparation
+            .as_ref()
+            .and_then(|preparation| preparation.call.as_ref());
         let owed = match &mut self.phase {
             Phase::Idle { owed, .. } => std::mem::take(owed),
             Phase::Requesting(_) => Vec::new(),
         };
+        let delivered = self
+            .tools
+            .iter()
+            .filter(|(id, tool)| {
+                !preparing || tool.answer == ToolCallAnswer::Owed || preparation_call == Some(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut blocks = std::mem::take(&mut self.recovery_blocks);
-        self.collect_stream_notes();
+        self.collect_stream_notes(Some(&delivered));
         if !owed.is_empty() {
             blocks.push(ContextBlock::ToolResults {
                 results: owed
@@ -1370,6 +1466,9 @@ impl Agent {
         let mut tools = self.tools.values_mut().collect::<Vec<_>>();
         tools.sort_by_key(|tool| tool.output_order(latest));
         for tool in tools {
+            if !delivered.contains(&tool.call.id) {
+                continue;
+            }
             // Whatever the tool is reporting: a request that leaves one call
             // unanswered is rejected whole, so the first drain after a call is
             // made answers it and the tool says what it has, even if that is
@@ -1430,7 +1529,8 @@ impl Agent {
         // a tool that answers `true` here has had its last chance to speak and
         // is choosing not to want another. Nothing to record — a reaped call is
         // one the transcript has finished talking about.
-        self.tools.retain(|_, tool| !tool.session.done());
+        self.tools
+            .retain(|id, tool| !delivered.contains(id) || !tool.session.done());
         // Everything pending went into this request; the next event's clock
         // starts fresh.
         self.observations.clear();
@@ -1438,37 +1538,37 @@ impl Agent {
             blocks.push(ContextBlock::ToolResults { results });
         }
         blocks.extend(updates);
-        // One block per sender: several messages from the same peer collapse,
-        // so a chatty one costs the model one block rather than five.
-        let mut by_sender: BTreeMap<AgentId, Vec<ContentPart>> = BTreeMap::new();
-        for item in std::mem::take(&mut self.mail) {
-            by_sender
-                .entry(item.sender)
-                .or_default()
-                .extend(item.content);
-        }
-        blocks.extend(
-            by_sender
-                .into_iter()
-                .map(|(sender, content)| ContextBlock::UserMessage {
+        if !preparing {
+            // One block per sender: several messages from the same peer collapse,
+            // so a chatty one costs the model one block rather than five.
+            let mut by_sender: BTreeMap<AgentId, Vec<ContentPart>> = BTreeMap::new();
+            for item in std::mem::take(&mut self.mail) {
+                by_sender
+                    .entry(item.sender)
+                    .or_default()
+                    .extend(item.content);
+            }
+            blocks.extend(by_sender.into_iter().map(|(sender, content)| {
+                ContextBlock::UserMessage {
                     sender: MessageSender::Agent { id: sender },
                     content,
-                }),
-        );
+                }
+            }));
 
-        // Every queued item is eligible at every boundary, so the drain is
-        // total. Compaction is stable-sorted to the back, because the trigger
-        // has to be the final input item and history would otherwise disagree
-        // with the request it produced: `REQ-provider-transcript-protocol`.
-        let mut inputs = std::mem::take(&mut self.user);
-        inputs.sort_by_key(|input| matches!(input.kind, InputKind::Compaction));
-        blocks.extend(inputs.into_iter().map(|input| match input.kind {
-            InputKind::Message { content } => ContextBlock::UserMessage {
-                sender: MessageSender::User,
-                content,
-            },
-            InputKind::Compaction => ContextBlock::CompactionTrigger,
-        }));
+            // Ordinary input enters only outside the dedicated preparation exchange.
+            blocks.extend(
+                std::mem::take(&mut self.user)
+                    .into_iter()
+                    .filter_map(|input| match input.kind {
+                        InputKind::Message { content } => Some(ContextBlock::UserMessage {
+                            sender: MessageSender::User,
+                            content,
+                        }),
+                        // Explicit compact uses the same rotation path, never a provider summary.
+                        InputKind::Compaction => None,
+                    }),
+            );
+        }
 
         for text in std::mem::take(&mut self.recovery_notes) {
             let index = blocks
@@ -1484,66 +1584,91 @@ impl Agent {
             );
         }
 
-        // Automatic compaction is not an input — it is something the core does
-        // while assembling a request. (A user-requested compaction *is* an
-        // input, and arrives through the user queue.)
-        let over_limit = self
-            .session
-            .auto_compact_token_limit()
-            .zip(self.context_used)
-            .is_some_and(|(limit, used)| used >= limit);
-        // A trigger can already be on the table two ways: this drain carries a
-        // `/compact`, or an earlier request pushed one and never got its answer
-        // because it failed — which is what reading back as far as the latest
-        // response finds.
-        let compacting_already = blocks.contains(&ContextBlock::CompactionTrigger)
-            || self
-                .history
-                .iter()
-                .rev()
-                .find_map(|block| match &**block {
-                    ContextBlock::CompactionTrigger => Some(true),
-                    ContextBlock::InferenceResponse { .. } => Some(false),
-                    ContextBlock::UserMessage { .. }
-                    | ContextBlock::ToolResults { .. }
-                    | ContextBlock::ToolUpdate(_) => None,
-                })
-                .unwrap_or(false);
-        let compact = over_limit && !compacting_already;
-        if compact {
-            blocks.push(ContextBlock::CompactionTrigger);
+        if let Some(crate::ContextChange::Preparing {
+            retain_from,
+            repair,
+        }) = &change
+        {
+            let text = if *repair {
+                context::REPAIR.to_owned()
+            } else if self.context.marker.is_some() {
+                context::PREPARE.to_owned()
+            } else {
+                context::fallback_notice(&self.history, *retain_from as usize)
+            };
+            blocks.push(ContextBlock::DeveloperMessage { text });
+        } else if let Some(retain_from) = rotate {
+            blocks.push(ContextBlock::ContextRotation {
+                retain_from: retain_from as u64,
+            });
+            let inventory = if let Some(path) = notes_path {
+                tokio::task::spawn_blocking(move || notes::inventory(&path))
+                    .await
+                    .unwrap_or_else(|_| "Notes inventory unavailable.".into())
+            } else {
+                "Notes inventory unavailable.".into()
+            };
+            blocks.push(ContextBlock::DeveloperMessage {
+                text: format!(
+                    "Context has rotated. Older conversation before the announced boundary is no \
+                     longer in context; the retained conversation and preparation exchange remain. \
+                     The earlier retention and preparation notices are now fulfilled; wait for a new \
+                     notice before preparing for another rotation. Python state and running jobs were \
+                     preserved. Read relevant notes and use the retained conversation and tool state \
+                     to build on the work already done and avoid duplicating work. Continue the user's task.\n\n{inventory}"
+                ),
+            });
+        } else if self.context.marker.is_none()
+            && limit
+                .zip(self.context_used)
+                .is_some_and(|(limit, used)| used >= limit.saturating_sub(context::RETAIN_TOKENS))
+        {
+            change = Some(crate::ContextChange::Marked {
+                retain_from: (self.history.len() + blocks.len()) as u64,
+            });
+            blocks.push(ContextBlock::DeveloperMessage {
+                text: context::MARKER.to_owned(),
+            });
         }
-        // Once it compacts, is the agent still owed a reply? A compaction is a
-        // means, not an end: whatever else rode in the request is inside the
-        // summary now rather than answered, and one the core asked for displaced
-        // a request that had its own purpose. Only a bare `/compact` asks for
-        // nothing further, and that is where the agent stops.
-        let owes_reply = compact
-            || blocks
-                .iter()
-                .any(|block| *block != ContextBlock::CompactionTrigger);
 
         // The drain, the append and the send are one event because they are one
         // thing: a crash between them would leave a transcript nobody drained
         // into and a queue nobody emptied.
-        self.persist(AgentEvent::Sent {
-            blocks: Cow::Borrowed(&blocks),
-            at: now,
-            wake,
-        })
-        .await;
+        if let Some(change) = &change {
+            self.persist(AgentEvent::ContextSent {
+                blocks: Cow::Borrowed(&blocks),
+                change: change.clone(),
+                at: now,
+                wake,
+            })
+            .await;
+            self.context.sent(change);
+        } else {
+            self.persist(AgentEvent::Sent {
+                blocks: Cow::Borrowed(&blocks),
+                at: now,
+                wake,
+            })
+            .await;
+        }
+        if rotate.is_some() {
+            self.context.rotated();
+            self.context_used = None;
+            self.session.abort();
+        }
         self.history.extend(blocks.into_iter().map(Arc::new));
-        self.acknowledge_streams(now).await;
+        self.acknowledge_streams(now, &delivered).await;
         self.session.request_once(InferenceRequest {
             instructions,
             input: self.history.clone(),
+
             agent_id_labels: Default::default(),
             tools: tool_specs,
         });
         self.phase = Phase::Requesting(InFlight {
             retry,
             previous_failure,
-            compaction_owes_reply: owes_reply,
+            compaction_owes_reply: !preparing,
             ..InFlight::default()
         });
     }
@@ -1600,6 +1725,8 @@ impl Agent {
         }
         let final_text = calls.is_empty().then(|| final_answer_text(&items));
 
+        let preparing = self.context.preparation.is_some();
+        self.context.replied(&items);
         let block = ContextBlock::InferenceResponse {
             items,
             provider_response_id,
@@ -1683,6 +1810,7 @@ impl Agent {
         // classifies it.
         if let Some(final_text) = final_text
             && !compacted
+            && !preparing
         {
             if let Some(pool) = self.pool.upgrade() {
                 pool.publish_completed_turn(AgentTurnCompleted {
@@ -1827,6 +1955,7 @@ impl Agent {
                     .tools
                     .values()
                     .any(|tool| tool.answer == ToolCallAnswer::Owed)
+                    || self.context.preparation.is_some()
                     || deadline.is_some() =>
             {
                 AgentStateKind::ToolCalling {
@@ -1962,6 +2091,13 @@ fn surface(
         role,
         &others.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     );
+    let notes = inference
+        .map(|_| notes::directory(view.workset()))
+        .transpose()?;
+    let instructions = match notes.as_ref() {
+        Some(path) => Arc::from(format!("{}{}", instructions, notes::instructions(path))),
+        None => instructions,
+    };
     let tool: Arc<dyn Tool> = Arc::new(
         rho_agent_tools::PythonTool::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
@@ -1969,6 +2105,7 @@ fn surface(
     Ok(Surface {
         tools: BTreeMap::from([(tool.spec().name, tool)]),
         instructions,
+        notes,
     })
 }
 

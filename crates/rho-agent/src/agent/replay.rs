@@ -12,6 +12,7 @@ use crate::{AgentEvent, InputKind, QueuedInput};
 #[derive(Default)]
 pub(crate) struct Replayed {
     pub history: Vec<Arc<ContextBlock>>,
+    pub(super) context: super::context::Window,
     pub recovery_notes: Vec<String>,
     pub recovery_blocks: Vec<ContextBlock>,
     pub recovery_streams: Vec<rho_core::ToolCallId>,
@@ -26,6 +27,7 @@ pub(crate) struct Replayed {
 pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut history: Vec<Arc<ContextBlock>> = Vec::new();
     let mut context_used = None;
+    let mut context = super::context::Window::default();
     let mut streams =
         BTreeMap::<rho_core::ToolCallId, (rho_core::InferenceResponseItem, String, usize)>::new();
     let mut canonical = BTreeSet::new();
@@ -36,7 +38,10 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut mail = Vec::new();
 
     for event in events {
-        if let AgentEvent::Sent { blocks, .. } | AgentEvent::Replied { blocks, .. } = &event {
+        if let AgentEvent::Sent { blocks, .. }
+        | AgentEvent::ContextSent { blocks, .. }
+        | AgentEvent::Replied { blocks, .. } = &event
+        {
             for block in blocks.iter() {
                 if let ContextBlock::InferenceResponse { items, .. } = block {
                     for item in items {
@@ -55,9 +60,24 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             }
             // A drain is total: whatever was queued rode in these blocks.
             AgentEvent::Sent { blocks, .. } => {
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
+                {
+                    context.rotated();
+                    context_used = None;
+                }
                 history.extend(blocks.into_owned().into_iter().map(Arc::new));
                 user.clear();
                 mail.clear();
+            }
+            AgentEvent::ContextSent { blocks, change, .. } => {
+                if !matches!(change, crate::ContextChange::Preparing { .. }) {
+                    user.clear();
+                    mail.clear();
+                }
+                context.sent(&change);
+                history.extend(blocks.into_owned().into_iter().map(Arc::new));
             }
             AgentEvent::PythonStream { event, .. } => {
                 use crate::PythonStreamEvent;
@@ -96,6 +116,11 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                 context_used: replied,
                 ..
             } => {
+                for block in blocks.iter() {
+                    if let ContextBlock::InferenceResponse { items, .. } = block {
+                        context.replied(items);
+                    }
+                }
                 history.extend(blocks.into_owned().into_iter().map(Arc::new));
                 context_used = replied;
             }
@@ -142,11 +167,20 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             ),
         ));
     }
+    if context.preparation.take().is_some() {
+        recovery_notes.push(
+            "Rho restarted during context-rotation preparation. Notes may already have been \
+             written; inspect them rather than replaying preparation code. The old context \
+             has not been removed."
+                .into(),
+        );
+    }
     let mut recovery_history = history.clone();
     recovery_history.extend(recovery_blocks.iter().cloned().map(Arc::new));
     let owed = owed_calls(&recovery_history);
     Replayed {
         history,
+        context,
         recovery_notes,
         recovery_blocks,
         recovery_streams,
@@ -202,7 +236,9 @@ pub(crate) fn owed_calls(history: &[Arc<ContextBlock>]) -> Vec<ToolCall> {
             }
             ContextBlock::UserMessage { .. }
             | ContextBlock::ToolUpdate(_)
-            | ContextBlock::CompactionTrigger => {}
+            | ContextBlock::CompactionTrigger
+            | ContextBlock::DeveloperMessage { .. }
+            | ContextBlock::ContextRotation { .. } => {}
         }
     }
     unanswered

@@ -15,7 +15,7 @@ no separate record of its contents.
   store.sock           # the mirror keeper's socket
   cache/               # every agent's ~/.cache (VIEW.md)
   worksets/<id>/src    # one directory per workset
-  worksets/<id>/state  # its direnv layout and nix GC roots
+  worksets/<id>/state  # its direnv layout, nix GC roots, and shared notes
 ```
 
 `Worksets::open` creates the root and starts the mirror keeper
@@ -84,7 +84,9 @@ a plain directory or file except a handful of real mounts:
   optional skeleton. The host home is not mounted at all; `~/.cache` is
   the shared persistent cache.
 - The workset's state directory, read-write at its host path, so the
-  nix GC roots direnv registers there resolve on the host.
+  nix GC roots direnv registers there resolve on the host. Native context-rotation
+  notes live in `state/notes`, shared by all agents in the workset and removed
+  with it.
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
 - `/src`: the workset directory, read-write. The command starts here.

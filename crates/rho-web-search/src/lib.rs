@@ -184,7 +184,9 @@ fn recent_input(blocks: &[Arc<ContextBlock>]) -> Option<Vec<ResponseItem>> {
             }
             ContextBlock::ToolResults { .. }
             | ContextBlock::ToolUpdate(_)
-            | ContextBlock::CompactionTrigger => {}
+            | ContextBlock::CompactionTrigger
+            | ContextBlock::DeveloperMessage { .. }
+            | ContextBlock::ContextRotation { .. } => {}
         }
     }
 

@@ -203,7 +203,7 @@ pub(crate) enum InferenceSessionMode {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ResponsesConfig {
     pub model: ResponsesModel,
-    pub auto_compaction: Option<AutoCompaction>,
+    pub auto_compaction: Option<u64>,
     pub reasoning_context: ReasoningContext,
     pub effort: ResponsesEffort,
     pub text_verbosity: TextVerbosity,
@@ -212,12 +212,10 @@ pub(crate) struct ResponsesConfig {
 
 impl ResponsesConfig {
     fn deep(config: InferenceProfile, model: ResponsesModel) -> Self {
-        let info = model.info();
         Self {
-            // Responses Lite rejects server-side compaction requests. The
-            // agent's explicit trigger policy works for both wire shapes.
-            auto_compaction: (!model.use_responses_lite())
-                .then_some(AutoCompaction::Threshold(info.auto_compact_token_limit)),
+            // The harness owns context rotation and its preparation window.
+            // Server compaction would silently erase the promised retained tail.
+            auto_compaction: None,
             model,
             reasoning_context: ReasoningContext::AllTurns,
             effort: config.effort.into(),
@@ -360,11 +358,6 @@ pub(crate) enum ReasoningContext {
     #[cfg(test)]
     CurrentTurn,
     AllTurns,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum AutoCompaction {
-    Threshold(u64),
 }
 
 impl InferenceSession {

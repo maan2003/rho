@@ -134,6 +134,11 @@ async fn run() {
         checkout.join("x")
     );
 
+    // Notes created after the namespace exists use the existing state mount.
+    let notes = workset.state_dir().unwrap().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("progress.md"), "before rotation").unwrap();
+
     // Inside the namespace `git` is Rho's git: the agent clones through
     // the keeper, works in the clone, fetches from the mirror, and cannot
     // write the store or the git directory. The command starts in /src.
@@ -176,6 +181,8 @@ test "$(echo piped | cat /dev/stdin)" = piped
 set -eu
 test "$PWD" = /src
 test -d /src/project
+test "$(cat {notes}/progress.md)" = "before rotation"
+printf 'after rotation' > {notes}/progress.md
 test "$RHO_GIT_STORE_SOCKET" = {socket}
 test -S "$RHO_GIT_STORE_SOCKET"
 {with_store}
@@ -186,6 +193,7 @@ if touch {store}/mirror 2>/dev/null; then echo "store is writable"; exit 1; fi
 if mkdir {stores}/x 2>/dev/null; then echo "store root is writable"; exit 1; fi
 test ! -e /src/.stores
 "#,
+        notes = notes,
         stores = root.store_root(),
         socket = root.store_socket().unwrap(),
         store = store.display(),
@@ -199,6 +207,28 @@ test ! -e /src/.stores
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(notes.join("progress.md")).unwrap(),
+        "after rotation"
+    );
+    let child = workset
+        .enter(
+            Mode::View {
+                home_skeleton: None,
+            },
+            Utf8Path::new("/src/project"),
+        )
+        .unwrap();
+    let mut command = tokio::process::Command::new(&sh);
+    command.arg("-c").arg(format!(
+        "test \"$(cat {notes}/progress.md)\" = \"after rotation\" && printf child > {notes}/child.md"
+    ));
+    child.prepare_command(&mut command, None).await.unwrap();
+    assert!(command.status().await.unwrap().success());
+    assert_eq!(
+        std::fs::read_to_string(notes.join("child.md")).unwrap(),
+        "child"
     );
     assert!(workset.root().join("second/written").exists());
     assert!(root.cache_dir().join("from-view").exists());

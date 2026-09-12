@@ -78,6 +78,14 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         wake: Option<WakeFacts>,
     },
+    /// A request boundary that also advances context rotation. Preparation
+    /// preserves queued input; other context boundaries drain it normally.
+    ContextSent {
+        blocks: Cow<'a, [ContextBlock]>,
+        change: ContextChange,
+        at: UnixMs,
+        wake: Option<WakeFacts>,
+    },
     /// The model answered, and the request is over.
     Replied {
         blocks: Cow<'a, [ContextBlock]>,
@@ -213,6 +221,14 @@ pub enum AgentEvent<'a> {
     },
 }
 
+/// Durable context transitions; indices refer to the complete block history,
+/// never to the shortened provider projection.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum ContextChange {
+    Marked { retain_from: u64 },
+    Preparing { retain_from: u64, repair: bool },
+}
+
 /// Why a request went out when it did: the scheduler's reading of its
 /// sources at the boundary (`agent/boundary.rs`), recorded with the request
 /// so the pace of a session can be judged from its log.
@@ -262,6 +278,7 @@ pub enum WakeTrigger {
     Finished,
     /// The model's check-in came due.
     Checkin,
+    ContextRotation,
 }
 
 /// One pending event as the scheduler saw it.
@@ -741,6 +758,7 @@ pub(crate) fn presentation_sources(
             AgentEvent::Transcript { .. }
             | AgentEvent::Accepted(_)
             | AgentEvent::Sent { .. }
+            | AgentEvent::ContextSent { .. }
             | AgentEvent::QueueCleared
             | AgentEvent::Cleared { .. }
             | AgentEvent::Turn { .. }
@@ -796,6 +814,28 @@ mod encoding_tests {
                 context_used: Some(12),
                 usage: None,
                 at: UnixMs(10),
+            },
+            AgentEvent::ContextSent {
+                blocks: Cow::Owned(vec![ContextBlock::DeveloperMessage {
+                    text: "boundary".into(),
+                }]),
+                change: ContextChange::Marked { retain_from: 1 },
+                at: UnixMs(11),
+                wake: None,
+            },
+            AgentEvent::ContextSent {
+                blocks: Cow::Owned(Vec::new()),
+                change: ContextChange::Preparing {
+                    retain_from: 1,
+                    repair: true,
+                },
+                at: UnixMs(11),
+                wake: None,
+            },
+            AgentEvent::Sent {
+                blocks: Cow::Owned(vec![ContextBlock::ContextRotation { retain_from: 1 }]),
+                at: UnixMs(11),
+                wake: None,
             },
             AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {

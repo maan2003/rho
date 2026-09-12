@@ -92,7 +92,19 @@ request builder:
   usable;
 - falls back to full transcript replay when the provider reports a stale or
   missing previous response;
-- trims input before the latest compaction item when replaying compacted history.
+- interprets `ContextBlock::ContextRotation` as a local activation item: its
+  `retain_from` index selects a suffix of full block history and the item itself
+  emits no wire content. Only responses after activation may supply a cached
+  continuation, even if an earlier response is inside the retained suffix;
+- resolves tool identities from full history so late output from dropped calls
+  can be emitted as standalone named output;
+- trims input before the latest legacy provider compaction item when replaying
+  compacted history. Native rotation does not request provider summary compaction.
+
+There is no separate request-window field. `rho-core::context_window_start`
+interprets and checks the typed activation items; `rho-agent` owns when to append
+them, not how providers project them. Early developer notices do not activate a
+window change.
 
 Responses request bodies use `store: false`; durable transcript persistence is
 owned by the agent/store layer, not by the inference service.

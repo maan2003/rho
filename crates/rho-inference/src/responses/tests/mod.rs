@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
 use super::session::{
-    AutoCompaction, ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
+    ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
     is_quota_exhaustion_error, is_transient_turn_error, transient_backoff,
 };
 use super::wire::{
@@ -274,7 +274,7 @@ fn test_inference_service_with(
     auth: InferenceAuth,
     model: impl Into<String>,
     prompt_cache_key: PromptCacheKey,
-    auto_compaction: Option<AutoCompaction>,
+    auto_compaction: Option<u64>,
 ) -> InferenceSession {
     let mut session = InferenceSession::new_deep(
         Inference::for_test(auth),
