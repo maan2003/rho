@@ -45,6 +45,8 @@ the life of the value. `prepare_command` enters it for a child process;
 in-process Python notebook. There are two modes, view and exposed, and
 in both the workset is at `/src`; `rho-workset-dev` enters one from the
 command line the way the daemon does.
+`VIEW.md` records the requirements and principles the view is being
+built towards, and why.
 
 **This is a layout, not a sandbox.** Everything runs as the invoking
 user in an unprivileged user namespace; no security boundary is

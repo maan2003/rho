@@ -61,7 +61,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
   shape that loop consumes.
 - `rho-workset` owns the state root (`~/.local/state/rho`) and the agent
-  filesystem view; `WORKSET.md` is its design note. A workset is one plain
+  filesystem view; `WORKSET.md` is its design note and `VIEW.md` the
+  requirements the view is built towards. A workset is one plain
   directory per agent group, presented at `/src`: the daemon does not
   interpret its contents, there is no workset table (the directory is the
   record), and nothing forks. An agent's record is a workset id, its working
