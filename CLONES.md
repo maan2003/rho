@@ -44,6 +44,12 @@ for everything else, arguments untouched:
   (`git remote add upstream ...; git fetch upstream`) gets a mirror of
   its own on first fetch and the clone borrows from both. `--all` and
   `--multiple` name several remotes at once and go to the real git.
+- `git subtree add|pull --prefix=<dir> <repository> <ref>` is routed the
+  same way, from outside: `git subtree` is a script, and git puts its
+  own exec path first on the script's PATH, so the script's nested
+  `git fetch` is the real git. The `insteadOf` the wrapper passes reaches
+  it through the environment, and the mirror is in the alternates before
+  the script starts.
 
 If the keeper cannot be reached the wrapper says so on stderr and runs
 the real git against the network. Without the socket variable it is

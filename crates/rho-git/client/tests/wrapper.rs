@@ -187,11 +187,19 @@ async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
 
     ok(wrapper(&work, Some(&keeper.socket), &["clone", "-q", url]));
     let clone = work.join("remote");
-    ok(wrapper(&clone, Some(&keeper.socket), &["remote", "add", "fork", fork_url]));
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["remote", "add", "fork", fork_url],
+    ));
 
     // Fetching a named remote: its mirror is made, joins the alternates,
     // and the objects are borrowed rather than packed.
-    ok(wrapper(&clone, Some(&keeper.socket), &["fetch", "-q", "fork"]));
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["fetch", "-q", "fork"],
+    ));
     assert_eq!(git(&clone, &["rev-parse", "fork/feature"]).trim(), fork_tip);
     let fork_mirror = keeper.store.mirror_dir(fork_url);
     assert!(fork_mirror.join("HEAD").is_file());
@@ -199,7 +207,12 @@ async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
     assert_eq!(
         alternates.lines().collect::<Vec<_>>(),
         vec![
-            keeper.store.mirror_dir(url).join("objects").to_str().unwrap(),
+            keeper
+                .store
+                .mirror_dir(url)
+                .join("objects")
+                .to_str()
+                .unwrap(),
             fork_mirror.join("objects").to_str().unwrap(),
         ]
     );
@@ -242,7 +255,11 @@ async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
     git(&source, &["commit", "-q", "-am", "again"]);
     let fork_last = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
     git(&source, &["push", "-q", "fork", "HEAD:refs/heads/feature"]);
-    ok(wrapper(&clone, Some(&keeper.socket), &["pull", "-q", "--ff-only"]));
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["pull", "-q", "--ff-only"],
+    ));
     assert_eq!(git(&clone, &["rev-parse", "HEAD"]).trim(), fork_last);
     assert!(no_own_pack(&clone));
     assert_eq!(
@@ -251,7 +268,80 @@ async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
     );
 
     // --all is many remotes at once: the real git, over the wire.
-    ok(wrapper(&clone, Some(&keeper.socket), &["fetch", "-q", "--all"]));
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["fetch", "-q", "--all"],
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subtree_add_and_pull_read_the_mirror() {
+    let temp = tempfile::tempdir().unwrap();
+    let (source, remote) = setup_remote(temp.path());
+    let url = remote.to_str().unwrap();
+    let keeper = keeper(temp.path());
+    let app = temp.path().join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    git(&app, &["init", "-q", "-b", "main"]);
+    std::fs::write(app.join("README"), "app\n").unwrap();
+    git(&app, &["add", "."]);
+    git(&app, &["commit", "-q", "-m", "app"]);
+
+    ok(wrapper(
+        &app,
+        Some(&keeper.socket),
+        &[
+            "subtree",
+            "add",
+            "--prefix=vendor/lib",
+            url,
+            "main",
+            "--squash",
+        ],
+    ));
+    assert_eq!(
+        std::fs::read_to_string(app.join("vendor/lib/file.txt")).unwrap(),
+        "one\n"
+    );
+    let mirror = keeper.store.mirror_dir(url);
+    assert!(
+        mirror.join("HEAD").is_file(),
+        "the store served the subtree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join(".git/objects/info/alternates"))
+            .unwrap()
+            .trim(),
+        mirror.join("objects").to_str().unwrap()
+    );
+    assert!(no_own_pack(&app));
+
+    let second = push_commit(&source, "two\n");
+    ok(wrapper(
+        &app,
+        Some(&keeper.socket),
+        &[
+            "subtree",
+            "pull",
+            "--prefix=vendor/lib",
+            url,
+            "main",
+            "--squash",
+            "-m",
+            "sync lib",
+        ],
+    ));
+    assert_eq!(
+        std::fs::read_to_string(app.join("vendor/lib/file.txt")).unwrap(),
+        "two\n"
+    );
+    let squash = git(&app, &["log", "-1", "--format=%B", "HEAD^2"]);
+    assert!(
+        squash.contains(&format!("git-subtree-split: {second}")),
+        "{squash}"
+    );
+    assert!(no_own_pack(&app), "the pulled objects are borrowed");
 }
 
 #[tokio::test(flavor = "multi_thread")]

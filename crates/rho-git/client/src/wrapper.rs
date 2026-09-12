@@ -7,12 +7,15 @@
 //!   (`--depth`, `--branch`, `--bare`, `--mirror`, `--reference`, ...) send it
 //!   to the real git unchanged: the store serves the common case, not every
 //!   case.
-//! - `git fetch ...` and `git pull ...` work out which URL git would read
-//!   (the named remote's, a literal URL or path, else the branch's upstream
-//!   remote or `origin`), ask the keeper to refresh that mirror, add the
-//!   mirror to the clone's alternates, then run the real git with
-//!   `url.<mirror>.insteadOf=<url>`, so the fetch reads the mirror and
-//!   never the network. `--all`/`--multiple` go to the real git as is.
+//! - `git fetch ...` and `git pull ...` work out which URL git would read (the
+//!   named remote's, a literal URL or path, else the branch's upstream remote
+//!   or `origin`), ask the keeper to refresh that mirror, add the mirror to the
+//!   clone's alternates, then run the real git with
+//!   `url.<mirror>.insteadOf=<url>`, so the fetch reads the mirror and never
+//!   the network. `--all`/`--multiple` go to the real git as is.
+//! - `git subtree add|pull --prefix=<dir> <repository> <ref>` is routed the
+//!   same way, from outside: `git subtree` is a script whose nested `git fetch`
+//!   is the real git, and the `insteadOf` reaches it through the environment.
 //!
 //! The wrapper is exec-transparent: git's own exit status, output and
 //! signals pass straight through, and git's global options before the
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::{Git, Store, clone_from_mirror, ensure_alternate, fetch_url};
+use crate::{FetchTarget, Git, Store, clone_from_mirror, ensure_alternate, resolve_fetch_target};
 
 /// A git command line split at its subcommand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -245,8 +248,13 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
                 }
             }
         }
-        (Some("fetch" | "pull"), Some(store)) => {
-            if let Some(url) = fetch_url(&git, &invocation.globals, &invocation.rest) {
+        (Some(subcommand @ ("fetch" | "pull" | "subtree")), Some(store)) => {
+            let target = if subcommand == "subtree" {
+                FetchTarget::parse_subtree(&invocation.rest)
+            } else {
+                FetchTarget::parse(&invocation.rest)
+            };
+            if let Some(url) = resolve_fetch_target(&git, &invocation.globals, target) {
                 match store.refresh(&url) {
                     Ok(mirror) => {
                         if let Err(error) = ensure_alternate(&git, &invocation.globals, &mirror) {

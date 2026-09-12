@@ -310,6 +310,35 @@ pub enum FetchTarget {
 }
 
 impl FetchTarget {
+    /// The repository a `git subtree add|pull --prefix=<dir> <repository>
+    /// <ref>` reads from. `git subtree` is a script whose nested `git
+    /// fetch` runs the real git, so the wrapper routes it from outside:
+    /// the `insteadOf` it passes reaches the script through the
+    /// environment (`GIT_CONFIG_PARAMETERS`). Other subtree commands are
+    /// unrouted.
+    pub fn parse_subtree(rest: &[OsString]) -> Self {
+        const WITH_VALUE: &[&str] = &[
+            "-P",
+            "--prefix",
+            "-m",
+            "--message",
+            "-b",
+            "--branch",
+            "--onto",
+            "--annotate",
+        ];
+        let positionals = match positionals(rest, WITH_VALUE) {
+            Some(positionals) => positionals,
+            None => return Self::Unrouted,
+        };
+        match positionals.as_slice() {
+            [command, repository, _reference] if *command == "add" || *command == "pull" => {
+                Self::Named((*repository).to_owned())
+            }
+            _ => Self::Unrouted,
+        }
+    }
+
     /// Reads `rest` (the words after `fetch`/`pull`), skipping options and
     /// the values of those that take one.
     pub fn parse(rest: &[OsString]) -> Self {
@@ -334,30 +363,40 @@ impl FetchTarget {
             "--strategy-option",
             "--cleanup",
         ];
-        let mut positionals = Vec::new();
-        let mut index = 0;
-        let mut options_done = false;
-        while index < rest.len() {
-            let Some(text) = rest[index].to_str() else {
-                return Self::Unrouted;
-            };
-            index += 1;
-            if options_done || !text.starts_with('-') || text == "-" {
-                positionals.push(text);
-                continue;
-            }
-            match text {
-                "--" => options_done = true,
-                "--all" | "--multiple" => return Self::Unrouted,
-                _ if WITH_VALUE.contains(&text) => index += 1,
-                _ => {}
-            }
+        if rest
+            .iter()
+            .any(|word| word == "--all" || word == "--multiple")
+        {
+            return Self::Unrouted;
         }
-        match positionals.first() {
-            None => Self::Default,
-            Some(name) => Self::Named((*name).to_owned()),
+        match positionals(rest, WITH_VALUE).as_deref() {
+            None => Self::Unrouted,
+            Some([]) => Self::Default,
+            Some([name, ..]) => Self::Named((*name).to_owned()),
         }
     }
+}
+
+/// The non-option words of `rest`, skipping the values of options in
+/// `with_value`; `None` when a word is not UTF-8.
+fn positionals<'a>(rest: &'a [OsString], with_value: &[&str]) -> Option<Vec<&'a str>> {
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    let mut options_done = false;
+    while index < rest.len() {
+        let text = rest[index].to_str()?;
+        index += 1;
+        if options_done || !text.starts_with('-') || text == "-" {
+            positionals.push(text);
+            continue;
+        }
+        if text == "--" {
+            options_done = true;
+        } else if with_value.contains(&text) {
+            index += 1;
+        }
+    }
+    Some(positionals)
 }
 
 /// The URL the `git fetch`/`git pull` given by `globals` and `rest` would
@@ -366,15 +405,30 @@ impl FetchTarget {
 /// not read one place (`--all`), names nothing git could resolve, or
 /// there is no repository.
 pub fn fetch_url(git: &Git, globals: &[OsString], rest: &[OsString]) -> Option<String> {
-    let name = match FetchTarget::parse(rest) {
+    resolve_fetch_target(git, globals, FetchTarget::parse(rest))
+}
+
+/// The URL `target` stands for in the repository `globals` select.
+pub fn resolve_fetch_target(
+    git: &Git,
+    globals: &[OsString],
+    target: FetchTarget,
+) -> Option<String> {
+    let name = match target {
         FetchTarget::Unrouted => return None,
         FetchTarget::Named(name) => name,
-        FetchTarget::Default => git_line(git, globals, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .and_then(|branch| {
-                git_line(git, globals, ["config", "--get", &format!("branch.{branch}.remote")])
-            })
-            .filter(|remote| remote != ".")
-            .unwrap_or_else(|| "origin".to_owned()),
+        FetchTarget::Default => {
+            git_line(git, globals, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+                .and_then(|branch| {
+                    git_line(
+                        git,
+                        globals,
+                        ["config", "--get", &format!("branch.{branch}.remote")],
+                    )
+                })
+                .filter(|remote| remote != ".")
+                .unwrap_or_else(|| "origin".to_owned())
+        }
     };
     if let Some(url) = git_line(git, globals, ["remote", "get-url", &name]) {
         return Some(url);
@@ -503,7 +557,10 @@ mod tests {
             fetch_url(&git, &globals, &[]).as_deref(),
             Some(remote.to_str().unwrap())
         );
-        assert_eq!(fetch_url(&git, &["-C".into(), temp.path().into()], &[]), None);
+        assert_eq!(
+            fetch_url(&git, &["-C".into(), temp.path().into()], &[]),
+            None
+        );
 
         // A second mirror joins the alternates once, whatever the order.
         let other = temp.path().join("other-mirror");
@@ -523,14 +580,26 @@ mod tests {
         );
 
         // Naming a remote, a path or the upstream remote of the branch.
-        run(&dest, &["remote", "add", "upstream", other.to_str().unwrap()]);
+        run(
+            &dest,
+            &["remote", "add", "upstream", other.to_str().unwrap()],
+        );
         assert_eq!(
-            fetch_url(&git, &globals, &["-q".into(), "upstream".into(), "main".into()]).as_deref(),
+            fetch_url(
+                &git,
+                &globals,
+                &["-q".into(), "upstream".into(), "main".into()]
+            )
+            .as_deref(),
             Some(other.to_str().unwrap())
         );
         assert_eq!(
-            fetch_url(&git, &globals, &["--depth".into(), "1".into(), mirror.clone().into()])
-                .as_deref(),
+            fetch_url(
+                &git,
+                &globals,
+                &["--depth".into(), "1".into(), mirror.clone().into()]
+            )
+            .as_deref(),
             Some(mirror.to_str().unwrap())
         );
         assert_eq!(fetch_url(&git, &globals, &["nosuch".into()]), None);
@@ -555,7 +624,14 @@ mod tests {
             FetchTarget::Named("up".into())
         );
         assert_eq!(
-            FetchTarget::parse(&words(&["--rebase", "-Xtheirs", "-s", "ort", "https://x/y", "main"])),
+            FetchTarget::parse(&words(&[
+                "--rebase",
+                "-Xtheirs",
+                "-s",
+                "ort",
+                "https://x/y",
+                "main"
+            ])),
             FetchTarget::Named("https://x/y".into())
         );
         assert_eq!(
@@ -570,6 +646,35 @@ mod tests {
             FetchTarget::parse(&words(&["--multiple", "a", "b"])),
             FetchTarget::Unrouted
         );
+
+        assert_eq!(
+            FetchTarget::parse_subtree(&words(&[
+                "pull",
+                "--prefix=vendor/x",
+                "https://x/y",
+                "main",
+                "--squash",
+                "-m",
+                "msg"
+            ])),
+            FetchTarget::Named("https://x/y".into())
+        );
+        assert_eq!(
+            FetchTarget::parse_subtree(&words(&["add", "-P", "vendor/x", "up", "v1", "--squash"])),
+            FetchTarget::Named("up".into())
+        );
+        for unrouted in [
+            &["add", "--prefix=vendor/x", "abc123"][..],
+            &["merge", "--prefix=vendor/x", "abc123", "https://x/y"],
+            &["split", "--prefix=vendor/x"],
+            &["push", "--prefix=vendor/x", "https://x/y", "main"],
+        ] {
+            assert_eq!(
+                FetchTarget::parse_subtree(&words(unrouted)),
+                FetchTarget::Unrouted,
+                "{unrouted:?}"
+            );
+        }
     }
 
     #[test]
