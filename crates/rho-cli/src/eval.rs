@@ -3,14 +3,13 @@
 use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use rho_agent::db::{AgentReadTxnExt as _, AgentRole, EngineerIntelligence, TurnEdge, TurnOutcome};
-use rho_agent::{AgentEvent, MessageDelivery, StartWorkdir};
+use rho_agent::{AgentEvent, MessageDelivery, StartPlace};
 use rho_core::{ContextBlock, InferenceResponseItem};
-use rho_workspaces::{PathOverrides, Repo, UserEnvironment};
+use rho_workset::{UserEnvironment, Worksets};
 use serde_json::{Value, json};
 
 #[derive(Clone, clap::Args)]
@@ -91,30 +90,20 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
     };
     let env = UserEnvironment::new(std::env::vars_os().collect());
-    let (root, is_jj) = rho_workspaces::resolve_workdir_root(&workdir)?;
-    let repo = Arc::new(if is_jj {
-        Repo::open_with_environment(root.as_std_path(), PathOverrides::default(), env.clone())?
-    } else {
-        Repo::open_plain_with_environment(
-            root.as_std_path(),
-            PathOverrides::default(),
-            env.clone(),
-        )?
-    });
-    let workspace = repo.user_checkout().await?;
+    // An eval works in place: no namespace, no store server.
+    let worksets = Worksets::open_plain(temp.path().join("state"), env).await?;
+    let view = worksets.plain_view(&workdir)?;
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
     rho_inference::ensure_crypto_provider();
     let inference = rho_inference::Inference::new(db.clone()).await?;
     let pool = rho_agent::pool::AgentPool::new(
         db.clone(),
         inference,
-        PathOverrides::default(),
-        camino::Utf8PathBuf::try_from(temp.path().to_owned())?,
+        worksets,
         // An eval runs on its own directory, not on the user's Claude state.
         rho_claude::accounts::ClaudePaths::at(camino::Utf8PathBuf::try_from(
             temp.path().join("claude"),
         )?),
-        env,
     )
     .await;
     let role = AgentRole::Engineer {
@@ -131,7 +120,7 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         .create(
             role,
             Some("CLI evaluation".into()),
-            vec![StartWorkdir::Existing(workspace)],
+            StartPlace::new(view, None),
         )
         .await?;
     // Drop is also cancellation, including early output/connection failures.

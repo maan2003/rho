@@ -14,21 +14,32 @@ async fn worksets_clone_through_the_store_server() {
 
     // The first clone initializes the store and is born on the default branch.
     let first_workset = root.create().await.unwrap();
-    let project = first_workset.clone_repo(remote_url, Some("project")).await.unwrap();
+    let project = first_workset
+        .clone_repo(remote_url, Some("project"))
+        .await
+        .unwrap();
     assert_eq!(project, first_workset.root().join("project"));
     assert_eq!(
         std::fs::read_to_string(project.join("file.txt")).unwrap(),
         "one\n"
     );
     assert_eq!(
-        jj(&root, project.as_std_path(), &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]).await,
+        jj(
+            &root,
+            project.as_std_path(),
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
+        )
+        .await,
         git(&source, &["rev-parse", "main"])
     );
     let store = only_store(temp.path());
     let git_target = std::fs::read_to_string(project.join(".jj/repo/store/git_target")).unwrap();
     let git_dir = project.join(".jj/repo/store").join(git_target.trim());
     let alternates = std::fs::read_to_string(git_dir.join("objects/info/alternates")).unwrap();
-    assert_eq!(alternates.trim(), store.join("git/objects").to_str().unwrap());
+    assert_eq!(
+        alternates.trim(),
+        store.join("git/objects").to_str().unwrap()
+    );
     // Committed work carries a change-id header.
     std::fs::write(project.join("file.txt"), "two\n").unwrap();
     let commit = jj(
@@ -42,7 +53,10 @@ async fn worksets_clone_through_the_store_server() {
     // Cloning again is idempotent; a default name comes from the URL; the
     // store is shared.
     assert_eq!(
-        first_workset.clone_repo(remote_url, Some("project")).await.unwrap(),
+        first_workset
+            .clone_repo(remote_url, Some("project"))
+            .await
+            .unwrap(),
         project
     );
     let by_url = first_workset.clone_repo(remote_url, None).await.unwrap();
@@ -50,12 +64,19 @@ async fn worksets_clone_through_the_store_server() {
     assert_eq!(first_workset.repos().unwrap(), vec!["project", "remote"]);
     assert_eq!(only_store(temp.path()), store);
     assert_eq!(
-        first_workset.host_path(Utf8Path::new("/src/project/file.txt")).unwrap(),
+        first_workset
+            .host_path(Utf8Path::new("/src/project/file.txt"))
+            .unwrap(),
         project.join("file.txt")
     );
     assert!(first_workset.host_path(Utf8Path::new("/src/../x")).is_err());
     std::fs::write(first_workset.root().join("not-a-repo"), "").unwrap();
-    assert!(first_workset.clone_repo(remote_url, Some("not-a-repo")).await.is_err());
+    assert!(
+        first_workset
+            .clone_repo(remote_url, Some("not-a-repo"))
+            .await
+            .is_err()
+    );
 
     // The remote moves on: a new clone in another workset is born on the
     // new commit, and the old clone fetches it without network access.
@@ -64,9 +85,17 @@ async fn worksets_clone_through_the_store_server() {
     git(&source, &["push", remote_url, "main"]);
     let new_main = git(&source, &["rev-parse", "main"]);
     let second_workset = root.create().await.unwrap();
-    let second = second_workset.clone_repo(remote_url, Some("project")).await.unwrap();
+    let second = second_workset
+        .clone_repo(remote_url, Some("project"))
+        .await
+        .unwrap();
     assert_eq!(
-        jj(&root, second.as_std_path(), &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]).await,
+        jj(
+            &root,
+            second.as_std_path(),
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
+        )
+        .await,
         new_main
     );
     assert_eq!(
@@ -89,6 +118,39 @@ async fn worksets_clone_through_the_store_server() {
         "the first clone's own edits are untouched"
     );
 
+    // A second jj workspace beside the clone, on a new change atop its @.
+    let beside = second_workset.add_workspace(&second, "@").await.unwrap();
+    assert_eq!(beside, second_workset.root().join("project-2"));
+    assert_eq!(
+        std::fs::read_to_string(beside.join("file.txt")).unwrap(),
+        "three\n"
+    );
+    assert_eq!(
+        rho_workset::resolve_repo_root(beside.as_std_path()).unwrap(),
+        second
+    );
+    assert_eq!(
+        second_workset.repos().unwrap(),
+        vec!["project", "project-2"]
+    );
+
+    // Diff snapshots read the working copy against its parent.
+    std::fs::write(beside.join("new.txt"), "hello\n").unwrap();
+    let snapshot = second_workset
+        .diff_snapshot(&beside, None, &[])
+        .await
+        .unwrap()
+        .expect("first snapshot");
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "new.txt");
+    assert!(
+        second_workset
+            .diff_snapshot(&beside, Some(&snapshot.commit_id), &[])
+            .await
+            .unwrap()
+            .is_none()
+    );
+
     // Discard removes the directory and nothing else; it is idempotent.
     let first_id = first_workset.id().to_owned();
     let first_root = first_workset.root().to_owned();
@@ -106,10 +168,26 @@ async fn worksets_clone_through_the_store_server() {
     drop(root);
     let root = open_worksets(temp.path(), &jj_bin).await;
     let reopened = root.open_workset(&second_id).await.unwrap();
-    assert_eq!(reopened.repos().unwrap(), vec!["project"]);
-    let again = reopened.clone_repo(remote_url, Some("again")).await.unwrap();
+    assert_eq!(reopened.repos().unwrap(), vec!["project", "project-2"]);
+    let again = reopened
+        .clone_repo(remote_url, Some("again"))
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(again.join("file.txt")).unwrap(),
         "three\n"
     );
+
+    // An adopted directory is a workset for this process only.
+    let adopted = root.adopt(&source).unwrap();
+    assert!(adopted.id().starts_with("adopted-"));
+    assert_eq!(
+        adopted.root(),
+        Utf8Path::from_path(&source.canonicalize().unwrap()).unwrap()
+    );
+    assert_eq!(
+        root.open_workset(adopted.id()).await.unwrap().root(),
+        adopted.root()
+    );
+    assert!(!root.list().unwrap().iter().any(|id| id == adopted.id()));
 }

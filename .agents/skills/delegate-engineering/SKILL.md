@@ -1,6 +1,6 @@
 ---
 name: delegate-engineering
-description: Delegate independent implementation work to isolated Engineer workspaces and integrate the results.
+description: Delegate independent implementation work to Engineer sub-agents in your workset and integrate the results.
 ---
 
 # Delegate engineering work
@@ -14,11 +14,14 @@ declare const tools: { spawn_engineer(args: {
   prompt: string;
   // Short user-visible kebab-case label for the sub-task.
   task_name: string;
-  // The child's working set. Omit to fork your complete working set.
+  // Where the child works: at most one entry. Omit to share your working
+  // directory.
   workdirs?: Array<{
-    // Absolute repository or directory path.
+    // A directory in your workset, absolute or relative to your working
+    // directory.
     repo: string;
-    // Optional jj revision from which to fork the isolated checkout.
+    // Optional jj revset: the child gets its own jj workspace of that
+    // repository, on a new change atop the revset (for example `@`).
     revset?: string;
   }>;
 }): Promise<string>; };
@@ -42,24 +45,22 @@ subtask with separately assigned ownership. Otherwise, send necessary
 follow-ups and use `wait` rather than doing the delegated work yourself
 or yielding a final response while it is still running.
 
-Each jj workdir is always isolated in the child. Omit `workdirs` to fork the
-parent's complete working set. Otherwise list the repositories the child needs;
-`revset` starts an isolated checkout from a specific revision. Plain directories
-cannot be isolated and remain shared.
-
-Separate child Engineer workspaces do not share live filesystem edits, even
-when their visible paths are the same. That existing isolation is normally
-sufficient for implementation and experiments; an additional temporary
-worktree, jj workspace, clone, or copy is not required merely to avoid
-concurrent edits. This is context, not a prohibition: use judgment when the
-task itself benefits from another setup.
+The child always works in your workset. Omit `workdirs` and it shares your
+working directory: you both see every edit immediately, so only do that when
+one of you is reading rather than editing. Give it a `revset` (`@` for your
+current change) and it gets its own jj workspace of the repository, made
+beside yours in the workset (`<repo>-2`, `<repo>-3`, ...); that is the right
+setup for concurrent edits, and no further worktree, clone, or copy is needed.
+You can also prepare a workspace yourself with `jj workspace add` and name its
+directory in `repo`.
 
 Give the Engineer an outcome-focused, self-contained prompt. It already receives
 repository guidance, skills, tools, and environment context.
 
 Use `message_agent` for follow-ups and `interrupt_engineer` to stop its current
-turn. Results arrive as mail. After the Engineer reports completion, inspect
-completed jj work through the workspace handle reported by `spawn_engineer`, for example with
-`jj diff -r '<workspace>@' --stat`, and integrate it with an explicit `jj edit`
-or `jj squash --from '<workspace>@' --into @` only when you intend to take over
-that work.
+turn. Results arrive as mail. After the Engineer reports completion, inspect its
+work in the directory `spawn_engineer` reported: `jj log` and `jj diff` there
+show its changes, and its workspace's commits are visible from your own
+workspace as `<workspace name>@`. Integrate with an explicit `jj squash --from
+'<workspace name>@' --into @` (or `jj new` on top of its commits) only when
+you intend to take over that work.

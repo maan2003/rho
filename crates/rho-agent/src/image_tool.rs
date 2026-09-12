@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rho_core::{ImageDetail, ToolCall, ToolName, ToolOutput, ToolOutputStatus, ToolSpec, ToolType};
-use rho_workspaces::View;
 use serde::Deserialize;
 use serde_json::json;
+
+use crate::View;
 
 pub(crate) const VIEW_IMAGE_TOOL_NAME: &str = "view_image";
 
@@ -35,7 +36,7 @@ impl ImageTools {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Image path, relative to the primary workdir or absolute."
+                        "description": "Image path, relative to the working directory or absolute."
                     },
                     "detail": {
                         "type": "string",
@@ -77,7 +78,7 @@ impl ImageTools {
         let visible = if args.path.is_absolute() {
             args.path
         } else {
-            self.view.primary().repo().as_std_path().join(args.path)
+            self.view.cwd().as_std_path().join(args.path)
         };
         let bytes = self
             .view
@@ -92,7 +93,6 @@ impl ImageTools {
 mod tests {
     use image::{DynamicImage, ImageBuffer, Rgba};
     use rho_core::ToolCallId;
-    use rho_workspaces::Repo;
 
     use super::*;
 
@@ -101,11 +101,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source =
             DynamicImage::ImageRgba8(ImageBuffer::from_pixel(4096, 1, Rgba([10, 20, 30, 255])));
-        source.save(temp.path().join("image.png")).unwrap();
-        let repo = Arc::new(
-            Repo::open_plain_with_path_overrides(temp.path(), Default::default()).unwrap(),
-        );
-        let view = View::new(vec![repo.user_checkout().await.unwrap()]).unwrap();
+        let work = temp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        source.save(work.join("image.png")).unwrap();
+        let worksets =
+            rho_workset::Worksets::open_plain(temp.path().join("state"), Default::default())
+                .await
+                .unwrap();
+        let view = worksets.plain_view(&work).unwrap();
         let output = ImageTools::new(view)
             .call(ToolCall {
                 id: ToolCallId::try_from("image-call".to_owned()).unwrap(),

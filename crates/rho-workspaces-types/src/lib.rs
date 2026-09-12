@@ -40,16 +40,61 @@ pub enum WorkspaceInfo {
         id: WorkspaceId,
     },
     /// A jj-managed workspace whose original VCS metadata is masked from
-    /// child commands and replaced by a synthetic Git baseline.
+    /// child commands and replaced by a synthetic Git baseline. Historical:
+    /// no longer created.
     Sandbox { repo: Utf8PathBuf, id: WorkspaceId },
+    /// A place in a workset: the workset's id and the agent's working
+    /// directory as it sees it (`/src/<repo>/...`). `origin` is what was
+    /// cloned to make the workset, when this agent's creation cloned it.
+    Workset {
+        workset: String,
+        cwd: Utf8PathBuf,
+        #[senax(default)]
+        mode: WorksetMode,
+        #[senax(default)]
+        origin: Option<Utf8PathBuf>,
+    },
+}
+
+/// How an agent in a workset sees the filesystem.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub enum WorksetMode {
+    /// A minimal generated root with the workset at `/src`.
+    #[default]
+    View,
+    /// The host filesystem with the workset at `/ws`.
+    Exposed,
+    /// No namespace: the workset directory at its host path.
+    Plain,
 }
 
 impl WorkspaceInfo {
+    /// The directory the agent works in: a repository root for the
+    /// historical variants, the working directory for a workset.
     pub fn repo(&self) -> &Utf8Path {
         match self {
             Self::UserCheckout { repo }
             | Self::Workspace { repo, .. }
             | Self::Sandbox { repo, .. } => repo,
+            Self::Workset { cwd, .. } => cwd,
+        }
+    }
+
+    /// The workset this agent works in.
+    pub fn workset(&self) -> Option<&str> {
+        match self {
+            Self::Workset { workset, .. } => Some(workset),
+            _ => None,
+        }
+    }
+
+    /// What was cloned to start this agent's workset, when known.
+    pub fn origin(&self) -> Option<&Utf8Path> {
+        match self {
+            Self::Workset { origin, .. } => origin.as_deref(),
+            Self::UserCheckout { repo }
+            | Self::Workspace { repo, .. }
+            | Self::Sandbox { repo, .. } => Some(repo),
         }
     }
 
@@ -59,7 +104,7 @@ impl WorkspaceInfo {
 
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         match self {
-            Self::UserCheckout { .. } => None,
+            Self::UserCheckout { .. } | Self::Workset { .. } => None,
             Self::Workspace { id, .. } | Self::Sandbox { id, .. } => Some(*id),
         }
     }
@@ -67,7 +112,7 @@ impl WorkspaceInfo {
     pub fn workspace_handle(&self) -> Option<String> {
         match self {
             Self::Workspace { id, .. } => Some(workspace_handle(*id)),
-            Self::UserCheckout { .. } | Self::Sandbox { .. } => None,
+            Self::UserCheckout { .. } | Self::Sandbox { .. } | Self::Workset { .. } => None,
         }
     }
 

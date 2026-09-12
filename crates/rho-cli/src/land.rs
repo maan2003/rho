@@ -24,7 +24,7 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
     let workspace_name = current_jj_workspace(&checkout)?;
     let workspace_root = PathBuf::from(workspace_root);
     let repo_root =
-        rho_workspaces::resolve_repo_root(&workspace_root).context("resolve origin repo")?;
+        rho_workset::resolve_repo_root(&workspace_root).context("resolve origin repo")?;
     let agent_id = current_agent_id()?;
     let mut lease =
         LandLease::acquire(repo_root.clone(), agent_id, args.socket_path.as_deref()).await?;

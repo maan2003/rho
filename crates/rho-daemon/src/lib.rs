@@ -21,7 +21,7 @@ use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
     McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
-    WorkspaceInfo, read_frame, write_frame,
+    WorksetMode, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast, mpsc, oneshot};
 
@@ -304,8 +304,8 @@ fn start_runtime_sockets(
 
 /// Re-exported so daemon entry points can set up the user+mount namespace
 /// before the async runtime starts (see
-/// [`rho_workspaces::init_daemon_namespace`]).
-pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
+/// [`rho_workset::init_daemon_namespace`]).
+pub use rho_workset::{PathOverrides, init_daemon_namespace};
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
 const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
@@ -328,6 +328,24 @@ pub fn configure_embedded_environment() {
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WorksetModeArg {
+    #[default]
+    View,
+    Exposed,
+    Plain,
+}
+
+impl From<WorksetModeArg> for WorksetMode {
+    fn from(mode: WorksetModeArg) -> Self {
+        match mode {
+            WorksetModeArg::View => Self::View,
+            WorksetModeArg::Exposed => Self::Exposed,
+            WorksetModeArg::Plain => Self::Plain,
+        }
+    }
+}
+
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
     #[arg(long = "socket-path")]
@@ -341,6 +359,15 @@ pub struct DaemonArgs {
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
+    /// How new agents see the filesystem: `view` (a minimal generated root
+    /// with the workset at /src), `exposed` (the host, with the workset at
+    /// /ws) or `plain` (no namespace).
+    #[arg(
+        long = "workset-mode",
+        env = "RHO_WORKSET_MODE",
+        default_value = "view"
+    )]
+    pub workset_mode: WorksetModeArg,
     /// Write a Dial9 CPU trace on shutdown (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
@@ -438,7 +465,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         set_environment_value(&mut user_environment, "ANTHROPIC_BASE_URL", endpoint);
     }
     apply_daemon_directories(&mut user_environment, &state_dir, &claude);
-    let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
+    let user_environment = rho_workset::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
     // One-off (7 Sep), before any agent loop can append: every Claude
@@ -469,6 +496,31 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .unwrap_or_default(),
     };
     let quota_path_overrides = path_overrides.clone();
+    // The clone store server keeps every store fetched so new agents start
+    // on the remote's latest state; without it (no jj on PATH, say) jj
+    // clients initialize stores themselves and nothing refreshes them.
+    let worksets = match rho_workset::Worksets::open(
+        &state_dir,
+        user_environment.clone(),
+        path_overrides.clone(),
+        rho_workset::StoreService::Serve(rho_workset::StoreRefresh::default()),
+    )
+    .await
+    {
+        Ok(worksets) => worksets,
+        Err(error) => {
+            eprintln!(
+                "rho daemon: clone store server unavailable, clones fetch for themselves: {error:#}"
+            );
+            rho_workset::Worksets::open(
+                &state_dir,
+                user_environment.clone(),
+                path_overrides,
+                rho_workset::StoreService::None,
+            )
+            .await?
+        }
+    };
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;
@@ -479,15 +531,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     };
 
     let iroh_auth = iroh.as_ref().map(|(_, auth)| auth.clone());
-    let pool = AgentPool::new(
-        db.clone(),
-        inference.clone(),
-        path_overrides,
-        state_dir,
-        claude.clone(),
-        user_environment.clone(),
-    )
-    .await;
+    let pool = AgentPool::new(db.clone(), inference.clone(), worksets, claude.clone()).await;
     let services = Arc::new(
         Services::new(
             db,
@@ -495,6 +539,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             pool,
             claude.clone(),
             user_environment,
+            args.workset_mode.into(),
             platform_secrets,
             runtime.paths.octo_socket(),
         )
@@ -900,7 +945,9 @@ struct Services {
     /// Daemon-owned terminal sessions, keyed per agent.
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
-    user_environment: rho_workspaces::UserEnvironment,
+    user_environment: rho_workset::UserEnvironment,
+    /// How agents this daemon creates see the filesystem.
+    workset_mode: WorksetMode,
     /// The Claude configuration this daemon runs against, resolved in `run`.
     claude: rho_claude::accounts::ClaudePaths,
     git_transport: GitTransportBroker,
@@ -909,12 +956,14 @@ struct Services {
 }
 
 impl Services {
+    #[allow(clippy::too_many_arguments)]
     async fn new(
         db: RhoDb,
         inference: Inference,
         pool: Arc<AgentPool>,
         claude: rho_claude::accounts::ClaudePaths,
-        user_environment: rho_workspaces::UserEnvironment,
+        user_environment: rho_workset::UserEnvironment,
+        workset_mode: WorksetMode,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
@@ -943,6 +992,7 @@ impl Services {
             shells: Arc::new(shell::ShellRegistry::default()),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
+            workset_mode,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
         };
@@ -1012,29 +1062,53 @@ impl Services {
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
-                let repo = validate_repo_root(repo)?;
-                vec![rho_agent::StartWorkdir::Create {
-                    repo: self.pool.repo(&repo).await?,
-                    parent_revset: revset,
-                }]
+                let origin = expand_home(&repo).unwrap_or(repo);
+                let worksets = self.pool.worksets();
+                let workset = worksets.create().await?;
+                let mode = rho_workset::Mode::from_workset_mode(self.workset_mode);
+                let placed = async {
+                    let checkout = workset.clone_repo(origin.as_str(), None).await?;
+                    workset.new_change(&checkout, &revset).await?;
+                    let cwd = visible_path(&workset, &mode, &checkout)?;
+                    let view = workset.enter(mode, &cwd)?;
+                    anyhow::Ok(rho_agent::StartPlace::new(view, Some(origin)).owning_workset())
+                }
+                .await;
+                match placed {
+                    Ok(start) => start,
+                    Err(error) => {
+                        if let Err(discard) = worksets.discard_workset(workset.id()).await {
+                            eprintln!("rho daemon: discard workset {}: {discard:#}", workset.id());
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            StartMode::Sandbox { repo, revset } => {
-                let repo = validate_repo_root(repo)?;
-                vec![rho_agent::StartWorkdir::Sandbox {
-                    repo: self.pool.repo(&repo).await?,
-                    parent_revset: revset,
-                }]
+            StartMode::Beside { base, revset } => {
+                let (workset, mode, host_cwd) = self.pool.open_workset(&base).await?;
+                let (root, is_jj) = rho_workset::resolve_workdir_root(host_cwd.as_std_path())?;
+                anyhow::ensure!(
+                    is_jj,
+                    "{} is not in a jj repository, so there is nothing to start beside",
+                    base.repo()
+                );
+                let added = workset.add_workspace(&root, &revset).await?;
+                let cwd = visible_path(&workset, &mode, &added)?;
+                let view = workset.enter(mode, &cwd)?;
+                rho_agent::StartPlace::new(view, base.origin().map(ToOwned::to_owned))
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                vec![rho_agent::StartWorkdir::Existing(
-                    self.pool.open_workspace(&info).await?,
-                )]
+                let view = self.pool.materialize_view(&info).await?;
+                rho_agent::StartPlace::new(view, info.origin().map(ToOwned::to_owned))
             }
-            StartMode::Join(JoinTarget::User { repo }) => {
-                let repo = validate_repo_root(repo)?;
-                vec![rho_agent::StartWorkdir::Existing(
-                    self.pool.repo(&repo).await?.user_checkout().await?,
-                )]
+            StartMode::Join(JoinTarget::User { .. }) => {
+                anyhow::bail!(
+                    "agents no longer work in the user's own checkout: start on the \
+                     repository's URL or path instead"
+                );
+            }
+            StartMode::Sandbox { .. } => {
+                anyhow::bail!("sandboxes are no longer supported");
             }
         };
         let (agent_id, agent) = self.pool.create(role, None, start).await?;
@@ -1074,7 +1148,6 @@ impl Services {
                         .into_iter()
                         .map(|entry| rho_agent::multi_agent_tools::SpawnWorkdirArgs {
                             repo: entry.repo,
-                            checkout: None,
                             revset: entry.revset,
                         })
                         .collect(),
@@ -1090,15 +1163,8 @@ impl Services {
                     )
                     .await?;
                 let child_record = self.load(child_id).await?.1.head();
-                let workspace_note = match child_record.primary_workdir().workspace_handle() {
-                    Some(workspace) => format!(
-                        " Its jj workspace is `{workspace}`; inspect its working-copy commit with \
-                         `jj diff -r '{workspace}@' --stat`."
-                    ),
-                    None => " It is running in the shared user checkout workspace; there is no \
-                             separate `<workspace>@` handle."
-                        .to_owned(),
-                };
+                let workspace_note =
+                    format!(" It works in {}.", child_record.primary_workdir().repo());
                 Ok(format!(
                     "Spawned Engineer {} for task \"{}\". Its results will arrive as mail.{}",
                     self.display_agent_id(child_id),
@@ -1142,23 +1208,14 @@ impl Services {
                 ))
             }
             McpAgentToolRequest::AskAdvisor { message } => {
-                let workdirs = self_agent
-                    .head()
-                    .config
-                    .workdirs
-                    .into_iter()
-                    .map(|info| rho_agent::pool::SpawnWorkdir {
-                        repo: info.repo().to_owned(),
-                        checkout: rho_agent::pool::SpawnCheckout::Shared,
-                    })
-                    .collect();
+                // The advisor reads what the asker sees: same directory.
                 let advisor = self
                     .pool
                     .spawn_child(
                         self_agent_id,
                         "advisor".to_owned(),
                         message,
-                        workdirs,
+                        Vec::new(),
                         AgentRole::Advisor {
                             intelligence: rho_agent::db::AdvisorIntelligence::Medium,
                         },
@@ -2973,7 +3030,7 @@ async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()
     shell::ensure_supported_workdirs(&record.config.workdirs)?;
     let view = services
         .pool
-        .materialize_view(&record.config.workdirs)
+        .materialize_view(record.primary_workdir())
         .await
         .context("materialize agent view")?;
     services
@@ -3067,9 +3124,9 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = services.pool.open_workspace(&workspace).await?;
-        workspace
-            .diff_base_contents(&operation_id, &commit_id, &paths)
+        let (workset, checkout) = open_checkout(&services, &workspace).await?;
+        workset
+            .diff_base_contents(&checkout, &operation_id, &commit_id, &paths)
             .await
     })
     .await
@@ -3177,9 +3234,9 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = services.pool.open_workspace(&workspace).await?;
-        workspace
-            .diff_snapshot(known_commit_id.as_deref(), &include_paths)
+        let (workset, checkout) = open_checkout(&services, &workspace).await?;
+        workset
+            .diff_snapshot(&checkout, known_commit_id.as_deref(), &include_paths)
             .await
     })
     .await
@@ -3321,17 +3378,10 @@ async fn terminal_attach(
             .await;
     }
     let record = services.load(agent_id).await?.1.head();
-    anyhow::ensure!(
-        !record
-            .config
-            .workdirs
-            .iter()
-            .any(|workdir| matches!(workdir, WorkspaceInfo::Sandbox { .. })),
-        "sandboxed agents have no terminals yet"
-    );
+    shell::ensure_supported_workdirs(&record.config.workdirs)?;
     let view = services
         .pool
-        .materialize_view(&record.config.workdirs)
+        .materialize_view(record.primary_workdir())
         .await
         .context("materialize agent view")?;
     let shell = services
@@ -3406,8 +3456,8 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let workspace = match services.pool.open_workspace(&workspace).await {
-        Ok(workspace) => workspace,
+    let checkout = match open_checkout(&services, &workspace).await {
+        Ok((_, checkout)) => checkout,
         Err(error) => {
             let _ = write_frame(
                 &mut writer,
@@ -3419,7 +3469,7 @@ where
             return Err(error);
         }
     };
-    let files = match workspace_channel::WorkspaceFiles::open(workspace.checkout().to_owned()) {
+    let files = match workspace_channel::WorkspaceFiles::open(checkout) {
         Ok(files) => Arc::new(files),
         Err(error) => {
             let _ = write_frame(
@@ -3711,9 +3761,27 @@ async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()
     validate_image_content(content)
 }
 
-fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {
-    let path = expand_home(&path).unwrap_or(path);
-    rho_workspaces::resolve_repo_root(path.as_std_path())
+/// The workset behind an agent's place and the root of the jj workspace
+/// (or plain directory) its working directory is in, on the host.
+async fn open_checkout(
+    services: &Services,
+    workspace: &WorkspaceInfo,
+) -> anyhow::Result<(rho_workset::Workset, Utf8PathBuf)> {
+    let (workset, _, host_cwd) = services.pool.open_workset(workspace).await?;
+    let (root, _) = rho_workset::resolve_workdir_root(host_cwd.as_std_path())?;
+    Ok((workset, root))
+}
+
+/// Where a host directory inside `workset` appears to an agent in `mode`.
+fn visible_path(
+    workset: &rho_workset::Workset,
+    mode: &rho_workset::Mode,
+    host_path: &Utf8Path,
+) -> anyhow::Result<Utf8PathBuf> {
+    let relative = host_path
+        .strip_prefix(workset.root())
+        .with_context(|| format!("{host_path} is outside workset {}", workset.id()))?;
+    Ok(mode.visible_root(workset.root()).join(relative))
 }
 
 fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
@@ -4532,16 +4600,12 @@ mod tests {
         let claude = rho_claude::accounts::ClaudePaths::at(
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
         );
-        let user_environment = rho_workspaces::UserEnvironment::new(Default::default());
-        let pool = AgentPool::new(
-            db.clone(),
-            inference.clone(),
-            Default::default(),
-            camino::Utf8PathBuf::from_path_buf(root.join("state")).unwrap(),
-            claude.clone(),
-            user_environment.clone(),
-        )
-        .await;
+        let user_environment = rho_workset::UserEnvironment::new(Default::default());
+        let worksets =
+            rho_workset::Worksets::open_plain(root.join("state"), user_environment.clone())
+                .await
+                .unwrap();
+        let pool = AgentPool::new(db.clone(), inference.clone(), worksets, claude.clone()).await;
         Arc::new(
             Services::new(
                 db,
@@ -4549,6 +4613,7 @@ mod tests {
                 pool,
                 claude,
                 user_environment,
+                rho_workset::WorksetMode::Plain,
                 PlatformSecrets::default(),
                 root.join("octo.sock"),
             )

@@ -17,7 +17,7 @@ use rho_core::{
 };
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
-use rho_workspaces::{Repo, Workspace, WorkspaceInfo};
+pub use rho_workset::{WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
 use crate::db::{
@@ -574,81 +574,42 @@ pub struct FailedInferenceResponse {
     pub error: Arc<String>,
 }
 
-/// Where one of a new agent's workdirs comes from. Agents start from a
-/// nonempty list of these; the first entry is the primary workdir.
-pub enum StartWorkdir {
-    /// Create a jj workspace on a new change on top of the revset.
-    Create {
-        repo: Arc<Repo>,
-        parent_revset: String,
-    },
-    /// Create a jj workspace whose original VCS metadata is masked and whose
-    /// child commands are Landlock-restricted.
-    Sandbox {
-        repo: Arc<Repo>,
-        parent_revset: String,
-    },
-    /// Work in an existing workspace (joining another agent, the user's
-    /// checkout, or a plain live directory).
-    Existing(Arc<Workspace>),
+/// An agent's view of its workset. One value per agent: the mount
+/// namespace inside is built on the first command and shared by every
+/// process the agent runs.
+pub type View = rho_workset::Namespace;
+
+/// Where a new agent starts: a view of a workset, and the record of it.
+/// `owned_workset` names a workset this creation made, which the pool
+/// discards if the creation fails.
+#[derive(Clone)]
+pub struct StartPlace {
+    pub view: Arc<View>,
+    pub info: WorkspaceInfo,
+    pub owned_workset: Option<String>,
 }
 
-/// Materializes a new agent's workdirs. Each jj repository allocates its own
-/// managed workspace id.
-pub(crate) async fn materialize_workdirs(start: Vec<StartWorkdir>) -> anyhow::Result<Materialized> {
-    anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
-    let mut entries = Vec::with_capacity(start.len());
-    // Which checkouts this creation made, so a failure halfway through a
-    // multi-repo start hands them back rather than stranding them.
-    let mut made = Vec::new();
-    for entry in start {
-        let created = match entry {
-            StartWorkdir::Create {
-                repo,
-                parent_revset,
-            } => repo.create_workspace(&parent_revset).await,
-            StartWorkdir::Sandbox {
-                repo,
-                parent_revset,
-            } => repo.create_sandbox(&parent_revset).await,
-            // Joined, so not this creation's to give back.
-            StartWorkdir::Existing(workspace) => {
-                entries.push(workspace);
-                continue;
-            }
+impl StartPlace {
+    /// A start in `view`; `origin` is what was cloned to make its workset,
+    /// when this creation cloned it.
+    pub fn new(view: Arc<View>, origin: Option<camino::Utf8PathBuf>) -> Self {
+        let info = WorkspaceInfo::Workset {
+            workset: view.workset().id().to_owned(),
+            cwd: view.cwd().to_owned(),
+            mode: view.workset_mode(),
+            origin,
         };
-        match created {
-            Ok(workspace) => {
-                made.push(workspace.checkout().to_owned());
-                entries.push(workspace);
-            }
-            Err(error) => {
-                Materialized { entries, made }.discard();
-                return Err(error);
-            }
+        Self {
+            view,
+            info,
+            owned_workset: None,
         }
     }
-    Ok(Materialized { entries, made })
-}
 
-/// The workdirs an agent starts with, and the checkouts this creation made.
-pub(crate) struct Materialized {
-    pub(crate) entries: Vec<Arc<Workspace>>,
-    made: Vec<camino::Utf8PathBuf>,
-}
-
-impl Materialized {
-    /// Gives back what this creation made, for a creation that will not
-    /// happen. Dropping the workspaces drops their leases first, which is
-    /// what makes the checkouts free to remove.
-    pub(crate) fn discard(self) {
-        let Self { entries, made } = self;
-        drop(entries);
-        for checkout in made {
-            if let Err(error) = rho_workspaces::discard_new_checkout(&checkout) {
-                eprintln!("rho-agent: {error:#}");
-            }
-        }
+    /// Marks the view's workset as made by this creation.
+    pub fn owning_workset(mut self) -> Self {
+        self.owned_workset = Some(self.view.workset().id().to_owned());
+        self
     }
 }
 

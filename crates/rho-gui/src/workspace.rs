@@ -4028,12 +4028,12 @@ impl Workspace {
             })
     }
 
-    /// An agent's working directory as a host-qualified workdir: what a new
-    /// sibling agent should inherit.
+    /// What an agent's workset was cloned from, as a host-qualified workdir:
+    /// what a new sibling agent should inherit.
     fn agent_workdir(&self, agent_id: AgentId) -> Option<HostPath> {
         Some(HostPath {
             host: self.host_of(agent_id)?,
-            path: self.registry.working_directory(agent_id)?,
+            path: self.registry.agent_origin(agent_id)?,
         })
     }
 

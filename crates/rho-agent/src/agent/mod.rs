@@ -35,7 +35,6 @@ use rho_inference::config::{InferenceModel, InferenceProfile};
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
-use rho_workspaces::View;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use self::boundary::{Boundary, ModelAsked, ModelTurn, Observations, SourceKind, boundary};
@@ -51,7 +50,7 @@ use crate::pool::{AgentPool, AgentTurnCompleted};
 use crate::presentation::{self, Sidecar, SidecarMessage};
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
-    StartWorkdir, ToolPreview, assistant_text, final_answer_text, materialize_workdirs, prompt,
+    StartPlace, ToolPreview, View, assistant_text, final_answer_text, prompt,
 };
 
 /// Whether the model's turn made a call it is waiting on. Only the notebook
@@ -142,7 +141,7 @@ impl AgentHandle {
         mode: SessionBinding,
         role: AgentRole,
         display_name: Option<String>,
-        start: Vec<StartWorkdir>,
+        start: StartPlace,
         parent: Option<AgentId>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
@@ -158,28 +157,14 @@ impl AgentHandle {
         );
         let prompt_cache_key = PromptCacheKey::generate();
         // One transaction spans agent id allocation and the record write.
-        // jj owns repository-local managed workspace id allocation; a failed
-        // multi-repo creation may leave an unreachable checkout for jj GC.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let materialized = materialize_workdirs(start).await?;
-        let entries = materialized.entries.clone();
-        let view = match View::new(entries.clone()) {
-            Ok(view) => view,
-            Err(error) => {
-                drop(entries);
-                materialized.discard();
-                return Err(error);
-            }
-        };
+        let StartPlace { view, info, .. } = start;
         write.create_agent(
             UnixMillis::now(),
             agent_id,
             display_name,
-            entries
-                .iter()
-                .map(|workspace| workspace.info().clone())
-                .collect(),
+            vec![info],
             role,
             mode,
             AgentRuntime::Rho { prompt_cache_key },

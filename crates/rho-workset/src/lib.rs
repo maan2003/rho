@@ -18,15 +18,16 @@ use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 use tokio::sync::Mutex;
 
+mod diff;
 mod ns;
 
 pub mod layout;
 
 pub use layout::*;
 pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
-pub use rho_workset_types::{
-    WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
-    WorkspaceDiffStatus, WorkspaceDiffTarget,
+pub use rho_workspaces_types::{
+    WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
+    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
 
 /// Establishes the identity user namespace required before workset mount
@@ -116,6 +117,15 @@ impl Default for StoreRefresh {
     }
 }
 
+/// Whether a state root runs the store server. Without one, jj clients
+/// initialize and fetch stores themselves (`JJ_STORE` only) and nothing
+/// keeps them fresh in the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreService {
+    Serve(StoreRefresh),
+    None,
+}
+
 /// The daemon-wide owner of one state root: the clone-store root, its
 /// server, and every workset directory.
 #[derive(Debug)]
@@ -123,49 +133,88 @@ pub struct Worksets {
     root: Utf8PathBuf,
     environment: UserEnvironment,
     path_overrides: PathOverrides,
-    server: Mutex<tokio::process::Child>,
+    server: Mutex<Option<tokio::process::Child>>,
     worksets: Mutex<BTreeMap<String, Weak<WorksetInner>>>,
+    /// Host directories adopted as worksets for this process's lifetime.
+    adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
 }
 
 impl Worksets {
-    /// Opens (creating if needed) the state root and starts its store
-    /// server, returning once the server accepts connections.
+    /// Opens (creating if needed) the state root and, when asked, starts
+    /// its store server, returning once the server accepts connections.
     pub async fn open(
         root: impl AsRef<Path>,
         environment: UserEnvironment,
         path_overrides: PathOverrides,
-        refresh: StoreRefresh,
+        service: StoreService,
     ) -> anyhow::Result<Arc<Self>> {
         let root = absolute_utf8(root.as_ref())?;
         std::fs::create_dir_all(root.join("stores"))
             .with_context(|| format!("create clone-store root at {root}"))?;
         std::fs::create_dir_all(root.join("worksets"))
             .with_context(|| format!("create workset root at {root}"))?;
-        let server = spawn_store_server(&root, &environment, &path_overrides, refresh).await?;
+        let server = match service {
+            StoreService::Serve(refresh) => {
+                Some(spawn_store_server(&root, &environment, &path_overrides, refresh).await?)
+            }
+            StoreService::None => None,
+        };
         Ok(Arc::new(Self {
             root,
             environment,
             path_overrides,
             server: Mutex::new(server),
             worksets: Mutex::new(BTreeMap::new()),
+            adopted: std::sync::Mutex::new(BTreeMap::new()),
         }))
     }
 
-    /// Opens `$XDG_STATE_HOME/rho` (`~/.local/state/rho`).
+    /// The default state root: `$XDG_STATE_HOME/rho` (`~/.local/state/rho`).
+    pub fn default_root() -> anyhow::Result<std::path::PathBuf> {
+        let state = dirs::state_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
+            .context("state directory is unavailable")?;
+        Ok(state.join("rho"))
+    }
+
+    /// Opens the default root with a store server.
     pub async fn open_default(
         environment: UserEnvironment,
         path_overrides: PathOverrides,
     ) -> anyhow::Result<Arc<Self>> {
-        let state = dirs::state_dir()
-            .or_else(|| dirs::home_dir().map(|home| home.join(".local/state")))
-            .context("state directory is unavailable")?;
         Self::open(
-            state.join("rho"),
+            Self::default_root()?,
             environment,
             path_overrides,
-            StoreRefresh::default(),
+            StoreService::Serve(StoreRefresh::default()),
         )
         .await
+    }
+
+    /// A state root without a store server, for tests and evaluations:
+    /// jj clients initialize stores themselves.
+    pub async fn open_plain(
+        root: impl AsRef<Path>,
+        environment: UserEnvironment,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::open(
+            root,
+            environment,
+            PathOverrides::default(),
+            StoreService::None,
+        )
+        .await
+    }
+
+    /// `directory` as an agent would see it without a namespace: adopted
+    /// as a workset for this process and entered in plain mode at its root.
+    pub fn plain_view(
+        self: &Arc<Self>,
+        directory: impl AsRef<Path>,
+    ) -> anyhow::Result<Arc<Namespace>> {
+        let workset = self.adopt(directory)?;
+        let root = workset.root().to_owned();
+        workset.enter(Mode::Plain, &root)
     }
 
     pub fn root(&self) -> &Utf8Path {
@@ -178,22 +227,57 @@ impl Worksets {
         self.root.join("stores")
     }
 
-    /// The store server's socket (`git.clone-store-socket`).
-    pub fn store_socket(&self) -> Utf8PathBuf {
-        self.root.join("store.sock")
+    /// The store server's socket (`git.clone-store-socket`), when one runs.
+    pub fn store_socket(&self) -> Option<Utf8PathBuf> {
+        self.server
+            .try_lock()
+            .map(|server| server.is_some())
+            .unwrap_or(true)
+            .then(|| self.root.join("store.sock"))
     }
 
-    /// Environment that points jj at the store server.
+    /// Environment that points jj at the store root and its server.
     pub fn store_environment(&self) -> Vec<(OsString, OsString)> {
-        vec![
-            ("JJ_STORE".into(), self.store_root().into_os_string()),
-            ("JJ_STORE_SOCKET".into(), self.store_socket().into_os_string()),
-        ]
+        let mut environment = vec![("JJ_STORE".into(), self.store_root().into_os_string())];
+        if let Some(socket) = self.store_socket() {
+            environment.push(("JJ_STORE_SOCKET".into(), socket.into_os_string()));
+        }
+        environment
     }
 
     /// Whether the store server is still running.
     pub async fn server_alive(&self) -> bool {
-        matches!(self.server.lock().await.try_wait(), Ok(None))
+        matches!(
+            self.server
+                .lock()
+                .await
+                .as_mut()
+                .map(|server| server.try_wait()),
+            Some(Ok(None))
+        )
+    }
+
+    /// Adopts an existing host directory as a workset for the lifetime of
+    /// this process: for evaluations and renderings that work on a directory
+    /// the user already has, in [`Mode::Plain`]. Nothing is written to the
+    /// state root.
+    pub fn adopt(self: &Arc<Self>, directory: impl AsRef<Path>) -> anyhow::Result<Workset> {
+        let root = absolute_utf8(directory.as_ref())?;
+        anyhow::ensure!(root.is_dir(), "not a directory: {root}");
+        let id = format!("adopted-{}", random_workset_id()?);
+        self.adopted
+            .lock()
+            .unwrap()
+            .insert(id.clone(), root.clone());
+        let workset = Arc::new(WorksetInner {
+            id: id.clone(),
+            root,
+            owner: Arc::downgrade(self),
+            operation_lock: Mutex::new(()),
+        });
+        // Not memoized weakly: an adopted workset is looked up by its
+        // recorded directory instead.
+        Ok(Workset(workset))
     }
 
     pub async fn create(self: &Arc<Self>) -> anyhow::Result<Workset> {
@@ -219,7 +303,11 @@ impl Worksets {
         if let Some(workset) = worksets.get(workset_id).and_then(Weak::upgrade) {
             return Ok(Workset(workset));
         }
-        let root = self.root.join("worksets").join(workset_id).join("src");
+        let adopted = self.adopted.lock().unwrap().get(workset_id).cloned();
+        let root = match adopted {
+            Some(root) => root,
+            None => self.root.join("worksets").join(workset_id).join("src"),
+        };
         anyhow::ensure!(root.is_dir(), "workset does not exist: {workset_id}");
         let workset = Arc::new(WorksetInner {
             id: workset_id.to_owned(),
@@ -311,7 +399,10 @@ async fn spawn_store_server(
     let mut command = base_command("jj", environment, path_overrides);
     command
         .arg("--config")
-        .arg(format!("git.clone-store={}", toml_string(root.join("stores").as_str())))
+        .arg(format!(
+            "git.clone-store={}",
+            toml_string(root.join("stores").as_str())
+        ))
         .args(["store", "serve", "--socket"])
         .arg(&socket)
         .arg("--interval")
@@ -345,7 +436,10 @@ async fn spawn_store_server(
                 use tokio::io::AsyncReadExt as _;
                 let _ = pipe.read_to_string(&mut stderr).await;
             }
-            anyhow::bail!("clone store server exited during startup ({status}): {}", stderr.trim());
+            anyhow::bail!(
+                "clone store server exited during startup ({status}): {}",
+                stderr.trim()
+            );
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
@@ -388,8 +482,196 @@ impl Workset {
             .context("worksets manager was dropped")
     }
 
-    pub async fn enter(&self, mode: Mode) -> anyhow::Result<Arc<Namespace>> {
-        Namespace::create(self.clone(), mode).await
+    /// A namespace over this workset for one agent, whose working
+    /// directory is `cwd` as the agent sees it (below the mode's visible
+    /// root, or relative to it). The mount namespace itself is built on the
+    /// first command.
+    pub fn enter(&self, mode: Mode, cwd: &Utf8Path) -> anyhow::Result<Arc<Namespace>> {
+        Namespace::new(self.clone(), mode, cwd)
+    }
+
+    /// The host directory behind a workset-relative or visible path in
+    /// `mode`, checked lexically.
+    pub fn host_path_in(&self, mode: &Mode, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
+        let visible_root = mode.visible_root(self.root());
+        let relative = visible_relative(visible_root.as_str(), visible)?;
+        Ok(self.0.root.join(relative))
+    }
+
+    /// Adds a jj workspace of the repository containing `base` (a host
+    /// directory inside the workset), on a new change atop `revset`
+    /// evaluated in `base`'s workspace. Returns the new workspace directory.
+    pub async fn add_workspace(
+        &self,
+        base: &Utf8Path,
+        revset: &str,
+    ) -> anyhow::Result<Utf8PathBuf> {
+        let owner = self.owner()?;
+        anyhow::ensure!(
+            base.starts_with(&self.0.root),
+            "{base} is outside workset {}",
+            self.id()
+        );
+        let (workspace_root, is_jj) = resolve_workdir_root(base.as_std_path())?;
+        anyhow::ensure!(is_jj, "{base} is not inside a jj repository");
+        let repo_root = resolve_repo_root(workspace_root.as_std_path())?;
+        let repo_name = repo_root
+            .file_name()
+            .context("repository root has no name")?
+            .to_owned();
+        let _guard = self.0.operation_lock.lock().await;
+        let (name, target) = (2..1000)
+            .map(|n| format!("{repo_name}-{n}"))
+            .map(|name| {
+                let target = self.0.root.join(&name);
+                (name, target)
+            })
+            .find(|(_, target)| !target.exists())
+            .context("no free workspace name")?;
+        let mut command = owner.command("jj");
+        command
+            .current_dir(base)
+            .args(["workspace", "add", "--name", &name, "-r", revset])
+            .arg(&target);
+        if let Err(error) = run(command, "add jj workspace").await {
+            let _ = std::fs::remove_dir_all(&target);
+            return Err(error);
+        }
+        Ok(target)
+    }
+
+    /// Starts a new change atop `revset` in the repository at `checkout`
+    /// (a host directory inside the workset).
+    pub async fn new_change(&self, checkout: &Utf8Path, revset: &str) -> anyhow::Result<()> {
+        let owner = self.owner()?;
+        let _guard = self.0.operation_lock.lock().await;
+        let mut command = owner.command("jj");
+        command.current_dir(checkout).args(["new", revset]);
+        run(command, "start change at requested revset").await
+    }
+
+    /// Snapshots the jj workspace containing `checkout` (a host directory
+    /// inside the workset) and reads its working-copy commit against the
+    /// merged parent tree through `jj-lib`. `None` when the commit is still
+    /// `known_commit_id`.
+    pub async fn diff_snapshot(
+        &self,
+        checkout: &Utf8Path,
+        known_commit_id: Option<&str>,
+        include_paths: &[Utf8PathBuf],
+    ) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
+        anyhow::ensure!(
+            include_paths.len() <= 2_048,
+            "too many live diff paths: {}",
+            include_paths.len()
+        );
+        anyhow::ensure!(
+            include_paths
+                .iter()
+                .try_fold(0_usize, |total, path| total
+                    .checked_add(path.as_str().len()))
+                .is_some_and(|total| total <= 1024 * 1024),
+            "live diff paths exceed the 1 MiB path budget"
+        );
+        let (checkout, is_jj) = resolve_workdir_root(checkout.as_std_path())?;
+        anyhow::ensure!(is_jj, "diff view requires a jj repository: {checkout}");
+        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let permit = DIFF_READERS
+            .acquire()
+            .await
+            .context("diff readers closed")?;
+        let known_commit_id = known_commit_id.map(str::to_owned);
+        let include_paths = include_paths.to_vec();
+        let environment = self.jj_environment()?;
+        let inner = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            // jj-lib's repository/index graph is intentionally !Send. Keep
+            // every jj value and future on this one blocking worker; only the
+            // fully-owned wire DTO crosses back to Tokio.
+            let _permit = permit;
+            let _guard = inner.operation_lock.blocking_lock();
+            futures::executor::block_on(async {
+                let epoch = jj_cli::cli_util::snapshot_workspace_descendants_at_with_environment(
+                    checkout.as_std_path(),
+                    environment,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+                let captured = diff::capture(epoch).await?;
+                if known_commit_id.as_deref() == Some(captured.commit_id_hex().as_str()) {
+                    return Ok(None);
+                }
+                diff::load(captured, &include_paths).await.map(Some)
+            })
+        })
+        .await
+        .context("jj diff reader panicked")?
+    }
+
+    /// Materializes bounded parent-side content from a previously returned
+    /// immutable jj operation. This never snapshots the live working copy.
+    pub async fn diff_base_contents(
+        &self,
+        checkout: &Utf8Path,
+        operation_id: &str,
+        commit_id: &str,
+        paths: &[Utf8PathBuf],
+    ) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
+        anyhow::ensure!(
+            paths.len() <= 64,
+            "too many deferred diff paths: {}",
+            paths.len()
+        );
+        anyhow::ensure!(
+            paths
+                .iter()
+                .try_fold(0_usize, |total, path| total
+                    .checked_add(path.as_str().len()))
+                .is_some_and(|total| total <= 1024 * 1024),
+            "deferred diff paths exceed the 1 MiB path budget"
+        );
+        let (checkout, is_jj) = resolve_workdir_root(checkout.as_std_path())?;
+        anyhow::ensure!(is_jj, "diff view requires a jj repository: {checkout}");
+        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let permit = DIFF_READERS
+            .acquire()
+            .await
+            .context("diff readers closed")?;
+        let operation_id = operation_id.to_owned();
+        let commit_id = commit_id.to_owned();
+        let paths = paths.to_vec();
+        let environment = self.jj_environment()?;
+        let inner = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _guard = inner.operation_lock.blocking_lock();
+            futures::executor::block_on(async {
+                let epoch = jj_cli::cli_util::workspace_snapshot_at_operation_with_environment(
+                    checkout.as_std_path(),
+                    &operation_id,
+                    environment,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+                let captured = diff::capture(epoch).await?;
+                anyhow::ensure!(
+                    captured.commit_id_hex() == commit_id,
+                    "diff snapshot revision is no longer available"
+                );
+                diff::load_base_contents(captured, &paths).await
+            })
+        })
+        .await
+        .context("jj deferred diff reader panicked")?
+    }
+
+    /// The environment in-process jj readers see: the user's, plus the
+    /// store variables.
+    fn jj_environment(&self) -> anyhow::Result<Vec<(OsString, OsString)>> {
+        let owner = self.owner()?;
+        let mut environment = owner.environment.0.iter().cloned().collect::<Vec<_>>();
+        environment.extend(owner.store_environment());
+        Ok(environment)
     }
 
     /// Clones `remote_url` into `<root>/<name>` through the store server,
@@ -474,9 +756,10 @@ pub(crate) fn visible_relative<'a>(
     path: &'a Utf8Path,
 ) -> anyhow::Result<&'a Utf8Path> {
     anyhow::ensure!(
-        !path
-            .components()
-            .any(|component| matches!(component, camino::Utf8Component::CurDir | camino::Utf8Component::ParentDir)),
+        !path.components().any(|component| matches!(
+            component,
+            camino::Utf8Component::CurDir | camino::Utf8Component::ParentDir
+        )),
         "path must not contain . or .. components: {path}"
     );
     if path.is_absolute() {
@@ -496,6 +779,81 @@ fn repo_name(url: &str) -> anyhow::Result<String> {
         .find(|part| !part.is_empty())
         .context("remote URL has no repository name")?;
     Ok(name.to_owned())
+}
+
+/// The root of the jj repository whose workspace `path` is (following a
+/// secondary workspace's pointer to its origin).
+pub fn resolve_repo_root(path: &Path) -> anyhow::Result<Utf8PathBuf> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "repo path must be absolute: {}",
+        path.display()
+    );
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("repo does not exist: {}", path.display()))?;
+    let path = Utf8PathBuf::try_from(path).context("repo path is not valid UTF-8")?;
+    anyhow::ensure!(
+        path.join(".jj").is_dir(),
+        "not a jj repository root: {path}"
+    );
+    let pointer = path.join(".jj").join("repo");
+    if pointer.is_file() {
+        // A secondary workspace: the pointer names `<origin>/.jj/repo`.
+        let target = Utf8PathBuf::from(
+            std::fs::read_to_string(&pointer)
+                .with_context(|| format!("read {pointer}"))?
+                .trim(),
+        );
+        let target = if target.is_absolute() {
+            target
+        } else {
+            path.join(".jj").join(target)
+        };
+        let origin = target
+            .parent()
+            .and_then(Utf8Path::parent)
+            .with_context(|| format!("malformed repo pointer in {pointer}"))?
+            .to_owned();
+        anyhow::ensure!(
+            origin.join(".jj").is_dir(),
+            "workspace points at a missing repo: {origin}",
+        );
+        let origin = origin
+            .canonicalize_utf8()
+            .with_context(|| format!("canonicalize repo root {origin}"))?;
+        return Ok(origin);
+    }
+    Ok(path)
+}
+
+/// Walks up from `path` to the containing jj workspace root when there is
+/// one, otherwise canonicalizes the plain directory. Returns the root and
+/// whether it is a jj workspace.
+pub fn resolve_workdir_root(path: &Path) -> anyhow::Result<(Utf8PathBuf, bool)> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "workdir path must be absolute: {}",
+        path.display()
+    );
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("workdir does not exist: {}", path.display()))?;
+    let canonical = Utf8PathBuf::try_from(canonical).context("workdir path is not valid UTF-8")?;
+    anyhow::ensure!(
+        canonical.is_dir(),
+        "workdir is not a directory: {canonical}"
+    );
+    let mut cursor: &Utf8Path = &canonical;
+    loop {
+        if cursor.join(".jj").is_dir() {
+            return Ok((cursor.to_owned(), true));
+        }
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => return Ok((canonical, false)),
+        }
+    }
 }
 
 fn validate_name(name: &str) -> anyhow::Result<()> {
@@ -548,7 +906,10 @@ mod tests {
 
     #[test]
     fn repo_names_follow_the_url() {
-        assert_eq!(repo_name("https://github.com/org/repo.git").unwrap(), "repo");
+        assert_eq!(
+            repo_name("https://github.com/org/repo.git").unwrap(),
+            "repo"
+        );
         assert_eq!(repo_name("git@github.com:org/repo").unwrap(), "repo");
         assert_eq!(repo_name("/tmp/remote.git/").unwrap(), "remote");
         assert!(repo_name("").is_err());

@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
-use crate::pool::{AgentPool, SpawnCheckout, SpawnWorkdir};
+use crate::pool::{AgentPool, SpawnWorkdir};
 
 /// A pooled agent's handle to the multi-agent world: its identity plus the
 /// pool for spawning, mail routing, and id resolution. `Agent::create` and
@@ -111,8 +111,8 @@ fn spawn_engineer_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(SPAWN_ENGINEER_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Start a sub-agent with its own working set of workdirs (defaulting to a \
-                      fork of yours) and return its agent id immediately. Use this for a concrete, bounded subtask, including side \
+        description: "Start a sub-agent in your workset (in your working directory unless told \
+                      otherwise) and return its agent id immediately. Use this for a concrete, bounded subtask, including side \
                       investigations or experiments when the user asks for them or they de-risk \
                       the main task. The subtask should run independently alongside useful local \
                       work; otherwise continue locally. The prompt must be self-contained and \
@@ -135,12 +135,12 @@ fn spawn_engineer_spec() -> ToolSpec {
                 },
                 "workdirs": {
                     "type": "array",
-                    "description": "The child's working set, primary workdir first. Omit for \
-                                    the default: your whole working set, with the child's own \
-                                    jj workspace forked from your current change in each \
-                                    workdir (safe for concurrent edits). List entries \
-                                    explicitly to share your checkouts, start from another \
-                                    revision, or work in other repositories.",
+                    "maxItems": 1,
+                    "description": "Where the child works: at most one entry. Omit for the \
+                                    default, your working directory, which the child then \
+                                    shares with you. Give a directory to start it elsewhere \
+                                    in your workset, and a revset to give it its own jj \
+                                    workspace of that repository (safe for concurrent edits).",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -148,15 +148,14 @@ fn spawn_engineer_spec() -> ToolSpec {
                         "properties": {
                             "repo": {
                                 "type": "string",
-                                "description": "Absolute path of the repository or directory \
-                                                (or anywhere inside it)."
+                                "description": "A directory in your workset, absolute or \
+                                                relative to your working directory."
                             },
                             "revset": {
                                 "type": "string",
-                                "description": "With checkout=own: jj revset the child's \
-                                                change starts from. Defaults to your current \
-                                                change in that repo, or trunk() for \
-                                                repositories outside your working set."
+                                "description": "jj revset the child's own workspace starts \
+                                                from, for example `@`. Without it the child \
+                                                works in the directory as it is."
                             }
                         }
                     }
@@ -333,20 +332,13 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
     let pool = tools.pool()?;
     let parent = pool.db().read().get_agent(tools.self_id).config;
     let advisor_intelligence = default_advisor_intelligence(parent.role);
-    let workdirs = parent
-        .workdirs
-        .into_iter()
-        .map(|info| SpawnWorkdir {
-            repo: info.repo().to_owned(),
-            checkout: SpawnCheckout::Shared,
-        })
-        .collect();
+    // The advisor reads what the asker sees: same directory, same workset.
     let advisor = pool
         .spawn_child(
             tools.self_id,
             "advisor".to_owned(),
             args.message,
-            workdirs,
+            Vec::new(),
             AgentRole::Advisor {
                 intelligence: advisor_intelligence,
             },
@@ -380,7 +372,6 @@ struct SpawnArgs {
 #[derive(Deserialize)]
 pub struct SpawnWorkdirArgs {
     pub repo: String,
-    pub checkout: Option<String>,
     pub revset: Option<String>,
 }
 
@@ -390,14 +381,12 @@ pub fn parse_spawn_workdirs(entries: Vec<SpawnWorkdirArgs>) -> anyhow::Result<Ve
         .into_iter()
         .map(|entry| {
             anyhow::ensure!(
-                entry.checkout.as_deref().is_none_or(|value| value == "own"),
-                "shared Engineer checkouts are not supported"
+                !entry.repo.trim().is_empty(),
+                "workdirs.repo must not be empty"
             );
             Ok(SpawnWorkdir {
-                repo: Utf8PathBuf::from(entry.repo),
-                checkout: SpawnCheckout::Own {
-                    revset: entry.revset,
-                },
+                path: Utf8PathBuf::from(entry.repo),
+                revset: entry.revset,
             })
         })
         .collect()
@@ -421,15 +410,7 @@ async fn spawn_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Res
         .spawn_child(tools.self_id, args.task_name, args.prompt, workdirs, config)
         .await?;
     let child_record = pool.db().read().get_agent(child_id);
-    let workspace_note = match child_record.primary_workdir().workspace_handle() {
-        Some(workspace) => format!(
-            " Its jj workspace is `{workspace}`; inspect its working-copy commit with `jj diff -r \
-             '{workspace}@' --stat`."
-        ),
-        None => " It is running in the shared user checkout workspace; there is no separate \
-                 `<workspace>@` handle."
-            .to_owned(),
-    };
+    let workspace_note = format!(" It works in {}.", child_record.primary_workdir().repo());
     let child_id = format!("eng-{}", pool.agent_id_prefix(child_id));
     Ok(format!(
         "Spawned agent {} for task \"{}\". It is working now; its results will arrive as mail \

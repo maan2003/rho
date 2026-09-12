@@ -9,7 +9,7 @@ use rho_agent::db::{
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workspaces::WorkspaceInfo;
+use rho_workset::WorkspaceInfo;
 
 use crate::default_db_path;
 
@@ -93,17 +93,14 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let role = parse_role(role)?;
     let cwd = std::env::current_dir().context("read current directory")?;
-    let (root, is_jj) = rho_workspaces::resolve_workdir_root(&cwd)?;
-    let repo = if is_jj {
-        rho_workspaces::Repo::open(root.as_std_path())?
-    } else {
-        rho_workspaces::Repo::open_plain_with_path_overrides(
-            root.as_std_path(),
-            rho_workspaces::PathOverrides::default(),
-        )?
-    };
-    let workspace = std::sync::Arc::new(repo).user_checkout().await?;
-    let view = rho_workspaces::View::new(vec![workspace])?;
+    // A rendering runs where it is invoked, with no namespace and no store
+    // server; the state root only has to exist.
+    let worksets = rho_workset::Worksets::open_plain(
+        rho_workset::Worksets::default_root()?,
+        rho_workset::UserEnvironment::new(std::env::vars_os().collect()),
+    )
+    .await?;
+    let view = worksets.plain_view(&cwd)?;
     let surface = rho_agent::render_agent_surface(view, role)?;
 
     println!("# System prompt\n");
@@ -626,6 +623,7 @@ fn workspace_name(workspace: &WorkspaceInfo) -> String {
         WorkspaceInfo::Sandbox { repo, id } => {
             format!("sandbox ws-{} from {repo}", id.encoded())
         }
+        WorkspaceInfo::Workset { workset, cwd, .. } => format!("{cwd} in workset {workset}"),
     }
 }
 

@@ -14,7 +14,7 @@ use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 pub use rho_ui_proto::mirror::{AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome};
-use rho_workspaces::WorkspaceInfo;
+use rho_workset::WorkspaceInfo;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use uuid::Uuid;
 

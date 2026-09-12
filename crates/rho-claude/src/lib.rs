@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use camino::Utf8PathBuf;
-use rho_workspaces::PathOverrides;
+use rho_workset::PathOverrides;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 

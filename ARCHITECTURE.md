@@ -60,46 +60,33 @@ than by running a supervisor, extension protocol, or daemon process graph.
   architecture and governing decisions are recorded under
   `crates/rho-agent/specs/`. `rho-agent-tools` is the real tools in the
   shape that loop consumes.
-- `rho-workspaces` owns checkout materialization and filesystem views. A
-  `Workspace` is one materialized checkout (a stable jj-managed bcachefs
-  subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a
-  plain directory). Managed workspace ids are repository-local prefix ids
-  rendered as `ws-<id>` and allocated by jj from a compact repository-local
-  `(seed, next-counter)` registry; generated IDs are derived rather than
-  stored individually. jj also dictates their stable per-repository paths,
-  rematerializes missing checkouts, and garbage-collects stale materialized
-  paths enumerated by jj's workspace store after snapshotting them. GC never
-  scans the prefix-id counter range. Snapshotting is commit-cone scoped: jj
-  snapshots the command workspace, workspaces sharing its working-copy commit,
-  and materialized descendant workspaces, but not ancestors or siblings.
-  Turn-boundary snapshots run `jj util snapshot` from the specific workspace
-  checkout so the correct cone is selected. Every live `Workspace`
-  holds a shared lock on its persistent sibling lease file; GC alone requests
-  the nonblocking exclusive lock, so any number of Rho processes can inhibit
-  collection without using the lease as a workspace-ownership mutex.
-  Repository caches retain only weak references, while agents and views own
-  live workspaces. Sandbox workspaces use the same managed checkout
-  lifecycle while masking their `.jj` and colocated `.git` metadata from child
-  commands, expose a separate synthetic Git baseline, and install a Landlock
-  filesystem/network policy on every prepared child command. A `View` is one agent's world: a working
-  set of workdir entries, fixed at spawn, realized as a private mount
-  namespace with each entry's checkout mounted over its origin path. Entry 0 is
-  the primary workdir (default cwd, prompt header).
-  Agents joining a workspace share the `Workspace`; each agent has its own
-  `View`. Each repository allocates its own managed workspace id, so a
-  multi-repository agent's prompt lists a separate `ws-<id>` handle for every
-  workdir.
-  Sandbox and ordinary workspaces cannot be mixed in one view.
-  Live-diff semantic barriers use the same vendored descendant-snapshot
-  implementation through an embedded `jj-cli` API under the repo lock. The
-  API returns the exact immutable repository epoch it wrote, so derived
-  manifests never reload a racing operation head.
+- `rho-workset` owns the state root (`~/.local/state/rho`) and the agent
+  filesystem view; `WORKSET.md` is its design note. A workset is one plain
+  directory per agent group, presented at `/src`: the daemon does not
+  interpret its contents, there is no workset table (the directory is the
+  record), and nothing forks. An agent's record is a workset id, its working
+  directory as it sees it, and its mode. A new agent gets a fresh workset
+  holding a `jj git clone` of what it was started on; clones go through the
+  transparent clone store (`CLONES.md`) whose server the daemon runs, so
+  they are fast and born on the remote's current state. Children join their
+  parent's workset, in the parent's directory or in a jj workspace the pool
+  adds beside it; the GUI's "beside" start does the same for a user-made
+  agent. A `Namespace` is one agent's view: a mount namespace built lazily
+  on the first command, in view mode (a generated tmpfs root with the
+  workset at `/src`), exposed mode (the host, with the workset at `/ws`) or
+  plain mode (no namespace; tests and evaluations). Live-diff semantic
+  barriers use the vendored descendant-snapshot implementation through an
+  embedded `jj-cli` API under the workset's operation lock. The API returns
+  the exact immutable repository epoch it wrote, so derived manifests never
+  reload a racing operation head. Records written before worksets name
+  checkouts this daemon no longer manages; their transcripts stay
+  readable, but they cannot run.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
-  the binaries, below project and user skills in precedence. Results are cached per
-  `rho-workspaces::Workspace` and merged across a view's workdirs;
-  `rho-agent` owns system prompt rendering. Clients have no special skill or
+  the binaries, below project and user skills in precedence. Discovery is a
+  function of the agent's working directory: the jj workspace containing it,
+  or the directory itself; `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
   discovery and receives only Rho role/team and workspace context on
@@ -320,16 +307,15 @@ than by running a supervisor, extension protocol, or daemon process graph.
   a transient item (`space shift+s`) and as a vim key (`shift+g`), so
   shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
-  explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
+  explicitly to `rho-workset` for daemon-owned commands. Workset-control
   subprocesses use that environment directly; agent execution shells and
-  Claude processes add the primary project's environment through `direnv exec`.
+  Claude processes add the working directory's environment through `direnv exec`.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent
   View and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
   hook. Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
   `vendor/brush` as a squashed Git subtree and linked only into the sidecar.
-  Sandboxed agents remain refused until a sandbox-native startup policy can
-  replace the intentionally empty sandbox HOME. The daemon treats the sidecar
+  The daemon treats the sidecar
   protocol as untrusted: it assigns execution ids, retains accepted command
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
@@ -386,7 +372,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   synchronously before Python continues; no Python object crosses threads.
   Async host completions wake the interpreter through eventfd and resolve its
   futures on the interpreter thread. Shared globals and ordinary asyncio remain.
-  Python runs with private cwd state inside the agent's workspace mount view;
+  Python runs with private cwd state inside the agent's workset view;
   this is path mapping, not a sandbox.
 - `rho-agent-tools` owns each `PythonExec` and its independently registered host
   operations. The submitted code returning, remaining Python activity stopping,
@@ -440,12 +426,12 @@ pending descriptor reconstructs that view on load and rotates away from any
 partial destination transcript before retrying.
 
 Collaboration creation is role-specific while communication is shared.
-`spawn_engineer` always gives jj-backed workdirs isolated child workspaces.
-Explicit child revsets resolve in the parent's corresponding workspace context
-(or the user checkout for a repository outside the parent's working set), so
-workspace-relative symbols and snapshot scope follow the spawning agent.
-Sandboxed parents create only sandboxed child workdirs;
-detailed delegation and integration guidance lives in the
+`spawn_engineer` puts the child in the parent's workset: in the parent's
+working directory by default, in another directory of the workset on
+request, or, with a revset, in its own jj workspace of that repository on a
+new change atop the revset (resolved in the parent's workspace, so
+workspace-relative symbols follow the spawning agent). Advisors join the
+asker's directory. Detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
 use `ask_advisor` to create an advisory session. `message_agent` is
 an unrestricted bidirectional
@@ -469,9 +455,9 @@ parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
 reasoning.
 
 The database also stores a global project registry, distinct from each agent's
-fixed execution `workdirs`. Projects are keyed by local repository path and
-carry a UI-only name plus a description; UI clients use the names for display
-and selection.
+fixed place. Projects are keyed by what an agent is started on (a repository
+URL or a daemon-side path) and carry a UI-only name plus a description; UI
+clients use the names for display and selection.
 
 `AgentRole` also carries a persistence-compatible workflow distinction:
 the existing Engineer variants are the default workflow, while appended

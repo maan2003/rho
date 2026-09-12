@@ -21,12 +21,11 @@ pub const DEFAULT_ROLE: &str = "eng";
 /// the cursor is in the field. The field label shows the current mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartFieldMode {
-    /// A fresh workspace with a new change on top of the target.
+    /// A fresh clone with a new change on top of the target, or beside a
+    /// target agent: a new jj workspace in its workset.
     NewOn,
-    /// The same workspace as the target: shared checkout and namespace.
+    /// The same directory as the target agent.
     Join,
-    /// A VCS-masked workspace with restricted filesystem and network access.
-    Sandbox,
 }
 
 /// What the agents map says about the label in the start field: which host
@@ -49,8 +48,11 @@ pub fn resolve_workdir(hosts: &Hosts, argument: &str) -> Result<HostPath, String
         return Ok(registered);
     }
     // A Windows-style drive letter is not a thing on a daemon host, so a
-    // colon before any separator is unambiguously a host prefix.
-    if let Some((name, path)) = argument.split_once(':')
+    // colon before any separator is unambiguously a host prefix. A URL
+    // (`https://…`, `git@host:path`) is what the daemon clones, not a host.
+    let is_url = argument.contains("://") || argument.starts_with("git@");
+    if !is_url
+        && let Some((name, path)) = argument.split_once(':')
         && !name.contains('/')
     {
         let host = hosts
@@ -132,34 +134,15 @@ pub fn parse_start(
     };
     let workspace = base.workspace;
     let start = match (mode, target, workspace) {
-        (StartFieldMode::Sandbox, "", _) => {
-            return Err("pick a sandbox base: a revset like `@-` or an agent label".to_owned());
-        }
-        (
-            StartFieldMode::Sandbox,
-            _,
-            Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-        ) => StartMode::Sandbox {
-            repo,
-            revset: format!("{}@", id.encoded()),
-        },
-        (StartFieldMode::Sandbox, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-            StartMode::Sandbox {
-                repo,
-                revset: "@".to_owned(),
-            }
-        }
-        (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
-            repo: require_workdir()?.path,
-            revset: if target.eq_ignore_ascii_case(DEFAULT_START) {
-                AUTO_BASE_REVSET
-            } else {
-                target
-            }
-            .to_owned(),
-        },
         (StartFieldMode::NewOn, "", _) => {
             return Err("pick a base: a revset like `@-` or an agent label".to_owned());
+        }
+        // Beside an agent: a new jj workspace in its workset, on its change.
+        (StartFieldMode::NewOn, _, Some(base @ WorkspaceInfo::Workset { .. })) => {
+            StartMode::Beside {
+                base,
+                revset: "@".to_owned(),
+            }
         }
         (
             StartFieldMode::NewOn,

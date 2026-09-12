@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rho_workset::{PathOverrides, StoreRefresh, UserEnvironment, Worksets};
+use rho_workset::{PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -112,10 +112,10 @@ pub async fn open_worksets(temp: &Path, jj_bin: &Path) -> Arc<Worksets> {
         temp.join("root"),
         environment(jj_bin),
         PathOverrides::default(),
-        StoreRefresh {
+        StoreService::Serve(StoreRefresh {
             interval: Duration::from_secs(3600),
             debounce: Duration::ZERO,
-        },
+        }),
     )
     .await
     .unwrap()

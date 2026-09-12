@@ -21,7 +21,7 @@ use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
-use rho_workspaces::{PathOverrides, View};
+use rho_workset::{Namespace as View, PathOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

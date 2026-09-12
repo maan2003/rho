@@ -27,7 +27,7 @@ use crate::db::{
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
     AgentEvent, AgentState, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind,
-    InputQueues, MessageDelivery, QueuedInput, StartWorkdir, TranscriptLine, prompt,
+    InputQueues, MessageDelivery, QueuedInput, TranscriptLine, prompt,
 };
 
 pub(crate) mod projection;
@@ -52,7 +52,7 @@ impl ClaudeAgent {
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
         display_name: Option<String>,
-        start: Vec<StartWorkdir>,
+        start: crate::StartPlace,
         mode: SessionBinding,
         role: AgentRole,
         parent: Option<AgentId>,
@@ -66,25 +66,13 @@ impl ClaudeAgent {
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let materialized = crate::materialize_workdirs(start).await?;
-        let entries = materialized.entries.clone();
-        let view = match rho_workspaces::View::new(entries.clone()) {
-            Ok(view) => view,
-            Err(error) => {
-                drop(entries);
-                materialized.discard();
-                return Err(error);
-            }
-        };
+        let crate::StartPlace { view, info, .. } = start;
         let session_id = Uuid::new_v4();
         write.create_agent(
             UnixMillis::now(),
             agent_id,
             display_name,
-            entries
-                .iter()
-                .map(|workspace| workspace.info().clone())
-                .collect(),
+            vec![info],
             role,
             mode,
             AgentRuntime::Claude { session_id },
@@ -139,7 +127,7 @@ impl ClaudeAgent {
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+        view: Arc<Lazy<Arc<crate::View>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
@@ -272,7 +260,7 @@ impl ClaudeAgent {
         inference: Inference,
         claude: rho_claude::accounts::ClaudePaths,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+        view: Arc<Lazy<Arc<crate::View>>>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -506,7 +494,7 @@ struct ClaudeLoop {
     /// and turn reports so both keep one prompt prefix warm.
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
-    view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+    view: Arc<Lazy<Arc<crate::View>>>,
     /// The primary workdir's repo, which is where Claude files the
     /// session. Known without materializing the view.
     model: Model,
@@ -1175,7 +1163,7 @@ impl ClaudeLoop {
                     let source = rho_claude::read_session_messages_by_id(
                         &self.claude.projects(),
                         source_session_id,
-                        view.primary().repo(),
+                        view.cwd(),
                         rho_claude::SessionMessagesOptions::default(),
                     )
                     .await?;
@@ -1191,7 +1179,7 @@ impl ClaudeLoop {
             let messages = rho_claude::read_session_messages_by_id(
                 &self.claude.projects(),
                 self.session_id,
-                view.primary().repo(),
+                view.cwd(),
                 rho_claude::SessionMessagesOptions::default(),
             )
             .await?;
@@ -1301,7 +1289,7 @@ impl ClaudeLoop {
             },
         };
         let mut options = ClaudeCodeOptions::new(
-            view.primary().repo().to_owned(),
+            view.cwd().to_owned(),
             self.model,
             self.effort,
             self.session_id,
@@ -1349,7 +1337,7 @@ impl ClaudeLoop {
 
     /// Builds the notebook on the first spawn. It lives as long as the
     /// loop: a respawned CLI finds the same globals and running cells.
-    fn ensure_python(&mut self, view: &Arc<rho_workspaces::View>) -> anyhow::Result<()> {
+    fn ensure_python(&mut self, view: &Arc<crate::View>) -> anyhow::Result<()> {
         if self.python.is_some() {
             return Ok(());
         }
@@ -1375,7 +1363,7 @@ impl ClaudeLoop {
     /// the standing mount already points at.
     async fn configure_claude_home(
         &mut self,
-        view: &rho_workspaces::View,
+        view: &crate::View,
         options: &mut rho_claude::ClaudeCodeOptions,
         account: &str,
     ) -> anyhow::Result<()> {
@@ -1430,7 +1418,7 @@ impl ClaudeLoop {
         } else {
             None
         };
-        view.set_claude_home(rho_workspaces::ns::ClaudeHome {
+        view.set_claude_home(rho_workset::ClaudeHome {
             account: account_dir.into_std_path_buf(),
             shared_projects: config_home.join("projects").into_std_path_buf(),
             config_home: config_home.into_std_path_buf(),
@@ -1904,7 +1892,7 @@ impl ClaudeLoop {
         let messages = rho_claude::read_session_messages_by_id(
             &self.claude.projects(),
             self.session_id,
-            view.primary().repo(),
+            view.cwd(),
             rho_claude::SessionMessagesOptions::default(),
         )
         .await?;

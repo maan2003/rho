@@ -4030,7 +4030,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
-    use rho_ui_proto::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+    use rho_ui_proto::WorkspaceInfo;
 
     let workspace = test_workspace(cx);
     let agent_id = agent(1);
@@ -4042,9 +4042,11 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
                 ready_with(
                     vec![story::UiAgentHead {
                         spawn_name: Some("worker".to_owned()),
-                        workdirs: vec![WorkspaceInfo::Workspace {
-                            repo: "/tmp/rho".into(),
-                            id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+                        workdirs: vec![WorkspaceInfo::Workset {
+                            workset: "0123456789ab".to_owned(),
+                            cwd: "/src/rho".into(),
+                            mode: Default::default(),
+                            origin: Some("/tmp/rho".into()),
                         }],
                         ..ui_head(agent_id)
                     }],

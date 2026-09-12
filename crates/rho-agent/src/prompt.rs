@@ -394,21 +394,14 @@ text](file:///absolute/path#L10-L20)` — never paste a raw `file://` URL as vis
 /// the section explaining them. The tool surface is always the Python
 /// notebook, and `host_specs` are the functions it exposes.
 pub fn prompt(
-    view: &rho_workspaces::View,
+    view: &crate::View,
     multi_agent: Option<&MultiAgentTools>,
     role: AgentRole,
     host_specs: &[rho_core::ToolSpec],
 ) -> Arc<str> {
-    let entries = view.entries();
-    let workdirs = entries
-        .iter()
-        .map(|workspace| WorkdirPrompt {
-            path: workspace.repo().to_string(),
-            kind: WorkdirKind::of(workspace),
-        })
-        .collect::<Vec<_>>();
+    let place = WorksetPrompt::of(view, multi_agent);
     let (agents_md, skills) = {
-        let (agents_files, skills) = merged_context(entries);
+        let (agents_files, skills) = discovered_context(view);
         let skills = skills
             .into_iter()
             .filter(|skill| role.is_engineer() || skill.name != "delegate-engineering")
@@ -487,8 +480,8 @@ request.
     } else {
         BASE_PROMPT
     };
-    let environment = render_environment_prompt(&workdirs);
-    let workspace = render_workspace_prompt(&workdirs);
+    let environment = render_environment_prompt(&place);
+    let workspace = render_workspace_prompt(&place);
     format!("{base_prompt}{agents_md}{skills}{python}{team_context}{role_prompt}{workspace}{environment}")
         .into()
 }
@@ -498,7 +491,7 @@ request.
 /// agent's only tool (served to Claude Code over MCP), and `None` when the
 /// agent runs with Claude's own tools.
 pub fn claude_prompt(
-    view: Option<&rho_workspaces::View>,
+    view: Option<&crate::View>,
     multi_agent: Option<&MultiAgentTools>,
     role: AgentRole,
     python_hosts: Option<&[rho_core::ToolSpec]>,
@@ -531,15 +524,7 @@ pub fn claude_prompt(
     let workspace = view
         .filter(|_| role.is_engineer() || matches!(role, AgentRole::Advisor { .. }))
         .map_or_else(String::new, |view| {
-            let workdirs = view
-                .entries()
-                .iter()
-                .map(|workspace| WorkdirPrompt {
-                    path: workspace.repo().to_string(),
-                    kind: WorkdirKind::of(workspace),
-                })
-                .collect::<Vec<_>>();
-            render_workspace_prompt(&workdirs)
+            render_workspace_prompt(&WorksetPrompt::of(view, multi_agent))
         });
     format!("{team}{role_prompt}{python}{workspace}").into()
 }
@@ -564,67 +549,63 @@ sleeping: the call returns when the check-in fires without blocking Python.
 
 ";
 
-/// One workdir as the prompt renders it: the agent-visible path and the kind
-/// of checkout mounted there.
-struct WorkdirPrompt {
-    path: String,
-    kind: WorkdirKind,
+/// An agent's place as the prompt renders it.
+struct WorksetPrompt {
+    /// The workset directory as the agent sees it.
+    root: String,
+    /// The agent's working directory as it sees it.
+    cwd: String,
+    /// Whether the working directory is inside a jj repository.
+    jj: bool,
+    /// Whether the filesystem outside the workset is a disposable view.
+    view: bool,
+    /// Whether another agent started this one, and so may share its
+    /// directory.
+    spawned: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WorkdirKind {
-    Live,
-    Managed,
-    Sandbox,
-}
-
-impl WorkdirKind {
-    fn of(workspace: &rho_workspaces::Workspace) -> Self {
-        if workspace.is_sandbox() {
-            Self::Sandbox
-        } else if workspace.is_user_checkout() {
-            Self::Live
-        } else {
-            Self::Managed
+impl WorksetPrompt {
+    fn of(view: &crate::View, multi_agent: Option<&MultiAgentTools>) -> Self {
+        let jj = view
+            .context_roots()
+            .map(|(_, host_root)| host_root.join(".jj").is_dir())
+            .unwrap_or(false);
+        Self {
+            root: view.visible_root().to_string(),
+            cwd: view.cwd().to_string(),
+            jj,
+            view: matches!(view.mode(), rho_workset::Mode::View { .. }),
+            spawned: multi_agent.is_some_and(|tools| tools.parent().is_some()),
         }
     }
 }
 
-/// Union of every workdir's discovered context: AGENTS.md files deduped by
-/// path (the user-level file appears in each entry's discovery), skills
-/// deduped by name with earlier (primary-first) workdirs winning.
-fn merged_context(
-    entries: &[Arc<rho_workspaces::Workspace>],
+/// The context an agent's working directory brings: AGENTS.md files and
+/// skills discovered from the repository containing it (or the directory
+/// itself), plus the user-level ones.
+fn discovered_context(
+    view: &crate::View,
 ) -> (
     Vec<rho_context_config::AgentsFile>,
     Vec<rho_context_config::Skill>,
 ) {
-    let mut seen_files = std::collections::HashSet::new();
-    let mut seen_skills = std::collections::HashSet::new();
-    let mut agents_files = Vec::new();
-    let mut skills = Vec::new();
-    for entry in entries {
-        let context = entry.discovered_context();
-        for diagnostic in &context.diagnostics {
-            eprintln!(
-                "rho-agent: context config {:?}: {}: {}",
-                diagnostic.kind,
-                diagnostic.path.display(),
-                diagnostic.message
-            );
+    let (visible_root, host_root) = match view.context_roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            eprintln!("rho-agent: context discovery: {error:#}");
+            return (Vec::new(), Vec::new());
         }
-        for file in &context.agents_files {
-            if seen_files.insert(file.file_path.clone()) {
-                agents_files.push(file.clone());
-            }
-        }
-        for skill in &context.skills {
-            if seen_skills.insert(skill.name.clone()) {
-                skills.push(skill.clone());
-            }
-        }
+    };
+    let context = rho_context_config::DiscoveredContext::discover(&visible_root, &host_root);
+    for diagnostic in &context.diagnostics {
+        eprintln!(
+            "rho-agent: context config {:?}: {}: {}",
+            diagnostic.kind,
+            diagnostic.path.display(),
+            diagnostic.message
+        );
     }
-    (agents_files, skills)
+    (context.agents_files, context.skills)
 }
 
 const ADVISOR_PROMPT: &str = "## Advisor
@@ -696,121 +677,54 @@ fn render_skills_prompt(skills: &[rho_context_config::Skill]) -> Option<String> 
     Some(out)
 }
 
-fn render_environment_prompt(workdirs: &[WorkdirPrompt]) -> String {
-    let working_directory = &workdirs[0].path;
-    let mut out = format!(
+fn render_environment_prompt(place: &WorksetPrompt) -> String {
+    let WorksetPrompt { cwd, root, .. } = place;
+    format!(
         "## Environment
 
-Working directory: {working_directory}
+Working directory: {cwd}
 
-Relative paths in commands and patches resolve against this directory.
+Relative paths in commands and patches resolve against this directory. Your workset is {root}; \
+stay within it unless the user points you elsewhere.
 "
-    );
-    if workdirs.len() > 1 {
-        out.push_str("\nAdditional workdirs in your working set:\n");
-        for workdir in &workdirs[1..] {
-            let binding = match workdir.kind {
-                WorkdirKind::Managed => "a Rho-managed jj workspace",
-                WorkdirKind::Sandbox => "a Rho-managed sandbox workspace",
-                WorkdirKind::Live => "a live directory rather than a Rho-managed workspace",
-            };
-            out.push_str(&format!("- {} ({binding})\n", workdir.path));
-        }
-        out.push_str("\nStay within these directories unless the user points you elsewhere.\n");
-    } else {
-        out.push_str("Stay within it unless the user points you elsewhere.\n");
-    }
-    out
+    )
 }
 
-/// Draft replacement for the rendered `## Workspace Context` section under the
-/// per-agent clone model (each agent gets its own jj repo over shared storage
-/// instead of a Rho-managed workspace in one shared repo). Unused until that
-/// runtime lands.
-///
-/// Variants the renderer still needs: "Every repository in your working set is
-/// your own clone" for multiple jj workdirs; a live-directory line for plain
-/// workdirs; the existing per-workdir list when the working set is mixed; and,
-/// for an agent that joined its spawner's checkout, "You share this clone with
-/// the agent that started you, so your edits are visible to it immediately" in
-/// place of the second sentence.
-#[allow(dead_code)]
-const DRAFT_CLONE_WORKSPACE_PROMPT: &str = "## Workspace Context
+fn render_workspace_prompt(place: &WorksetPrompt) -> String {
+    let WorksetPrompt { root, cwd, .. } = place;
+    let mut out = format!(
+        "## Workspace Context
 
-Your working directory is your own clone of the repository. No other agent \
-works in it, so edit files and run tests here freely. The user may also open \
-and edit it — treat changes you did not make as intentional and leave them \
-alone.
+Your workset is the directory {root}: a place that is yours, holding the repositories you work \
+in. Your working directory is {cwd}. Clone further repositories into the workset with \
+`jj git clone <url>` (fast: clones are served from a local store), and add jj workspaces of a \
+repository with `jj workspace add`. Nothing in the workset is cleaned up behind you; what is \
+there when you start is the starting state you were given.
 
-";
-
-/// Draft version-control section to accompany [`DRAFT_CLONE_WORKSPACE_PROMPT`],
-/// rendered only when at least one workdir is a jj repo. Landing and history
-/// editing are deliberately absent: the `land` skill owns that policy, and
-/// restating it here is the repetition that makes agents ask before safe,
-/// expected actions.
-///
-/// Blocked on the handoff fix: `delegate-engineering/SKILL.md` and the
-/// `spawn_engineer` result still hand out `jj diff -r '<workspace>@'`, which
-/// reads empty once an agent commits. That needs to become a range from the
-/// spawn base, which is also correct when the agent leaves work uncommitted.
-#[allow(dead_code)]
-const DRAFT_JJ_WORKFLOW_PROMPT: &str = "## jj Workflow
-
-This repository uses jj. Record a change once it is complete: \
-`jj commit -m '<message>'` for new work, or `jj squash -u` to fold a follow-up \
-into the change you just made. Work still in progress can stay in the working \
-copy.
-
-";
-
-fn render_workspace_prompt(workdirs: &[WorkdirPrompt]) -> String {
-    let managed = workdirs
-        .iter()
-        .filter(|workdir| workdir.kind == WorkdirKind::Managed)
-        .count();
-    let sandboxed = workdirs
-        .iter()
-        .filter(|workdir| workdir.kind == WorkdirKind::Sandbox)
-        .count();
-    let mut out = String::from("## Workspace Context\n\n");
-    if managed == workdirs.len() {
-        if workdirs.len() == 1 {
-            out.push_str("Your working directory is a Rho-managed jj workspace.\n\n");
-        } else {
-            out.push_str(
-                "Every repository workdir in your working set is a Rho-managed jj workspace.\n\n",
-            );
-        }
-    } else if sandboxed == workdirs.len() {
-        if workdirs.len() == 1 {
-            out.push_str("Your working directory is a Rho-managed sandbox workspace.\n\n");
-        } else {
-            out.push_str(
-                "Every workdir in your working set is a Rho-managed sandbox workspace.\n\n",
-            );
-        }
-    } else if managed == 0 && sandboxed == 0 {
+"
+    );
+    if place.view {
         out.push_str(
-            "Your workdirs are live directories rather than Rho-managed jj workspaces. Edits there are immediately visible to other processes using those directories.\n\n",
+            "Outside the workset the filesystem is a minimal, disposable environment: `$HOME` \
+             and `/tmp` are empty and vanish when you are done, so keep everything that matters \
+             inside the workset.\n\n",
         );
-    } else {
-        out.push_str("Workspace management differs across your working set:\n");
-        for workdir in workdirs {
-            let management = match workdir.kind {
-                WorkdirKind::Managed => "Rho-managed jj workspace",
-                WorkdirKind::Sandbox => "Rho-managed sandbox workspace",
-                WorkdirKind::Live => "live directory",
-            };
-            out.push_str(&format!("- {} — {management}\n", workdir.path));
-        }
-        out.push('\n');
     }
-    if managed > 0 {
-        out.push_str("Each Rho-managed jj workdir is a workspace: the checkout you are working in, with a working-copy commit named `@`. jj records your edits into `@` as you work, so keeping them takes no extra step. Files and uncommitted changes already present are the starting state you were given, not leftovers to clean up. Other workspaces have their own working-copy commits; leave commits you did not create alone unless the task is to work on them.\n\n");
+    if place.jj {
+        out.push_str(
+            "This repository uses jj. Your working copy is the commit named `@`; jj records your \
+             edits into it as you work, so keeping them takes no extra step. Record a change once \
+             it is complete: `jj commit -m '<message>'` for new work, or `jj squash -u` to fold a \
+             follow-up into the change you just made. Work still in progress can stay in the \
+             working copy. Other workspaces have their own working-copy commits; leave commits \
+             you did not create alone unless the task is to work on them.\n\n",
+        );
     }
-    if sandboxed > 0 {
-        out.push_str("A Rho-managed sandbox workspace masks the repository's original VCS metadata from commands and presents a separate synthetic Git baseline. Work with the checkout and VCS view provided inside the sandbox rather than assuming the origin checkout's metadata is available.\n\n");
+    if place.spawned {
+        out.push_str(
+            "The agent that started you may share this directory with you, so your edits are \
+             visible to it immediately and its edits to you.\n\n",
+        );
     }
     out
 }
@@ -858,53 +772,38 @@ mod tests {
         assert!(prompt.contains("follow them unless they conflict"));
     }
 
-    fn workdir(path: &str, kind: WorkdirKind) -> WorkdirPrompt {
-        WorkdirPrompt {
-            path: path.to_owned(),
-            kind,
+    fn place(jj: bool, view: bool, spawned: bool) -> WorksetPrompt {
+        WorksetPrompt {
+            root: "/src".to_owned(),
+            cwd: "/src/repo".to_owned(),
+            jj,
+            view,
+            spawned,
         }
     }
 
     #[test]
-    fn managed_workspace_prompt_is_informational() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Managed)]);
+    fn workspace_prompt_is_informational() {
+        let prompt = render_workspace_prompt(&place(true, true, false));
         assert!(prompt.contains("## Workspace Context"));
-        assert!(prompt.contains("working directory is a Rho-managed jj workspace"));
-        assert!(prompt.contains("working-copy commit named `@`"));
+        assert!(prompt.contains("Your workset is the directory /src"));
+        assert!(prompt.contains("Your working directory is /src/repo"));
+        assert!(prompt.contains("jj git clone <url>"));
+        assert!(prompt.contains("commit named `@`"));
         assert!(prompt.contains("keeping them takes no extra step"));
         assert!(prompt.contains("starting state you were given"));
         assert!(prompt.contains("leave commits you did not create alone"));
-        assert!(!prompt.contains("Agent views"));
-        assert!(!prompt.contains("user's own checkout"));
-        assert!(!prompt.contains("working in place"));
-        assert!(!prompt.contains("Delegated Engineer Isolation"));
+        assert!(prompt.contains("disposable environment"));
+        assert!(!prompt.contains("agent that started you"));
         assert!(!prompt.contains("do not create"));
     }
 
     #[test]
-    fn live_workspace_prompt_reports_management() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Live)]);
-        assert!(prompt.contains("live directories rather than Rho-managed jj workspaces"));
-        assert!(prompt.contains("immediately visible to other processes"));
-    }
-
-    #[test]
-    fn sandbox_workspace_prompt_does_not_call_it_live() {
-        let prompt = render_workspace_prompt(&[workdir("/repo", WorkdirKind::Sandbox)]);
-        assert!(prompt.contains("Rho-managed sandbox workspace"));
-        assert!(prompt.contains("masks the repository's original VCS metadata"));
-        assert!(!prompt.contains("immediately visible to other processes"));
-    }
-
-    #[test]
-    fn workspace_prompt_lists_mixed_workdirs() {
-        let prompt = render_workspace_prompt(&[
-            workdir("/repo", WorkdirKind::Managed),
-            workdir("/docs", WorkdirKind::Live),
-        ]);
-        assert!(prompt.contains("Workspace management differs across your working set"));
-        assert!(prompt.contains("- /repo — Rho-managed jj workspace"));
-        assert!(prompt.contains("- /docs — live directory"));
+    fn workspace_prompt_omits_jj_and_view_sections_when_absent() {
+        let prompt = render_workspace_prompt(&place(false, false, true));
+        assert!(!prompt.contains("This repository uses jj"));
+        assert!(!prompt.contains("disposable environment"));
+        assert!(prompt.contains("agent that started you"));
     }
 
     #[test]
@@ -935,21 +834,9 @@ mod tests {
 
     #[test]
     fn environment_prompt_mentions_working_directory() {
-        let prompt = render_environment_prompt(&[workdir("/repo", WorkdirKind::Managed)]);
-        assert!(prompt.contains("Working directory: /repo"));
+        let prompt = render_environment_prompt(&place(true, true, false));
+        assert!(prompt.contains("Working directory: /src/repo"));
+        assert!(prompt.contains("Your workset is /src"));
         assert!(!prompt.contains("jj workspace id"));
-        assert!(!prompt.contains("Additional workdirs"));
-    }
-
-    #[test]
-    fn environment_prompt_lists_additional_workdirs() {
-        let prompt = render_environment_prompt(&[
-            workdir("/repo", WorkdirKind::Managed),
-            workdir("/lib", WorkdirKind::Managed),
-            workdir("/docs", WorkdirKind::Live),
-        ]);
-        assert!(prompt.contains("Working directory: /repo"));
-        assert!(prompt.contains("- /lib (a Rho-managed jj workspace)"));
-        assert!(prompt.contains("- /docs (a live directory"));
     }
 }

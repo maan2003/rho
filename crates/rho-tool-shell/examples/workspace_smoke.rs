@@ -1,14 +1,14 @@
-//! End-to-end smoke test for workspace isolation: daemon namespace, jj
-//! workspace creation, ws-parent pointer resolution, and namespaced command
-//! execution.
+//! End-to-end smoke test for the agent view: a workset, a clone through the
+//! store, and shell tool commands inside the view namespace.
 //! Run with `cargo run -p rho-tool-shell --example workspace_smoke`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use camino::Utf8Path;
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
-use rho_workspaces::{Repo, View};
+use rho_workset::{Mode, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
@@ -19,347 +19,95 @@ fn shell_call(command: &str) -> ToolCall {
     }
 }
 
-fn slow_shell_call(command: &str) -> ToolCall {
-    let mut call = shell_call(command);
-    call.arguments = serde_json::json!({ "command": command, "yield_time_ms": 30_000 }).to_string();
-    call
-}
-
-fn jj(repo: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(repo)
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=Smoke", "-c", "user.email=smoke@localhost"])
         .args(args)
-        .output()
-        .expect("run jj");
-    assert!(
-        output.status.success(),
-        "jj {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn jj_has_file(checkout: &std::path::Path, path: &str) -> bool {
-    std::process::Command::new("jj")
-        .current_dir(checkout)
-        .arg("--ignore-working-copy")
-        .args(["file", "show", "-r", "@", path])
-        .output()
-        .expect("run jj file show")
-        .status
-        .success()
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed");
 }
 
 fn main() -> anyhow::Result<()> {
     // SAFETY: top of main, single-threaded.
-    unsafe { rho_workspaces::init_daemon_namespace() }?;
-
+    unsafe { rho_workset::init_daemon_namespace() }?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run())
 }
 
 async fn run() -> anyhow::Result<()> {
-    // Managed workspaces require bcachefs, so keep the smoke repository on
-    // the same filesystem as this checkout rather than /tmp.
-    let temp = tempfile::tempdir_in(std::env::current_dir()?)?;
-    let repo = temp.path().join("repo");
-    std::fs::create_dir(&repo)?;
-    let status = std::process::Command::new("jj")
-        .current_dir(&repo)
-        .args(["git", "init", "--colocate"])
-        .status()?;
-    assert!(status.success());
-    std::fs::write(repo.join("file.txt"), "origin\n")?;
-    jj(&repo, &["commit", "-m", "init"]);
-    std::fs::write(repo.join("file.txt"), "origin\n")?;
-    jj(&repo, &["st"]);
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source)?;
+    git(&source, &["init", "-q", "-b", "main"]);
+    std::fs::write(source.join("file.txt"), "origin\n")?;
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-qm", "init"]);
 
-    let temp = if std::env::var_os("SMOKE_KEEP").is_some() {
-        let path = temp.keep();
-        println!("keeping temp dir: {}", path.display());
-        None
-    } else {
-        Some(temp)
-    };
-    let _ = &temp;
-    let repo_handle = Arc::new(Repo::open(&repo)?);
+    let environment = UserEnvironment::new(std::env::vars_os().collect());
+    let worksets = Worksets::open(
+        temp.path().join("state"),
+        environment,
+        Default::default(),
+        StoreService::Serve(StoreRefresh::default()),
+    )
+    .await?;
+    let workset = worksets.create().await?;
     let started = std::time::Instant::now();
-    let workspace = repo_handle.create_workspace("@").await?;
-    let main_id = workspace.info().workspace_id().unwrap();
-    println!("created workspace in {:?}", started.elapsed());
-    println!("repo: {}", workspace.repo());
-    println!("checkout: {}", workspace.checkout());
-    assert!(
-        workspace
-            .checkout()
-            .starts_with(repo.join(".jj/managed-workspaces")),
-        "managed workspaces live inside the repo"
+    let checkout = workset
+        .clone_repo(source.to_str().unwrap(), Some("project"))
+        .await?;
+    println!(
+        "cloned through the store in {:?}: {checkout}",
+        started.elapsed()
     );
 
-    let tools = ShellTools::new(
-        Duration::from_secs(30),
-        View::new(vec![Arc::clone(&workspace)])?,
-    );
+    let view = workset.enter(
+        Mode::View {
+            home_skeleton: None,
+        },
+        Utf8Path::new("/src/project"),
+    )?;
+    let tools = ShellTools::new(Duration::from_secs(30), Arc::clone(&view));
 
     let started = std::time::Instant::now();
     let result = tools.call(shell_call("pwd; cat file.txt")).await;
     println!("first call ({:?}):\n{}", started.elapsed(), result.output);
     assert!(
-        result.output.contains(repo.to_str().unwrap()),
-        "agent should see the origin repo path"
+        result.output.contains("/src/project"),
+        "commands start in the working directory"
+    );
+    assert!(
+        result.output.contains("origin"),
+        "the clone's files are visible"
     );
 
     let result = tools
-        .call(shell_call("echo agent > file.txt && jj st"))
-        .await;
-    println!("write + jj inside namespace:\n{}", result.output);
-
-    // Git must work in the namespace too: the checkout's `.git` gitdir pointer
-    // was rewritten through ws-parent.
-    let result = tools
-        .call(slow_shell_call(
-            "status=\"$(git status --short)\" && printf '%s\\n' \"$status\" && \
-             test \"$status\" = \" M file.txt\" && \
-             git log --oneline | head -2 && git rev-parse --show-toplevel",
+        .call(shell_call(
+            "echo agent > file.txt && jj st && jj log --no-graph -r @ -T description",
         ))
         .await;
-    println!("git inside namespace:\n{}", result.output);
+    println!("write + jj inside the view:\n{}", result.output);
     assert!(
         result.output.contains("Process exited with code 0"),
-        "git should work inside the namespace"
+        "jj should work inside the view"
     );
-    assert!(
-        result.output.contains("file.txt"),
-        "git should see the agent's dirty file"
-    );
-    assert!(
-        result.output.contains(repo.to_str().unwrap()),
-        "git should report the origin path as its toplevel"
-    );
-
-    // Real git (unwrapped, via nix): diff and commit must work against the
-    // workspace's git worktree.
-    let result = tools
-        .call(slow_shell_call(
-            "nix shell nixpkgs#git -c sh -c \
-             'git diff --stat && git commit -am from-git && \
-              git ls-files --error-unmatch file.txt && \
-              test \"$(git show HEAD:file.txt)\" = agent && \
-              git log --oneline | head -1'",
-        ))
-        .await;
-    println!(
-        "real git diff + commit inside namespace:\n{}",
-        result.output
-    );
-    assert!(
-        result.output.contains("Process exited with code 0"),
-        "git diff/commit should work inside the namespace"
-    );
-    assert!(
-        result.output.contains("file.txt") && result.output.contains("from-git"),
-        "git should diff and commit the agent's edit"
-    );
-
-    // The origin checkout must be untouched; the checkout has the agent's edit.
-    assert_eq!(std::fs::read_to_string(repo.join("file.txt"))?, "origin\n");
     assert_eq!(
-        std::fs::read_to_string(workspace.checkout().join("file.txt"))?,
-        "agent\n"
+        std::fs::read_to_string(checkout.join("file.txt"))?,
+        "agent\n",
+        "edits land in the workset on the host"
     );
 
-    // From the host (no agent namespace), the checkout is an ordinary jj
-    // workspace: cd in and run jj — the pointer resolves via the origin's
-    // ws-parent symlink.
-    let output = std::process::Command::new("jj")
-        .current_dir(workspace.checkout())
-        .arg("st")
-        .output()?;
-    assert!(
-        output.status.success(),
-        "host-side jj inside the checkout should work: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    println!("host-side jj in checkout: ok");
-
-    let started = std::time::Instant::now();
-    workspace.snapshot().await?;
-    println!("snapshot in {:?}", started.elapsed());
-
-    let output = std::process::Command::new("jj")
-        .arg("--repository")
-        .arg(&repo)
-        .args(["log", "--no-graph", "-T", "separate(\" \", change_id.short(), working_copies, description.first_line()) ++ \"\\n\""])
-        .output()?;
-    println!(
-        "origin log:\n{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let started = std::time::Instant::now();
-    let result = tools.call(shell_call("true")).await;
-    assert!(result.output.contains("Process exited with code 0"));
-    println!("steady-state call round trip: {:?}", started.elapsed());
-
-    // Joining a workspace shares the live instance: same checkout, same
-    // mount namespace, edits visible to each other instantly (no snapshot).
-    let joined = repo_handle.open_workspace(main_id).await?;
-    assert!(
-        Arc::ptr_eq(&workspace, &joined),
-        "join shares the live workspace instance"
-    );
-    let tools_joined = ShellTools::new(Duration::from_secs(30), View::new(vec![joined])?);
-    let result = tools_joined
-        .call(shell_call("echo joint > joint.txt"))
+    let result = tools
+        .call(shell_call(
+            "touch /tmp/scratch && ls / && test ! -e $HOME/.bashrc && echo home-is-empty",
+        ))
         .await;
-    assert!(result.output.contains("Process exited with code 0"));
-    let result = tools.call(shell_call("cat joint.txt")).await;
-    assert!(
-        result.output.contains("joint"),
-        "joining agent's edit visible to the original instantly: {}",
-        result.output
-    );
-    println!("join shares checkout across separate views: ok");
-
-    // A user-checkout workspace works directly in the user's own checkout:
-    // real repo path, no namespace, edits land in the origin immediately.
-    let uc = repo_handle.user_checkout().await?;
-    let tools_uc = ShellTools::new(Duration::from_secs(30), View::new(vec![uc])?);
-    let result = tools_uc.call(shell_call("pwd && echo here > uc.txt")).await;
-    assert!(result.output.contains(repo.to_str().unwrap()));
-    assert_eq!(std::fs::read_to_string(repo.join("uc.txt"))?, "here\n");
-    println!("user-checkout workspace edits the origin directly: ok");
-
-    // ---- multi-workspace snapshot matrix ----
-    // Two independent sibling workspaces, both children of the user's @.
-    let wa = repo_handle.create_workspace("@").await?;
-    let wb = repo_handle.create_workspace("@").await?;
-    let agent_a_id = wa.info().workspace_id().unwrap();
-    let agent_b_id = wb.info().workspace_id().unwrap();
-    let wc = repo_handle
-        .create_workspace(&format!("ws-{}@", agent_a_id.encoded()))
-        .await?;
-    let tools_a = ShellTools::new(Duration::from_secs(30), View::new(vec![Arc::clone(&wa)])?);
-
-    // (1) Snapshot from OUTSIDE (origin jj): the user's edit follows down
-    // into both checkouts via rebase_descendants, sibling edits stay isolated
-    // from each other, and nothing leaks up into the user's checkout.
-    std::fs::write(wa.checkout().join("a.txt"), "one\n")?;
-    std::fs::write(wb.checkout().join("b.txt"), "two\n")?;
-    std::fs::write(repo.join("u.txt"), "user\n")?;
-    jj(&repo, &["st"]);
-    assert!(
-        wa.checkout().join("u.txt").exists(),
-        "user edit follows into checkout a"
-    );
-    assert!(
-        wb.checkout().join("u.txt").exists(),
-        "user edit follows into checkout b"
-    );
-    assert!(
-        !wa.checkout().join("b.txt").exists(),
-        "sibling edits stay isolated"
-    );
-    assert!(
-        !wb.checkout().join("a.txt").exists(),
-        "sibling edits stay isolated"
-    );
-    assert!(
-        !repo.join("a.txt").exists(),
-        "agent work must not leak into the user's checkout"
-    );
-    println!("outside snapshot: parent following + sibling isolation: ok");
-
-    // (2) Snapshot from INSIDE an agent namespace: ancestors are outside the
-    // agent workspace's snapshot cone, so an unsnapshotted user edit does not
-    // flow down into the agent.
-    std::fs::write(repo.join("u2.txt"), "user\n")?;
-    let result = tools_a.call(shell_call("jj st")).await;
-    assert!(
-        result.output.contains("Process exited with code 0"),
-        "jj st in namespace: {}",
-        result.output
-    );
-    assert!(
-        !wa.checkout().join("u2.txt").exists(),
-        "agent snapshot must not inspect its dirty ancestor"
-    );
-    println!("inside-namespace snapshot excludes ancestors: ok");
-
-    // (3) The Rho turn-boundary path selects the agent checkout itself. It
-    // snapshots that workspace and its descendant, but not its sibling.
-    std::fs::write(wa.checkout().join("d.txt"), "dee\n")?;
-    std::fs::write(wb.checkout().join("sibling.txt"), "sib\n")?;
-    std::fs::write(wc.checkout().join("child.txt"), "child\n")?;
-    wa.snapshot().await?;
-    assert!(
-        jj_has_file(wa.checkout().as_std_path(), "d.txt"),
-        "turn boundary snapshots the current agent workspace"
-    );
-    assert!(
-        jj_has_file(wc.checkout().as_std_path(), "child.txt"),
-        "turn boundary snapshots descendant workspaces"
-    );
-    assert!(
-        !jj_has_file(wb.checkout().as_std_path(), "sibling.txt"),
-        "turn boundary excludes sibling workspaces"
-    );
-    println!("turn-boundary descendant snapshot cone: ok");
-
-    // ---- daemon restart: stable reopen ----
-    // A fresh Repo handle reuses the same managed path. Other live managed
-    // workspaces are untouched; there is no repo-wide detach/reap operation.
-    let wb_path = wb.checkout().to_owned();
-    drop(wb);
-    let repo_handle2 = Arc::new(Repo::open(&repo)?);
-    let wb2 = repo_handle2.open_workspace(agent_b_id).await?;
-    assert_eq!(wb2.checkout(), wb_path);
-    let tools_b2 = ShellTools::new(Duration::from_secs(30), View::new(vec![Arc::clone(&wb2)])?);
-    let result = tools_b2.call(shell_call("cat b.txt")).await;
-    assert!(
-        result.output.contains("two"),
-        "reattached workspace has its work back: {}",
-        result.output
-    );
-    println!("stable managed reopen: ok");
-
-    // ---- multi-workdir view: two repos in one namespace ----
-    // A view over two workdirs mounts both entries' checkouts over their origin
-    // paths: commands see the agent's workspace checkout in each repo, at
-    // the repo's real path.
-    let repo2 = repo.parent().unwrap().join("repo2");
-    std::fs::create_dir(&repo2)?;
-    let status = std::process::Command::new("jj")
-        .current_dir(&repo2)
-        .args(["git", "init", "--colocate"])
-        .status()?;
-    assert!(status.success());
-    std::fs::write(repo2.join("file.txt"), "user\n")?;
-    jj(&repo2, &["commit", "-m", "init"]);
-    std::fs::write(repo2.join("file.txt"), "user\n")?;
-    jj(&repo2, &["st"]);
-    let repo2_handle = Arc::new(Repo::open(&repo2)?);
-    let repo2_ws = repo2_handle.create_workspace("@").await?;
-    // Distinguish the workspace checkout from the user's live files.
-    std::fs::write(repo2_ws.checkout().join("file.txt"), "workspace\n")?;
-
-    let view = View::new(vec![Arc::clone(&wb2), Arc::clone(&repo2_ws)])?;
-    let tools_multi = ShellTools::new(Duration::from_secs(30), Arc::clone(&view));
-    let repo2_path = repo2.display();
-    let result = tools_multi
-        .call(shell_call(&format!("cat {repo2_path}/file.txt")))
-        .await;
-    assert!(
-        result.output.contains("workspace"),
-        "the second workdir shows the workspace checkout at its real path: {}",
-        result.output
-    );
-    assert!(
-        View::new(vec![Arc::clone(&wb2), Arc::clone(&wb2)]).is_err(),
-        "a view with the same repo twice must be rejected"
-    );
-    println!("multi-workdir view: ok");
+    println!("outside the workset:\n{}", result.output);
+    assert!(result.output.contains("home-is-empty"));
+    assert!(!temp.path().join("scratch").exists());
 
     println!("smoke test passed");
     Ok(())

@@ -14132,7 +14132,7 @@ dependencies = [
  "rho-tool-shell",
  "rho-ui-proto",
  "rho-web-search",
- "rho-workspaces",
+ "rho-workset",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -14146,12 +14146,13 @@ name = "rho-agent-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camino",
  "futures 0.3.33",
  "rho-core",
  "rho-python",
  "rho-tool-shell",
  "rho-web-search",
- "rho-workspaces",
+ "rho-workset",
  "serde",
  "serde_json",
  "tempfile",
@@ -14247,7 +14248,7 @@ dependencies = [
  "bytes",
  "camino",
  "rho-core",
- "rho-workspaces",
+ "rho-workset",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -14290,7 +14291,7 @@ dependencies = [
  "rho-inference",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workspaces",
+ "rho-workset",
  "serde",
  "serde_json",
  "tempfile",
@@ -14365,7 +14366,7 @@ dependencies = [
  "rho-shell-proto",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workspaces",
+ "rho-workset",
  "rustix-openpty",
  "senax-encoder",
  "serde",
@@ -14892,7 +14893,7 @@ dependencies = [
  "camino",
  "rho-core",
  "rho-db",
- "rho-workspaces",
+ "rho-workset",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -15008,42 +15009,12 @@ dependencies = [
  "anyhow",
  "camino",
  "dirs",
- "libc",
- "rho-workset-types",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "rho-workset-types"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "camino",
- "senax-encoder",
-]
-
-[[package]]
-name = "rho-workspaces"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "camino",
- "dirs",
  "futures 0.3.33",
  "jj-cli",
  "jj-lib",
  "libc",
- "prefix-id",
- "rho-context-config",
  "rho-workspaces-types",
- "rustix 1.1.4",
- "senax-encoder",
- "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

@@ -175,7 +175,11 @@ impl ExposedBuilder {
     /// namespace without forking, unsharing, or changing cwd/environment.
     pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
         let ws = mount_root(root, EXPOSED_MOUNT_ROOT);
-        ensure!(ws.is_dir(), "workset mount stub is missing: {}", ws.display());
+        ensure!(
+            ws.is_dir(),
+            "workset mount stub is missing: {}",
+            ws.display()
+        );
         mount_in_place(&self.mounts, root, EXPOSED_MOUNT_ROOT)
     }
 
@@ -232,10 +236,11 @@ fn validate_mounts(set: &Mounts) -> anyhow::Result<()> {
         "workset directory is missing: {}",
         set.src.display()
     );
-    for (what, path) in [("store root", &set.store_root)]
-        .into_iter()
-        .chain(set.store_socket.iter().map(|socket| ("store socket", socket)))
-    {
+    for (what, path) in [("store root", &set.store_root)].into_iter().chain(
+        set.store_socket
+            .iter()
+            .map(|socket| ("store socket", socket)),
+    ) {
         ensure!(
             path.is_absolute(),
             "{what} must be an absolute path: {}",
@@ -543,8 +548,7 @@ pub fn mount_in_place(set: &Mounts, root: &Path, visible_root: &str) -> anyhow::
     let ws = mount_root(root, visible_root);
     bind(&set.src, &ws, false)?;
     let store_root = host_path_in(root, &set.store_root);
-    fs::create_dir_all(&store_root)
-        .with_context(|| format!("create {}", store_root.display()))?;
+    fs::create_dir_all(&store_root).with_context(|| format!("create {}", store_root.display()))?;
     bind(&set.store_root, &store_root, true)?;
     if let Some(socket) = &set.store_socket {
         let target = host_path_in(root, socket);

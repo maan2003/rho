@@ -19,7 +19,8 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-rho-workspaces.workspace = true
+camino.workspace = true
+rho-workset.workspace = true
 
 [[test]]
 name = "python_workspace"

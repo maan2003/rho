@@ -1,17 +1,17 @@
 //! Process-local pool of running agents.
 //!
-//! The pool owns the id → running-agent map and the shared repo handles that
-//! make live-workspace sharing possible. Higher layers (the daemon) own
-//! product policy around it: topics, titles, land leases.
+//! The pool owns the id → running-agent map and the worksets agents work
+//! in. Higher layers (the daemon) own product policy around it: topics,
+//! titles, land leases.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
+use rho_workset::{Mode, Workset, Worksets};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::agent::AgentHandle;
@@ -21,7 +21,7 @@ use crate::db::{
     AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, StartWorkdir};
+use crate::{AgentStatus, MessageDelivery, StartPlace, View, WorkspaceInfo};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -35,15 +35,14 @@ const ID_LABEL_HEADROOM: u64 = 200;
 pub struct AgentPool {
     db: RhoDb,
     inference: Inference,
-    path_overrides: PathOverrides,
-    /// Where sandboxes are made, named by the daemon rather than resolved
-    /// here: a library does not reach for the user's state directory.
-    state_dir: camino::Utf8PathBuf,
+    /// The worksets agents work in, named by the daemon rather than
+    /// resolved here: a library does not reach for the user's state
+    /// directory.
+    worksets: Arc<Worksets>,
     /// The Claude configuration agents run against, named by the daemon for
-    /// the same reason as `state_dir`: a library that resolves `$HOME` puts
+    /// the same reason as `worksets`: a library that resolves `$HOME` puts
     /// every caller on the user's live `~/.claude`.
     claude: rho_claude::accounts::ClaudePaths,
-    user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// Loaded agents, least recently used first. Touched by every load.
     recent: std::sync::Mutex<std::collections::VecDeque<AgentId>>,
@@ -57,10 +56,6 @@ pub struct AgentPool {
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
     load_locks: Mutex<HashMap<AgentId, Arc<Mutex<()>>>>,
-    /// One shared handle per repo root: live-workspace sharing (joined
-    /// agents get one checkout but retain separate View namespaces) only
-    /// holds within one instance.
-    repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
@@ -101,24 +96,14 @@ pub struct AgentTurnReported {
     pub report: crate::db::TurnReport,
 }
 
-/// One entry of a spawned child's working set.
+/// Where a spawned child works, inside its parent's workset.
 pub struct SpawnWorkdir {
-    /// Absolute path anywhere inside the repository (or plain directory).
-    pub repo: Utf8PathBuf,
-    pub checkout: SpawnCheckout,
-}
-
-/// Which checkout a child workdir works in.
-pub enum SpawnCheckout {
-    /// The checkout the parent uses for this repo (its workspace or a live
-    /// checkout), or the user's live checkout when the repo is outside the
-    /// parent's working set.
-    Shared,
-    /// The child's own jj workspace on a new change atop `revset`, which
-    /// defaults to the parent's current change when the parent has this repo
-    /// and `trunk()` otherwise. Plain (non-jj) directories have no
-    /// workspaces and are shared instead.
-    Own { revset: Option<String> },
+    /// A directory in the parent's workset, as the parent sees it (absolute,
+    /// or relative to the parent's working directory).
+    pub path: Utf8PathBuf,
+    /// With a revset, the child gets its own jj workspace of the repository
+    /// containing `path`, on a new change atop the revset.
+    pub revset: Option<String>,
 }
 
 impl AgentPool {
@@ -126,10 +111,8 @@ impl AgentPool {
     pub async fn new(
         db: RhoDb,
         inference: Inference,
-        path_overrides: PathOverrides,
-        state_dir: camino::Utf8PathBuf,
+        worksets: Arc<Worksets>,
         claude: rho_claude::accounts::ClaudePaths,
-        user_environment: UserEnvironment,
     ) -> Arc<Self> {
         crate::db::prepare(&db).await;
         // The account agents run on has to exist before the first spawn.
@@ -140,16 +123,13 @@ impl AgentPool {
         let pool = Arc::new(Self {
             db,
             inference: inference.clone(),
-            path_overrides,
-            state_dir,
+            worksets,
             claude,
-            user_environment,
             agents: Mutex::new(HashMap::new()),
             recent: std::sync::Mutex::new(std::collections::VecDeque::new()),
             live_wants: std::sync::Mutex::new(HashMap::new()),
             live: std::sync::Mutex::new(HashSet::new()),
             load_locks: Mutex::new(HashMap::new()),
-            repos: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             presentation_changes: broadcast::channel(64).0,
             turn_reports: broadcast::channel(64).0,
@@ -169,6 +149,11 @@ impl AgentPool {
             }
         });
         pool
+    }
+
+    /// The worksets agents work in.
+    pub fn worksets(&self) -> &Arc<Worksets> {
+        &self.worksets
     }
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {
@@ -437,7 +422,7 @@ impl AgentPool {
         self: &Arc<Self>,
         config: AgentRole,
         display_name: Option<String>,
-        start: Vec<StartWorkdir>,
+        start: StartPlace,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         self.create_with_parent(config, display_name, start, None)
             .await
@@ -447,7 +432,29 @@ impl AgentPool {
         self: &Arc<Self>,
         config: AgentRole,
         display_name: Option<String>,
-        start: Vec<StartWorkdir>,
+        start: StartPlace,
+        parent: Option<AgentId>,
+    ) -> anyhow::Result<(AgentId, RunningAgent)> {
+        let owned_workset = start.owned_workset.clone();
+        match self.create_agent(config, display_name, start, parent).await {
+            Ok(created) => Ok(created),
+            Err(error) => {
+                // A workset made for an agent that never came to be.
+                if let Some(workset) = owned_workset
+                    && let Err(discard) = self.worksets.discard_workset(&workset).await
+                {
+                    eprintln!("rho-agent: discard workset {workset}: {discard:#}");
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn create_agent(
+        self: &Arc<Self>,
+        config: AgentRole,
+        display_name: Option<String>,
+        start: StartPlace,
         parent: Option<AgentId>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let mode = config.session_profile()?;
@@ -503,10 +510,9 @@ impl AgentPool {
         Ok((agent_id, agent))
     }
 
-    /// Create a child agent for `parent` in the parent's mode and mail it its
-    /// task. Returns once the child has
-    /// accepted that task. An empty `workdirs` forks the parent's whole
-    /// working set.
+    /// Create a child agent for `parent` in the parent's workset and mail it
+    /// its task. Returns once the child has accepted that task. An empty
+    /// `workdirs` puts the child in the parent's working directory.
     pub async fn spawn_child(
         self: &Arc<Self>,
         parent: AgentId,
@@ -516,73 +522,57 @@ impl AgentPool {
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
-        let (parent_workdirs, parent_role) = {
+        let (parent_place, parent_role) = {
             let record = self.load(parent).await?.1.head();
-            (record.config.workdirs, record.config.role)
+            (record.primary_workdir().clone(), record.config.role)
         };
-        let workdirs = if workdirs.is_empty() {
-            parent_workdirs
-                .iter()
-                .map(|info| SpawnWorkdir {
-                    repo: info.repo().to_owned(),
-                    checkout: SpawnCheckout::Own { revset: None },
-                })
-                .collect()
-        } else {
-            workdirs
+        let WorkspaceInfo::Workset {
+            workset,
+            cwd: parent_cwd,
+            mode,
+            origin,
+        } = parent_place
+        else {
+            anyhow::bail!("this agent predates worksets and cannot spawn children");
         };
-        let parent_is_sandboxed = parent_workdirs[0].is_sandbox();
-        let mut start = Vec::with_capacity(workdirs.len());
-        for entry in workdirs {
-            let repo = self.repo(&entry.repo).await?;
-            let parent_entry = parent_workdirs
-                .iter()
-                .find(|info| info.repo() == repo.root());
-            start.push(match entry.checkout {
-                SpawnCheckout::Own { revset } if repo.is_jj() => {
-                    // The child's change forks off whatever the parent's
-                    // checkout currently points at; repos outside the
-                    // parent's working set start from trunk.
-                    let parent_revset = revset
-                        .unwrap_or_else(|| parent_entry.map_or("trunk()", |_| "@").to_owned());
-                    let source = match parent_entry {
-                        Some(info) => self.open_workspace(info).await?,
-                        None => repo.user_checkout().await?,
-                    };
-                    let workspace = if parent_is_sandboxed {
-                        repo.create_sandbox_from(&source, &parent_revset).await?
-                    } else {
-                        repo.create_workspace_from(&source, &parent_revset).await?
-                    };
-                    StartWorkdir::Existing(workspace)
-                }
-                SpawnCheckout::Own { revset } => {
-                    anyhow::ensure!(
-                        revset.is_none(),
-                        "revset is only supported inside a jj repository: {}",
-                        repo.root()
-                    );
-                    anyhow::ensure!(
-                        !parent_is_sandboxed,
-                        "sandboxed Engineers cannot spawn into plain directories: {}",
-                        repo.root()
-                    );
-                    // Plain directories have no workspaces to create.
-                    StartWorkdir::Existing(repo.user_checkout().await?)
-                }
-                SpawnCheckout::Shared => {
-                    anyhow::ensure!(
-                        !parent_is_sandboxed || parent_entry.is_some_and(WorkspaceInfo::is_sandbox),
-                        "sandboxed Engineers cannot share an ordinary checkout: {}",
-                        repo.root()
-                    );
-                    match parent_entry {
-                        Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
-                        None => StartWorkdir::Existing(repo.user_checkout().await?),
+        anyhow::ensure!(
+            workdirs.len() <= 1,
+            "a child works in one directory of your workset: pass at most one workdirs entry"
+        );
+        let workset = self.worksets.open_workset(&workset).await?;
+        let mode = Mode::from_workset_mode(mode);
+        let cwd = match workdirs.into_iter().next() {
+            None => parent_cwd,
+            Some(entry) => {
+                let requested = if entry.path.is_absolute() {
+                    entry.path
+                } else {
+                    parent_cwd.join(entry.path)
+                };
+                let host = workset.host_path_in(&mode, &requested)?;
+                anyhow::ensure!(
+                    host.is_dir(),
+                    "no such directory in your workset: {requested}"
+                );
+                match entry.revset {
+                    None => requested,
+                    Some(revset) => {
+                        let (root, is_jj) = rho_workset::resolve_workdir_root(host.as_std_path())?;
+                        anyhow::ensure!(
+                            is_jj,
+                            "a revset needs a jj repository, and {requested} is not in one"
+                        );
+                        let added = workset.add_workspace(&root, &revset).await?;
+                        let relative = added
+                            .strip_prefix(workset.root())
+                            .context("new workspace is outside the workset")?;
+                        mode.visible_root(workset.root()).join(relative)
                     }
                 }
-            });
-        }
+            }
+        };
+        let view = workset.enter(mode, &cwd)?;
+        let start = StartPlace::new(view, origin);
         let config = child_role(parent_role, config);
         let (child_id, child) = self
             .create_with_parent(config, Some(task_name), start, Some(parent))
@@ -701,70 +691,44 @@ impl AgentPool {
         )
     }
 
-    /// The shared handle for the workdir containing `path`: the enclosing jj
-    /// repo when there is one, otherwise the plain directory itself
-    /// (live-only, no separate workspaces). Cache-keyed by the resolved root
-    /// so agents in the same repo share one instance.
-    pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
-        let (root, is_jj) = rho_workspaces::resolve_workdir_root(path.as_std_path())?;
-        let repo = if is_jj {
-            Repo::open_with_environment(
-                root.as_std_path(),
-                self.path_overrides.clone(),
-                self.user_environment.clone(),
-            )?
-            .with_state_dir(self.state_dir.clone())
-        } else {
-            Repo::open_plain_with_environment(
-                root.as_std_path(),
-                self.path_overrides.clone(),
-                self.user_environment.clone(),
-            )?
-            .with_state_dir(self.state_dir.clone())
-        };
-        let mut repos = self.repos.lock().await;
-        Ok(match repos.entry(repo.root().to_owned()) {
-            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                Arc::clone(entry.insert(Arc::new(repo)))
-            }
-        })
-    }
-
-    pub async fn open_workspace(
+    /// The workset behind a persisted place, its mode, and the place's
+    /// working directory on the host.
+    pub async fn open_workset(
         &self,
         info: &WorkspaceInfo,
-    ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
-        match info {
-            WorkspaceInfo::UserCheckout { repo } => self.repo(repo).await?.user_checkout().await,
-            WorkspaceInfo::Workspace { repo, id } => {
-                self.repo(repo).await?.open_workspace(*id).await
-            }
-            WorkspaceInfo::Sandbox { repo, id } => self.repo(repo).await?.open_sandbox(*id).await,
-        }
+    ) -> anyhow::Result<(Workset, Mode, Utf8PathBuf)> {
+        let WorkspaceInfo::Workset {
+            workset, cwd, mode, ..
+        } = info
+        else {
+            anyhow::bail!(
+                "this agent predates worksets; its transcript is readable but it cannot run"
+            );
+        };
+        let workset = self.worksets.open_workset(workset).await?;
+        let mode = Mode::from_workset_mode(*mode);
+        let host_cwd = workset.host_path_in(&mode, cwd)?;
+        Ok((workset, mode, host_cwd))
     }
 
-    /// Materializes an agent's persisted working set into a live view.
-    pub async fn materialize_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
-        let mut entries = Vec::with_capacity(workdirs.len());
-        for info in workdirs {
-            entries.push(self.open_workspace(info).await?);
-        }
-        View::new(entries)
+    /// Materializes an agent's persisted place into a live view.
+    pub async fn materialize_view(&self, info: &WorkspaceInfo) -> anyhow::Result<Arc<View>> {
+        let (workset, mode, _) = self.open_workset(info).await?;
+        workset.enter(mode, info.repo())
     }
 
     fn lazy_view(
         self: &Arc<Self>,
         _agent_id: AgentId,
-        workdirs: Vec<WorkspaceInfo>,
+        info: WorkspaceInfo,
     ) -> Arc<Lazy<Arc<View>>> {
         let pool = Arc::downgrade(self);
         Arc::new(Lazy::new(move || {
             let pool = pool.clone();
-            let workdirs = workdirs.clone();
+            let info = info.clone();
             async move {
                 let pool = pool.upgrade().context("agent pool dropped")?;
-                pool.materialize_view(&workdirs).await
+                pool.materialize_view(&info).await
             }
         }))
     }
@@ -792,7 +756,7 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.config.workdirs.clone());
+        let view = self.lazy_view(agent_id, record.primary_workdir().clone());
         let agent = match record.config.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(
                 AgentHandle::load(

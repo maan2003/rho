@@ -629,9 +629,17 @@ impl AgentMap {
             })
     }
 
+    /// The directory the agent works in, as the agent sees it.
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_workspace(agent_id)
             .map(|workspace| workspace.repo().to_owned())
+    }
+    /// What the agent's workset was cloned from: the thing a new agent
+    /// started "like this one" clones again.
+    pub fn agent_origin(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
+        self.agent_workspace(agent_id)
+            .and_then(|workspace| workspace.origin())
+            .map(ToOwned::to_owned)
     }
     /// Every agent is created with at least one workdir, so an agent with
     /// none is a creation that arrived malformed rather than an ordinary
@@ -641,8 +649,12 @@ impl AgentMap {
             .and_then(|identity| identity.workspace())
     }
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
-        self.agent_workspace(agent_id)
-            .and_then(|workspace| workspace.workspace_id())
+        let workspace = self.agent_workspace(agent_id)?;
+        if let Some(workset) = workspace.workset() {
+            return Some(format!("ws-{workset}"));
+        }
+        workspace
+            .workspace_id()
             .map(|id| format!("ws-{}", id.encoded()))
     }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {

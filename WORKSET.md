@@ -27,14 +27,23 @@ network. `Worksets::discard_workset` deletes the workset directory;
 stores are shared and never removed.
 
 Several agents can work in one workset: a child agent joins its parent's
-workset and gets its own jj workspace inside it, made by the parent.
-Every agent carries its own working directory below `/src`; loading
-`AGENTS.md`-style context is a function of that directory, not of a
-"primary" repository.
+workset, in the parent's directory or in its own jj workspace beside it
+(`Workset::add_workspace`, which the pool runs for a child spawned with a
+revset and the daemon for a "beside" start). Every agent's record is a
+workset id, a working directory as the agent sees it, and a mode; loading
+`AGENTS.md`-style context is a function of that directory (the jj
+workspace containing it), not of a "primary" repository. The daemon runs
+one `Worksets` for its state root and hands the pool a `Workset` per
+agent; a directory outside the root can be adopted for one process
+(`Worksets::adopt`), which is how tests and `rho eval` work in place.
 
-`Workset::enter(Mode)` turns the directory into one of the runtime views
-below. The lower-level layout builders remain public for direct
-inspection and development tooling (`rho-workset-dev`).
+`Workset::enter(mode, cwd)` is one agent's `Namespace` over the
+directory: its mount namespace is built on the first command (so loading
+an agent never fails on a namespace it does not use) and then kept for
+the life of the value. `prepare_command` enters it for a child process;
+`enter_interpreter_thread` moves a dedicated thread into it for the
+in-process Python notebook. The lower-level layout builders remain public
+for direct inspection and development tooling (`rho-workset-dev`).
 
 **This is a layout, not a sandbox.** Everything runs as the invoking
 user in an unprivileged user namespace; no security boundary is
@@ -77,7 +86,8 @@ detaches the previous stack first.
 relative path with `openat2(RESOLVE_BENEATH)`, so symlinks that leave the
 workset are refused, and returns at most 64 MiB.
 `Namespace::prepare_command` takes the working directory as a visible
-path and refuses anything outside `/src`.
+path, or one relative to the agent's own, and refuses anything outside
+`/src`.
 
 ## Exposed mode
 
@@ -95,6 +105,14 @@ and `/` belongs to root. So the host keeps a permanently empty `/ws`
 (`d /ws 0500 root root` via systemd-tmpfiles) purely as mountpoint
 real estate — deliberately opaque, so nothing can use or pollute it
 unmounted.
+
+## Plain mode
+
+`Mode::Plain` is no namespace at all: commands run in the workset
+directory at its host path with the user's environment, and the store is
+not protected. It exists for tests, `rho eval`, and `rho-daemon debug
+render-prompt`; the daemon's `--workset-mode` flag (`RHO_WORKSET_MODE`)
+picks the mode new agents get, `view` by default.
 
 ## Deliberately not here
 

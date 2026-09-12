@@ -40,18 +40,21 @@ const OMITTED: &str = "[... older shell output omitted ...]\n";
 const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
 
-pub fn ensure_supported_workdirs(workdirs: &[rho_workspaces::WorkspaceInfo]) -> anyhow::Result<()> {
+/// Only agents in worksets can run: older records name checkouts this
+/// daemon no longer manages, and their transcripts are all that is left.
+pub fn ensure_supported_workdirs(workdirs: &[rho_workset::WorkspaceInfo]) -> anyhow::Result<()> {
     anyhow::ensure!(
-        !workdirs
-            .iter()
-            .any(|workdir| matches!(workdir, rho_workspaces::WorkspaceInfo::Sandbox { .. })),
-        "sandboxed agents have no editor shells yet"
+        matches!(
+            workdirs.first(),
+            Some(rho_workset::WorkspaceInfo::Workset { .. })
+        ),
+        "this agent predates worksets; its transcript is readable but it cannot run"
     );
     Ok(())
 }
 
 pub struct ShellSpawn {
-    pub view: Arc<rho_workspaces::View>,
+    pub view: Arc<rho_workset::Namespace>,
     /// Shell sidecar launched through the agent View.
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -1695,19 +1698,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sandboxed_workdirs_are_refused() {
-        let id =
-            rho_workspaces::WorkspaceId::from_counter(1, &rho_workspaces::WorkspaceIdDomain(42))
-                .unwrap();
-        let sandbox = rho_workspaces::WorkspaceInfo::Sandbox {
-            repo: camino::Utf8PathBuf::from("/repo"),
-            id,
-        };
-        assert!(ensure_supported_workdirs(&[sandbox]).is_err());
-        let checkout = rho_workspaces::WorkspaceInfo::UserCheckout {
+    fn pre_workset_workdirs_are_refused() {
+        let checkout = rho_workset::WorkspaceInfo::UserCheckout {
             repo: camino::Utf8PathBuf::from("/repo"),
         };
-        assert!(ensure_supported_workdirs(&[checkout]).is_ok());
+        assert!(ensure_supported_workdirs(&[checkout]).is_err());
+        assert!(ensure_supported_workdirs(&[]).is_err());
+        let place = rho_workset::WorkspaceInfo::Workset {
+            workset: "0123456789ab".to_owned(),
+            cwd: camino::Utf8PathBuf::from("/src/repo"),
+            mode: Default::default(),
+            origin: None,
+        };
+        assert!(ensure_supported_workdirs(&[place]).is_ok());
     }
 
     #[test]
@@ -1988,23 +1991,19 @@ mod tests {
              trap 'printf fired >\"$HOME/brush-exit-hook\"' EXIT\n",
         )
         .unwrap();
-        let environment = rho_workspaces::UserEnvironment::new(vec![
+        let environment = rho_workset::UserEnvironment::new(vec![
             ("PATH".into(), std::env::var_os("PATH").unwrap()),
             ("HOME".into(), home.clone().into_os_string()),
             ("USER".into(), "rho-test".into()),
             ("LOGNAME".into(), "rho-test".into()),
             ("LANG".into(), "C.UTF-8".into()),
         ]);
-        let repo = Arc::new(
-            rho_workspaces::Repo::open_plain_with_environment(
-                temp.path(),
-                rho_workspaces::PathOverrides::default(),
-                environment,
-            )
-            .unwrap(),
-        );
-        let workspace = repo.user_checkout().await.unwrap();
-        let view = rho_workspaces::View::new(vec![workspace]).unwrap();
+        let work = temp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let worksets = rho_workset::Worksets::open_plain(temp.path().join("state"), environment)
+            .await
+            .unwrap();
+        let view = worksets.plain_view(&work).unwrap();
         let registry = Arc::new(ShellRegistry::default());
         let agent_id =
             AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter encodes");
@@ -2182,7 +2181,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_text(&mut first, &mut first_state, interrupt_token).await;
-        assert!(!temp.path().join("interrupt-failed").exists());
+        assert!(!work.join("interrupt-failed").exists());
 
         let line_token = "line-limit-ok";
         let long_line = format!("{} #{}", shell_token(line_token), "x".repeat(8192));
@@ -2203,7 +2202,7 @@ mod tests {
             .await
             .unwrap();
         wait_for_text(&mut first, &mut first_state, after_oversized_token).await;
-        assert!(!temp.path().join("oversized-command-ran").exists());
+        assert!(!work.join("oversized-command-ran").exists());
         wait_for_idle(&first).await;
 
         // Controls sent while idle are scoped to no execution.
@@ -2276,7 +2275,7 @@ mod tests {
             "fired"
         );
 
-        let background_pid: i32 = std::fs::read_to_string(temp.path().join("bg.pid"))
+        let background_pid: i32 = std::fs::read_to_string(work.join("bg.pid"))
             .unwrap()
             .trim()
             .parse()

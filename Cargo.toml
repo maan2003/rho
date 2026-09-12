@@ -49,8 +49,6 @@ members = [
   "crates/rho-visualizations",
   "crates/rho-web-search",
   "crates/rho-workset",
-  "crates/rho-workset-types",
-  "crates/rho-workspaces",
   "crates/rho-workspaces-types",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
@@ -156,8 +154,6 @@ rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workset = { path = "crates/rho-workset" }
-rho-workset-types = { path = "crates/rho-workset-types" }
-rho-workspaces = { path = "crates/rho-workspaces" }
 rho-workspaces-types = { path = "crates/rho-workspaces-types" }
 rpassword = "7"
 rustix-openpty = "0.2"

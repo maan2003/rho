@@ -384,12 +384,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let repo = Arc::new(
-            rho_workspaces::Repo::open_plain_with_path_overrides(directory, Default::default())
-                .unwrap(),
-        );
-        let workspace = repo.user_checkout().await.unwrap();
-        let view = View::new(vec![workspace.clone()]).unwrap();
+        let worksets =
+            rho_workset::Worksets::open_plain(directory.join("state"), Default::default())
+                .await
+                .unwrap();
+        let view = worksets.plain_view(directory).unwrap();
         let role = AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         };
@@ -404,7 +403,7 @@ mod tests {
             UnixMillis::now(),
             id,
             None,
-            vec![workspace.info().clone()],
+            vec![crate::StartPlace::new(Arc::clone(&view), None).info],
             role,
             binding,
             AgentRuntime::Rho {

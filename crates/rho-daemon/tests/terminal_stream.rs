@@ -1,14 +1,12 @@
 //! End-to-end smoke test for terminal streams: a real daemon on a temp
-//! socket, an agent joined to a plain temp checkout, a shell echoing through
-//! the dedicated stream, and a second attach after detach proving the
-//! terminal survived.
+//! socket, an agent started on a clone of a temp git repository, a shell
+//! echoing through the dedicated stream, and a second attach after detach
+//! proving the terminal survived.
 
 use std::time::Duration;
 
 use rho_ui_proto::term::{ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, WireScreen};
-use rho_ui_proto::{
-    AgentId, ClientMessage, JoinTarget, ServerMessage, StartMode, read_frame, write_frame,
-};
+use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, StartMode, read_frame, write_frame};
 
 #[tokio::test]
 async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
@@ -17,15 +15,36 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
     // SAFETY: this integration test binary has no other threads yet.
     unsafe { std::env::set_var("XDG_STATE_HOME", state_dir.path()) };
     let socket_path = state_dir.path().join("rho.sock");
-    // Agent workdirs must be jj repos, even when joining the user checkout.
-    let repo_dir = tempfile::tempdir()?;
-    let jj_init = std::process::Command::new("jj")
-        .args(["git", "init"])
-        .current_dir(repo_dir.path())
-        .output();
-    if !jj_init.is_ok_and(|output| output.status.success()) {
+    // The agent starts on a clone of this repository, made with jj. The
+    // clone takes its name from the path, so it cannot be the dot-prefixed
+    // temporary directory itself.
+    let repo_temp = tempfile::tempdir()?;
+    let repo_dir = repo_temp.path().join("repo");
+    std::fs::create_dir(&repo_dir)?;
+    let jj_version = std::process::Command::new("jj").arg("--version").output();
+    if !jj_version.is_ok_and(|output| output.status.success()) {
         eprintln!("skipping: jj unavailable");
         return Ok(());
+    }
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .status()?;
+        assert!(status.success());
     }
 
     tokio::spawn(rho_daemon::run(rho_daemon::DaemonArgs {
@@ -40,6 +59,8 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         anthropic_base_url: None,
         extra_before_path: None,
         extra_after_path: None,
+        // The test process has no private mount namespace.
+        workset_mode: rho_daemon::WorksetModeArg::Plain,
     }));
     let mut control = loop {
         match rho_rpc::connect_unix(&socket_path).await {
@@ -48,8 +69,8 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         }
     };
 
-    // Create an agent working directly in the plain temp checkout: no jj
-    // forking, no namespace mounts, nothing outside the temp dirs.
+    // Create an agent on a clone of the temp repository: no namespace
+    // mounts, nothing outside the temp dirs.
     write_frame(&mut control, &ClientMessage::Subscribe).await?;
     let ServerMessage::Ready { .. } =
         tokio::time::timeout(Duration::from_secs(30), read_frame(&mut control)).await??
@@ -60,9 +81,10 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         &mut control,
         &ClientMessage::NewAgent {
             role: Default::default(),
-            start: StartMode::Join(JoinTarget::User {
-                repo: camino::Utf8PathBuf::from_path_buf(repo_dir.path().to_owned()).unwrap(),
-            }),
+            start: StartMode::NewOn {
+                repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
+                revset: "@".to_owned(),
+            },
             content: None,
         },
     )

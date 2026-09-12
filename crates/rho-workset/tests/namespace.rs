@@ -59,12 +59,25 @@ async fn run(jj_bin: PathBuf) {
     std::fs::create_dir(&skeleton).unwrap();
     std::fs::copy(&jj_bin, skeleton.join("jj")).unwrap();
     let ns = workset
-        .enter(Mode::View {
-            home_skeleton: Some(skeleton),
-        })
-        .await
+        .enter(
+            Mode::View {
+                home_skeleton: Some(skeleton),
+            },
+            Utf8Path::new("/src"),
+        )
         .unwrap();
     assert_eq!(ns.visible_root(), "/src");
+    assert_eq!(ns.cwd(), "/src");
+    assert!(
+        workset
+            .enter(
+                Mode::View {
+                    home_skeleton: None
+                },
+                Utf8Path::new("/src/missing")
+            )
+            .is_err()
+    );
 
     // Bounded reads: visible and relative paths, limits, and escapes.
     assert_eq!(
@@ -116,9 +129,14 @@ async fn run(jj_bin: PathBuf) {
             .await
             .is_err()
     );
-    assert!(ns.read_file_bounded(Path::new("project/sub"), 1024).await.is_err());
+    assert!(
+        ns.read_file_bounded(Path::new("project/sub"), 1024)
+            .await
+            .is_err()
+    );
     assert_eq!(
-        ns.resolve_host_path_checked(Path::new("/src/project/x")).unwrap(),
+        ns.resolve_host_path_checked(Path::new("/src/project/x"))
+            .unwrap(),
         checkout.join("x")
     );
 
@@ -143,13 +161,13 @@ if mkdir {stores}/x 2>/dev/null; then echo "store root is writable"; exit 1; fi
 test ! -e /src/.stores
 "#,
         stores = root.store_root(),
-        socket = root.store_socket(),
+        socket = root.store_socket().unwrap(),
         remote = remote.display(),
         store = store.display(),
     );
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg(&script);
-    ns.prepare_command(&mut command, None).unwrap();
+    ns.prepare_command(&mut command, None).await.unwrap();
     let output = command.output().await.unwrap();
     assert!(
         output.status.success(),
@@ -165,12 +183,14 @@ test ! -e /src/.stores
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg("pwd");
     ns.prepare_command(&mut command, Some(Utf8Path::new("second")))
+        .await
         .unwrap();
     let output = command.output().await.unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), "/src/second\n");
     let mut command = tokio::process::Command::new(&sh);
     assert!(
         ns.prepare_command(&mut command, Some(Utf8Path::new("/tmp")))
+            .await
             .is_err()
     );
 
@@ -212,19 +232,17 @@ test ! -e /src/.stores
         for entry in "$HOME"/.claude/projects/*; do echo "project=${entry##*/}"; done
         echo "home=$HOME"
     "#;
-    let observe = |ns: &rho_workset::Namespace| {
+    let observe = async |ns: &rho_workset::Namespace| {
         let mut command = tokio::process::Command::new(&sh);
         command.arg("-c").arg(script);
-        ns.prepare_command(&mut command, None).unwrap();
-        async move {
-            let output = command.output().await.unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap()
-        }
+        ns.prepare_command(&mut command, None).await.unwrap();
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     };
 
     ns.set_claude_home(home_one.clone()).await.unwrap();
@@ -249,7 +267,7 @@ test ! -e /src/.stores
     command
         .arg("-c")
         .arg("echo written > \"$HOME/.claude/projects/from-agent\"");
-    ns.prepare_command(&mut command, None).unwrap();
+    ns.prepare_command(&mut command, None).await.unwrap();
     assert!(command.status().await.unwrap().success());
     assert_eq!(
         std::fs::read_to_string(shared.join("from-agent")).unwrap(),
@@ -272,5 +290,28 @@ test ! -e /src/.stores
                 .unwrap_or(true)
         }
     );
+    // Plain mode: no namespace, host paths, same fences.
+    let plain = workset
+        .enter(Mode::Plain, Utf8Path::new("project"))
+        .unwrap();
+    assert_eq!(plain.visible_root(), workset.root());
+    assert_eq!(plain.cwd(), workset.root().join("project"));
+    let mut command = tokio::process::Command::new(&sh);
+    command.arg("-c").arg("pwd; test -n \"$JJ_STORE\"");
+    plain.prepare_command(&mut command, None).await.unwrap();
+    let output = command.output().await.unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        workset.root().join("project").as_str()
+    );
+    assert_eq!(
+        plain
+            .read_file_bounded(Path::new("file.txt"), 1024)
+            .await
+            .unwrap(),
+        b"one\n"
+    );
+    assert!(plain.set_claude_home(home_two).await.is_err());
     println!("namespace test passed");
 }

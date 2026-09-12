@@ -11,8 +11,9 @@ pub use rho_core::{
     AdvisorIntelligence, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence, MessageDelivery,
 };
 pub use rho_workspaces_types::{
-    WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
-    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+    WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
+    WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId,
+    WorkspaceIdDomain, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -535,21 +536,21 @@ pub struct McpAgentToolResponse {
     pub is_error: bool,
 }
 
-/// Where a new agent works. Each mode carries exactly the data it needs:
-/// joining an existing workspace already knows its repo, the others say
-/// which repo they mean.
+/// Where a new agent works. Each mode carries exactly the data it needs.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum StartMode {
-    /// A fresh workspace in `repo` with a new change on top of the revset.
-    /// Clients resolve agent targets to `<workspace name>@` themselves
-    /// (workspace names arrive on the mirror's `Created` event).
+    /// A fresh workset holding a clone of `repo` (a URL or a daemon-side
+    /// path), with a new change on top of the revset.
     NewOn { repo: Utf8PathBuf, revset: String },
-    /// A fresh restricted workspace in `repo` on top of the revset.
+    /// Historical: sandboxes are no longer made.
     Sandbox { repo: Utf8PathBuf, revset: String },
-    /// The SAME workspace as the target: no new checkout — agents share the
-    /// directory (and namespace), seeing each other's edits instantly.
-    /// Joining the user means working directly in the user's checkout.
+    /// The SAME place as the target: the new agent works in the target
+    /// agent's directory, seeing its edits instantly.
     Join(JoinTarget),
+    /// In the target agent's workset, in a new jj workspace of the
+    /// repository the target works in, on a new change atop the revset
+    /// (`@` for the target's own change).
+    Beside { base: WorkspaceInfo, revset: String },
 }
 
 /// Whose workspace [`StartMode::Join`] joins.

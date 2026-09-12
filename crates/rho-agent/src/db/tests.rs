@@ -1,7 +1,7 @@
 use rho_core::{ContentPart, UnixMs};
 use rho_db::RhoDb;
 use rho_inference::PromptCacheKey;
-use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+use rho_workset::WorkspaceInfo;
 
 use super::*;
 
@@ -456,9 +456,11 @@ fn event_text(event: &AgentEvent<'_>) -> String {
 
 /// Tests exercise agent records only; any workspace info will do.
 pub(crate) fn test_workspace() -> WorkspaceInfo {
-    WorkspaceInfo::Workspace {
-        repo: "/home/user/src/rho".into(),
-        id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+    WorkspaceInfo::Workset {
+        workset: "0123456789ab".into(),
+        cwd: "/src/rho".into(),
+        mode: Default::default(),
+        origin: None,
     }
 }
 

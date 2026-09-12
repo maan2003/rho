@@ -251,13 +251,11 @@ mod tests {
             UnixMs(1),
             agent_id,
             None,
-            vec![rho_workspaces::WorkspaceInfo::Workspace {
-                repo: "/home/user/src/rho".into(),
-                id: rho_workspaces::WorkspaceId::from_counter(
-                    counter,
-                    &rho_workspaces::WorkspaceIdDomain(0),
-                )
-                .unwrap(),
+            vec![crate::WorkspaceInfo::Workset {
+                workset: format!("{counter:012x}"),
+                cwd: "/src/rho".into(),
+                mode: Default::default(),
+                origin: None,
             }],
             AgentRole::default(),
             SessionBinding::ClaudeOpus {
