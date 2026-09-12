@@ -415,6 +415,12 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
         Some("newinstance,ptmxmode=0666,mode=0620"),
     )?;
     symlink("pts/ptmx", dev.join("ptmx"))?;
+    // The process's own descriptors, as every distribution's /dev has
+    // them: bash's `<(...)` opens /dev/fd/N, and tools read /dev/stdin.
+    symlink("/proc/self/fd", dev.join("fd"))?;
+    for (name, fd) in [("stdin", 0), ("stdout", 1), ("stderr", 2)] {
+        symlink(format!("/proc/self/fd/{fd}"), dev.join(name))?;
+    }
     fs::create_dir(dev.join("shm"))?;
     fs::set_permissions(dev.join("shm"), fs::Permissions::from_mode(0o1777))?;
     Ok(())

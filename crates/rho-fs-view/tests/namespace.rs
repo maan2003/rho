@@ -164,6 +164,8 @@ git -C /src/second commit -q --allow-empty -m identity
 test "$(git -C /src/second log -1 --format=%an)" = "Test Agent"
 printf 'export FOO=bar\n' > /src/second/.envrc
 test "$(direnv exec /src/second sh -c 'echo $FOO' 2>/dev/null)" = bar
+test "$(bash -c 'cat <(echo substituted)')" = substituted
+test "$(echo piped | cat /dev/stdin)" = piped
 "#,
         base = rho_fs_view::AGENT_BASE,
         state = workset.state_dir().unwrap(),
