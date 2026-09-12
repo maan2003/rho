@@ -21,8 +21,7 @@ pub const DEFAULT_ROLE: &str = "eng";
 /// the cursor is in the field. The field label shows the current mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartFieldMode {
-    /// A fresh clone with a new change on top of the target, or beside a
-    /// target agent: a new jj workspace in its workset.
+    /// A fresh clone with a new change on top of the target revset.
     NewOn,
     /// The same directory as the target agent.
     Join,
@@ -137,12 +136,13 @@ pub fn parse_start(
         (StartFieldMode::NewOn, "", _) => {
             return Err("pick a base: a revset like `@-` or an agent label".to_owned());
         }
-        // Beside an agent: a new jj workspace in its workset, on its change.
-        (StartFieldMode::NewOn, _, Some(base @ WorkspaceInfo::Workset { .. })) => {
-            StartMode::Beside {
-                base,
-                revset: "@".to_owned(),
-            }
+        // An agent's change lives in its own clone, which a fresh clone
+        // cannot see: work with it by joining it.
+        (StartFieldMode::NewOn, _, Some(WorkspaceInfo::Workset { .. })) => {
+            return Err(format!(
+                "`{target}` is an agent: Shift-Tab to Join mode to work in its directory, \
+                 or base on a revset like `@-`"
+            ));
         }
         (
             StartFieldMode::NewOn,

@@ -547,10 +547,6 @@ pub enum StartMode {
     /// The SAME place as the target: the new agent works in the target
     /// agent's directory, seeing its edits instantly.
     Join(JoinTarget),
-    /// In the target agent's workset, in a new jj workspace of the
-    /// repository the target works in, on a new change atop the revset
-    /// (`@` for the target's own change).
-    Beside { base: WorkspaceInfo, revset: String },
 }
 
 /// Whose workspace [`StartMode::Join`] joins.

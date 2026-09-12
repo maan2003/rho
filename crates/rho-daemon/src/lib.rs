@@ -1084,19 +1084,6 @@ impl Services {
                     }
                 }
             }
-            StartMode::Beside { base, revset } => {
-                let (workset, mode, host_cwd) = self.pool.open_workset(&base).await?;
-                let (root, is_jj) = rho_workset::resolve_workdir_root(host_cwd.as_std_path())?;
-                anyhow::ensure!(
-                    is_jj,
-                    "{} is not in a jj repository, so there is nothing to start beside",
-                    base.repo()
-                );
-                let added = workset.add_workspace(&root, &revset).await?;
-                let cwd = visible_path(&workset, &mode, &added)?;
-                let view = workset.enter(mode, &cwd)?;
-                rho_agent::StartPlace::new(view, base.origin().map(ToOwned::to_owned))
-            }
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 let view = self.pool.materialize_view(&info).await?;
                 rho_agent::StartPlace::new(view, info.origin().map(ToOwned::to_owned))
