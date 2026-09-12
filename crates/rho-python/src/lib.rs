@@ -114,12 +114,19 @@ pub trait Execution: Send + Sync {
 type Executions = Arc<Mutex<HashMap<CellId, Arc<dyn Execution>>>>;
 
 /// A cloneable sender, not an owner of the interpreter's lifetime.
+///
+/// Inputs go through an unbounded outbox that one thread forwards, in
+/// order, into the interpreter's bounded inbox, waiting when that is full.
+/// The interpreter drains its inbox only between units of Python, so a cell
+/// running synchronous code while commands finish or source streams in
+/// behind it would otherwise fill the inbox, and the next thing sent, often
+/// the very cell that could relieve it, would be refused instead of queued.
 #[derive(Clone)]
 pub struct Sender {
     tx: mpsc::SyncSender<Input>,
+    outbox: mpsc::Sender<Input>,
     executions: Executions,
     cancelled: Arc<Mutex<HashSet<CellId>>>,
-    space: Arc<tokio::sync::Notify>,
     wake: Arc<OwnedFd>,
 }
 
@@ -149,39 +156,21 @@ impl Sender {
         Ok(())
     }
 
+    /// Queues an input for the interpreter. Never refuses a busy runtime:
+    /// the input waits its turn behind whatever is already queued and is
+    /// delivered in the order sent. Fails only when the runtime is gone.
     pub fn send(&self, input: Input) -> Result<(), String> {
         if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > MAX_MESSAGE_BYTES {
             return Err("Python input exceeds 1 MiB".into());
         }
-        self.tx
-            .try_send(input)
-            .map_err(|e| format!("Python runtime unavailable or busy: {e}"))?;
-        wake(&self.wake);
-        Ok(())
+        self.outbox
+            .send(input)
+            .map_err(|_| "Python runtime disconnected".to_owned())
     }
 
-    /// Reliable, bounded host completion delivery with asynchronous
-    /// backpressure.
-    pub async fn send_async(&self, mut input: Input) -> Result<(), String> {
-        if serde_json::to_vec(&input).map_err(|e| e.to_string())?.len() > MAX_MESSAGE_BYTES {
-            return Err("Python input exceeds 1 MiB".into());
-        }
-        loop {
-            let space = self.space.notified();
-            tokio::pin!(space);
-            space.as_mut().enable();
-            match self.tx.try_send(input) {
-                Ok(()) => {
-                    wake(&self.wake);
-                    return Ok(());
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => {
-                    return Err("Python runtime disconnected".into());
-                }
-                Err(mpsc::TrySendError::Full(value)) => input = value,
-            }
-            space.await;
-        }
+    /// The same queue as [`Sender::send`], for callers that already await.
+    pub async fn send_async(&self, input: Input) -> Result<(), String> {
+        self.send(input)
     }
 
     pub fn cancel(&self, cell: CellId) {
@@ -206,6 +195,7 @@ impl Session {
         tools: Value,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::sync_channel(256);
+        let (outbox, outbox_rx) = mpsc::channel::<Input>();
         let executions: Executions = Default::default();
         let cancelled = Arc::new(Mutex::new(HashSet::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -227,12 +217,29 @@ impl Session {
                 Ok(tools)
             },
         )?;
+        {
+            let tx = tx.clone();
+            let wake = Arc::clone(&wake);
+            std::thread::Builder::new()
+                .name("python-inbox".into())
+                .spawn(move || {
+                    // A blocking send here waits for the interpreter to
+                    // drain, and ends when the interpreter thread is gone.
+                    while let Ok(input) = outbox_rx.recv() {
+                        if tx.send(input).is_err() {
+                            break;
+                        }
+                        crate::wake(&wake);
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Self {
             sender: Sender {
                 tx,
+                outbox,
                 executions,
                 cancelled,
-                space,
                 wake,
             },
             shutdown,
@@ -325,6 +332,43 @@ mod tests {
             .await
             .expect("runtime timed out")
             .expect("runtime stopped")
+    }
+
+    #[tokio::test]
+    async fn a_full_inbox_delays_a_cell_instead_of_refusing_it() {
+        let (session, mut events) = test_session(|| Ok(())).unwrap();
+        let sender = session.sender();
+        // Fill the interpreter's inbox behind its back, as a burst of
+        // completions or streamed source would while a cell runs.
+        let raw = session.session.sender();
+        let mut queued = 0;
+        while raw
+            .tx
+            .try_send(Input::Resolve {
+                request: u64::MAX,
+                value: Value::Null,
+                error: None,
+            })
+            .is_ok()
+        {
+            queued += 1;
+        }
+        assert!(queued >= 256);
+        // The cell is accepted, waits for the backlog to drain, then runs.
+        sender
+            .send(Input::Execute {
+                cell: 1,
+                source: "notify('after the backlog')".into(),
+            })
+            .unwrap();
+        crate::wake(&raw.wake);
+        loop {
+            if let Event::Text { text, .. } = next(&mut events).await
+                && text.contains("after the backlog")
+            {
+                break;
+            }
+        }
     }
 
     #[tokio::test]
