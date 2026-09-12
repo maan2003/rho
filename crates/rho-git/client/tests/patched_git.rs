@@ -1,6 +1,6 @@
 //! Rho's patched git against a live keeper: clones are born from the
 //! mirror, fetches read the refreshed mirror of whatever they name, and
-//! nothing is copied into a pack of the clone's own. Needs `RHO_GIT`.
+//! nothing is copied into a pack of the clone's own.
 
 mod common;
 
@@ -14,7 +14,7 @@ use rho_git_proto::SOCKET_ENV;
 use rho_git_server::{MirrorStore, Refresh};
 
 fn rho_git(cwd: &Path, socket: Option<&Path>, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(patched_git().unwrap());
+    let mut command = Command::new(patched_git());
     command
         .args(args)
         .current_dir(cwd)
@@ -88,18 +88,8 @@ fn alternates(clone: &Path) -> Vec<String> {
         .collect()
 }
 
-macro_rules! needs_patched_git {
-    () => {
-        if patched_git().is_none() {
-            eprintln!("RHO_GIT is not set: skipping");
-            return;
-        }
-    };
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn clone_and_fetch_go_through_the_store() {
-    needs_patched_git!();
     let temp = tempfile::tempdir().unwrap();
     let (source, remote) = setup_remote(temp.path());
     let daemon = GitDaemon::start(temp.path());
@@ -177,7 +167,6 @@ async fn clone_and_fetch_go_through_the_store() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_remote_gets_its_own_mirror() {
-    needs_patched_git!();
     let temp = tempfile::tempdir().unwrap();
     let (source, _remote) = setup_remote(temp.path());
     // A second remote: a fork with a branch of its own.
@@ -299,7 +288,6 @@ async fn every_remote_gets_its_own_mirror() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subtree_add_and_pull_read_the_mirror() {
-    needs_patched_git!();
     let temp = tempfile::tempdir().unwrap();
     let (source, _remote) = setup_remote(temp.path());
     let daemon = GitDaemon::start(temp.path());
@@ -368,7 +356,6 @@ async fn subtree_add_and_pull_read_the_mirror() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn shaped_clones_and_local_paths() {
-    needs_patched_git!();
     let temp = tempfile::tempdir().unwrap();
     let (_source, remote) = setup_remote(temp.path());
     let daemon = GitDaemon::start(temp.path());
@@ -402,7 +389,6 @@ async fn shaped_clones_and_local_paths() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_store_git_is_plain() {
-    needs_patched_git!();
     let temp = tempfile::tempdir().unwrap();
     let (source, _remote) = setup_remote(temp.path());
     let daemon = GitDaemon::start(temp.path());

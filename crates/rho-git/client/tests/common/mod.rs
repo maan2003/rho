@@ -51,16 +51,12 @@ pub fn push_commit(source: &Path, content: &str) -> String {
     git(source, &["rev-parse", "HEAD"]).trim().to_owned()
 }
 
-/// Rho's patched git (`RHO_GIT`), or `None` when the environment does not
-/// name one: the tests that need it then skip.
-pub fn patched_git() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("RHO_GIT")?);
-    if path.is_file() {
-        Some(path)
-    } else {
-        eprintln!("RHO_GIT={} is not a file", path.display());
-        None
-    }
+/// Rho's patched git, the one this build was made with.
+pub fn patched_git() -> PathBuf {
+    PathBuf::from(env!(
+        "RHO_GIT",
+        "RHO_GIT must name Rho's patched git at build time"
+    ))
 }
 
 /// A `git daemon` serving every repository under `base` over `git://`,

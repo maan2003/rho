@@ -166,7 +166,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `LANG=C.UTF-8`; `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`;
 `NIX_REMOTE=daemon`; `DIRENV_CONFIG=/etc/rho/direnv`;
 `GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*`, `GIT_COMMITTER_*`;
-`RHO_GIT_STORE_SOCKET`, `RHO_GIT`; `INSIDE_AGENT=1`;
+`RHO_GIT_STORE_SOCKET`; `INSIDE_AGENT=1`;
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the shared cache.
 Variables the caller sets on a command survive, as today.
 

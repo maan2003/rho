@@ -13,13 +13,14 @@ It is three small crates under `crates/rho-git/` and one patch to git:
   the store key.
 - `rho-git-server`: the **keeper**, `MirrorStore`. The daemon runs it
   in-process; it is the only writer of the store root.
-- `rho-git-client`: the daemon's client library (`Store`,
-  `clone_from_mirror`, `ensure_alternate`) and the end-to-end tests of
-  the patched git against a live keeper.
+- `rho-git-client`: how the daemon births its own clones from a mirror
+  (`clone_from_mirror`, `ensure_alternate`; the keeper is called
+  in-process) and the end-to-end tests of the patched git against a live
+  keeper.
 - `nix/patches/git-rho-store.patch`: Rho's git. Its `clone` and `fetch`
   ask the keeper for the mirror themselves, so every path into a fetch
   is covered by construction. The flake builds it as `rhoGit`; the
-  daemon learns its path from `RHO_GIT` at build or run time.
+  daemon bakes its path in at build time (`RHO_GIT` in the flake).
 
 ## It is a cache, not a workflow
 

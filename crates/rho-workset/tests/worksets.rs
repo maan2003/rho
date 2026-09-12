@@ -1,9 +1,7 @@
 use camino::Utf8Path;
 
 mod common;
-use common::{
-    GitDaemon, git, only_store, open_worksets, patched_git_known, setup_remote, store_git,
-};
+use common::{GitDaemon, git, only_store, open_worksets, setup_remote, store_git};
 
 #[tokio::test]
 async fn worksets_clone_through_the_mirror_store() {
@@ -13,9 +11,7 @@ async fn worksets_clone_through_the_mirror_store() {
     let root = open_worksets(temp.path()).await;
     let socket = root.store_socket().expect("keeper running");
     assert!(socket.exists());
-    if patched_git_known() {
-        assert!(root.store_bin().unwrap().join("git").is_file());
-    }
+    assert!(root.store_bin().unwrap().join("git").is_file());
     let remote_url = daemon.url("remote.git");
     let remote_url = remote_url.as_str();
 
@@ -100,23 +96,19 @@ async fn worksets_clone_through_the_mirror_store() {
         std::fs::read_to_string(second.join("file.txt")).unwrap(),
         "three\n"
     );
-    if patched_git_known() {
-        store_git(&root, project.as_std_path(), &["fetch", "-q"]).await;
-        assert_eq!(
-            git(project.as_std_path(), &["rev-parse", "origin/main"]),
-            new_main
-        );
-        assert!(
-            project
-                .join(".git/objects/pack")
-                .read_dir()
-                .unwrap()
-                .next()
-                .is_none()
-        );
-    } else {
-        eprintln!("RHO_GIT is not set: skipping the agent-side fetch");
-    }
+    store_git(&root, project.as_std_path(), &["fetch", "-q"]).await;
+    assert_eq!(
+        git(project.as_std_path(), &["rev-parse", "origin/main"]),
+        new_main
+    );
+    assert!(
+        project
+            .join(".git/objects/pack")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
     assert_eq!(
         std::fs::read_to_string(project.join("file.txt")).unwrap(),
         "two\n",

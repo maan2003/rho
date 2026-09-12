@@ -24,7 +24,7 @@ the same mirror to concurrent requests under one lock. Everything else —
 the daemon's own `Workset::clone_repo`, an agent's `git clone` and `git
 fetch` through Rho's patched git — is a client that reads a mirror.
 Agents get that git first on their PATH; the daemon finds it through
-`RHO_GIT` (baked in by the nix build, or set in the environment) and
+`RHO_GIT` at build time (the flake sets it for nix and dev-shell builds) and
 mounts its directory read-only into the view. `Worksets::discard_workset`
 deletes the workset directory; mirrors are shared and never removed.
 

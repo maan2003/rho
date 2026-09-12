@@ -158,7 +158,6 @@ fn writes_the_fixed_environment_manifest() {
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
         "RHO_DIRENV_LAYOUT_DIR",
-        "RHO_GIT",
         "RHO_GIT_STORE_SOCKET",
     ]);
     assert!(

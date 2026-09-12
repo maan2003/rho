@@ -26,7 +26,16 @@ pub mod layout;
 
 pub use layout::*;
 pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
-pub use rho_git_proto::{GIT_ENV, SOCKET_ENV, repo_name};
+pub use rho_git_proto::{SOCKET_ENV, repo_name};
+
+/// Rho's patched git (`nix/patches/git-rho-store.patch`), fixed at build
+/// time: the keeper fetches with it, the daemon clones with it, and agents
+/// see it as `git`. Without the store socket in its environment it is
+/// plain git.
+pub const GIT: &str = env!(
+    "RHO_GIT",
+    "RHO_GIT must name Rho's patched git at build time"
+);
 pub use rho_git_server::Refresh as StoreRefresh;
 pub use rho_workspaces_types::{
     WorksetMode, WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile,
@@ -125,14 +134,11 @@ pub struct Worksets {
     adopted: std::sync::Mutex<BTreeMap<String, Utf8PathBuf>>,
 }
 
-/// The running keeper: its socket, the git it and the daemon's clones run,
-/// and the directory of Rho's patched git, which agents see as `git`.
+/// The running keeper and its socket.
 #[derive(Debug)]
 struct StoreHandle {
     keeper: Arc<MirrorStore>,
     socket: Utf8PathBuf,
-    git: PathBuf,
-    bin: Option<Utf8PathBuf>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -210,10 +216,15 @@ impl Worksets {
         self.store.as_ref().map(|store| store.socket.clone())
     }
 
-    /// The directory of Rho's patched git (`RHO_GIT`), when the keeper runs
-    /// and the build knows one; agents get it first on their PATH.
+    /// The directory of Rho's patched git (`GIT`), when the keeper runs;
+    /// agents get it first on their PATH.
     pub fn store_bin(&self) -> Option<Utf8PathBuf> {
-        self.store.as_ref().and_then(|store| store.bin.clone())
+        self.store.as_ref().map(|_| {
+            Utf8Path::new(GIT)
+                .parent()
+                .expect("git has a directory")
+                .to_owned()
+        })
     }
 
     /// Environment that points the agent's git at the keeper.
@@ -373,15 +384,9 @@ fn start_store(
     path_overrides: &PathOverrides,
     refresh: StoreRefresh,
 ) -> anyhow::Result<StoreHandle> {
-    let agent_git = agent_git();
-    let git = real_git(environment, path_overrides, agent_git.as_deref())?;
-    let bin = agent_git
-        .as_deref()
-        .and_then(Path::parent)
-        .and_then(|dir| Utf8PathBuf::from_path_buf(dir.to_owned()).ok());
     let keeper = MirrorStore::new(
         root.join("stores").into_std_path_buf(),
-        git.clone(),
+        PathBuf::from(GIT),
         keeper_environment(environment, path_overrides),
         refresh,
     );
@@ -399,54 +404,8 @@ fn start_store(
     Ok(StoreHandle {
         keeper,
         socket,
-        git,
-        bin,
         tasks: vec![serve],
     })
-}
-
-/// Rho's patched git for agents: `RHO_GIT` in the environment, else the
-/// one this build was made with. A build without one warns and leaves
-/// agents the plain git on their PATH, which never consults the store.
-fn agent_git() -> Option<PathBuf> {
-    let configured = std::env::var_os(GIT_ENV)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| option_env!("RHO_GIT").map(PathBuf::from));
-    match configured {
-        Some(path) if path.is_file() => Some(path),
-        Some(path) => {
-            eprintln!(
-                "git store: {GIT_ENV}={} is not a file; agents get plain git",
-                path.display()
-            );
-            None
-        }
-        None => {
-            eprintln!("git store: {GIT_ENV} is not set; agents get plain git and no mirrors");
-            None
-        }
-    }
-}
-
-/// The git the keeper fetches with and the daemon clones with: the first
-/// on the user's PATH (overrides applied), else on the daemon's own PATH,
-/// else the patched git, canonicalized so a `/nix/store` git is named as
-/// such.
-fn real_git(
-    environment: &UserEnvironment,
-    path_overrides: &PathOverrides,
-    fallback: Option<&Path>,
-) -> anyhow::Result<PathBuf> {
-    let user_path = environment
-        .get("PATH")
-        .map(|path| path_overrides.add_to(path));
-    let git = rho_git_client::Git::find_on_path(user_path.as_deref())
-        .or_else(|| rho_git_client::Git::find_on_path(None))
-        .map(|git| git.executable().to_owned())
-        .or_else(|| fallback.map(Path::to_owned))
-        .context("git is not on PATH; the mirror store needs it")?;
-    Ok(git.canonicalize().unwrap_or(git))
 }
 
 /// A handle to one workset's host-frame `src` directory.
@@ -562,7 +521,7 @@ impl Workset {
         let cloned = match &owner.store {
             Some(store) => {
                 let mirror = store.keeper.ensure(remote_url).await?;
-                let git = rho_git_client::Git::new(&store.git);
+                let git = rho_git_client::Git::new(GIT);
                 let url = remote_url.to_owned();
                 let dest = target.clone();
                 tokio::task::spawn_blocking(move || {

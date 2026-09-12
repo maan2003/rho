@@ -1,10 +1,10 @@
-//! The mirror store's client side: talking to the keeper and birthing a
-//! clone from a mirror, for the daemon's own clones. Agents need no client:
-//! the `git` in their view is Rho's patched git
+//! The mirror store's client side: birthing a clone from a mirror, for
+//! the daemon's own clones (the keeper itself is called in-process). Agents
+//! need no client: the `git` in their view is Rho's patched git
 //! (`nix/patches/git-rho-store.patch`), which asks the keeper itself on every
 //! fetch and clone of a remote URL when `RHO_GIT_STORE_SOCKET` is set. The
-//! end-to-end tests in `tests/` drive that git (`RHO_GIT`) against a live
-//! keeper.
+//! end-to-end tests in `tests/` drive that git (the build's `RHO_GIT`)
+//! against a live keeper.
 //!
 //! A clone born here is an ordinary git repository whose `origin` is the
 //! real remote URL, so `git remote -v`, `git push` and any tooling see
@@ -13,71 +13,12 @@
 //! `objects/info/alternates` (`CLONES.md`).
 
 use std::ffi::{OsStr, OsString};
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::os::unix::net::UnixStream;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context as _;
 pub use rho_git_proto as proto;
-use rho_git_proto::{GIT_ENV, Request, Response, SOCKET_ENV};
-
-/// A connection recipe for the keeper's socket.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Store {
-    socket: PathBuf,
-}
-
-impl Store {
-    /// The store the environment points at, if any.
-    pub fn from_env() -> Option<Self> {
-        std::env::var_os(SOCKET_ENV)
-            .filter(|path| !path.is_empty())
-            .map(|path| Self::at(PathBuf::from(path)))
-    }
-
-    pub fn at(socket: impl Into<PathBuf>) -> Self {
-        Self {
-            socket: socket.into(),
-        }
-    }
-
-    pub fn socket(&self) -> &Path {
-        &self.socket
-    }
-
-    /// The mirror for `url`, made or refreshed as needed.
-    pub fn ensure(&self, url: &str) -> anyhow::Result<PathBuf> {
-        self.request(Request::Ensure {
-            url: url.to_owned(),
-        })
-    }
-
-    /// The mirror for `url`, fetched now (within the keeper's debounce).
-    pub fn refresh(&self, url: &str) -> anyhow::Result<PathBuf> {
-        self.request(Request::Refresh {
-            url: url.to_owned(),
-        })
-    }
-
-    fn request(&self, request: Request) -> anyhow::Result<PathBuf> {
-        let line = request.encode()?;
-        let mut stream = UnixStream::connect(&self.socket)
-            .with_context(|| format!("connect to git store at {}", self.socket.display()))?;
-        stream
-            .write_all(line.as_bytes())
-            .context("send request to git store")?;
-        stream.shutdown(std::net::Shutdown::Write).ok();
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .context("read git store reply")?;
-        match Response::decode(&reply)? {
-            Response::Ok { mirror } => Ok(mirror),
-            Response::Error { message } => anyhow::bail!("git store: {message}"),
-        }
-    }
-}
 
 /// The real git executable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,31 +31,6 @@ impl Git {
         Self {
             executable: executable.into(),
         }
-    }
-
-    /// The git `RHO_GIT` names, if set.
-    pub fn from_env() -> Option<Self> {
-        std::env::var_os(GIT_ENV)
-            .filter(|path| !path.is_empty())
-            .map(Self::new)
-    }
-
-    /// The first executable `git` on `path` (the process's PATH when
-    /// `None`).
-    pub fn find_on_path(path: Option<&OsStr>) -> Option<Self> {
-        let path = path
-            .map(ToOwned::to_owned)
-            .or_else(|| std::env::var_os("PATH"))?;
-        std::env::split_paths(&path)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(|dir| dir.join("git"))
-            .find(|candidate| {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::metadata(candidate).is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            })
-            .map(Self::new)
     }
 
     pub fn executable(&self) -> &Path {
@@ -357,7 +273,7 @@ mod tests {
     fn clone_borrows_the_mirror_and_tracks_the_remote() {
         let temp = tempfile::tempdir().unwrap();
         let (remote, mirror) = fixture(temp.path());
-        let git = Git::find_on_path(None).unwrap();
+        let git = Git::new("git");
         let dest = temp.path().join("clone");
         clone_from_mirror(&git, &mirror, remote.to_str().unwrap(), &dest).unwrap();
 
@@ -408,27 +324,11 @@ mod tests {
     fn clone_refuses_a_populated_destination() {
         let temp = tempfile::tempdir().unwrap();
         let (remote, mirror) = fixture(temp.path());
-        let git = Git::find_on_path(None).unwrap();
+        let git = Git::new("git");
         let dest = temp.path().join("busy");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("x"), "").unwrap();
         let error = clone_from_mirror(&git, &mirror, remote.to_str().unwrap(), &dest).unwrap_err();
         assert!(error.to_string().contains("already exists"), "{error:#}");
-    }
-
-    #[test]
-    fn find_on_path_takes_the_first_executable_git() {
-        let temp = tempfile::tempdir().unwrap();
-        let fake = temp.path().join("bin");
-        std::fs::create_dir_all(&fake).unwrap();
-        let first = fake.join("git");
-        std::fs::write(&first, "#!/bin/sh\n").unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut path = std::env::join_paths([fake.clone()]).unwrap();
-        path.push(":");
-        path.push(std::env::var_os("PATH").unwrap());
-        assert_eq!(Git::find_on_path(Some(&path)).unwrap().executable(), first);
-        assert_ne!(Git::find_on_path(None).unwrap().executable(), first);
     }
 }

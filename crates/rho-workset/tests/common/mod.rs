@@ -53,12 +53,6 @@ pub async fn store_git(root: &Worksets, dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-/// Whether `RHO_GIT` names Rho's patched git; tests of the agent's git
-/// skip their store assertions without it.
-pub fn patched_git_known() -> bool {
-    std::env::var_os("RHO_GIT").is_some_and(|path| Path::new(&path).is_file())
-}
-
 /// The user environment the tests hand the daemon: the process's, without
 /// the store variables a surrounding view may have set.
 pub fn environment() -> UserEnvironment {

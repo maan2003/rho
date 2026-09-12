@@ -22,9 +22,6 @@ use std::path::PathBuf;
 /// as plain git.
 pub const SOCKET_ENV: &str = "RHO_GIT_STORE_SOCKET";
 
-/// Environment variable naming the real git executable the wrapper runs.
-pub const GIT_ENV: &str = "RHO_GIT";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Ensure { url: String },

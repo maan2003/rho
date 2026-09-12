@@ -10,7 +10,7 @@ use camino::Utf8Path;
 use rho_workset::{ClaudeHome, MAX_BOUNDED_READ, Mode};
 
 mod common;
-use common::{GitDaemon, only_store, open_worksets, patched_git_known, setup_remote};
+use common::{GitDaemon, only_store, open_worksets, setup_remote};
 
 fn main() {
     let unshare = Command::new("unshare").args(["-U", "true"]).status();
@@ -137,25 +137,19 @@ async fn run() {
     // Inside the namespace `git` is Rho's git: the agent clones through
     // the keeper, works in the clone, fetches from the mirror, and cannot
     // write the store or the git directory. The command starts in /src.
-    // Without a patched git known (`RHO_GIT`) the clone is plain.
     let sh = host_binary("sh");
     let store = only_store(temp.path());
-    let with_store = if patched_git_known() {
-        format!(
-            r#"
+    let with_store = format!(
+        r#"
 test "$(command -v git)" = {bin}/git
 git clone -q -- {remote} second
 test "$(cat /src/second/.git/objects/info/alternates)" = {store}/git/objects
 git -C /src/second fetch -q
 if touch {bin}/x 2>/dev/null; then echo "git dir is writable"; exit 1; fi
 "#,
-            bin = root.store_bin().unwrap(),
-            store = store.display(),
-        )
-    } else {
-        eprintln!("RHO_GIT is not set: the in-view clone is plain git");
-        format!("git clone -q -- {remote} second\n")
-    };
+        bin = root.store_bin().unwrap(),
+        store = store.display(),
+    );
     let script = format!(
         r#"
 set -eu
