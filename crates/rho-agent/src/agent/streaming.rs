@@ -384,11 +384,24 @@ mod tests {
         )
         .await
         .unwrap();
-        let worksets =
-            rho_workset::Worksets::open_plain(directory.join("state"), Default::default())
-                .await
-                .unwrap();
-        let view = worksets.plain_view(directory).unwrap();
+        let worksets = rho_workset::Worksets::open(
+            directory.join("state"),
+            Default::default(),
+            Default::default(),
+            rho_workset::StoreService::None,
+        )
+        .await
+        .unwrap();
+        let view = worksets
+            .adopt(directory)
+            .unwrap()
+            .enter(
+                rho_workset::Mode::View {
+                    home_skeleton: None,
+                },
+                camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+            )
+            .unwrap();
         let role = AgentRole::Engineer {
             intelligence: EngineerIntelligence::Medium,
         };

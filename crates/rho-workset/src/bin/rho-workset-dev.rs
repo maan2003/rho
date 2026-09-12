@@ -1,14 +1,18 @@
+//! Development runner: enters a workset namespace the way the daemon does
+//! and runs one command in it. `--src` is adopted as the workset; `--state`
+//! is a state root (its `stores/` is the clone store, no server runs).
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use rho_workset::{ExposedBuilder, FsViewBuilder, FsViewConfig, Mounts};
+use camino::Utf8Path;
+use rho_workset::{Mode, PathOverrides, StoreService, UserEnvironment, Worksets};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
     let mut src = None;
-    let mut stores = None;
-    let mut socket = None;
+    let mut state = None;
     let mut skeleton = None;
     let mut exposed = false;
     let mut command = Vec::new();
@@ -18,7 +22,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         let value = match arg.to_str() {
-            Some("--src" | "--stores" | "--socket" | "--skeleton") => args
+            Some("--src" | "--state" | "--skeleton") => args
                 .next()
                 .with_context(|| format!("missing value for {}", arg.to_string_lossy()))?,
             Some("--exposed") => {
@@ -33,20 +37,13 @@ fn main() -> anyhow::Result<()> {
         };
         match arg.to_str().unwrap() {
             "--src" => src = Some(PathBuf::from(value)),
-            "--stores" => stores = Some(PathBuf::from(value)),
-            "--socket" => socket = Some(PathBuf::from(value)),
+            "--state" => state = Some(PathBuf::from(value)),
             "--skeleton" => skeleton = Some(PathBuf::from(value)),
             _ => unreachable!(),
         }
     }
     let src = std::path::absolute(src.context("--src is required")?)?;
-    let store_root = std::path::absolute(stores.context("--stores is required")?)?;
-    let store_socket = socket.map(std::path::absolute).transpose()?;
-    let set = Mounts {
-        src,
-        store_root,
-        store_socket,
-    };
+    let state = std::path::absolute(state.context("--state is required")?)?;
     let mut command = if command.is_empty() {
         vec![
             std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("bash")),
@@ -55,28 +52,47 @@ fn main() -> anyhow::Result<()> {
     } else {
         command
     };
-    let status = if exposed {
+    let mode = if exposed {
         anyhow::ensure!(
             skeleton.is_none(),
             "--skeleton makes no sense in exposed mode: the host home is used as-is"
         );
-        let builder = ExposedBuilder::new(set)?;
-        // SAFETY: this dev program creates no threads before entering the builder.
-        unsafe { builder.run(&command[0], &command[1..]) }?
+        Mode::Exposed
     } else {
         command[0] = resolve_program(&command[0])?.into_os_string();
-        let mut config = FsViewConfig::new(set)?;
-        config.home_skeleton = skeleton;
-        let builder = FsViewBuilder::new(config)?;
-        // SAFETY: this dev program creates no threads before entering the builder.
-        unsafe { builder.run(&command[0], &command[1..]) }?
+        Mode::View {
+            home_skeleton: skeleton,
+        }
     };
+    // SAFETY: top of main, before the runtime: no threads exist yet.
+    unsafe { rho_workset::init_daemon_namespace() }?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let status = runtime.block_on(async {
+        let worksets = Worksets::open(
+            &state,
+            UserEnvironment::new(std::env::vars_os().collect()),
+            PathOverrides::default(),
+            StoreService::None,
+        )
+        .await?;
+        let workset = worksets.adopt(&src)?;
+        let namespace = workset.enter(mode, Utf8Path::new(rho_workset::MOUNT_ROOT))?;
+        let mut child = tokio::process::Command::new(&command[0]);
+        child.args(&command[1..]);
+        namespace.prepare_command(&mut child, None).await?;
+        child
+            .status()
+            .await
+            .with_context(|| format!("run {}", command[0].to_string_lossy()))
+    })?;
     std::process::exit(status.code().unwrap_or(128));
 }
 
 fn usage() {
     eprintln!(
-        "usage: rho-workset-dev [--exposed] --src PATH --stores PATH [--socket PATH] [--skeleton PATH] [-- COMMAND ...]"
+        "usage: rho-workset-dev [--exposed] --src PATH --state PATH [--skeleton PATH] [-- COMMAND ...]"
     );
 }
 

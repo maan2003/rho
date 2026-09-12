@@ -191,32 +191,6 @@ impl Worksets {
         .await
     }
 
-    /// A state root without a store server, for tests and evaluations:
-    /// jj clients initialize stores themselves.
-    pub async fn open_plain(
-        root: impl AsRef<Path>,
-        environment: UserEnvironment,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::open(
-            root,
-            environment,
-            PathOverrides::default(),
-            StoreService::None,
-        )
-        .await
-    }
-
-    /// `directory` as an agent would see it without a namespace: adopted
-    /// as a workset for this process and entered in plain mode at its root.
-    pub fn plain_view(
-        self: &Arc<Self>,
-        directory: impl AsRef<Path>,
-    ) -> anyhow::Result<Arc<Namespace>> {
-        let workset = self.adopt(directory)?;
-        let root = workset.root().to_owned();
-        workset.enter(Mode::Plain, &root)
-    }
-
     pub fn root(&self) -> &Utf8Path {
         &self.root
     }
@@ -258,9 +232,8 @@ impl Worksets {
     }
 
     /// Adopts an existing host directory as a workset for the lifetime of
-    /// this process: for evaluations and renderings that work on a directory
-    /// the user already has, in [`Mode::Plain`]. Nothing is written to the
-    /// state root.
+    /// this process: for evaluations, renderings and tests that work on a
+    /// directory the user already has. Nothing is written to the state root.
     pub fn adopt(self: &Arc<Self>, directory: impl AsRef<Path>) -> anyhow::Result<Workset> {
         let root = absolute_utf8(directory.as_ref())?;
         anyhow::ensure!(root.is_dir(), "not a directory: {root}");
@@ -488,14 +461,6 @@ impl Workset {
     /// first command.
     pub fn enter(&self, mode: Mode, cwd: &Utf8Path) -> anyhow::Result<Arc<Namespace>> {
         Namespace::new(self.clone(), mode, cwd)
-    }
-
-    /// The host directory behind a workset-relative or visible path in
-    /// `mode`, checked lexically.
-    pub fn host_path_in(&self, mode: &Mode, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
-        let visible_root = mode.visible_root(self.root());
-        let relative = visible_relative(visible_root.as_str(), visible)?;
-        Ok(self.0.root.join(relative))
     }
 
     /// Adds a jj workspace of the repository containing `base` (a host
@@ -729,8 +694,7 @@ impl Workset {
     /// Maps a path as the agent sees it (absolute below `/src`, or relative
     /// to it) onto the host directory, refusing `.` and `..` components.
     pub fn host_path(&self, visible: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {
-        let relative = visible_relative(layout::VIEW_MOUNT_ROOT, visible)
-            .or_else(|_| visible_relative(layout::EXPOSED_MOUNT_ROOT, visible))?;
+        let relative = visible_relative(layout::MOUNT_ROOT, visible)?;
         Ok(self.0.root.join(relative))
     }
 

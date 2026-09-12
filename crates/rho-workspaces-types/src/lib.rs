@@ -62,10 +62,8 @@ pub enum WorksetMode {
     /// A minimal generated root with the workset at `/src`.
     #[default]
     View,
-    /// The host filesystem with the workset at `/ws`.
+    /// The host filesystem with the workset mounted over its `/src` stub.
     Exposed,
-    /// No namespace: the workset directory at its host path.
-    Plain,
 }
 
 impl WorkspaceInfo {

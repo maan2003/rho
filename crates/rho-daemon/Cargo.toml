@@ -63,3 +63,15 @@ uuid.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 rho-shell.workspace = true
 senax-encoder.workspace = true
+
+[[test]]
+name = "terminal_stream"
+harness = false
+
+[[test]]
+name = "shell_e2e"
+harness = false
+
+[[test]]
+name = "terminal_e2e"
+harness = false

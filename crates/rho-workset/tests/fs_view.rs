@@ -30,12 +30,13 @@ fn namespace_setup_available() -> bool {
     true
 }
 
-/// Creates a bare remote, a store root, and a workset directory holding a
-/// "project" clone made through the store. Returns (store root, workset
-/// dir, store dir).
+/// Creates a bare remote, a state root whose `stores/` holds one store, and
+/// a workset directory holding a "project" clone made through that store.
+/// Returns (state root, workset dir, store dir).
 fn build_fixture(temp: &Path, jj: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let (_source, remote) = common::setup_remote(temp);
-    let stores = temp.join("stores");
+    let state = temp.join("state");
+    let stores = state.join("stores");
     let src = temp.join("src");
     std::fs::create_dir_all(&stores).unwrap();
     std::fs::create_dir_all(&src).unwrap();
@@ -52,7 +53,7 @@ fn build_fixture(temp: &Path, jj: &Path) -> (PathBuf, PathBuf, PathBuf) {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.is_dir())
         .unwrap();
-    (stores, src, store)
+    (state, src, store)
 }
 
 #[test]
@@ -63,7 +64,7 @@ fn workset_and_generated_root_work_in_the_view() {
 
     let temp = tempfile::tempdir().unwrap();
     let jj = jj_binary();
-    let (stores, src, store) = build_fixture(temp.path(), &jj);
+    let (state, src, store) = build_fixture(temp.path(), &jj);
     let skeleton = temp.path().join("skeleton");
     std::fs::create_dir(&skeleton).unwrap();
     std::fs::write(skeleton.join("seeded"), "seed\n").unwrap();
@@ -104,7 +105,7 @@ test ! -w {store}/clone-store
 touch /src/project/writable
 test ! -e {temp}/source
 "#,
-        stores = stores.display(),
+        stores = state.join("stores").display(),
         store = store.display(),
         temp = temp.path().display(),
         git = git_bin.display(),
@@ -127,8 +128,8 @@ test ! -e {temp}/source
     view.env("RHO_FS_VIEW_TEST_SECRET", "must-not-leak")
         .arg("--src")
         .arg(&src)
-        .arg("--stores")
-        .arg(&stores)
+        .arg("--state")
+        .arg(&state)
         .args(["--skeleton", skeleton.to_str().unwrap(), "--"])
         .arg(shell)
         .args(["-c", &script]);
@@ -138,31 +139,31 @@ test ! -e {temp}/source
 }
 
 #[test]
-fn exposed_mode_mounts_the_workset_over_the_host_ws_stub() {
+fn exposed_mode_mounts_the_workset_over_the_host_src_stub() {
     if !namespace_setup_available() {
         return;
     }
-    if !Path::new("/ws").is_dir() {
-        eprintln!("skipping exposed-mode test: host has no /ws mount stub");
+    if !Path::new("/src").is_dir() {
+        eprintln!("skipping exposed-mode test: host has no /src mount stub");
         return;
     }
 
     let temp = tempfile::tempdir().unwrap();
     let jj = jj_binary();
-    let (stores, src, store) = build_fixture(temp.path(), &jj);
+    let (state, src, store) = build_fixture(temp.path(), &jj);
 
     let script = format!(
         r#"
 set -eu
-test "$PWD" = /ws
-test -d /ws/project
+test "$PWD" = /src
+test -d /src/project
 test "$HOME" = {home}
 test -d {temp}
 test "$RHO_FS_VIEW_TEST_ENV" = kept
-git -C /ws/project status --short
-{jj} -R /ws/project st >/dev/null
+git -C /src/project status --short
+{jj} -R /src/project st >/dev/null
 test ! -w {store}/clone-store
-touch /ws/project/writable
+touch /src/project/writable
 "#,
         home = std::env::var("HOME").unwrap(),
         temp = temp.path().display(),
@@ -174,8 +175,8 @@ touch /ws/project/writable
         .args(["--exposed"])
         .arg("--src")
         .arg(&src)
-        .arg("--stores")
-        .arg(&stores)
+        .arg("--state")
+        .arg(&state)
         .args(["--", "/bin/sh", "-c", &script]);
     run(view);
     assert!(src.join("project/writable").exists());

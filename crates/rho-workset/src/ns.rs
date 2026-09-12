@@ -1,4 +1,4 @@
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
 
+use crate::layout::MOUNT_ROOT;
 use crate::{PathOverrides, UserEnvironment, Workset, WorksetMode};
 
 /// How an agent sees its workset.
@@ -17,11 +18,8 @@ pub enum Mode {
     /// A fresh tmpfs root holding `/nix/store`, a generated `/etc`, an empty
     /// `$HOME` (seeded from `home_skeleton`), and the workset at `/src`.
     View { home_skeleton: Option<PathBuf> },
-    /// The full host view, plus the workset at `/ws` over the host stub.
+    /// The full host view, plus the workset at `/src` over the host stub.
     Exposed,
-    /// No namespace at all: commands run in the workset directory at its
-    /// host path. For evaluations and tests; the store is not protected.
-    Plain,
 }
 
 impl Mode {
@@ -31,7 +29,6 @@ impl Mode {
                 home_skeleton: None,
             },
             WorksetMode::Exposed => Self::Exposed,
-            WorksetMode::Plain => Self::Plain,
         }
     }
 
@@ -40,16 +37,6 @@ impl Mode {
         match self {
             Self::View { .. } => WorksetMode::View,
             Self::Exposed => WorksetMode::Exposed,
-            Self::Plain => WorksetMode::Plain,
-        }
-    }
-
-    /// Where a workset rooted at `root` on the host appears in this mode.
-    pub fn visible_root(&self, root: &Utf8Path) -> Utf8PathBuf {
-        match self {
-            Self::View { .. } => Utf8PathBuf::from(crate::layout::VIEW_MOUNT_ROOT),
-            Self::Exposed => Utf8PathBuf::from(crate::layout::EXPOSED_MOUNT_ROOT),
-            Self::Plain => root.to_owned(),
         }
     }
 }
@@ -83,8 +70,6 @@ pub struct ClaudeHome {
 pub struct Namespace {
     workset: Workset,
     mode: Mode,
-    /// Where the workset directory appears inside the namespace.
-    visible_root: Utf8PathBuf,
     /// The agent's working directory as it sees it.
     cwd: Utf8PathBuf,
     /// The workset directory on the host.
@@ -119,11 +104,11 @@ struct LiveNs {
 impl Namespace {
     pub(crate) fn new(workset: Workset, mode: Mode, cwd: &Utf8Path) -> anyhow::Result<Arc<Self>> {
         let owner = workset.owner()?;
-        let visible_root = mode.visible_root(workset.root());
-        let cwd = visible_root.join(crate::visible_relative(visible_root.as_str(), cwd)?);
+        let visible_root = Utf8Path::new(MOUNT_ROOT);
+        let cwd = visible_root.join(crate::visible_relative(MOUNT_ROOT, cwd)?);
         let src = workset.root().to_owned();
         anyhow::ensure!(
-            src.join(cwd.strip_prefix(&visible_root).unwrap_or(&cwd))
+            src.join(cwd.strip_prefix(visible_root).unwrap_or(&cwd))
                 .is_dir(),
             "working directory does not exist in workset {}: {cwd}",
             workset.id()
@@ -138,7 +123,6 @@ impl Namespace {
         Ok(Arc::new(Self {
             workset,
             mode,
-            visible_root,
             cwd,
             src,
             environment,
@@ -162,9 +146,9 @@ impl Namespace {
         self.mode.workset_mode()
     }
 
-    /// Where the workset directory appears inside this namespace.
-    pub fn visible_root(&self) -> &Utf8Path {
-        &self.visible_root
+    /// Where the workset directory appears inside this namespace: `/src`.
+    pub fn visible_root(&self) -> &'static Utf8Path {
+        Utf8Path::new(MOUNT_ROOT)
     }
 
     /// The agent's working directory as it sees it.
@@ -174,11 +158,8 @@ impl Namespace {
 
     /// The agent's working directory on the host.
     pub fn host_cwd(&self) -> Utf8PathBuf {
-        self.src.join(
-            self.cwd
-                .strip_prefix(&self.visible_root)
-                .unwrap_or(&self.cwd),
-        )
+        self.src
+            .join(self.cwd.strip_prefix(MOUNT_ROOT).unwrap_or(&self.cwd))
     }
 
     /// The repository the agent works in: the jj workspace containing its
@@ -192,7 +173,7 @@ impl Namespace {
             host_cwd
         };
         let visible = self
-            .visible_root
+            .visible_root()
             .join(root.strip_prefix(&self.src).unwrap_or(&root));
         Ok((visible, root))
     }
@@ -235,7 +216,6 @@ impl Namespace {
                         crate::layout::ExposedBuilder::new(mounts)?
                             .build_in_place(Path::new("/"))?;
                     }
-                    Mode::Plain => unreachable!("plain mode has no namespace"),
                 }
                 Ok::<_, anyhow::Error>((
                     File::open("/proc/thread-self/ns/user")?.into(),
@@ -313,10 +293,6 @@ impl Namespace {
     /// stack. Every mount is a bind of a host path, so the agent's writes
     /// land in the account and shared-projects directories.
     pub async fn set_claude_home(&self, home: ClaudeHome) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !matches!(self.mode, Mode::Plain),
-            "a plain workset has no private mount namespace for a Claude home"
-        );
         let mut state = self.state.lock().await;
         let previous = state.claude_home.replace(home);
         if state.live.is_some()
@@ -379,15 +355,13 @@ impl Namespace {
         } else {
             self.cwd.join(path)
         };
-        Ok(
-            crate::visible_relative(self.visible_root.as_str(), &visible)?
-                .as_std_path()
-                .to_owned(),
-        )
+        Ok(crate::visible_relative(MOUNT_ROOT, &visible)?
+            .as_std_path()
+            .to_owned())
     }
 
     /// Where a host path appears inside the namespace: view mode relocates
-    /// the host home to `/home/agent`, other modes keep host paths.
+    /// the host home to `/home/agent`, exposed mode keeps host paths.
     fn visible_path_for(&self, host_path: &Path) -> PathBuf {
         if matches!(&self.mode, Mode::View { .. })
             && let Some(relative) = dirs::home_dir()
@@ -401,28 +375,23 @@ impl Namespace {
 
     /// Configures `command` to run in the namespace. `cwd` is a visible
     /// path or relative to the agent's working directory, which is the
-    /// default.
+    /// default. View mode replaces the environment with an allowlist;
+    /// exposed mode passes the user's through. Inherited descriptors above
+    /// stdio are closed on exec either way.
     pub async fn prepare_command(
         &self,
         command: &mut tokio::process::Command,
         cwd: Option<&Utf8Path>,
     ) -> anyhow::Result<()> {
-        self.prepare_command_with_mounts(command, cwd, Vec::new())
-            .await
-    }
-
-    /// [`Self::prepare_command`], additionally bind-mounting host files at
-    /// visible paths for this one process (view mode relocates targets
-    /// under the host home to `/home/agent`).
-    pub async fn prepare_command_with_mounts(
-        &self,
-        command: &mut tokio::process::Command,
-        cwd: Option<&Utf8Path>,
-        file_mounts: Vec<(Utf8PathBuf, Utf8PathBuf)>,
-    ) -> anyhow::Result<()> {
+        // What the caller set explicitly wins over the mode's environment.
+        let overrides = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect::<Vec<_>>();
+        command.env_clear();
         match &self.mode {
             Mode::View { .. } => {
-                command.env_clear();
                 if let Some(value) = self.environment.get("TERM") {
                     command.env("TERM", value);
                 }
@@ -434,8 +403,8 @@ impl Namespace {
                     .env("USER", "agent")
                     .env("LOGNAME", "agent");
             }
-            Mode::Exposed | Mode::Plain => {
-                self.environment.apply(command);
+            Mode::Exposed => {
+                command.envs(self.environment.0.iter().map(|(name, value)| (name, value)));
                 if let Some(path) = self.environment.get("PATH") {
                     command.env("PATH", self.path_overrides.add_to(path));
                 }
@@ -446,75 +415,32 @@ impl Namespace {
                 .iter()
                 .map(|(name, value)| (name, value)),
         );
-        let cwd = namespace_cwd(&self.visible_root, &self.cwd, cwd)?;
-        if matches!(self.mode, Mode::Plain) {
-            anyhow::ensure!(
-                file_mounts.is_empty(),
-                "a plain workset has no private mount namespace for file mounts"
-            );
-            command.current_dir(cwd);
-            return Ok(());
+        for (name, value) in overrides {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
         }
+        let cwd = namespace_cwd(self.visible_root(), &self.cwd, cwd)?;
         let mut state = self.state.lock().await;
         let live = self.live(&mut state).await?;
         let cwd = CString::new(cwd).context("namespace cwd contains NUL")?;
         let mount_ns = live.mount_ns.as_raw_fd();
         let root = live.root.as_raw_fd();
-        let host_home = dirs::home_dir();
-        let file_mounts = file_mounts
-            .into_iter()
-            .map(|(source, target)| {
-                let target = if matches!(&self.mode, Mode::View { .. }) {
-                    host_home
-                        .as_deref()
-                        .and_then(|home| target.as_std_path().strip_prefix(home).ok())
-                        .map_or_else(
-                            || target.as_std_path().to_owned(),
-                            |relative| Path::new("/home/agent").join(relative),
-                        )
-                } else {
-                    target.into_std_path_buf()
-                };
-                let relative = target.strip_prefix("/").unwrap_or(&target);
-                let target = Path::new(&format!("/proc/self/fd/{root}")).join(relative);
-                let parent = target.parent().context("file mount target has no parent")?;
-                Ok::<_, anyhow::Error>((
-                    CString::new(source.as_os_str().as_bytes())?,
-                    CString::new(parent.as_os_str().as_bytes())?,
-                    CString::new(target.as_os_str().as_bytes())?,
-                ))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
         unsafe {
             command.pre_exec(move || {
-                setns(mount_ns)?;
-                for (source, parent, target) in &file_mounts {
-                    if libc::mkdir(parent.as_ptr(), 0o700) != 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() != std::io::ErrorKind::AlreadyExists {
-                            return Err(error);
-                        }
-                    }
-                    let target_fd = libc::open(
-                        target.as_ptr(),
-                        libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
-                        0o600,
-                    );
-                    if target_fd < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    libc::close(target_fd);
-                    if libc::mount(
-                        source.as_ptr(),
-                        target.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND,
-                        std::ptr::null(),
-                    ) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                // Whatever the daemon holds open without CLOEXEC must not
+                // reach the agent; stdio is the only deliberate channel.
+                if libc::syscall(
+                    libc::SYS_close_range,
+                    3_u32,
+                    u32::MAX,
+                    libc::CLOSE_RANGE_CLOEXEC,
+                ) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
+                setns(mount_ns)?;
                 if libc::fchdir(root) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -541,13 +467,6 @@ impl Namespace {
     /// its cwd, root and mount namespace change here. This future must be
     /// polled on that same thread throughout.
     pub async unsafe fn enter_interpreter_thread(&self) -> anyhow::Result<()> {
-        if matches!(self.mode, Mode::Plain) {
-            // The cwd is per fs_struct, which threads share until unshared:
-            // without this the whole daemon would change directory.
-            crate::layout::unshare_fs_attributes()?;
-            std::env::set_current_dir(self.host_cwd())?;
-            return Ok(());
-        }
         let mut state = self.state.lock().await;
         let live = self.live(&mut state).await?;
         let mount_ns = live.mount_ns.try_clone()?;

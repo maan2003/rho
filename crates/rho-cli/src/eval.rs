@@ -90,9 +90,21 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
         }
     };
     let env = UserEnvironment::new(std::env::vars_os().collect());
-    // An eval works in place: no namespace, no store server.
-    let worksets = Worksets::open_plain(temp.path().join("state"), env).await?;
-    let view = worksets.plain_view(&workdir)?;
+    // An eval adopts its directory as a workset seen in view mode; the
+    // store has no server, so jj clients initialize stores themselves.
+    let worksets = Worksets::open(
+        temp.path().join("state"),
+        env,
+        Default::default(),
+        rho_workset::StoreService::None,
+    )
+    .await?;
+    let view = worksets.adopt(&workdir)?.enter(
+        rho_workset::Mode::View {
+            home_skeleton: None,
+        },
+        camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+    )?;
     let db = rho_db::RhoDb::open(temp.path().join("eval.redb"));
     rho_inference::ensure_crypto_provider();
     let inference = rho_inference::Inference::new(db.clone()).await?;

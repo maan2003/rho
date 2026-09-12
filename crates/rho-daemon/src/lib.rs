@@ -30,8 +30,10 @@ mod desk_cells;
 mod detail;
 mod realtime;
 mod secret_store;
-mod shell;
-mod terminal;
+#[doc(hidden)]
+pub mod shell;
+#[doc(hidden)]
+pub mod terminal;
 mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
@@ -333,7 +335,6 @@ pub enum WorksetModeArg {
     #[default]
     View,
     Exposed,
-    Plain,
 }
 
 impl From<WorksetModeArg> for WorksetMode {
@@ -341,7 +342,6 @@ impl From<WorksetModeArg> for WorksetMode {
         match mode {
             WorksetModeArg::View => Self::View,
             WorksetModeArg::Exposed => Self::Exposed,
-            WorksetModeArg::Plain => Self::Plain,
         }
     }
 }
@@ -360,8 +360,8 @@ pub struct DaemonArgs {
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
     /// How new agents see the filesystem: `view` (a minimal generated root
-    /// with the workset at /src), `exposed` (the host, with the workset at
-    /// /ws) or `plain` (no namespace).
+    /// with the workset at /src) or `exposed` (the host, with the workset
+    /// mounted over its /src stub).
     #[arg(
         long = "workset-mode",
         env = "RHO_WORKSET_MODE",
@@ -1069,7 +1069,7 @@ impl Services {
                 let placed = async {
                     let checkout = workset.clone_repo(origin.as_str(), None).await?;
                     workset.new_change(&checkout, &revset).await?;
-                    let cwd = visible_path(&workset, &mode, &checkout)?;
+                    let cwd = visible_path(&workset, &checkout)?;
                     let view = workset.enter(mode, &cwd)?;
                     anyhow::Ok(rho_agent::StartPlace::new(view, Some(origin)).owning_workset())
                 }
@@ -3375,8 +3375,13 @@ async fn terminal_attach(
         .user_environment
         .get("SHELL")
         .and_then(|shell| shell.to_str())
-        .unwrap_or("bash")
-        .to_owned();
+        .unwrap_or("bash");
+    // A profile symlink such as ~/.nix-profile/bin/zsh does not exist in
+    // a view; its /nix/store target does.
+    let shell = std::fs::canonicalize(shell)
+        .ok()
+        .and_then(|resolved| resolved.into_os_string().into_string().ok())
+        .unwrap_or_else(|| shell.to_owned());
     services
         .terminals
         .create(
@@ -3759,16 +3764,15 @@ async fn open_checkout(
     Ok((workset, root))
 }
 
-/// Where a host directory inside `workset` appears to an agent in `mode`.
+/// Where a host directory inside `workset` appears to its agents.
 fn visible_path(
     workset: &rho_workset::Workset,
-    mode: &rho_workset::Mode,
     host_path: &Utf8Path,
 ) -> anyhow::Result<Utf8PathBuf> {
     let relative = host_path
         .strip_prefix(workset.root())
         .with_context(|| format!("{host_path} is outside workset {}", workset.id()))?;
-    Ok(mode.visible_root(workset.root()).join(relative))
+    Ok(Utf8Path::new(rho_workset::MOUNT_ROOT).join(relative))
 }
 
 fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
@@ -4588,10 +4592,14 @@ mod tests {
             camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
         );
         let user_environment = rho_workset::UserEnvironment::new(Default::default());
-        let worksets =
-            rho_workset::Worksets::open_plain(root.join("state"), user_environment.clone())
-                .await
-                .unwrap();
+        let worksets = rho_workset::Worksets::open(
+            root.join("state"),
+            user_environment.clone(),
+            Default::default(),
+            rho_workset::StoreService::None,
+        )
+        .await
+        .unwrap();
         let pool = AgentPool::new(db.clone(), inference.clone(), worksets, claude.clone()).await;
         Arc::new(
             Services::new(
@@ -4600,7 +4608,7 @@ mod tests {
                 pool,
                 claude,
                 user_environment,
-                rho_workset::WorksetMode::Plain,
+                rho_workset::WorksetMode::View,
                 PlatformSecrets::default(),
                 root.join("octo.sock"),
             )

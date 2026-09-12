@@ -29,8 +29,8 @@ stores are shared and never removed.
 Several agents can work in one workset: a child agent joins its parent's
 workset, in the parent's directory or in its own jj workspace beside it
 (`Workset::add_workspace`, which the pool runs for a child spawned with a
-revset and the daemon for a "beside" start). Every agent's record is a
-workset id, a working directory as the agent sees it, and a mode; loading
+revset). Every agent's record is a workset id, a working directory as the
+agent sees it, and a mode; loading
 `AGENTS.md`-style context is a function of that directory (the jj
 workspace containing it), not of a "primary" repository. The daemon runs
 one `Worksets` for its state root and hands the pool a `Workset` per
@@ -42,8 +42,9 @@ directory: its mount namespace is built on the first command (so loading
 an agent never fails on a namespace it does not use) and then kept for
 the life of the value. `prepare_command` enters it for a child process;
 `enter_interpreter_thread` moves a dedicated thread into it for the
-in-process Python notebook. The lower-level layout builders remain public
-for direct inspection and development tooling (`rho-workset-dev`).
+in-process Python notebook. There are two modes, view and exposed, and
+in both the workset is at `/src`; `rho-workset-dev` enters one from the
+command line the way the daemon does.
 
 **This is a layout, not a sandbox.** Everything runs as the invoking
 user in an unprivileged user namespace; no security boundary is
@@ -70,10 +71,15 @@ a plain directory or file except a handful of real mounts:
   absolute paths they have on the host. Clones record the store by
   absolute path (git alternates), so the path must not change between
   the daemon's frame and the agent's.
+- The directory holding the daemon's own executable, read-only at its
+  host path, when that is outside `/nix/store`: a cargo-built daemon can
+  then launch its sibling sidecars (`rho-shell`, `rho-pager`). A nix
+  build adds nothing.
 
-The environment is an explicit allowlist (PATH, TERM, plus
-HOME/USER/LOGNAME) and `JJ_STORE` / `JJ_STORE_SOCKET` pointing jj at the
-store server; inherited fds are closed on exec.
+The environment is an explicit allowlist (PATH filtered to `/nix/store`
+entries, TERM, plus HOME/USER/LOGNAME) and `JJ_STORE` / `JJ_STORE_SOCKET`
+pointing jj at the store server; variables the caller sets on the command
+survive in both modes, and inherited fds are closed on exec.
 
 `Namespace::set_claude_home` mounts an agent's Claude Code home over its
 `~/.claude` inside the live namespace: the per-account state directory,
@@ -93,26 +99,27 @@ path, or one relative to the agent's own, and refuses anything outside
 
 Some work genuinely needs the real system. Exposed mode is the full
 host view as the user — environment, `$HOME`, every path unchanged —
-plus the workset directory mounted at `/ws` over the host's existing
-`/ws` stub and the store root made read-only. View mode presents the
-workset at `/src`; exposed mode temporarily keeps `/ws` until the
-deployed host stub migrates. Exposed access is granted per agent by the
-user.
+plus the workset directory mounted at `/src` over the host's existing
+`/src` stub and the store root made read-only. Paths are the same in
+both modes, so an agent's record and prompt do not depend on the mode.
+Exposed access is granted per agent by the user; the daemon's
+`--workset-mode` flag (`RHO_WORKSET_MODE`) picks the mode new agents
+get, `view` by default.
 
 The stub is the one host prerequisite this implies: an unprivileged
 mount namespace can only mount over a directory that already exists,
-and `/` belongs to root. So the host keeps a permanently empty `/ws`
-(`d /ws 0500 root root` via systemd-tmpfiles) purely as mountpoint
+and `/` belongs to root. So the host keeps a permanently empty `/src`
+(`d /src 0500 root root` via systemd-tmpfiles) purely as mountpoint
 real estate — deliberately opaque, so nothing can use or pollute it
-unmounted.
+unmounted. Entering exposed mode on a host without it fails with that
+message.
 
-## Plain mode
-
-`Mode::Plain` is no namespace at all: commands run in the workset
-directory at its host path with the user's environment, and the store is
-not protected. It exists for tests, `rho eval`, and `rho-daemon debug
-render-prompt`; the daemon's `--workset-mode` flag (`RHO_WORKSET_MODE`)
-picks the mode new agents get, `view` by default.
+There is no mode without a namespace. `rho eval`, `rho-daemon debug
+render-prompt` and the tests adopt a host directory as a workset
+(`Worksets::adopt`) and enter it in view mode; whatever only reads files
+or renders prompts never builds the namespace, and whatever runs
+commands does so in a real one (their processes set up the identity user
+namespace first, before any thread).
 
 ## Deliberately not here
 
@@ -130,4 +137,4 @@ picks the mode new agents get, `view` by default.
   tools (sandboxed browsers, containers, agents' own tools) keep
   working without pid-1 signal plumbing.
 - No other host prerequisites: unprivileged user namespaces and the
-  `/ws` stub are the whole list.
+  `/src` stub (exposed mode only) are the whole list.

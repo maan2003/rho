@@ -549,7 +549,7 @@ impl AgentPool {
                 } else {
                     parent_cwd.join(entry.path)
                 };
-                let host = workset.host_path_in(&mode, &requested)?;
+                let host = workset.host_path(&requested)?;
                 anyhow::ensure!(
                     host.is_dir(),
                     "no such directory in your workset: {requested}"
@@ -566,7 +566,7 @@ impl AgentPool {
                         let relative = added
                             .strip_prefix(workset.root())
                             .context("new workspace is outside the workset")?;
-                        mode.visible_root(workset.root()).join(relative)
+                        camino::Utf8Path::new(rho_workset::MOUNT_ROOT).join(relative)
                     }
                 }
             }
@@ -707,7 +707,7 @@ impl AgentPool {
         };
         let workset = self.worksets.open_workset(workset).await?;
         let mode = Mode::from_workset_mode(*mode);
-        let host_cwd = workset.host_path_in(&mode, cwd)?;
+        let host_cwd = workset.host_path(cwd)?;
         Ok((workset, mode, host_cwd))
     }
 

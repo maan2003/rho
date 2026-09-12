@@ -104,11 +104,25 @@ mod tests {
         let work = temp.path().join("work");
         std::fs::create_dir(&work).unwrap();
         source.save(work.join("image.png")).unwrap();
-        let worksets =
-            rho_workset::Worksets::open_plain(temp.path().join("state"), Default::default())
-                .await
-                .unwrap();
-        let view = worksets.plain_view(&work).unwrap();
+        let worksets = rho_workset::Worksets::open(
+            temp.path().join("state"),
+            Default::default(),
+            Default::default(),
+            rho_workset::StoreService::None,
+        )
+        .await
+        .unwrap();
+        // Reads never build the namespace, so no user namespace is needed.
+        let view = worksets
+            .adopt(&work)
+            .unwrap()
+            .enter(
+                rho_workset::Mode::View {
+                    home_skeleton: None,
+                },
+                camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+            )
+            .unwrap();
         let output = ImageTools::new(view)
             .call(ToolCall {
                 id: ToolCallId::try_from("image-call".to_owned()).unwrap(),

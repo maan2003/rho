@@ -93,14 +93,22 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let role = parse_role(role)?;
     let cwd = std::env::current_dir().context("read current directory")?;
-    // A rendering runs where it is invoked, with no namespace and no store
-    // server; the state root only has to exist.
-    let worksets = rho_workset::Worksets::open_plain(
+    // A rendering runs on the invoking directory adopted as a workset. It
+    // never runs a command, so no namespace is built and no store server
+    // is needed; the state root only has to exist.
+    let worksets = rho_workset::Worksets::open(
         rho_workset::Worksets::default_root()?,
         rho_workset::UserEnvironment::new(std::env::vars_os().collect()),
+        Default::default(),
+        rho_workset::StoreService::None,
     )
     .await?;
-    let view = worksets.plain_view(&cwd)?;
+    let view = worksets.adopt(&cwd)?.enter(
+        rho_workset::Mode::View {
+            home_skeleton: None,
+        },
+        camino::Utf8Path::new(rho_workset::MOUNT_ROOT),
+    )?;
     let surface = rho_agent::render_agent_surface(view, role)?;
 
     println!("# System prompt\n");

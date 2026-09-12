@@ -290,28 +290,5 @@ test ! -e /src/.stores
                 .unwrap_or(true)
         }
     );
-    // Plain mode: no namespace, host paths, same fences.
-    let plain = workset
-        .enter(Mode::Plain, Utf8Path::new("project"))
-        .unwrap();
-    assert_eq!(plain.visible_root(), workset.root());
-    assert_eq!(plain.cwd(), workset.root().join("project"));
-    let mut command = tokio::process::Command::new(&sh);
-    command.arg("-c").arg("pwd; test -n \"$JJ_STORE\"");
-    plain.prepare_command(&mut command, None).await.unwrap();
-    let output = command.output().await.unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        workset.root().join("project").as_str()
-    );
-    assert_eq!(
-        plain
-            .read_file_bounded(Path::new("file.txt"), 1024)
-            .await
-            .unwrap(),
-        b"one\n"
-    );
-    assert!(plain.set_claude_home(home_two).await.is_err());
     println!("namespace test passed");
 }

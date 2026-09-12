@@ -1,20 +1,41 @@
 //! End-to-end smoke test for terminal streams: a real daemon on a temp
 //! socket, an agent started on a clone of a temp git repository, a shell
 //! echoing through the dedicated stream, and a second attach after detach
-//! proving the terminal survived.
+//! proving the terminal survived. Harness-free: the daemon's identity user
+//! namespace must precede every thread, including the test harness's.
 
 use std::time::Duration;
 
 use rho_ui_proto::term::{ScrollbackItem, TermClientFrame, TermRow, TermServerFrame, WireScreen};
 use rho_ui_proto::{AgentId, ClientMessage, ServerMessage, StartMode, read_frame, write_frame};
 
-#[tokio::test]
-async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let unshare = std::process::Command::new("unshare")
+        .args(["-U", "true"])
+        .status();
+    if !unshare.map(|status| status.success()).unwrap_or(false) {
+        eprintln!("skipping terminal_stream: kernel forbids unshare(CLONE_NEWUSER)");
+        return Ok(());
+    }
     let state_dir = tempfile::tempdir()?;
-    // Keep the daemon's state (redb, sockets) away from the user's real one.
-    // SAFETY: this integration test binary has no other threads yet.
-    unsafe { std::env::set_var("XDG_STATE_HOME", state_dir.path()) };
-    let socket_path = state_dir.path().join("rho.sock");
+    // Keep the daemon's state (redb, sockets) away from the user's real one,
+    // and give its terminals a shell that exists in a view.
+    // SAFETY: top of main; no other threads exist yet.
+    unsafe {
+        std::env::set_var("XDG_STATE_HOME", state_dir.path());
+        std::env::set_var("SHELL", "bash");
+        rho_workset::init_daemon_namespace()?;
+    }
+    let result = tokio::runtime::Runtime::new()?
+        .block_on(terminal_survives_detach_and_echoes(state_dir.path()));
+    if result.is_ok() {
+        println!("terminal_stream passed");
+    }
+    result
+}
+
+async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> anyhow::Result<()> {
+    let socket_path = state_dir.join("rho.sock");
     // The agent starts on a clone of this repository, made with jj. The
     // clone takes its name from the path, so it cannot be the dot-prefixed
     // temporary directory itself.
@@ -51,7 +72,7 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         socket_path: Some(socket_path.clone()),
         // As with the state directory: the test's own, never the user's.
         claude_config_dir: Some(
-            camino::Utf8PathBuf::from_path_buf(state_dir.path().join("claude")).unwrap(),
+            camino::Utf8PathBuf::from_path_buf(state_dir.join("claude")).unwrap(),
         ),
         iroh: false,
         cpu_profile: None,
@@ -59,8 +80,7 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         anthropic_base_url: None,
         extra_before_path: None,
         extra_after_path: None,
-        // The test process has no private mount namespace.
-        workset_mode: rho_daemon::WorksetModeArg::Plain,
+        workset_mode: rho_daemon::WorksetModeArg::View,
     }));
     let mut control = loop {
         match rho_rpc::connect_unix(&socket_path).await {
@@ -69,8 +89,7 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
         }
     };
 
-    // Create an agent on a clone of the temp repository: no namespace
-    // mounts, nothing outside the temp dirs.
+    // Create an agent on a clone of the temp repository.
     write_frame(&mut control, &ClientMessage::Subscribe).await?;
     let ServerMessage::Ready { .. } =
         tokio::time::timeout(Duration::from_secs(30), read_frame(&mut control)).await??

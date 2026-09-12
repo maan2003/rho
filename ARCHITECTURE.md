@@ -70,11 +70,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   transparent clone store (`CLONES.md`) whose server the daemon runs, so
   they are fast and born on the remote's current state. Children join their
   parent's workset, in the parent's directory or in a jj workspace the pool
-  adds beside it; the GUI's "beside" start does the same for a user-made
-  agent. A `Namespace` is one agent's view: a mount namespace built lazily
-  on the first command, in view mode (a generated tmpfs root with the
-  workset at `/src`), exposed mode (the host, with the workset at `/ws`) or
-  plain mode (no namespace; tests and evaluations). Live-diff semantic
+  adds beside it. A `Namespace` is one agent's view: a mount namespace
+  built lazily on the first command, in view mode (a generated tmpfs root
+  with the workset at `/src`) or exposed mode (the host, with the workset
+  mounted over its `/src` stub); tests and evaluations adopt a directory
+  and use the same namespaces. Live-diff semantic
   barriers use the vendored descendant-snapshot implementation through an
   embedded `jj-cli` API under the workset's operation lock. The API returns
   the exact immutable repository epoch it wrote, so derived manifests never
