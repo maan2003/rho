@@ -94,8 +94,8 @@ pub fn parse_start(
 ) -> Result<(HostId, StartMode), String> {
     let require_workdir = || {
         workdir.clone().ok_or_else(|| {
-            "no working directory for the new agent: type one in the \
-             Workdir field, or register one with :projects add <path>"
+            "no repository for the new agent: type its URL in the \
+             Workdir field, or register a project under space p a"
                 .to_owned()
         })
     };
@@ -363,6 +363,6 @@ mod tests {
             StartBase::default(),
         )
         .expect_err("nothing says where the agent works");
-        assert!(refusal.contains("type one in the Workdir field"));
+        assert!(refusal.contains("type its URL in the Workdir field"));
     }
 }

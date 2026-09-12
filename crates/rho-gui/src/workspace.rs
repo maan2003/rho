@@ -3240,15 +3240,16 @@ impl Workspace {
                 return;
             }
         };
-        // A project is a label carrying a workdir. The name the user gave
-        // is the label's path; the description was the daemon's and has no
-        // fact to live in.
+        // A project is a label carrying what the daemon clones: a
+        // repository URL, or a path on the daemon's machine. The name the
+        // user gave is the label's path, else the repository's own name;
+        // the description was the daemon's and has no fact to live in.
         let _ = description;
         let path_name = name.unwrap_or_else(|| {
             workdir
                 .path
                 .file_name()
-                .map(str::to_owned)
+                .map(|name| name.strip_suffix(".git").unwrap_or(name).to_owned())
                 .unwrap_or_else(|| workdir.path.to_string())
         });
         let seed = self.registry.host_machine_seed(workdir.host);
@@ -6938,7 +6939,7 @@ impl Workspace {
                 workspace.cmd_project_add(path.to_owned(), name, description, _window, cx);
             },
         );
-        self.open_prompt("project path [name]:", complete, on_submit, window, cx);
+        self.open_prompt("project url [name]:", complete, on_submit, window, cx);
     }
 
     /// Prompt (completing over registered projects) for one to remove.
