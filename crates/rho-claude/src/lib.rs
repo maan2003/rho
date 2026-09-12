@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use camino::Utf8PathBuf;
-use rho_workset::PathOverrides;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -35,7 +34,6 @@ pub struct ClaudeCodeOptions {
     pub model: Model,
     pub effort: Effort,
     pub session: Session,
-    pub path_overrides: PathOverrides,
     pub env: Vec<(String, String)>,
 }
 
@@ -53,7 +51,6 @@ impl ClaudeCodeOptions {
             model,
             effort,
             session: Session::New { session_id },
-            path_overrides: PathOverrides::default(),
             env: Vec::new(),
         }
     }
@@ -119,19 +116,16 @@ impl ClaudeCodeOptions {
         command.env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
         command.env("CLAUDE_CODE_DISABLE_BUNDLED_SKILLS", "1");
         // Built-in commit and PR workflow instructions are written for git and
-        // conflict with Rho's jj guidance; the land and github-workflow skills
-        // own that territory instead.
+        // conflict with Rho's own git guidance; the github-workflow skill
+        // owns that territory instead.
         command.env("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1");
         for (name, value) in &self.env {
             command.env(name, value);
         }
         command.arg(self.command.as_std_path()).args(self.args());
-        command.env(
-            "PATH",
-            self.path_overrides
-                .add_to(&std::env::var_os("PATH").expect("PATH must be set")),
-        );
-        command.current_dir(self.cwd.as_std_path());
+        // The working directory and PATH are the agent namespace's: the
+        // caller enters it with `Namespace::prepare_command`, and `cwd` is a
+        // path as the agent sees it, which need not exist on the host.
         command.env_remove("NODE_OPTIONS");
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
