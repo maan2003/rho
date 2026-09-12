@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::{FetchTarget, Git, Store, clone_from_mirror, ensure_alternate, resolve_fetch_target};
+use crate::{FetchTarget, Git, Store, clone_from_mirror, ensure_alternate, fetch_urls};
 
 /// A git command line split at its subcommand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -254,17 +254,12 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             } else {
                 FetchTarget::parse(&invocation.rest)
             };
-            if let Some(url) = resolve_fetch_target(&git, &invocation.globals, target) {
-                match store.refresh(&url) {
-                    Ok(mirror) => {
-                        if let Err(error) = ensure_alternate(&git, &invocation.globals, &mirror) {
-                            eprintln!(
-                                "rho-git: cannot borrow the mirror's objects, fetching copies ({error:#})"
-                            );
-                        }
+            let urls = fetch_urls(&git, &invocation.globals, target);
+            if !urls.is_empty() {
+                match route_fetch(&git, &store, &invocation.globals, &urls) {
+                    Ok(rewrites) => {
                         let mut args = invocation.globals.clone();
-                        args.push("-c".into());
-                        args.push(insteadof(&mirror, &url));
+                        args.extend(rewrites);
                         args.push(invocation.subcommand.clone().unwrap().into());
                         args.extend(invocation.rest.iter().cloned());
                         return Err(exec(&git, args));
@@ -311,6 +306,26 @@ fn serve_clone(
     }
     clone_from_mirror(git, &mirror, &request.url, &dest).map_err(StoreError::Clone)?;
     Ok(0)
+}
+
+/// Refreshes the mirror of every URL, borrows each into the repository's
+/// alternates, and returns the `-c url.<mirror>.insteadOf=<url>` pairs.
+fn route_fetch(
+    git: &Git,
+    store: &Store,
+    globals: &[OsString],
+    urls: &[String],
+) -> anyhow::Result<Vec<OsString>> {
+    let mut rewrites = Vec::new();
+    for url in urls {
+        let mirror = store.refresh(url)?;
+        if let Err(error) = ensure_alternate(git, globals, &mirror) {
+            eprintln!("rho-git: cannot borrow the mirror's objects, fetching copies ({error:#})");
+        }
+        rewrites.push("-c".into());
+        rewrites.push(insteadof(&mirror, url));
+    }
+    Ok(rewrites)
 }
 
 fn insteadof(mirror: &Path, url: &str) -> OsString {

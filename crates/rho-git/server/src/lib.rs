@@ -14,9 +14,11 @@
 //!                     refspecs behaves exactly like one from the remote.
 //! <root>/<key>/url    the remote URL; written last, so its presence means
 //!                     the mirror is complete
-//! <root>/<key>/used   unix time of the last request for this mirror; the
-//!                     background loop leaves mirrors nobody asked for in
-//!                     `idle` alone, and the next request refetches them
+//! <root>/<key>/used   unix times of the last few requests for this mirror,
+//!                     one per line; the background loop only refetches a
+//!                     mirror requested `active_after` times within `idle`,
+//!                     so a one-off command never starts it, and a request
+//!                     always fetches what it needs itself
 //! ```
 //!
 //! **The mirror never prunes objects.** Clones borrow them through
@@ -35,14 +37,15 @@ use rho_git_proto::{Request, Response, store_key};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixListener;
 
-/// How the keeper keeps mirrors fresh: every mirror requested within
-/// `idle` is refetched each `interval`, and a mirror fetched within
-/// `debounce` is served as is.
+/// How the keeper keeps mirrors fresh: a mirror fetched within `debounce`
+/// is served as is, and every mirror requested at least `active_after`
+/// times within `idle` is refetched each `interval` in the background.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refresh {
     pub interval: Duration,
     pub debounce: Duration,
     pub idle: Duration,
+    pub active_after: usize,
 }
 
 impl Default for Refresh {
@@ -51,6 +54,7 @@ impl Default for Refresh {
             interval: Duration::from_secs(60),
             debounce: Duration::from_secs(30),
             idle: Duration::from_secs(3 * 24 * 3600),
+            active_after: 5,
         }
     }
 }
@@ -124,11 +128,17 @@ impl MirrorStore {
     /// it marks the mirror used, so the background loop keeps it fresh.
     pub async fn ensure(&self, url: &str) -> anyhow::Result<PathBuf> {
         let mirror = self.fetch(url).await?;
-        std::fs::write(
-            self.store_dir(url).join("used"),
-            format!("{}\n", unix_now()),
-        )
-        .with_context(|| format!("mark {} used", self.store_dir(url).display()))?;
+        let mut requests = self.requests(url);
+        requests.push(unix_now());
+        let keep = requests
+            .len()
+            .saturating_sub(self.refresh.active_after.max(1));
+        let text: String = requests[keep..]
+            .iter()
+            .map(|at| format!("{at}\n"))
+            .collect();
+        std::fs::write(self.store_dir(url).join("used"), text)
+            .with_context(|| format!("mark {} used", self.store_dir(url).display()))?;
         Ok(mirror)
     }
 
@@ -150,13 +160,25 @@ impl MirrorStore {
         Ok(store.join("git"))
     }
 
-    /// When `url`'s mirror was last requested, if it ever was.
-    pub fn last_used(&self, url: &str) -> Option<u64> {
+    /// Unix times of the last `active_after` requests for `url`'s mirror,
+    /// oldest first.
+    pub fn requests(&self, url: &str) -> Vec<u64> {
         std::fs::read_to_string(self.store_dir(url).join("used"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+
+    /// Whether the background loop keeps `url`'s mirror fresh: requested
+    /// `active_after` times, all within `idle`.
+    pub fn is_active(&self, url: &str) -> bool {
+        let requests = self.requests(url);
+        let window = self.refresh.idle.as_secs();
+        requests.len() >= self.refresh.active_after.max(1)
+            && requests
+                .iter()
+                .all(|at| unix_now().saturating_sub(*at) < window)
     }
 
     /// Initializes `url`'s store in a staging directory and renames it into
@@ -299,22 +321,18 @@ impl MirrorStore {
         Ok(stores)
     }
 
-    /// Fetches every mirror under the root that was requested within
-    /// `idle` and is due, returning the failures. Meant for the background
-    /// loop: a mirror nobody has asked for lately stays as it is until the
-    /// next request fetches it.
+    /// Fetches every active mirror under the root (`is_active`) that is
+    /// due, returning the failures. Meant for the background loop: a
+    /// mirror asked for once, or not lately, stays as it is until the next
+    /// request fetches it.
     pub async fn refresh_all(&self) -> Vec<(PathBuf, anyhow::Error)> {
         let stores = match self.list() {
             Ok(stores) => stores,
             Err(error) => return vec![(self.root.clone(), error.into())],
         };
-        let now = unix_now();
         let mut failures = Vec::new();
         for (dir, url) in stores {
-            let active = self
-                .last_used(&url)
-                .is_some_and(|used| now.saturating_sub(used) < self.refresh.idle.as_secs());
-            if !active {
+            if !self.is_active(&url) {
                 continue;
             }
             if let Err(error) = self.fetch(&url).await {

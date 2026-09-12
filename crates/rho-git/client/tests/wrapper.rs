@@ -267,12 +267,37 @@ async fn fetches_from_any_remote_go_through_that_remotes_mirror() {
         git(&remote, &["rev-parse", "main"]).trim()
     );
 
-    // --all is many remotes at once: the real git, over the wire.
+    // --all and --multiple: every remote through its mirror, still no pack.
+    let origin_next = push_commit(&source, "origin moves\n");
+    std::fs::write(source.join("fork.txt"), "fork moves\n").unwrap();
+    git(&source, &["commit", "-q", "-am", "fork moves"]);
+    let fork_next = git(&source, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&source, &["push", "-q", "fork", "HEAD:refs/heads/feature"]);
     ok(wrapper(
         &clone,
         Some(&keeper.socket),
         &["fetch", "-q", "--all"],
     ));
+    assert_eq!(
+        git(&clone, &["rev-parse", "origin/main"]).trim(),
+        origin_next
+    );
+    assert_eq!(
+        git(&clone, &["rev-parse", "fork/feature"]).trim(),
+        fork_next
+    );
+    assert!(no_own_pack(&clone));
+    let origin_last = push_commit(&source, "origin again\n");
+    ok(wrapper(
+        &clone,
+        Some(&keeper.socket),
+        &["fetch", "-q", "--multiple", "origin", "fork"],
+    ));
+    assert_eq!(
+        git(&clone, &["rev-parse", "origin/main"]).trim(),
+        origin_last
+    );
+    assert!(no_own_pack(&clone));
 }
 
 #[tokio::test(flavor = "multi_thread")]

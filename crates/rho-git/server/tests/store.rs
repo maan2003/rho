@@ -77,7 +77,7 @@ async fn ensure_refetches_after_the_debounce_only() {
 }
 
 #[tokio::test]
-async fn refresh_all_covers_every_store() {
+async fn refresh_all_covers_active_stores_only() {
     let temp = tempfile::tempdir().unwrap();
     let (source, remote) = setup_remote(temp.path());
     let url = remote.to_str().unwrap();
@@ -86,40 +86,64 @@ async fn refresh_all_covers_every_store() {
         store.refresh_all().await.is_empty(),
         "an empty root is fine"
     );
+
+    // One request does not make a mirror active.
     let mirror = store.ensure(url).await.unwrap();
-    let used = store.last_used(url).unwrap();
+    assert_eq!(store.requests(url).len(), 1);
+    assert!(!store.is_active(url));
     let second = push_commit(&source, "two\n");
     assert!(store.refresh_all().await.is_empty());
-    assert_eq!(
+    assert_ne!(
         git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
-        second
-    );
-    assert_eq!(
-        store.last_used(url),
-        Some(used),
-        "the background loop is not a request"
+        second,
+        "a one-off mirror is not refetched in the background"
     );
 
-    // A mirror nobody asked for in `idle` is left alone until asked again.
-    std::fs::write(
-        store.store_dir(url).join("used"),
-        format!("{}\n", used - 10 * 24 * 3600),
-    )
-    .unwrap();
+    // Five do.
+    for _ in 0..4 {
+        store.ensure(url).await.unwrap();
+    }
+    assert!(store.is_active(url));
+    let requests = store.requests(url);
+    assert_eq!(requests.len(), 5);
     let third = push_commit(&source, "three\n");
     assert!(store.refresh_all().await.is_empty());
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
-        second,
+        third
+    );
+    assert_eq!(
+        store.requests(url),
+        requests,
+        "the background loop is not a request"
+    );
+
+    // Requests older than `idle` no longer count.
+    let mut aged = requests.clone();
+    aged[0] -= 10 * 24 * 3600;
+    std::fs::write(
+        store.store_dir(url).join("used"),
+        aged.iter().map(|at| format!("{at}\n")).collect::<String>(),
+    )
+    .unwrap();
+    assert!(!store.is_active(url));
+    let fourth = push_commit(&source, "four\n");
+    assert!(store.refresh_all().await.is_empty());
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
+        third,
         "idle mirrors are skipped"
     );
     store.ensure(url).await.unwrap();
     assert_eq!(
         git(&mirror, &["rev-parse", "refs/heads/main"]).trim(),
-        third
+        fourth,
+        "a request always fetches"
     );
-    assert!(store.last_used(url).unwrap() >= used);
-    assert!(store.refresh_all().await.is_empty());
+    assert!(
+        store.is_active(url),
+        "the stale request rolled out of the window"
+    );
 }
 
 #[tokio::test]

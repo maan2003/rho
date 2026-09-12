@@ -7,7 +7,8 @@
 //! where the bytes come from: objects are borrowed from the mirror through
 //! `objects/info/alternates` (`CLONES.md`), and the wrapper routes every
 //! `fetch`/`pull` to the mirror of whatever URL it names after asking the
-//! keeper to refresh it, adding that mirror to the alternates on the way.
+//! keeper to refresh it, adding that mirror to the alternates on the way
+//! (every remote's, for `--all`).
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -305,7 +306,11 @@ pub enum FetchTarget {
     Default,
     /// The first positional: a remote name, a URL or a path.
     Named(String),
-    /// `--all`, `--multiple`, or arguments the wrapper does not read.
+    /// `--all`: every configured remote.
+    All,
+    /// `--multiple`: these remotes or remote groups.
+    Multiple(Vec<String>),
+    /// Arguments the wrapper does not read.
     Unrouted,
 }
 
@@ -363,16 +368,18 @@ impl FetchTarget {
             "--strategy-option",
             "--cleanup",
         ];
-        if rest
-            .iter()
-            .any(|word| word == "--all" || word == "--multiple")
-        {
+        let Some(positionals) = positionals(rest, WITH_VALUE) else {
             return Self::Unrouted;
+        };
+        if rest.iter().any(|word| word == "--all") {
+            return Self::All;
         }
-        match positionals(rest, WITH_VALUE).as_deref() {
-            None => Self::Unrouted,
-            Some([]) => Self::Default,
-            Some([name, ..]) => Self::Named((*name).to_owned()),
+        if rest.iter().any(|word| word == "--multiple") {
+            return Self::Multiple(positionals.iter().map(|name| (*name).to_owned()).collect());
+        }
+        match positionals.as_slice() {
+            [] => Self::Default,
+            [name, ..] => Self::Named((*name).to_owned()),
         }
     }
 }
@@ -399,25 +406,17 @@ fn positionals<'a>(rest: &'a [OsString], with_value: &[&str]) -> Option<Vec<&'a 
     Some(positionals)
 }
 
-/// The URL the `git fetch`/`git pull` given by `globals` and `rest` would
-/// read from: a named remote's URL, a literal URL or path, or the current
-/// branch's upstream remote (else `origin`). `None` when the command does
-/// not read one place (`--all`), names nothing git could resolve, or
-/// there is no repository.
-pub fn fetch_url(git: &Git, globals: &[OsString], rest: &[OsString]) -> Option<String> {
-    resolve_fetch_target(git, globals, FetchTarget::parse(rest))
-}
-
-/// The URL `target` stands for in the repository `globals` select.
-pub fn resolve_fetch_target(
-    git: &Git,
-    globals: &[OsString],
-    target: FetchTarget,
-) -> Option<String> {
-    let name = match target {
-        FetchTarget::Unrouted => return None,
-        FetchTarget::Named(name) => name,
-        FetchTarget::Default => {
+/// The URLs the `git fetch`/`git pull` given by `globals` and `rest` would
+/// read from: a named remote's URL, a literal URL or path, the current
+/// branch's upstream remote (else `origin`), or every remote of `--all`
+/// and `--multiple` (git fetches those in child processes of the real
+/// git, so they too are routed from here). Empty when the command names
+/// nothing git could resolve or there is no repository.
+pub fn fetch_urls(git: &Git, globals: &[OsString], target: FetchTarget) -> Vec<String> {
+    let names: Vec<String> = match target {
+        FetchTarget::Unrouted => return Vec::new(),
+        FetchTarget::Named(name) => vec![name],
+        FetchTarget::Default => vec![
             git_line(git, globals, ["symbolic-ref", "--quiet", "--short", "HEAD"])
                 .and_then(|branch| {
                     git_line(
@@ -427,13 +426,48 @@ pub fn resolve_fetch_target(
                     )
                 })
                 .filter(|remote| remote != ".")
-                .unwrap_or_else(|| "origin".to_owned())
-        }
+                .unwrap_or_else(|| "origin".to_owned()),
+        ],
+        FetchTarget::All => git_lines(git, globals, ["remote"]),
+        FetchTarget::Multiple(names) => names
+            .into_iter()
+            .flat_map(|name| {
+                // A remote group (`remotes.<group>`) expands to its members.
+                let members = git_lines(
+                    git,
+                    globals,
+                    ["config", "--get-all", &format!("remotes.{name}")],
+                );
+                if members.is_empty() {
+                    vec![name]
+                } else {
+                    members
+                        .iter()
+                        .flat_map(|line| line.split_whitespace().map(ToOwned::to_owned))
+                        .collect()
+                }
+            })
+            .collect(),
     };
-    if let Some(url) = git_line(git, globals, ["remote", "get-url", &name]) {
-        return Some(url);
+    let mut urls = Vec::new();
+    for name in names {
+        let url = match git_line(git, globals, ["remote", "get-url", &name]) {
+            Some(url) => url,
+            None if looks_like_url(&name) => name,
+            None => return Vec::new(),
+        };
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
     }
-    looks_like_url(&name).then_some(name)
+    urls
+}
+
+/// `fetch_urls` for a command line with one source.
+pub fn fetch_url(git: &Git, globals: &[OsString], rest: &[OsString]) -> Option<String> {
+    fetch_urls(git, globals, FetchTarget::parse(rest))
+        .into_iter()
+        .next()
 }
 
 /// Something git would take as a repository rather than a remote name.
@@ -450,11 +484,22 @@ fn looks_like_url(name: &str) -> bool {
 
 /// One non-empty line of git's stdout, or `None` on failure.
 fn git_line<const N: usize>(git: &Git, globals: &[OsString], args: [&str; N]) -> Option<String> {
+    git_lines(git, globals, args).into_iter().next()
+}
+
+/// The non-empty lines of git's stdout; empty on failure.
+fn git_lines<const N: usize>(git: &Git, globals: &[OsString], args: [&str; N]) -> Vec<String> {
     let mut all: Vec<OsString> = globals.to_vec();
     all.extend(args.map(OsString::from));
-    let out = git.output(None, all).ok()?;
-    let line = out.lines().next()?.trim();
-    (!line.is_empty()).then(|| line.to_owned())
+    git.output(None, all)
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -603,7 +648,22 @@ mod tests {
             Some(mirror.to_str().unwrap())
         );
         assert_eq!(fetch_url(&git, &globals, &["nosuch".into()]), None);
-        assert_eq!(fetch_url(&git, &globals, &["--all".into()]), None);
+        assert_eq!(
+            fetch_urls(&git, &globals, FetchTarget::All),
+            vec![remote.to_str().unwrap(), other.to_str().unwrap()]
+        );
+        run(&dest, &["config", "remotes.both", "origin upstream"]);
+        assert_eq!(
+            fetch_urls(
+                &git,
+                &globals,
+                FetchTarget::Multiple(vec!["both".into(), "origin".into()])
+            ),
+            vec![remote.to_str().unwrap(), other.to_str().unwrap()]
+        );
+        assert!(
+            fetch_urls(&git, &globals, FetchTarget::Multiple(vec!["nosuch".into()])).is_empty()
+        );
         run(&dest, &["config", "branch.main.remote", "upstream"]);
         assert_eq!(
             fetch_url(&git, &globals, &[]).as_deref(),
@@ -640,11 +700,11 @@ mod tests {
         );
         assert_eq!(
             FetchTarget::parse(&words(&["--all", "-q"])),
-            FetchTarget::Unrouted
+            FetchTarget::All
         );
         assert_eq!(
-            FetchTarget::parse(&words(&["--multiple", "a", "b"])),
-            FetchTarget::Unrouted
+            FetchTarget::parse(&words(&["--multiple", "-p", "a", "b"])),
+            FetchTarget::Multiple(vec!["a".into(), "b".into()])
         );
 
         assert_eq!(

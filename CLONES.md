@@ -43,7 +43,11 @@ for everything else, arguments untouched:
   the mirror. Refspecs and options pass through. So a second remote
   (`git remote add upstream ...; git fetch upstream`) gets a mirror of
   its own on first fetch and the clone borrows from both. `--all` and
-  `--multiple` name several remotes at once and go to the real git.
+  `--multiple` refresh every remote named and pass one rewrite per
+  remote: git fetches them in child processes of the real git, which
+  read the rewrites from the environment. The rewrite is a per-process
+  `-c` option; nothing is written to the clone's config or the store,
+  only the alternates line.
 - `git subtree add|pull --prefix=<dir> <repository> <ref>` is routed the
   same way, from outside: `git subtree` is a script, and git puts its
   own exec path first on the script's PATH, so the script's nested
@@ -125,12 +129,12 @@ git with the user's environment, so credential helpers, ssh and
 The keeper serializes work per mirror: one `tokio` mutex per URL, so
 concurrent requests for one URL share a single fetch. A mirror fetched
 within the *debounce* window (30 s by default) is served as is; a
-background loop refetches each *interval* (60 s) every mirror that was
-requested within *idle* (3 days; each request records its time in the
-store's `used` file), so new clones are born on the remote's current
-state without waiting, and a mirror nobody asks for stops costing
-network until the next request fetches it. There is no file locking: the
-daemon is one process, and git takes its own locks inside a mirror.
+background loop refetches each *interval* (60 s) every *active* mirror:
+one requested at least *active_after* times (5) within *idle* (3 days;
+the store's `used` file keeps the last few request times). A mirror
+asked for once, or not lately, stays as it is, and every request fetches
+what it needs itself. There is no file locking: the daemon is one
+process, and git takes its own locks inside a mirror.
 
 The protocol is one line each way on a unix socket, so a client needs
 nothing but a socket:
