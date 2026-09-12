@@ -213,26 +213,20 @@ AI APIs.
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent
   drops and kills its retained child processes.
-- An agent's working set (its workdirs/mount-namespace view) is fixed at spawn,
-  persisted on the agent record, and provides version isolation rather than
-  access isolation: the namespace redirects entry paths to the agent's
-  checkouts but does not restrict access to the rest of the filesystem.
-  Isolated jj workdirs are stable bcachefs subvolumes. Each live Rho process
-  holds a shared advisory lock on a persistent sibling lease file; jj's
-  repository-local GC alone requests a nonblocking exclusive lock, rechecks
-  its last-use timestamp, snapshots the working copy, and only then deletes
-  the subvolume.
-  The lock coordinates cooperating Rho/jj processes, not arbitrary same-user
-  filesystem mutation. Managed workspaces require bcachefs; jj invokes the
-  kernel's bcachefs subvolume ioctls directly rather than spawning a mutable
-  executable from PATH.
-  Apply-patch translates absolute paths inside any workdir to that workdir's
-  checkout, so in-process file writes follow the same redirection as
+- An agent's place (its workset, working directory and mode) is fixed at
+  spawn, persisted on the agent record, and provides version isolation rather
+  than access isolation: the mount namespace presents the workset at `/src`
+  and, in view mode, hides the rest of the host, but the process is the same
+  user as the daemon (`WORKSET.md`). Worksets are plain directories under the
+  state root; discarding one removes its directory, and the mirrors under
+  `stores/` that clones borrow objects from are never removed.
+  Apply-patch translates absolute paths inside the workset to the host
+  directory, so in-process file writes follow the same mapping as
   namespaced commands.
-- Sandbox workspaces are a narrower, opt-in boundary for native agents. Rho
-  creates a normal isolated jj-managed workspace, masks its original `.jj` and
-  colocated `.git` metadata in the command mount namespace, and points Git at
-  a separate synthetic baseline. Child commands receive a fail-closed Landlock policy: sandbox
+- Sandbox workspaces were a narrower, opt-in boundary for native agents
+  (historical; no longer created). Rho created an isolated workspace, masked
+  its original VCS metadata in the command mount namespace, and pointed Git
+  at a separate synthetic baseline. Child commands receive a fail-closed Landlock policy: sandbox
   workdirs/home/temp/runtime directories are writable, explicit system and
   toolchain paths are read-only, other filesystem access is denied, and new
   TCP bind/connect operations are denied; a seccomp filter permits creation
@@ -437,13 +431,9 @@ AI APIs.
   sender-driven graceful completion instead finishes the zstd frame and
   half-closes before the task joins.
 - An authenticated native UI client may request a diff for any workspace it
-  can already open through the fully privileged UI protocol. A refresh is a
-  persistent jj write: it snapshots that workspace and descendant workspace
-  commits under the per-repo lock and may therefore rebase/materialize those
-  descendants. Unrelated workspace branches are not scanned. The returned
-  repository epoch is consumed under the same lock, avoiding mixed-operation
-  manifests. The blocking job owns that lock, so an RPC timeout cannot admit a
-  concurrent jj mutation while the timed-out worker finishes.
+  can already open through the fully privileged UI protocol. A refresh runs
+  under the workset's operation lock. The git-based snapshot behind it is
+  not implemented yet; until it is, the request fails cleanly.
 - Diff manifests expose repository-relative paths and bounded parent file
   contents to the requesting GUI; current-side contents stay in the GUI's
   local editor buffers. Reads are limited per file, aggregate I/O, aggregate payload,
@@ -455,7 +445,7 @@ AI APIs.
   30-second wait, and use a low-priority one-shot iroh stream. Both encoded and
   raw frame writers enforce the same 64 MiB bound as readers.
 - Hidden diff surfaces retain their workspace watch stream and local buffer identity,
-  but watcher/buffer invalidations cannot initiate jj manifest RPCs until that
+  but watcher/buffer invalidations cannot initiate manifest RPCs until that
   model is shown in an active pane. Hidden changes coalesce; an already-started
   request may still finish after the surface is hidden.
 - Workspace file requests accept only normalized relative paths and resolve
@@ -540,8 +530,7 @@ AI APIs.
   arbitrary interactive input, `/dev/tty`, persistent job-control terminal
   semantics, a terminal screen, or hidden password entry belong in the raw
   terminal.
-- Pager-aware commands receive `rho-pager` through `PAGER`, `GIT_PAGER`, and
-  `JJ_PAGER`.
+- Pager-aware commands receive `rho-pager` through `PAGER` and `GIT_PAGER`.
   The sidecar binds one Unix socket below the user-private `XDG_RUNTIME_DIR`
   and requires both a random shell-lifetime token and a fresh random execution
   token from the pager's inherited environment. Pager frames are independently
@@ -669,13 +658,11 @@ its queue. This is a collaboration bus inside one trusted local pool, not a
 team-isolation boundary. Self-messaging and ambiguous or mismatched handles are
 rejected. Interrupt remains role-specific and separately validated.
 
-Spawned Engineers always receive isolated jj workspaces; the model cannot opt
-them into a shared jj checkout. Plain directories cannot be isolated and remain
-shared for ordinary agents. Spawn revsets are resolved and snapshotted from the
-parent's corresponding workspace, not the user's root checkout. Sandboxed
-parents create sandboxed owned workdirs even for repositories outside their
-working set; sharing an outside ordinary checkout or spawning into a plain
-directory is refused. Advisors intentionally join their caller's workdirs and
+Spawned Engineers join their parent's workset and working directory; a
+parent that wants concurrent edits makes the child a checkout of its own
+(a git worktree) first and says so in the prompt. The daemon creates no
+checkouts for children, only the initial clone of a new agent's
+repository. Advisors intentionally join their caller's directory and
 keep shell and patch tools for read-oriented investigation and scratch
 experiments. They may message other agents and wait for replies, but cannot
 spawn or interrupt, and are instructed not to implement changes.

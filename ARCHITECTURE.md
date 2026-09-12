@@ -67,26 +67,26 @@ than by running a supervisor, extension protocol, or daemon process graph.
   interpret its contents, there is no workset table (the directory is the
   record), and nothing forks. An agent's record is a workset id, its working
   directory as it sees it, and its mode. A new agent gets a fresh workset
-  holding a `jj git clone` of what it was started on; clones go through the
-  transparent clone store (`CLONES.md`) whose server the daemon runs, so
-  they are fast and born on the remote's current state. Children join their
-  parent's workset, in the parent's directory or in a jj workspace the pool
-  adds beside it. A `Namespace` is one agent's view: a mount namespace
+  holding a `git clone` of what it was started on; clones are born from the
+  mirror store (`CLONES.md`) whose keeper the daemon runs in-process, so
+  they are fast and start on the remote's current state, and the `git` in
+  an agent's view is the store's client. Children join their parent's
+  workset, in the parent's directory; a parent that wants them in a
+  checkout of their own makes a worktree first. A `Namespace` is one agent's view: a mount namespace
   built lazily on the first command, in view mode (a generated tmpfs root
   with the workset at `/src`) or exposed mode (the host, with the workset
   mounted over its `/src` stub); tests and evaluations adopt a directory
   and use the same namespaces. Live-diff semantic
-  barriers use the vendored descendant-snapshot implementation through an
-  embedded `jj-cli` API under the workset's operation lock. The API returns
-  the exact immutable repository epoch it wrote, so derived manifests never
-  reload a racing operation head. Records written before worksets name
+  barriers take the workset's operation lock; the git-based snapshot
+  behind them is not implemented yet (`Workset::diff_snapshot` is a
+  TODO and fails cleanly). Records written before worksets name
   checkouts this daemon no longer manages; their transcripts stay
   readable, but they cannot run.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
   the binaries, below project and user skills in precedence. Discovery is a
-  function of the agent's working directory: the jj workspace containing it,
+  function of the agent's working directory: the git checkout containing it,
   or the directory itself; `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
@@ -427,7 +427,7 @@ partial destination transcript before retrying.
 Collaboration creation is role-specific while communication is shared.
 `spawn_engineer` puts the child in the parent's workset and working
 directory. A parent that wants concurrent edits makes the child a checkout
-of its own first (a jj workspace or git worktree in the workset) and says
+of its own first (a git worktree in the workset) and says
 so in the prompt; the daemon creates no workspaces, only initial clones.
 Advisors join the asker's directory. Detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
@@ -596,7 +596,7 @@ until checked save reports a conflict, and watcher overflow asks the GUI to
 rescan every open path. Syntax parsing remains GUI-local; the daemon runs no
 headless GPUI/Zed project.
 A diff refresh is a semantic barrier, not a second watcher snapshot: the daemon
-persists the requested jj workspace/descendant closure and returns a bounded
+persists the requested workspace snapshot and returns a bounded
 manifest containing the exact operation and working-copy commit, parent-side
 text, and bounded target type/size/mode descriptors. Current-side text is
 deliberately omitted and always comes from the live GUI buffer. The GUI unions
@@ -609,7 +609,7 @@ editors over its multibuffer. Stable repository-path keys and subscriptions to
 buffers, buffer diffs, and workspace-file events let refreshes reconcile paths
 and recalculate hunks without replacing the surface. Manifest invalidations are
 lazy: a hidden diff stays subscribed to its retained file channel but cannot
-start a jj manifest request. Returning it to an active pane coalesces all hidden
+start a manifest request. Returning it to an active pane coalesces all hidden
 changes into one refresh; a request already started while visible may finish
 after it becomes hidden.
 

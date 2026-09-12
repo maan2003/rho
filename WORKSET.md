@@ -3,37 +3,39 @@
 A workset is the unit Rho gives an agent: one plain directory, presented
 at `/src` inside the agent's private mount namespace. The daemon does not
 interpret what is in it. The agent clones repositories into it with
-ordinary `jj git clone`, adds jj workspaces with `jj workspace add`, and
-keeps whatever else it wants there; the directory is the truth and there
-is no separate record of its contents.
+ordinary `git clone`, adds checkouts with `git worktree add`, and keeps
+whatever else it wants there; the directory is the truth and there is
+no separate record of its contents.
 
 `rho-workset` owns the state root, `~/.local/state/rho`:
 
 ```
 ~/.local/state/rho/
-  stores/            # clone-store root (CLONES.md), URL-keyed
-  store.sock         # the store server's socket
+  stores/            # mirror store root (CLONES.md), URL-keyed
+  store.sock         # the mirror keeper's socket
+  bin/git            # the `git` wrapper (rho-git) agents run
   worksets/<id>/src  # one directory per workset
 ```
 
-`Worksets::open` creates the root and starts `jj store serve` on the
-socket. That server is the only writer of `stores/`: it initializes a
-store on first request, refetches every store in the background so new
-clones are born on the remote's current state, and serves the same
-store to concurrent requests under one lock. Everything else — the
-daemon's own `Workset::clone_repo`, an agent's `jj git clone` and
-`jj git fetch` — is a client that reads a store and never touches the
+`Worksets::open` creates the root, installs the wrapper and starts the
+mirror keeper (`rho-git-server`) in-process on the socket. The keeper
+is the only writer of `stores/`: it initializes a mirror on first
+request, refetches every mirror in the background so new clones are
+born on the remote's current state, and serves the same mirror to
+concurrent requests under one lock. Everything else — the daemon's own
+`Workset::clone_repo`, an agent's `git clone` and `git fetch` through
+the wrapper — is a client that reads a mirror and never touches the
 network. `Worksets::discard_workset` deletes the workset directory;
-stores are shared and never removed.
+mirrors are shared and never removed.
 
 Several agents can work in one workset: a child agent joins its parent's
 workset in the parent's directory. A parent that wants a child in a
-checkout of its own makes one itself first — a jj workspace, a git
-worktree, whatever it likes — and tells the child where to work; the
+checkout of its own makes one itself first — a git worktree, another
+clone, whatever it likes — and tells the child where to work; the
 daemon only ever does the initial clone. Every agent's record is a workset id, a working directory as the
 agent sees it, and a mode; loading
-`AGENTS.md`-style context is a function of that directory (the jj
-workspace containing it), not of a "primary" repository. The daemon runs
+`AGENTS.md`-style context is a function of that directory (the git
+checkout containing it), not of a "primary" repository. The daemon runs
 one `Worksets` for its state root and hands the pool a `Workset` per
 agent; a directory outside the root can be adopted for one process
 (`Worksets::adopt`), which is how tests and `rho eval` work in place.
@@ -70,18 +72,19 @@ a plain directory or file except a handful of real mounts:
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
 - `/src`: the workset directory, read-write. The command starts here.
-- The clone-store root, read-only, and the store socket, at the same
-  absolute paths they have on the host. Clones record the store by
-  absolute path (git alternates), so the path must not change between
-  the daemon's frame and the agent's.
+- The mirror store root and the wrapper directory, read-only, and the
+  keeper's socket, at the same absolute paths they have on the host.
+  Clones record the store by absolute path (git alternates), so the
+  path must not change between the daemon's frame and the agent's.
 - The directory holding the daemon's own executable, read-only at its
   host path, when that is outside `/nix/store`: a cargo-built daemon can
   then launch its sibling sidecars (`rho-shell`, `rho-pager`). A nix
   build adds nothing.
 
 The environment is an explicit allowlist (PATH filtered to `/nix/store`
-entries, TERM, plus HOME/USER/LOGNAME) and `JJ_STORE` / `JJ_STORE_SOCKET`
-pointing jj at the store server; variables the caller sets on the command
+entries with the wrapper directory first, TERM, plus HOME/USER/LOGNAME)
+and `RHO_GIT_STORE_SOCKET` / `RHO_GIT` pointing the wrapper at the
+keeper and the real git; variables the caller sets on the command
 survive in both modes, and inherited fds are closed on exec.
 
 `Namespace::set_claude_home` mounts an agent's Claude Code home over its
@@ -129,7 +132,7 @@ namespace first, before any thread).
 - No workset table: the directory is the record. Opening a workset is
   checking that its directory exists.
 - No forking of checkouts between agents: children join the parent's
-  workset; separate work happens in jj workspaces the parent creates.
+  workset; separate work happens in worktrees the parent creates.
 - No namespace refresh: `/src` is one bind mount, so anything cloned
   into the workset is visible immediately.
 - No uid separation, no role users, no setgroups/setuid machinery:

@@ -33,7 +33,7 @@ security boundary (see `WORKSET.md`); it is a distribution.
    keeps the user's own config free to be as personal as they like.
 
 2. **The userland is a declared program list.** Rho names the tools an
-   agent gets (coreutils, bash, git, Rho's jj, direnv, nix, ripgrep,
+   agent gets (coreutils, bash, git behind Rho's `git` wrapper, direnv, nix, ripgrep,
    fd, just, python3, uv, node, …) and presents them as one directory
    mounted at `/usr`, with `/bin` pointing at it and `PATH=/usr/bin`. A
    nix build of Rho produces that directory as a `buildEnv`; a
@@ -62,8 +62,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
      not exist on the host, so the roots would dangle and every GC would
      delete the dev shell. At a host-valid path the roots resolve, and
      they die with the workset when it is discarded — a better lifetime
-     than a `.direnv` that outlives its checkout. It also means two jj
-     workspaces of one repository do not share one cache directory.
+     than a `.direnv` that outlives its checkout. It also means two
+     worktrees of one repository do not share one cache directory.
    - The `use_flake` wrapper that adds the shared cargo cache and
      `RHO_DIRENV_PATH_BEFORE` is part of that `direnvrc`.
 
@@ -91,14 +91,13 @@ security boundary (see `WORKSET.md`); it is a distribution.
    which matters to nix's `path:` fetcher (see 8).
 
 6. **Identity is environment; behaviour is `/etc`.** The daemon owns
-   the user's name and email as a setting and exports `JJ_USER`,
-   `JJ_EMAIL`, `GIT_AUTHOR_*` and `GIT_COMMITTER_*`. jj's behavioural
-   settings (no pager, git-style diffs, no signing) are a generated
-   `/etc/jj/config.toml` named by `JJ_CONFIG`.
+   the user's name and email as a setting and exports `GIT_AUTHOR_*`
+   and `GIT_COMMITTER_*`. Git's behavioural settings (no pager, no
+   signing, `init.defaultBranch`) are a generated `/etc/gitconfig`
+   named by `GIT_CONFIG_SYSTEM`.
    *Why:* every commit an agent makes must carry authorship, and no
-   agent should need a config file in its home to get it. The
-   `INSIDE_AGENT` scope in a user's own jj config becomes unnecessary
-   because that config is not in the view.
+   agent should need a config file in its home to get it. The user's
+   own git config is not in the view, so nothing personal leaks in.
 
 7. **Locale and terminal are fixed.** `LANG=C.UTF-8` (built into glibc,
    so no locale archive), `TERM` and `TZ` passed through, `COLORTERM`
@@ -106,29 +105,17 @@ security boundary (see `WORKSET.md`); it is a distribution.
    the nixpkgs bash reads; the direnv hook and prompt live there. Fish,
    tmux and zoxide are not part of the distro.
 
-8. **Every checkout is a colocated git repository.** The main clone
-   already is: `jj git clone` colocates by default and the clone store
-   supplies objects through git alternates. Secondary jj workspaces
-   (`jj workspace add`, which agents run for themselves when they want a
-   child in its own checkout) must be colocated too, as git worktrees of the main clone: a `.git` file
-   pointing at `<main>/.git/worktrees/<name>`, with `HEAD`, `commondir`
-   and `gitdir` written there. Rho's jj fork already does exactly this
-   for managed workspaces (`create_git_worktree` in
-   `cli/src/commands/workspace/managed.rs`: `git worktree add --detach
-   --no-checkout` followed by `git read-tree HEAD`), which is what the
-   previous Rho architecture used. The redesign switched
-   `Workset::add_workspace` to plain `jj workspace add`, which does not
-   colocate, and the daemon no longer adds workspaces at all: agents
-   do. So that worktree step has to move into `jj workspace add`
-   itself, applied whenever the main workspace is colocated. The rest is already in
-   place: jj recognises such a worktree as colocated and syncs both
-   ways per workspace, exactly as in the main workspace. Verified by
-   hand on a store-backed clone: `jj new` moves the worktree's git HEAD
-   and index; a `git commit` in the worktree is imported as the new
-   working-copy parent on the next jj command; `git branch` becomes a
-   bookmark; `git switch` to a branch is detached again on export. No
-   git hooks or command blocking are needed.
-   *Why:* tools read git, not jj. Nix treats a directory without `.git`
+8. **Every checkout is a plain git repository, and `git` is git.** The
+   `git` on the agent's PATH is Rho's wrapper (`rho-git`,
+   `CLONES.md`): `git clone` births the clone from the daemon's mirror
+   store through git alternates and leaves an ordinary repository with
+   `origin` at the real remote; `git fetch` and `git pull` read the
+   refreshed mirror; every other command is the real git, `exec`ed
+   with its arguments untouched. Further checkouts are `git worktree
+   add`, which agents run for themselves when they want a child in its
+   own checkout. There is no second VCS in the view and no daemon-side
+   notion of a change: the model works with git alone.
+   *Why:* one tool the model knows well beats two it confuses. Nix treats a directory without `.git`
    as a `path:` flake and copies the whole tree, ignored files included,
    into the store on every evaluation; with `.git` it fetches only
    tracked files. `git status`, `gh`, cargo's vergen-style build
@@ -165,10 +152,10 @@ security boundary (see `WORKSET.md`); it is a distribution.
 | `/usr` (`/bin` → `/usr/bin`) | the declared userland, read-only |
 | `/nix/store` | host store, read-only |
 | `/nix/var/nix/daemon-socket` | host nix daemon socket |
-| `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `jj/config.toml`, `rho/direnv/`, `bashrc`, `profile` |
+| `/etc` | generated: passwd, group, hosts, resolv.conf, nsswitch, ssl, localtime, `nix/nix.conf`, `gitconfig`, `rho/direnv/`, `bashrc`, `profile` |
 | `/home/agent` | empty tmpfs; `~/.cache` is the shared persistent cache; `~/.claude` is the Claude home stack |
 | `/src` | the workset, read-write |
-| `<state>/stores`, `<state>/store.sock` | at host paths, read-only / socket |
+| `<state>/stores`, `<state>/bin`, `<state>/store.sock` | at host paths: mirrors and the `git` wrapper read-only, the keeper's socket |
 | `<state>/worksets/<id>/state` | at its host path, read-write: direnv layout and GC roots |
 | `/proc`, `/dev`, `/tmp` | as today |
 
@@ -177,8 +164,8 @@ security boundary (see `WORKSET.md`); it is a distribution.
 `PATH=/usr/bin`; `HOME`, `USER`, `LOGNAME`; `TERM`, `TZ`, `COLORTERM`;
 `LANG=C.UTF-8`; `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`;
 `NIX_REMOTE=daemon`; `DIRENV_CONFIG=/etc/rho/direnv`;
-`JJ_CONFIG=/etc/jj/config.toml`; `JJ_USER`, `JJ_EMAIL`, `GIT_AUTHOR_*`,
-`GIT_COMMITTER_*`; `JJ_STORE`, `JJ_STORE_SOCKET`; `INSIDE_AGENT=1`;
+`GIT_CONFIG_SYSTEM=/etc/gitconfig`; `GIT_AUTHOR_*`, `GIT_COMMITTER_*`;
+`RHO_GIT_STORE_SOCKET`, `RHO_GIT`; `INSIDE_AGENT=1`;
 `CARGO_HOME` and `CARGO_BUILD_TARGET_DIR` under the shared cache.
 Variables the caller sets on a command survive, as today.
 
@@ -189,7 +176,7 @@ image versus runtime:
 
 - `rho-agent-distro` builds an **image**: a directory tree on disk plus
   an environment manifest. It resolves the program list into `usr/`,
-  writes every generated `/etc` file (nix.conf, jj config, the direnv
+  writes every generated `/etc` file (nix.conf, gitconfig, the direnv
   configuration and `direnvrc`, bashrc and profile) and lists the
   variables. It knows nothing about namespaces or mounts, so it is
   tested with plain file assertions, and a nix build of Rho can run it
