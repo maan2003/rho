@@ -109,6 +109,23 @@ impl ProbeScreen {
     }
 }
 
+fn trust_prompt_response(text: &str) -> Option<&'static [u8]> {
+    if !text.contains("Quick safety check") {
+        return None;
+    }
+    let selected = text
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix('❯'))?
+        .trim_start();
+    if selected.starts_with("Yes, I trust this folder") {
+        Some(b"\r")
+    } else if selected.starts_with("No, exit") {
+        Some(b"\x1b[B\r")
+    } else {
+        None
+    }
+}
+
 async fn probe_usage(
     mut command: tokio::process::Command,
     probe_dir: &Path,
@@ -189,11 +206,20 @@ async fn probe_usage(
             }
 
             let text = screen.text();
-            if !accepted_probe_dir && text.contains("Quick safety check") {
+            if !accepted_probe_dir
+                && output.is_empty()
+                && screen.replies.is_empty()
+                && let Some(response) = trust_prompt_response(&text)
+            {
+                // Claude can paint this prompt just before its input handler is
+                // ready. Give that handler one terminal frame to attach.
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 accepted_probe_dir = true;
-                output.extend_from_slice(b"\r");
+                output.extend_from_slice(response);
             }
             if !usage_sent
+                && output.is_empty()
+                && screen.replies.is_empty()
                 && text.contains("Safe mode: all customizations are disabled")
                 && text.contains('❯')
             {
@@ -482,6 +508,19 @@ mod tests {
                     .timestamp()
             )
         );
+    }
+
+    #[test]
+    fn accepts_whichever_trust_option_is_selected() {
+        assert_eq!(
+            trust_prompt_response("Quick safety check\n❯ No, exit\n  Yes, I trust this folder"),
+            Some(b"\x1b[B\r".as_slice())
+        );
+        assert_eq!(
+            trust_prompt_response("Quick safety check\n  No, exit\n❯ Yes, I trust this folder"),
+            Some(b"\r".as_slice())
+        );
+        assert_eq!(trust_prompt_response("ordinary prompt\n❯ hello"), None);
     }
 
     #[test]
