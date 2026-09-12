@@ -23,6 +23,10 @@ tempfile.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 
+[[test]]
+name = "namespace"
+harness = false
+
 [[bin]]
 name = "rho-workset-dev"
 path = "src/bin/rho-workset-dev.rs"

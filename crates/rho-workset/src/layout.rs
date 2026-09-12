@@ -547,10 +547,47 @@ pub fn prepare_mounts(set: &Mounts) -> anyhow::Result<PreparedMounts> {
     Ok(PreparedMounts { workspaces, stores })
 }
 
+/// Captures one host directory or file as a detached mount tree that can be
+/// installed into another mount namespace with [`install_captured_mount`].
+/// Must run in a private mount namespace: it stages a bind mount in a
+/// temporary location while cloning it.
+pub fn capture_mount(source: &Path) -> anyhow::Result<OwnedFd> {
+    clone_mount(source)
+}
+
+/// Installs a tree captured by [`capture_mount`] over `target`, read-write.
+pub fn install_captured_mount(source: &OwnedFd, target: &Path) -> anyhow::Result<()> {
+    install_mount(source, target, false)
+}
+
+/// Lazily detaches the mount at `target` together with everything mounted
+/// below it.
+pub fn detach_mount(target: &Path) -> anyhow::Result<()> {
+    let path = cstring(target)?;
+    if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("detach mount at {}", target.display()));
+    }
+    Ok(())
+}
+
 fn clone_mount(source: &Path) -> anyhow::Result<OwnedFd> {
-    let staging = tempfile::tempdir().context("create mount staging directory")?;
-    bind(source, staging.path(), false)?;
-    let path = cstring(staging.path())?;
+    // A bind mount needs a target of the same kind, so files stage over a
+    // temporary file and directories over a temporary directory.
+    let is_dir = fs::metadata(source)
+        .with_context(|| format!("stat mount source {}", source.display()))?
+        .is_dir();
+    let staging_dir;
+    let staging_file;
+    let staging: &Path = if is_dir {
+        staging_dir = tempfile::tempdir().context("create mount staging directory")?;
+        staging_dir.path()
+    } else {
+        staging_file = tempfile::NamedTempFile::new().context("create mount staging file")?;
+        staging_file.path()
+    };
+    bind(source, staging, false)?;
+    let path = cstring(staging)?;
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     const AT_RECURSIVE: libc::c_uint = 0x8000;
     let fd = unsafe {

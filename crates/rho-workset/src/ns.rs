@@ -1,5 +1,6 @@
 use std::ffi::{CString, OsString};
 use std::fs::File;
+use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,27 @@ use crate::{Checkout, PathOverrides, UserEnvironment, Workset};
 pub enum Mode {
     View { home_skeleton: Option<PathBuf> },
     Exposed,
+}
+
+/// Largest file [`Namespace::read_file_bounded`] will ever return.
+pub const MAX_BOUNDED_READ: usize = 64 * 1024 * 1024;
+
+/// Claude Code's home for one agent, mounted over its `~/.claude` inside the
+/// namespace. All paths are host paths; `config_home` is where the agent
+/// expects the directory, and view mode retargets a host-home-relative
+/// `config_home` under `/home/agent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeHome {
+    /// Per-account state directory mounted over `config_home`.
+    pub account: PathBuf,
+    /// The agent's `~/.claude` as a host path.
+    pub config_home: PathBuf,
+    /// Directory mounted over `<config_home>/projects`.
+    pub shared_projects: PathBuf,
+    /// File mounted over `<config_home>/CLAUDE.md`.
+    pub prompt: PathBuf,
+    /// Optional file mounted over `<config_home>/settings.json`.
+    pub settings: Option<PathBuf>,
 }
 
 /// A live user+mount namespace presenting one workset at `/src`.
@@ -32,6 +54,9 @@ pub struct Namespace {
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     view_path: Option<OsString>,
+    /// The Claude home currently mounted, keyed by the visible path it sits
+    /// on so a replacement can detach it first.
+    claude_home: tokio::sync::Mutex<Option<(ClaudeHome, PathBuf)>>,
 }
 
 impl Namespace {
@@ -112,7 +137,133 @@ impl Namespace {
             environment,
             path_overrides,
             view_path,
+            claude_home: tokio::sync::Mutex::new(None),
         }))
+    }
+
+    /// Mounts `home` over the agent's `~/.claude` inside the live namespace.
+    /// Setting the same home again is a no-op; a different one replaces the
+    /// previous mount stack. Every mount is a bind of a host path, so the
+    /// agent's writes land in the account and shared-projects directories.
+    pub async fn set_claude_home(&self, home: ClaudeHome) -> anyhow::Result<()> {
+        let mut current = self.claude_home.lock().await;
+        if current
+            .as_ref()
+            .is_some_and(|(mounted, _)| *mounted == home)
+        {
+            return Ok(());
+        }
+        let target = self.visible_path_for(&home.config_home);
+        let previous = current.as_ref().map(|(_, target)| target.clone());
+        let mount_ns = self.mount_ns.try_clone()?;
+        let root = self.root.try_clone()?;
+        let mounted = home.clone();
+        let install_target = target.clone();
+        namespace_thread("rho-workset-claude-home", move || {
+            use crate::layout::{capture_mount, detach_mount, install_captured_mount};
+            crate::layout::unshare_mount_namespace()?;
+            let account = capture_mount(&home.account)?;
+            let projects = capture_mount(&home.shared_projects)?;
+            let prompt = capture_mount(&home.prompt)?;
+            let settings = home.settings.as_deref().map(capture_mount).transpose()?;
+            enter(&mount_ns, &root)?;
+            if let Some(previous) = previous {
+                detach_mount(&previous)?;
+            }
+            std::fs::create_dir_all(&install_target)
+                .with_context(|| format!("create {}", install_target.display()))?;
+            install_captured_mount(&account, &install_target)?;
+            let inner = (|| {
+                install_captured_mount(&projects, &install_target.join("projects"))?;
+                install_captured_mount(&prompt, &install_target.join("CLAUDE.md"))?;
+                if let Some(settings) = &settings {
+                    install_captured_mount(settings, &install_target.join("settings.json"))?;
+                }
+                anyhow::Ok(())
+            })();
+            if inner.is_err() {
+                // Leave no half-assembled home behind; the caller sees the
+                // original error.
+                let _ = detach_mount(&install_target);
+            }
+            inner
+        })
+        .await?;
+        *current = Some((mounted, target));
+        Ok(())
+    }
+
+    /// Reads a file inside a checkout, refusing symlinks that escape it and
+    /// files larger than `max_len` (capped at [`MAX_BOUNDED_READ`]). `path` is
+    /// a visible path (`/src/<name>/...`) or relative to the primary checkout.
+    pub async fn read_file_bounded(&self, path: &Path, max_len: usize) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            max_len <= MAX_BOUNDED_READ,
+            "read limit {max_len} exceeds {MAX_BOUNDED_READ} bytes"
+        );
+        let (root, relative) = self.split_checkout_path(path)?;
+        let display = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut file = open_beneath(&root, &relative)
+                .with_context(|| format!("open {}", display.display()))?;
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "not a regular file: {}",
+                display.display()
+            );
+            anyhow::ensure!(
+                metadata.len() <= max_len as u64,
+                "{} is {} bytes, over the {max_len} byte limit",
+                display.display(),
+                metadata.len()
+            );
+            let mut contents = Vec::with_capacity(metadata.len() as usize);
+            file.by_ref()
+                .take(max_len as u64 + 1)
+                .read_to_end(&mut contents)?;
+            anyhow::ensure!(
+                contents.len() <= max_len,
+                "{} grew past the {max_len} byte limit while reading",
+                display.display()
+            );
+            Ok(contents)
+        })
+        .await
+        .context("bounded read task panicked")?
+    }
+
+    /// Splits a visible or primary-relative path into the host checkout root
+    /// it belongs to and the path below it.
+    fn split_checkout_path(&self, path: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
+        if path.is_absolute() {
+            for (visible, host) in &self.host_paths {
+                if let Ok(relative) = path.strip_prefix(visible) {
+                    return Ok((host.clone(), relative.to_owned()));
+                }
+            }
+            anyhow::bail!("path is outside every checkout: {}", path.display())
+        }
+        let host = self
+            .host_paths
+            .iter()
+            .find(|(visible, _)| visible.file_name() == Some(self.primary.as_ref()))
+            .map(|(_, host)| host.clone())
+            .context("primary checkout is unavailable")?;
+        Ok((host, path.to_owned()))
+    }
+
+    /// Where a host path appears inside the namespace: view mode relocates
+    /// the host home to `/home/agent`, exposed mode keeps host paths.
+    fn visible_path_for(&self, host_path: &Path) -> PathBuf {
+        if matches!(&self.mode, Mode::View { .. })
+            && let Some(relative) = dirs::home_dir()
+                .as_deref()
+                .and_then(|home| host_path.strip_prefix(home).ok())
+        {
+            return Path::new("/home/agent").join(relative);
+        }
+        host_path.to_owned()
     }
 
     pub fn workset(&self) -> &Workset {
@@ -353,6 +504,44 @@ fn namespace_cwd(
         "namespace cwd must be below {visible_root}: {cwd}"
     );
     Ok(cwd.into_string())
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// Opens `path` below `root` with the kernel refusing any resolution step
+/// (symlink, `..`, magic link) that would leave `root`. Symlinks that stay
+/// inside are followed.
+fn open_beneath(root: &Path, path: &Path) -> anyhow::Result<File> {
+    let root = File::open(root).with_context(|| format!("open checkout {}", root.display()))?;
+    let path =
+        CString::new(path.as_os_str().as_bytes()).context("file path contains a NUL byte")?;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH,
+    };
+    // SAFETY: `path` and `how` outlive the syscall; a non-negative result is
+    // a descriptor this process now owns.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 fn open_root() -> anyhow::Result<OwnedFd> {

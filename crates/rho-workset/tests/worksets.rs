@@ -1,104 +1,14 @@
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use rho_workset::Worksets;
 
-use rho_workset::{PathOverrides, UserEnvironment, Worksets};
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["-c", "user.name=Test", "-c", "user.email=test@localhost"])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-fn jj(binary: &Path, dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(binary)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "jj {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
-fn jj_binary() -> PathBuf {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/jj/Cargo.toml");
-    let output = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "jj-cli",
-            "--message-format=json-render-diagnostics",
-            "--manifest-path",
-        ])
-        .arg(manifest)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "build jj: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
-        .find_map(|message| {
-            if message.get("reason")?.as_str()? == "compiler-artifact"
-                && message.get("target")?.get("name")?.as_str()? == "jj"
-            {
-                Some(PathBuf::from(message.get("executable")?.as_str()?))
-            } else {
-                None
-            }
-        })
-        .expect("cargo did not report jj executable")
-}
+mod common;
+use common::{git, jj, jj_binary, open_worksets, setup_remote};
 
 #[tokio::test]
 async fn worksets_grant_workspace_fork_and_order() {
     let jj_bin = jj_binary();
     let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    let remote = temp.path().join("remote.git");
-    std::fs::create_dir(&source).unwrap();
-    git(&source, &["init", "-b", "main"]);
-    std::fs::write(source.join("file.txt"), "one\n").unwrap();
-    git(&source, &["add", "."]);
-    git(&source, &["commit", "-m", "initial"]);
-    git(
-        temp.path(),
-        &[
-            "clone",
-            "--bare",
-            source.to_str().unwrap(),
-            remote.to_str().unwrap(),
-        ],
-    );
-
-    let mut environment = std::env::vars_os().collect::<Vec<_>>();
-    environment.push((OsString::from("RHO_JJ"), jj_bin.clone().into_os_string()));
-    let environment = UserEnvironment::new(environment);
-    let root = Worksets::open(
-        temp.path().join("root"),
-        rho_db::RhoDb::open(temp.path().join("rho.redb")),
-        environment.clone(),
-        PathOverrides::default(),
-    )
-    .unwrap();
+    let (_source, remote) = setup_remote(temp.path());
+    let root = open_worksets(temp.path(), &jj_bin);
     let parent_workset = root.create().await.unwrap();
     let parent = parent_workset
         .clone(
@@ -281,14 +191,100 @@ async fn worksets_grant_workspace_fork_and_order() {
     drop(alpha);
     drop(ordered);
     drop(root);
-    let reopened_root = Worksets::open(
-        temp.path().join("root"),
-        rho_db::RhoDb::open(temp.path().join("rho.redb")),
-        environment,
-        PathOverrides::default(),
-    )
-    .unwrap();
+    let reopened_root = open_worksets(temp.path(), &jj_bin);
     let reopened = reopened_root.open_workset(&ordered_id).await.unwrap();
     assert_eq!(reopened.checkout_names().await, vec!["zeta", "alpha"]);
     assert_eq!(reopened.primary_name().await.unwrap(), "zeta");
+}
+
+#[tokio::test]
+async fn existing_store_is_refreshed_before_clone_and_worksets_discard_cleanly() {
+    let jj_bin = jj_binary();
+    let temp = tempfile::tempdir().unwrap();
+    let (source, remote) = setup_remote(temp.path());
+    let root = open_worksets(temp.path(), &jj_bin);
+    let store_root = temp.path().join("root/stores/repo");
+
+    let first_workset = root.create().await.unwrap();
+    let first = first_workset
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("project"),
+            Some("main@origin"),
+        )
+        .await
+        .unwrap();
+    let first_id = first_workset.id().to_owned();
+    assert!(store_root.join("clones").join(&first_id).is_dir());
+
+    // The remote moves on after the store was initialized.
+    std::fs::write(source.join("file.txt"), "two\n").unwrap();
+    git(&source, &["commit", "-am", "second"]);
+    git(&source, &["push", remote.to_str().unwrap(), "main"]);
+    let new_main = git(&source, &["rev-parse", "main"]);
+
+    // A later clone of the same store sees the new commit.
+    let second_workset = root.create().await.unwrap();
+    let second = second_workset
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("project"),
+            Some("main@origin"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        jj(
+            &jj_bin,
+            second.checkout().as_std_path(),
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
+        ),
+        new_main
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.checkout().join("file.txt")).unwrap(),
+        "two\n"
+    );
+    // The first workset is untouched by the refresh.
+    assert_eq!(
+        std::fs::read_to_string(first.checkout().join("file.txt")).unwrap(),
+        "one\n"
+    );
+
+    // Discarding removes the checkouts, the store clone and the record, but
+    // never the shared store.
+    let first_root = temp.path().join("root/worksets").join(&first_id);
+    assert!(first_root.is_dir());
+    drop(first);
+    drop(first_workset);
+    root.discard_workset(&first_id).await.unwrap();
+    assert!(!first_root.exists());
+    assert!(!store_root.join("clones").join(&first_id).exists());
+    assert!(store_root.join("git").is_dir());
+    assert!(store_root.join("template").is_dir());
+    assert!(root.open_workset(&first_id).await.is_err());
+    assert!(
+        root.discard_workset(&first_id).await.is_ok(),
+        "discard is idempotent"
+    );
+
+    // The surviving workset still works and survives a reopen.
+    drop(root);
+    let root: std::sync::Arc<Worksets> = open_worksets(temp.path(), &jj_bin);
+    let reopened = root.open_workset(second_workset.id()).await.unwrap();
+    assert_eq!(reopened.checkout_names().await, vec!["project".to_owned()]);
+    assert_eq!(
+        std::fs::read_to_string(
+            reopened
+                .checkout("project")
+                .await
+                .unwrap()
+                .checkout()
+                .join("file.txt")
+        )
+        .unwrap(),
+        "two\n"
+    );
 }

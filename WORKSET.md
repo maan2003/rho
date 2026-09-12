@@ -40,6 +40,17 @@ a plain directory or file except a handful of real mounts:
 The environment is an explicit allowlist (plus HOME/USER/LOGNAME);
 inherited fds are closed on exec.
 
+`Namespace::set_claude_home` mounts an agent's Claude Code home over its
+`~/.claude` inside the live namespace: the per-account state directory,
+a shared `projects/` directory, the prompt as `CLAUDE.md`, and an optional
+`settings.json`, all bind mounts of host paths. In view mode a host-home
+relative `config_home` lands under `/home/agent`. Setting a different home
+detaches the previous stack first.
+
+`Namespace::read_file_bounded` reads a file from a checkout by visible or
+primary-relative path with `openat2(RESOLVE_BENEATH)`, so symlinks that
+leave the checkout are refused, and returns at most 64 MiB.
+
 ## /src: the working set
 
 Workspaces appear at `/src/<name>`, read-write. Clone stores appear at
@@ -53,6 +64,13 @@ Because clone-store pointers are relative and never leave the tree
 workspace plus its store, mounted in the same relative positions,
 works identically from any mount root. The host locations of the
 backing directories are bookkeeping the launcher owns.
+
+A store is initialized on first use and refreshed with `jj store fetch`
+before every later clone into it, so a new Checkout always starts from
+the remote's current state; forks transfer by sha and need no refresh.
+`Worksets::discard_workset` removes a Workset's Checkouts, its clone in
+every store and its rho-db record, never the store's `git/` or
+`template/`.
 
 ## Exposed mode
 

@@ -22,7 +22,7 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{Mode, Namespace};
+pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
 pub use rho_workset_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
     WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
@@ -34,19 +34,10 @@ const WORKSET_RECORDS: TableDefinition<Sen<String>, Sen<WorksetRecord>> =
 /// Durable Workset ordering. `primary` is stored explicitly rather than
 /// inferred from map or directory iteration; `checkouts` records creation
 /// order and is append-only.
-#[derive(Clone, Debug, Encode, Decode)]
+#[derive(Clone, Debug, Default, Encode, Decode)]
 struct WorksetRecord {
     primary: Option<String>,
     checkouts: Vec<String>,
-}
-
-impl Default for WorksetRecord {
-    fn default() -> Self {
-        Self {
-            primary: None,
-            checkouts: Vec::new(),
-        }
-    }
 }
 
 /// Establishes the identity user namespace required before workset mount
@@ -189,8 +180,14 @@ impl Worksets {
         &self.root
     }
 
-    /// Gets or crash-safely initializes a named clone store.
-    async fn store(self: &Arc<Self>, name: &str, remote_url: &str) -> anyhow::Result<Arc<Store>> {
+    /// Gets or crash-safely initializes a named clone store. The flag says
+    /// whether this call initialized it: a store that already existed is
+    /// stale by definition and the caller refreshes it before cloning.
+    async fn store(
+        self: &Arc<Self>,
+        name: &str,
+        remote_url: &str,
+    ) -> anyhow::Result<(Arc<Store>, bool)> {
         validate_name(name)?;
         let mut stores = self.stores.lock().await;
         if let Some(store) = stores.get(name).and_then(Weak::upgrade) {
@@ -198,13 +195,15 @@ impl Worksets {
                 store.remote_url == remote_url,
                 "store {name} already uses a different remote"
             );
-            return Ok(store);
+            return Ok((store, false));
         }
         let root = self.root.join("stores").join(name);
+        let mut initialized = false;
         if !root.join("clone-store").is_file() {
             let mut command = self.command("jj");
             command.args(["store", "init"]).arg(&root).arg(remote_url);
             run(command, "initialize clone store").await?;
+            initialized = true;
         }
         anyhow::ensure!(
             root.join("clone-store").is_file(),
@@ -217,7 +216,17 @@ impl Worksets {
             operation_lock: Mutex::new(()),
         });
         stores.insert(name.to_owned(), Arc::downgrade(&store));
-        Ok(store)
+        Ok((store, initialized))
+    }
+
+    /// Brings a store up to date with its remote. Clone birth reads the
+    /// store's last-fetched state, so this runs before every new clone of an
+    /// existing store; forks transfer by sha and never need it.
+    async fn fetch_store(&self, store: &Store) -> anyhow::Result<()> {
+        let _guard = store.operation_lock.lock().await;
+        let mut command = self.command("jj");
+        command.args(["store", "fetch"]).arg(&store.root);
+        run(command, "refresh clone store").await
     }
 
     pub async fn create(self: &Arc<Self>) -> anyhow::Result<Workset> {
@@ -374,12 +383,52 @@ impl Worksets {
         }
     }
 
-    pub fn delete_workset(&self, workset_id: &str) -> anyhow::Result<()> {
+    /// Removes a workset entirely: its checkouts, its private clone in every
+    /// store, and its rho-db record. Stores' shared `git/` and `template/`
+    /// are never touched. Safe on a half-created workset (a failed first
+    /// clone) and on one nothing has opened.
+    pub async fn discard_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<()> {
         validate_name(workset_id)?;
-        let root = self.root.join("worksets").join(workset_id);
-        if root.exists() {
-            std::fs::remove_dir_all(&root).with_context(|| format!("delete workset {root}"))?;
+        let live = self
+            .worksets
+            .lock()
+            .await
+            .remove(workset_id)
+            .and_then(|workset| workset.upgrade());
+        let _workset_guard = match &live {
+            Some(workset) => Some(Arc::clone(&workset.operation_lock).lock_owned().await),
+            None => None,
+        };
+        let stores_dir = self.root.join("stores");
+        for entry in std::fs::read_dir(&stores_dir)
+            .with_context(|| format!("list clone stores in {stores_dir}"))?
+        {
+            let entry = entry?;
+            let clone = entry.path().join("clones").join(workset_id);
+            if !clone.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let store = self.stores.lock().await.get(&name).and_then(Weak::upgrade);
+            let _store_guard = match &store {
+                Some(store) => Some(store.operation_lock.lock().await),
+                None => None,
+            };
+            std::fs::remove_dir_all(&clone)
+                .with_context(|| format!("remove workset clone {}", clone.display()))?;
         }
+        let base = self.root.join("worksets").join(workset_id);
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("remove workset {base}")),
+        }
+        let mut write = self.db.write().await;
+        let key = workset_id.to_owned();
+        write
+            .open_table(WORKSET_RECORDS)
+            .remove(SenValue::borrowed(&key));
+        write.commit();
         Ok(())
     }
 
@@ -682,7 +731,10 @@ impl WorksetInner {
             .owner
             .upgrade()
             .context("worksets manager was dropped")?;
-        let store = owner.store(repo, remote_url).await?;
+        let (store, initialized) = owner.store(repo, remote_url).await?;
+        if !initialized {
+            owner.fetch_store(&store).await?;
+        }
         self.create_workspace(store, name.unwrap_or(repo), at).await
     }
 
