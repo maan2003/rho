@@ -13,6 +13,6 @@ the `rho-agent` runtime loop only, in `crates/rho-agent/specs/`.
 Managed subtrees are first-class parts of this codebase, not opaque third-party
 dependencies. In particular, edit `vendor/zed` directly when Zed is the
 correct ownership layer instead of adding a workaround in a
-Rho crate. Apply the same rule to every path reported by `jj subtree list`,
-including `crates/senax-encoder`. Consult the `jj-subtree-management` skill
-when adding, adopting, or updating a subtree.
+Rho crate. Apply the same rule to every vendored subtree, including
+`crates/senax-encoder`. Consult the `git-subtree` skill when adding or
+updating a subtree.

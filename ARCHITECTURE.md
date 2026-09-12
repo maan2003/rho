@@ -622,7 +622,7 @@ the revision only after explicit confirmation, while discard reloads the daemon
 contents into the same buffer entity. Focus loss does not save because arbitrary
 external writers can still race the content check and write.
 
-Rho imports iroh as a managed jj subtree and patches its `noq` transport
+Rho vendors iroh as a squashed git subtree and patches its `noq` transport
 dependencies to vendored copies. The local extensions preserve strict stream
 priorities, add relative send-stream weights within each equal-priority
 fair-scheduling class, and allow an application-authenticated pair to
