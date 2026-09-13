@@ -85,17 +85,49 @@ pub(crate) struct MailItem {
     pub at: UnixMs,
 }
 
-/// The tools the model may call and the instructions it gets, built from the
+/// The session-lifetime tools and prompt ingredients, built from the
 /// agent's workdirs once they are materialized. Lazy because a load must not
 /// fail on a workdir that has gone: a reader still gets the transcript, and
 /// only a turn needs the tools.
 struct Surface {
     tools: BTreeMap<ToolName, Arc<dyn Tool>>,
-    instructions: Arc<str>,
+    prompt: PromptInputs,
+}
+
+/// Role-independent ingredients; rendering instructions never rebuilds tools.
+struct PromptInputs {
+    view: Arc<View>,
+    multi_agent: Option<MultiAgentTools>,
+    host_specs: Vec<ToolSpec>,
+    notes: Option<Lazy<std::path::PathBuf>>,
+}
+
+struct Instructions {
+    text: Arc<str>,
     notes: Option<std::path::PathBuf>,
 }
 
-/// What a surface is built from; kept so a role change can build another.
+impl PromptInputs {
+    async fn render(&self, role: AgentRole) -> anyhow::Result<Instructions> {
+        let text = prompt::prompt(
+            &self.view,
+            self.multi_agent.as_ref(),
+            role,
+            &self.host_specs,
+        );
+        let notes = match &self.notes {
+            Some(notes) if role.uses_notes_rotation() => Some(notes.get().await?.clone()),
+            _ => None,
+        };
+        let text = match &notes {
+            Some(path) => Arc::from(format!("{}{}", text, notes::instructions(path))),
+            None => text,
+        };
+        Ok(Instructions { text, notes })
+    }
+}
+
+/// Inputs consumed by the session's lazy tool initialization.
 #[derive(Clone)]
 struct SurfaceInputs {
     view: Arc<Lazy<Arc<View>>>,
@@ -106,7 +138,7 @@ struct SurfaceInputs {
 }
 
 impl SurfaceInputs {
-    fn lazy(&self, role: AgentRole, profile: InferenceProfile) -> Arc<Lazy<Surface>> {
+    fn lazy(&self, role: AgentRole) -> Arc<Lazy<Surface>> {
         let inputs = self.clone();
         Arc::new(Lazy::new(move || {
             let inputs = inputs.clone();
@@ -117,7 +149,6 @@ impl SurfaceInputs {
                     role,
                     inputs.agent_id,
                     Some(&inputs.inference),
-                    profile,
                     inputs.parent,
                     &inputs.pool,
                 )
@@ -290,8 +321,7 @@ impl AgentHandle {
             db,
             agent_id,
             pool,
-            surface: surface_inputs.lazy(role, profile),
-            surface_inputs,
+            surface: surface_inputs.lazy(role),
             model,
             history: replayed.history,
             context: replayed.context,
@@ -679,7 +709,6 @@ struct Agent {
     agent_id: AgentId,
     pool: std::sync::Weak<AgentPool>,
     surface: Arc<Lazy<Surface>>,
-    surface_inputs: SurfaceInputs,
     model: InferenceModel,
 
     /// The transcript. Append-only, and this struct is its sole writer.
@@ -1201,9 +1230,8 @@ impl Agent {
             self.session.abort();
         }
         self.model = model;
-        // The prompt and the tool surface follow the role, so the next turn
-        // builds them again.
-        self.surface = self.surface_inputs.lazy(role, profile);
+        // Instructions are rendered from the current role on each request.
+        // The session's tool surface (including Python globals) stays alive.
         Ok(())
     }
 
@@ -1345,28 +1373,35 @@ impl Agent {
                 return;
             }
         };
-        let notes_rotation = self
-            .head
-            .read()
-            .expect("poison")
-            .config
-            .role
-            .uses_notes_rotation();
+        let role = self.head.read().expect("poison").config.role;
+        let prompt = match surface.prompt.render(role).await {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.fail(
+                    now,
+                    PendingInferenceResponse::default(),
+                    format!("{error:#}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let notes_rotation = role.uses_notes_rotation();
         let instructions = if !notes_rotation && self.context.marker.is_some() {
             // Older experimental builds emitted rotation notices for ordinary roles.
             Arc::from(format!(
                 "{}\n\nThis role uses standard provider compaction, not notes rotation. Earlier retention and preparation notices are canceled; continue the user's task.",
-                surface.instructions
+                prompt.text
             ))
         } else {
-            Arc::clone(&surface.instructions)
+            Arc::clone(&prompt.text)
         };
         let tool_specs = surface
             .tools
             .values()
             .map(|tool| tool.spec())
             .collect::<Arc<[ToolSpec]>>();
-        let notes_path = surface.notes.clone();
+        let notes_path = prompt.notes;
         // What is owed is settled here and nowhere earlier:
         // `SPEC-restart-recovery`.
         let previous_failure = match &self.phase {
@@ -2158,14 +2193,14 @@ fn usage_model(model: InferenceModel) -> AgentUsageModel {
 
 // -- the tool surface -------------------------------------------------------
 
-/// The tools and instructions of one agent.
+/// Build one session-lifetime notebook. Allowed role switches preserve its
+/// capabilities.
 #[allow(clippy::too_many_arguments)]
 fn surface(
     view: Arc<View>,
     role: AgentRole,
     agent_id: AgentId,
     inference: Option<&Inference>,
-    profile: InferenceProfile,
     parent: Option<AgentId>,
     pool: &std::sync::Weak<AgentPool>,
 ) -> anyhow::Result<Surface> {
@@ -2173,31 +2208,26 @@ fn surface(
         .upgrade()
         .map(|_| MultiAgentTools::new(pool.clone(), agent_id, parent));
     let (shell, others) = host_tools(&view, role, agent_id, inference, multi_agent.as_ref(), pool);
-    // The notebook is the whole surface, whatever the profile once said about
-    // code modes: every role runs Python.
-    let _ = profile;
-    let instructions = prompt::prompt(
-        view.as_ref(),
-        multi_agent.as_ref(),
-        role,
-        &others.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
-    );
-    let notes = inference
-        .filter(|_| role.uses_notes_rotation())
-        .map(|_| notes::directory(view.workset()))
-        .transpose()?;
-    let instructions = match notes.as_ref() {
-        Some(path) => Arc::from(format!("{}{}", instructions, notes::instructions(path))),
-        None => instructions,
-    };
+    let host_specs = others.iter().map(|tool| tool.spec()).collect();
+    let notes = inference.map(|_| {
+        let view = Arc::clone(&view);
+        Lazy::new(move || {
+            let view = Arc::clone(&view);
+            async move { notes::directory(view.workset()) }
+        })
+    });
     let tool: Arc<dyn Tool> = Arc::new(
         rho_agent_tools::PythonTool::new(shell, others)
             .map_err(|error| anyhow::anyhow!("the Python notebook failed to start: {error}"))?,
     );
     Ok(Surface {
         tools: BTreeMap::from([(tool.spec().name, tool)]),
-        instructions,
-        notes,
+        prompt: PromptInputs {
+            view,
+            multi_agent,
+            host_specs,
+            notes,
+        },
     })
 }
 
@@ -2283,22 +2313,19 @@ pub fn render_agent_surface(
             tools: Arc::from([]),
         });
     }
-    let profile = binding
+    binding
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
     let placeholder = AgentId::from_counter(1, &crate::db::AgentIdDomain(0))
         .expect("counter 1 is within prefix-id capacity");
-    let surface = surface(
-        view,
-        role,
-        placeholder,
-        None,
-        profile,
-        None,
-        &std::sync::Weak::new(),
-    )?;
+    let surface = surface(view, role, placeholder, None, None, &std::sync::Weak::new())?;
     Ok(crate::RenderedAgentSurface {
-        system_prompt: surface.instructions,
+        system_prompt: prompt::prompt(
+            &surface.prompt.view,
+            surface.prompt.multi_agent.as_ref(),
+            role,
+            &surface.prompt.host_specs,
+        ),
         tools: surface.tools.values().map(|tool| tool.spec()).collect(),
     })
 }

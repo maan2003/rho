@@ -520,6 +520,91 @@ async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
 }
 
 #[tokio::test]
+async fn role_switches_preserve_python_and_refresh_instructions() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = standard_agent(directory.path()).await;
+    let surface = Arc::clone(&agent.surface);
+    reply(
+        &mut agent,
+        vec![exec("initialize", "remembered = [41]")],
+        100,
+    )
+    .await;
+
+    for (index, intelligence) in [
+        EngineerIntelligence::High,
+        EngineerIntelligence::HighNotes,
+        EngineerIntelligence::High,
+        EngineerIntelligence::Cheap,
+        EngineerIntelligence::Low,
+        EngineerIntelligence::Medium,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cell_returned(&agent).await;
+        assert!(
+            !agent.latest_python_exec.as_ref().unwrap().1.facts().failed,
+            "switch {index}: {:?}",
+            agent
+                .tools
+                .values_mut()
+                .map(|tool| tool.session.first_output())
+                .collect::<Vec<_>>()
+        );
+        // Drain tool output, then settle the synthetic provider response.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                agent.start_request(UnixMs::now(), None).await;
+                agent.session.abort();
+                reply(&mut agent, vec![message("done")], 100).await;
+                if agent.tools.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let role = AgentRole::Engineer { intelligence };
+        agent.change_role(role).await.unwrap();
+        assert!(Arc::ptr_eq(&surface, &agent.surface));
+        let instructions = agent
+            .surface
+            .get()
+            .await
+            .unwrap()
+            .prompt
+            .render(role)
+            .await
+            .unwrap();
+        assert_eq!(instructions.notes.is_some(), role.uses_notes_rotation());
+        assert_eq!(
+            instructions.text.contains("# Notes and context rotation"),
+            role.uses_notes_rotation()
+        );
+        assert_eq!(
+            agent.model,
+            role.session_profile().unwrap().deep_model().unwrap()
+        );
+
+        agent.start_request(UnixMs::now(), None).await;
+        reply(
+            &mut agent,
+            vec![exec(
+                &format!("after-{index}"),
+                &format!("assert remembered == [{}]\nremembered[0] += 1", 41 + index),
+            )],
+            100,
+        )
+        .await;
+    }
+    cell_returned(&agent).await;
+    assert!(!agent.latest_python_exec.as_ref().unwrap().1.facts().failed);
+}
+
+#[tokio::test]
 async fn role_switches_cancel_pending_rotation_durably() {
     let directory = tempfile::tempdir().unwrap();
     let mut agent = standard_agent(directory.path()).await;

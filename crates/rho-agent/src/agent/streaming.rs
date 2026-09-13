@@ -449,8 +449,12 @@ pub(in crate::agent) mod tests {
             .unwrap(),
         );
         let surface = Surface {
-            instructions: Arc::from("test"),
-            notes: None,
+            prompt: PromptInputs {
+                view,
+                multi_agent: None,
+                host_specs: Vec::new(),
+                notes: Some(Lazy::ready(directory.join("notes"))),
+            },
             tools: BTreeMap::from([(tool.spec().name, tool)]),
         };
         let (control, control_rx) = mpsc::unbounded_channel();
@@ -459,13 +463,6 @@ pub(in crate::agent) mod tests {
             agent_id: id,
             pool: Default::default(),
             surface: Arc::new(Lazy::ready(surface)),
-            surface_inputs: SurfaceInputs {
-                view: Arc::new(Lazy::ready(view)),
-                agent_id: id,
-                inference: inference.clone(),
-                parent: None,
-                pool: Default::default(),
-            },
             model,
             history: Vec::new(),
             context: Default::default(),
