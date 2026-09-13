@@ -2597,11 +2597,16 @@ async fn handle_message(
             prepare_image_content(&mut content).await?;
             let (_, agent, _) = services.load(agent_id).await?;
             // What Rho has to tell the agent goes ahead of the person's
-            // words, once.
-            if let Some(text) = agent.head().pending_notice {
+            // words, once: the loop's head forgets it as soon as the
+            // message is accepted, the log when the message's row lands.
+            let notice = agent.head().pending_notice;
+            if let Some(text) = notice.clone() {
                 content.insert(0, rho_core::ContentPart::Text { text });
             }
             agent.send_user_content_accepted(content, delivery).await?;
+            if notice.is_some() {
+                agent.notice_carried();
+            }
             Ok(Refresh::None)
         }
         // A compaction rides the next request whichever lane the client

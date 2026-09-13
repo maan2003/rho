@@ -812,6 +812,14 @@ impl RunningAgent {
         }
     }
 
+    /// A user message carried the pending notice: it is not said again.
+    pub fn notice_carried(&self) {
+        match self {
+            Self::Rho(agent) => agent.notice_carried(),
+            Self::Claude(agent) => agent.notice_carried(),
+        }
+    }
+
     /// Say the live tail whole again.
     pub fn tell_tail(&self) {
         match self {

@@ -345,6 +345,12 @@ impl AgentHandle {
         self.head.read().expect("poison").clone()
     }
 
+    /// A user message carried the pending notice: it is not said again.
+    /// The log agrees once the message's row is in it.
+    pub fn notice_carried(&self) {
+        self.head.write().expect("poison").pending_notice = None;
+    }
+
     /// Say the whole tail again: a client just started looking.
     pub fn tell_tail(&self) {
         let _ = self.control.send(Control::TellTail);

@@ -184,7 +184,9 @@ fn mint_workset_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
 }
 
-/// What the agent is told, ahead of its first user message after the move.
+/// What the agent is told, ahead of its first user message after the move:
+/// where it is now, where its work was, and the state to reach. How to get
+/// there is the agent's to work out.
 fn moved_notice(old: &OldWorkspaceInfo) -> String {
     let mut note = String::from(
         "Note from Rho: this agent was moved into a workset. Your working directory is now \
@@ -195,20 +197,23 @@ fn moved_notice(old: &OldWorkspaceInfo) -> String {
         OldWorkspaceInfo::Workspace { repo, id } | OldWorkspaceInfo::Sandbox { repo, id } => {
             let workspace = format!("ws-{}", id.encoded());
             note.push_str(&format!(
-                "Before, you worked in the jj workspace {workspace} of {repo}, which is still \
-                 there: `jj -R {repo} --ignore-working-copy log -r '{workspace}@'` shows its \
-                 working-copy commit and `jj -R {repo} --ignore-working-copy git root` its git \
-                 store. Clone the repository you need into /src (`git clone <url> /src/<name>`) \
-                 and bring over what you want, for example \
-                 `git -C /src/<name> -c uploadpack.allowAnySHA1InWant=true fetch <git store> <commit>` \
-                 and then a checkout or cherry-pick of it. Leave the old workspace as it is."
+                "Before, you worked in the jj workspace {workspace} of the repository at {repo}; \
+                 it is still there with your commits, and \
+                 `jj -R {repo} --ignore-working-copy log -r '{workspace}@'` shows where it \
+                 stands. The state to reach: a clone under /src of the repository's remote \
+                 (the URL `git -C {repo} remote get-url origin` names; clone that, not the \
+                 local store), with the commits you still need fetched by id from the local \
+                 git store (`jj -R {repo} --ignore-working-copy git root`) and cherry-picked \
+                 in. Leave the old workspace as it is."
             ));
         }
         OldWorkspaceInfo::UserCheckout { repo } => {
             note.push_str(&format!(
-                "Before, you worked directly in {repo}, the user's own checkout. Clone the \
-                 repository you need into /src (`git clone <url> /src/<name>`) and continue \
-                 there; leave {repo} to the user."
+                "Before, you worked directly in {repo}, the user's own checkout. The state to \
+                 reach: a clone under /src of the repository's remote (the URL \
+                 `git -C {repo} remote get-url origin` names; clone that, not {repo}), with \
+                 any commits you still need fetched by id from {repo} and cherry-picked in. \
+                 Leave {repo} to the user."
             ));
         }
         OldWorkspaceInfo::Workset { workset, cwd, .. } => {
