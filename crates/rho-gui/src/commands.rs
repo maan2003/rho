@@ -95,6 +95,7 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
             "eng-low",
             "eng-cheap",
             "eng-high",
+            "eng-high-notes",
             "eng-ultra",
             "eng-alt",
             "eng-gemini",
@@ -285,7 +286,12 @@ mod tests {
     #[test]
     fn role_field_completes_roles_and_intelligence() {
         let candidates = role_field_candidates("eng-h");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].value, "eng-high");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eng-high", "eng-high-notes"]
+        );
     }
 }

@@ -513,6 +513,45 @@ fn compaction_trigger_is_the_last_provider_input_item() {
 }
 
 #[test]
+fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffix() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let mut session = test_inference_service_with(
+        auth,
+        "gpt-test",
+        PromptCacheKey::from_bytes(*b"noteskey"),
+        Some(42_000),
+    );
+    // The adapter distinguishes automatic rotation from an explicit manual
+    // override.
+    let request = inference_request(
+        vec![
+            user_block("discarded"),
+            user_block("retained"),
+            Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
+            Arc::new(ContextBlock::CompactionTrigger),
+            user_block("prepare notes"),
+        ],
+        Vec::new(),
+    );
+    session.set_context_rotation(true);
+    let body = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
+    let json = serde_json::to_value(body).unwrap();
+    assert!(json.get("context_management").is_none());
+    assert!(!json["input"].to_string().contains("compaction_trigger"));
+    assert!(!json["input"].to_string().contains("discarded"));
+    assert!(json["input"].to_string().contains("retained"));
+
+    session.set_context_rotation(false);
+    let body = ResponsesRequest::from_inference_request(&session.config, request, None);
+    let json = serde_json::to_value(body).unwrap();
+    assert_eq!(
+        json["input"].as_array().unwrap().last().unwrap()["type"],
+        "compaction_trigger"
+    );
+    assert!(!json["input"].to_string().contains("discarded"));
+}
+
+#[test]
 fn compaction_replay_trims_before_latest_compaction_item() {
     let request = inference_request(
         vec![

@@ -99,7 +99,10 @@ request builder:
 - resolves tool identities from full history so late output from dropped calls
   can be emitted as standalone named output;
 - trims input before the latest legacy provider compaction item when replaying
-  compacted history. Native rotation does not request provider summary compaction.
+  compacted history. Automatic notes-rotation requests suppress both server compaction and
+  manual triggers. An explicit Compact request overrides notes mode, using real
+  provider compaction through completion and retries. Ordinary roles retain
+  provider summary compaction.
 
 There is no separate request-window field. `rho-core::context_window_start`
 interprets and checks the typed activation items; `rho-agent` owns when to append

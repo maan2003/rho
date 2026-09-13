@@ -123,6 +123,8 @@ pub enum EngineerIntelligence {
     Cheap,
     /// Reduced function-tool agent backed by Gemini through Antigravity.
     Gemini,
+    /// High engineer with shared-notes context rotation.
+    HighNotes,
 }
 
 /// The intelligence as rows wrote it while `eng-py` and `eng-ultra-py`
@@ -141,6 +143,7 @@ enum StoredEngineerIntelligence {
     Gemini,
     Python,
     UltraPython,
+    HighNotes,
 }
 
 impl senax_encoder::Decoder for EngineerIntelligence {
@@ -150,12 +153,24 @@ impl senax_encoder::Decoder for EngineerIntelligence {
             Stored::Low => Self::Low,
             Stored::Medium | Stored::Python => Self::Medium,
             Stored::High => Self::High,
+            Stored::HighNotes => Self::HighNotes,
             Stored::Ultra | Stored::UltraPython => Self::Ultra,
             Stored::Mini => Self::Mini,
             Stored::Alt => Self::Alt,
             Stored::Cheap => Self::Cheap,
             Stored::Gemini => Self::Gemini,
         })
+    }
+}
+
+impl AgentRole {
+    pub fn uses_notes_rotation(self) -> bool {
+        matches!(
+            self,
+            Self::Engineer {
+                intelligence: EngineerIntelligence::HighNotes
+            }
+        )
     }
 }
 
@@ -856,6 +871,32 @@ mod tests {
         let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
         assert_eq!(decoded.output.as_str(), "done");
         assert!(decoded.full_output.is_none());
+    }
+
+    #[test]
+    fn notes_role_round_trips_and_is_opt_in() {
+        let role = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::HighNotes,
+        };
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(&role, &mut encoded).unwrap();
+        assert_eq!(
+            senax_encoder::decode::<AgentRole>(&mut encoded).unwrap(),
+            role
+        );
+        let mut packed = senax_encoder::pack(&role).unwrap();
+        assert_eq!(
+            senax_encoder::unpack::<AgentRole>(&mut packed).unwrap(),
+            role
+        );
+        assert!(role.uses_notes_rotation());
+        assert!(!AgentRole::default().uses_notes_rotation());
+        assert!(
+            !AgentRole::Engineer {
+                intelligence: EngineerIntelligence::High
+            }
+            .uses_notes_rotation()
+        );
     }
 
     #[test]

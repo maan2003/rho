@@ -333,9 +333,10 @@ impl ResponsesRequest {
         // The Responses API requires a manual compaction trigger to be the
         // final input item. Multiple queued requests are equivalent, so
         // coalesce them into one trigger at the tail.
-        if timeline
-            .iter()
-            .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
+        if !session.responses_config.context_rotation
+            && timeline
+                .iter()
+                .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
         {
             convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_names, &mut input);
         }

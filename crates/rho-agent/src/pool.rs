@@ -453,6 +453,7 @@ impl AgentPool {
             | SessionBinding::ResponsesSol(_)
             | SessionBinding::ResponsesLuna(_)
             | SessionBinding::ResponsesTerra(_)
+            | SessionBinding::ResponsesAstraNotes(_)
             | SessionBinding::ResponsesAstra(_)
             | SessionBinding::AdvisorSol(_)
             | SessionBinding::AdvisorTerra(_)

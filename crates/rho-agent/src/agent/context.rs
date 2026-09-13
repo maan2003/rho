@@ -10,6 +10,10 @@ use crate::ContextChange;
 pub(super) const RETAIN_TOKENS: u64 = 40000;
 pub(super) const REPAIR_HEADROOM: u64 = 8000;
 
+pub(super) const MANUAL_COMPACTION: &str = "Manual compaction was requested. All earlier retention and preparation notices are canceled; do not resume their preparation. This request uses provider compaction. Any future automatic notes rotation will establish a new boundary.";
+
+pub(super) const POLICY_CHANGED: &str = "The context-management role has changed. All earlier retention and preparation notices are canceled; do not resume their preparation. Follow the current role's instructions. Any future notes rotation will establish a new boundary. Existing notes and the current retained conversation remain available.";
+
 pub(super) const MARKER: &str = "Context retention boundary: at the next rotation, this notice and everything after it will \
      remain in context; everything before it will leave. Keep incremental notes in your notes directory as \
      you work. You will receive one dedicated preparation response before rotation.";
@@ -80,9 +84,9 @@ impl Window {
         }
     }
 
-    /// Explicit /compact and an oversized first turn may have no early
-    /// marker. Retain a recent suffix and identify its actual beginning in
-    /// the preparation notice, instead of discarding the whole conversation.
+    /// An oversized first turn may have no early marker. Retain a recent suffix
+    /// and identify its actual beginning in the preparation notice, instead
+    /// of discarding the whole conversation.
     pub fn fallback_start(&self, history: &[Arc<ContextBlock>]) -> usize {
         let mut used = 0;
         let mut start = history.len();

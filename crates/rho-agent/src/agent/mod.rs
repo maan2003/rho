@@ -572,6 +572,7 @@ pub(crate) enum Standing {
         since: UnixMs,
         failed_at: UnixMs,
         attempts: u32,
+        compaction_owes_reply: bool,
         error: Arc<str>,
     },
     /// The user cancelled at `at`, and nothing has been asked since.
@@ -870,7 +871,15 @@ impl Agent {
                 latest: true,
             });
         }
-        if let Some(preparation) = &self.context.preparation {
+        if self
+            .head
+            .read()
+            .expect("poison")
+            .config
+            .role
+            .uses_notes_rotation()
+            && let Some(preparation) = &self.context.preparation
+        {
             let returned = preparation.call.as_ref().is_none_or(|id| {
                 self.tools.get(id).is_none_or(|tool| {
                     tool.session
@@ -917,6 +926,7 @@ impl Agent {
                     }
                     InferenceEvent::TemporaryFailure { error, .. } => {
                         let (since, attempts) = in_flight.retry.unwrap_or((now, 0));
+                        let compaction_owes_reply = in_flight.compaction_owes_reply;
                         let partial = std::mem::take(&mut in_flight.pending);
                         let error = error.to_string();
                         let has_execution = self.abandon_stream(now).await;
@@ -945,6 +955,7 @@ impl Agent {
                                     since,
                                     failed_at: now,
                                     attempts: attempts + 1,
+                                    compaction_owes_reply,
                                     error: Arc::from(error),
                                 }
                             },
@@ -1141,11 +1152,12 @@ impl Agent {
                     | EngineerIntelligence::Cheap
                     | EngineerIntelligence::Medium
                     | EngineerIntelligence::High
+                    | EngineerIntelligence::HighNotes
             )
         };
         anyhow::ensure!(
             switchable(requested),
-            "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
+            "this agent can switch only between eng-low, eng-cheap, eng, eng-high, and eng-high-notes"
         );
         let current = self.head.read().expect("poison").config.role;
         let role = match current {
@@ -1155,7 +1167,7 @@ impl Agent {
                 }
             }
             _ => anyhow::bail!(
-                "this agent can switch only between eng-low, eng-cheap, eng, and eng-high"
+                "this agent can switch only between eng-low, eng-cheap, eng, eng-high, and eng-high-notes"
             ),
         };
         if role == current {
@@ -1179,6 +1191,14 @@ impl Agent {
             let mut head = self.head.write().expect("poison");
             head.config.role = role;
             head.config.binding = binding;
+        }
+        if current.uses_notes_rotation() != role.uses_notes_rotation() {
+            self.context.rotated();
+            self.history.push(Arc::new(ContextBlock::DeveloperMessage {
+                text: context::POLICY_CHANGED.into(),
+            }));
+            // Same-model roles still change the developer instructions.
+            self.session.abort();
         }
         self.model = model;
         // The prompt and the tool surface follow the role, so the next turn
@@ -1325,7 +1345,22 @@ impl Agent {
                 return;
             }
         };
-        let instructions = Arc::clone(&surface.instructions);
+        let notes_rotation = self
+            .head
+            .read()
+            .expect("poison")
+            .config
+            .role
+            .uses_notes_rotation();
+        let instructions = if !notes_rotation && self.context.marker.is_some() {
+            // Older experimental builds emitted rotation notices for ordinary roles.
+            Arc::from(format!(
+                "{}\n\nThis role uses standard provider compaction, not notes rotation. Earlier retention and preparation notices are canceled; continue the user's task.",
+                surface.instructions
+            ))
+        } else {
+            Arc::clone(&surface.instructions)
+        };
         let tool_specs = surface
             .tools
             .values()
@@ -1351,14 +1386,49 @@ impl Agent {
             } => Some((*since, *attempts)),
             _ => None,
         };
+        let pending_compaction =
+            self.history
+                .iter()
+                .skip(rho_core::context_window_start(&self.history))
+                .rev()
+                .find_map(|block| match &**block {
+                    ContextBlock::CompactionTrigger => Some(true),
+                    ContextBlock::InferenceResponse { .. }
+                    | ContextBlock::ContextRotation { .. } => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(false);
+        let manual = pending_compaction
+            || self
+                .user
+                .iter()
+                .any(|input| matches!(input.kind, InputKind::Compaction));
+        let cancel_rotation = manual && self.context.marker.is_some();
+        if manual {
+            self.context.rotated();
+        }
+        // Explicit compaction always uses the provider, including transport retries.
+        let notes_rotation = notes_rotation && !manual;
+        self.session.set_context_rotation(notes_rotation);
+        if !notes_rotation {
+            self.context.preparation = None;
+        }
+        let retry_owes_reply = matches!(
+            &self.phase,
+            Phase::Idle {
+                standing: Standing::Retry {
+                    compaction_owes_reply: true,
+                    ..
+                },
+                ..
+            }
+        );
         let prior_preparation = self.context.preparation.clone();
         let limit = self.session.auto_compact_token_limit();
-        let manual = self
-            .user
-            .iter()
-            .any(|input| matches!(input.kind, InputKind::Compaction));
         let mut rotate = None;
-        let mut change = if let Some(preparation) = &prior_preparation {
+        let mut change = if !notes_rotation {
+            None
+        } else if let Some(preparation) = &prior_preparation {
             if !preparation.replied {
                 Some(crate::ContextChange::Preparing {
                     retain_from: preparation.retain_from as u64,
@@ -1389,10 +1459,9 @@ impl Agent {
                     None
                 }
             }
-        } else if manual
-            || limit
-                .zip(self.context_used)
-                .is_some_and(|(limit, used)| used >= limit)
+        } else if limit
+            .zip(self.context_used)
+            .is_some_and(|(limit, used)| used >= limit)
         {
             Some(crate::ContextChange::Preparing {
                 retain_from: self
@@ -1422,6 +1491,11 @@ impl Agent {
             .map(|(id, _)| id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         let mut blocks = std::mem::take(&mut self.recovery_blocks);
+        if cancel_rotation {
+            blocks.push(ContextBlock::DeveloperMessage {
+                text: context::MANUAL_COMPACTION.into(),
+            });
+        }
         self.collect_stream_notes(Some(&delivered));
         if !owed.is_empty() {
             blocks.push(ContextBlock::ToolResults {
@@ -1556,18 +1630,16 @@ impl Agent {
             }));
 
             // Ordinary input enters only outside the dedicated preparation exchange.
-            blocks.extend(
-                std::mem::take(&mut self.user)
-                    .into_iter()
-                    .filter_map(|input| match input.kind {
-                        InputKind::Message { content } => Some(ContextBlock::UserMessage {
-                            sender: MessageSender::User,
-                            content,
-                        }),
-                        // Explicit compact uses the same rotation path, never a provider summary.
-                        InputKind::Compaction => None,
-                    }),
-            );
+            let mut inputs = std::mem::take(&mut self.user);
+            inputs.sort_by_key(|input| matches!(input.kind, InputKind::Compaction));
+            blocks.extend(inputs.into_iter().filter_map(|input| match input.kind {
+                InputKind::Message { content } => Some(ContextBlock::UserMessage {
+                    sender: MessageSender::User,
+                    content,
+                }),
+                InputKind::Compaction if notes_rotation => None,
+                InputKind::Compaction => Some(ContextBlock::CompactionTrigger),
+            }));
         }
 
         for text in std::mem::take(&mut self.recovery_notes) {
@@ -1618,7 +1690,8 @@ impl Agent {
                      to build on the work already done and avoid duplicating work. Continue the user's task.\n\n{inventory}"
                 ),
             });
-        } else if self.context.marker.is_none()
+        } else if notes_rotation
+            && self.context.marker.is_none()
             && limit
                 .zip(self.context_used)
                 .is_some_and(|(limit, used)| used >= limit.saturating_sub(context::RETAIN_TOKENS))
@@ -1630,6 +1703,24 @@ impl Agent {
                 text: context::MARKER.to_owned(),
             });
         }
+
+        // Standard roles retain the existing explicit provider-compaction path.
+        let compacting_already =
+            pending_compaction || blocks.contains(&ContextBlock::CompactionTrigger);
+        let compact = !notes_rotation
+            && !compacting_already
+            && limit
+                .zip(self.context_used)
+                .is_some_and(|(limit, used)| used >= limit);
+        if compact {
+            blocks.push(ContextBlock::CompactionTrigger);
+        }
+        let compaction_owes_reply = !preparing
+            && (retry_owes_reply || compact
+                || blocks
+                    .iter()
+                    .any(|block| !matches!(block, ContextBlock::CompactionTrigger)
+                        && !matches!(block, ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION)));
 
         // The drain, the append and the send are one event because they are one
         // thing: a crash between them would leave a transcript nobody drained
@@ -1668,7 +1759,7 @@ impl Agent {
         self.phase = Phase::Requesting(InFlight {
             retry,
             previous_failure,
-            compaction_owes_reply: !preparing,
+            compaction_owes_reply,
             ..InFlight::default()
         });
     }
@@ -2092,6 +2183,7 @@ fn surface(
         &others.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
     );
     let notes = inference
+        .filter(|_| role.uses_notes_rotation())
         .map(|_| notes::directory(view.workset()))
         .transpose()?;
     let instructions = match notes.as_ref() {

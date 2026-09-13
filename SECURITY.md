@@ -784,6 +784,11 @@ own tools denied.
 
 ## Native context rotation and notes
 
+Rotation is opt-in through `eng-high-notes`; ordinary roles keep provider
+compaction. Manual Compact always uses provider compaction and cancels the
+current rotation cycle. Role transitions cancel pending preparation durably and discard
+provider continuation without reopening previously discarded history.
+
 - Full transcripts and original call identities remain durable; rotation changes
   only the provider-visible suffix through a typed transcript activation item.
   Inference derives the cutoff from that item and excludes pre-activation provider

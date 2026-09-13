@@ -93,7 +93,7 @@ walks back to the root and replays forwards
 Instructions are deliberately not among the stored fields
 ([DECISION-instructions-are-code](DECISION-instructions-are-code.md)).
 
-Native context rotation retains a verbatim suffix of full history; the active
+The opt-in `eng-high-notes` role retains a verbatim suffix of full history; the active
 window boundary is a typed `ContextRotation` transcript item, persisted with
 its ordinary drain. Early marker and preparation events describe scheduling, not
 a separate active-window authority. Preparation supplies response/cell-completion facts to `boundary`; it

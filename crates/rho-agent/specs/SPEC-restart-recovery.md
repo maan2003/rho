@@ -97,6 +97,10 @@ Required by
 
 ### Context rotation
 
+Only `eng-high-notes` schedules rotation. Role transitions reset unfinished
+rotation state and append the same cancellation notice live and during replay;
+committed retention boundaries remain authoritative regardless of current role.
+
 A live rotation preserves Python and jobs; a restart never does. Replay retains
 the last committed active-window boundary but abandons an unfinished preparation
 exchange. The next independently triggered request explains that note writes may

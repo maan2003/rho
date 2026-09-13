@@ -89,3 +89,31 @@ fn provider_debug_request_redacts_image_data() {
     );
     assert!(!value.to_string().contains("SECRET"));
 }
+
+#[test]
+fn notes_policy_disables_server_compaction_and_can_restore_it() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let mut session = InferenceSession::new_deep(
+        Inference::for_test(auth),
+        InferenceProfile::default(),
+        InferenceModel::Gpt55,
+        PromptCacheKey::from_bytes(*b"noteskey"),
+    );
+    assert_eq!(
+        session.config.responses_config.auto_compaction,
+        Some(232_560)
+    );
+    session.set_context_rotation(true);
+    assert_eq!(session.config.responses_config.auto_compaction, None);
+    session.set_context_rotation(false);
+    assert_eq!(
+        session.config.responses_config.auto_compaction,
+        Some(232_560)
+    );
+    session.set_deep_config(InferenceProfile::default(), InferenceModel::Gpt6Astra);
+    session.set_context_rotation(false);
+    assert_eq!(
+        session.config.responses_config.auto_compaction, None,
+        "Lite uses explicit triggers"
+    );
+}

@@ -85,7 +85,10 @@ GenerateContent requests for the explicit Gemini agent mode.
   not cancel in-flight turns. Replacing an idle connection deliberately clears
   its connection-bound response id, so the next request safely full-replays its
   transcript.
-- Native Responses context rotation disables automatic server summary compaction.
+- The opt-in native notes policy disables automatic server summary compaction
+  and suppresses retained triggers during rotation requests. Explicit Compact
+  overrides this policy and uses provider compaction, including retries.
+  Ordinary roles keep provider compaction.
   Requests carry full local history. Harness-authored `ContextRotation` items
   select the active suffix, while earlier history remains available for tool-name
   lookup. Forward or decreasing cutoffs violate the trusted caller contract and

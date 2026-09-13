@@ -327,7 +327,8 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
 fn default_advisor_intelligence(role: AgentRole) -> crate::db::AdvisorIntelligence {
     match role {
         AgentRole::Engineer {
-            intelligence: crate::db::EngineerIntelligence::High,
+            intelligence:
+                crate::db::EngineerIntelligence::High | crate::db::EngineerIntelligence::HighNotes,
         } => crate::db::AdvisorIntelligence::High,
         _ => crate::db::AdvisorIntelligence::Medium,
     }

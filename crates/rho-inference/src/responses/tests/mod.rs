@@ -288,6 +288,7 @@ fn test_inference_service_with(
     session.config.responses_config = super::session::ResponsesConfig {
         model: ResponsesModel::Test(model.into()),
         auto_compaction,
+        context_rotation: false,
         reasoning_context: super::session::ReasoningContext::AllTurns,
         effort: ResponsesEffort::Medium,
         text_verbosity: TextVerbosity::Medium,

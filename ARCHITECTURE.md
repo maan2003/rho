@@ -58,7 +58,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   mail and user input are pull-based sources it drains at that boundary; the
   model paces its own check-ins with the notebook's `set_checkin`. Its
   architecture and governing decisions are recorded under
-  `crates/rho-agent/specs/`. Native context rotation persists an active suffix
+  `crates/rho-agent/specs/`. The opt-in `eng-high-notes` role persists an active suffix
   boundary without deleting history, pauses ordinary drains for a dedicated
   notes-preparation exchange, and resets provider continuation without replacing
   Python or live jobs. Notes are shared workset files outside code checkouts; rotation

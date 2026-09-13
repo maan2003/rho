@@ -2,13 +2,14 @@
 
 ## Status
 
-Implemented for the native Rho runtime. This document records the behavior
-and its rationale, not an implementation plan.
+Implemented for the native `eng-high-notes` role, an opt-in variant of
+`eng-high` with the same model and effort. Ordinary native roles retain provider
+compaction. This document records the behavior and its rationale.
 It does not change Claude Code's own context management.
 
 ## Rotate context rather than summarize it
 
-Replace summary-driven compaction with automatic context rotation. Keep a
+For `eng-high-notes`, replace summary-driven compaction with automatic context rotation. Keep a
 recent stretch of conversation verbatim and let the model preserve older
 knowledge in ordinary notes. Rho neither generates a summary nor requires a
 structured checkpoint.
@@ -26,6 +27,23 @@ continuations. Early notices alone do not activate rotation. There is no separat
 request-window offset.
 Stored history remains available under the existing
 [history preservation constraint](../crates/rho-agent/specs/DECISION-history-only-branches.md).
+
+## Role switching selects the policy
+
+Use the existing role picker to switch a settled native engineer to
+`eng-high-notes`; switch back to an ordinary native role for standard compaction.
+The UI's Compact action always requests real provider compaction, including for
+the notes role. It cancels the current rotation cycle and honors the manual
+request across transport retries; a later automatic rotation starts a fresh cycle.
+Claude still uses Claude Code's `/compact`.
+
+A notes-mode transition resets unfinished retention/preparation scheduling,
+cancels old notices with a developer message, and discards provider continuation
+so the new instructions take effect. Replay derives the same reset and notice
+from the durable role event. Existing rotation boundaries and shared files remain:
+switching off does not reopen discarded context. Switching on begins a fresh
+retention cycle. Children share notes but retain their normally selected roles;
+the parent's rotation mode is not inherited automatically.
 
 ## Notes are ordinary shared workset files
 

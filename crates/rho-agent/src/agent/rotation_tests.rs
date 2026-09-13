@@ -1,8 +1,16 @@
 use rho_core::MessagePhase;
 
-use super::streaming::tests::agent;
+use super::streaming::tests::agent as standard_agent;
 use super::*;
 use crate::{ContextChange, WakeTrigger};
+
+async fn agent(directory: &std::path::Path) -> Agent {
+    let agent = standard_agent(directory).await;
+    agent.head.write().unwrap().config.role = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::HighNotes,
+    };
+    agent
+}
 
 fn input(text: &str, at: u64) -> QueuedInput {
     QueuedInput {
@@ -369,52 +377,65 @@ async fn terminal_preparation_failure_allows_fresh_input_and_explicit_retry() {
 }
 
 #[tokio::test]
-async fn manual_rotation_includes_recovery_without_losing_compact_request() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut agent = agent(directory.path()).await;
-    agent.phase = Phase::Idle {
-        owed: Vec::new(),
-        standing: Standing::Asked,
-    };
-    agent
-        .recovery_notes
-        .push("Rho restarted; inspect existing notes.".into());
-    agent
-        .handle_control(
-            Control::User(
-                QueuedInput {
-                    kind: InputKind::Compaction,
-                    ..input("", 1)
-                },
-                None,
-            ),
-            UnixMs(1),
-        )
-        .await;
-    agent.start_request(UnixMs(2), None).await;
-    let (change, blocks) = latest_send(&agent);
-    assert!(matches!(
-        change,
-        Some(ContextChange::Preparing { repair: false, .. })
-    ));
-    assert!(blocks.iter().any(
-        |block| matches!(block, ContextBlock::UserMessage { content, .. }
-        if rho_core::text_content(content).contains("Rho restarted"))
-    ));
-    assert!(blocks.iter().any(
-        |block| matches!(block, ContextBlock::DeveloperMessage { text }
-        if text.contains("No early retention notice"))
-    ));
-    assert_eq!(agent.user.len(), 1);
-    reply(&mut agent, vec![message("prepared")], 100).await;
-    agent.start_request(UnixMs(3), None).await;
-    assert!(
-        latest_send(&agent)
-            .1
-            .iter()
-            .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
-    );
-    assert!(agent.user.is_empty());
+async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
+    for preparing in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        agent.phase = Phase::Idle {
+            owed: Vec::new(),
+            standing: Standing::Asked,
+        };
+        let change = if preparing {
+            ContextChange::Preparing {
+                retain_from: 0,
+                repair: false,
+            }
+        } else {
+            ContextChange::Marked { retain_from: 0 }
+        };
+        agent
+            .persist(AgentEvent::ContextSent {
+                blocks: Cow::Owned(vec![]),
+                change: change.clone(),
+                at: UnixMs(1),
+                wake: None,
+            })
+            .await;
+        agent.context.sent(&change);
+        agent.context_used = agent.session.auto_compact_token_limit();
+        agent
+            .handle_control(
+                Control::User(
+                    QueuedInput {
+                        kind: InputKind::Compaction,
+                        ..input("", 2)
+                    },
+                    None,
+                ),
+                UnixMs(2),
+            )
+            .await;
+        agent.start_request(UnixMs(3), None).await;
+        let (change, blocks) = latest_send(&agent);
+        assert!(change.is_none());
+        assert!(matches!(
+            blocks.last(),
+            Some(ContextBlock::CompactionTrigger)
+        ));
+        assert!(blocks.iter().any(|block| matches!(block,
+            ContextBlock::DeveloperMessage { text } if text == context::MANUAL_COMPACTION)));
+        assert!(agent.context.marker.is_none());
+        assert!(agent.context.preparation.is_none());
+        assert!(agent.user.is_empty());
+        let (_, events) = agent.db.read().agent_events(agent.agent_id);
+        let restored = replay::replay(events);
+        assert!(restored.context.marker.is_none());
+        assert!(restored.context.preparation.is_none());
+        assert!(
+            matches!(&agent.phase, Phase::Requesting(request) if !request.compaction_owes_reply)
+        );
+        agent.session.abort();
+    }
 }
 
 #[tokio::test]
@@ -460,4 +481,155 @@ async fn ordinary_python_writes_notes_without_a_prebound_variable() {
     let inventory = notes::inventory(&notes_path);
     assert!(inventory.contains("\"progress.md\" (2 lines, 14 bytes)"));
     assert!(!inventory.contains("next step"));
+}
+
+#[tokio::test]
+async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
+    for manual in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = standard_agent(directory.path()).await;
+        let limit = agent.session.auto_compact_token_limit().unwrap();
+        agent.context_used = Some(if manual { 100 } else { limit });
+        if manual {
+            agent.user.push(QueuedInput {
+                source: MessageSender::User,
+                kind: InputKind::Compaction,
+                delivery: MessageDelivery::NextRequest,
+                at: UnixMs::now(),
+            });
+        }
+        agent.start_request(UnixMs::now(), None).await;
+        assert!(matches!(
+            &**agent.history.last().unwrap(),
+            ContextBlock::CompactionTrigger
+        ));
+        assert!(agent.context.marker.is_none());
+        assert!(agent.context.preparation.is_none());
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|block| matches!(&**block, ContextBlock::DeveloperMessage { .. }))
+        );
+        let Phase::Requesting(request) = &agent.phase else {
+            panic!("expected request")
+        };
+        assert_eq!(request.compaction_owes_reply, !manual);
+        agent.session.abort();
+    }
+}
+
+#[tokio::test]
+async fn role_switches_cancel_pending_rotation_durably() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = standard_agent(directory.path()).await;
+    agent.phase = Phase::Idle {
+        owed: Vec::new(),
+        standing: Standing::Nothing,
+    };
+    let notes_role = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::HighNotes,
+    };
+    agent.change_role(notes_role).await.unwrap();
+    assert_eq!(agent.model, InferenceModel::Gpt6Astra);
+
+    // Model the marker and an interrupted preparation.
+    let change = ContextChange::Preparing {
+        retain_from: agent.history.len() as u64,
+        repair: false,
+    };
+    let blocks = vec![ContextBlock::DeveloperMessage {
+        text: context::MARKER.into(),
+    }];
+    agent
+        .persist(AgentEvent::ContextSent {
+            blocks: Cow::Borrowed(&blocks),
+            change: change.clone(),
+            at: UnixMs::now(),
+            wake: None,
+        })
+        .await;
+    agent.history.extend(blocks.into_iter().map(Arc::new));
+    agent.context.sent(&change);
+    agent
+        .change_role(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        })
+        .await
+        .unwrap();
+    assert!(agent.context.marker.is_none());
+    assert!(agent.context.preparation.is_none());
+
+    let (_, events) = agent.db.read().agent_events(agent.agent_id);
+    let restored = replay::replay(events);
+    assert_eq!(restored.history.len(), agent.history.len());
+    assert!(restored.context.marker.is_none());
+    assert!(restored.context.preparation.is_none());
+    assert!(restored.recovery_notes.is_empty());
+    assert!(matches!(&**restored.history.last().unwrap(),
+        ContextBlock::DeveloperMessage { text } if text == context::POLICY_CHANGED));
+    agent.change_role(notes_role).await.unwrap();
+    assert!(agent.context.marker.is_none());
+    assert!(agent.context.preparation.is_none());
+}
+
+#[tokio::test]
+async fn compaction_retries_preserve_task_obligations_and_manual_override() {
+    for manual in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = if manual {
+            agent(directory.path()).await
+        } else {
+            standard_agent(directory.path()).await
+        };
+        agent.context_used = agent.session.auto_compact_token_limit();
+        if manual {
+            agent.user.push(QueuedInput {
+                kind: InputKind::Compaction,
+                ..input("", 1)
+            });
+        }
+        agent.start_request(UnixMs::now(), None).await;
+        agent
+            .handle(Event::Inference(InferenceEvent::TemporaryFailure {
+                error: Arc::new(anyhow::anyhow!("disconnected")),
+                retrying_at: std::time::Instant::now(),
+            }))
+            .await;
+        agent.start_request(UnixMs::now(), None).await;
+        assert!(agent.context.preparation.is_none());
+        assert!(
+            matches!(&agent.phase, Phase::Requesting(request) if request.compaction_owes_reply == !manual)
+        );
+        agent.session.abort();
+        reply(
+            &mut agent,
+            vec![InferenceResponseItem::Compaction {
+                provider_specific: Box::new(
+                    rho_inference::OpenAiResponsesProviderData::Compaction {
+                        item_id: "compaction".try_into().unwrap(),
+                        encrypted_content: "summary".into(),
+                    },
+                ),
+            }],
+            100,
+        )
+        .await;
+        assert!(
+            matches!(
+                &agent.phase,
+                Phase::Idle {
+                    standing: Standing::Asked,
+                    ..
+                }
+            ) == !manual
+        );
+        if manual {
+            // The fulfilled manual override must not disable future automatic rotation.
+            agent.context_used = agent.session.auto_compact_token_limit();
+            agent.start_request(UnixMs::now(), None).await;
+            assert!(agent.context.preparation.is_some());
+            agent.session.abort();
+        }
+    }
 }

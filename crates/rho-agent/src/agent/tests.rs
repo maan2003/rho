@@ -906,6 +906,7 @@ fn provider_retries_use_boundary_backoff_even_with_fresh_command_output() {
             since: UnixMs(100),
             failed_at: UnixMs(100),
             attempts: 1,
+            compaction_owes_reply: false,
             error: Arc::from("overloaded"),
         },
     };

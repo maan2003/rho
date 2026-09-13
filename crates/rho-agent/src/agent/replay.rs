@@ -37,6 +37,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut user = Vec::new();
     let mut mail = Vec::new();
 
+    let mut notes_rotation = false;
     for event in events {
         if let AgentEvent::Sent { blocks, .. }
         | AgentEvent::ContextSent { blocks, .. }
@@ -60,6 +61,9 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             }
             // A drain is total: whatever was queued rode in these blocks.
             AgentEvent::Sent { blocks, .. } => {
+                if blocks.contains(&ContextBlock::CompactionTrigger) {
+                    context.rotated();
+                }
                 if blocks
                     .iter()
                     .any(|block| matches!(block, ContextBlock::ContextRotation { .. }))
@@ -124,6 +128,17 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                 history.extend(blocks.into_owned().into_iter().map(Arc::new));
                 context_used = replied;
             }
+            AgentEvent::Created { role, .. } => notes_rotation = role.uses_notes_rotation(),
+            AgentEvent::RoleChanged { role, .. } => {
+                let enabled = role.uses_notes_rotation();
+                if enabled != notes_rotation {
+                    context.rotated();
+                    history.push(Arc::new(ContextBlock::DeveloperMessage {
+                        text: super::context::POLICY_CHANGED.into(),
+                    }));
+                }
+                notes_rotation = enabled;
+            }
             // Config, creation and what a reader is told are the head's
             // business, never context. A `Rewound` never reaches replay:
             // the read that hands over the visible log has applied it.
@@ -134,8 +149,6 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             | AgentEvent::Wants { .. }
             | AgentEvent::Rewound { .. }
             | AgentEvent::Failed { .. }
-            | AgentEvent::Created { .. }
-            | AgentEvent::RoleChanged { .. }
             | AgentEvent::WorkdirAdded { .. }
             | AgentEvent::Notice { .. }
             | AgentEvent::RuntimeRebound { .. } => {}

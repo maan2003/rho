@@ -213,6 +213,9 @@ pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-cheap" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Cheap,
         }),
+        "eng-high-notes" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::HighNotes,
+        }),
         "eng-high" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::High,
         }),
@@ -226,7 +229,7 @@ pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
             intelligence: EngineerIntelligence::Gemini,
         }),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, or eng-gemini"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-high-notes, eng-ultra, eng-alt, or eng-gemini"
         )),
     }
 }
@@ -250,7 +253,7 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
             ..
         } => "eng-high",
         AgentRole::Engineer {
-            intelligence: EngineerIntelligence::High,
+            intelligence: EngineerIntelligence::High | EngineerIntelligence::HighNotes,
             ..
         } => "eng-ultra",
         AgentRole::Engineer {
@@ -275,6 +278,12 @@ mod tests {
 
     #[test]
     fn parses_agent_role() {
+        assert_eq!(
+            parse_agent_role("eng-high-notes").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::HighNotes
+            }
+        );
         assert!(parse_agent_role("eng-py").is_err());
         assert!(parse_agent_role("eng-ultra-py").is_err());
         assert_eq!(cycle_agent_role_text("eng"), "eng-high");

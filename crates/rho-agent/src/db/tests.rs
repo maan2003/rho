@@ -9,6 +9,7 @@ use super::*;
 fn astra_bindings_round_trip() {
     for binding in [
         SessionBinding::ResponsesAstra(InferenceProfile::default()),
+        SessionBinding::ResponsesAstraNotes(InferenceProfile::default()),
         SessionBinding::AdvisorAstra(InferenceProfile::default()),
     ] {
         let mut encoded = bytes::BytesMut::new();
@@ -887,5 +888,27 @@ async fn the_journal_names_every_row_in_write_order() {
             (4, second, 1),
             (5, first, 2)
         ]
+    );
+}
+
+#[test]
+fn notes_role_has_high_model_and_effort_but_a_distinct_binding() {
+    let high = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::High,
+    };
+    let notes = AgentRole::Engineer {
+        intelligence: EngineerIntelligence::HighNotes,
+    };
+    let high_binding = high.session_profile().unwrap();
+    let notes_binding = notes.session_profile().unwrap();
+    assert_ne!(notes_binding, high_binding);
+    assert_eq!(notes_binding.deep_model(), high_binding.deep_model());
+    assert_eq!(notes_binding.deep_config(), high_binding.deep_config());
+    assert_eq!(notes_binding.agent_role(), notes);
+    assert_eq!(high_binding.agent_role(), high);
+    let mut packed = senax_encoder::pack(&notes_binding).unwrap();
+    assert_eq!(
+        senax_encoder::unpack::<SessionBinding>(&mut packed).unwrap(),
+        notes_binding
     );
 }

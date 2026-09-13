@@ -435,6 +435,7 @@ mod tests {
         ResponsesConfig {
             model: ResponsesModel::Gpt56Luna,
             auto_compaction: None,
+            context_rotation: false,
             reasoning_context: ReasoningContext::AllTurns,
             effort: ResponsesEffort::Medium,
             text_verbosity: TextVerbosity::Low,

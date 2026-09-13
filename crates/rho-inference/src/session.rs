@@ -72,6 +72,12 @@ impl InferenceSession {
         }
     }
 
+    pub fn set_context_rotation(&mut self, enabled: bool) {
+        if let SessionImpl::Responses(session) = &mut self.inner {
+            session.set_context_rotation(enabled);
+        }
+    }
+
     pub fn prompt_cache_key(&self) -> PromptCacheKey {
         match &self.inner {
             SessionImpl::Responses(session) => session.prompt_cache_key(),

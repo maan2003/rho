@@ -204,6 +204,7 @@ pub(crate) enum InferenceSessionMode {
 pub(crate) struct ResponsesConfig {
     pub model: ResponsesModel,
     pub auto_compaction: Option<u64>,
+    pub context_rotation: bool,
     pub reasoning_context: ReasoningContext,
     pub effort: ResponsesEffort,
     pub text_verbosity: TextVerbosity,
@@ -213,9 +214,10 @@ pub(crate) struct ResponsesConfig {
 impl ResponsesConfig {
     fn deep(config: InferenceProfile, model: ResponsesModel) -> Self {
         Self {
-            // The harness owns context rotation and its preparation window.
-            // Server compaction would silently erase the promised retained tail.
-            auto_compaction: None,
+            context_rotation: false,
+            // Responses Lite requires explicit client compaction.
+            auto_compaction: (!model.use_responses_lite())
+                .then_some(model.info().auto_compact_token_limit),
             model,
             reasoning_context: ReasoningContext::AllTurns,
             effort: config.effort.into(),
@@ -232,6 +234,7 @@ impl ResponsesConfig {
         Self {
             model: ResponsesModel::Gpt56Luna,
             auto_compaction: None,
+            context_rotation: false,
             reasoning_context: ReasoningContext::AllTurns,
             effort: ResponsesEffort::Medium,
             text_verbosity: TextVerbosity::Low,
@@ -420,6 +423,15 @@ impl InferenceSession {
             }
             InferenceSessionMode::Title | InferenceSessionMode::Status => false,
         }
+    }
+
+    /// Notes rotation owns the retained tail, so it must disable server
+    /// compaction.
+    pub fn set_context_rotation(&mut self, enabled: bool) {
+        self.config.responses_config.context_rotation = enabled;
+        let model = &self.config.responses_config.model;
+        self.config.responses_config.auto_compaction = (!enabled && !model.use_responses_lite())
+            .then_some(model.info().auto_compact_token_limit);
     }
 
     pub fn prompt_cache_key(&self) -> PromptCacheKey {

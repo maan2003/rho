@@ -473,6 +473,7 @@ pub enum SessionBinding {
     ResponsesAstra(InferenceProfile),
     /// GPT-6 Astra-backed advisor; distinct so its role survives pinning.
     AdvisorAstra(InferenceProfile),
+    ResponsesAstraNotes(InferenceProfile),
 }
 
 /// `SessionBinding` as rows wrote it while the PM role existed. The
@@ -497,6 +498,7 @@ enum StoredSessionBinding {
     AdvisorAstra(InferenceProfile),
     ResponsesSolPython(InferenceProfile),
     ClaudeFablePython { effort: ClaudeEffort },
+    ResponsesAstraNotes(InferenceProfile),
 }
 
 impl senax_encoder::Decoder for SessionBinding {
@@ -518,6 +520,7 @@ impl senax_encoder::Decoder for SessionBinding {
             Stored::AdvisorTerra(config) => Self::AdvisorTerra(config),
             Stored::AntigravityFlashLow(config) => Self::AntigravityFlashLow(config),
             Stored::ResponsesAstra(config) => Self::ResponsesAstra(config),
+            Stored::ResponsesAstraNotes(config) => Self::ResponsesAstraNotes(config),
             Stored::AdvisorAstra(config) => Self::AdvisorAstra(config),
             Stored::ResponsesSolPython(config) => Self::ResponsesSol(config),
             Stored::ClaudeFablePython { effort } => Self::ClaudeFable { effort },
@@ -554,6 +557,9 @@ impl AgentRoleSessionProfile for AgentRole {
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
             } => SessionBinding::ResponsesAstra(deep(ReasoningEffort::Medium)),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::HighNotes,
+            } => SessionBinding::ResponsesAstraNotes(deep(ReasoningEffort::Medium)),
             AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Ultra,
             } => SessionBinding::ClaudeFable {
@@ -592,7 +598,11 @@ pub enum ClaudeEffort {
 
 impl SessionBinding {
     pub fn agent_role(self) -> AgentRole {
-        if matches!(self, Self::ResponsesAstra(_)) {
+        if matches!(self, Self::ResponsesAstraNotes(_)) {
+            return AgentRole::Engineer {
+                intelligence: EngineerIntelligence::HighNotes,
+            };
+        } else if matches!(self, Self::ResponsesAstra(_)) {
             return AgentRole::Engineer {
                 intelligence: EngineerIntelligence::High,
             };
@@ -630,7 +640,7 @@ impl SessionBinding {
             Self::ResponsesTerra(config) if config.effort == ReasoningEffort::High => {
                 EngineerIntelligence::Cheap
             }
-            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => {
+            Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
                 unreachable!("Astra role binding returned above")
             }
             Self::ResponsesGpt55(config)
@@ -656,6 +666,7 @@ impl SessionBinding {
             | Self::ResponsesLuna(config)
             | Self::ResponsesTerra(config)
             | Self::ResponsesAstra(config)
+            | Self::ResponsesAstraNotes(config)
             | Self::AdvisorAstra(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
@@ -670,7 +681,9 @@ impl SessionBinding {
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
             Self::ResponsesTerra(_) | Self::AdvisorTerra(_) => Some(InferenceModel::Gpt56Terra),
-            Self::ResponsesAstra(_) | Self::AdvisorAstra(_) => Some(InferenceModel::Gpt6Astra),
+            Self::ResponsesAstra(_) | Self::ResponsesAstraNotes(_) | Self::AdvisorAstra(_) => {
+                Some(InferenceModel::Gpt6Astra)
+            }
             Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
@@ -685,6 +698,7 @@ impl SessionBinding {
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
+            | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
@@ -703,6 +717,7 @@ impl SessionBinding {
             | Self::ResponsesLuna(_)
             | Self::ResponsesTerra(_)
             | Self::ResponsesAstra(_)
+            | Self::ResponsesAstraNotes(_)
             | Self::AdvisorAstra(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
