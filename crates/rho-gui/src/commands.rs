@@ -116,6 +116,26 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
     Vec::new()
 }
 
+/// Completion inside the draft's filesystem field buffer: the two ways an
+/// agent can see the machine.
+pub fn filesystem_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
+    let token = last_token(text_before_cursor);
+    [
+        ("view", "a minimal generated root, the workset at /src"),
+        (
+            "exposed",
+            "the host as you see it, the workset mounted at /src",
+        ),
+    ]
+    .into_iter()
+    .filter(|(mode, _)| fuzzy_contains(mode, token))
+    .map(|(mode, description)| Candidate {
+        value: mode.to_owned(),
+        description: description.to_owned(),
+    })
+    .collect()
+}
+
 pub struct WorkspaceCompletionProvider {
     workspace: WeakEntity<Workspace>,
     /// The draft view's workdir field buffer: completions in it come from
@@ -127,6 +147,9 @@ pub struct WorkspaceCompletionProvider {
     /// The draft view's start field buffer: completions are `user` and the
     /// live agent labels.
     start_buffer: Option<gpui::EntityId>,
+    /// The draft view's filesystem field buffer: completions are `view`
+    /// and `exposed`.
+    filesystem_buffer: Option<gpui::EntityId>,
 }
 
 impl WorkspaceCompletionProvider {
@@ -135,12 +158,14 @@ impl WorkspaceCompletionProvider {
         workdir_buffer: Option<gpui::EntityId>,
         role_buffer: Option<gpui::EntityId>,
         start_buffer: Option<gpui::EntityId>,
+        filesystem_buffer: Option<gpui::EntityId>,
     ) -> Rc<Self> {
         Rc::new(Self {
             workspace,
             workdir_buffer,
             role_buffer,
             start_buffer,
+            filesystem_buffer,
         })
     }
 }
@@ -169,6 +194,7 @@ impl CompletionProvider for WorkspaceCompletionProvider {
         let in_workdir_field = self.workdir_buffer == Some(buffer.entity_id());
         let in_role_field = self.role_buffer == Some(buffer.entity_id());
         let in_start_field = self.start_buffer == Some(buffer.entity_id());
+        let in_filesystem_field = self.filesystem_buffer == Some(buffer.entity_id());
         let buffer = buffer.read(cx);
         let cursor_offset = buffer_position.to_offset(buffer);
         let text_before_cursor = buffer.text_for_range(0..cursor_offset).collect::<String>();
@@ -181,6 +207,8 @@ impl CompletionProvider for WorkspaceCompletionProvider {
             role_field_candidates(&text_before_cursor)
         } else if in_start_field {
             start_field_candidates(&text_before_cursor, &live_agents)
+        } else if in_filesystem_field {
+            filesystem_field_candidates(&text_before_cursor)
         } else {
             completions_for(&text_before_cursor, &live_agents)
         };

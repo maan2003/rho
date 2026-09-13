@@ -29,7 +29,10 @@ use gpui::{
 #[cfg(test)]
 pub(crate) use phone::set_touch_modal_editing;
 use rho_agents::agent_view::AgentModel;
-use rho_agents::create::{StartBase, cycle_agent_role_text, parse_agent_role, parse_start};
+use rho_agents::create::{
+    StartBase, cycle_agent_role_text, cycle_workset_mode_text, parse_agent_role, parse_start,
+    parse_workset_mode,
+};
 use rho_agents::draft::DraftModel;
 use rho_agents::messages::MessageLog;
 use rho_agents::session::ActiveAgents;
@@ -615,6 +618,7 @@ impl Workspace {
                 None,
                 None,
                 None,
+                None,
             );
             let visualization_client = self
                 .connection_for(agent_id)
@@ -884,6 +888,7 @@ impl Workspace {
                             Some(fields.workdir),
                             Some(fields.role),
                             Some(fields.start),
+                            Some(fields.filesystem),
                         ),
                     ));
                 }),
@@ -2165,6 +2170,7 @@ impl Workspace {
                         view.set_workdir_text(&label, cx);
                         view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
                         view.set_start_text(rho_agents::create::DEFAULT_START, cx);
+                        view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
                     });
                     self.select_agent(Some(agent_id), window, cx);
                 }
@@ -2668,6 +2674,13 @@ impl Workspace {
                 return;
             }
         };
+        let mode = match parse_workset_mode(&self.draft_model.read(cx).filesystem_text(cx)) {
+            Ok(mode) => mode,
+            Err(message) => {
+                self.refuse_draft(&message, cx);
+                return;
+            }
+        };
         self.awaiting_draft_agent = Some(host);
         // `n a` chose an area, and that is where the agent is filed; an
         // ordinary draft has none and starts at the root.
@@ -2680,6 +2693,7 @@ impl Workspace {
             ClientMessage::NewAgent {
                 role,
                 start,
+                mode,
                 content: Some(content),
             },
         );
@@ -3990,9 +4004,10 @@ impl Workspace {
         }
     }
 
-    /// Ctrl-Tab cycles the value the cursor is on: the role, or the start
-    /// field's mode (on top of → join → sandbox). Elsewhere in the draft it
-    /// does nothing, there being no value to cycle.
+    /// Ctrl-Tab cycles the value the cursor is on: the role, the start
+    /// field's mode (on top of → join), or the filesystem (view →
+    /// exposed). Elsewhere in the draft it does nothing, there being no
+    /// value to cycle.
     fn cycle_draft_value(&mut self, cx: &mut Context<Self>) {
         if self.selection.selected_agent().is_none()
             && let Some(editor) = self.focused_draft_editor()
@@ -4003,6 +4018,9 @@ impl Workspace {
                     view.set_role_text(next, cx);
                 } else if view.cursor_in_start_field(&editor, cx) {
                     view.cycle_start_mode(cx);
+                } else if view.cursor_in_filesystem_field(&editor, cx) {
+                    let next = cycle_workset_mode_text(&view.filesystem_text(cx));
+                    view.set_filesystem_text(next, cx);
                 }
             });
         }
@@ -7714,6 +7732,7 @@ impl Workspace {
             view.clear_attachments(cx);
             view.set_role_text(rho_agents::create::DEFAULT_ROLE, cx);
             view.set_start_text(rho_agents::create::DEFAULT_START, cx);
+            view.set_filesystem_text(rho_agents::create::DEFAULT_FILESYSTEM, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
         // The draft exists to be written in, so it opens ready to type.
@@ -7835,6 +7854,15 @@ impl Workspace {
     pub(crate) fn cursor_in_draft_start_field_for_test(&self, cx: &mut Context<Self>) -> bool {
         self.focused_draft_editor()
             .is_some_and(|editor| self.draft_model.read(cx).cursor_in_start_field(&editor, cx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_in_draft_filesystem_field_for_test(&self, cx: &mut Context<Self>) -> bool {
+        self.focused_draft_editor().is_some_and(|editor| {
+            self.draft_model
+                .read(cx)
+                .cursor_in_filesystem_field(&editor, cx)
+        })
     }
 
     #[cfg(test)]

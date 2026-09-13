@@ -329,22 +329,6 @@ pub fn configure_embedded_environment() {
     unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum WorksetModeArg {
-    #[default]
-    View,
-    Exposed,
-}
-
-impl From<WorksetModeArg> for WorksetMode {
-    fn from(mode: WorksetModeArg) -> Self {
-        match mode {
-            WorksetModeArg::View => Self::View,
-            WorksetModeArg::Exposed => Self::Exposed,
-        }
-    }
-}
-
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
     #[arg(long = "socket-path")]
@@ -358,15 +342,6 @@ pub struct DaemonArgs {
     pub extra_before_path: Option<OsString>,
     #[arg(long = "extra-after-path", env = "RHO_EXTRA_AFTER_PATH")]
     pub extra_after_path: Option<OsString>,
-    /// How new agents see the filesystem: `view` (a minimal generated root
-    /// with the workset at /src) or `exposed` (the host, with the workset
-    /// mounted over its /src stub).
-    #[arg(
-        long = "workset-mode",
-        env = "RHO_WORKSET_MODE",
-        default_value = "view"
-    )]
-    pub workset_mode: WorksetModeArg,
     /// Write a Dial9 CPU trace on shutdown (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     pub cpu_profile: Option<PathBuf>,
@@ -531,7 +506,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             pool,
             claude.clone(),
             user_environment,
-            args.workset_mode.into(),
             platform_secrets,
             runtime.paths.octo_socket(),
         )
@@ -938,8 +912,6 @@ struct Services {
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
-    /// How agents this daemon creates see the filesystem.
-    workset_mode: WorksetMode,
     /// The Claude configuration this daemon runs against, resolved in `run`.
     claude: rho_claude::accounts::ClaudePaths,
     git_transport: GitTransportBroker,
@@ -955,7 +927,6 @@ impl Services {
         pool: Arc<AgentPool>,
         claude: rho_claude::accounts::ClaudePaths,
         user_environment: rho_fs_view::UserEnvironment,
-        workset_mode: WorksetMode,
         platform_secrets: PlatformSecrets,
         octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
@@ -984,7 +955,6 @@ impl Services {
             shells: Arc::new(shell::ShellRegistry::default()),
             terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
-            workset_mode,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
         };
@@ -1047,10 +1017,13 @@ impl Services {
             .insert(repo, (agent_id, status));
     }
 
+    /// `mode` is the agent's own: how it sees the filesystem around the
+    /// workset, whether that workset is fresh or one it joins.
     async fn create(
         &self,
         role: AgentRole,
         start: StartMode,
+        mode: WorksetMode,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
         let start = match start {
             StartMode::NewOn { repo, revset } => {
@@ -1068,10 +1041,10 @@ impl Services {
                 let place = Place {
                     workset: workset.id().to_owned(),
                     cwd: cwd.clone(),
-                    mode: self.workset_mode,
+                    mode,
                     origin: Some(origin.clone()),
                 };
-                let mode = rho_fs_view::Mode::from_workset_mode(self.workset_mode);
+                let mode = rho_fs_view::Mode::from_workset_mode(mode);
                 rho_agent::StartPlace::pending(place, move || {
                     let workset = workset.clone();
                     let origin = origin.clone();
@@ -1088,10 +1061,13 @@ impl Services {
                 .owning_workset()
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
-                let place = info
+                let mut place = info
                     .place()
                     .context("agents no longer work in the user's own checkout")?
                     .clone();
+                // The same directory as the agent joined, seen the way this
+                // agent asked to see it.
+                place.mode = mode;
                 let view = self.pool.materialize_view(&place).await?;
                 rho_agent::StartPlace::new(view, place.origin.clone())
             }
@@ -2468,6 +2444,7 @@ async fn handle_message(
         ClientMessage::NewAgent {
             role,
             start,
+            mode,
             mut content,
         } => {
             if let Some(content) = content.as_mut() {
@@ -2475,7 +2452,7 @@ async fn handle_message(
             }
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
-            let (_, agent) = services.create(role, start).await?;
+            let (_, agent) = services.create(role, start, mode).await?;
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
@@ -4457,7 +4434,6 @@ mod tests {
                 pool,
                 claude,
                 user_environment,
-                rho_fs_view::WorksetMode::View,
                 PlatformSecrets::default(),
                 root.join("octo.sock"),
             )

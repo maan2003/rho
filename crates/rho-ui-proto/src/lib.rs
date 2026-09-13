@@ -164,6 +164,9 @@ pub enum ClientMessage {
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
         start: StartMode,
+        /// How the agent sees the filesystem around its workset: a minimal
+        /// generated root, or the host.
+        mode: WorksetMode,
         content: Option<Vec<ContentPart>>,
     },
     SendUserMessage {

@@ -192,6 +192,7 @@ async fn run_async(args: Args) -> Result<()> {
             .send(&ClientMessage::NewAgent {
                 role: AgentRole::default(),
                 start: StartMode::Join(JoinTarget::User { repo: repo.clone() }),
+                mode: rho_ui_proto::WorksetMode::View,
                 content: Some(prompt(index, 0)),
             })
             .await?;

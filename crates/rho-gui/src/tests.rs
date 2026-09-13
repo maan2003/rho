@@ -10666,7 +10666,14 @@ fn shift_tab_walks_the_draft_fields_backwards(cx: &mut TestAppContext) {
         })
         .expect("open a new-agent draft");
 
-    // From the body, backwards is the start row, then the role row.
+    // From the body, backwards is the filesystem row, then the start row,
+    // then the role row.
+    cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.cursor_in_draft_filesystem_field_for_test(cx));
+        })
+        .expect("filesystem row");
     cx.dispatch_action(*workspace, rho_agents::RoleCycleGroup);
     workspace
         .update(cx, |workspace, _, cx| {

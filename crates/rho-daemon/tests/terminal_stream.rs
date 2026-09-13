@@ -75,7 +75,6 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
         anthropic_base_url: None,
         extra_before_path: None,
         extra_after_path: None,
-        workset_mode: rho_daemon::WorksetModeArg::View,
     }));
     let mut control = loop {
         match rho_rpc::connect_unix(&socket_path).await {
@@ -99,6 +98,7 @@ async fn terminal_survives_detach_and_echoes(state_dir: &std::path::Path) -> any
                 repo: camino::Utf8PathBuf::from_path_buf(repo_dir.clone()).unwrap(),
                 revset: "@".to_owned(),
             },
+            mode: rho_ui_proto::WorksetMode::View,
             content: None,
         },
     )

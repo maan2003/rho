@@ -129,9 +129,9 @@ host view as the user — environment, `$HOME`, every path unchanged —
 plus the workset directory mounted at `/src` over the host's existing
 `/src` stub and the store root made read-only. Paths are the same in
 both modes, so an agent's record and prompt do not depend on the mode.
-Exposed access is granted per agent by the user; the daemon's
-`--workset-mode` flag (`RHO_WORKSET_MODE`) picks the mode new agents
-get, `view` by default.
+Exposed access is granted per agent by the user: the mode is a field of
+the draft that makes the agent (`view` by default), and rides the
+`NewAgent` request with the rest of the start.
 
 The stub is the one host prerequisite this implies: an unprivileged
 mount namespace can only mount over a directory that already exists,

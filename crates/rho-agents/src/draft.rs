@@ -1,4 +1,5 @@
-//! The draft compose model: pick a workdir, write the first message, submit
+//! The draft compose model: pick a workdir, a role, a base and a
+//! filesystem, write the first message, submit
 //! to create the agent.
 //!
 //! Entirely separate from [`rho_agents::agent_view::AgentModel`] — there is no
@@ -27,11 +28,14 @@ use rho_window::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
 const WORKDIR_LABEL_INLAY_ID: usize = 1;
-const MODE_LABEL_INLAY_ID: usize = 2;
+const ROLE_LABEL_INLAY_ID: usize = 2;
 const START_LABEL_INLAY_ID: usize = 3;
 const START_TARGET_HINT_INLAY_ID: usize = 4;
+const FILESYSTEM_LABEL_INLAY_ID: usize = 5;
 
-pub use crate::create::{AUTO_BASE_REV, DEFAULT_ROLE, DEFAULT_START, StartFieldMode};
+pub use crate::create::{
+    AUTO_BASE_REV, DEFAULT_FILESYSTEM, DEFAULT_ROLE, DEFAULT_START, StartFieldMode,
+};
 
 impl StartFieldModeLabel for StartFieldMode {
     fn label(self) -> &'static str {
@@ -70,13 +74,14 @@ impl Hooks {
     }
 }
 
-/// The three field buffers an editor is built over, named so the host can
+/// The four field buffers an editor is built over, named so the host can
 /// tell them apart when it installs completion.
 #[derive(Clone, Copy)]
 pub struct Fields {
     pub workdir: gpui::EntityId,
     pub role: gpui::EntityId,
     pub start: gpui::EntityId,
+    pub filesystem: gpui::EntityId,
 }
 
 /// What the draft says about itself. The host decides what an edit means
@@ -97,6 +102,10 @@ pub struct DraftModel {
     workdir_buffer: Entity<Buffer>,
     role_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
+    /// `view` or `exposed`: how the agent sees the filesystem around its
+    /// workset. Free text like the role, so it completes and cycles the
+    /// same way.
+    filesystem_buffer: Entity<Buffer>,
     start_mode: StartFieldMode,
     start_target_hints: Vec<(String, String)>,
     body_buffer: Entity<Buffer>,
@@ -119,6 +128,7 @@ impl DraftModel {
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
         let role_buffer = cx.new(|cx| Buffer::local(DEFAULT_ROLE, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
+        let filesystem_buffer = cx.new(|cx| Buffer::local(DEFAULT_FILESYSTEM, cx));
         let body_buffer = cx.new(|cx| Buffer::local("", cx));
         let body_end = body_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|cx| {
@@ -127,7 +137,8 @@ impl DraftModel {
                 (0, &workdir_buffer),
                 (1, &role_buffer),
                 (2, &start_buffer),
-                (3, &body_buffer),
+                (3, &filesystem_buffer),
+                (4, &body_buffer),
             ] {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(key),
@@ -163,6 +174,11 @@ impl DraftModel {
                     this.update_start_target_hint(cx);
                 }
             }),
+            cx.subscribe(&filesystem_buffer, |this, _, event, cx| {
+                if matches!(event, BufferEvent::Edited { .. }) {
+                    this.note_draft_edit(cx);
+                }
+            }),
         ];
 
         Self {
@@ -171,6 +187,7 @@ impl DraftModel {
             workdir_buffer,
             role_buffer,
             start_buffer,
+            filesystem_buffer,
             start_mode: StartFieldMode::NewOn,
             start_target_hints: Vec::new(),
             body_buffer,
@@ -194,12 +211,14 @@ impl DraftModel {
             &self.workdir_buffer,
             &self.role_buffer,
             &self.start_buffer,
+            &self.filesystem_buffer,
             &self.body_buffer,
         ];
         let buffer_ids = buffers.map(|buffer| buffer.read(cx).remote_id());
         let workdir_id = self.workdir_buffer.entity_id();
         let role_id = self.role_buffer.entity_id();
         let start_id = self.start_buffer.entity_id();
+        let filesystem_id = self.filesystem_buffer.entity_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -222,6 +241,7 @@ impl DraftModel {
                     workdir: workdir_id,
                     role: role_id,
                     start: start_id,
+                    filesystem: filesystem_id,
                 },
                 window,
                 cx,
@@ -234,6 +254,7 @@ impl DraftModel {
         self.insert_role_label_to(&editor, cx);
         self.insert_start_label_to(&editor, cx);
         self.apply_start_target_hint_to(&editor, cx);
+        self.insert_filesystem_label_to(&editor, cx);
         self.insert_body_gap_to(&editor, cx);
         self.pin_autoscroll_to(&editor, cx);
         self.apply_body_chrome_to(&editor, cx);
@@ -299,6 +320,20 @@ impl DraftModel {
         self.update_start_target_hint(cx);
     }
 
+    pub fn filesystem_text(&self, cx: &gpui::App) -> String {
+        let buffer = self.filesystem_buffer.read(cx);
+        buffer.text_for_range(0..buffer.len()).collect()
+    }
+
+    pub fn set_filesystem_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.suppress_draft_activation = true;
+        self.filesystem_buffer.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+        self.suppress_draft_activation = false;
+    }
+
     pub fn set_start_target_hints(&mut self, hints: Vec<(String, String)>, cx: &mut Context<Self>) {
         self.start_target_hints = hints;
         self.update_start_target_hint(cx);
@@ -324,6 +359,7 @@ impl DraftModel {
         self.cursor_in(&self.workdir_buffer, editor, cx)
             || self.cursor_in(&self.role_buffer, editor, cx)
             || self.cursor_in(&self.start_buffer, editor, cx)
+            || self.cursor_in(&self.filesystem_buffer, editor, cx)
     }
 
     pub fn cursor_in_start_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -332,6 +368,10 @@ impl DraftModel {
 
     pub fn cursor_in_role_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
         self.cursor_in(&self.role_buffer, editor, cx)
+    }
+
+    pub fn cursor_in_filesystem_field(&self, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
+        self.cursor_in(&self.filesystem_buffer, editor, cx)
     }
 
     fn cursor_in(&self, buffer: &Entity<Buffer>, editor: &Entity<Editor>, cx: &gpui::App) -> bool {
@@ -420,7 +460,8 @@ impl DraftModel {
         }
     }
 
-    /// Tab: cycles workdir field → role field → start field → message body.
+    /// Tab: cycles workdir field → role field → start field → filesystem
+    /// field → message body.
     pub fn toggle_field(
         &mut self,
         editor: &Entity<Editor>,
@@ -432,6 +473,8 @@ impl DraftModel {
         } else if self.cursor_in(&self.role_buffer, editor, cx) {
             Some(&self.start_buffer)
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
+            Some(&self.filesystem_buffer)
+        } else if self.cursor_in(&self.filesystem_buffer, editor, cx) {
             None
         } else {
             Some(&self.workdir_buffer)
@@ -439,8 +482,8 @@ impl DraftModel {
         self.go_to_field(target.cloned(), editor, window, cx);
     }
 
-    /// Shift-Tab: the same rows the other way round, body → start field →
-    /// role field → workdir field → body.
+    /// Shift-Tab: the same rows the other way round, body → filesystem
+    /// field → start field → role field → workdir field → body.
     pub fn toggle_field_back(
         &mut self,
         editor: &Entity<Editor>,
@@ -453,8 +496,10 @@ impl DraftModel {
             Some(&self.workdir_buffer)
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
             Some(&self.role_buffer)
-        } else {
+        } else if self.cursor_in(&self.filesystem_buffer, editor, cx) {
             Some(&self.start_buffer)
+        } else {
+            Some(&self.filesystem_buffer)
         };
         self.go_to_field(target.cloned(), editor, window, cx);
     }
@@ -473,6 +518,8 @@ impl DraftModel {
             self.role_buffer.clone()
         } else if self.cursor_in(&self.start_buffer, editor, cx) {
             self.start_buffer.clone()
+        } else if self.cursor_in(&self.filesystem_buffer, editor, cx) {
+            self.filesystem_buffer.clone()
         } else {
             return false;
         };
@@ -570,7 +617,7 @@ impl DraftModel {
         editor.update(cx, |editor, cx| {
             editor.splice_inlays(
                 &[],
-                vec![Inlay::custom(MODE_LABEL_INLAY_ID, field_start, "Role: ")],
+                vec![Inlay::custom(ROLE_LABEL_INLAY_ID, field_start, "Role: ")],
                 cx,
             );
         });
@@ -590,6 +637,26 @@ impl DraftModel {
                     START_LABEL_INLAY_ID,
                     field_start,
                     self.start_mode.label(),
+                )],
+                cx,
+            );
+        });
+    }
+
+    fn insert_filesystem_label_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(field_start) =
+            snapshot.anchor_in_excerpt(self.filesystem_buffer.read(cx).anchor_before(0))
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.splice_inlays(
+                &[],
+                vec![Inlay::custom(
+                    FILESYSTEM_LABEL_INLAY_ID,
+                    field_start,
+                    "Filesystem: ",
                 )],
                 cx,
             );

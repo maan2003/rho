@@ -8,7 +8,9 @@
 
 use camino::Utf8PathBuf;
 use rho_hosts::{HostId, HostPath, Hosts};
-use rho_ui_proto::{AgentRole, EngineerIntelligence, JoinTarget, StartMode, WorkspaceInfo};
+use rho_ui_proto::{
+    AgentRole, EngineerIntelligence, JoinTarget, StartMode, WorksetMode, WorkspaceInfo,
+};
 
 /// The user-facing name for selecting the first available conventional base.
 pub const DEFAULT_START: &str = "auto";
@@ -16,6 +18,9 @@ pub const DEFAULT_START: &str = "auto";
 /// starts where a fresh clone is born, on the remote's default branch.
 pub const AUTO_BASE_REV: &str = "";
 pub const DEFAULT_ROLE: &str = "eng";
+/// The filesystem a new agent gets unless the draft says otherwise: the
+/// minimal generated root, with the workset at /src.
+pub const DEFAULT_FILESYSTEM: &str = "view";
 
 /// How the start field's target is interpreted; cycled with Shift-Tab while
 /// the cursor is in the field. The field label shows the current mode.
@@ -234,6 +239,24 @@ pub fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
     }
 }
 
+/// What the draft's filesystem field means: `view` is a minimal generated
+/// root with the workset at /src; `exposed` is the host itself, with the
+/// workset mounted at /src.
+pub fn parse_workset_mode(text: &str) -> Result<WorksetMode, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "" | "view" => Ok(WorksetMode::View),
+        "exposed" => Ok(WorksetMode::Exposed),
+        other => Err(format!("unknown filesystem `{other}`; use view or exposed")),
+    }
+}
+
+pub fn cycle_workset_mode_text(current: &str) -> &'static str {
+    match parse_workset_mode(current) {
+        Ok(WorksetMode::Exposed) => "view",
+        _ => "exposed",
+    }
+}
+
 pub fn cycle_agent_role_text(current: &str) -> &'static str {
     match parse_agent_role(current).unwrap_or_default() {
         AgentRole::Engineer {
@@ -275,6 +298,17 @@ pub fn cycle_agent_role_text(current: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_filesystem_field_names_a_workset_mode() {
+        assert_eq!(parse_workset_mode("").unwrap(), WorksetMode::View);
+        assert_eq!(parse_workset_mode(" View ").unwrap(), WorksetMode::View);
+        assert_eq!(parse_workset_mode("exposed").unwrap(), WorksetMode::Exposed);
+        assert!(parse_workset_mode("sandbox").is_err());
+        assert_eq!(cycle_workset_mode_text("view"), "exposed");
+        assert_eq!(cycle_workset_mode_text("exposed"), "view");
+        assert_eq!(cycle_workset_mode_text("garbage"), "exposed");
+    }
 
     #[test]
     fn parses_agent_role() {
