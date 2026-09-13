@@ -29,7 +29,6 @@ use crate::db::{
 pub mod agent;
 mod claude;
 pub use agent::{AgentHandle, render_agent_surface};
-pub use claude::rebuild;
 
 pub mod db;
 mod image_tool;

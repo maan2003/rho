@@ -55,7 +55,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = notices::TO;
+const CURRENT_AGENT_DB_FORMAT: &str = "6d0f41b9";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,18 +64,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: places::FROM,
-        to: places::TO,
-        migrate: places::run,
-    },
-    AgentDbMigration {
-        from: notices::FROM,
-        to: notices::TO,
-        migrate: notices::run,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1462,12 +1451,12 @@ impl AgentWriteTxnExt for WriteTxn {
 }
 
 /// Every key of one agent's log.
-pub(super) fn agent_range(agent_id: AgentId) -> std::ops::RangeInclusive<(AgentId, u64)> {
+fn agent_range(agent_id: AgentId) -> std::ops::RangeInclusive<(AgentId, u64)> {
     (agent_id, 0)..=(agent_id, u64::MAX)
 }
 
 /// Rows as `(position, event)`, from either kind of table iterator.
-pub(super) fn rows<'a>(
+fn rows<'a>(
     iter: impl Iterator<
         Item = (
             redb::AccessGuard<'a, (AgentId, u64)>,
@@ -1526,7 +1515,7 @@ impl Hidden {
 /// log does not begin with a creation (no such agent).
 /// A user message in the log: the row that carries a pending notice to
 /// the agent, whichever runtime wrote it.
-pub(super) fn carries_notice(event: &AgentEvent<'_>) -> bool {
+fn carries_notice(event: &AgentEvent<'_>) -> bool {
     matches!(
         event,
         AgentEvent::Accepted(crate::QueuedInput {
@@ -1928,9 +1917,6 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }
-
-mod notices;
-mod places;
 
 #[cfg(test)]
 pub(crate) mod tests;

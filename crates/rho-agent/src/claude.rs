@@ -32,7 +32,6 @@ use crate::{
 
 pub(crate) mod projection;
 pub(crate) mod python_host;
-pub mod rebuild;
 
 use projection::{ClaudeStreamItem, Projection, assistant_row, compacted_row, user_row};
 

@@ -27,7 +27,6 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, Notify, OwnedMutexGuard, broadcast
 pub mod debug;
 mod desk_cells;
 mod detail;
-mod migrate;
 mod realtime;
 mod secret_store;
 #[doc(hidden)]
@@ -468,13 +467,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_fs_view::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(db_path);
-    // One-off (7 Sep), before any agent loop can append: every Claude
-    // log the file copier wrote is rebuilt from its session file.
-    let rebuilt = rho_agent::rebuild::rebuild_claude_logs(&db, &claude.projects()).await;
-    eprintln!(
-        "rho daemon: rebuilt {} Claude logs from their session files, closed {} queues without one (one-off)",
-        rebuilt.rebuilt, rebuilt.closed
-    );
     let inference = match args.openai_base_url {
         Some(endpoint) => {
             Inference::new_with_config(
@@ -521,13 +513,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             .await?
         }
     };
-    // One-off (13 Sep), before any agent loads: the worksets the store's
-    // migration named for agents from before worksets get their directories.
-    match migrate::create_missing_worksets(&db, &worksets).await {
-        Ok(0) => {}
-        Ok(made) => eprintln!("rho daemon: made {made} empty worksets for moved agents (one-off)"),
-        Err(error) => eprintln!("rho daemon: making worksets for moved agents failed: {error:#}"),
-    }
     let iroh = if args.iroh {
         let (listener, auth) =
             rho_rpc::AuthenticatedIrohListener::bind(db.clone(), rho_ui_proto::IROH_ALPN).await?;

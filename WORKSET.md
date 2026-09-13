@@ -45,14 +45,13 @@ agent; a directory outside the root can be adopted for one process
 Every agent's record names one place: its workset, its working
 directory there, and its mode. Agents recorded before worksets (a jj
 managed workspace, or the user's own checkout) were moved into one by a
-one-hop migration of the store (`rho-agent/src/db/places.rs`): each got
-an empty workset, exposed since a checkout on the host was, and a
-`Notice` at the tail of its log saying where its old checkout is and how
-to bring its work over, which its next user message carries. Nothing is
-copied; the agent does the clone and the fetch itself, and the old
-workspace is left as it is. The daemon makes the directories those
-worksets name at startup (`rho-daemon/src/migrate.rs`). Both are to be
-removed once the databases of interest have run them.
+one-hop migration of the store, since removed: each got an empty
+workset, exposed since a checkout on the host was, and a `Notice` at the
+tail of its log saying where its old checkout is and the state to reach
+(a clone of the repository's remote under /src with the unpushed
+commits cherry-picked in), which its next user message carries. Nothing
+was copied; the agent does the clone and the fetch itself, and the old
+workspace is left as it is.
 
 `Workset::enter(mode, cwd)` is one agent's `Namespace` over the
 directory: its mount namespace is built on the first command (so loading
