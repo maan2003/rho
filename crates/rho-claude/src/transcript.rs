@@ -403,6 +403,72 @@ pub async fn find_session_transcript(
     Ok(None)
 }
 
+/// A moved agent's transcript, brought to where its new place looks for
+/// it. Claude keys a session's file by the directory it ran in, so an agent
+/// whose place changed would otherwise start the session again under the
+/// same id with nothing in it. The file is hard-linked into the project
+/// directory for `cwd` (copied when a link is not possible); the old
+/// directory keeps its entry. Returns the file at the new place, or `None`
+/// when the session has no file anywhere: it was never spoken to.
+pub async fn relocate_session_transcript(
+    projects: &Utf8Path,
+    session_id: Uuid,
+    cwd: &Utf8Path,
+) -> Result<Option<Utf8PathBuf>> {
+    if let Some(found) = find_session_transcript(projects, session_id, cwd).await? {
+        return Ok(Some(found));
+    }
+    let cwd = canonical_utf8(cwd).await.unwrap_or_else(|| cwd.to_owned());
+    let project_key = project_key(&cwd);
+    if project_key.len() > MAX_PROJECT_KEY_LEN {
+        // Claude shortens a long key with a hash this crate does not compute.
+        return Ok(None);
+    }
+    let Some(source) = find_session_transcript_anywhere(projects, session_id).await? else {
+        return Ok(None);
+    };
+    let dir = projects.join(&project_key);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("create Claude project directory {dir}"))?;
+    let target = dir.join(format!("{session_id}.jsonl"));
+    match tokio::fs::hard_link(&source, &target).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => {
+            tokio::fs::copy(&source, &target)
+                .await
+                .with_context(|| format!("copy Claude transcript {source} to {target}"))?;
+        }
+    }
+    Ok(Some(target))
+}
+
+/// The session's file under any project directory.
+async fn find_session_transcript_anywhere(
+    projects: &Utf8Path,
+    session_id: Uuid,
+) -> Result<Option<Utf8PathBuf>> {
+    let mut entries = match tokio::fs::read_dir(projects).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read Claude projects directory"),
+    };
+    let file_name = format!("{session_id}.jsonl");
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(path) = Utf8PathBuf::from_path_buf(entry.path())
+            .ok()
+            .map(|path| path.join(&file_name))
+        else {
+            continue;
+        };
+        if non_empty_file(&path).await? {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
 const MAX_PROJECT_KEY_LEN: usize = 200;
 
 async fn canonical_utf8(path: &Utf8Path) -> Option<Utf8PathBuf> {
@@ -621,6 +687,45 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_moved_agents_transcript_is_brought_to_its_new_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        let session_id = uuid::uuid!("00000000-0000-4000-8000-000000000005");
+        let old = projects.join("-home-someone-src-rho");
+        std::fs::create_dir_all(&old).unwrap();
+        let rows = "{\"type\":\"user\"}\n";
+        std::fs::write(old.join(format!("{session_id}.jsonl")), rows).unwrap();
+        let cwd = Utf8Path::new("/nowhere-yet/src");
+
+        let brought = relocate_session_transcript(&projects, session_id, cwd)
+            .await
+            .unwrap()
+            .expect("the file is found under the old place");
+        assert_eq!(
+            brought,
+            projects
+                .join("-nowhere-yet-src")
+                .join(format!("{session_id}.jsonl"))
+        );
+        assert_eq!(std::fs::read_to_string(&brought).unwrap(), rows);
+        // Already there: found, not made again.
+        assert_eq!(
+            relocate_session_transcript(&projects, session_id, cwd)
+                .await
+                .unwrap(),
+            Some(brought)
+        );
+        // Never spoken to: nothing anywhere, nothing made.
+        let unspoken = uuid::uuid!("00000000-0000-4000-8000-000000000006");
+        assert_eq!(
+            relocate_session_transcript(&projects, unspoken, cwd)
+                .await
+                .unwrap(),
+            None
+        );
+    }
 
     fn entry(kind: TranscriptEntryKind, uuid: Uuid, parent_uuid: Option<Uuid>) -> TranscriptEntry {
         TranscriptEntry {

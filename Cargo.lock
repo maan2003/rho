@@ -12884,6 +12884,7 @@ dependencies = [
  "senax-encoder",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]

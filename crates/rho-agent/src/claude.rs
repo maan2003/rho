@@ -149,6 +149,24 @@ impl ClaudeAgent {
             })?;
         let python_mode = record.config.binding.claude_python();
         let primary_repo = record.place().cwd.clone();
+        // A moved agent's file is where its old place looked, until it is
+        // brought here; found nowhere, the session is one never spoken to.
+        let mut sessions = vec![session_id];
+        if let Some(rewind) = &record.config.claude_rewind {
+            sessions.push(rewind.session_id);
+            sessions.push(rewind.source_session_id);
+        }
+        for session in sessions {
+            if let Err(error) =
+                rho_claude::relocate_session_transcript(&claude.projects(), session, &primary_repo)
+                    .await
+            {
+                eprintln!(
+                    "rho-agent: Claude session {session} of {} stays where it was: {error:#}",
+                    agent_id.encoded()
+                );
+            }
+        }
         // The transcript's rows come from the file when the loop starts
         // (`sync_transcript`); a load reads the file only to settle a
         // rewind that was cut short.
@@ -353,6 +371,12 @@ impl ClaudeAgent {
     /// The record as of the loop's last change to it.
     pub fn head(&self) -> crate::db::AgentHead {
         self.head.read().expect("poison").clone()
+    }
+
+    /// A user message carried the pending notice: it is not said again.
+    /// The log agrees once the message's row is in it.
+    pub fn notice_carried(&self) {
+        self.head.write().expect("poison").pending_notice = None;
     }
 
     /// Say the whole tail again: a client just started looking.
