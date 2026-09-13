@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use prefix_id::{PrefixId, PrefixIdDomain};
 use redb::TableDefinition;
 use rho_core::{AgentId, UnixMs};
@@ -184,18 +184,45 @@ fn mint_workset_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_owned()
 }
 
-/// What the agent is told, ahead of its first user message after the move:
-/// where it is now, where its work was, and the state to reach. How to get
-/// there is the agent's to work out.
+/// Where a moved agent's work was, as the notice names it.
+pub(super) enum MovedFrom<'a> {
+    Workspace {
+        repo: &'a Utf8Path,
+        workspace: String,
+    },
+    UserCheckout {
+        repo: &'a Utf8Path,
+    },
+    Workset {
+        workset: &'a str,
+        cwd: &'a Utf8Path,
+    },
+}
+
+/// What the agent is told, ahead of its first user message after the move.
 fn moved_notice(old: &OldWorkspaceInfo) -> String {
+    moved_notice_text(&match old {
+        OldWorkspaceInfo::Workspace { repo, id } | OldWorkspaceInfo::Sandbox { repo, id } => {
+            MovedFrom::Workspace {
+                repo,
+                workspace: format!("ws-{}", id.encoded()),
+            }
+        }
+        OldWorkspaceInfo::UserCheckout { repo } => MovedFrom::UserCheckout { repo },
+        OldWorkspaceInfo::Workset { workset, cwd, .. } => MovedFrom::Workset { workset, cwd },
+    })
+}
+
+/// The notice's words: where the agent is now, where its work was, and
+/// the state to reach. How to get there is the agent's to work out.
+pub(super) fn moved_notice_text(from: &MovedFrom<'_>) -> String {
     let mut note = String::from(
         "Note from Rho: this agent was moved into a workset. Your working directory is now \
          /src, an empty directory of your own; the rest of the host is visible as before. \
          Nothing was copied. ",
     );
-    match old {
-        OldWorkspaceInfo::Workspace { repo, id } | OldWorkspaceInfo::Sandbox { repo, id } => {
-            let workspace = format!("ws-{}", id.encoded());
+    match from {
+        MovedFrom::Workspace { repo, workspace } => {
             note.push_str(&format!(
                 "Before, you worked in the jj workspace {workspace} of the repository at {repo}; \
                  it is still there with your commits, and \
@@ -207,7 +234,7 @@ fn moved_notice(old: &OldWorkspaceInfo) -> String {
                  in. Leave the old workspace as it is."
             ));
         }
-        OldWorkspaceInfo::UserCheckout { repo } => {
+        MovedFrom::UserCheckout { repo } => {
             note.push_str(&format!(
                 "Before, you worked directly in {repo}, the user's own checkout. The state to \
                  reach: a clone under /src of the repository's remote (the URL \
@@ -216,7 +243,7 @@ fn moved_notice(old: &OldWorkspaceInfo) -> String {
                  Leave {repo} to the user."
             ));
         }
-        OldWorkspaceInfo::Workset { workset, cwd, .. } => {
+        MovedFrom::Workset { workset, cwd } => {
             note.push_str(&format!(
                 "Before, you worked at {cwd} in workset {workset}."
             ));
@@ -291,7 +318,10 @@ mod tests {
             write.commit();
         }
         let read = db.read();
-        assert_eq!(read.open_table(FORMAT).get(&()).unwrap().value(), TO);
+        assert_eq!(
+            read.open_table(FORMAT).get(&()).unwrap().value(),
+            super::super::CURRENT_AGENT_DB_FORMAT
+        );
         let kept = read.get_agent(in_workset);
         assert_eq!(
             kept.config.place,

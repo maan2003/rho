@@ -55,7 +55,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = places::TO;
+const CURRENT_AGENT_DB_FORMAT: &str = notices::TO;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,11 +64,18 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: places::FROM,
-    to: places::TO,
-    migrate: places::run,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: places::FROM,
+        to: places::TO,
+        migrate: places::run,
+    },
+    AgentDbMigration {
+        from: notices::FROM,
+        to: notices::TO,
+        migrate: notices::run,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1455,12 +1462,12 @@ impl AgentWriteTxnExt for WriteTxn {
 }
 
 /// Every key of one agent's log.
-fn agent_range(agent_id: AgentId) -> std::ops::RangeInclusive<(AgentId, u64)> {
+pub(super) fn agent_range(agent_id: AgentId) -> std::ops::RangeInclusive<(AgentId, u64)> {
     (agent_id, 0)..=(agent_id, u64::MAX)
 }
 
 /// Rows as `(position, event)`, from either kind of table iterator.
-fn rows<'a>(
+pub(super) fn rows<'a>(
     iter: impl Iterator<
         Item = (
             redb::AccessGuard<'a, (AgentId, u64)>,
@@ -1517,6 +1524,25 @@ impl Hidden {
 
 /// The fold of one agent's rows, hidden ones included; `None` when the
 /// log does not begin with a creation (no such agent).
+/// A user message in the log: the row that carries a pending notice to
+/// the agent, whichever runtime wrote it.
+pub(super) fn carries_notice(event: &AgentEvent<'_>) -> bool {
+    matches!(
+        event,
+        AgentEvent::Accepted(crate::QueuedInput {
+            source: rho_core::MessageSender::User,
+            kind: crate::InputKind::Message { .. },
+            ..
+        }) | AgentEvent::ClaudePresentationSource {
+            speaker: crate::PresentationSpeaker::User,
+            ..
+        } | AgentEvent::Transcript {
+            line: crate::TranscriptLine::User { .. },
+            ..
+        }
+    )
+}
+
 fn fold_head(all: impl Iterator<Item = (AgentEventPos, AgentEvent<'static>)>) -> Option<AgentHead> {
     let mut head: Option<AgentHead> = None;
     for (pos, event) in all {
@@ -1713,19 +1739,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.last_turn_ended = Some(*at);
             }
         },
-        AgentEvent::Accepted(crate::QueuedInput {
-            source: rho_core::MessageSender::User,
-            kind: crate::InputKind::Message { .. },
-            ..
-        })
-        | AgentEvent::ClaudePresentationSource {
-            speaker: crate::PresentationSpeaker::User,
-            ..
-        }
-        | AgentEvent::Transcript {
-            line: crate::TranscriptLine::User { .. },
-            ..
-        } => {
+        event if carries_notice(event) => {
             head.user_interacted = true;
             head.pending_notice = None;
         }
@@ -1915,6 +1929,7 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .value()
 }
 
+mod notices;
 mod places;
 
 #[cfg(test)]
