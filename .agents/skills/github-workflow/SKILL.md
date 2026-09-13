@@ -5,17 +5,21 @@ description: Deliver code through GitHub pull requests, including pushes, review
 
 # GitHub workflow
 
-Use `rho pr` for GitHub operations. Carry this workflow through from
-completed local changes to a pull request with a terminal CI result; creating
-the pull request alone is not completion.
+Use `rho pr` for pull-request and GitHub Actions operations. For PR delivery,
+carry this workflow through to a terminal CI result; creating the pull request
+alone is not completion. When the user explicitly requests a direct branch
+update, use the approved-push path below instead of creating an unsolicited PR.
 
 ## Model interface to GitHub
 
 Pushes go through `origin` as usual. An Octo remote may route them through
 `git-remote-octo` internally, but never invoke the helper or Octo API
-directly. Token-backed pushes are confined to
-`refs/heads/rho/*`; other refs require explicit local SSH approval and are not
-part of the normal agent workflow.
+directly. Token-backed pushes are confined to `refs/heads/rho/*`. Pushes to
+other refs, including `main`, are supported through the same `git push origin`
+command: the helper automatically routes them to the client SSH transport and
+prompts the user for approval. Do not switch remotes or credentials, invoke SSH
+yourself, or treat these refs as unsupported. Wait for the approval result and
+report a refusal or unavailable client honestly.
 
 Use only `rho pr` for pull-request and GitHub Actions operations:
 
@@ -69,8 +73,23 @@ git push origin HEAD:refs/heads/rho/CHANGE_NAME
 rho pr create --head rho/CHANGE_NAME --title "TITLE" --body "BODY"
 ```
 
-For a stacked pull request, pass its parent branch with `--base`. Never push a
-normal branch or tag through Octo.
+For a stacked pull request, pass its parent branch with `--base`.
+
+### User-requested direct branch updates
+
+When the user explicitly asks to update `main`, `master`, or another branch,
+verify the target branch, fetch it, rebase if needed, and rerun relevant checks.
+Use a non-force push for a requested fast-forward:
+
+```bash
+git push origin HEAD:refs/heads/main
+```
+
+Use the actual requested/default branch name, not an assumed `main`. Octo
+automatically requests user approval for destinations outside `rho/*`; do not
+ask the user to configure a separate SSH push. If the remote advances, fetch,
+rebase, and verify again rather than force-pushing. Confirm the remote tip after
+success. A direct update does not require creating a PR.
 
 The default bot allowlist contains the Codex review connector. To trust another
 review bot for this subscription, repeat `--review-bot EXACT_GITHUB_LOGIN` on
