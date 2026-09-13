@@ -1101,9 +1101,6 @@ impl Services {
                      repository's URL or path instead"
                 );
             }
-            StartMode::Sandbox { .. } => {
-                anyhow::bail!("sandboxes are no longer supported");
-            }
         };
         let (agent_id, agent) = self.pool.create(role, None, start).await?;
         Ok((agent_id, agent))

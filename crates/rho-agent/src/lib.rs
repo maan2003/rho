@@ -18,7 +18,7 @@ use rho_core::{
 pub use rho_core::{MessageDelivery, MessageSender};
 use rho_db::RhoDb;
 pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
-use senax_encoder::{Decode, Encode, Pack, Unpack};
+use senax_encoder::{Decode, Encode};
 
 use crate::db::{
     AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, AgentWant,
@@ -375,11 +375,6 @@ pub enum InputKind {
     /// input at all — it happens while building a request.
     Compaction,
 }
-
-/// Opaque tag the previous loop stored for the surface that submitted an
-/// input. Kept so old rows decode; nothing reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
-pub struct InputSourceId(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum PresentationSpeaker {

@@ -55,7 +55,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "6d0f41b9";
+const CURRENT_AGENT_DB_FORMAT: &str = old_rows::TO;
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,7 +64,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: old_rows::FROM,
+    to: old_rows::TO,
+    migrate: old_rows::run,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1715,7 +1719,12 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
             }
         }
         AgentEvent::WorkdirAdded { .. } => {}
-        AgentEvent::Notice { text, .. } => head.pending_notice = Some(text.to_string()),
+        // An empty notice is nothing to say (a rewritten `WorkdirAdded`).
+        AgentEvent::Notice { text, .. } => {
+            if !text.is_empty() {
+                head.pending_notice = Some(text.to_string());
+            }
+        }
         AgentEvent::RuntimeRebound { change, .. } => match change {
             crate::RuntimeChange::ClaudeRewindPending(rewind) => {
                 head.config.claude_rewind = rewind.clone();
@@ -1934,6 +1943,8 @@ fn machine_seed(write: &mut WriteTxn) -> u64 {
         .expect("machine seed missing; init_agent_tables must run first")
         .value()
 }
+
+mod old_rows;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -496,8 +496,6 @@ pub enum StartMode {
     /// A fresh workset holding a clone of `repo` (a URL or a daemon-side
     /// path), with a new change on top of the revset.
     NewOn { repo: Utf8PathBuf, revset: String },
-    /// Historical: sandboxes are no longer made.
-    Sandbox { repo: Utf8PathBuf, revset: String },
     /// The SAME place as the target: the new agent works in the target
     /// agent's directory, seeing its edits instantly.
     Join(JoinTarget),

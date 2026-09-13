@@ -47,7 +47,7 @@ pub fn start_field_candidates(
     [
         Candidate {
             value: rho_agents::create::DEFAULT_START.to_owned(),
-            description: "local main → local master → trunk (New/Sandbox)".to_owned(),
+            description: "local main → local master → trunk (New)".to_owned(),
         },
         Candidate {
             value: "user".to_owned(),
