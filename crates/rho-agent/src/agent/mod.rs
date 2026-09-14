@@ -40,17 +40,15 @@ use crate::boundary::{
     Boundary, ModelAsked, ModelTurn, Observations, SourceKind, Standing, boundary,
 };
 use crate::db::{
-    AgentEventPos, AgentHead, AgentProfileWriteTxnExt as _,
-    AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket,
-    AgentUsageModel, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding, TurnEdge,
-    TurnOutcome, UnixMillis,
+    AgentEventPos, AgentHead, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRole,
+    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentUsageModel,
+    AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding, TurnEdge, TurnOutcome, UnixMillis,
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::native::NativeEvent;
 use crate::notebook::host_tools;
 use crate::pool::{AgentPool, AgentTurnCompleted};
-
 use crate::{
     AgentEvent, AgentStateKind, AgentStatus, FailedInferenceResponse, InputKind, QueuedInput,
     StartPlace, ToolPreview, View, final_answer_text, prompt,
@@ -660,8 +658,7 @@ struct Agent {
 }
 
 impl Drop for Agent {
-    fn drop(&mut self) {
-    }
+    fn drop(&mut self) {}
 }
 
 impl Agent {
@@ -984,16 +981,15 @@ impl Agent {
                 at,
                 done,
             } => {
-                self
-                    .persist(AgentEvent::Accepted(QueuedInput {
-                        source: MessageSender::Agent { id: sender },
-                        kind: InputKind::Message {
-                            content: content.clone(),
-                        },
-                        delivery: MessageDelivery::NextRequest,
-                        at,
-                    }))
-                    .await;
+                self.persist(AgentEvent::Accepted(QueuedInput {
+                    source: MessageSender::Agent { id: sender },
+                    kind: InputKind::Message {
+                        content: content.clone(),
+                    },
+                    delivery: MessageDelivery::NextRequest,
+                    at,
+                }))
+                .await;
                 if !rho_core::text_content(&content).trim().is_empty() {
                     self.name(&rho_core::text_content(&content)).await;
                 }
@@ -1050,7 +1046,15 @@ impl Agent {
             Control::Rewind { turns, reply } => {
                 let _ = reply.send(self.rewind(turns).await);
             }
-            Control::TitleFinished(result) => crate::title::finish(&self.db, self.agent_id, result).await,
+            Control::TitleFinished(result) => {
+                crate::title::finish(&self.db, self.agent_id, result).await;
+                let stored = self.db.read().get_agent(self.agent_id);
+                {
+                    let mut head = self.head.write().expect("poison");
+                    head.generated_title = stored.generated_title;
+                    head.title_attempted = stored.title_attempted;
+                }
+            }
         }
     }
 
@@ -1218,11 +1222,13 @@ impl Agent {
 
     async fn name(&mut self, input: &str) {
         let control = self.control.clone();
-        self.title.start(&self.db, self.agent_id, input, move |result| {
-            if let Some(control) = control.upgrade() {
-                let _ = control.send(Control::TitleFinished(result));
-            }
-        }).await;
+        self.title
+            .start(&self.db, self.agent_id, input, move |result| {
+                if let Some(control) = control.upgrade() {
+                    let _ = control.send(Control::TitleFinished(result));
+                }
+            })
+            .await;
     }
 
     // -- acting on it -------------------------------------------------------
@@ -1598,7 +1604,8 @@ impl Agent {
                 ContextBlock::ToolResults { results } => Some(results),
                 _ => None,
             })
-            .flatten().map(|result| result.call_id.clone())
+            .flatten()
+            .map(|result| result.call_id.clone())
             .collect::<Vec<_>>();
         for id in &handoff {
             self.persist(AgentEvent::ExecObserved {
@@ -1703,14 +1710,16 @@ impl Agent {
             requests: 1,
             ..AgentUsageBucket::default()
         });
-        self
-            .persist(AgentEvent::Native(NativeEvent::ResponseFinished {
-                output: vec![ContextBlock::InferenceResponse { items, provider_response_id }],
-                context_used,
-                usage: turn_usage.clone(),
-                at: now,
-            }))
-            .await;
+        self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
+            output: vec![ContextBlock::InferenceResponse {
+                items,
+                provider_response_id,
+            }],
+            context_used,
+            usage: turn_usage.clone(),
+            at: now,
+        }))
+        .await;
 
         if let Some(turn_usage) = turn_usage {
             self.total_usage.add(&turn_usage);

@@ -1,7 +1,7 @@
 # rho-inference architecture
 
 `rho-inference` provides concrete inference provider integrations for rho. Its
-deep, title, and status sessions use the concrete OpenAI Responses WebSocket
+native exec and one-shot text sessions use the concrete OpenAI Responses WebSocket
 implementation. There is no provider-dispatch wrapper around the session.
 
 ## Public API boundary
@@ -24,13 +24,16 @@ The public surface is intentionally small:
   settings contract. Request setup never queries quota.
 - `Inference::route_probe_history` exposes the retained route measurements for
   diagnostics without exposing provider account ids or credentials.
+- `Inference::text` makes one tool-free text request for bounded naming callers.
 - `InferenceSession::request` queues a `rho_core::InferenceRequest`;
   `InferenceSession::run` drives the concrete session and yields
   `rho_core::InferenceEvent` values ending in `InferenceEvent::Finished`.
 - `auth_cli::AuthArgs` and `run_auth_cli` own the user-facing auth management
   workflow for add/list/remove/path/status/import.
 - `exec` owns the native custom-Python specification and validates the response
-  as prose or exactly one exec. Nested host functions are not top-level actions.
+  as prose or exactly one exec. Native sessions always advertise that fixed
+  action; requests cannot supply arbitrary tool specifications. Historical
+  function calls remain replay evidence. Nested host functions are not top-level actions.
 - `rho_core::InferenceEvent` is the streaming update contract consumed by
   `rho-agent` and UIs.
 - Raw OAuth helpers, credential DTOs, credential files, token refresh, and
@@ -76,7 +79,8 @@ configuration.
 `InferenceRequest.input` is the source of truth for the Responses request body. The
 request builder:
 
-- extracts system/developer messages into `instructions`;
+- uses the request's explicit instructions and projects canonical entries directly,
+  without a second flattened conversation representation;
 - sends user/assistant/tool-call/tool-result items as Responses input items;
 - encodes local tool names to provider-safe wire names and maps them back when
   parsing tool calls;
@@ -92,7 +96,7 @@ request builder:
   continuation, even if an earlier response is inside the retained suffix;
 - resolves tool identities from full history so late output from dropped calls
   can be emitted as standalone named output;
-- trims input before the latest legacy provider compaction item when replaying
+- trims input before the latest provider compaction item when replaying
   compacted history. Automatic notes-rotation requests suppress both server compaction and
   manual triggers. An explicit Compact request overrides notes mode, using real
   provider compaction through completion and retries. Ordinary roles retain

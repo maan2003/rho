@@ -3445,11 +3445,17 @@ fn agent_detail(
                     })
                     .collect(),
             ),
-            NativeEvent::ResponseFinished { output, .. } => {
-                DetailBody::Response(output.iter().filter_map(|entry| match entry {
-                    rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None,
-                }).flatten().filter_map(detail::item).collect())
-            }
+            NativeEvent::ResponseFinished { output, .. } => DetailBody::Response(
+                output
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items),
+                        _ => None,
+                    })
+                    .flatten()
+                    .filter_map(detail::item)
+                    .collect(),
+            ),
             NativeEvent::RequestFailed { partial, .. } => DetailBody::Response(
                 partial
                     .items
@@ -3717,6 +3723,7 @@ mod tests {
         assert_eq!(super::detail_result(&result).output, "complete host record");
 
         let update = rho_core::ToolUpdate {
+            status: None,
             images: Default::default(),
             call_id: rho_core::ToolCallId::try_from("call-1").unwrap(),
             tool_type: rho_core::ToolType::Custom,

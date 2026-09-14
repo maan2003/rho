@@ -8,8 +8,8 @@ use futures_util::{Sink, Stream};
 use rho_core::{
     ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, PendingInferenceResponse, ProviderResponseId,
-    StreamingContextItem, TokenUsage, ToolCall, ToolCallId,
-    ToolName, ToolOutput, ToolOutputStatus, ToolResult, ToolType, UnixMs, text_content,
+    StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolName, ToolOutput, ToolOutputStatus,
+    ToolResult, ToolType, UnixMs, text_content,
 };
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite;

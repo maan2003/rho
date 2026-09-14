@@ -662,7 +662,7 @@ async fn response_subscriptions_are_persistent_edges() {
     assert!(db.read().agent_response_subscribers(target).is_empty());
 }
 
-fn create(
+pub(super) fn create(
     write: &mut rho_db::WriteTxn,
     spawn_name: Option<&str>,
     parent: Option<AgentId>,
@@ -767,7 +767,6 @@ async fn a_rewind_hides_rows_and_is_itself_visible() {
         Some(user_event("old branch"))
     );
     // The tail walk backward skips it too.
-
 }
 
 #[tokio::test]

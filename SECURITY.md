@@ -34,15 +34,14 @@ AI APIs.
   same checked in-process path mapping as patch writes and rejects paths outside
   the workdirs; ordinary views retain their documented ambient filesystem
   authority.
-- A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB
-  per message), text-only recent transcript excerpt to Luna to derive a
-  title/activity cache. Native agents commit source events directly; Claude
-  commits individually bounded user and assistant text from confirmed CLI
-  messages, then reconciles that mirror against the selected JSONL chain on
-  load and rewind. XML wrapping is structural context, not a trust boundary:
-  transcript text remains semi-trusted provider input. Requests are
-  globally bounded, cancelled when the last UI watch is released, and never
-  feed their output back into the agent transcript.
+- Native and Claude agents may send at most 1 KiB of the first user/task
+  message to Luna for a one-shot, text-only title. The attempt is durable before
+  dispatch, globally limited to four concurrent requests, and bounded by a
+  30-second timeout including queueing. Failure, cancellation, restart, and
+  rewind do not retry it. Task text remains semi-trusted input; the output is
+  restricted to a 30-character ASCII title and never enters agent context.
+  Existing names win over late completion. Naming has no tools, evolving
+  transcript access, activity classification, or UI-watch trigger.
 - Client-side web search sends the configured model and a bounded recent
   transcript excerpt to ChatGPT's first-party search endpoint using the same
   OAuth identity as inference. Search responses are remote, semi-trusted tool

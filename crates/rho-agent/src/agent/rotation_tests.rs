@@ -90,10 +90,9 @@ fn latest_send(agent: &Agent) -> (Option<crate::ContextChange>, Vec<ContextBlock
         .find_map(|event| {
             let native = event.native_event()?;
             match native {
-                NativeEvent::RequestStarted { input, context, .. } => Some((
-                    context.clone(),
-                    input.clone(),
-                )),
+                NativeEvent::RequestStarted { input, context, .. } => {
+                    Some((context.clone(), input.clone()))
+                }
                 _ => None,
             }
         })
@@ -328,10 +327,15 @@ async fn cancellation_stops_preparation_even_with_buffered_input() {
 
 #[test]
 fn preparation_mirror_does_not_drain_the_ui_queue() {
-    let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { context: Some(ContextChange::Preparing {
+    let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+        context: Some(ContextChange::Preparing {
             retain_from: 0,
             repair: false,
-        }), input: Vec::from(Vec::new()), at: UnixMs(5), wake: None });
+        }),
+        input: Vec::from(Vec::new()),
+        at: UnixMs(5),
+        wake: None,
+    });
     assert_eq!(
         crate::mirror::strip(&event),
         Some(rho_ui_proto::mirror::MirrorEvent::Results {
@@ -398,7 +402,14 @@ async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
             ContextChange::Marked { retain_from: 0 }
         };
         agent
-            .persist(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![]), context: Some(change.clone()), at: UnixMs(1), wake: None }))
+            .persist(AgentEvent::Native(
+                crate::native::NativeEvent::RequestStarted {
+                    input: Vec::from(vec![]),
+                    context: Some(change.clone()),
+                    at: UnixMs(1),
+                    wake: None,
+                },
+            ))
             .await;
         agent.context.sent(&change);
         agent.context_used = agent.session.auto_compact_token_limit();
@@ -626,7 +637,14 @@ async fn role_switches_cancel_pending_rotation_durably() {
         text: context::MARKER.into(),
     }];
     agent
-        .persist(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: blocks.clone(), context: Some(change.clone()), at: UnixMs::now(), wake: None }))
+        .persist(AgentEvent::Native(
+            crate::native::NativeEvent::RequestStarted {
+                input: blocks.clone(),
+                context: Some(change.clone()),
+                at: UnixMs::now(),
+                wake: None,
+            },
+        ))
         .await;
     agent.context.sent(&change);
     agent

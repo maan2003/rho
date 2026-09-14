@@ -65,7 +65,9 @@ struct AgentDbMigration {
 
 mod migration;
 const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "b4e2c7a1", to: CURRENT_AGENT_DB_FORMAT, migrate: migration::migrate,
+    from: "b4e2c7a1",
+    to: CURRENT_AGENT_DB_FORMAT,
+    migrate: migration::migrate,
 }];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
@@ -358,7 +360,6 @@ pub struct AgentHead {
     /// Where the next event goes: one past the last row, hidden or not.
     pub next: AgentEventPos,
 }
-
 
 impl AgentHead {
     pub fn config(&self) -> AgentRole {
@@ -779,7 +780,6 @@ pub trait AgentWriteTxnExt {
     /// returned cache is the acknowledged source of truth for a sidecar
     /// session; `None` means its result was made stale by a rewind.
 
-
     /// Takes back history from `to` on: told at a new position, so what
     /// the agent walked away from stays in the log
     /// (`DECISION-history-only-branches`). Returns where it was told.
@@ -1026,7 +1026,6 @@ impl AgentReadTxnExt for ReadTxn {
             .map(|value| value.value().into_owned())
     }
 
-
     fn journal_head(&self) -> Seq {
         Seq(self
             .open_table(JOURNAL)
@@ -1239,7 +1238,6 @@ impl AgentWriteTxnExt for WriteTxn {
         AgentId::from_counter(next_counter(self, CounterKey::LAST_AGENT_ID), &domain)
             .expect("agent id counter exceeds prefix-id capacity")
     }
-
 
     fn rewind_agent(
         &mut self,
@@ -1523,7 +1521,11 @@ pub(crate) fn agent_head_write(write: &mut WriteTxn, agent_id: AgentId) -> Optio
 }
 
 /// Whether a rewind destination is still in the visible history.
-fn agent_event_visible_write(write: &mut WriteTxn, agent_id: AgentId, position: AgentEventPos) -> bool {
+fn agent_event_visible_write(
+    write: &mut WriteTxn,
+    agent_id: AgentId,
+    position: AgentEventPos,
+) -> bool {
     let log = write.open_table(AGENT_LOG);
     let mut hidden = Hidden::default();
     for (pos, event) in rows(log.range(agent_range(agent_id)).rev()) {

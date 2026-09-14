@@ -174,7 +174,10 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
             continue;
         };
         match event {
-            AgentEvent::Native(rho_agent::native::NativeEvent::RequestStarted { input: blocks, .. }) => {
+            AgentEvent::Native(rho_agent::native::NativeEvent::RequestStarted {
+                input: blocks,
+                ..
+            }) => {
                 requests += 1;
                 emit(json!({"type":"request", "number":requests}))?;
                 for block in blocks.iter() {
@@ -193,7 +196,11 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                     }
                 }
             }
-            AgentEvent::Native(rho_agent::native::NativeEvent::ResponseFinished { output: blocks, usage, .. }) => {
+            AgentEvent::Native(rho_agent::native::NativeEvent::ResponseFinished {
+                output: blocks,
+                usage,
+                ..
+            }) => {
                 // The final response replaces earlier commentary for assertions.
                 final_answer.clear();
                 for block in blocks.iter() {
@@ -237,7 +244,9 @@ pub(crate) async fn run(args: EvalArgs) -> Result<()> {
                 }
             }
             AgentEvent::Native(rho_agent::native::NativeEvent::RequestFailed {
-                error, retrying, ..
+                error,
+                retrying,
+                ..
             }) => emit(json!({"type":"provider_error","error":error,"retrying":retrying}))?,
             AgentEvent::Turn {
                 edge: TurnEdge::Ended(outcome),

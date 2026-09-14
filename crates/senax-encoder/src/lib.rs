@@ -416,6 +416,7 @@ macro_rules! declare_senax_tagged_trait {
             #[derive(Debug, Clone, PartialEq, Eq)]
             $vis struct $unknown_name {
                 pub tag: String,
+                pub body: bytes::Bytes,
             }
 
             impl $trait_name for $unknown_name {
@@ -425,8 +426,9 @@ macro_rules! declare_senax_tagged_trait {
 
                 fn encode_tagged_body(
                     &self,
-                    _writer: &mut bytes::BytesMut,
+                    writer: &mut bytes::BytesMut,
                 ) -> $crate::Result<()> {
+                    writer.extend_from_slice(&self.body);
                     Ok(())
                 }
 
@@ -494,7 +496,7 @@ macro_rules! declare_senax_tagged_trait {
                             return (entry.decode)(body);
                         }
                     }
-                    Ok(Box::new($unknown_name { tag }))
+                    Ok(Box::new($unknown_name { tag, body }))
                 }
             }
         }

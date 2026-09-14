@@ -61,15 +61,13 @@ file-backed OAuth credentials.
   operations need explicit timeout/cancellation behavior.
 - Unbounded memory/task growth: inference streams should apply backpressure and
   stop promptly when the returned stream is dropped.
-- Transient provider/transport stream failures (for example overload, rate
-  limit, and mid-turn WebSocket loss) are retried in the active turn for up to
-  eight hours with jittered Fibonacci backoff capped at 30 minutes before
-  surfacing a terminal failure.
-- A structured `rate_limit_exceeded` failure switches the process-wide
-  selection and may replay the active request through another enabled OAuth
-  account. `TemporaryFailure` lets the agent retain the failed attempt's
-  partial response while starting a clean pending response. Cross-account
-  replay always drops the old socket and provider response chain.
+- Each session request makes one provider attempt. Transport failures surface
+  to the runtime, which owns admission-aware retry and backoff; there is no
+  internal multi-hour retry loop. A stale `previous_response_id` can reopen and
+  replay the same request from canonical history.
+- A structured `rate_limit_exceeded` failure updates account selection for the
+  next runtime attempt. Cross-account requests drop the old socket and provider
+  response chain; failed partial output is not silently merged into a retry.
 - Responses protocol drift or malformed events: event parsing should ignore
   unknown/malformed non-terminal events, surface terminal error/incomplete
   events, and preserve provider items needed for replay.

@@ -41,8 +41,8 @@ pub mod mirror;
 pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
-mod title;
 pub mod prompt;
+mod title;
 
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic
 /// agent identity/team text and stateful integration hosts are omitted.
@@ -71,9 +71,14 @@ pub enum AgentEvent<'a> {
         at: UnixMs,
     },
     /// The lifetime naming opportunity was consumed, before network dispatch.
-    TitleAttempted { at: UnixMs },
+    TitleAttempted {
+        at: UnixMs,
+    },
     /// Generated naming metadata; a spawn or user name always takes precedence.
-    Titled { title: Option<String>, at: UnixMs },
+    Titled {
+        title: Option<String>,
+        at: UnixMs,
+    },
     /// What the last turn asks of the person.
     Wants {
         want: AgentWant,
@@ -351,7 +356,6 @@ pub enum InputKind {
     /// input at all — it happens while building a request.
     Compaction,
 }
-
 
 /// What one transcript line says, as far as a reader needs. Bodies are
 /// whole: the wire strips them.
@@ -639,7 +643,6 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod encoding_tests {
     use senax_encoder::{Decoder as _, Encoder as _};
@@ -668,16 +671,41 @@ mod encoding_tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs(8),
             }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::CompactionTrigger]), at: UnixMs(9), wake: None, context: None }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(Vec::new()), context_used: Some(12), usage: None, at: UnixMs(10) }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::DeveloperMessage {
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(vec![ContextBlock::CompactionTrigger]),
+                at: UnixMs(9),
+                wake: None,
+                context: None,
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(Vec::new()),
+                context_used: Some(12),
+                usage: None,
+                at: UnixMs(10),
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(vec![ContextBlock::DeveloperMessage {
                     text: "boundary".into(),
-                }]), context: Some(ContextChange::Marked { retain_from: 1 }), at: UnixMs(11), wake: None }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(Vec::new()), context: Some(ContextChange::Preparing {
+                }]),
+                context: Some(ContextChange::Marked { retain_from: 1 }),
+                at: UnixMs(11),
+                wake: None,
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(Vec::new()),
+                context: Some(ContextChange::Preparing {
                     retain_from: 1,
                     repair: true,
-                }), at: UnixMs(11), wake: None }),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ContextRotation { retain_from: 1 }]), at: UnixMs(11), wake: None, context: None }),
+                }),
+                at: UnixMs(11),
+                wake: None,
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(vec![ContextBlock::ContextRotation { retain_from: 1 }]),
+                at: UnixMs(11),
+                wake: None,
+                context: None,
+            }),
             AgentEvent::Cleared { at: UnixMs(11) },
             AgentEvent::Turn {
                 edge: TurnEdge::Ended(TurnOutcome::Errored {

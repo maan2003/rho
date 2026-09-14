@@ -2249,6 +2249,7 @@ fn test_declared_senax_tagged_traits_have_separate_registries() {
         }
     );
 
+    let original = encoded.clone().freeze();
     let decoded = Box::<dyn OtherProviderData>::decode(&mut encoded.freeze()).unwrap();
     assert_eq!(
         decoded
@@ -2256,8 +2257,19 @@ fn test_declared_senax_tagged_traits_have_separate_registries() {
             .downcast_ref::<UnknownOtherProviderData>()
             .expect("unknown other provider data"),
         &UnknownOtherProviderData {
-            tag: <RegisteredOpenAiMeta as senax_encoder::TaggedSenax>::TAG.to_owned()
+            tag: <RegisteredOpenAiMeta as senax_encoder::TaggedSenax>::TAG.to_owned(),
+            body: senax_encoder::encode(&RegisteredOpenAiMeta {
+                item_id: "fc_123".to_owned()
+            })
+            .unwrap(),
         }
+    );
+    let mut reencoded = BytesMut::new();
+    decoded.clone().encode(&mut reencoded).unwrap();
+    assert_eq!(
+        reencoded.freeze(),
+        original,
+        "unknown tagged payload was discarded"
     );
 }
 

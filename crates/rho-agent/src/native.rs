@@ -3,6 +3,7 @@
 //! response entry, never to the containing event. Provider input is disposable.
 use rho_core::{ContextBlock, PendingInferenceResponse, UnixMs};
 use senax_encoder::{Decode, Encode};
+
 use crate::{ContextChange, PythonStreamEvent, WakeFacts};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]

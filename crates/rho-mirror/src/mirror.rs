@@ -29,9 +29,9 @@ use rho_ui_proto::mirror::{AgentPos, LogEntry, MirrorEvent, Seq};
 /// name rather than the host id: ids are handed out in attach order and
 /// mean nothing across a restart. The seed says which database the
 /// cursor counts in; a daemon with another one starts the copy over.
-const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v3");
+const HOSTS: TableDefinition<&str, Sen<StoredHost>> = TableDefinition::new("gui_mirror_host_v4");
 /// Which host an agent was heard from, so a host's rows can go together.
-const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v1");
+const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_agent_host_v2");
 /// One agent's mirror, ordered by position, agent first: a range read
 /// gives one agent's events and nothing else.
 /// The version in the name is the story's format, not redb's. A fold that
@@ -45,12 +45,14 @@ const AGENT_HOSTS: TableDefinition<AgentId, &str> = TableDefinition::new("gui_ag
 /// field a label names, so a code-mode `exec` call — whose arguments are
 /// JavaScript, not JSON — stored nothing at all.
 /// v3: `Created` names one place instead of a list of workdirs.
+/// v4: canonical native entries preserve every response boundary; recurring
+/// presentation was replaced by one-shot titles. Old projections must refetch.
 const EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
-    TableDefinition::new("gui_mirror_events_v3");
+    TableDefinition::new("gui_mirror_events_v4");
 /// What the registry made of an agent's rows, as of the newest row held:
 /// written with the rows, so the two never disagree.
 const DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
-    TableDefinition::new("gui_agent_digest_v1");
+    TableDefinition::new("gui_agent_digest_v2");
 /// What the user last said about an agent, so Home ranks the same way on
 /// the first frame as it did before the restart: attention is derived
 /// from this and the digest. The store overwrites it as soon as the GUI
@@ -72,7 +74,7 @@ impl RecordedTypeName for VerdictName {
 }
 /// Tables nothing reads: retired folds, and the rows and cursor of a story
 /// format the client has moved past. Dropped on open, every open.
-const RETIRED_TABLES: [&str; 7] = [
+const RETIRED_TABLES: [&str; 11] = [
     "gui_agent_head_v1",
     "gui_agent_story_v1",
     "gui_agent_attention_v1",
@@ -83,6 +85,12 @@ const RETIRED_TABLES: [&str; 7] = [
     "gui_mirror_host_v1",
     "gui_mirror_events_v2",
     "gui_mirror_host_v2",
+    // Native history was rewritten at the same journal positions. Refetch all
+    // projections together; a digest refold cannot recover omitted data.
+    "gui_mirror_host_v3",
+    "gui_mirror_events_v3",
+    "gui_agent_host_v1",
+    "gui_agent_digest_v1",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
@@ -851,5 +859,80 @@ mod tests {
             "the user's verdict went with the tables the daemon can \
              replace; nothing else holds it"
         );
+    }
+    #[test]
+    fn canonical_history_retires_all_old_projections_but_keeps_user_verdicts() {
+        const OLD_HOSTS: TableDefinition<&str, Sen<StoredHost>> =
+            TableDefinition::new("gui_mirror_host_v3");
+        const OLD_EVENTS: TableDefinition<(AgentId, u64), Sen<MirrorEvent>> =
+            TableDefinition::new("gui_mirror_events_v3");
+        const OLD_DIGESTS: TableDefinition<AgentId, Sen<AgentSnapshot>> =
+            TableDefinition::new("gui_agent_digest_v1");
+        const OLD_AGENT_HOSTS: TableDefinition<AgentId, &str> =
+            TableDefinition::new("gui_agent_host_v1");
+        const UNRELATED: TableDefinition<u64, &str> = TableDefinition::new("unrelated_user_data");
+        let dir = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(dir.path().join("client.redb"));
+        let id = agent_id(1);
+        let entries = told(id, 1);
+        let verdict = Verdict {
+            handled_through: AgentPos(2),
+            muted: true,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut write = db.write().await;
+                write.open_table(OLD_HOSTS).insert(
+                    "local",
+                    SenValue::borrowed(&StoredHost {
+                        machine_seed: 7,
+                        seq: Seq(3),
+                    }),
+                );
+                write.open_table(OLD_AGENT_HOSTS).insert(&id, "local");
+                write
+                    .open_table(OLD_DIGESTS)
+                    .insert(&id, SenValue::borrowed(&snapshot(&entries)));
+                for entry in &entries {
+                    write
+                        .open_table(OLD_EVENTS)
+                        .insert(&(id, entry.pos.0), SenValue::borrowed(&entry.event));
+                }
+                write
+                    .open_table(VERDICTS)
+                    .insert(&id, SenValue::borrowed(&verdict));
+                write.open_table(UNRELATED).insert(&1, "keep me");
+                write.commit();
+            });
+        let mirror = Mirror::open_on(db.clone()).unwrap();
+        assert!(
+            mirror.load().hosts.is_empty(),
+            "a cursor survived its projection"
+        );
+        assert!(mirror.load().agents.is_empty());
+        assert!(mirror.read_events(id).is_empty());
+        assert_eq!(db.read().open_table(AGENT_HOSTS).iter().count(), 0);
+        assert_eq!(
+            db.read()
+                .open_table(VERDICTS)
+                .get(&id)
+                .unwrap()
+                .value()
+                .into_owned(),
+            verdict
+        );
+        assert_eq!(
+            db.read().open_table(UNRELATED).get(&1).unwrap().value(),
+            "keep me"
+        );
+        // Refill from the migrated daemon as on Follow{since:0}; preserve user
+        // disposition when the rebuilt agent first appears again.
+        write(&mirror, "local", 7, entries);
+        mirror.flush();
+        let loaded = mirror.load();
+        assert_eq!(loaded.hosts[0].seq, Seq(3));
+        assert_eq!(loaded.agents[0].1.verdict.as_ref(), Some(&verdict));
     }
 }

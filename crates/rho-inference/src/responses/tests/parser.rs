@@ -353,7 +353,6 @@ fn does_not_classify_user_actionable_stream_errors_for_retry() {
     )));
 }
 
-
 #[test]
 fn argument_end_is_distinct_from_item_end_and_response_end() {
     let mut state = ResponseState::default();

@@ -109,8 +109,10 @@ impl Inference {
     /// A single text-only exchange. The caller owns its deadline and any retry.
     /// Dropping this future drops the session and cancels its socket task.
     pub async fn text(&self, instructions: Arc<str>, input: String) -> anyhow::Result<String> {
-        use rho_core::{ContentPart, ContextBlock, InferenceEvent, InferenceRequest,
-            InferenceResponseItem, MessageSender, PendingInferenceResponse};
+        use rho_core::{
+            ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
+            MessageSender, PendingInferenceResponse,
+        };
         let mut session = InferenceSession::new_title(self.clone(), PromptCacheKey::generate());
         session.request(InferenceRequest {
             instructions,
@@ -131,13 +133,16 @@ impl Inference {
                             InferenceResponseItem::AssistantMessage { content, .. } => {
                                 text.push_str(&rho_core::text_content(&content));
                             }
-                            InferenceResponseItem::ToolCall { .. } => anyhow::bail!("text completion returned a tool call"),
+                            InferenceResponseItem::ToolCall { .. } => {
+                                anyhow::bail!("text completion returned a tool call")
+                            }
                             _ => {}
                         }
                     }
                     return Ok(text);
                 }
-                InferenceEvent::Failed { error } | InferenceEvent::TemporaryFailure { error, .. } => anyhow::bail!("{error:#}"),
+                InferenceEvent::Failed { error }
+                | InferenceEvent::TemporaryFailure { error, .. } => anyhow::bail!("{error:#}"),
                 _ => {}
             }
         }

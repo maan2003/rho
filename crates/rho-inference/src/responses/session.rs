@@ -98,7 +98,6 @@ struct Turn {
     debug_sequence: Option<u64>,
     /// Raw provider text frames observed for the in-flight send attempt.
     raw_events: Vec<serde_json::Value>,
-
 }
 
 #[derive(Clone, Copy)]
@@ -227,7 +226,6 @@ impl ResponsesConfig {
             service_tier: ServiceTier::Priority,
         }
     }
-
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -369,7 +367,6 @@ impl InferenceSession {
         })
     }
 
-
     fn new(config: SessionConfig) -> Self {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -432,7 +429,8 @@ impl InferenceSession {
         })
     }
 
-    /// Queue one attempt. Recoverable failures return to the caller, never resend.
+    /// Queue one attempt. Recoverable failures return to the caller, never
+    /// resend.
     pub fn request(&mut self, request: InferenceRequest) {
         self.epochs += 1;
         self.awaiting = Some(self.epochs);
@@ -491,10 +489,10 @@ impl InferenceSession {
             }
             if matches!(
                 event,
-                InferenceEvent::Finished { .. } | InferenceEvent::Failed { .. }
-                | InferenceEvent::TemporaryFailure { .. }
-            )
-            {
+                InferenceEvent::Finished { .. }
+                    | InferenceEvent::Failed { .. }
+                    | InferenceEvent::TemporaryFailure { .. }
+            ) {
                 self.awaiting = None;
             }
             return event;
@@ -600,9 +598,7 @@ impl SessionTask {
             // once: what the phase says is settled before anything below is
             // awaited, and re-reading it afterwards only invites a second
             // answer.
-            if let Some(TurnPhase::Queued) =
-                self.turn.as_ref().map(|turn| turn.phase)
-            {
+            if let Some(TurnPhase::Queued) = self.turn.as_ref().map(|turn| turn.phase) {
                 if let Err(error) = self.ensure_connection().await {
                     self.connection = None;
                     self.fail_turn(error).await;
@@ -803,7 +799,9 @@ impl SessionTask {
         if error.downcast_ref::<AuthFailure>().is_some() {
             self.turn = None;
             self.connection = None;
-            return InferenceEvent::Failed { error: error.into() };
+            return InferenceEvent::Failed {
+                error: error.into(),
+            };
         }
         let mut retryable =
             is_transient_turn_error(&error) || super::is_stale_previous_response_error(&error);
@@ -823,9 +821,10 @@ impl SessionTask {
         return if retryable {
             temporary_failure(error, Instant::now())
         } else {
-            InferenceEvent::Failed { error: error.into() }
+            InferenceEvent::Failed {
+                error: error.into(),
+            }
         };
-
     }
 
     fn next_debug_sequence(&mut self) -> u64 {
@@ -896,7 +895,6 @@ impl SessionTask {
         std::fs::write(path, serde_json::to_vec_pretty(metadata)?)?;
         Ok(())
     }
-
 
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
     /// the bearer, or when nearing the server's age cap.
@@ -1021,7 +1019,6 @@ pub(crate) fn redact_image_data(value: &mut serde_json::Value) {
     }
 }
 
-
 pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<ProviderError>() {
         return error.is_transient();
@@ -1097,9 +1094,9 @@ mod account_selection_tests {
                 streaming_started: false,
                 debug_sequence: None,
                 raw_events: Vec::new(),
-                    }),
+            }),
             config: SessionConfig {
-                    base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+                base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
                 inference: Inference::for_test(auth),
                 mode: InferenceSessionMode::Title,
                 responses_config: ResponsesConfig::title(),

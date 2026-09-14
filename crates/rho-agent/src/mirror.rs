@@ -12,8 +12,7 @@ use rho_ui_proto::mirror::{
 };
 
 use crate::db::{AgentRuntime, AgentSpawnedBy, AgentUsageBucket, usage_model_of};
-use crate::PresentationField;
-use crate::{AgentEvent, InputKind, QueuedInput};
+use crate::{AgentEvent, InputKind, PresentationField, QueuedInput};
 
 /// One row, the moment it became durable. `event` is `None` for the rows
 /// a client is not told about (the previous loop's bookkeeping).
@@ -147,7 +146,8 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                             compaction: input.iter().any(|item| {
                                 matches!(
                                     item,
-                                    rho_core::ContextBlock::CompactionTrigger | rho_core::ContextBlock::ContextRotation { .. }
+                                    rho_core::ContextBlock::CompactionTrigger
+                                        | rho_core::ContextBlock::ContextRotation { .. }
                                 )
                             }),
                             at: *at,
@@ -162,9 +162,14 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 at,
                 ..
             } => Some(replied(
-                &output.iter().filter_map(|entry| match entry {
-                    rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None,
-                }).flatten().collect::<Vec<_>>(),
+                &output
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>(),
                 *context_used,
                 cost.as_ref().map(usage),
                 *at,
@@ -197,7 +202,9 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
     Some(match event {
         AgentEvent::TitleAttempted { .. } => return None,
         AgentEvent::Titled { title, at } => MirrorEvent::Presented {
-            title: title.clone().map_or(PresentationField::Clear, PresentationField::Set),
+            title: title
+                .clone()
+                .map_or(PresentationField::Clear, PresentationField::Set),
             activity: PresentationField::Unchanged,
             at: *at,
         },
@@ -215,8 +222,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             InputKind::Message { content } => message(source, content, *delivery, *at),
             InputKind::Compaction => MirrorEvent::CompactionRequested { at: *at },
         },
-        AgentEvent::Native(_)
-        | AgentEvent::Failed { .. } => unreachable!("normalized above"),
+        AgentEvent::Native(_) | AgentEvent::Failed { .. } => unreachable!("normalized above"),
         AgentEvent::Cleared { at } => MirrorEvent::QueueCleared { at: *at },
         AgentEvent::RuntimeRebound { .. }
         | AgentEvent::ClaudeExecAdmitted { .. }
@@ -457,7 +463,8 @@ mod tests {
 
     #[test]
     fn a_sent_keeps_statuses_and_leaves_output_behind() {
-        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ToolResults {
+        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            input: Vec::from(vec![ContextBlock::ToolResults {
                 results: vec![ToolResult {
                     call_id: "call-1".try_into().unwrap(),
                     tool_type: rho_core::ToolType::Function,
@@ -471,7 +478,11 @@ mod tests {
                     finished_at: UnixMs(2),
                     metadata: None,
                 }],
-            }]), at: UnixMs(3), wake: None, context: None });
+            }]),
+            at: UnixMs(3),
+            wake: None,
+            context: None,
+        });
         let stripped = strip(&event).unwrap();
         assert_eq!(
             stripped,
@@ -491,7 +502,8 @@ mod tests {
 
     #[test]
     fn a_later_report_does_not_rewrite_the_first_results_status_or_duration() {
-        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::ToolUpdate(ToolUpdate {
+        let event = AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+            input: Vec::from(vec![ContextBlock::ToolUpdate(ToolUpdate {
                 status: None,
                 images: Default::default(),
                 call_id: "call-1".try_into().unwrap(),
@@ -499,7 +511,11 @@ mod tests {
                 output: std::sync::Arc::new("bounded".to_owned()),
                 full_output: Some(std::sync::Arc::new("complete".to_owned())),
                 at: UnixMs(2),
-            })]), at: UnixMs(3), wake: None, context: None });
+            })]),
+            at: UnixMs(3),
+            wake: None,
+            context: None,
+        });
 
         assert_eq!(
             strip(&event),

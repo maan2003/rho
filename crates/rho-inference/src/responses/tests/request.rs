@@ -54,35 +54,35 @@ fn builds_responses_request_with_tools_and_item_timeline() {
         None,
     );
     let request = inference_request(vec![
-            user_block("hello"),
-            inference_response(
-                None,
-                vec![InferenceResponseItem::ToolCall {
-                    provider_specific: provider_specific(
-                        "function_call",
-                        json!({
-                            "type": "function_call",
-                            "id": "fc_call-1",
-                            "call_id": "call-1",
-                            "name": "shell_run",
-                            "arguments": r#"{"command":"pwd"}"#,
-                        }),
-                    ),
-                    id: tool_call_id("call-1"),
-                    name: tool_name("shell_run"),
-                    tool_type: ToolType::Function,
-                    arguments: r#"{"command":"pwd"}"#.to_owned(),
-                }],
-            ),
-            Arc::new(ContextBlock::ToolResults {
-                results: vec![{
-                    let mut result = tool_result_success(tool_call_id("call-1"), "done");
-                    result.body.full_output = Some(Arc::new("the complete host record".to_owned()));
-                    result
-                }],
-            }),
-            Arc::new(ContextBlock::CompactionTrigger),
-        ]);
+        user_block("hello"),
+        inference_response(
+            None,
+            vec![InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific(
+                    "function_call",
+                    json!({
+                        "type": "function_call",
+                        "id": "fc_call-1",
+                        "call_id": "call-1",
+                        "name": "shell_run",
+                        "arguments": r#"{"command":"pwd"}"#,
+                    }),
+                ),
+                id: tool_call_id("call-1"),
+                name: tool_name("shell_run"),
+                tool_type: ToolType::Function,
+                arguments: r#"{"command":"pwd"}"#.to_owned(),
+            }],
+        ),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![{
+                let mut result = tool_result_success(tool_call_id("call-1"), "done");
+                result.body.full_output = Some(Arc::new("the complete host record".to_owned()));
+                result
+            }],
+        }),
+        Arc::new(ContextBlock::CompactionTrigger),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
@@ -128,17 +128,17 @@ fn text_completion_declares_no_tools() {
 #[test]
 fn renders_text_and_image_user_content() {
     let request = inference_request(vec![Arc::new(ContextBlock::UserMessage {
-            sender: rho_core::MessageSender::User,
-            content: vec![
-                ContentPart::Text {
-                    text: "inspect".to_owned(),
-                },
-                ContentPart::Image {
-                    media_type: "image/png".to_owned(),
-                    data: vec![1, 2, 3],
-                },
-            ],
-        })]);
+        sender: rho_core::MessageSender::User,
+        content: vec![
+            ContentPart::Text {
+                text: "inspect".to_owned(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+            },
+        ],
+    })]);
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
         request,
@@ -186,12 +186,12 @@ fn renders_agent_mail_with_supplied_short_label() {
 #[test]
 fn stamps_phase_on_assistant_messages_when_supported() {
     let request = inference_request(vec![inference_response(
-            None,
-            vec![
-                assistant_message_with_phase("commentary", MessagePhase::Commentary),
-                assistant_message("legacy answer"),
-            ],
-        )]);
+        None,
+        vec![
+            assistant_message_with_phase("commentary", MessagePhase::Commentary),
+            assistant_message("legacy answer"),
+        ],
+    )]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -285,10 +285,10 @@ fn serializes_prompt_cache_key() {
 #[test]
 fn previous_response_hint_slices_input_in_provider() {
     let request = inference_request(vec![
-            user_block("first"),
-            inference_response(Some("resp_1"), vec![assistant_message("done")]),
-            user_block("second"),
-        ]);
+        user_block("first"),
+        inference_response(Some("resp_1"), vec![assistant_message("done")]),
+        user_block("second"),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -305,10 +305,10 @@ fn previous_response_hint_slices_input_in_provider() {
 #[test]
 fn previous_response_hint_requires_connection_cached_match() {
     let request = inference_request(vec![
-            user_block("first"),
-            inference_response(Some("resp_1"), vec![assistant_message("done")]),
-            user_block("second"),
-        ]);
+        user_block("first"),
+        inference_response(Some("resp_1"), vec![assistant_message("done")]),
+        user_block("second"),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -324,10 +324,10 @@ fn previous_response_hint_requires_connection_cached_match() {
 #[test]
 fn previous_response_without_valid_boundary_replays_full_history() {
     let request = inference_request(vec![
-            user_block("first"),
-            inference_response(None, vec![assistant_message("done")]),
-            user_block("second"),
-        ]);
+        user_block("first"),
+        inference_response(None, vec![assistant_message("done")]),
+        user_block("second"),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -343,10 +343,10 @@ fn previous_response_without_valid_boundary_replays_full_history() {
 #[test]
 fn stale_previous_response_error_builds_full_replay_request() {
     let request = inference_request(vec![
-            user_block("first"),
-            inference_response(Some("resp_1"), vec![assistant_message("done")]),
-            user_block("second"),
-        ]);
+        user_block("first"),
+        inference_response(Some("resp_1"), vec![assistant_message("done")]),
+        user_block("second"),
+    ]);
     let sliced = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
         request.clone(),
@@ -449,10 +449,10 @@ fn compaction_trigger_is_the_last_provider_input_item() {
         Some(42_000),
     );
     let request = inference_request(vec![
-            Arc::new(ContextBlock::CompactionTrigger),
-            user_block("queued after compaction"),
-            Arc::new(ContextBlock::CompactionTrigger),
-        ]);
+        Arc::new(ContextBlock::CompactionTrigger),
+        user_block("queued after compaction"),
+        Arc::new(ContextBlock::CompactionTrigger),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(&session.config, request, None);
     let json = serde_json::to_value(body).unwrap();
@@ -477,12 +477,12 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
     // The adapter distinguishes automatic rotation from an explicit manual
     // override.
     let request = inference_request(vec![
-            user_block("discarded"),
-            user_block("retained"),
-            Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
-            Arc::new(ContextBlock::CompactionTrigger),
-            user_block("prepare notes"),
-        ]);
+        user_block("discarded"),
+        user_block("retained"),
+        Arc::new(ContextBlock::ContextRotation { retain_from: 1 }),
+        Arc::new(ContextBlock::CompactionTrigger),
+        user_block("prepare notes"),
+    ]);
     session.set_context_rotation(true);
     let body = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
     let json = serde_json::to_value(body).unwrap();
@@ -504,22 +504,22 @@ fn automatic_rotation_requests_omit_triggers_and_manual_override_keeps_the_suffi
 #[test]
 fn compaction_replay_trims_before_latest_compaction_item() {
     let request = inference_request(vec![
-            user_block("before"),
-            inference_response(
-                Some("resp_compaction"),
-                vec![InferenceResponseItem::Compaction {
-                    provider_specific: provider_specific(
-                        "compaction",
-                        json!({
-                            "type": "compaction",
-                            "id": "cmp_1",
-                            "encrypted_content": "compacted",
-                        }),
-                    ),
-                }],
-            ),
-            user_block("after"),
-        ]);
+        user_block("before"),
+        inference_response(
+            Some("resp_compaction"),
+            vec![InferenceResponseItem::Compaction {
+                provider_specific: provider_specific(
+                    "compaction",
+                    json!({
+                        "type": "compaction",
+                        "id": "cmp_1",
+                        "encrypted_content": "compacted",
+                    }),
+                ),
+            }],
+        ),
+        user_block("after"),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -538,17 +538,17 @@ fn compaction_replay_trims_before_latest_compaction_item() {
 #[test]
 fn skips_compaction_without_encrypted_content() {
     let request = inference_request(vec![
-            inference_response(
-                Some("resp_compaction"),
-                vec![InferenceResponseItem::Compaction {
-                    provider_specific: Box::new(OpenAiResponsesProviderData::Compaction {
-                        item_id: rho_core::ProviderResponseItemId::try_from("cmp_1").unwrap(),
-                        encrypted_content: String::new(),
-                    }),
-                }],
-            ),
-            user_block("after"),
-        ]);
+        inference_response(
+            Some("resp_compaction"),
+            vec![InferenceResponseItem::Compaction {
+                provider_specific: Box::new(OpenAiResponsesProviderData::Compaction {
+                    item_id: rho_core::ProviderResponseItemId::try_from("cmp_1").unwrap(),
+                    encrypted_content: String::new(),
+                }),
+            }],
+        ),
+        user_block("after"),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -571,9 +571,9 @@ fn replays_reasoning_provider_item() {
         summary: vec!["kept".to_owned()],
     };
     let request = inference_request(vec![
-            inference_response(None, vec![reasoning]),
-            user_block("after"),
-        ]);
+        inference_response(None, vec![reasoning]),
+        user_block("after"),
+    ]);
 
     let body = serde_json::to_value(ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -609,29 +609,29 @@ fn serializes_custom_tool_calls_and_results() {
         metadata: None,
     };
     let request = inference_request(vec![
-            inference_response(
-                None,
-                vec![InferenceResponseItem::ToolCall {
-                    provider_specific: provider_specific(
-                        "custom_tool_call",
-                        json!({
-                            "type": "custom_tool_call",
-                            "id": "ctc_call-1",
-                            "call_id": "call-1",
-                            "name": "patch",
-                            "input": "*** Begin Patch\n*** End Patch",
-                        }),
-                    ),
-                    id: tool_call_id("call-1"),
-                    name: tool_name("patch"),
-                    tool_type: ToolType::Custom,
-                    arguments: "*** Begin Patch\n*** End Patch".to_owned(),
-                }],
-            ),
-            Arc::new(ContextBlock::ToolResults {
-                results: vec![result],
-            }),
-        ]);
+        inference_response(
+            None,
+            vec![InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific(
+                    "custom_tool_call",
+                    json!({
+                        "type": "custom_tool_call",
+                        "id": "ctc_call-1",
+                        "call_id": "call-1",
+                        "name": "patch",
+                        "input": "*** Begin Patch\n*** End Patch",
+                    }),
+                ),
+                id: tool_call_id("call-1"),
+                name: tool_name("patch"),
+                tool_type: ToolType::Custom,
+                arguments: "*** Begin Patch\n*** End Patch".to_owned(),
+            }],
+        ),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![result],
+        }),
+    ]);
 
     let body = ResponsesRequest::from_inference_request(
         &test_inference_service("gpt-test").config,
@@ -809,10 +809,10 @@ fn responses_lite_previous_response_skips_developer_prefix() {
         PromptCacheKey::from_bytes(*b"testkey0"),
     );
     let mut request = inference_request(vec![
-            user_block("first"),
-            inference_response(Some("resp_1"), vec![assistant_message("done")]),
-            user_block("second"),
-        ]);
+        user_block("first"),
+        inference_response(Some("resp_1"), vec![assistant_message("done")]),
+        user_block("second"),
+    ]);
     request.instructions = Arc::from("You are rho.");
 
     let body = ResponsesRequest::from_inference_request(&session.config, request, Some("resp_1"));
@@ -960,24 +960,24 @@ fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_ca
         detail: rho_core::ImageDetail::High,
     }]);
     let mut request = inference_request(vec![
-            user_block("discard this old request"),
-            old_call,
-            Arc::new(ContextBlock::DeveloperMessage {
-                text: "retention boundary".into(),
-            }),
-            Arc::new(ContextBlock::ToolResults {
-                results: vec![result],
-            }),
-            Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
-                status: None,
-                images: Default::default(),
-                call_id: tool_call_id("old-call"),
-                tool_type: ToolType::Custom,
-                output: Arc::new("later update".into()),
-                full_output: None,
-                at: UnixMs(1),
-            })),
-        ]);
+        user_block("discard this old request"),
+        old_call,
+        Arc::new(ContextBlock::DeveloperMessage {
+            text: "retention boundary".into(),
+        }),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![result],
+        }),
+        Arc::new(ContextBlock::ToolUpdate(rho_core::ToolUpdate {
+            status: None,
+            images: Default::default(),
+            call_id: tool_call_id("old-call"),
+            tool_type: ToolType::Custom,
+            output: Arc::new("later update".into()),
+            full_output: None,
+            at: UnixMs(1),
+        })),
+    ]);
     request
         .input
         .push(Arc::new(ContextBlock::ContextRotation { retain_from: 2 }));
@@ -1004,30 +1004,30 @@ fn rotated_context_keeps_developer_notices_and_old_tool_output_without_orphan_ca
 #[test]
 fn rotated_context_preserves_retained_call_result_pairs() {
     let mut request = inference_request(vec![
-            user_block("discard"),
-            Arc::new(ContextBlock::DeveloperMessage {
-                text: "boundary".into(),
-            }),
-            inference_response(
-                None,
-                vec![InferenceResponseItem::ToolCall {
-                    provider_specific: provider_specific(
-                        "function_call",
-                        json!({
-                            "type": "function_call", "id": "item", "call_id": "call",
-                            "name": "exec", "arguments": "{}",
-                        }),
-                    ),
-                    id: tool_call_id("call"),
-                    name: tool_name("exec"),
-                    tool_type: ToolType::Function,
-                    arguments: "{}".into(),
-                }],
-            ),
-            Arc::new(ContextBlock::ToolResults {
-                results: vec![tool_result_success(tool_call_id("call"), "done")],
-            }),
-        ]);
+        user_block("discard"),
+        Arc::new(ContextBlock::DeveloperMessage {
+            text: "boundary".into(),
+        }),
+        inference_response(
+            None,
+            vec![InferenceResponseItem::ToolCall {
+                provider_specific: provider_specific(
+                    "function_call",
+                    json!({
+                        "type": "function_call", "id": "item", "call_id": "call",
+                        "name": "exec", "arguments": "{}",
+                    }),
+                ),
+                id: tool_call_id("call"),
+                name: tool_name("exec"),
+                tool_type: ToolType::Function,
+                arguments: "{}".into(),
+            }],
+        ),
+        Arc::new(ContextBlock::ToolResults {
+            results: vec![tool_result_success(tool_call_id("call"), "done")],
+        }),
+    ]);
     request
         .input
         .push(Arc::new(ContextBlock::ContextRotation { retain_from: 1 }));
@@ -1046,12 +1046,12 @@ fn rotated_context_preserves_retained_call_result_pairs() {
 fn rotation_activation_invalidates_retained_old_continuations_but_not_new_ones() {
     let session = test_inference_service("gpt-test");
     let mut request = inference_request(vec![
-            user_block("old context"),
-            Arc::new(ContextBlock::DeveloperMessage {
-                text: "early marker".into(),
-            }),
-            inference_response(Some("prepared-in-old-window"), Vec::new()),
-        ]);
+        user_block("old context"),
+        Arc::new(ContextBlock::DeveloperMessage {
+            text: "early marker".into(),
+        }),
+        inference_response(Some("prepared-in-old-window"), Vec::new()),
+    ]);
     // Merely announcing the boundary must not discard anything.
     let before = ResponsesRequest::from_inference_request(&session.config, request.clone(), None);
     assert_eq!(before.input[0]["content"][0]["text"], "old context");

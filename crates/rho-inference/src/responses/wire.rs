@@ -7,8 +7,8 @@ use anyhow::{Result, bail};
 use rho_core::{
     AppendString, ContentPart, ContextBlock, ContextItemEvent, InferenceEvent, InferenceRequest,
     InferenceResponseItem, MessagePhase, ProviderResponseId, ProviderResponseItemId,
-    ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId,
-    ToolName, ToolResult, ToolType, text_content,
+    ProviderSpecificData, StreamingContextItem, TokenUsage, ToolCall, ToolCallId, ToolName,
+    ToolResult, ToolType, text_content,
 };
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde::Serialize;
@@ -296,13 +296,20 @@ impl ResponsesRequest {
             &request.input[context_start..]
         };
 
-        // Flatten the heterogeneous blocks into a single item timeline, then
-        // drop everything before the most recent compaction marker.
-        let mut timeline = Vec::new();
-        for block in input_blocks {
-            append_block_items(block, &request.agent_id_labels, &mut timeline);
-        }
-        let timeline = trim_before_latest_compaction(&timeline);
+        // Slice at the latest provider compaction without flattening or
+        // cloning the canonical history into a second conversation model.
+        let (first_block, first_item) = input_blocks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(block, entry)| match &**entry {
+                ContextBlock::InferenceResponse { items, .. } => items
+                    .iter()
+                    .rposition(|item| matches!(item, InferenceResponseItem::Compaction { .. }))
+                    .map(|item| (block, item)),
+                _ => None,
+            })
+            .unwrap_or((0, 0));
 
         let mut tools = if matches!(session.mode, super::session::InferenceSessionMode::Deep(_)) {
             let spec = crate::exec::spec();
@@ -314,37 +321,59 @@ impl ResponsesRequest {
             Vec::new()
         };
         let mut input = Vec::new();
-        for item in timeline
-            .iter()
-            .filter(|item| !matches!(item, WireTimelineItem::CompactionTrigger))
-        {
-            if let WireTimelineItem::ToolResult(result) = item
-                && context_start > 0
-                && !retained_calls.contains(&result.call_id)
-            {
-                // The original call is outside this window. Deliver its real
-                // output as a standalone update, not an orphan result. Keep
-                // image content and the original callable name.
-                let mut output =
-                    convert_tool_result(result.clone(), tool_calls.get(&result.call_id));
-                let object = output.as_object_mut().unwrap();
-                object.remove("call_id");
-                object.insert("type".into(), json!("function_call_output"));
-                object.insert("namespace".into(), json!("functions"));
-                input.push(output);
-            } else {
-                convert_timeline_item(item.clone(), &tool_calls, &mut input);
+        let mut compaction_requested = false;
+        for (index, block) in input_blocks.iter().enumerate().skip(first_block) {
+            match &**block {
+                ContextBlock::ContextRotation { .. } => {}
+                ContextBlock::DeveloperMessage { text } => input.push(json!({
+                    "type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": text}],
+                })),
+                ContextBlock::UserMessage { sender, content } => match sender {
+                    rho_core::MessageSender::User => convert_user_message(content, &mut input),
+                    rho_core::MessageSender::Agent { id } => {
+                        let sender = request
+                            .agent_id_labels
+                            .get(id)
+                            .map_or_else(|| id.encoded(), ToString::to_string);
+                        let text = format!(
+                            "Message Type: MESSAGE\nSender: {sender}\nPayload:\n{}",
+                            rho_core::text_content(content)
+                        );
+                        convert_user_message(&[ContentPart::Text { text }], &mut input);
+                    }
+                },
+                ContextBlock::CompactionTrigger => compaction_requested = true,
+                ContextBlock::ToolResults { results } => {
+                    for result in results {
+                        let mut output =
+                            convert_tool_result(result.clone(), tool_calls.get(&result.call_id));
+                        if context_start > 0 && !retained_calls.contains(&result.call_id) {
+                            // Preserve late output whose call is outside the
+                            // active window without emitting an orphan result.
+                            let object = output.as_object_mut().unwrap();
+                            object.remove("call_id");
+                            object.insert("type".into(), json!("function_call_output"));
+                            object.insert("namespace".into(), json!("functions"));
+                        }
+                        input.push(output);
+                    }
+                }
+                ContextBlock::ToolUpdate(update) => input.push(convert_tool_update(
+                    update,
+                    tool_calls.get(&update.call_id).map(|(name, _)| name),
+                )),
+                ContextBlock::InferenceResponse { items, .. } => {
+                    let skip = if index == first_block { first_item } else { 0 };
+                    for item in items.iter().skip(skip) {
+                        convert_response_item(item.clone(), &mut input);
+                    }
+                }
             }
         }
-        // The Responses API requires a manual compaction trigger to be the
-        // final input item. Multiple queued requests are equivalent, so
-        // coalesce them into one trigger at the tail.
-        if !session.responses_config.context_rotation
-            && timeline
-                .iter()
-                .any(|item| matches!(item, WireTimelineItem::CompactionTrigger))
-        {
-            convert_timeline_item(WireTimelineItem::CompactionTrigger, &tool_calls, &mut input);
+        // The API requires one manual trigger at the tail.
+        if !session.responses_config.context_rotation && compaction_requested {
+            input.push(json!({ "type": "compaction_trigger" }));
         }
 
         let prompt_cache_key = session
@@ -438,86 +467,6 @@ impl ResponsesRequest {
             client_metadata,
             parallel_tool_calls,
         }
-    }
-}
-
-#[derive(Clone)]
-enum WireTimelineItem {
-    UserMessage(Vec<ContentPart>),
-    DeveloperMessage(String),
-    CompactionTrigger,
-    ToolResult(ToolResult),
-    ToolUpdate(rho_core::ToolUpdate),
-    ResponseItem(InferenceResponseItem),
-}
-
-fn append_block_items(
-    block: &ContextBlock,
-    agent_id_labels: &std::collections::BTreeMap<rho_core::AgentId, std::sync::Arc<str>>,
-    out: &mut Vec<WireTimelineItem>,
-) {
-    match block {
-        ContextBlock::ContextRotation { .. } => {}
-        ContextBlock::DeveloperMessage { text } => {
-            out.push(WireTimelineItem::DeveloperMessage(text.clone()));
-        }
-        ContextBlock::UserMessage { sender, content } => match sender {
-            rho_core::MessageSender::User => {
-                out.push(WireTimelineItem::UserMessage(content.clone()));
-            }
-            // Agent mail rides the user role; the header identifies the
-            // sender so the model can tell peers from the actual user.
-            rho_core::MessageSender::Agent { id } => {
-                let sender = agent_id_labels
-                    .get(id)
-                    .map_or_else(|| id.encoded(), ToString::to_string);
-                let text = format!(
-                    "Message Type: MESSAGE\nSender: {sender}\nPayload:\n{}",
-                    rho_core::text_content(content)
-                );
-                out.push(WireTimelineItem::UserMessage(vec![
-                    rho_core::ContentPart::Text { text },
-                ]));
-            }
-        },
-        ContextBlock::CompactionTrigger => {
-            out.push(WireTimelineItem::CompactionTrigger);
-        }
-        ContextBlock::ToolResults { results } => {
-            out.extend(results.iter().cloned().map(WireTimelineItem::ToolResult));
-        }
-        ContextBlock::ToolUpdate(update) => {
-            out.push(WireTimelineItem::ToolUpdate(update.clone()));
-        }
-        ContextBlock::InferenceResponse { items, .. } => {
-            out.extend(items.iter().cloned().map(WireTimelineItem::ResponseItem))
-        }
-    }
-}
-
-fn convert_timeline_item(
-    item: WireTimelineItem,
-    tool_calls: &std::collections::HashMap<ToolCallId, (ToolName, ToolType)>,
-    out: &mut Vec<Value>,
-) {
-    match item {
-        WireTimelineItem::UserMessage(content) => convert_user_message(&content, out),
-        WireTimelineItem::DeveloperMessage(text) => out.push(json!({
-            "type": "message", "role": "developer",
-            "content": [{"type": "input_text", "text": text}],
-        })),
-        WireTimelineItem::CompactionTrigger => out.push(json!({
-            "type": "compaction_trigger",
-        })),
-        WireTimelineItem::ToolResult(result) => {
-            let name = tool_calls.get(&result.call_id);
-            out.push(convert_tool_result(result, name));
-        }
-        WireTimelineItem::ToolUpdate(update) => out.push(convert_tool_update(
-            &update,
-            tool_calls.get(&update.call_id).map(|(name, _)| name),
-        )),
-        WireTimelineItem::ResponseItem(item) => convert_response_item(item, out),
     }
 }
 
@@ -830,18 +779,6 @@ fn convert_tool_update(update: &rho_core::ToolUpdate, name: Option<&ToolName>) -
         item["name"] = json!(name.as_str());
     }
     item
-}
-
-fn trim_before_latest_compaction(timeline: &[WireTimelineItem]) -> &[WireTimelineItem] {
-    timeline
-        .iter()
-        .rposition(|item| {
-            matches!(
-                item,
-                WireTimelineItem::ResponseItem(InferenceResponseItem::Compaction { .. })
-            )
-        })
-        .map_or(timeline, |index| &timeline[index..])
 }
 
 /// Translates the Responses API event stream into provider-neutral
@@ -1223,6 +1160,7 @@ fn openai_provider_data_from_item(item: &Value) -> OpenAiResponsesProviderData {
 
 fn pending_openai_provider_data() -> Box<dyn ProviderSpecificData> {
     Box::new(rho_core::UnknownProviderSpecificData {
+        body: bytes::Bytes::new(),
         tag: "openai.responses.pending".to_owned(),
     })
 }

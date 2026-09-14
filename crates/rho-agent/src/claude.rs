@@ -20,8 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentId,
-    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
+    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
     AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
 };
 use crate::multi_agent_tools::MultiAgentTools;
@@ -447,7 +446,6 @@ impl ClaudeAgent {
             .await
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
     }
-
 }
 
 #[derive(Clone, Copy)]
@@ -655,13 +653,21 @@ impl ClaudeLoop {
                 uuid,
                 accepted,
             } => {
-                if !matches!(content.first(), Some(ContentPart::Text { text }) if text.trim_start().starts_with('/')) {
+                if !matches!(content.first(), Some(ContentPart::Text { text }) if text.trim_start().starts_with('/'))
+                {
                     let control = self.control.clone();
-                    self.title.start(&self.db, self.agent_id, &rho_core::text_content(&content), move |result| {
-                        if let Some(control) = control.upgrade() {
-                            let _ = control.send(ClaudeControl::TitleFinished(result));
-                        }
-                    }).await;
+                    self.title
+                        .start(
+                            &self.db,
+                            self.agent_id,
+                            &rho_core::text_content(&content),
+                            move |result| {
+                                if let Some(control) = control.upgrade() {
+                                    let _ = control.send(ClaudeControl::TitleFinished(result));
+                                }
+                            },
+                        )
+                        .await;
                 }
                 // Keep CLI slash commands intact. Any retained output remains
                 // queued until the command finishes and the CLI is idle.
@@ -796,13 +802,16 @@ impl ClaudeLoop {
             }
             ClaudeControl::TitleFinished(result) => {
                 crate::title::finish(&self.db, self.agent_id, result).await;
+                let stored = self.db.read().get_agent(self.agent_id);
+                {
+                    let mut head = self.head.write().expect("poison");
+                    head.generated_title = stored.generated_title;
+                    head.title_attempted = stored.title_attempted;
+                }
                 self.published();
-            },
+            }
         }
     }
-
-
-
 
     async fn close_process(&mut self) {
         self.forget_pending_exec();

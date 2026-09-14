@@ -8,8 +8,10 @@ Each runtime serializes its controls, persistence, scheduling, and publication.
 
 Native conversation authority is the append-only `NativeEvent` log. Provider
 input, restart recovery, and presentation are disposable projections, not another
-independently mutated history. Historical block records normalize at the read
-boundary. Claude Code instead owns its session, history, and compaction; Rho
+independently mutated history. Requests and responses use the same canonical grouped entries consumed by
+inference. A temporary atomic database migration rewrites historical raw rows
+at their original positions, preserving response boundaries, IDs, provider data,
+and context-window offsets; normal replay does not normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
 records bounded transcript observations, execution admission, output ownership,
 and timing, and controls its in-process MCP server.
 
@@ -46,9 +48,9 @@ commits. Provider interruption is not EOF, and admitted effects are never replay
 Settlement, model completion, and job completion are distinct facts
 ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
-Output reads lease a stable contribution until acknowledgment. Native inputs use
-exec-specific replies and reports carrying complete text, images, and status;
-wire tool classification belongs to inference adaptation. Native requests
+Output reads lease a stable contribution until acknowledgment. Notebook replies and reports project once into canonical native inputs carrying
+complete text, images, and status. Historical function-call evidence remains
+replay data, not an active tool capability. Native requests
 commit contributions before acknowledging notebook buffers. Claude transfers them
 to a durable outbox before transport; a failed handoff leaves them recoverable.
 Retained batches participate in boundary scheduling and stop rules; when a later
@@ -72,6 +74,12 @@ jobs; notes remain external effects
 ([DESIGN-context-rotation](../../../specs/DESIGN-context-rotation.md)).
 
 ## Read-only presentation
+
+Both runtimes make one bounded text-only naming attempt from the first task.
+The attempted fact survives rewind; cancellation or failure never retries it.
+Existing names win, and loading or viewing an agent never initiates naming.
+Titles do not write conversation context or classify turn outcomes. Runtime
+status and peer completion delivery remain independent of naming.
 
 Native and Claude observations share the GUI projection, not a conversation
 writer. Timing identifies provider first block, argument completion, response

@@ -29,18 +29,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   and persistence hooks. Loading restores that logical state cheaply; the
   workspace-backed execution context (view, prompt, and tools) initializes
   lazily at first inference. It depends directly on the concrete
-  `rho-inference` session. Its presentation sidecar derives a durable
-  generated title and activity cache from committed text events. Native agents
-  write those events directly; Claude commits individually bounded text from
-  confirmed CLI messages into the same lineage and reconciles that mirror
-  against the selected JSONL chain on load and rewind. It
-  receives positions only after event persistence, validates every result's
-  source position in the serialized agent loop, and rebuilds after a lineage
-  fork. The same loop owns watched UI leases, source coalescing, cancellation,
-  a 15-second request cadence, and result persistence; `AgentPool` only
-  routes a lease to the loaded runtime. `AgentPool` also owns persistent
-  agent-response subscription edges: terminal successes and failures are
-  delivered to current subscribers as normal agent mail.
+  `rho-inference` session. Native and Claude runtimes make one bounded,
+  text-only naming attempt from the first user/task message, committing the
+  attempt before dispatch and preserving existing names. Viewing, restart, and
+  rewind never trigger another attempt. There is no evolving activity or
+  turn-classification sidecar. `AgentPool` owns persistent agent-response
+  subscription edges: terminal successes and failures are delivered to current
+  subscribers as normal agent mail.
   Native agents expose a view-aware `view_image` tool. Image-producing nested
   tools return opaque image items to the notebook, where `image(item)` explicitly
   appends one to the enclosing `exec` result rather than implicitly

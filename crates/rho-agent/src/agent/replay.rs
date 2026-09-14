@@ -302,14 +302,24 @@ mod tests {
     #[test]
     fn native_records_project_the_same_protocol_history_without_a_second_authority() {
         let legacy = vec![
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::UserMessage {
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(vec![ContextBlock::UserMessage {
                     sender: MessageSender::User,
                     content: text_parts("go"),
-                }]), at: UnixMs(1), wake: None, context: None }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+                }]),
+                at: UnixMs(1),
+                wake: None,
+                context: None,
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("same-id")],
                     provider_response_id: Some("response-1".try_into().unwrap()),
-                }]), context_used: Some(42), usage: None, at: UnixMs(2) }),
+                }]),
+                context_used: Some(42),
+                usage: None,
+                at: UnixMs(2),
+            }),
         ];
         let current = legacy
             .iter()
@@ -344,14 +354,24 @@ mod tests {
 
         let replayed = replay(vec![
             AgentEvent::Accepted(input.clone()),
-            AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(vec![ContextBlock::UserMessage {
+            AgentEvent::Native(crate::native::NativeEvent::RequestStarted {
+                input: Vec::from(vec![ContextBlock::UserMessage {
                     sender: MessageSender::User,
                     content: text_parts("go"),
-                }]), at: rho_core::UnixMs(0), wake: None, context: None }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+                }]),
+                at: rho_core::UnixMs(0),
+                wake: None,
+                context: None,
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("c")],
                     provider_response_id: None,
-                }]), context_used: Some(40), usage: None, at: rho_core::UnixMs(0) }),
+                }]),
+                context_used: Some(40),
+                usage: None,
+                at: rho_core::UnixMs(0),
+            }),
         ]);
         assert!(replayed.user.is_empty());
         assert_eq!(replayed.history.len(), 2);
@@ -396,7 +416,12 @@ mod tests {
             let events: Vec<_> = journal[..cut]
                 .iter()
                 .cloned()
-                .map(|event| AgentEvent::Native(crate::native::NativeEvent::PythonStream { event, at: rho_core::UnixMs(0) }))
+                .map(|event| {
+                    AgentEvent::Native(crate::native::NativeEvent::PythonStream {
+                        event,
+                        at: rho_core::UnixMs(0),
+                    })
+                })
                 .collect();
             let replayed = replay(events.clone());
             if cut == 1 {
@@ -430,7 +455,14 @@ mod tests {
                 }],
             });
             let mut events = events;
-            events.push(AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input: Vec::from(blocks), at: rho_core::UnixMs(1), wake: None, context: None }));
+            events.push(AgentEvent::Native(
+                crate::native::NativeEvent::RequestStarted {
+                    input: Vec::from(blocks),
+                    at: rho_core::UnixMs(1),
+                    wake: None,
+                    context: None,
+                },
+            ));
             let twice = replay(events);
             assert!(twice.owed.is_empty());
             assert!(
@@ -444,21 +476,37 @@ mod tests {
     fn a_later_success_does_not_erase_an_earlier_unsettled_stream() {
         use crate::PythonStreamEvent;
         let replayed = replay(vec![
-            AgentEvent::Native(crate::native::NativeEvent::PythonStream { event: PythonStreamEvent::Opened {
+            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
+                event: PythonStreamEvent::Opened {
                     item: tool_call("first"),
-                }, at: rho_core::UnixMs(0) }),
-            AgentEvent::Native(crate::native::NativeEvent::PythonStream { event: PythonStreamEvent::Admitted {
+                },
+                at: rho_core::UnixMs(0),
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
+                event: PythonStreamEvent::Admitted {
                     call_id: rho_core::ToolCallId::try_from("first").unwrap(),
                     source: "await work()\n".into(),
-                }, at: rho_core::UnixMs(0) }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+                },
+                at: rho_core::UnixMs(0),
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("first")],
                     provider_response_id: None,
-                }]), context_used: None, usage: None, at: rho_core::UnixMs(1) }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+                }]),
+                context_used: None,
+                usage: None,
+                at: rho_core::UnixMs(1),
+            }),
+            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("second")],
                     provider_response_id: None,
-                }]), context_used: None, usage: None, at: rho_core::UnixMs(2) }),
+                }]),
+                context_used: None,
+                usage: None,
+                at: rho_core::UnixMs(2),
+            }),
         ]);
         assert_eq!(replayed.owed.len(), 2);
         assert!(replayed.recovery_blocks.is_empty());
@@ -469,7 +517,12 @@ mod tests {
     fn closed_and_replied_do_not_retire_progress_before_durable_acknowledgement() {
         use crate::PythonStreamEvent;
         let id = rho_core::ToolCallId::try_from("c").unwrap();
-        let journal = |event| AgentEvent::Native(crate::native::NativeEvent::PythonStream { event, at: rho_core::UnixMs(0) });
+        let journal = |event| {
+            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
+                event,
+                at: rho_core::UnixMs(0),
+            })
+        };
         for close_first in [false, true] {
             let mut events = vec![
                 journal(PythonStreamEvent::Opened {
@@ -488,10 +541,15 @@ mod tests {
             let close = journal(PythonStreamEvent::Closed {
                 call_id: id.clone(),
             });
-            let reply = AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output: Vec::from(vec![ContextBlock::InferenceResponse {
+            let reply = AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+                output: Vec::from(vec![ContextBlock::InferenceResponse {
                     items: vec![tool_call("c")],
                     provider_response_id: None,
-                }]), context_used: None, usage: None, at: rho_core::UnixMs(0) });
+                }]),
+                context_used: None,
+                usage: None,
+                at: rho_core::UnixMs(0),
+            });
             events.extend(if close_first {
                 vec![close, reply]
             } else {

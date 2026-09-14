@@ -267,7 +267,10 @@ impl Agent {
         // Give the admitted, syntactically complete prefix its one place in
         // history before the normal boundary drains its result.
         self.persist(AgentEvent::Native(NativeEvent::ResponseFinished {
-            output: vec![ContextBlock::InferenceResponse { items: vec![item], provider_response_id: None }],
+            output: vec![ContextBlock::InferenceResponse {
+                items: vec![item],
+                provider_response_id: None,
+            }],
             context_used: self.context_used,
             usage: None,
             at: now,

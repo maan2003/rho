@@ -483,7 +483,8 @@ pub enum ExecOutput {
 /// call id retains transcript attribution across compaction.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct ToolUpdate {
-    /// Status of this contribution when recorded natively; unknown on old wire-only reports.
+    /// Status of this contribution when recorded natively; unknown on old
+    /// wire-only reports.
     #[senax(default)]
     pub status: Option<ToolOutputStatus>,
     /// The [`ToolCall`] this update annotates.
@@ -924,7 +925,6 @@ mod tests {
     fn tool_update_without_complete_record_decodes_from_legacy_shape() {
         #[derive(Encode)]
         struct LegacyToolUpdate {
-            status: None,
             call_id: ToolCallId,
             tool_type: ToolType,
             output: Arc<String>,
@@ -932,7 +932,6 @@ mod tests {
         }
 
         let mut encoded = senax_encoder::encode(&LegacyToolUpdate {
-            status: None,
             call_id: "call-1".try_into().unwrap(),
             tool_type: ToolType::Custom,
             output: Arc::new("done".to_owned()),
@@ -941,6 +940,7 @@ mod tests {
         .unwrap();
         let decoded = senax_encoder::decode::<ToolUpdate>(&mut encoded).unwrap();
         assert_eq!(decoded.output.as_str(), "done");
+        assert_eq!(decoded.status, None);
         assert!(decoded.full_output.is_none());
     }
 

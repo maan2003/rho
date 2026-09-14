@@ -317,6 +317,7 @@ mod tests {
             Arc::new(ContextBlock::InferenceResponse {
                 items: vec![InferenceResponseItem::AssistantMessage {
                     provider_specific: Box::new(rho_core::UnknownProviderSpecificData {
+                        body: Default::default(),
                         tag: "test".to_owned(),
                     }),
                     content: vec![ContentPart::Text { text: text.into() }],

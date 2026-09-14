@@ -195,7 +195,6 @@ impl AgentPool {
         self.flush_agent_usage(Some(agent_id)).await;
     }
 
-
     pub fn db(&self) -> &RhoDb {
         &self.db
     }
