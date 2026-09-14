@@ -185,7 +185,6 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
                 retrying: *retrying,
                 at: *at,
             }),
-            NativeEvent::PythonStream { .. } => None,
         };
     }
     let message = |sender: &MessageSender, content: &[rho_core::ContentPart], delivery, at| {
@@ -310,6 +309,7 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             mode: *mode,
             at: *at,
         },
+        AgentEvent::Notice { text, .. } if text.is_empty() => return None,
         AgentEvent::Notice { text, at } => MirrorEvent::Notice {
             text: text.to_string(),
             at: *at,

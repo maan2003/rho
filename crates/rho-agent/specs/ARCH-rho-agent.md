@@ -43,9 +43,11 @@ A cancelled or failed runtime waits for fresh input as specified by
 
 ## Durable ownership and recovery
 
-Native Python units may execute while a response streams, only after admission
-commits. Provider interruption is not EOF, and admitted effects are never replayed.
-Settlement, model completion, and job completion are distinct facts
+Native Python units may execute while a response streams. Admission and
+settlement are ordered in memory, without per-unit database writes. Provider interruption is not EOF, and admitted effects are never replayed.
+Only coherent conversation boundaries are persisted; a restart may lose recent
+execution and output without rolling back external effects. Settlement, model
+completion, and job completion are distinct live facts
 ([SPEC-restart-recovery](SPEC-restart-recovery.md)).
 
 Output reads lease a stable contribution until acknowledgment. Notebook replies and reports project once into canonical native inputs carrying

@@ -777,15 +777,17 @@ own tools denied.
   and does not disable the timer, user input, or agent mail.
 - Python source can execute complete top-level units before its provider response
   finishes. The agent validates one stable, append-only custom `exec` identity,
-  bounds total source to 1 MiB, and persists admission before permitting each unit.
-  It persists settlement before permitting the next unit. Transport loss never
+  bounds total source to 1 MiB, and orders unit admission and settlement in memory.
+  Executing a unit never waits for a database admission or settlement write. Transport loss never
   closes the compiler as EOF: unadmitted source is discarded, while an admitted
   unit and its commands continue as ordinary sources on the accepted `exec`
   call. The next request respects their normal completion, batching, and check-in
   rules rather than a forced retry deadline. Failures before admission retain
   bounded backoff. Fresh context reports completed, running, or failed statements
-  rather than automatically replaying them. Admission records do not prove
-  side effects occurred; a crash between admission and settlement is uncertain.
+  rather than automatically replaying them. Only coherent conversation boundaries
+  are saved. After restart, recent source and execution may be absent; external
+  side effects may remain. Recovery never reconstructs interpreter progress or
+  automatically replays interrupted work.
 - Notebook state and live jobs are ephemeral and do not survive restart. The
   existing transcript recovery rules apply. The `rho-code-mode` V8 crate remains
   the JavaScript runtime for all other code-mode roles.

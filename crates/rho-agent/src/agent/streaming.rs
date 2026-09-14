@@ -1,12 +1,11 @@
-//! Streaming admission belongs to the agent: write intent before permitting
-//! Python, and write settlement before admitting another unit. Provider EOF
-//! and transport loss are deliberately different operations.
+//! Streaming admission and settlement are in-memory execution state. Only
+//! complete conversation boundaries are persisted. Provider EOF and transport
+//! loss are deliberately different operations.
 #[cfg(test)]
 use rho_core::StreamingContextItem;
 use rho_inference::exec::set_source;
 
 use super::*;
-use crate::PythonStreamEvent;
 
 pub(super) struct Stream {
     pub exec: Arc<rho_agent_tools::PythonExec>,
@@ -100,13 +99,6 @@ impl Agent {
             at: now,
         })
         .await;
-        self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-            event: PythonStreamEvent::Opened {
-                item: identity.clone(),
-            },
-            at: now,
-        }))
-        .await;
         self.execs.insert(
             incoming.id.clone(),
             RunningExec {
@@ -144,7 +136,7 @@ impl Agent {
         exec.feed(incoming.source, false)
     }
 
-    pub(super) async fn advance_streams(&mut self, now: UnixMs, admit: bool) {
+    pub(super) fn advance_streams(&mut self, admit: bool) {
         let ids = self.streams.keys().cloned().collect::<Vec<_>>();
         for id in ids {
             let mut stream = self.streams.remove(&id).unwrap();
@@ -152,15 +144,6 @@ impl Agent {
             if let Some((end, error)) = progress.settled
                 && end > stream.settled
             {
-                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-                    event: PythonStreamEvent::Settled {
-                        call_id: id.clone(),
-                        end: end as u64,
-                        error: error.clone(),
-                    },
-                    at: now,
-                }))
-                .await;
                 stream.settled = end;
                 stream.recovery |= stream.stopped;
                 if error.is_none() {
@@ -171,13 +154,6 @@ impl Agent {
                 }
             }
             if progress.returned && !stream.closed {
-                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-                    event: PythonStreamEvent::Closed {
-                        call_id: id.clone(),
-                    },
-                    at: now,
-                }))
-                .await;
                 stream.closed = true;
             }
             if admit
@@ -187,16 +163,6 @@ impl Agent {
                 && let Some(end) = progress.ready
                 && end > stream.admitted
             {
-                // Compiler offsets refer to the validated original UTF-8 source.
-                let source = stream.source[stream.admitted..end].to_owned();
-                self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-                    event: PythonStreamEvent::Admitted {
-                        call_id: id.clone(),
-                        source,
-                    },
-                    at: now,
-                }))
-                .await;
                 stream.admitted = end;
                 if let Err(error) = stream.exec.permit(end) {
                     stream.stopped = true;
@@ -253,11 +219,6 @@ impl Agent {
             self.streams.remove(&id);
             self.execs.remove(&id);
             self.latest_python_exec = None;
-            self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-                event: PythonStreamEvent::Acknowledged { call_id: id },
-                at: now,
-            }))
-            .await;
             return false;
         }
         let mut item = stream.item.clone();
@@ -279,28 +240,18 @@ impl Agent {
         true
     }
 
-    /// Called only after the boundary's Sent has committed its output and
-    /// notes.
-    pub(super) async fn acknowledge_streams(
+    /// Retire live stream state after the boundary has accepted its output.
+    pub(super) fn acknowledge_streams(
         &mut self,
-        now: UnixMs,
         delivered: &std::collections::BTreeSet<ToolCallId>,
     ) {
-        let mut ids = self
+        let ids = self
             .streams
             .iter()
             .filter(|(id, stream)| delivered.contains(*id) && stream.closed && stream.canonical)
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        ids.extend(std::mem::take(&mut self.recovery_streams));
         for id in ids {
-            self.persist(AgentEvent::Native(NativeEvent::PythonStream {
-                event: PythonStreamEvent::Acknowledged {
-                    call_id: id.clone(),
-                },
-                at: now,
-            }))
-            .await;
             self.streams.remove(&id);
         }
     }
@@ -429,8 +380,6 @@ pub(in crate::agent) mod tests {
             observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: Vec::new(),
-            recovery_blocks: Vec::new(),
-            recovery_streams: Vec::new(),
             context_used: None,
             turn: None,
             latest_python_exec: None,
@@ -469,7 +418,7 @@ pub(in crate::agent) mod tests {
     async fn until(agent: &mut Agent, predicate: impl Fn(&Agent) -> bool) {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                agent.advance_streams(UnixMs::now(), true).await;
+                agent.advance_streams(true);
                 if predicate(agent) {
                     return;
                 }
@@ -478,6 +427,47 @@ pub(in crate::agent) mod tests {
         })
         .await
         .expect("stream did not settle");
+    }
+
+    #[tokio::test]
+    async fn units_execute_without_database_access_and_restart_drops_unsaved_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        let source = "Path('marker').write_text('first')\nPath('marker').write_text('second')\n";
+        agent.handle(update("one", source)).await;
+        let db = agent.db.clone();
+        let (_, before) = db.read().agent_events(agent.agent_id);
+        // The first-block observation is coarse metadata; unit admission and
+        // settlement must never need the writer, including the very first unit.
+        let writer = db.write().await;
+        until(&mut agent, |agent| {
+            agent.streams.values().next().unwrap().completed == source.len()
+        })
+        .await;
+        drop(writer);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker")).unwrap(),
+            "second"
+        );
+        let (_, events) = db.read().agent_events(agent.agent_id);
+        assert_eq!(
+            events, before,
+            "executing units must not journal interpreter progress"
+        );
+        drop(agent);
+        let recovered = replay::replay(events);
+        assert!(
+            recovered.history.is_empty(),
+            "no response boundary was committed"
+        );
+        assert!(
+            recovered.owed.is_empty(),
+            "do not invent or replay an unsaved call"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker")).unwrap(),
+            "second"
+        );
     }
 
     #[tokio::test]
@@ -533,13 +523,14 @@ pub(in crate::agent) mod tests {
         );
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
-        assert!(recovered.recovery_notes[0].contains("successfully evaluated"));
+        assert_eq!(recovered.owed.len(), 1);
+        assert!(recovered.recovery_notes.is_empty());
         agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
         assert!(agent.provider_input().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
-        assert!(replay::replay(events).recovery_notes.is_empty());
+        assert!(replay::replay(events).owed.is_empty());
     }
 
     #[tokio::test]
@@ -576,7 +567,8 @@ pub(in crate::agent) mod tests {
             )).await;
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
-        assert!(recovered.recovery_notes[0].contains(&format!("bytes 0..{}", prefix.len())));
+        assert_eq!(recovered.owed.len(), 1);
+        assert!(recovered.recovery_notes.is_empty());
         agent.start_request(UnixMs::now(), None).await;
         agent.session.abort();
         assert!(!directory.path().join("wrong").exists());
@@ -675,9 +667,7 @@ pub(in crate::agent) mod tests {
         });
         let decision = agent.decide(UnixMs::now());
         assert_eq!(decision, Boundary::AbortAndResend);
-        agent
-            .advance_streams(UnixMs::now(), decision != Boundary::AbortAndResend)
-            .await;
+        agent.advance_streams(decision != Boundary::AbortAndResend);
         assert_eq!(agent.streams.values().next().unwrap().admitted, 0);
         let exec = agent.streams.values().next().unwrap().exec.clone();
         agent.abandon_stream(UnixMs::now()).await;
@@ -729,9 +719,9 @@ pub(in crate::agent) mod tests {
             recovered.owed.is_empty(),
             "its one provider result was already drained"
         );
-        assert!(recovered.recovery_notes[0].contains("await gate.wait()"));
+        assert!(recovered.recovery_notes.is_empty());
         // Another notebook cell can release it; the original execution still
-        // carries the eventual settlement and must remain journaled.
+        // carries the eventual settlement in memory.
         agent.phase = Phase::Requesting(InFlight::default());
         agent.handle(update("two", "gate.set()\n")).await;
         until(&mut agent, |agent| {
@@ -747,22 +737,15 @@ pub(in crate::agent) mod tests {
             replay::replay(events)
                 .recovery_notes
                 .iter()
-                .any(|note| note.contains(&format!("bytes 0..{}", source.len())))
+                .all(|note| !note.contains("bytes 0.."))
         );
         let old = ToolCallId::try_from("one").unwrap();
-        agent
-            .acknowledge_streams(UnixMs::now(), &Default::default())
-            .await;
+        agent.acknowledge_streams(&Default::default());
         assert!(
             agent.streams.contains_key(&old),
             "held stream evidence must survive preparation"
         );
-        agent
-            .acknowledge_streams(
-                UnixMs::now(),
-                &std::collections::BTreeSet::from([old.clone()]),
-            )
-            .await;
+        agent.acknowledge_streams(&std::collections::BTreeSet::from([old.clone()]));
         assert!(
             !agent.streams.contains_key(&old),
             "delivered settled evidence may be retired"
@@ -772,10 +755,36 @@ pub(in crate::agent) mod tests {
     async fn rewind_rebuilds_recovery_state_instead_of_carrying_abandoned_notes() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
-        agent.phase = Phase::Idle {
-            owed: Vec::new(),
-            standing: Standing::Nothing,
-        };
+        agent.handle(update("one", "survives_rewind = 42\n")).await;
+        agent
+            .handle(Event::Inference(InferenceEvent::ContextItem {
+                index: 0,
+                event: ContextItemEvent::Finish,
+            }))
+            .await;
+        agent
+            .handle(Event::Inference(InferenceEvent::Finished {
+                usage: None,
+                provider_response_id: None,
+            }))
+            .await;
+        until(&mut agent, |agent| {
+            agent.streams.values().next().unwrap().closed
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !agent.execs.is_empty() {
+                agent.start_request(UnixMs::now(), None).await;
+                agent.session.abort();
+                agent.phase = Phase::Idle {
+                    owed: Vec::new(),
+                    standing: Standing::Nothing,
+                };
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("drain the settled cell before rewinding");
         agent
             .persist(AgentEvent::Accepted(QueuedInput {
                 source: MessageSender::User,
@@ -789,13 +798,23 @@ pub(in crate::agent) mod tests {
             }))
             .await;
         agent.recovery_notes.push("old failed attempt".into());
-        agent
-            .recovery_streams
-            .push(ToolCallId::try_from("old").unwrap());
         agent.rewind(1).await.unwrap();
         assert!(agent.recovery_notes.is_empty());
-        assert!(agent.recovery_streams.is_empty());
-        assert!(agent.recovery_blocks.is_empty());
+        assert!(
+            !agent.provider_input().is_empty(),
+            "rewind retained the earlier conversation"
+        );
+        agent.phase = Phase::Requesting(InFlight::default());
+        let source = "assert survives_rewind == 42\nPath('survived').write_text('yes')\n";
+        agent.handle(update("two", source)).await;
+        until(&mut agent, |agent| {
+            agent.streams.values().next().unwrap().completed == source.len()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("survived")).unwrap(),
+            "yes"
+        );
     }
     #[tokio::test]
     async fn partial_exec_failure_uses_normal_command_waiting_and_checkin() {
@@ -916,7 +935,6 @@ pub(in crate::agent) mod tests {
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);
         assert!(recovered.history.is_empty());
-        assert!(recovered.recovery_blocks.is_empty());
         assert!(recovered.recovery_notes.is_empty());
         let Phase::Idle {
             standing: Standing::Retry { failed_at, .. },

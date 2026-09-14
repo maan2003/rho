@@ -1,7 +1,6 @@
 //! Rebuilding an agent from its log: the history the next request sends,
 //! the calls it owes an answer to, and what was queued when it stopped.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rho_core::{ContextBlock, InferenceResponseItem, MessageSender};
@@ -14,8 +13,6 @@ pub(crate) struct Replayed {
     pub history: Vec<Arc<ContextBlock>>,
     pub(super) context: super::context::Window,
     pub recovery_notes: Vec<String>,
-    pub recovery_blocks: Vec<ContextBlock>,
-    pub recovery_streams: Vec<rho_core::ToolCallId>,
     /// Calls history left hanging: every one of them gets a placeholder
     /// result in the next request (`SPEC-restart-recovery`).
     pub owed: Vec<rho_core::ExecId>,
@@ -24,16 +21,26 @@ pub(crate) struct Replayed {
     pub context_used: Option<u64>,
 }
 
+/// Process restart, unlike live rewind or provider-input projection, discards
+/// the notebook and all command handles.
+pub(crate) fn recover(events: Vec<AgentEvent<'static>>) -> Replayed {
+    let mut replayed = replay(events);
+    if !replayed.history.is_empty() && replayed.owed.is_empty() {
+        replayed.recovery_notes.push(
+            "Rho restarted: Python state and command handles are gone. Recent execution may be \
+             absent from this conversation, and external side effects may remain. Do not \
+             automatically replay interrupted work; inspect current state and continue with new code."
+                .into(),
+        );
+    }
+    replayed
+}
+
 pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
     let mut history: Vec<Arc<ContextBlock>> = Vec::new();
     let mut context_used = None;
     let mut context = super::context::Window::default();
-    let mut streams =
-        BTreeMap::<rho_core::ToolCallId, (rho_core::InferenceResponseItem, String, usize)>::new();
-    let mut canonical = BTreeSet::new();
     let mut recovery_notes = Vec::new();
-    let mut recovery_blocks = Vec::new();
-    let mut recovery_streams = Vec::new();
     let mut user = Vec::new();
     let mut mail = Vec::new();
 
@@ -82,47 +89,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                     output.clone()
                 }
                 NativeEvent::RequestFailed { .. } => Vec::new(),
-                NativeEvent::PythonStream { event, .. } => {
-                    use crate::PythonStreamEvent;
-                    match event {
-                        PythonStreamEvent::Opened { item } => {
-                            if let InferenceResponseItem::ToolCall { id, .. } = item {
-                                streams.insert(id.clone(), (item.clone(), String::new(), 0));
-                            }
-                        }
-                        PythonStreamEvent::Admitted { call_id, source } => {
-                            if let Some((_, admitted, _)) = streams.get_mut(call_id) {
-                                admitted.push_str(source);
-                            }
-                        }
-                        PythonStreamEvent::Settled {
-                            call_id,
-                            end,
-                            error,
-                        } => {
-                            if let Some((_, _, completed)) = streams.get_mut(call_id)
-                                && error.is_none()
-                            {
-                                *completed = *end as usize;
-                            }
-                        }
-                        PythonStreamEvent::Closed { .. } => {}
-                        PythonStreamEvent::Acknowledged { call_id } => {
-                            streams.remove(call_id);
-                        }
-                    }
-                    Vec::new()
-                }
             };
-            for block in &blocks {
-                if let ContextBlock::InferenceResponse { items, .. } = block {
-                    for item in items {
-                        if let InferenceResponseItem::ToolCall { id, .. } = item {
-                            canonical.insert(id.clone());
-                        }
-                    }
-                }
-            }
             history.extend(blocks.into_iter().map(Arc::new));
             continue;
         }
@@ -163,32 +130,6 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             | AgentEvent::RuntimeRebound { .. } => {}
         }
     }
-    for (id, (mut item, source, completed)) in streams {
-        recovery_streams.push(id.clone());
-        if source.is_empty() {
-            continue;
-        }
-        if !canonical.contains(&id) {
-            let InferenceResponseItem::ToolCall { arguments, .. } = &mut item else {
-                unreachable!()
-            };
-            *arguments = source.clone();
-            recovery_blocks.push(ContextBlock::InferenceResponse {
-                items: vec![item],
-                provider_response_id: None,
-            });
-        }
-        recovery_notes.push(format!(
-            "Rho restarted: Python state and command handles are gone. {}",
-            super::streaming::progress_note(
-                &id, &source, completed, source.len(),
-                "execution was interrupted by restart; these statements may have executed partially",
-            ).replace(
-                "existing command handles and their fresh output remain authoritative",
-                "external side effects may remain, but old command handles cannot be used"
-            ),
-        ));
-    }
     if context.preparation.take().is_some() {
         recovery_notes.push(
             "Rho restarted during context-rotation preparation. Notes may already have been \
@@ -197,15 +138,11 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
                 .into(),
         );
     }
-    let mut recovery_history = history.clone();
-    recovery_history.extend(recovery_blocks.iter().cloned().map(Arc::new));
-    let owed = owed_calls(&recovery_history);
+    let owed = owed_calls(&history);
     Replayed {
         history,
         context,
         recovery_notes,
-        recovery_blocks,
-        recovery_streams,
         owed,
         user,
         mail,
@@ -394,174 +331,68 @@ mod tests {
         assert!(replayed.history.is_empty());
     }
     #[test]
-    fn streaming_crash_cuts_preserve_admission_and_recovery_is_idempotent() {
-        use crate::PythonStreamEvent;
-        let id = rho_core::ToolCallId::try_from("c").unwrap();
-        let source = "command('touch marker')\n";
-        let journal = [
-            PythonStreamEvent::Opened {
-                item: tool_call("c"),
-            },
-            PythonStreamEvent::Admitted {
-                call_id: id.clone(),
-                source: source.into(),
-            },
-            PythonStreamEvent::Settled {
-                call_id: id.clone(),
-                end: source.len() as u64,
-                error: None,
-            },
-        ];
-        for cut in 1..=journal.len() {
-            let events: Vec<_> = journal[..cut]
-                .iter()
-                .cloned()
-                .map(|event| {
-                    AgentEvent::Native(crate::native::NativeEvent::PythonStream {
-                        event,
-                        at: rho_core::UnixMs(0),
-                    })
-                })
-                .collect();
-            let replayed = replay(events.clone());
-            if cut == 1 {
-                assert!(replayed.owed.is_empty());
-                assert!(replayed.recovery_blocks.is_empty());
-                assert!(replayed.recovery_notes.is_empty());
-                continue;
-            }
-            assert_eq!(replayed.owed.len(), 1);
-            assert_eq!(replayed.recovery_blocks.len(), 1);
-            assert!(
-                replayed.history.is_empty(),
-                "load must not invent already-persisted history"
-            );
-            let completed = if cut == 3 { source.len() } else { 0 };
-            assert!(replayed.recovery_notes[0].contains(&format!("bytes 0..{completed}")));
-            let mut blocks = replayed.recovery_blocks;
-            blocks.push(ContextBlock::ToolResults {
-                results: vec![rho_core::ToolResult {
-                    call_id: id.clone(),
-                    tool_type: rho_core::ToolType::Function,
-                    body: rho_core::ToolOutput {
-                        output: Arc::new(String::new()),
-                        full_output: None,
-                        images: Arc::new(Vec::new()),
-                        status: rho_core::ToolOutputStatus::Cancelled,
-                    },
-                    started_at: rho_core::UnixMs(1),
-                    finished_at: rho_core::UnixMs(1),
-                    metadata: None,
+    fn only_process_recovery_reports_lost_notebook_state() {
+        let events = vec![AgentEvent::Native(
+            crate::native::NativeEvent::RequestStarted {
+                input: vec![ContextBlock::UserMessage {
+                    sender: MessageSender::User,
+                    content: vec![rho_core::ContentPart::Text {
+                        text: "saved conversation".into(),
+                    }],
                 }],
-            });
-            let mut events = events;
-            events.push(AgentEvent::Native(
-                crate::native::NativeEvent::RequestStarted {
-                    input: Vec::from(blocks),
-                    at: rho_core::UnixMs(1),
-                    wake: None,
-                    context: None,
-                },
-            ));
-            let twice = replay(events);
-            assert!(twice.owed.is_empty());
-            assert!(
-                twice.recovery_blocks.is_empty(),
-                "the recovery call must not be inserted twice"
-            );
-        }
-    }
-
-    #[test]
-    fn a_later_success_does_not_erase_an_earlier_unsettled_stream() {
-        use crate::PythonStreamEvent;
-        let replayed = replay(vec![
-            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
-                event: PythonStreamEvent::Opened {
-                    item: tool_call("first"),
-                },
-                at: rho_core::UnixMs(0),
-            }),
-            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
-                event: PythonStreamEvent::Admitted {
-                    call_id: rho_core::ToolCallId::try_from("first").unwrap(),
-                    source: "await work()\n".into(),
-                },
-                at: rho_core::UnixMs(0),
-            }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
-                output: Vec::from(vec![ContextBlock::InferenceResponse {
-                    items: vec![tool_call("first")],
-                    provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
+                context: None,
+                wake: None,
                 at: rho_core::UnixMs(1),
-            }),
-            AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
-                output: Vec::from(vec![ContextBlock::InferenceResponse {
-                    items: vec![tool_call("second")],
-                    provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
-                at: rho_core::UnixMs(2),
-            }),
-        ]);
-        assert_eq!(replayed.owed.len(), 2);
-        assert!(replayed.recovery_blocks.is_empty());
-        assert!(replayed.recovery_notes[0].contains("await work()"));
+            },
+        )];
+        assert!(replay(events.clone()).recovery_notes.is_empty());
+        let recovered = recover(events);
+        assert_eq!(recovered.recovery_notes.len(), 1);
+        assert!(recovered.recovery_notes[0].contains("command handles are gone"));
+        assert!(recovered.recovery_notes[0].contains("Recent execution may be absent"));
+        assert!(recovered.owed.is_empty());
+        assert!(recovered.user.is_empty());
+        assert!(recovered.mail.is_empty());
+        assert!(recover(Vec::new()).recovery_notes.is_empty());
     }
 
     #[test]
-    fn closed_and_replied_do_not_retire_progress_before_durable_acknowledgement() {
-        use crate::PythonStreamEvent;
-        let id = rho_core::ToolCallId::try_from("c").unwrap();
-        let journal = |event| {
-            AgentEvent::Native(crate::native::NativeEvent::PythonStream {
-                event,
-                at: rho_core::UnixMs(0),
-            })
-        };
-        for close_first in [false, true] {
-            let mut events = vec![
-                journal(PythonStreamEvent::Opened {
-                    item: tool_call("c"),
-                }),
-                journal(PythonStreamEvent::Admitted {
-                    call_id: id.clone(),
-                    source: "work()\n".into(),
-                }),
-                journal(PythonStreamEvent::Settled {
-                    call_id: id.clone(),
-                    end: 7,
-                    error: None,
-                }),
-            ];
-            let close = journal(PythonStreamEvent::Closed {
-                call_id: id.clone(),
-            });
-            let reply = AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
-                output: Vec::from(vec![ContextBlock::InferenceResponse {
-                    items: vec![tool_call("c")],
-                    provider_response_id: None,
-                }]),
-                context_used: None,
-                usage: None,
-                at: rho_core::UnixMs(0),
-            });
-            events.extend(if close_first {
-                vec![close, reply]
-            } else {
-                vec![reply, close]
-            });
-            let before = replay(events.clone());
-            assert!(before.recovery_notes[0].contains("bytes 0..7"));
-            assert!(before.recovery_blocks.is_empty());
-            events.push(journal(PythonStreamEvent::Acknowledged {
-                call_id: id.clone(),
-            }));
-            assert!(replay(events).recovery_notes.is_empty());
-        }
+    fn recovery_uses_canonical_calls_without_interpreter_progress() {
+        use crate::native::NativeEvent;
+        let id = rho_core::ExecId::try_from("c").unwrap();
+        let mut events = Vec::new();
+        events.push(AgentEvent::Native(NativeEvent::ResponseFinished {
+            output: vec![ContextBlock::InferenceResponse {
+                items: vec![tool_call("c")],
+                provider_response_id: None,
+            }],
+            context_used: None,
+            usage: None,
+            at: rho_core::UnixMs(1),
+        }));
+        let recovered = replay(events.clone());
+        assert_eq!(recovered.history.len(), 1);
+        assert_eq!(recovered.owed, vec![id.clone()]);
+
+        events.push(AgentEvent::Native(NativeEvent::RequestStarted {
+            input: vec![rho_inference::exec::output(&rho_core::ExecOutput::Reply {
+                id: id.clone(),
+                body: rho_core::ToolOutput {
+                    output: Arc::new(String::new()),
+                    full_output: None,
+                    images: Default::default(),
+                    status: rho_core::ToolOutputStatus::Cancelled,
+                },
+                first_block_at: rho_core::UnixMs(2),
+                at: rho_core::UnixMs(2),
+            })],
+            context: None,
+            wake: None,
+            at: rho_core::UnixMs(2),
+        }));
+        let recovered = replay(events);
+        assert!(recovered.owed.is_empty());
+        assert_eq!(recovered.history.len(), 2);
+        assert!(recovered.recovery_notes.is_empty());
     }
 }

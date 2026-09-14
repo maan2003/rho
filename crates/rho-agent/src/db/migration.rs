@@ -1,10 +1,33 @@
-//! One format hop from b4e2c7a1. Remove after the migrated build has opened
-//! active developer databases. Never normalize legacy rows in live readers.
+//! Temporary format hops from b4e2c7a1 and d8f63a20. Remove after the
+//! migrated build has opened active developer databases. Live readers only
+//! decode the current conversation format.
 use redb::TableDefinition;
 use rho_core::{ExecOutput, ProviderResponseId};
 use rho_db::{RecordedTypeName, SenAs, SenValue, WriteTxn};
 
 use crate::*;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum PythonStreamEvent {
+    Opened {
+        item: rho_core::InferenceResponseItem,
+    },
+    Admitted {
+        call_id: rho_core::ToolCallId,
+        source: String,
+    },
+    Settled {
+        call_id: rho_core::ToolCallId,
+        end: u64,
+        error: Option<String>,
+    },
+    Closed {
+        call_id: rho_core::ToolCallId,
+    },
+    Acknowledged {
+        call_id: rho_core::ToolCallId,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum Event<'a> {
@@ -304,7 +327,12 @@ impl Event<'static> {
                 retrying,
                 at,
             },
-            Self::PythonStream { event, at } => Current::PythonStream { event, at },
+            Self::PythonStream { at, .. } => {
+                return AgentEvent::Notice {
+                    text: "".into(),
+                    at,
+                };
+            }
             Self::Native(event) => match event {
                 NativeEvent::RequestStarted {
                     input,
@@ -343,7 +371,12 @@ impl Event<'static> {
                     retrying,
                     at,
                 },
-                NativeEvent::PythonStream { event, at } => Current::PythonStream { event, at },
+                NativeEvent::PythonStream { at, .. } => {
+                    return AgentEvent::Notice {
+                        text: "".into(),
+                        at,
+                    };
+                }
             },
             Self::QueueCleared => return AgentEvent::Cleared { at: UnixMs(0) },
             Self::Presented { title, at, .. } => {
@@ -400,6 +433,70 @@ pub(super) fn migrate(write: &mut WriteTxn) {
             }
             let current = event.current(native);
             log.insert(&key, SenValue::borrowed(&current));
+            after = Some(key);
+        }
+    }
+}
+
+// Only the retired shape falls back to the old decoder. Current conversation
+// records retain their codec, identities, opaque provider data and grouping.
+#[derive(Clone, Debug, Encode)]
+enum ConversationRow {
+    Current,
+    Progress(UnixMs),
+}
+
+#[derive(Decode)]
+enum RetiredEvent {
+    Native(NativeEvent),
+}
+
+impl senax_encoder::Decoder for ConversationRow {
+    fn decode(data: &mut impl bytes::Buf) -> senax_encoder::Result<Self> {
+        // This codec is only a complete redb value, never a nested field.
+        let bytes = data.copy_to_bytes(data.remaining());
+        let mut current = bytes.as_ref();
+        match AgentEvent::decode(&mut current) {
+            Ok(_) => Ok(Self::Current),
+            Err(error) => match RetiredEvent::decode(&mut bytes.as_ref()) {
+                Ok(RetiredEvent::Native(NativeEvent::PythonStream { at, .. })) => {
+                    Ok(Self::Progress(at))
+                }
+                _ => Err(error),
+            },
+        }
+    }
+}
+
+const CONVERSATION_LOG: TableDefinition<(AgentId, u64), SenAs<ConversationRow, LogName>> =
+    TableDefinition::new("agent_log");
+
+pub(super) fn retire_stream_progress(write: &mut WriteTxn) {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let mut after = None;
+    loop {
+        let rows = write
+            .open_table(CONVERSATION_LOG)
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(128)
+            .map(|(key, value)| (key.value(), value.value().into_owned()))
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            break;
+        }
+        let mut log = write.open_table(super::AGENT_LOG);
+        for (key, row) in rows {
+            // Empty notices are the existing inert tombstone convention. Keys,
+            // journal references, rewind positions and allocation stay intact.
+            if let ConversationRow::Progress(at) = row {
+                log.insert(
+                    &key,
+                    SenValue::borrowed(&AgentEvent::Notice {
+                        text: "".into(),
+                        at,
+                    }),
+                );
+            }
             after = Some(key);
         }
     }
@@ -592,7 +689,7 @@ mod tests {
                     .get(&())
                     .unwrap()
                     .value(),
-                "d8f63a20"
+                super::super::CURRENT_AGENT_DB_FORMAT
             );
             let AgentEvent::Native(crate::native::NativeEvent::ResponseFinished { output, .. }) =
                 read.agent_event(agent, crate::db::AgentEventPos::new(2))
@@ -608,7 +705,10 @@ mod tests {
                 panic!("request")
             };
             assert_eq!(senax_encoder::encode(&input).unwrap(), expected_input);
-            assert!(read.agent_exec_was_admitted(agent, &"hidden".try_into().unwrap()));
+            assert!(
+                !read.agent_exec_was_admitted(agent, &"hidden".try_into().unwrap()),
+                "uncanonicalized interpreter evidence is retired, never replayed"
+            );
             let (_, visible) = read.agent_event_records(agent);
             assert!(!visible.iter().any(|(pos, _)| matches!(pos.pos, 4 | 5)));
             let AgentEvent::Native(crate::native::NativeEvent::RequestStarted { input, .. }) = read
@@ -634,9 +734,141 @@ mod tests {
         assert_eq!(db.read().journal_head(), journal);
         assert_eq!(db.read().get_agent(agent).next.pos, 9);
         assert!(
-            db.read()
+            !db.read()
                 .agent_exec_was_admitted(agent, &"hidden".try_into().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn retires_progress_without_changing_positions_conversation_or_pending_notice() {
+        use crate::db::AgentWriteTxnExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent.redb");
+        let db = rho_db::RhoDb::open(&path);
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let agent = super::super::tests::create(&mut write, None, None);
+        write.append_agent_event(
+            agent,
+            &AgentEvent::Notice {
+                text: "keep this notice".into(),
+                at: UnixMs(1),
+            },
+        );
+        let response = AgentEvent::Native(crate::native::NativeEvent::ResponseFinished {
+            output: vec![response("response-one", vec![old_call("saved-call")])],
+            context_used: Some(42),
+            usage: None,
+            at: UnixMs(2),
+        });
+        write.append_agent_event(agent, &response);
+        let original_response = senax_encoder::encode(&response).unwrap();
+        for (pos, event) in [
+            (
+                3,
+                PythonStreamEvent::Opened {
+                    item: old_call("unsaved-call"),
+                },
+            ),
+            (
+                4,
+                PythonStreamEvent::Admitted {
+                    call_id: "unsaved-call".try_into().unwrap(),
+                    source: "side_effect()\n".into(),
+                },
+            ),
+            (
+                6,
+                PythonStreamEvent::Closed {
+                    call_id: "unsaved-call".try_into().unwrap(),
+                },
+            ),
+        ] {
+            write.open_table(OLD_LOG).insert(
+                &(agent, pos),
+                SenValue::borrowed(&Event::Native(NativeEvent::PythonStream {
+                    event,
+                    at: UnixMs(pos),
+                })),
+            );
+            write
+                .open_table(super::super::JOURNAL)
+                .insert(&(pos + 1), &(agent, pos));
+        }
+        write.open_table(super::super::AGENT_LOG).insert(
+            &(agent, 5),
+            SenValue::borrowed(&AgentEvent::Rewound {
+                to: crate::db::AgentEventPos::new(3),
+                at: UnixMs(5),
+            }),
+        );
+        write
+            .open_table(super::super::JOURNAL)
+            .insert(&6, &(agent, 5));
+        write
+            .open_table(super::super::FORMAT)
+            .insert(&(), &"d8f63a20".to_owned());
+        write.commit();
+        drop(db);
+        let db = rho_db::RhoDb::open(&path);
+        super::super::prepare(&db).await;
+        {
+            let read = db.read();
+            assert_eq!(
+                read.get_agent(agent).pending_notice.as_deref(),
+                Some("keep this notice")
+            );
+            assert_eq!(
+                senax_encoder::encode(
+                    &read
+                        .agent_event(agent, crate::db::AgentEventPos::new(2))
+                        .unwrap()
+                )
+                .unwrap(),
+                original_response
+            );
+            for pos in [3, 4, 6] {
+                let event = read
+                    .agent_event(agent, crate::db::AgentEventPos::new(pos))
+                    .unwrap();
+                assert!(
+                    matches!(&event, AgentEvent::Notice { text, at } if text.is_empty() && *at == UnixMs(pos))
+                );
+                assert!(crate::mirror::strip(&event).is_none());
+            }
+            let (_, events) = read.agent_events(agent);
+            let restored = crate::agent::replay::replay(events);
+            assert_eq!(restored.history.len(), 1);
+            assert_eq!(
+                restored.owed,
+                vec![rho_core::ExecId::try_from("saved-call").unwrap()]
+            );
+            assert!(read.agent_exec_was_admitted(agent, &"saved-call".try_into().unwrap()));
+            assert!(!read.agent_exec_was_admitted(agent, &"unsaved-call".try_into().unwrap()));
+            let journal = read.journal_since(crate::db::Seq(0), 100);
+            assert_eq!(journal.len(), 7);
+            for (index, (seq, id, pos, _)) in journal.into_iter().enumerate() {
+                assert_eq!(seq.0, index as u64 + 1);
+                assert_eq!(id, agent);
+                assert_eq!(pos.pos, index as u64);
+            }
+        }
+        let mut write = db.write().await;
+        assert_eq!(
+            write
+                .append_agent_event(
+                    agent,
+                    &AgentEvent::Notice {
+                        text: "".into(),
+                        at: UnixMs(7)
+                    }
+                )
+                .pos,
+            7
+        );
+        write.commit();
+        super::super::prepare(&db).await;
+        assert_eq!(db.read().journal_head().0, 8);
     }
 
     #[tokio::test]
@@ -656,56 +888,67 @@ mod tests {
         }
         const BAD_LOG: TableDefinition<(AgentId, u64), SenAs<Unrecognized, LogName>> =
             TableDefinition::new("agent_log");
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agents.redb");
-        let db = rho_db::RhoDb::open(&path);
-        let mut write = db.write().await;
-        write.init_agent_tables();
-        let agent = super::super::tests::create(&mut write, None, None);
-        for pos in 1..=129 {
-            write.open_table(OLD_LOG).insert(
-                &(agent, pos),
-                SenValue::borrowed(&Event::Sent {
-                    blocks: Cow::Owned(Vec::new()),
-                    at: UnixMs(pos),
-                    wake: None,
-                }),
+        for format in ["b4e2c7a1", "d8f63a20"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("agents.redb");
+            let db = rho_db::RhoDb::open(&path);
+            let mut write = db.write().await;
+            write.init_agent_tables();
+            let agent = super::super::tests::create(&mut write, None, None);
+            for pos in 1..=129 {
+                write.open_table(OLD_LOG).insert(
+                    &(agent, pos),
+                    SenValue::borrowed(&if format == "b4e2c7a1" {
+                        Event::Sent {
+                            blocks: Cow::Owned(Vec::new()),
+                            at: UnixMs(pos),
+                            wake: None,
+                        }
+                    } else {
+                        Event::Native(NativeEvent::PythonStream {
+                            event: PythonStreamEvent::Opened {
+                                item: old_call("retired"),
+                            },
+                            at: UnixMs(pos),
+                        })
+                    }),
+                );
+            }
+            write.open_table(BAD_LOG).insert(
+                &(agent, 130),
+                SenValue::borrowed(&Unrecognized::FutureEvent),
             );
-        }
-        write.open_table(BAD_LOG).insert(
-            &(agent, 130),
-            SenValue::borrowed(&Unrecognized::FutureEvent),
-        );
-        write
-            .open_table(super::super::FORMAT)
-            .insert(&(), &"b4e2c7a1".to_owned());
-        write.commit();
-        drop(db);
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            write
+                .open_table(super::super::FORMAT)
+                .insert(&(), &format.to_owned());
+            write.commit();
+            drop(db);
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "db::migration::tests::malformed_later_batch_rolls_back_earlier_rewrites_and_format", "--nocapture"])
             .env("RHO_MIGRATION_ROLLBACK_TEST", &path)
             .output().unwrap();
-        assert!(
-            !child.status.success(),
-            "corrupt migration unexpectedly committed"
-        );
-        assert!(String::from_utf8_lossy(&child.stderr).contains("UnknownVariantId"));
-        let db = rho_db::RhoDb::open(&path);
-        let read = db.read();
-        assert_eq!(
-            read.open_table(super::super::FORMAT)
-                .get(&())
-                .unwrap()
-                .value(),
-            "b4e2c7a1"
-        );
-        assert!(matches!(
-            read.open_table(OLD_LOG)
-                .get(&(agent, 1))
-                .unwrap()
-                .value()
-                .into_owned(),
-            Event::Sent { .. }
-        ));
+            assert!(
+                !child.status.success(),
+                "corrupt migration unexpectedly committed"
+            );
+            assert!(String::from_utf8_lossy(&child.stderr).contains("UnknownVariantId"));
+            let db = rho_db::RhoDb::open(&path);
+            let read = db.read();
+            assert_eq!(
+                read.open_table(super::super::FORMAT)
+                    .get(&())
+                    .unwrap()
+                    .value(),
+                format
+            );
+            assert!(matches!(
+                read.open_table(OLD_LOG)
+                    .get(&(agent, 1))
+                    .unwrap()
+                    .value()
+                    .into_owned(),
+                Event::Sent { .. } | Event::Native(NativeEvent::PythonStream { .. })
+            ));
+        }
     }
 }

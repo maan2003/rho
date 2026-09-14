@@ -287,28 +287,6 @@ pub enum WakeKind {
     Failed,
 }
 
-#[derive(Clone, Debug, PartialEq, Encode, Decode)]
-pub enum PythonStreamEvent {
-    Opened {
-        item: rho_core::InferenceResponseItem,
-    },
-    Admitted {
-        call_id: rho_core::ToolCallId,
-        source: String,
-    },
-    Settled {
-        call_id: rho_core::ToolCallId,
-        end: u64,
-        error: Option<String>,
-    },
-    Closed {
-        call_id: rho_core::ToolCallId,
-    },
-    Acknowledged {
-        call_id: rho_core::ToolCallId,
-    },
-}
-
 impl AgentEvent<'_> {
     /// Whether this is a message the user typed, in either generation of
     /// the log: what a rewind counts turns by.

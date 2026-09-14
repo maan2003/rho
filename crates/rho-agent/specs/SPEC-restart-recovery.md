@@ -2,9 +2,9 @@
 
 ## Record justification
 
-Recovery spans provider attempts, Python unit admission and settlement, event-log
-replay, boundary scheduling, and request assembly; none alone owns which effects
-a continuation may safely repeat.
+Recovery spans canonical conversation persistence, event-log replay, boundary
+scheduling, and request assembly; none alone owns consistent history and how
+interrupted executions are represented.
 
 ## Contract
 
@@ -13,18 +13,20 @@ indistinguishable from the log and are treated alike, which is why the note
 below says "restarted" rather than "crashed".
 
 Restarting is not a state of its own. A loaded agent and a fresh one are both
-`Phase::Idle`; loading supplies `owed` and any undelivered streaming evidence.
+`Phase::Idle`; loading supplies `owed` and a restart notice, not live execution state.
 
 ### `owed`: what the next request must open with
 
-No tool or Python namespace survives a restart. Streaming Python records source
-admission before execution and successful unit settlement afterwards; other tool
-side effects are not recorded. Every `ToolCall` in history that no `ToolResult`
-answers is a call nothing is ever going to answer. `load` derives that set by replaying history, adding each
-call and removing each answered id, rather than by remembering which tools were
-alive. Admitted streaming calls whose response never completed are reconstructed
-under their original identity and durably included before their placeholder
-results at the next request.
+No tool or Python namespace survives a restart. Only coherent conversation
+boundaries are persisted; streaming source, unit admission, and settlement are
+in memory. Recent execution, source, and output may be absent from the saved
+conversation. External effects are not rolled back, and recovery must not claim
+an exact executed prefix.
+
+Every persisted call without a result is a call nothing is ever going to
+answer. `load` derives `owed` by replaying canonical history, adding each call
+and removing each answered identity. It does not reconstruct calls from
+interpreter progress or execute saved source.
 
 Membership does not depend on when the call was made. A call the model has moved
 past is still unanswered, and a call from five turns ago whose tool ran the whole
@@ -38,9 +40,8 @@ It emits, ahead of everything the sources drain:
    quietly;
 2. one note, as a user message, saying that every tool is gone —
    foreground and background alike — and that the empty results are placeholders
-   rather than output. Streaming recovery notes additionally preserve the durable
-   completed prefix and any uncertain admitted unit; they must not suggest that
-   externally visible effects were rolled back. There is one general note however
+   rather than output. The note must explain that recent execution may be unrecorded and external
+   side effects may remain; it must not suggest rollback or automatic replay. There is one general note however
    many calls were owed, because the restart happened once, and prose belongs in a message rather than dressed up as
    output some tool never produced.
 
@@ -58,15 +59,14 @@ request must carry is not a reason to make one.
 Always `Standing::Nothing` at load, whether or not a request was in flight when
 the process stopped
 ([DECISION-a-restart-does-not-resume-by-itself](DECISION-a-restart-does-not-resume-by-itself.md)).
-Recovery rebuilds history, queues, and streaming Python admission evidence, but
-never treats interrupted work as permission to execute it again. Two consequences:
+Recovery rebuilds saved conversation and queues, but never treats interrupted
+work as permission to execute it again. An agent with saved history gets a
+restart notice even when all its calls were answered: background jobs and
+notebook globals are gone too. Two consequences:
 
-- an interrupted request with no streaming Python leaves no context beyond its
-  `RequestStarted`; a streamed call is preserved under its original provider identity,
-  even when the response never finished. The next request carries the exact
-  successfully evaluated prefix and identifies admitted-but-unsettled source as
-  possibly partially executed. Admission is not proof of execution, and Python
-  evaluation is not proof that its commands completed;
+- a response that never reached a conversation boundary may be absent entirely,
+  even if some of its Python ran. A detected live interruption can record the
+  accepted call before its result; a process crash need not preserve that call;
 - a cancel does not survive a restart. `Standing` is in-memory only, so a
   cancelled agent that is reloaded comes back merely idle. In practice it stays
   quiet anyway, for the reason below.
@@ -105,7 +105,7 @@ A live rotation preserves Python and jobs; a restart never does. Replay retains
 the last committed active-window boundary but abandons an unfinished preparation
 exchange. The next independently triggered request explains that note writes may
 already have happened; it must not automatically replay them. Preparing sends do
-not acknowledge held input or unrelated streaming evidence. A committed rotation
+not acknowledge held input or unrelated live output. A committed rotation
 clears old occupancy along with advancing the window. Notes are ordinary external
 filesystem effects and are not rewound with conversation.
 
@@ -132,9 +132,10 @@ messages, discarded-source explanations, or source-range reports. Ordinary tool
 output remains authoritative; restart recovery separately reports uncertainty
 about execution whose live state has been lost.
 
-Interpreter return and provider completion do not retire execution evidence.
-It remains recoverable until its progress or result has been durably delivered
-at a request boundary.
+Interpreter return, provider completion, and job completion remain distinct live
+facts. Output ownership is acknowledged at conversation boundaries, not inferred
+from interpreter return. None of these mechanisms requires a per-unit durable
+execution journal.
 
 ### Claude ownership
 

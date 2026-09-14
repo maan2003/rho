@@ -54,7 +54,7 @@ const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBuc
 /// The Claude account every agent runs on. One row: the account is global,
 /// and switching it moves every agent at its next turn.
 const CLAUDE_ACCOUNT: TableDefinition<(), String> = TableDefinition::new("claude_account");
-const CURRENT_AGENT_DB_FORMAT: &str = "d8f63a20";
+const CURRENT_AGENT_DB_FORMAT: &str = "7a2ecf91";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -64,11 +64,18 @@ struct AgentDbMigration {
 }
 
 mod migration;
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "b4e2c7a1",
-    to: CURRENT_AGENT_DB_FORMAT,
-    migrate: migration::migrate,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "b4e2c7a1",
+        to: "d8f63a20",
+        migrate: migration::migrate,
+    },
+    AgentDbMigration {
+        from: "d8f63a20",
+        to: CURRENT_AGENT_DB_FORMAT,
+        migrate: migration::retire_stream_progress,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1010,9 +1017,6 @@ impl AgentReadTxnExt for ReadTxn {
                 return &call.id == exec;
             }
             match event.native_event() {
-                Some(crate::native::NativeEvent::PythonStream {
-                    event: crate::PythonStreamEvent::Admitted { call_id, .. }, ..
-                }) => call_id == exec,
                 Some(crate::native::NativeEvent::ResponseFinished { output, .. }) =>
                     output.iter().filter_map(|entry| match entry { rho_core::ContextBlock::InferenceResponse { items, .. } => Some(items), _ => None }).flatten().any(|item| matches!(item, rho_core::InferenceResponseItem::ToolCall { id, .. } if id == exec)),
                 _ => false,

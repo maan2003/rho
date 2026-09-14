@@ -241,7 +241,7 @@ impl AgentHandle {
             .expect("deep config implies a deep model");
         let parent = record.parent;
         let (_, events) = db.read().agent_events(agent_id);
-        let replayed = replay::replay(events);
+        let replayed = replay::recover(events);
         Ok(Self::start(
             db,
             inference,
@@ -313,8 +313,6 @@ impl AgentHandle {
             observations: Observations::default(),
             streams: BTreeMap::new(),
             recovery_notes: replayed.recovery_notes,
-            recovery_blocks: replayed.recovery_blocks,
-            recovery_streams: replayed.recovery_streams,
             context_used: replayed.context_used,
             turn: None,
             latest_python_exec: None,
@@ -585,7 +583,7 @@ impl RunningExec {
 }
 
 /// The in-flight provider response. Its streamed Python call may already have
-/// durable admission records and live work; abandoning the response preserves
+/// live work; abandoning the response preserves
 /// that call before the next boundary drains its output.
 #[derive(Clone, Default)]
 pub(crate) struct InFlight {
@@ -628,8 +626,6 @@ struct Agent {
     observations: Observations,
     streams: BTreeMap<ToolCallId, streaming::Stream>,
     recovery_notes: Vec<String>,
-    recovery_blocks: Vec<ContextBlock>,
-    recovery_streams: Vec<ToolCallId>,
 
     context_used: Option<u64>,
     /// What the model's latest turn settled about being looked in on. `None`
@@ -675,12 +671,11 @@ impl Agent {
             // In flight, admission waits on the decision: a statement is not
             // admitted into a request about to be thrown away.
             if matches!(self.phase, Phase::Idle { .. }) {
-                self.advance_streams(now, true).await;
+                self.advance_streams(true);
             }
             let decision = self.decide(now);
             if matches!(self.phase, Phase::Requesting(_)) {
-                self.advance_streams(now, decision != Boundary::AbortAndResend)
-                    .await;
+                self.advance_streams(decision != Boundary::AbortAndResend);
             }
             let deadline = match decision {
                 Boundary::No { recheck } => recheck,
@@ -1201,8 +1196,6 @@ impl Agent {
         let replayed = replay::replay(events);
         self.context = replayed.context;
         self.recovery_notes = replayed.recovery_notes;
-        self.recovery_blocks = replayed.recovery_blocks;
-        self.recovery_streams = replayed.recovery_streams;
         self.streams.clear();
         self.latest_python_exec = None;
         self.user = replayed.user;
@@ -1396,9 +1389,7 @@ impl Agent {
             })
             .map(|(id, _)| id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut blocks: Vec<ContextBlock> = std::mem::take(&mut self.recovery_blocks)
-            .into_iter()
-            .collect();
+        let mut blocks: Vec<ContextBlock> = Vec::new();
         if cancel_rotation {
             blocks.push(ContextBlock::DeveloperMessage {
                 text: context::MANUAL_COMPACTION.into(),
@@ -1426,7 +1417,7 @@ impl Agent {
                     // The prose half of what the request owes the model;
                     // the empty results above are the other half.
                     text: "note: rho restarted. Every tool that was running is gone — foreground \
-                           and background alike — and their external side effects may remain. The empty tool results above are placeholders, not output. Consult streaming progress notes before deciding what is safe to repeat."
+                           and background alike — and their external side effects may remain. The empty tool results above are placeholders, not output. Recent execution may be absent from this conversation. Do not automatically replay interrupted work; inspect current state before continuing."
                         .to_owned(),
                 }],
             });
@@ -1641,7 +1632,7 @@ impl Agent {
         }
         self.execs
             .retain(|id, exec| !delivered.contains(id) || !exec.session.done());
-        self.acknowledge_streams(now, &delivered).await;
+        self.acknowledge_streams(&delivered);
         self.session.request(InferenceRequest {
             instructions,
             input: self.provider_input(),

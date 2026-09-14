@@ -4,7 +4,7 @@
 use rho_core::{ContextBlock, PendingInferenceResponse, UnixMs};
 use senax_encoder::{Decode, Encode};
 
-use crate::{ContextChange, PythonStreamEvent, WakeFacts};
+use crate::{ContextChange, WakeFacts};
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum NativeEvent {
@@ -26,10 +26,6 @@ pub enum NativeEvent {
         partial: PendingInferenceResponse,
         error: String,
         retrying: bool,
-        at: UnixMs,
-    },
-    PythonStream {
-        event: PythonStreamEvent,
         at: UnixMs,
     },
 }

@@ -3470,7 +3470,6 @@ fn agent_detail(
                     })
                     .collect(),
             ),
-            NativeEvent::PythonStream { .. } => DetailBody::Nothing,
         };
     }
     match event {
