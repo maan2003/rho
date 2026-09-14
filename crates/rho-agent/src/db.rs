@@ -11,7 +11,7 @@ use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
 use rho_core::UnixMs;
 use rho_db::{ReadTxn, Sen, SenValue, WriteTxn};
-use rho_fs_view::Place;
+use rho_fs_view::{Place, WorksetMode};
 use rho_inference::PromptCacheKey;
 pub(crate) use rho_inference::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 pub use rho_ui_proto::mirror::{AgentWant, PresentationField, Seq, TurnEdge, TurnOutcome};
@@ -885,6 +885,8 @@ pub(crate) trait AgentProfileWriteTxnExt {
     );
 
     fn set_agent_profile(&mut self, agent_id: AgentId, role: AgentRole, binding: SessionBinding);
+    /// The agent sees the filesystem in `mode` from its next load on.
+    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode);
 }
 
 impl AgentProfileWriteTxnExt for WriteTxn {
@@ -929,6 +931,16 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             &AgentEvent::RoleChanged {
                 role,
                 binding: Some(binding),
+                at: UnixMillis::now(),
+            },
+        );
+    }
+
+    fn set_agent_mode(&mut self, agent_id: AgentId, mode: WorksetMode) {
+        self.append_agent_event(
+            agent_id,
+            &AgentEvent::ModeChanged {
+                mode,
                 at: UnixMillis::now(),
             },
         );
@@ -1630,6 +1642,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
         | AgentEvent::Failed { .. }
         | AgentEvent::Created { .. }
         | AgentEvent::RoleChanged { .. }
+        | AgentEvent::ModeChanged { .. }
         | AgentEvent::Notice { .. }
         | AgentEvent::RuntimeRebound { .. } => 0,
     }
@@ -1709,6 +1722,7 @@ fn fold_agent_head(head: &mut AgentHead, event: &AgentEvent<'_>) {
                 head.config.binding = *binding;
             }
         }
+        AgentEvent::ModeChanged { mode, .. } => head.config.place.mode = *mode,
         // An empty notice is nothing to say (what the old `WorkdirAdded`
         // rows became).
         AgentEvent::Notice { text, .. } => {

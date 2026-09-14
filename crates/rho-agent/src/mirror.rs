@@ -285,6 +285,10 @@ pub fn strip(event: &AgentEvent<'_>) -> Option<MirrorEvent> {
             }),
             at: *at,
         },
+        AgentEvent::ModeChanged { mode, at } => MirrorEvent::ModeChanged {
+            mode: *mode,
+            at: *at,
+        },
         AgentEvent::Notice { text, at } => MirrorEvent::Notice {
             text: text.to_string(),
             at: *at,

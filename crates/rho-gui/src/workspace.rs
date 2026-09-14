@@ -2927,6 +2927,73 @@ impl Workspace {
         );
     }
 
+    pub(crate) fn cmd_change_agent_mode(
+        &mut self,
+        mode: rho_ui_proto::WorksetMode,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent_id) = self.subject_agent_or_notice("change-filesystem", window, cx) else {
+            return;
+        };
+        if !self.require_agent_online(agent_id, cx) {
+            return;
+        }
+        self.send_to_agent(agent_id, ClientMessage::ChangeAgentMode { agent_id, mode });
+        self.notice_on(
+            Some(&agent_id),
+            &format!(
+                "filesystem set to {}: the agent restarts in it, and its notebook starts over",
+                mode_label(mode)
+            ),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    /// `space a f`: which filesystem the agent works in, `view` or
+    /// `exposed`. The current one is named in the prompt.
+    pub(crate) fn prompt_change_agent_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.subject_agent_or_notice("change-filesystem", window, cx) else {
+            return;
+        };
+        let current = self
+            .registry
+            .agent_place(agent_id)
+            .map(|place| place.mode)
+            .unwrap_or_default();
+        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_ascii_lowercase();
+            crate::commands::filesystem_field_candidates("")
+                .into_iter()
+                .filter(|candidate| candidate.value.contains(&needle))
+                .map(|mut candidate| {
+                    if candidate.value == mode_label(current) {
+                        candidate.description = format!("{} (now)", candidate.description);
+                    }
+                    candidate
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                match parse_workset_mode(&input) {
+                    Ok(mode) => workspace.cmd_change_agent_mode(mode, window, cx),
+                    Err(message) => workspace.notice_on(
+                        None,
+                        &format!("change-filesystem: {message}"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    ),
+                }
+            },
+        );
+        self.open_prompt("filesystem:", complete, on_submit, window, cx);
+    }
+
     pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.subject_agent_or_notice("change-role", window, cx) else {
             return;
@@ -6847,6 +6914,7 @@ impl Workspace {
             Command::Version => self.cmd_version(cx),
             Command::AgentCancel => self.cmd_agent_cancel(window, cx),
             Command::AgentRole => self.prompt_change_agent_role(window, cx),
+            Command::AgentMode => self.prompt_change_agent_mode(window, cx),
             Command::VerdictName => self.cmd_verdict_name(window, cx),
             Command::AgentCompact => self.cmd_compact(window, cx),
             Command::AgentRewind => self.cmd_rewind(1, window, cx),
@@ -8808,6 +8876,14 @@ pub(crate) fn resolve_filing_destination(
         })
         .nth(occurrence)
         .map(|(_, _, host, node_id)| (*host, node_id.clone()))
+}
+
+/// How a filesystem mode reads in a prompt: the draft field's words.
+fn mode_label(mode: rho_ui_proto::WorksetMode) -> &'static str {
+    match mode {
+        rho_ui_proto::WorksetMode::View => "view",
+        rho_ui_proto::WorksetMode::Exposed => "exposed",
+    }
 }
 
 /// How a role reads in the chips a transcript shows. Only the tests ask

@@ -515,6 +515,42 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
 }
 
 #[tokio::test]
+async fn a_mode_change_folds_into_the_agents_place() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        None,
+        test_workspace(),
+        AgentRole::default(),
+        AgentRole::default().session_profile().unwrap(),
+        test_agent_runtime(),
+        None,
+    );
+    write.commit();
+    let before = db.read().get_agent(agent_id).config.place.clone();
+    assert_eq!(before.mode, WorksetMode::View);
+
+    let mut write = db.write().await;
+    write.set_agent_mode(agent_id, WorksetMode::Exposed);
+    write.commit();
+    let after = db.read().get_agent(agent_id).config.place.clone();
+    assert_eq!(after.mode, WorksetMode::Exposed);
+    // Only the mode moved: the workset and directory are the same place.
+    assert_eq!(
+        Place {
+            mode: WorksetMode::View,
+            ..after
+        },
+        before
+    );
+}
+
+#[tokio::test]
 async fn agent_spawned_by_is_stored_at_creation() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

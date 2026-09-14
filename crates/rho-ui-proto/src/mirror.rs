@@ -13,7 +13,7 @@ use camino::Utf8PathBuf;
 use rho_core::{AgentId, AgentRole, MessageDelivery, UnixMs};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 
-use crate::Place;
+use crate::{Place, WorksetMode};
 
 /// A position in one agent's log: dense, starting at zero with the
 /// agent's creation, never reused. A rewind is told at a new position
@@ -198,6 +198,11 @@ pub enum MirrorEvent {
         model: Option<String>,
         at: UnixMs,
     },
+    /// The agent sees the filesystem this way from here on.
+    ModeChanged {
+        mode: WorksetMode,
+        at: UnixMs,
+    },
     /// Something Rho has to tell the agent, carried by its next user
     /// message: what a migration did to its place, say.
     Notice {
@@ -289,6 +294,7 @@ impl MirrorEvent {
         match self {
             Self::Created { at, .. }
             | Self::RoleChanged { at, .. }
+            | Self::ModeChanged { at, .. }
             | Self::Notice { at, .. }
             | Self::Message { at, .. }
             | Self::CompactionRequested { at }

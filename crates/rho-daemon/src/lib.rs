@@ -2583,6 +2583,12 @@ async fn handle_message(
             agent.change_role(role).await?;
             Ok(Refresh::Ready)
         }
+        ClientMessage::ChangeAgentMode { agent_id, mode } => {
+            services.pool.change_mode(agent_id, mode).await?;
+            // Back at once, in the new view, for whoever is looking.
+            services.load(agent_id).await?;
+            Ok(Refresh::Ready)
+        }
         ClientMessage::ChangePromptCacheKey { agent_id } => {
             let (_, agent, _) = services.load(agent_id).await?;
             agent.change_prompt_cache_key()?;

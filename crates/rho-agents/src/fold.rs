@@ -215,6 +215,7 @@ impl Digest {
             | MirrorEvent::ClaudeMessage { .. }
             | MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
+            | MirrorEvent::ModeChanged { .. }
             | MirrorEvent::Notice { .. }
             | MirrorEvent::CompactionRequested { .. }
             | MirrorEvent::QueueCleared { .. }
@@ -309,6 +310,9 @@ impl MirroredAgent {
             if let Some(model) = model {
                 self.identity.model = model.clone();
             }
+        }
+        if let MirrorEvent::ModeChanged { mode, .. } = event {
+            self.identity.place.mode = *mode;
         }
         true
     }
@@ -649,6 +653,7 @@ impl TranscriptFold {
             }
             MirrorEvent::Created { .. }
             | MirrorEvent::RoleChanged { .. }
+            | MirrorEvent::ModeChanged { .. }
             | MirrorEvent::Notice { .. }
             | MirrorEvent::Presented { .. }
             | MirrorEvent::Wants { .. } => {}
@@ -1269,5 +1274,18 @@ mod tests {
             }
         ));
         assert_eq!(mirrored.digest.wants, None);
+        // A mode change is the identity's place moving, and nothing else.
+        assert!(mirrored.tell(
+            AgentPos(6),
+            &MirrorEvent::ModeChanged {
+                mode: rho_ui_proto::WorksetMode::Exposed,
+                at: UnixMs(15),
+            }
+        ));
+        assert_eq!(
+            mirrored.identity.place.mode,
+            rho_ui_proto::WorksetMode::Exposed
+        );
+        assert_eq!(mirrored.identity.place.cwd, test_place().cwd);
     }
 }

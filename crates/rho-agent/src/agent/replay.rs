@@ -148,6 +148,7 @@ pub(crate) fn replay(events: Vec<AgentEvent<'static>>) -> Replayed {
             | AgentEvent::Wants { .. }
             | AgentEvent::Rewound { .. }
             | AgentEvent::Failed { .. }
+            | AgentEvent::ModeChanged { .. }
             | AgentEvent::Notice { .. }
             | AgentEvent::RuntimeRebound { .. } => {}
         }

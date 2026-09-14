@@ -17,11 +17,12 @@ use tokio::sync::{Mutex, broadcast};
 use crate::agent::AgentHandle;
 use crate::claude::ClaudeAgent;
 use crate::db::{
-    AGENT_USAGE_BUCKET_MS, AgentId, AgentReadTxnExt as _, AgentRole, AgentRoleSessionProfile as _,
-    AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _, EngineerIntelligence, SessionBinding,
+    AGENT_USAGE_BUCKET_MS, AgentId, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRole,
+    AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
+    EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, Place, StartPlace, View};
+use crate::{AgentStatus, MessageDelivery, Place, StartPlace, View, WorksetMode};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -674,6 +675,48 @@ impl AgentPool {
                 pool.materialize_view(&place).await
             }
         }))
+    }
+
+    /// Changes how the agent sees the filesystem. The agent has to be
+    /// settled: its loop is ended (a namespace is entered per view, and
+    /// the notebook thread and shells live in the old one), the change is
+    /// written, and the next load enters the same directory in the new
+    /// mode. Nothing to do when the mode is already that.
+    pub async fn change_mode(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        mode: WorksetMode,
+    ) -> anyhow::Result<()> {
+        let load_lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _loading = load_lock.lock().await;
+        let mut agents = self.agents.lock().await;
+        if let Some(agent) = agents.get(&agent_id) {
+            anyhow::ensure!(
+                agent.settled(),
+                "the filesystem mode cannot change while work is running; cancel the turn first"
+            );
+        }
+        let record = self.db.read().get_agent(agent_id);
+        if record.place().mode == mode {
+            return Ok(());
+        }
+        // Dropping the last handle ends the loop; a client looking at the
+        // agent gets it back on its next load.
+        agents.remove(&agent_id);
+        self.recent
+            .lock()
+            .expect("poison")
+            .retain(|id| *id != agent_id);
+        let mut write = self.db.write().await;
+        write.set_agent_mode(agent_id, mode);
+        write.commit();
+        Ok(())
     }
 
     /// Loads a persisted agent if it is not already running. The returned

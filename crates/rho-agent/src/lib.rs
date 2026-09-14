@@ -181,6 +181,13 @@ pub enum AgentEvent<'a> {
         #[senax(default)]
         at: UnixMs,
     },
+    /// The agent now sees the filesystem this way: the same workset and
+    /// directory, entered in the other mode at its next load.
+    ModeChanged {
+        mode: WorksetMode,
+        #[senax(default)]
+        at: UnixMs,
+    },
     /// Something Rho has to tell the agent, carried ahead of its next user
     /// message and then done: what a migration did to its place, say.
     Notice {
@@ -743,6 +750,7 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Failed { .. }
             | AgentEvent::Created { .. }
             | AgentEvent::RoleChanged { .. }
+            | AgentEvent::ModeChanged { .. }
             | AgentEvent::Notice { .. }
             | AgentEvent::RuntimeRebound { .. } => None,
         })
@@ -832,6 +840,10 @@ mod encoding_tests {
                 at: UnixMs(15),
             },
             AgentEvent::QueueCleared,
+            AgentEvent::ModeChanged {
+                mode: WorksetMode::Exposed,
+                at: UnixMs(16),
+            },
             AgentEvent::Transcript {
                 uuid: uuid::uuid!("00000000-0000-4000-8000-000000000002"),
                 line: TranscriptLine::Assistant {

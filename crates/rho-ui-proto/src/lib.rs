@@ -182,6 +182,12 @@ pub enum ClientMessage {
         agent_id: AgentId,
         role: AgentRole,
     },
+    /// How the agent sees the filesystem from now on. Its loop restarts
+    /// in the new view, so the Python notebook's state is lost.
+    ChangeAgentMode {
+        agent_id: AgentId,
+        mode: WorksetMode,
+    },
     CancelTurn {
         agent_id: AgentId,
     },
