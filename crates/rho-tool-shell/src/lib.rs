@@ -215,6 +215,8 @@ struct ProcessManager {
 
 #[derive(Debug)]
 struct ProcessSession {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    output_tasks: Vec<tokio::task::JoinHandle<io::Result<()>>>,
     stdin: Option<tokio::process::ChildStdin>,
     wait_task: tokio::task::JoinHandle<io::Result<std::process::ExitStatus>>,
     status: Option<std::process::ExitStatus>,
@@ -250,6 +252,33 @@ pub enum ProcessEvent {
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
 
 impl SpawnedProcess {
+    /// Stop and reap this owned child while the executor is still alive.
+    /// This does not contain or terminate arbitrary descendants.
+    pub async fn terminate(&mut self) -> io::Result<()> {
+        if let Some(stop) = self.session.stop.take() {
+            let _ = stop.send(());
+        }
+        let result = if self.session.status.is_none() {
+            match (&mut self.session.wait_task).await {
+                Ok(Ok(status)) => {
+                    self.session.status = Some(status);
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(io::Error::other(error)),
+            }
+        } else {
+            Ok(())
+        };
+        for task in &self.session.output_tasks {
+            task.abort();
+        }
+        for task in self.session.output_tasks.drain(..) {
+            let _ = task.await;
+        }
+        result
+    }
+
     /// The next thing that happens. After `Closed` or `Failed`, keeps
     /// returning `Closed`.
     pub async fn next(&mut self) -> ProcessEvent {
@@ -316,6 +345,9 @@ impl Drop for ProcessSession {
         // Cancelling the waiter drops its `Child`; `kill_on_drop` terminates a
         // live command and Tokio's orphan queue takes responsibility for reap.
         self.wait_task.abort();
+        for task in &self.output_tasks {
+            task.abort();
+        }
     }
 }
 
@@ -634,6 +666,21 @@ impl ShellTools {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "linux")]
+        {
+            let parent = rustix::process::getpid();
+            unsafe {
+                command.pre_exec(move || {
+                    rustix::process::set_parent_process_death_signal(Some(
+                        rustix::process::Signal::KILL,
+                    ))?;
+                    if rustix::process::getppid() != Some(parent) {
+                        return Err(io::Error::other("command owner exited during spawn"));
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -651,10 +698,19 @@ impl ShellTools {
         let stdout_task = tokio::spawn(read_output_chunks(stdout, output_tx.clone()));
         let stderr_task = tokio::spawn(read_output_chunks(stderr, output_tx));
 
-        drop(stdout_task);
-        drop(stderr_task);
-        let wait_task = tokio::spawn(async move { child.wait().await });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let wait_task = tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => status,
+                _ = stopped => {
+                    child.start_kill()?;
+                    child.wait().await
+                }
+            }
+        });
         Ok(ProcessSession {
+            stop: Some(stop),
+            output_tasks: vec![stdout_task, stderr_task],
             stdin: Some(stdin),
             wait_task,
             status: None,

@@ -315,7 +315,7 @@
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
             };
-            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo";
+            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-agent -p rho-shell -p git-remote-octo";
             extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. The patched noq crates are dependencies of iroh,

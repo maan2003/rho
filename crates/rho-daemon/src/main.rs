@@ -10,9 +10,6 @@ struct Args {
 fn main() {
     let args = Args::parse();
     init_tracing();
-    // SAFETY: top of main — no threads exist yet and nothing has captured
-    // pre-namespace state.
-    unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
     rho_daemon::configure_embedded_environment();
     let mut daemon_args = args.daemon;
     let result = (|| {

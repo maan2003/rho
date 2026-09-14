@@ -23,6 +23,10 @@ pub struct Inference(Arc<Inner>);
 /// route observations; it never opens the account database or starts pollers.
 pub trait InferenceHost: std::fmt::Debug + Send + Sync {
     fn select(&self) -> BoxFuture<'_, anyhow::Result<SelectedAuth>>;
+    fn resolve_auth(
+        &self,
+        auth: InferenceAuth,
+    ) -> BoxFuture<'_, anyhow::Result<crate::ResolvedAuth>>;
     fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool>;
     fn observe_quota(&self, selected: SelectedAuth, quota: QuotaUpdate) -> BoxFuture<'_, ()>;
     fn route_updates(&self) -> watch::Receiver<RouteSelection>;
@@ -214,6 +218,15 @@ impl Inference {
         Ok(self.select().await?.auth)
     }
 
+    /// Resolve/refresh credentials in the daemon's filesystem context, even
+    /// when the requesting provider transport lives in a pivoted workset.
+    pub async fn resolve_auth(&self, auth: InferenceAuth) -> anyhow::Result<crate::ResolvedAuth> {
+        if let Backend::Host(host) = &self.0.backend {
+            return host.resolve_auth(auth).await;
+        }
+        Ok(tokio::task::spawn_blocking(move || auth.resolve()).await??)
+    }
+
     pub async fn select(&self) -> anyhow::Result<SelectedAuth> {
         match &self.0.backend {
             Backend::Daemon { accounts, .. } => accounts.select().await,
@@ -327,6 +340,19 @@ mod host_tests {
                 Ok(self.selected.clone())
             })
         }
+        fn resolve_auth(
+            &self,
+            _auth: InferenceAuth,
+        ) -> BoxFuture<'_, anyhow::Result<crate::ResolvedAuth>> {
+            Box::pin(async {
+                self.calls.lock().unwrap().push("resolve");
+                Ok(crate::ResolvedAuth {
+                    bearer_token: "test".into(),
+                    account_id: None,
+                    client_secret: [0; 32],
+                })
+            })
+        }
         fn mark_rate_limited(&self, selected: SelectedAuth) -> BoxFuture<'_, bool> {
             Box::pin(async move {
                 assert_eq!(selected, self.selected);
@@ -375,6 +401,11 @@ mod host_tests {
         assert!(host.calls.lock().unwrap().is_empty());
         assert_eq!(inference.responses_base_url(), "http://127.0.0.1:1");
         let selected = inference.select().await.unwrap();
+        let resolved = inference.resolve_auth(selected.auth.clone()).await.unwrap();
+        assert_eq!(
+            resolved.bearer_token, "test",
+            "worker tried to read the nonexistent OAuth file"
+        );
         let quota = QuotaUpdate {
             weekly_used_percent: 17,
             weekly_reset_at_unix: Some(123),
@@ -396,7 +427,7 @@ mod host_tests {
         );
         assert_eq!(
             *host.calls.lock().unwrap(),
-            vec!["select", "quota", "rate-limit", "route-failure"]
+            vec!["select", "resolve", "quota", "rate-limit", "route-failure"]
         );
     }
 }

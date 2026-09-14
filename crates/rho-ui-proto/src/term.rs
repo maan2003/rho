@@ -1,11 +1,11 @@
-//! Wire vocabulary for daemon-owned terminals.
+//! Wire vocabulary for workset-owned terminals.
 //!
 //! A terminal stream is dedicated by a [`crate::ClientMessage::TerminalOpen`]
 //! first frame (like workspace file channels); after the
 //! [`crate::ServerMessage::TerminalOpened`] handshake the stream carries senax
 //! frames of [`TermClientFrame`] and [`TermServerFrame`].
 //!
-//! The protocol is deliberately dumb on the client side: the daemon owns the
+//! The protocol is deliberately dumb on the client side: the workset owns the
 //! only terminal emulator, and the wire carries *display state* — cell rows,
 //! cursor, title — never escape sequences. Clients render rows and send input;
 //! they answer no terminal queries and track no modes.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::db::{AgentRole, AgentSpawnedBy};
-use crate::multi_agent_tools::MultiAgentTools;
+use crate::multi_agent_tools::Team;
 
 const BASE_PROMPT: &str = "You are Rho, an autonomous coding agent. You and the user \
 share one workspace. Deliver the full outcome they ask for. Read the codebase before changing \
@@ -395,7 +395,7 @@ text](file:///absolute/path#L10-L20)` — never paste a raw `file://` URL as vis
 /// notebook, and `host_specs` are the functions it exposes.
 pub fn prompt(
     view: &crate::View,
-    multi_agent: Option<&MultiAgentTools>,
+    multi_agent: Option<&Team>,
     role: AgentRole,
     host_specs: &[rho_core::ToolSpec],
 ) -> Arc<str> {
@@ -412,14 +412,14 @@ pub fn prompt(
         )
     };
     let team_context = multi_agent.map_or_else(String::new, |tools| {
-        let agent_id = tools.display_id(tools.self_id());
-        let identity = match tools.parent() {
+        let agent_id = &tools.agent;
+        let identity = match tools.parent.as_ref() {
             Some(parent) => format!(
                 "You are an agent in a team of agents collaborating to complete a task. Your \
                  agent id is {agent_id}; your parent agent is {}.\n\nMessages from your \
                  parent define your task. When you provide a final response, that content is \
                  mailed back to your parent automatically.",
-                tools.display_id(parent)
+                parent
             ),
             None => format!(
                 "You are the primary agent in a team of agents collaborating to fulfill the \
@@ -439,7 +439,7 @@ agent and the idle mechanism described above when blocked on a reply.
 "
             );
         }
-        let ownership = match tools.spawned_by() {
+        let ownership = match tools.spawned_by {
             AgentSpawnedBy::Direct => {
                 "You were started directly and own the user's technical outcome."
             }
@@ -492,21 +492,20 @@ request.
 /// agent runs with Claude's own tools.
 pub fn claude_prompt(
     view: Option<&crate::View>,
-    multi_agent: Option<&MultiAgentTools>,
+    multi_agent: Option<&Team>,
     role: AgentRole,
     python_hosts: Option<&[rho_core::ToolSpec]>,
 ) -> Arc<str> {
     let team = multi_agent.map_or_else(String::new, |tools| {
-        let identity = match tools.parent() {
+        let identity = match tools.parent.as_ref() {
             Some(parent) => format!(
                 "Your Rho agent id is {}; your parent agent is {}. Your final response is mailed \
                  to your parent automatically.",
-                tools.display_id(tools.self_id()),
-                tools.display_id(parent),
+                &tools.agent, parent,
             ),
             None => format!(
                 "You are the primary Rho agent. Your agent id is {}.",
-                tools.display_id(tools.self_id())
+                &tools.agent
             ),
         };
         format!("## Rho Team Context\n\n{identity}\n\n")
@@ -565,7 +564,7 @@ struct WorksetPrompt {
 }
 
 impl WorksetPrompt {
-    fn of(view: &crate::View, multi_agent: Option<&MultiAgentTools>) -> Self {
+    fn of(view: &crate::View, multi_agent: Option<&Team>) -> Self {
         let git = view
             .context_roots()
             .map(|(_, host_root)| host_root.join(".git").exists())
@@ -575,7 +574,7 @@ impl WorksetPrompt {
             cwd: view.cwd().to_string(),
             git,
             view: matches!(view.mode(), rho_fs_view::Mode::View { .. }),
-            spawned: multi_agent.is_some_and(|tools| tools.parent().is_some()),
+            spawned: multi_agent.is_some_and(|tools| tools.parent.as_ref().is_some()),
         }
     }
 }

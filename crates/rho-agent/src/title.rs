@@ -36,13 +36,22 @@ impl Task {
             task: None,
         }
     }
-    pub(crate) async fn start(
+    pub(crate) async fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    pub(crate) async fn start<F>(
         &mut self,
         db: &RhoDb,
         agent_id: AgentId,
         current_input: &str,
-        deliver: impl FnOnce(Result<String, String>) + Send + 'static,
-    ) {
+        deliver: impl FnOnce(Result<String, String>) -> F + Send + 'static,
+    ) where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let head = db.read().get_agent(agent_id);
         if head.title_attempted || head.title().is_some() {
             return;
@@ -83,7 +92,8 @@ impl Task {
             deliver(match result {
                 Ok(result) => result.map_err(|error| format!("{error:#}")),
                 Err(_) => Err("title request timed out".into()),
-            });
+            })
+            .await;
         }));
     }
 }
@@ -224,7 +234,7 @@ mod tests {
             .await
             .unwrap();
             let mut task = Task::new(inference.clone());
-            task.start(&db, agent, "not the first message", |_| {
+            task.start(&db, agent, "not the first message", |_| async {
                 panic!("cancelled naming ran")
             })
             .await;
@@ -237,7 +247,7 @@ mod tests {
             write.rewind_agent(UnixMs(2), agent, first);
             write.commit();
             let mut task = Task::new(inference);
-            task.start(&db, agent, "new task after rewind", |_| {
+            task.start(&db, agent, "new task after rewind", |_| async {
                 panic!("naming retried")
             })
             .await;

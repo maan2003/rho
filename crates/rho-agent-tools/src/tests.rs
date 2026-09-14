@@ -1085,3 +1085,60 @@ async fn output_is_leased_until_its_owner_acknowledges_it() {
     assert!(cell.done());
     assert_eq!(cell.more_output(), None);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn shutdown_reaps_owned_commands_and_stops_host_calls_before_returning() {
+    let directory = tempfile::tempdir().unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tool = python(
+        shell_in(&directory),
+        vec![Arc::new(PendingTool(count.clone()))],
+    );
+    let wake = Arc::new(Notify::new());
+    let _cell = tool.exec(
+        call(
+            "shutdown",
+            json!("job = command('echo $$ > owned-pid; exec sleep 60')\npending()"),
+        ),
+        SourceWaker::new(wake.clone()),
+    );
+    let path = directory.path().join("owned-pid");
+    let pid: u32 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if count.load(std::sync::atomic::Ordering::SeqCst) == 1
+                && let Ok(pid) = std::fs::read_to_string(&path)
+                && let Ok(pid) = pid.trim().parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), tool.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "owned child was not reaped"
+    );
+    let mut rejected = tool.exec(
+        call(
+            "after-shutdown",
+            json!("Path('wrong').write_text('must not run')"),
+        ),
+        SourceWaker::new(wake),
+    );
+    assert!(
+        rejected
+            .first_output()
+            .output
+            .contains("Python notebook closed")
+    );
+    assert!(!directory.path().join("wrong").exists());
+    tool.shutdown().await.unwrap();
+}

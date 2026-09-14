@@ -85,6 +85,15 @@ impl Drained {
 }
 
 impl PythonHost {
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.cancel(UnixMs::now());
+        self.tool.shutdown().await.map_err(anyhow::Error::msg)?;
+        self.cells.clear();
+        self.pending = None;
+        self.latest = None;
+        Ok(())
+    }
+
     pub(crate) fn new(tool: PythonNotebook, host_specs: Vec<ToolSpec>) -> Self {
         Self {
             tool,

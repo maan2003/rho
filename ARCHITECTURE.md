@@ -1,7 +1,50 @@
 # rho architecture
 
-`rho` is a Rust-local toolkit for building AI agents by composing crates rather
-than by running a supervisor, extension protocol, or daemon process graph.
+`rho` composes concrete Rust runtimes around a daemon-owned shared store.
+One `rho-agent-worker` process owns execution for each active workset. The daemon
+owns allocation, shared services, and supervision; agents, notebooks, jobs,
+terminals, and interactive shells live in that workset process.
+
+## Workset execution boundary
+
+The companion is installed with the CLI and daemon and resolved beside the
+executable or on PATH. There is no in-daemon execution fallback. Before starting
+Tokio or Python, it builds and enters one workset filesystem namespace. Normal
+runtimes, notebook threads, terminals, and commands inherit that namespace.
+Notebook threads detach only their filesystem attributes, so `chdir` is local
+without constructing another mount namespace. Claude alone clones the namespace
+in its launcher child and installs private account, projects, prompt, and settings
+overlays using precomputed syscall-only operations before exec.
+
+Exactly one private Unix socketpair carries agent, workset, terminal, and shell
+traffic. Agent IDs and client ports route messages; connection-wide request IDs
+correlate replies. Bounded Senax fragments preserve logical messages and atomic
+domain operations; per-port FIFO and fair scheduling prevent bulk traffic from
+monopolizing the writer. Readers route without awaiting runtime progress.
+The control descriptor is close-on-exec and separated from stdin before threads
+start. Stdout and stderr remain diagnostics.
+
+The daemon alone opens the canonical database and owns account/quota/route
+policy, credential refresh, and naming. Completion publication queues delivery
+without awaiting recipient acceptance, so reciprocal subscriptions cannot stall
+serialized runtime loops. Explicit accepted-delivery APIs remain awaitable.
+An uncertain persistence result terminates the runtime rather than retrying a
+possibly committed mutation.
+
+Agent activation and retirement serialize under a cancellation-safe per-agent
+lock. Retirement requires permission from the runtime's serialized boundary,
+not coalesced UI status, and drains owned work and daemon handlers before reusing
+the ID. A stuck retirement kills and reaps the workset process. Agent unload
+and GUI detach do not close retained workset terminals or shells.
+
+Mode is workset-wide. Changing it requires settled agents and no live terminal
+or shell, excludes new admission, drains all loaded agents, stops the process,
+and updates all workset heads atomically. Legacy mixed-mode worksets require an
+explicit choice. Workset death loses every local interpreter and session; a
+later load restores canonical conversation only, never execution or jobs.
+Normal shutdown drains owned children with a bounded forced-stop fallback.
+Crashes can leave OS descendants and external effects behind: this is not a
+security, resource-isolation, or rollback boundary.
 
 ## Crate layering
 
@@ -13,14 +56,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
 - `rho-inference` translates `rho-core` requests and provider events, and its
   daemon-wide `Inference` handle owns the complete ChatGPT runtime: persisted
   enabled-account settings and current selection, quota polling/history,
-  automatic account routing, and session creation. `Inference::new` opens that
+  automatic account routing, and policy for session creation. `Inference::new` opens that
   state from `RhoDb`. `Inference::new_with_config` can instead point
   Responses sessions at an isolated provider; production defaults are
   unchanged and the ChatGPT-only quota poller is suppressed. The private account manager makes selection decisions only
   when settings, quota, or rate-limit facts change; each new request snapshots
   the existing choice. Ordinary retries retain that choice and only explicit
   rate-limit failover replaces it. The
-  daemon only projects safe settings/quota DTOs and merges Claude presentation.
+  worker's `Inference::from_host` owns provider transport but obtains account and
+  route policy through IPC, without another database or policy poller. The
+  daemon projects safe settings/quota DTOs and merges Claude presentation.
   ChatGPT quota observations are attributed to that daemon-local namespace;
   `Inference` polls every enabled configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.
@@ -28,7 +73,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. Loading restores that logical state cheaply; the
   workspace-backed execution context (view, prompt, and tools) initializes
-  lazily at first inference. It depends directly on the concrete
+  lazily at first inference. Both native and Claude loops, their notebooks, local
+  tools, and managed jobs live in the worker. Only collaboration, papercuts,
+  persistence, and global policy use daemon services. Naming tasks and their
+  concurrency limit also belong to the daemon. It depends directly on the concrete
   `rho-inference` session. Native and Claude runtimes make one bounded,
   text-only naming attempt from the first user/task message, committing the
   attempt before dispatch and preserving existing names. Viewing, restart, and
@@ -71,11 +119,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   they are fast and start on the remote's current state, and the `git` in
   an agent's view is the store's client. Children join their parent's
   workset, in the parent's directory; a parent that wants them in a
-  checkout of their own makes a worktree first. A `Namespace` is one agent's view: a mount namespace
-  built lazily on the first command, in view mode (a generated tmpfs root
-  with the workset at `/src`) or exposed mode (the host, with the workset
-  mounted over its `/src` stub); tests and evaluations adopt a directory
-  and use the same namespaces. Live-diff semantic
+  checkout of their own makes a worktree first. `Namespace` describes paths,
+  environment, and cwd inside the inherited workset view; it does not own an
+  agent-local OS namespace. `WorksetLayout` builds the startup mount namespace:
+  view mode uses a generated tmpfs root, exposed mode the host with the workset
+  mounted over `/src`. Tests and standalone runners enter through the same
+  single-threaded startup path. Live-diff semantic
   barriers take the workset's operation lock; the git-based snapshot
   behind them is not implemented yet (`Workset::diff_snapshot` is a
   TODO and fails cleanly). Records written before worksets name
@@ -366,7 +415,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rho-agent` assembles it as a built-in tool and supplies the configured model,
   recent transcript, and output budget; the tool resolves the same ChatGPT
   OAuth credentials as inference and calls the first-party search endpoint.
-- `rho-python` owns an in-process RustPython notebook on one dedicated thread.
+- `rho-python` owns a RustPython notebook on one dedicated thread inside the
+  agent worker, not the daemon.
   Each submitted execution carries a shared Rust host handle. Registration,
   output, execution lifecycle, and patience callbacks update that handle
   synchronously before Python continues; no Python object crosses threads.
@@ -577,9 +627,9 @@ parked-agent attention, so an unloaded pending agent remains pending.
 The native GUI initially subscribes its retained selection and up to ten
 recently active visible top-level agents. It then
 keeps a generous 128-entry transcript LRU; opening another agent beyond that
-bound releases the least recently viewed subscription. The daemon confirms a
-released or idle-evicted stream with `AgentUnloaded`, and only that server
-notice changes retained transcript status to `UiAgentStatus::Unloaded`.
+bound releases the least recently viewed subscription. Canonical journal updates
+and disposable `Live` observations are separate from workset execution lifetime;
+releasing a transcript subscription does not close its workset sessions.
 Unix sessions multiplex control and subscribed agent state on one byte stream.
 Native iroh sessions keep commands and lifecycle events on a high-priority
 bidirectional control stream (exactly one per physical connection); the daemon

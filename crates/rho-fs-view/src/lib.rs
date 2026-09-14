@@ -25,7 +25,7 @@ mod ns;
 pub mod layout;
 
 pub use layout::*;
-pub use ns::{ClaudeHome, MAX_BOUNDED_READ, Mode, Namespace};
+pub use ns::{MAX_BOUNDED_READ, Mode, Namespace, WorksetLayout};
 pub use rho_git_proto::{SOCKET_ENV, repo_name};
 
 /// The agent's base userland (`VIEW.md`): a nix `buildEnv` fixed at build
@@ -59,16 +59,7 @@ pub use rho_workspaces_types::{
     WorkspaceDiffSnapshot, WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
 
-/// Establishes the identity user namespace required before workset mount
-/// namespaces are created from runtime worker threads.
-///
-/// # Safety
-/// The caller must invoke this before starting any threads.
-pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
-    layout::unshare_identity_user_namespace()
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct PathOverrides {
     pub before: Vec<std::path::PathBuf>,
     pub after: Vec<std::path::PathBuf>,
@@ -132,8 +123,10 @@ impl UserEnvironment {
 /// Whether a state root runs the mirror keeper. Without one, the `git`
 /// agents see is the plain one: clones and fetches go to the network and
 /// nothing is shared.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreService {
+    /// Use the daemon's existing keeper without owning its service.
+    Client(Utf8PathBuf),
     Serve(StoreRefresh),
     None,
 }
@@ -157,7 +150,7 @@ pub struct Worksets {
 /// The running keeper and its socket.
 #[derive(Debug)]
 struct StoreHandle {
-    keeper: Arc<MirrorStore>,
+    keeper: Option<Arc<MirrorStore>>,
     socket: Utf8PathBuf,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -190,6 +183,11 @@ impl Worksets {
             StoreService::Serve(refresh) => {
                 Some(start_store(&root, &environment, &path_overrides, refresh)?)
             }
+            StoreService::Client(socket) => Some(StoreHandle {
+                keeper: None,
+                socket,
+                tasks: Vec::new(),
+            }),
             StoreService::None => None,
         };
         let identity = git_identity(&environment, &path_overrides).await;
@@ -224,6 +222,33 @@ impl Worksets {
             StoreService::Serve(StoreRefresh::default()),
         )
         .await
+    }
+
+    pub fn environment(&self) -> &UserEnvironment {
+        &self.environment
+    }
+
+    pub fn path_overrides(&self) -> &PathOverrides {
+        &self.path_overrides
+    }
+
+    /// Reconstitutes a daemon-owned workset in a worker without allocating
+    /// another identity or directory. The daemon has already resolved its root.
+    pub fn attach(self: &Arc<Self>, id: String, root: Utf8PathBuf) -> anyhow::Result<Workset> {
+        anyhow::ensure!(
+            root.is_absolute() && root.is_dir(),
+            "invalid workset root: {root}"
+        );
+        self.adopted
+            .lock()
+            .expect("poison")
+            .insert(id.clone(), root.clone());
+        Ok(Workset(Arc::new(WorksetInner {
+            id,
+            root,
+            owner: Arc::downgrade(self),
+            operation_lock: Mutex::new(()),
+        })))
     }
 
     pub fn root(&self) -> &Utf8Path {
@@ -480,7 +505,7 @@ fn start_store(
         }
     });
     Ok(StoreHandle {
-        keeper,
+        keeper: Some(keeper),
         socket,
         tasks: vec![serve],
     })
@@ -610,9 +635,9 @@ impl Workset {
             !target.exists(),
             "{target} exists and is not a git repository"
         );
-        let cloned = match &owner.store {
-            Some(store) => {
-                let mirror = store.keeper.ensure(remote_url).await?;
+        let cloned = match owner.store.as_ref().and_then(|store| store.keeper.as_ref()) {
+            Some(keeper) => {
+                let mirror = keeper.ensure(remote_url).await?;
                 let git = rho_git_client::Git::new(GIT);
                 let url = remote_url.to_owned();
                 let dest = target.clone();
@@ -765,6 +790,28 @@ async fn run(mut command: tokio::process::Command, action: &str) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_retains_keeper_endpoint_without_owning_the_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = Utf8PathBuf::from_path_buf(directory.path().join("keeper.sock")).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let worksets = Worksets::open(
+            directory.path(),
+            UserEnvironment::new(std::env::vars_os().collect()),
+            Default::default(),
+            StoreService::Client(socket.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(worksets.store_socket(), Some(socket.clone()));
+        assert!(!worksets.store_environment().is_empty());
+        assert!(worksets.store.as_ref().unwrap().keeper.is_none());
+        drop(worksets);
+        let connection = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let _ = listener.accept().await.unwrap();
+        drop(connection);
+    }
 
     #[test]
     fn visible_paths_stay_below_the_root() {

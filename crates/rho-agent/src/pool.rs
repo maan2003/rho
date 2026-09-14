@@ -14,15 +14,13 @@ use rho_fs_view::{Mode, Workset, Worksets};
 use rho_inference::Inference;
 use tokio::sync::{Mutex, broadcast};
 
-use crate::agent::AgentHandle;
-use crate::claude::ClaudeAgent;
 use crate::db::{
     AGENT_USAGE_BUCKET_MS, AgentId, AgentProfileWriteTxnExt as _, AgentReadTxnExt as _, AgentRole,
     AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWriteTxnExt as _,
     EngineerIntelligence, SessionBinding,
 };
 use crate::lazy::Lazy;
-use crate::{AgentStatus, MessageDelivery, Place, StartPlace, View, WorksetMode};
+use crate::{MessageDelivery, Place, StartPlace, View, WorksetMode};
 
 /// Runaway protection, not policy: children are user-visible agents.
 const MAX_SPAWN_DEPTH: usize = 3;
@@ -33,7 +31,22 @@ const MAX_WORKING_CHILDREN: usize = 20;
 pub const MAX_LOADED: usize = 100;
 const ID_LABEL_HEADROOM: u64 = 200;
 
+struct ResponseNotification {
+    sender: AgentId,
+    recipients: Vec<AgentId>,
+    body: String,
+}
+
+#[derive(Default)]
+struct ExecutionSlot {
+    admission: Arc<tokio::sync::RwLock<()>>,
+    process: Mutex<Option<Arc<crate::worker::Process>>>,
+}
+
 pub struct AgentPool {
+    processes: Mutex<HashMap<String, Arc<ExecutionSlot>>>,
+
+    responses: tokio::sync::mpsc::Sender<ResponseNotification>,
     db: RhoDb,
     inference: Inference,
     /// The worksets agents work in, named by the daemon rather than
@@ -95,7 +108,11 @@ impl AgentPool {
         if let Err(error) = claude.bootstrap(&account) {
             panic!("Claude account {account} could not be prepared: {error:#}");
         }
+        let (responses, mut notifications) =
+            tokio::sync::mpsc::channel::<ResponseNotification>(256);
         let pool = Arc::new(Self {
+            processes: Mutex::new(HashMap::new()),
+            responses,
             db,
             inference: inference.clone(),
             worksets,
@@ -107,6 +124,34 @@ impl AgentPool {
             load_locks: Mutex::new(HashMap::new()),
             created: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
+        });
+        let weak = Arc::downgrade(&pool);
+        tokio::spawn(async move {
+            // Completion publication must not await another serialized actor.
+            // A single daemon-owned consumer preserves notification order, and
+            // never participates in a worker generation's retirement barrier.
+            while let Some(notification) = notifications.recv().await {
+                let Some(pool) = weak.upgrade() else { break };
+                for recipient in notification.recipients {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        pool.deliver_mail(
+                            notification.sender,
+                            recipient,
+                            notification.body.clone(),
+                            MessageDelivery::NextRequest,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        result => eprintln!(
+                            "response notification {:?} -> {:?} was not confirmed: {result:?}",
+                            notification.sender, recipient
+                        ),
+                    }
+                }
+            }
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -125,6 +170,79 @@ impl AgentPool {
     }
 
     /// The worksets agents work in.
+    async fn execution_slot(&self, workset: &str) -> Arc<ExecutionSlot> {
+        self.processes
+            .lock()
+            .await
+            .entry(workset.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    pub async fn execution(
+        self: &Arc<Self>,
+        agent: AgentId,
+    ) -> anyhow::Result<Arc<crate::worker::Process>> {
+        let place = self.db.read().get_agent(agent).config.place;
+        let slot = self.execution_slot(&place.workset).await;
+        let _admission = slot.admission.clone().read_owned().await;
+        let place = self.db.read().get_agent(agent).config.place;
+        let view = self.materialize_view(&place).await?;
+        self.process(&view).await
+    }
+
+    pub async fn executions(&self) -> Vec<Arc<crate::worker::Process>> {
+        let slots = self
+            .processes
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut processes = Vec::new();
+        for slot in slots {
+            if let Some(process) = slot
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .filter(|process| !*process.closed.borrow())
+            {
+                processes.push(process.clone());
+            }
+        }
+        processes
+    }
+
+    pub(crate) async fn process(
+        self: &Arc<Self>,
+        view: &crate::View,
+    ) -> anyhow::Result<Arc<crate::worker::Process>> {
+        anyhow::ensure!(
+            self.db
+                .read()
+                .list_agents()
+                .iter()
+                .filter(|(_, head)| head.place().workset == view.workset_id())
+                .all(|(_, head)| head.place().mode == view.workset_mode()),
+            "workset contains mixed filesystem modes; explicitly select a workset mode first"
+        );
+        let slot = self.execution_slot(view.workset_id()).await;
+        let mut process = slot.process.lock().await;
+        if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
+            anyhow::ensure!(
+                process.mode == view.workset_mode(),
+                "workset mode must be changed before loading this agent"
+            );
+            return Ok(process.clone());
+        }
+        let started =
+            crate::worker::Process::start(self, view, self.claude.clone(), slot.admission.clone())
+                .await?;
+        *process = Some(started.clone());
+        Ok(started)
+    }
+
     pub fn worksets(&self) -> &Arc<Worksets> {
         &self.worksets
     }
@@ -142,26 +260,26 @@ impl AgentPool {
             } else {
                 completed.final_answer.clone()
             },
-        )
-        .await;
+        );
     }
 
     pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
-        self.deliver_response(agent_id, format!("Agent hit an error and stopped: {error}"))
-            .await;
+        self.deliver_response(agent_id, format!("Agent hit an error and stopped: {error}"));
     }
 
-    async fn deliver_response(self: &Arc<Self>, target: AgentId, body: String) {
-        let subscribers = self.db.read().agent_response_subscribers(target);
-        for subscriber in subscribers {
-            let _ = self
-                .deliver_mail(
-                    target,
-                    subscriber,
-                    body.clone(),
-                    MessageDelivery::NextRequest,
-                )
-                .await;
+    fn deliver_response(&self, target: AgentId, body: String) {
+        let recipients = self.db.read().agent_response_subscribers(target);
+        if recipients.is_empty() {
+            return;
+        }
+        // Waiting for capacity would recreate the actor dependency cycle when
+        // the consumer is waiting for a recipient to accept an earlier message.
+        if let Err(error) = self.responses.try_send(ResponseNotification {
+            sender: target,
+            recipients,
+            body,
+        }) {
+            eprintln!("response notification from {target:?} was dropped: {error}");
         }
     }
 
@@ -239,6 +357,14 @@ impl AgentPool {
     }
 
     pub async fn get(&self, agent_id: AgentId) -> Option<RunningAgent> {
+        let lock = self
+            .load_locks
+            .lock()
+            .await
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _loading = lock.lock_owned().await;
         let agent = self.agents.lock().await.get(&agent_id).cloned();
         if agent.is_some() {
             self.touch(agent_id);
@@ -323,10 +449,7 @@ impl AgentPool {
     /// Drop the least recently used loaded agents past [`MAX_LOADED`],
     /// skipping any that is mid-turn, has input waiting, or is being
     /// looked at. Dropping the last handle ends its loop.
-    fn trim(&self, agents: &mut HashMap<AgentId, RunningAgent>) {
-        if agents.len() <= MAX_LOADED {
-            return;
-        }
+    async fn trim(self: &Arc<Self>, limit: usize) {
         let candidates = self
             .recent
             .lock()
@@ -335,21 +458,49 @@ impl AgentPool {
             .copied()
             .collect::<Vec<_>>();
         for agent_id in candidates {
-            if agents.len() <= MAX_LOADED {
+            if self.agents.lock().await.len() <= limit {
                 break;
             }
-            if self.is_live(agent_id) {
-                continue;
-            }
-            let settled = agents.get(&agent_id).is_some_and(RunningAgent::settled);
-            if !settled {
-                continue;
-            }
-            agents.remove(&agent_id);
-            self.recent
-                .lock()
-                .expect("poison")
-                .retain(|id| *id != agent_id);
+            let pool = self.clone();
+            // The task retains the per-ID lock through removal and drain even
+            // if the caller that triggered trimming is cancelled.
+            let _ = tokio::spawn(async move {
+                let lock = pool
+                    .load_locks
+                    .lock()
+                    .await
+                    .entry(agent_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let _loading = lock.lock_owned().await;
+                let agent = {
+                    let agents = pool.agents.lock().await;
+                    if agents.len() <= limit
+                        || pool.is_live(agent_id)
+                        || !agents
+                            .get(&agent_id)
+                            .is_some_and(|agent| agent.settled() && agent.pool_only())
+                    {
+                        return;
+                    }
+                    let candidate = agents.get(&agent_id).expect("checked above").clone();
+                    drop(agents);
+                    if candidate.retire().await.is_err() {
+                        return;
+                    }
+                    let mut agents = pool.agents.lock().await;
+                    let agent = agents
+                        .remove(&agent_id)
+                        .expect("per-agent ownership lock held");
+                    pool.recent
+                        .lock()
+                        .expect("poison")
+                        .retain(|id| *id != agent_id);
+                    agent
+                };
+                agent.shutdown().await;
+            })
+            .await;
         }
     }
 
@@ -370,79 +521,80 @@ impl AgentPool {
         start: StartPlace,
         parent: Option<AgentId>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        let owned_workset = start.owned_workset.clone();
-        match self.create_agent(config, display_name, start, parent).await {
-            Ok(created) => Ok(created),
-            Err(error) => {
-                // A workset made for an agent that never came to be.
-                if let Some(workset) = owned_workset
-                    && let Err(discard) = self.worksets.discard_workset(&workset).await
-                {
-                    eprintln!("rho-agent: discard workset {workset}: {discard:#}");
+        let pool = self.clone();
+        // Admission and its per-ID ownership lock outlive cancellation of
+        // the API caller. Never leave an unregistered worker still draining.
+        tokio::spawn(async move {
+            let slot = pool.execution_slot(&start.place.workset).await;
+            let admission = slot.admission.clone().read_owned().await;
+            anyhow::ensure!(
+                pool.db
+                    .read()
+                    .list_agents()
+                    .iter()
+                    .filter(|(_, head)| head.place().workset == start.place.workset)
+                    .all(|(_, head)| head.place().mode == start.place.mode),
+                "new agents must use the workset's filesystem mode"
+            );
+            let mode = match config.session_profile() {
+                Ok(mode) => mode,
+                Err(error) => {
+                    if let Some(workset) = &start.owned_workset
+                        && let Err(discard) = pool.worksets.discard_workset(workset).await
+                    {
+                        eprintln!("rho-agent: discard workset {workset}: {discard:#}");
+                    }
+                    return Err(error);
                 }
-                Err(error)
+            };
+            let runtime = match mode {
+                SessionBinding::ClaudeFable { .. }
+                | SessionBinding::ClaudeOpus { .. }
+                | SessionBinding::ClaudeAdvisor { .. } => AgentRuntime::Claude {
+                    session_id: uuid::Uuid::new_v4(),
+                },
+                _ => AgentRuntime::Rho {
+                    prompt_cache_key: rho_inference::PromptCacheKey::generate(),
+                },
+            };
+            let StartPlace { view, place, .. } = start;
+            let mut write = pool.db.write().await;
+            let agent_id = write.alloc_agent_id();
+            let lock = pool
+                .load_locks
+                .lock()
+                .await
+                .entry(agent_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone();
+            let loading = lock.lock_owned().await;
+            write.create_agent(
+                rho_core::UnixMs::now(),
+                agent_id,
+                display_name,
+                place,
+                config,
+                mode,
+                runtime,
+                parent,
+            );
+            write.commit();
+            // Once its record commits, the workset belongs to that record,
+            // even if the companion cannot start. Do not discard it on error.
+            let agent = RunningAgent::start(&pool, pool.claude.clone(), agent_id, view).await?;
+            {
+                let mut agents = pool.agents.lock().await;
+                agents.insert(agent_id, agent.clone());
+                pool.touch(agent_id);
+                pool.attach_live(agent_id, &agent);
             }
-        }
-    }
-
-    async fn create_agent(
-        self: &Arc<Self>,
-        config: AgentRole,
-        display_name: Option<String>,
-        start: StartPlace,
-        parent: Option<AgentId>,
-    ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        let mode = config.session_profile()?;
-        let (agent_id, agent) = match mode {
-            SessionBinding::ResponsesGpt55(_)
-            | SessionBinding::ResponsesSol(_)
-            | SessionBinding::ResponsesLuna(_)
-            | SessionBinding::ResponsesTerra(_)
-            | SessionBinding::ResponsesAstraNotes(_)
-            | SessionBinding::ResponsesAstra(_)
-            | SessionBinding::AdvisorSol(_)
-            | SessionBinding::AdvisorTerra(_)
-            | SessionBinding::AdvisorAstra(_) => {
-                let (agent_id, agent) = AgentHandle::create(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    mode,
-                    config,
-                    display_name,
-                    start,
-                    parent,
-                    Arc::downgrade(self),
-                )
-                .await?;
-                (agent_id, RunningAgent::Rho(agent))
-            }
-            SessionBinding::ClaudeFable { .. }
-            | SessionBinding::ClaudeOpus { .. }
-            | SessionBinding::ClaudeAdvisor { .. } => {
-                let (agent_id, agent) = ClaudeAgent::create(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    self.claude.clone(),
-                    display_name,
-                    start,
-                    mode,
-                    config,
-                    parent,
-                    Arc::downgrade(self),
-                )
-                .await?;
-                (agent_id, RunningAgent::Claude(agent))
-            }
-        };
-        {
-            let mut agents = self.agents.lock().await;
-            agents.insert(agent_id, agent.clone());
-            self.touch(agent_id);
-            self.attach_live(agent_id, &agent);
-            self.trim(&mut agents);
-        }
-        let _ = self.created.send(AgentCreated { agent_id, parent });
-        Ok((agent_id, agent))
+            drop(loading);
+            drop(admission);
+            pool.trim(MAX_LOADED).await;
+            let _ = pool.created.send(AgentCreated { agent_id, parent });
+            Ok((agent_id, agent))
+        })
+        .await?
     }
 
     /// Create a child agent for `parent` in the parent's workset, in the
@@ -459,7 +611,7 @@ impl AgentPool {
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
         let (parent_place, parent_role) = {
-            let record = self.load(parent).await?.1.head();
+            let record = self.db.read().get_agent(parent);
             (record.place().clone(), record.config.role)
         };
         let Place {
@@ -532,12 +684,14 @@ impl AgentPool {
         mut body: String,
         delivery: MessageDelivery,
     ) -> anyhow::Result<()> {
+        let sender_role = {
+            let read = self.db.read();
+            anyhow::ensure!(read.agent_exists(from), "sender agent no longer exists");
+            read.get_agent(from).config.role
+        };
         let (_, agent, _) = self.load(to).await?;
         let sender_label = self.agent_handle(from);
-        if matches!(
-            self.load(from).await?.1.head().config.role,
-            AgentRole::Advisor { .. }
-        ) {
+        if matches!(sender_role, AgentRole::Advisor { .. }) {
             body.push_str(&format!(
                 "\n\nAdvisor {sender_label} remains available. Use message_agent with this ID \
                  to continue."
@@ -620,104 +774,126 @@ impl AgentPool {
         }))
     }
 
-    /// Changes how the agent sees the filesystem. The agent has to be
-    /// settled: its loop is ended (a namespace is entered per view, and
-    /// the notebook thread and shells live in the old one), the change is
-    /// written, and the next load enters the same directory in the new
-    /// mode. Nothing to do when the mode is already that.
+    /// Mode belongs to the workset. Existing execution must be idle and
+    /// retained terminals/shells closed before its base namespace can change.
     pub async fn change_mode(
         self: &Arc<Self>,
         agent_id: AgentId,
         mode: WorksetMode,
-    ) -> anyhow::Result<()> {
-        let load_lock = self
-            .load_locks
-            .lock()
-            .await
-            .entry(agent_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _loading = load_lock.lock().await;
-        let mut agents = self.agents.lock().await;
-        if let Some(agent) = agents.get(&agent_id) {
+    ) -> anyhow::Result<Vec<AgentId>> {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let workset = pool.db.read().get_agent(agent_id).place().workset.clone();
+            let slot = pool.execution_slot(&workset).await;
+            let _admission = slot.admission.clone().write_owned().await;
+            let records = pool
+                .db
+                .read()
+                .list_agents()
+                .into_iter()
+                .filter(|(_, head)| head.place().workset == workset)
+                .collect::<Vec<_>>();
+            if records.iter().all(|(_, head)| head.place().mode == mode) {
+                return Ok(Vec::new());
+            }
+            let mut process = slot.process.lock().await;
+            if let Some(process) = process.as_ref().filter(|process| !*process.closed.borrow()) {
+                anyhow::ensure!(
+                    process.no_sessions().await?,
+                    "close every terminal and shell in the workset before changing its mode"
+                );
+            }
+            let ids = records.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let locks = {
+                let mut locks = pool.load_locks.lock().await;
+                ids.iter()
+                    .map(|id| locks.entry(*id).or_default().clone())
+                    .collect::<Vec<_>>()
+            };
+            let mut guards = Vec::new();
+            for lock in locks {
+                guards.push(lock.lock_owned().await);
+            }
+            let candidates = {
+                let agents = pool.agents.lock().await;
+                ids.iter()
+                    .filter_map(|id| agents.get(id).map(|agent| (*id, agent.clone())))
+                    .collect::<Vec<_>>()
+            };
             anyhow::ensure!(
-                agent.settled(),
-                "the filesystem mode cannot change while work is running; cancel the turn first"
+                candidates.iter().all(|(_, agent)| agent.settled()),
+                "cancel active work in this workset before changing its mode"
             );
-        }
-        let record = self.db.read().get_agent(agent_id);
-        if record.place().mode == mode {
-            return Ok(());
-        }
-        // Dropping the last handle ends the loop; a client looking at the
-        // agent gets it back on its next load.
-        agents.remove(&agent_id);
-        self.recent
-            .lock()
-            .expect("poison")
-            .retain(|id| *id != agent_id);
-        let mut write = self.db.write().await;
-        write.set_agent_mode(agent_id, mode);
-        write.commit();
-        Ok(())
+            for (id, agent) in candidates {
+                agent
+                    .retire()
+                    .await
+                    .context("workset became active while changing its mode")?;
+                pool.agents.lock().await.remove(&id);
+                pool.recent
+                    .lock()
+                    .expect("poison")
+                    .retain(|candidate| *candidate != id);
+                agent.shutdown().await;
+            }
+            if let Some(process) = process.take() {
+                process.shutdown().await;
+            }
+            let mut write = pool.db.write().await;
+            for id in &ids {
+                write.set_agent_mode(*id, mode);
+            }
+            write.commit();
+            Ok(ids)
+        })
+        .await?
     }
 
     /// Loads a persisted agent if it is not already running. The returned
     /// bool is true when this call started it.
-    pub async fn load(
+    pub fn load(
         self: &Arc<Self>,
         agent_id: AgentId,
-    ) -> anyhow::Result<(AgentId, RunningAgent, bool)> {
-        // Lazy loading makes concurrent UI subscriptions, mail, and
-        // integrations commonplace. Serialize this id through construction,
-        // then recheck after waiting so two loops cannot restore at the same
-        // event position. Other agents still load concurrently.
-        let load_lock = self
-            .load_locks
-            .lock()
-            .await
-            .entry(agent_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _loading = load_lock.lock().await;
-        if let Some(agent) = self.agents.lock().await.get(&agent_id).cloned() {
-            self.touch(agent_id);
-            return Ok((agent_id, agent, false));
-        }
-        let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.place().clone());
-        let agent = match record.config.runtime {
-            AgentRuntime::Rho { .. } => RunningAgent::Rho(
-                AgentHandle::load(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    agent_id,
-                    view,
-                    Arc::downgrade(self),
-                )
-                .await?,
-            ),
-            AgentRuntime::Claude { .. } => {
-                let agent = ClaudeAgent::load(
-                    self.db.clone(),
-                    self.inference.clone(),
-                    self.claude.clone(),
-                    agent_id,
-                    view,
-                    Arc::downgrade(self),
-                )
-                .await?;
-                RunningAgent::Claude(agent)
-            }
-        };
-        {
-            let mut agents = self.agents.lock().await;
-            agents.insert(agent_id, agent.clone());
-            self.touch(agent_id);
-            self.attach_live(agent_id, &agent);
-            self.trim(&mut agents);
-        }
-        Ok((agent_id, agent, true))
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<(AgentId, RunningAgent, bool)>> {
+        let pool = self.clone();
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let workset = pool.db.read().get_agent(agent_id).place().workset.clone();
+                let slot = pool.execution_slot(&workset).await;
+                let admission = slot.admission.clone().read_owned().await;
+                let lock = pool
+                    .load_locks
+                    .lock()
+                    .await
+                    .entry(agent_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let loading = lock.lock_owned().await;
+                let existing = pool.agents.lock().await.get(&agent_id).cloned();
+                if let Some(agent) = existing {
+                    if !agent.stopping() {
+                        pool.touch(agent_id);
+                        return Ok((agent_id, agent, false));
+                    }
+                    agent.shutdown().await;
+                    pool.agents.lock().await.remove(&agent_id);
+                }
+                let record = pool.db.read().get_agent(agent_id);
+                let view = pool.lazy_view(agent_id, record.place().clone());
+                let agent = RunningAgent::start(&pool, pool.claude.clone(), agent_id, view).await?;
+                {
+                    let mut agents = pool.agents.lock().await;
+                    agents.insert(agent_id, agent.clone());
+                    pool.touch(agent_id);
+                    pool.attach_live(agent_id, &agent);
+                }
+                drop(loading);
+                drop(admission);
+                pool.trim(MAX_LOADED).await;
+                Ok((agent_id, agent, true))
+            })
+            .await?
+        })
     }
 }
 
@@ -759,183 +935,7 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
     }
 }
 
-#[derive(Clone)]
-pub enum RunningAgent {
-    Rho(AgentHandle),
-    Claude(ClaudeAgent),
-}
-
-impl RunningAgent {
-    /// Whether anyone is looking at this agent; titles and activity are
-    /// made only then.
-
-    /// The agent's view, ready once its place is: a new agent's clone may
-    /// still be in flight.
-    pub async fn view(&self) -> anyhow::Result<Arc<View>> {
-        match self {
-            Self::Rho(agent) => agent.view().await,
-            Self::Claude(agent) => agent.view().await,
-        }
-    }
-
-    pub fn status(&self) -> AgentStatus {
-        match self {
-            Self::Rho(agent) => agent.status(),
-            Self::Claude(agent) => agent.status(),
-        }
-    }
-
-    /// The record as the loop keeps it.
-    pub fn head(&self) -> crate::db::AgentHead {
-        match self {
-            Self::Rho(agent) => agent.head(),
-            Self::Claude(agent) => agent.head(),
-        }
-    }
-
-    /// A user message carried the pending notice: it is not said again.
-    pub fn notice_carried(&self) {
-        match self {
-            Self::Rho(agent) => agent.notice_carried(),
-            Self::Claude(agent) => agent.notice_carried(),
-        }
-    }
-
-    /// Say the live tail whole again.
-    pub fn tell_tail(&self) {
-        match self {
-            Self::Rho(agent) => agent.tell_tail(),
-            Self::Claude(agent) => agent.tell_tail(),
-        }
-    }
-
-    /// Nothing running and nothing waiting: safe to drop.
-    pub fn settled(&self) -> bool {
-        self.status().settled()
-    }
-
-    pub fn send_user_message(&self, text: String, delivery: MessageDelivery) {
-        match self {
-            Self::Rho(agent) => agent.send_user_message(text, delivery),
-            // The Claude CLI does its own mid-turn steering; there is no
-            // lane choice to forward.
-            Self::Claude(agent) => agent.send_user_message(text),
-        }
-    }
-
-    pub fn send_user_content(
-        &self,
-        content: Vec<rho_core::ContentPart>,
-        delivery: MessageDelivery,
-    ) {
-        match self {
-            Self::Rho(agent) => agent.send_user_content(content, delivery),
-            Self::Claude(agent) => agent.send_user_content(content),
-        }
-    }
-
-    /// Send user input and return once the agent has durably queued it.
-    pub async fn send_user_content_accepted(
-        &self,
-        content: Vec<rho_core::ContentPart>,
-        delivery: MessageDelivery,
-    ) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => agent.send_user_content_accepted(content, delivery).await,
-            Self::Claude(agent) => agent.send_user_content_accepted(content).await,
-        }
-    }
-
-    /// Deliver mail from another agent.
-    pub fn send_agent_message(
-        &self,
-        sender: AgentId,
-        sender_label: String,
-        body: String,
-        _delivery: MessageDelivery,
-    ) {
-        match self {
-            Self::Rho(agent) => agent.send_agent_message(sender, body),
-            // Claude has no agent-mail lane; mail arrives as a labeled user
-            // message.
-            Self::Claude(agent) => agent.send_user_message(format!(
-                "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
-            )),
-        }
-    }
-
-    pub async fn send_agent_message_accepted(
-        &self,
-        sender: AgentId,
-        sender_label: String,
-        body: String,
-        _delivery: MessageDelivery,
-    ) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => agent.send_agent_message_accepted(sender, body).await,
-            Self::Claude(agent) => {
-                agent
-                    .send_agent_message_accepted(format!(
-                        "Message Type: MESSAGE\nSender: {sender_label}\nPayload:\n{body}"
-                    ))
-                    .await
-            }
-        }
-    }
-
-    pub fn compact(&self) {
-        match self {
-            Self::Claude(agent) => agent.compact(),
-            Self::Rho(agent) => agent.compact(),
-        }
-    }
-
-    pub fn cancel(&self) {
-        match self {
-            Self::Rho(agent) => agent.cancel(),
-            Self::Claude(agent) => agent.cancel(),
-        }
-    }
-
-    /// Retry after a failure, or resume a turn a restart interrupted.
-    pub fn retry(&self) {
-        match self {
-            Self::Rho(agent) => agent.retry(),
-            Self::Claude(_) => {}
-        }
-    }
-
-    pub async fn set_claude_effort(&self, effort: rho_claude::Effort) -> anyhow::Result<()> {
-        match self {
-            Self::Claude(agent) => agent.set_effort(effort).await,
-            Self::Rho(_) => anyhow::bail!("cannot apply Claude effort to Rho agent"),
-        }
-    }
-
-    pub async fn change_role(&self, role: AgentRole) -> anyhow::Result<()> {
-        match self {
-            Self::Claude(agent) => agent.change_role(role).await,
-            Self::Rho(agent) => agent.change_role(role).await,
-        }
-    }
-
-    pub fn change_prompt_cache_key(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => {
-                agent.change_prompt_cache_key();
-                Ok(())
-            }
-            Self::Claude(_) => anyhow::bail!("prompt cache keys are only available for Rho agents"),
-        }
-    }
-
-    pub async fn rewind(&self, turns: u32) -> anyhow::Result<()> {
-        match self {
-            Self::Rho(agent) => agent.rewind(turns).await,
-            Self::Claude(agent) => agent.rewind(turns).await,
-        }
-    }
-}
+pub use crate::worker::Remote as RunningAgent;
 
 #[cfg(test)]
 mod tests {
@@ -1000,5 +1000,316 @@ mod tests {
                 intelligence: crate::db::AdvisorIntelligence::Cheap,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn external_handles_and_cancelled_eviction_cannot_create_overlapping_workers() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let worker = std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .map(|path| path.join("rho-agent-worker"))
+            .find(|path| path.is_file())
+            .expect("build rho-agent-worker before the pool process test")
+            .canonicalize()
+            .unwrap();
+        let bin = worker.parent().unwrap().to_owned();
+        let mut environment = std::env::vars_os()
+            .filter(|(key, _)| key != "PATH")
+            .collect::<Vec<_>>();
+        environment.push((
+            "PATH".into(),
+            std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        ));
+        let worksets = Worksets::open(
+            root.join("state"),
+            rho_fs_view::UserEnvironment::new(environment),
+            Default::default(),
+            rho_fs_view::StoreService::None,
+        )
+        .await
+        .unwrap();
+        let view = worksets
+            .create()
+            .await
+            .unwrap()
+            .enter(
+                Mode::View {
+                    home_skeleton: None,
+                },
+                camino::Utf8Path::new("/src"),
+            )
+            .unwrap();
+        let db = RhoDb::open(root.join("agents.redb"));
+        let inference = Inference::new_with_config(
+            db.clone(),
+            rho_inference::InferenceConfig::with_responses_base_url("http://127.0.0.1:1").unwrap(),
+        )
+        .await
+        .unwrap();
+        let pool = AgentPool::new(
+            db,
+            inference,
+            worksets,
+            rho_claude::accounts::ClaudePaths::at(
+                camino::Utf8PathBuf::from_path_buf(root.join("claude")).unwrap(),
+            ),
+        )
+        .await;
+        let role = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::High,
+        };
+        let (first_id, first) = pool
+            .create(
+                role,
+                Some("first".into()),
+                StartPlace::new(view.clone(), None),
+            )
+            .await
+            .unwrap();
+        let (second_id, second) = pool
+            .create(
+                AgentRole::default(),
+                Some("second".into()),
+                StartPlace::new(view, None),
+            )
+            .await
+            .unwrap();
+        // Neither completion publication nor queue saturation may wait for
+        // actor acceptance. Hold both activation locks to stall recipients.
+        pool.set_response_subscription(second_id, first_id, true)
+            .await
+            .unwrap();
+        pool.set_response_subscription(first_id, second_id, true)
+            .await
+            .unwrap();
+        let sender_lock = pool.load_locks.lock().await.get(&first_id).unwrap().clone();
+        let receiver_lock = pool
+            .load_locks
+            .lock()
+            .await
+            .get(&second_id)
+            .unwrap()
+            .clone();
+        let sender_guard = sender_lock.clone().lock_owned().await;
+        let receiver_guard = receiver_lock.lock_owned().await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            pool.publish_completed_turn(AgentTurnCompleted {
+                agent_id: first_id,
+                final_answer: "completed".into(),
+            }),
+        )
+        .await
+        .expect("completion waited for a recipient");
+
+        // Reserve the remaining bounded slots without queuing hundreds of
+        // irrelevant messages. The reverse subscription exercises full-queue
+        // admission while its recipient is equally unable to accept mail.
+        let reserved = pool
+            .responses
+            .try_reserve_many(pool.responses.capacity())
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            pool.publish_completed_turn(AgentTurnCompleted {
+                agent_id: second_id,
+                final_answer: "saturated reverse notification".into(),
+            }),
+        )
+        .await
+        .expect("completion waited for notification capacity");
+        drop(reserved);
+        pool.publish_completed_turn(AgentTurnCompleted {
+            agent_id: first_id,
+            final_answer: "second".into(),
+        })
+        .await;
+        pool.set_response_subscription(first_id, second_id, false)
+            .await
+            .unwrap();
+        drop(receiver_guard);
+        drop(sender_guard);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let messages = pool
+                    .db
+                    .read()
+                    .agent_event_records(second_id)
+                    .1
+                    .into_iter()
+                    .filter_map(|(_, event)| match event {
+                        crate::AgentEvent::Accepted(crate::QueuedInput {
+                            kind: crate::InputKind::Message { content },
+                            ..
+                        }) => Some(rho_core::text_content(&content)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if messages.len() >= 2 {
+                    assert_eq!(&messages[..2], &["completed", "second"]);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("notifications did not preserve FIFO delivery");
+
+        let process = pool.execution(first_id).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &process,
+            &pool.execution(second_id).await.unwrap()
+        ));
+        pool.trim(1).await;
+        assert!(pool.agents.lock().await.contains_key(&first_id));
+        assert!(pool.agents.lock().await.contains_key(&second_id));
+        drop(first);
+
+        // Hold the real workset process, not a fake runtime, during retirement.
+        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+        let trim = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.trim(1).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while sender_lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        trim.abort();
+        let load = || {
+            let pool = pool.clone();
+            tokio::spawn(async move { pool.load(first_id).await.unwrap() })
+        };
+        let one = load();
+        let two = load();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !one.is_finished() && !two.is_finished(),
+            "cancelled eviction released ownership"
+        );
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+        let ((_, one, loaded_one), (_, two, loaded_two)) =
+            tokio::time::timeout(Duration::from_secs(10), async {
+                (one.await.unwrap(), two.await.unwrap())
+            })
+            .await
+            .unwrap();
+        assert_ne!(loaded_one, loaded_two);
+        assert!(Arc::ptr_eq(
+            &process,
+            &pool.execution(first_id).await.unwrap()
+        ));
+
+        // A local service failure must not leave its runtime alive after reload.
+        process.fail_agent_service(first_id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let _ = process.closed.clone().wait_for(|closed| *closed).await;
+        })
+        .await
+        .unwrap();
+        let (_, reloaded, _) = pool.load(first_id).await.unwrap();
+        let replacement = pool.execution(first_id).await.unwrap();
+        assert!(!Arc::ptr_eq(&process, &replacement));
+        assert!(!std::path::Path::new(&format!("/proc/{}", process.pid)).exists());
+
+        // A failed Stop enqueue must take the termination-and-drain fallback.
+        replacement.fail_stop_send();
+        tokio::time::timeout(Duration::from_secs(10), reloaded.shutdown())
+            .await
+            .unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists());
+        let (_, active, _) = pool.load(first_id).await.unwrap();
+        let replacement = pool.execution(first_id).await.unwrap();
+
+        // Back up the daemon route while the real worker sends two controls.
+        let (old_route, _blocked) = replacement.overload_agent_route(first_id);
+        active.notice_carried();
+        active.tell_tail();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::path::Path::new(&format!("/proc/{}", replacement.pid)).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = replacement.closed.clone().wait_for(|closed| *closed).await;
+        drop(old_route);
+        let (_, final_agent, _) = pool.load(first_id).await.unwrap();
+        // A failing shutdown reply consumes the join result exactly once.
+        let process = pool.execution(first_id).await.unwrap();
+        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+        let shutdown = tokio::spawn({
+            let agent = final_agent.clone();
+            async move { agent.shutdown().await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        process.fail_shutdown_reply(first_id);
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{}", process.pid)).exists());
+
+        // Caller cancellation cannot release admission for an enqueued create.
+        let process = pool.execution(first_id).await.unwrap();
+        let slot = pool
+            .execution_slot(&pool.db().read().get_agent(first_id).config.place.workset)
+            .await;
+        let pid = rustix::process::Pid::from_raw(process.pid as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP).unwrap();
+        let attach = tokio::spawn({
+            let process = process.clone();
+            async move {
+                process
+                    .attach(crate::WorksetAttach::Terminal {
+                        agent: first_id,
+                        terminal: 99,
+                        create: true,
+                        cols: 80,
+                        rows: 24,
+                        cwd: "/src".into(),
+                        shell: "bash".into(),
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while slot.admission.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        attach.abort();
+        let _ = attach.await;
+        assert!(
+            slot.admission.try_write().is_err(),
+            "cancelled create released admission"
+        );
+        rustix::process::kill_process(pid, rustix::process::Signal::CONT).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            pool.change_mode(first_id, rho_fs_view::WorksetMode::Exposed),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("terminal"));
+        process.shutdown().await;
+        drop((one, two, second, active));
     }
 }

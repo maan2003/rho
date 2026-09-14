@@ -4,8 +4,10 @@
 //! thread, including the test harness's.
 
 use std::sync::Arc;
+#[path = "../../rho-fs-view/tests/common/workset.rs"]
+mod common;
 
-use rho_daemon::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
+use rho_agent::shell::{ShellClient, ShellControl, ShellRegistry, ShellSpawn};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::shell::{ShellColor, ShellServerFrame};
 
@@ -29,61 +31,26 @@ fn main() {
         eprintln!("skipping shell_e2e: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    // SAFETY: top of main, before the runtime: no threads exist yet.
-    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(shell_end_to_end_over_registry());
+    let program = std::env::current_exe().unwrap();
+    common::run(
+        "PS1=\'rho-test> \'\nPROMPT_COMMAND=\'export RHO_TEST_CONFIG_HOOK=fired\'\ntrap \'printf fired >/src/brush-exit-hook\' EXIT\n",
+        move |view| shell_end_to_end_over_registry(view, program),
+    );
     println!("shell e2e passed");
 }
 
-async fn shell_end_to_end_over_registry() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(
-        home.join(".bashrc"),
-        "PS1='rho-test> '\n\
-         PROMPT_COMMAND='export RHO_TEST_CONFIG_HOOK=fired'\n\
-         trap 'printf fired >/src/brush-exit-hook' EXIT\n",
-    )
-    .unwrap();
-    let environment = rho_fs_view::UserEnvironment::new(vec![
-        ("PATH".into(), std::env::var_os("PATH").unwrap()),
-        ("HOME".into(), home.clone().into_os_string()),
-        ("USER".into(), "rho-test".into()),
-        ("LOGNAME".into(), "rho-test".into()),
-        ("LANG".into(), "C.UTF-8".into()),
-    ]);
-    let work = temp.path().join("work");
-    std::fs::create_dir(&work).unwrap();
-    let worksets = rho_fs_view::Worksets::open(
-        temp.path().join("state"),
-        environment,
-        Default::default(),
-        rho_fs_view::StoreService::None,
-    )
-    .await
-    .unwrap();
-    // View mode: `home` is the skeleton of the agent's /home/agent, and this
-    // binary's directory is visible read-only, so it can be the sidecar.
-    let view = worksets
-        .adopt(&work)
-        .unwrap()
-        .enter(
-            rho_fs_view::Mode::View {
-                home_skeleton: Some(home.clone()),
-            },
-            camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-        )
-        .unwrap();
+async fn shell_end_to_end_over_registry(
+    view: Arc<rho_fs_view::Namespace>,
+    program: std::path::PathBuf,
+) {
+    let work = std::path::Path::new("/src");
     let registry = Arc::new(ShellRegistry::default());
     let agent_id =
         AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter encodes");
 
     let spawn = || ShellSpawn {
         view: Arc::clone(&view),
-        program: std::env::current_exe().unwrap().into_os_string(),
+        program: program.clone().into_os_string(),
         args: vec![CHILD_FLAG.into()],
         pager_program: "cat".into(),
     };

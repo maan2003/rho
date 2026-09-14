@@ -20,6 +20,15 @@ use crate::MessageDelivery;
 use crate::db::{AgentId, AgentReadTxnExt as _, AgentRole};
 use crate::pool::AgentPool;
 
+/// Fresh presentation identities for a prompt. Pool capabilities never cross
+/// into the worker, and shortened handles are resolved again for each request.
+#[derive(Clone, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct Team {
+    pub agent: String,
+    pub parent: Option<String>,
+    pub spawned_by: crate::db::AgentSpawnedBy,
+}
+
 /// A pooled agent's handle to the multi-agent world: its identity plus the
 /// pool for spawning, mail routing, and id resolution. `Agent::create` and
 /// `load` build it themselves once the agent id is known (create allocates
@@ -45,29 +54,13 @@ impl MultiAgentTools {
         }
     }
 
-    pub(crate) fn self_id(&self) -> AgentId {
-        self.self_id
-    }
-
-    pub(crate) fn parent(&self) -> Option<AgentId> {
-        self.parent
-    }
-
-    pub(crate) fn spawned_by(&self) -> crate::db::AgentSpawnedBy {
-        self.pool()
-            .expect("multi-agent tools require a live agent pool")
-            .db()
-            .read()
-            .get_agent(self.self_id)
-            .config
-            .spawned_by
-    }
-
-    pub(crate) fn display_id(&self, agent_id: AgentId) -> String {
-        let pool = self
-            .pool()
-            .expect("multi-agent tools require a live agent pool");
-        pool.agent_handle(agent_id)
+    pub(crate) fn team(&self) -> anyhow::Result<Team> {
+        let pool = self.pool()?;
+        Ok(Team {
+            agent: pool.agent_handle(self.self_id),
+            parent: self.parent.map(|parent| pool.agent_handle(parent)),
+            spawned_by: pool.db().read().get_agent(self.self_id).config.spawned_by,
+        })
     }
 
     fn pool(&self) -> anyhow::Result<Arc<AgentPool>> {

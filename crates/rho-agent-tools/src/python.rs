@@ -25,6 +25,7 @@ pub struct PythonNotebook {
     runtime: tokio::runtime::Handle,
 }
 struct Shared {
+    tasks: Mutex<HostTasks>,
     next_cell: AtomicU64,
     shell: ShellTools,
     others: HashMap<String, Arc<dyn FutureTool>>,
@@ -35,6 +36,13 @@ struct Shared {
     /// The newest cell that registered a job: where the foreground begins.
     /// Advanced by registration, never by a cell that only looks or waits.
     foreground_cell: AtomicU64,
+}
+
+#[derive(Default)]
+struct HostTasks {
+    closed: bool,
+    running: tokio::task::JoinSet<()>,
+    failure: Option<String>,
 }
 
 /// The session ID a job is reported under, so the pieces of one background
@@ -377,6 +385,7 @@ impl PythonNotebook {
     pub fn new(shell: ShellTools, others: Vec<Arc<dyn FutureTool>>) -> Result<Self, String> {
         let specs = others.iter().map(|tool| tool.spec()).collect::<Vec<_>>();
         let shared = Arc::new(Shared {
+            tasks: Mutex::new(HostTasks::default()),
             next_cell: AtomicU64::new(1),
             shell,
             others: others
@@ -408,13 +417,39 @@ impl PythonNotebook {
 }
 impl Drop for PythonNotebook {
     fn drop(&mut self) {
+        self.stop();
+    }
+}
+impl PythonNotebook {
+    fn stop(&self) {
+        self.shared.tasks.lock().unwrap().closed = true;
         for cell in self.shared.cells.lock().unwrap().values() {
             let mut cell = cell.lock().unwrap();
+            self.session.sender().cancel(cell.cell);
             cell.cancelled.send_replace(true);
             cell.fail("Python notebook closed");
         }
         for job in self.shared.jobs.lock().unwrap().values() {
             job.cancel.notify_one();
+        }
+    }
+
+    /// Stop admission, cancel managed work, and await its child cleanup.
+    /// This uses no daemon service or persistence acknowledgement.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.stop();
+        let (mut tasks, mut failure) = {
+            let mut tasks = self.shared.tasks.lock().unwrap();
+            (std::mem::take(&mut tasks.running), tasks.failure.take())
+        };
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                failure.get_or_insert_with(|| error.to_string());
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -428,6 +463,7 @@ impl PythonNotebook {
 }
 impl PythonNotebook {
     fn start(&self, id: ExecId, source: Option<String>, waker: SourceWaker) -> Box<PythonCell> {
+        let tasks = self.shared.tasks.lock().unwrap();
         let cell = self.shared.next_cell.fetch_add(1, Ordering::Relaxed);
         let link = Arc::new(Mutex::new(ExecState {
             cell,
@@ -464,9 +500,13 @@ impl PythonNotebook {
             runtime: self.runtime.clone(),
         });
         let sender = self.session.sender();
-        let result = match source {
-            Some(source) => sender.execute(cell, source, exec.clone()),
-            None => sender.stream(cell, exec.clone()),
+        let result = if tasks.closed {
+            Err("Python notebook closed".into())
+        } else {
+            match source {
+                Some(source) => sender.execute(cell, source, exec.clone()),
+                None => sender.stream(cell, exec.clone()),
+            }
         };
         if let Err(error) = result {
             let mut state = exec.link.lock().unwrap();
@@ -511,6 +551,17 @@ fn register_call(
     link: Arc<Mutex<ExecState>>,
     runtime: &tokio::runtime::Handle,
 ) {
+    let mut tasks = shared.tasks.lock().unwrap();
+    if tasks.closed {
+        sender.cancel(link.lock().unwrap().cell);
+        return;
+    }
+    while let Some(result) = tasks.running.try_join_next() {
+        if let Err(error) = result {
+            tasks.failure.get_or_insert_with(|| error.to_string());
+        }
+    }
+
     // Publish command handles synchronously: write_stdin in the same cell can
     // refer to a command whose process has not started yet.
     let job = if name == "command" {
@@ -609,21 +660,16 @@ fn register_call(
     }
     let shared = Arc::clone(shared);
     let sender = sender.clone();
-    runtime.spawn(async move {
+    tasks.running.spawn_on(async move {
         let mut cancelled = link.lock().unwrap().cancelled.subscribe();
-        let work = async {
-            match &job {
-                Ok(Some(job)) => run_command(&shared.shell, job, &args, &link).await,
-                Ok(None) => {
-                    host_call(&shared, &name, args, &link, operation.as_ref().unwrap()).await
-                }
-                Err(error) => Err(error.clone()),
-            }
-        };
-        let result = tokio::select! {
-            biased;
-            _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Tool call cancelled".into()),
-            result = work => result,
+        let result = match &job {
+            Ok(Some(job)) => run_command(&shared.shell, job, &args, &link, &mut cancelled).await,
+            Ok(None) => tokio::select! {
+                biased;
+                _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Tool call cancelled".into()),
+                result = host_call(&shared, &name, args, &link, operation.as_ref().unwrap()) => result,
+            },
+            Err(error) => Err(error.clone()),
         };
         if let Ok(Some(job)) = &job {
             *job.stdin.lock().await = None;
@@ -653,7 +699,7 @@ fn register_call(
             cell.waker.wake();
         }
         resolve(&sender, request, result).await;
-    });
+    }, runtime);
 }
 
 async fn run_command(
@@ -661,13 +707,16 @@ async fn run_command(
     job: &Job,
     args: &Value,
     link: &Arc<Mutex<ExecState>>,
+    cancelled: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Value, String> {
+    let cmd = args["cmd"].as_str().ok_or("command requires cmd")?;
+    let mut process = tokio::select! {
+        biased;
+        _ = cancelled.wait_for(|cancelled| *cancelled) => return Err("Command cancelled".into()),
+        _ = job.cancel.notified() => return Err("Command cancelled".into()),
+        process = shell.spawn(cmd, args["workdir"].as_str()) => process.map_err(|e| e.to_string())?,
+    };
     let work = async {
-        let cmd = args["cmd"].as_str().ok_or("command requires cmd")?;
-        let mut process = shell
-            .spawn(cmd, args["workdir"].as_str())
-            .await
-            .map_err(|e| e.to_string())?;
         *job.stdin.lock().await = process.take_stdin();
         job.ready.send_replace(true);
         let mut exit_code = None;
@@ -699,12 +748,19 @@ async fn run_command(
         }
         Ok(json!({"id": job.id, "exit_code": exit_code}))
     };
-    tokio::select! {
+    let result = tokio::select! {
         biased;
+        _ = cancelled.wait_for(|cancelled| *cancelled) => Err("Command cancelled".into()),
         _ = job.cancel.notified() => Err("Command cancelled".into()),
         result = work => result,
-    }
+    };
+    process
+        .terminate()
+        .await
+        .map_err(|error| error.to_string())?;
+    result
 }
+
 async fn host_call(
     shared: &Shared,
     name: &str,

@@ -47,11 +47,11 @@ pub(crate) struct ResponsesOAuthCredentials {
     pub(crate) client_secret: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResolvedAuth {
-    pub(crate) bearer_token: String,
-    pub(crate) account_id: Option<String>,
-    pub(crate) client_secret: [u8; 32],
+#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+pub struct ResolvedAuth {
+    pub bearer_token: String,
+    pub account_id: Option<String>,
+    pub client_secret: [u8; 32],
 }
 
 /// OAuth credentials resolved for another first-party ChatGPT endpoint.

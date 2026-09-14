@@ -5,13 +5,27 @@
 //! daemon; without it no keeper runs and `git` inside is the plain one.
 
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use camino::Utf8Path;
 use rho_fs_view::{Mode, PathOverrides, StoreRefresh, StoreService, UserEnvironment, Worksets};
 
 fn main() -> anyhow::Result<()> {
+    let incoming = std::env::args_os().collect::<Vec<_>>();
+    if incoming.get(1).is_some_and(|arg| arg == "--enter-layout") {
+        let bytes = std::fs::read(&incoming[2])?;
+        let layout: rho_fs_view::WorksetLayout = senax_encoder::decode(&mut bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid workset layout"))?;
+        unsafe {
+            layout.build()?;
+            layout.enter()?;
+        }
+        return Err(std::process::Command::new(&incoming[3])
+            .args(&incoming[4..])
+            .exec()
+            .into());
+    }
     let mut args = std::env::args_os().skip(1).peekable();
     let mut src = None;
     let mut state = None;
@@ -71,8 +85,6 @@ fn main() -> anyhow::Result<()> {
             home_skeleton: skeleton,
         }
     };
-    // SAFETY: top of main, before the runtime: no threads exist yet.
-    unsafe { rho_fs_view::init_daemon_namespace() }?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -89,10 +101,23 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         let workset = worksets.adopt(&src)?;
-        let namespace = workset.enter(mode, Utf8Path::new(rho_fs_view::MOUNT_ROOT))?;
-        let mut child = tokio::process::Command::new(&command[0]);
-        child.args(&command[1..]);
-        namespace.prepare_command(&mut child, None).await?;
+        let mount_root = tempfile::tempdir()?;
+        let layout = rho_fs_view::WorksetLayout::new(
+            &workset,
+            mode,
+            camino::Utf8PathBuf::from_path_buf(mount_root.path().to_owned())
+                .map_err(|_| anyhow::anyhow!("non-UTF8 mount root"))?,
+        )?;
+        let mut description = tempfile::NamedTempFile::new()?;
+        std::io::Write::write_all(
+            &mut description,
+            &senax_encoder::encode(&layout).map_err(|_| anyhow::anyhow!("encode layout"))?,
+        )?;
+        let mut child = tokio::process::Command::new(std::env::current_exe()?);
+        child
+            .arg("--enter-layout")
+            .arg(description.path())
+            .args(&command);
         child
             .status()
             .await

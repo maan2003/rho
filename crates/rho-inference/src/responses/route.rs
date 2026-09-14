@@ -28,8 +28,9 @@ const ROUTES: [DialRoute; 3] = [DialRoute::Dns, DialRoute::PinnedA, DialRoute::P
 
 /// A bounded set of ChatGPT edge paths. Fixed routes still use chatgpt.com as
 /// the WebSocket URL and TLS server name; only the TCP destination changes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Encode, Decode)]
 pub enum DialRoute {
+    #[default]
     Dns,
     PinnedA,
     PinnedB,
@@ -59,8 +60,9 @@ pub(crate) struct RouteSelector {
     db: Option<RhoDb>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Encode, Decode)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Encode, Decode)]
 pub struct RouteSelection {
+    revision: u64,
     route: DialRoute,
     account: Option<RouteAccount>,
 }
@@ -136,6 +138,10 @@ impl RouteAccount {
 }
 
 impl RouteSelection {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn for_session(
         &self,
         config: &ResponsesConfig,
@@ -163,10 +169,7 @@ impl RouteSelection {
 
 impl RouteSelector {
     pub(crate) fn new(db: Option<RhoDb>) -> Self {
-        let (selected, _) = watch::channel(RouteSelection {
-            route: DialRoute::Dns,
-            account: None,
-        });
+        let (selected, _) = watch::channel(RouteSelection::default());
         Self { selected, db }
     }
 
@@ -254,12 +257,16 @@ impl RouteSelector {
             DialRoute::Dns
         };
         let next = choose_route(current, &scores);
-        let selection = RouteSelection {
+        let mut selection = RouteSelection {
+            revision: previous.revision,
             route: next,
             account: Some(account),
         };
         if selection != previous {
-            self.selected.send_replace(selection);
+            self.selected.send_modify(|current| {
+                selection.revision = current.revision + 1;
+                *current = selection;
+            });
             if next != previous.route {
                 tracing::info!(
                     from = previous.route.name(),
@@ -280,8 +287,10 @@ impl RouteSelector {
         });
         if route != DialRoute::Dns && selected.route == route && matches_account {
             drop(selected);
-            self.selected
-                .send_modify(|selected| selected.route = DialRoute::Dns);
+            self.selected.send_modify(|selected| {
+                selected.route = DialRoute::Dns;
+                selected.revision += 1;
+            });
             tracing::warn!(
                 route = route.name(),
                 "ChatGPT inference route failed; falling back to DNS"
@@ -466,6 +475,7 @@ mod tests {
     fn selected_route_is_luna_default_and_account_scoped() {
         let routes = RouteSelector::new(None);
         routes.selected.send_replace(RouteSelection {
+            revision: 0,
             route: DialRoute::PinnedA,
             account: Some(RouteAccount::from_selected(&selected("one", "account-1"))),
         });

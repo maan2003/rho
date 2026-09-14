@@ -31,8 +31,18 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 }
 
 fn main() -> anyhow::Result<()> {
-    // SAFETY: top of main, single-threaded.
-    unsafe { rho_fs_view::init_daemon_namespace() }?;
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "--inside") {
+        let bytes = std::fs::read(&args[2])?;
+        let layout: rho_fs_view::WorksetLayout = senax_encoder::decode(&mut bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid layout"))?;
+        let view = unsafe {
+            layout.build()?;
+            layout.enter()?
+        }
+        .for_cwd(Utf8Path::new("/src/project"))?;
+        return tokio::runtime::Runtime::new()?.block_on(run_tools(view));
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run())
 }
@@ -64,12 +74,36 @@ async fn run() -> anyhow::Result<()> {
         started.elapsed()
     );
 
-    let view = workset.enter(
+    let mount_root = temp.path().join("mount");
+    std::fs::create_dir(&mount_root)?;
+    let layout = rho_fs_view::WorksetLayout::new(
+        &workset,
         Mode::View {
             home_skeleton: None,
         },
-        Utf8Path::new("/src/project"),
+        camino::Utf8PathBuf::from_path_buf(mount_root)
+            .map_err(|_| anyhow::anyhow!("non-UTF8 root"))?,
     )?;
+    let path = temp.path().join("layout");
+    std::fs::write(
+        &path,
+        senax_encoder::encode(&layout).map_err(|_| anyhow::anyhow!("encode layout"))?,
+    )?;
+    let status = tokio::process::Command::new(std::env::current_exe()?)
+        .arg("--inside")
+        .arg(path)
+        .status()
+        .await?;
+    anyhow::ensure!(status.success(), "workset smoke failed");
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("file.txt"))?,
+        "agent\n"
+    );
+    assert!(!temp.path().join("scratch").exists());
+    Ok(())
+}
+
+async fn run_tools(view: Arc<rho_fs_view::Namespace>) -> anyhow::Result<()> {
     let tools = ShellTools::new(Duration::from_secs(30), Arc::clone(&view));
 
     let started = std::time::Instant::now();
@@ -94,12 +128,6 @@ async fn run() -> anyhow::Result<()> {
         result.output.contains("Process exited with code 0"),
         "git should work inside the view"
     );
-    assert_eq!(
-        std::fs::read_to_string(checkout.join("file.txt"))?,
-        "agent\n",
-        "edits land in the workset on the host"
-    );
-
     let result = tools
         .call(shell_call(
             "touch /tmp/scratch && ls / && test ! -e $HOME/.bashrc && echo home-is-empty",
@@ -107,7 +135,6 @@ async fn run() -> anyhow::Result<()> {
         .await;
     println!("outside the workset:\n{}", result.output);
     assert!(result.output.contains("home-is-empty"));
-    assert!(!temp.path().join("scratch").exists());
 
     println!("smoke test passed");
     Ok(())

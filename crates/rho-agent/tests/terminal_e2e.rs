@@ -3,8 +3,10 @@
 //! identity user namespace must precede every thread.
 
 use std::sync::Arc;
+#[path = "../../rho-fs-view/tests/common/workset.rs"]
+mod common;
 
-use rho_daemon::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
+use rho_agent::terminal::{ClientInput, TerminalClient, TerminalRegistry, TerminalSpawn};
 use rho_ui_proto::AgentId;
 use rho_ui_proto::term::{ScrollbackItem, TermRow, TermServerFrame, WireScreen};
 
@@ -24,37 +26,11 @@ fn main() {
         eprintln!("skipping terminal_e2e: direnv unavailable");
         return;
     }
-    // SAFETY: top of main, before the runtime: no threads exist yet.
-    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
-    tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(terminal_end_to_end_over_registry());
+    common::run("", terminal_end_to_end_over_registry);
     println!("terminal e2e passed");
 }
 
-async fn terminal_end_to_end_over_registry() {
-    let temp = tempfile::tempdir().unwrap();
-    let work = temp.path().join("work");
-    std::fs::create_dir(&work).unwrap();
-    let worksets = rho_fs_view::Worksets::open(
-        temp.path().join("state"),
-        rho_fs_view::UserEnvironment::new(std::env::vars_os().collect()),
-        Default::default(),
-        rho_fs_view::StoreService::None,
-    )
-    .await
-    .unwrap();
-    let view = worksets
-        .adopt(&work)
-        .unwrap()
-        .enter(
-            rho_fs_view::Mode::View {
-                home_skeleton: None,
-            },
-            camino::Utf8Path::new(rho_fs_view::MOUNT_ROOT),
-        )
-        .unwrap();
-
+async fn terminal_end_to_end_over_registry(view: Arc<rho_fs_view::Namespace>) {
     let registry = Arc::new(TerminalRegistry::default());
     let agent_id =
         AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter 1 encodes");

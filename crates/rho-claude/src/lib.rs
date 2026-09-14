@@ -14,6 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub mod accounts;
 pub mod mcp;
+pub mod namespace;
 pub mod protocol;
 pub mod settings;
 mod transcript;
@@ -138,6 +139,21 @@ impl ClaudeCodeOptions {
 
 impl ClaudeCode {
     pub async fn spawn_command(mut command: Command) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            let parent = rustix::process::getpid();
+            unsafe {
+                command.pre_exec(move || {
+                    rustix::process::set_parent_process_death_signal(Some(
+                        rustix::process::Signal::KILL,
+                    ))?;
+                    if rustix::process::getppid() != Some(parent) {
+                        return Err(std::io::Error::other("Claude owner exited during spawn"));
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command.spawn().context("spawn Claude Code")?;
         let stdin = child
             .stdin
@@ -311,15 +327,15 @@ impl ClaudeCode {
         // Ignore write-side errors: the child may already have exited, and we
         // still want to reach the wait/kill path below.
         let _ = self.end_input().await;
-        if tokio::time::timeout(GRACEFUL_EXIT_TIMEOUT, self.wait())
-            .await
-            .is_ok()
-        {
+        if let Ok(status) = tokio::time::timeout(GRACEFUL_EXIT_TIMEOUT, self.wait()).await {
+            status?;
             return Ok(());
         }
 
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(KILL_EXIT_TIMEOUT, self.wait()).await;
+        self.child.start_kill().context("kill Claude Code")?;
+        tokio::time::timeout(KILL_EXIT_TIMEOUT, self.wait())
+            .await
+            .context("Claude Code did not exit after being killed")??;
         Ok(())
     }
 

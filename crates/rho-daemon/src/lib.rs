@@ -29,11 +29,7 @@ mod desk_cells;
 mod detail;
 mod realtime;
 mod secret_store;
-#[doc(hidden)]
-pub mod shell;
-#[doc(hidden)]
-pub mod terminal;
-mod workspace_channel;
+pub mod workspace_channel;
 
 /// FDNAME under which messaging-platform secrets live in the systemd fd store.
 const PLATFORM_SECRETS_FD_STORE_NAME: &str = "platform-secrets";
@@ -303,10 +299,7 @@ fn start_runtime_sockets(
     })
 }
 
-/// Re-exported so daemon entry points can set up the user+mount namespace
-/// before the async runtime starts (see
-/// [`rho_fs_view::init_daemon_namespace`]).
-pub use rho_fs_view::{PathOverrides, init_daemon_namespace};
+pub use rho_fs_view::PathOverrides;
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
 const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
@@ -906,10 +899,6 @@ struct Services {
     /// which connection caused them (attention changes); each connection
     /// forwards this onto its own outgoing channel.
     events: broadcast::Sender<ServerMessage>,
-    /// Daemon-owned Comint-style shell sessions, one per agent.
-    shells: Arc<shell::ShellRegistry>,
-    /// Daemon-owned terminal sessions, keyed per agent.
-    terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
     user_environment: rho_fs_view::UserEnvironment,
     /// The Claude configuration this daemon runs against, resolved in `run`.
@@ -952,8 +941,6 @@ impl Services {
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
-            shells: Arc::new(shell::ShellRegistry::default()),
-            terminals: Arc::new(terminal::TerminalRegistry::default()),
             user_environment,
             git_transport: GitTransportBroker::default(),
             voice_lease: Arc::new(TokioMutex::new(())),
@@ -2583,7 +2570,12 @@ async fn handle_message(
             Ok(Refresh::Ready)
         }
         ClientMessage::ChangeAgentMode { agent_id, mode } => {
-            services.pool.change_mode(agent_id, mode).await?;
+            let changed = services.pool.change_mode(agent_id, mode).await?;
+            for id in changed {
+                if id != agent_id && services.pool.is_live(id) {
+                    services.load(id).await?;
+                }
+            }
             // Back at once, in the new view, for whoever is looking.
             services.load(agent_id).await?;
             Ok(Refresh::Ready)
@@ -2683,7 +2675,7 @@ async fn handle_message(
 /// process when this client detaches.
 async fn serve_shell<R, W>(
     services: Arc<Services>,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     agent: String,
 ) -> anyhow::Result<()>
@@ -2691,13 +2683,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let client = shell_attach(&services, &agent).await;
-    let shell::ShellClient {
-        mut frames,
-        mut exit,
-        submit,
-        control,
-    } = match client {
+    let client = match shell_attach(&services, &agent).await {
         Ok(client) => client,
         Err(error) => {
             let _ = write_frame(
@@ -2711,161 +2697,35 @@ where
         }
     };
     write_frame(&mut writer, &ServerMessage::ShellOpened).await?;
-    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(shell::SUBMIT_QUEUE);
-
-    let mut writer_task = tokio::spawn(async move {
-        loop {
-            while let Ok((submission, execution)) = accepted_rx.try_recv() {
-                if write_frame(
-                    &mut writer,
-                    &rho_ui_proto::shell::ShellServerFrame::Accepted {
-                        submission,
-                        execution,
-                    },
-                )
-                .await
-                .is_err()
-                {
-                    return;
-                }
-            }
-            let final_state = { exit.borrow_and_update().clone() };
-            if let Some(final_state) = final_state {
-                let snapshot = rho_ui_proto::shell::ShellServerFrame::Snapshot {
-                    state: final_state.state.clone(),
-                };
-                if write_frame(&mut writer, &snapshot).await.is_ok() {
-                    let _ = write_frame(
-                        &mut writer,
-                        &rho_ui_proto::shell::ShellServerFrame::Exited {
-                            status: final_state.status,
-                        },
-                    )
-                    .await;
-                }
-                break;
-            }
-            tokio::select! {
-                biased;
-                changed = exit.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-                accepted = accepted_rx.recv() => match accepted {
-                    Some((submission, execution)) => {
-                        if write_frame(
-                            &mut writer,
-                            &rho_ui_proto::shell::ShellServerFrame::Accepted {
-                                submission,
-                                execution,
-                            },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => break,
-                },
-                frame = frames.recv() => match frame {
-                    Some(frame) => {
-                        if write_frame(&mut writer, &frame).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-    });
-    let result = loop {
-        tokio::select! {
-            _ = &mut writer_task => break Ok(()),
-            frame = read_frame::<_, rho_ui_proto::shell::ShellClientFrame>(&mut reader) => {
-                use rho_ui_proto::shell::{ShellClientFrame, command_fits};
-                match frame {
-                    Ok(ShellClientFrame::Submit { submission, command }) => {
-                        if !command_fits(&command) {
-                            break Err(anyhow::anyhow!("shell command exceeds the input limit"));
-                        }
-                        match submit.try_send(command) {
-                            Ok(execution) => {
-                                if accepted_tx.send((submission, execution)).await.is_err() {
-                                    break Ok(());
-                                }
-                            }
-                            Err(shell::ShellSubmitError::Full) => {
-                                break Err(anyhow::anyhow!("shell command queue is full"));
-                            }
-                            Err(shell::ShellSubmitError::Closed) => break Ok(()),
-                            Err(shell::ShellSubmitError::Exhausted) => {
-                                break Err(anyhow::anyhow!("shell execution ids exhausted"));
-                            }
-                            Err(shell::ShellSubmitError::TooLarge) => {
-                                break Err(anyhow::anyhow!("shell command exceeds the input limit"));
-                            }
-                        }
-                    }
-                    Ok(ShellClientFrame::Interrupt) => {
-                        if control.send(shell::ShellControl::Interrupt).await.is_err() {
-                            break Ok(());
-                        }
-                    }
-                    Ok(ShellClientFrame::Eof) => {
-                        if control.send(shell::ShellControl::Eof).await.is_err() {
-                            break Ok(());
-                        }
-                    }
-                    Ok(ShellClientFrame::PagerAction {
-                        execution,
-                        pager,
-                        page,
-                        action,
-                    }) => {
-                        if control
-                            .pager_action(execution, pager, page, action)
-                            .await
-                            .is_err()
-                        {
-                            break Ok(());
-                        }
-                    }
-                    Err(_) => break Ok(()),
-                }
-            }
-        }
-    };
-    if !writer_task.is_finished() {
-        writer_task.abort();
-    }
-    result
+    client.relay::<_, _, rho_ui_proto::shell::ShellClientFrame, rho_ui_proto::shell::ShellServerFrame>(reader, writer).await
 }
 
 async fn shell_start(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = services.resolve_display_agent_id(agent).await?;
-    let running = services.load(agent_id).await?.1;
-    // The agent's own view: a new agent's clone may still be in flight.
-    let view = running.view().await.context("materialize agent view")?;
-    services
-        .shells
-        .start(
-            agent_id,
-            shell::ShellSpawn {
-                view,
-                program: rho_shell_program(),
-                args: Vec::new(),
-                pager_program: rho_pager_program(),
-            },
-        )
-        .await
+    let agent = services.resolve_display_agent_id(agent).await?;
+    let process = services.pool.execution(agent).await?;
+    let cwd = services.db.read().get_agent(agent).config.place.cwd;
+    process
+        .action(rho_agent::WorksetAction::ShellStart {
+            agent,
+            cwd,
+            program: rho_shell_program().into(),
+            pager: rho_pager_program().into(),
+        })
+        .await?;
+    Ok(())
 }
 
-async fn shell_attach(services: &Arc<Services>, agent: &str) -> anyhow::Result<shell::ShellClient> {
-    let agent_id = services.resolve_display_agent_id(agent).await?;
-    services.shells.attach(agent_id).await
+async fn shell_attach(
+    services: &Arc<Services>,
+    agent: &str,
+) -> anyhow::Result<rho_agent::WorksetClient> {
+    let agent = services.resolve_display_agent_id(agent).await?;
+    services
+        .pool
+        .execution(agent)
+        .await?
+        .attach(rho_agent::WorksetAttach::Shell { agent })
+        .await
 }
 
 async fn shell_list(
@@ -2873,25 +2733,33 @@ async fn shell_list(
     agent: Option<&str>,
 ) -> anyhow::Result<Vec<rho_ui_proto::shell::ShellInfo>> {
     let filter = match agent {
-        Some(agent) => Some(services.resolve_display_agent_id(agent).await?),
+        Some(agent) => Some(services.resolve_display_agent_id(agent).await?.encoded()),
         None => None,
     };
-    Ok(services
-        .shells
-        .list()
-        .await
-        .into_iter()
-        .filter(|entry| filter.is_none_or(|agent_id| entry.agent_id == agent_id))
-        .map(|entry| rho_ui_proto::shell::ShellInfo {
-            agent: entry.agent_id.encoded(),
-            clients: entry.clients as u32,
-        })
-        .collect())
+    let mut shells = Vec::new();
+    for process in services.pool.executions().await {
+        if let rho_agent::WorksetReply::Shells(entries) =
+            process.action(rho_agent::WorksetAction::ShellList).await?
+        {
+            shells.extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| filter.as_ref().is_none_or(|agent| &entry.agent == agent)),
+            );
+        }
+    }
+    Ok(shells)
 }
 
 async fn shell_close(services: &Arc<Services>, agent: &str) -> anyhow::Result<()> {
-    let agent_id = services.resolve_display_agent_id(agent).await?;
-    services.shells.close(agent_id).await
+    let agent = services.resolve_display_agent_id(agent).await?;
+    services
+        .pool
+        .execution(agent)
+        .await?
+        .action(rho_agent::WorksetAction::ShellClose { agent })
+        .await?;
+    Ok(())
 }
 
 fn rho_shell_program() -> std::ffi::OsString {
@@ -3097,7 +2965,7 @@ enum TerminalOpenKind {
 #[expect(clippy::too_many_arguments)]
 async fn serve_terminal<R, W>(
     services: Arc<Services>,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     agent: String,
     terminal_id: u64,
@@ -3130,54 +2998,14 @@ where
         return Ok(());
     }
 
-    let terminal::TerminalClient { mut frames, input } = client;
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = frames.recv().await {
-            if write_frame(&mut writer, &frame).await.is_err() {
-                break;
-            }
-        }
-        // Half-close so a client blocked on reads notices the terminal is
-        // gone even if it never sends input.
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-    });
-    let result = loop {
-        use rho_ui_proto::term::TermClientFrame;
-        let client_input = match read_frame::<_, TermClientFrame>(&mut reader).await {
-            Ok(TermClientFrame::Input(bytes)) => terminal::ClientInput::Bytes(bytes),
-            Ok(TermClientFrame::Resize { cols, rows }) => {
-                terminal::ClientInput::Resize { cols, rows }
-            }
-            Ok(TermClientFrame::Keystroke(keystroke)) => {
-                terminal::ClientInput::Keystroke(keystroke)
-            }
-            Ok(TermClientFrame::Paste(text)) => terminal::ClientInput::Paste(text),
-            Ok(TermClientFrame::Scroll {
-                lines,
-                col,
-                row,
-                ctrl,
-                alt,
-                shift,
-            }) => terminal::ClientInput::Scroll {
-                lines,
-                col,
-                row,
-                ctrl,
-                alt,
-                shift,
-            },
-            Err(_) => break Ok(()),
-        };
-        let _ = input.send(client_input);
-    };
-    writer_task.abort();
-    result
+    client
+        .relay::<_, _, rho_ui_proto::term::TermClientFrame, rho_ui_proto::term::TermServerFrame>(
+            reader, writer,
+        )
+        .await
 }
 
-/// Resolves the agent, then attaches to a running terminal — or, for
-/// `create`, builds the spawn spec for its default shell inside its view and
-/// spawns a fresh one.
+/// Resolve metadata and attach to workset-owned execution; no agent activation.
 async fn terminal_attach(
     services: &Arc<Services>,
     agent: &str,
@@ -3185,37 +3013,29 @@ async fn terminal_attach(
     create: bool,
     cols: u16,
     rows: u16,
-) -> anyhow::Result<terminal::TerminalClient> {
-    let agent_id = services.resolve_display_agent_id(agent).await?;
-    if !create {
-        return services
-            .terminals
-            .attach(agent_id, terminal_id, cols, rows)
-            .await;
-    }
-    let running = services.load(agent_id).await?.1;
-    // The agent's own view: a new agent's clone may still be in flight.
-    let view = running.view().await.context("materialize agent view")?;
+) -> anyhow::Result<rho_agent::WorksetClient> {
+    let agent = services.resolve_display_agent_id(agent).await?;
+    let process = services.pool.execution(agent).await?;
+    let cwd = services.db.read().get_agent(agent).config.place.cwd;
     let shell = services
         .user_environment
         .get("SHELL")
         .and_then(|shell| shell.to_str())
         .unwrap_or("bash");
-    // A profile symlink such as ~/.nix-profile/bin/zsh does not exist in
-    // a view; its /nix/store target does.
     let shell = std::fs::canonicalize(shell)
         .ok()
-        .and_then(|resolved| resolved.into_os_string().into_string().ok())
+        .and_then(|path| path.into_os_string().into_string().ok())
         .unwrap_or_else(|| shell.to_owned());
-    services
-        .terminals
-        .create(
-            agent_id,
-            terminal_id,
+    process
+        .attach(rho_agent::WorksetAttach::Terminal {
+            agent,
+            terminal: terminal_id,
+            create,
             cols,
             rows,
-            terminal::TerminalSpawn { view, shell },
-        )
+            cwd,
+            shell,
+        })
         .await
 }
 
@@ -3244,21 +3064,20 @@ where
         },
         None => None,
     };
-    let terminals = services
-        .terminals
-        .list()
-        .await
-        .into_iter()
-        .filter(|entry| filter.is_none_or(|agent_id| entry.agent_id == agent_id))
-        .map(|entry| rho_ui_proto::term::TerminalInfo {
-            agent: entry.agent_id.encoded(),
-            terminal_id: entry.terminal_id,
-            title: entry.title.unwrap_or_default(),
-            cols: entry.cols,
-            rows: entry.rows,
-            clients: entry.clients as u32,
-        })
-        .collect();
+    let mut terminals = Vec::new();
+    let filter = filter.map(|id| id.encoded());
+    for process in services.pool.executions().await {
+        if let rho_agent::WorksetReply::Terminals(entries) = process
+            .action(rho_agent::WorksetAction::TerminalList)
+            .await?
+        {
+            terminals.extend(
+                entries
+                    .into_iter()
+                    .filter(|entry| filter.as_ref().is_none_or(|agent| &entry.agent == agent)),
+            );
+        }
+    }
     write_frame(&mut writer, &ServerMessage::TerminalList { terminals }).await
 }
 

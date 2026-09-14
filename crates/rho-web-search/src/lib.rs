@@ -91,9 +91,10 @@ impl WebSearchTools {
             .auth()
             .await
             .map_err(|error| format!("selecting ChatGPT OAuth credentials: {error}"))?;
-        let auth = tokio::task::spawn_blocking(move || auth.resolve_oauth())
+        let auth = self
+            .inference
+            .resolve_auth(auth)
             .await
-            .map_err(|_| "OAuth credential resolution task failed".to_owned())?
             .map_err(|error| format!("resolving ChatGPT OAuth credentials: {error}"))?;
         let request = SearchRequest {
             id: self.session_id.to_string(),

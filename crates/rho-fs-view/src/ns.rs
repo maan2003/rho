@@ -1,7 +1,7 @@
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io::Read as _;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::layout::MOUNT_ROOT;
 use crate::{PathOverrides, UserEnvironment, Workset, WorksetMode};
 
 /// How an agent sees its workset.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
 pub enum Mode {
     /// A fresh tmpfs root holding `/nix/store`, a generated `/etc`, an empty
     /// `$HOME` (seeded from `home_skeleton`), and the workset at `/src`.
@@ -44,65 +44,148 @@ impl Mode {
 /// Largest file [`Namespace::read_file_bounded`] will ever return.
 pub const MAX_BOUNDED_READ: usize = 64 * 1024 * 1024;
 
-/// Claude Code's home for one agent, mounted over its `~/.claude` inside the
-/// namespace. All paths are host paths; `config_home` is where the agent
-/// expects the directory, and view mode retargets a host-home-relative
-/// `config_home` under `/home/agent`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaudeHome {
-    /// Per-account state directory mounted over `config_home`.
-    pub account: PathBuf,
-    /// The agent's `~/.claude` as a host path.
-    pub config_home: PathBuf,
-    /// Directory mounted over `<config_home>/projects`.
-    pub shared_projects: PathBuf,
-    /// File mounted over `<config_home>/CLAUDE.md`.
-    pub prompt: PathBuf,
-    /// Optional file mounted over `<config_home>/settings.json`.
-    pub settings: Option<PathBuf>,
+/// Filesystem inputs for the one execution process of a workset.
+/// The daemon supplies paths; the single-threaded child builds the mounts.
+#[derive(Clone, Debug, senax_encoder::Encode, senax_encoder::Decode)]
+pub struct WorksetLayout {
+    pub workset: String,
+    pub mode: Mode,
+    pub source: Utf8PathBuf,
+    pub store_root: Utf8PathBuf,
+    pub store_socket: Option<Utf8PathBuf>,
+    pub root: Utf8PathBuf,
+    pub cache: Utf8PathBuf,
+    pub state: Utf8PathBuf,
+    pub paths: PathOverrides,
+    pub identity: Vec<(String, String)>,
 }
 
-/// One agent's view of its workset: a mode, a working directory, and the
-/// mount namespace realizing them. The namespace is built on the first
-/// command (a load must not fail on a namespace it never uses), then kept
-/// for the life of this value; commands enter it with `setns`.
-#[derive(Debug)]
+impl WorksetLayout {
+    pub fn new(workset: &Workset, mode: Mode, root: Utf8PathBuf) -> anyhow::Result<Self> {
+        let owner = workset.owner()?;
+        Ok(Self {
+            workset: workset.id().to_owned(),
+            mode,
+            source: workset.root().to_owned(),
+            store_root: owner.store_root(),
+            store_socket: owner.store_socket(),
+            root,
+            cache: owner.cache_dir(),
+            state: workset.state_dir()?,
+            paths: owner.path_overrides.clone(),
+            identity: owner
+                .identity_environment()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    /// # Safety
+    /// Only call in a fresh process before starting any threads.
+    pub unsafe fn build(&self) -> anyhow::Result<()> {
+        crate::layout::unshare_identity_user_namespace()?;
+        crate::layout::unshare_mount_namespace()?;
+        std::fs::create_dir_all(&self.state)?;
+        let mounts = crate::layout::Mounts {
+            src: self.source.clone().into_std_path_buf(),
+            store_root: self.store_root.clone().into_std_path_buf(),
+            store_socket: self
+                .store_socket
+                .clone()
+                .map(Utf8PathBuf::into_std_path_buf),
+        };
+        match &self.mode {
+            Mode::View { home_skeleton } => {
+                let mut config = crate::layout::FsViewConfig::new(mounts)?;
+                config.home_skeleton = home_skeleton.clone();
+                config.cache = Some(self.cache.clone().into_std_path_buf());
+                config.workset_state = Some(self.state.clone().into_std_path_buf());
+                crate::layout::FsViewBuilder::new(config)?
+                    .build_in_place(self.root.as_std_path())?;
+            }
+            Mode::Exposed => {
+                crate::layout::ExposedBuilder::new(mounts)?.build_in_place(Path::new("/"))?
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish startup after provider-owned source mounts have been installed.
+    ///
+    /// # Safety
+    /// Only call before starting threads: this changes root, cwd and
+    /// environment.
+    pub unsafe fn enter(&self) -> anyhow::Result<Arc<Namespace>> {
+        close_inherited_fds_on_exec()?;
+        let environment = UserEnvironment::new(std::env::vars_os().collect());
+        if matches!(self.mode, Mode::View { .. }) {
+            crate::layout::pivot_into(self.root.as_std_path())?;
+        }
+        std::env::set_current_dir(MOUNT_ROOT)?;
+        let view = Arc::new(Namespace {
+            workset: self.workset.clone(),
+            mode: self.mode.clone(),
+            cwd: MOUNT_ROOT.into(),
+            src: MOUNT_ROOT.into(),
+            environment,
+            path_overrides: self.paths.clone(),
+            store_environment: self
+                .store_socket
+                .as_ref()
+                .map(|socket| vec![(crate::SOCKET_ENV.into(), socket.as_os_str().to_owned())])
+                .unwrap_or_default(),
+            identity: self
+                .identity
+                .iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            workset_state: self.state.clone(),
+        });
+        let mut command = tokio::process::Command::new("");
+        view.configure_environment(&mut command);
+        for (key, _) in std::env::vars_os() {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+        for (key, value) in command.as_std().get_envs() {
+            if let Some(value) = value {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+        Ok(view)
+    }
+
+    /// The temporary tree before pivot, or the exposed process's root.
+    pub fn staging_root(&self) -> &Path {
+        match self.mode {
+            Mode::View { .. } => self.root.as_std_path(),
+            Mode::Exposed => Path::new("/"),
+        }
+    }
+}
+
+/// Paths and command configuration in a workset view. This value owns no
+/// namespace: execution inherits the process's workset mounts.
+#[derive(Clone, Debug)]
 pub struct Namespace {
-    workset: Workset,
+    workset: String,
     mode: Mode,
-    /// The agent's working directory as it sees it.
     cwd: Utf8PathBuf,
-    /// The workset directory on the host.
     src: Utf8PathBuf,
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     store_environment: Vec<(OsString, OsString)>,
     identity: Vec<(OsString, OsString)>,
-    /// The shared cache, mounted as the view's `~/.cache`.
-    cache: Utf8PathBuf,
-    /// The workset's state directory, mounted at its host path.
     workset_state: Utf8PathBuf,
-    state: tokio::sync::Mutex<NsState>,
-}
-
-#[derive(Debug, Default)]
-struct NsState {
-    live: Option<LiveNs>,
-    /// The Claude home the agent wants, mounted when the namespace exists.
-    claude_home: Option<ClaudeHome>,
-}
-
-/// Holding the fds keeps the namespace alive.
-#[derive(Debug)]
-struct LiveNs {
-    _user_ns: OwnedFd,
-    mount_ns: OwnedFd,
-    root: OwnedFd,
-    // Declared after namespace fds so their mount references close first.
-    _view_root: Option<tempfile::TempDir>,
-    /// The Claude home currently mounted, keyed by the visible path it sits
-    /// on so a replacement can detach it first.
-    mounted_claude: Option<(ClaudeHome, PathBuf)>,
 }
 
 impl Namespace {
@@ -119,12 +202,11 @@ impl Namespace {
         );
         let store_environment = owner.store_environment();
         let identity = owner.identity_environment().to_vec();
-        let cache = owner.cache_dir();
         let workset_state = workset.state_dir()?;
         let environment = owner.environment.clone();
         let path_overrides = owner.path_overrides.clone();
         Ok(Arc::new(Self {
-            workset,
+            workset: workset.id().to_owned(),
             mode,
             cwd,
             src,
@@ -132,14 +214,26 @@ impl Namespace {
             path_overrides,
             store_environment,
             identity,
-            cache,
             workset_state,
-            state: tokio::sync::Mutex::new(NsState::default()),
         }))
     }
 
-    pub fn workset(&self) -> &Workset {
+    pub fn workset_id(&self) -> &str {
         &self.workset
+    }
+    pub fn state_dir(&self) -> &Utf8Path {
+        &self.workset_state
+    }
+
+    pub fn for_cwd(&self, cwd: &Utf8Path) -> anyhow::Result<Arc<Self>> {
+        let mut view = self.clone();
+        view.cwd = namespace_cwd(self.visible_root(), self.visible_root(), Some(cwd))?.into();
+        anyhow::ensure!(
+            view.host_cwd().is_dir(),
+            "working directory does not exist: {}",
+            view.cwd
+        );
+        Ok(Arc::new(view))
     }
 
     pub fn mode(&self) -> &Mode {
@@ -181,138 +275,6 @@ impl Namespace {
             .visible_root()
             .join(root.strip_prefix(&self.src).unwrap_or(&root));
         Ok((visible, root))
-    }
-
-    /// The mount namespace, built on first use.
-    async fn live<'a>(&self, state: &'a mut NsState) -> anyhow::Result<&'a mut LiveNs> {
-        if state.live.is_none() {
-            let owner = self.workset.owner()?;
-            let mounts = crate::layout::Mounts {
-                src: self.src.as_std_path().to_owned(),
-                store_root: owner.store_root().into_std_path_buf(),
-                store_socket: owner.store_socket().map(Utf8PathBuf::into_std_path_buf),
-            };
-            // Own the temporary directory in the caller's host-root frame. If
-            // it were created and dropped after pivot_root, cleanup would
-            // resolve its host path from inside the view and leak an empty
-            // directory.
-            let view_root = matches!(&self.mode, Mode::View { .. })
-                .then(|| {
-                    tempfile::Builder::new()
-                        .prefix("rho-fs-view-view-")
-                        .tempdir()
-                        .context("create namespace root")
-                })
-                .transpose()?;
-            let view_root_path = view_root.as_ref().map(|root| root.path().to_owned());
-            let mode = self.mode.clone();
-            let cache = self.cache.clone();
-            let workset_state = self.workset_state.clone();
-            let (user_ns, mount_ns, root) = namespace_thread("rho-fs-view-namespace", move || {
-                crate::layout::unshare_mount_namespace()?;
-                match mode {
-                    Mode::View { home_skeleton } => {
-                        let root = view_root_path.context("view mode has no namespace root")?;
-                        std::fs::create_dir_all(&workset_state)
-                            .with_context(|| format!("create workset state {workset_state}"))?;
-                        let mut config = crate::layout::FsViewConfig::new(mounts)?;
-                        config.home_skeleton = home_skeleton;
-                        config.cache = Some(cache.into_std_path_buf());
-                        config.workset_state = Some(workset_state.into_std_path_buf());
-                        let builder = crate::layout::FsViewBuilder::new(config)?;
-                        builder.build_in_place(&root)?;
-                        builder.pivot_into(&root)?;
-                    }
-                    Mode::Exposed => {
-                        crate::layout::ExposedBuilder::new(mounts)?
-                            .build_in_place(Path::new("/"))?;
-                    }
-                }
-                Ok::<_, anyhow::Error>((
-                    File::open("/proc/thread-self/ns/user")?.into(),
-                    File::open("/proc/thread-self/ns/mnt")?.into(),
-                    open_root()?,
-                ))
-            })
-            .await?;
-            state.live = Some(LiveNs {
-                _user_ns: user_ns,
-                mount_ns,
-                root,
-                _view_root: view_root,
-                mounted_claude: None,
-            });
-        }
-        let live = state.live.as_mut().expect("namespace was just built");
-        if let Some(home) = state.claude_home.clone()
-            && live
-                .mounted_claude
-                .as_ref()
-                .is_none_or(|(mounted, _)| *mounted != home)
-        {
-            let target = self.visible_path_for(&home.config_home);
-            let previous = live
-                .mounted_claude
-                .as_ref()
-                .map(|(_, target)| target.clone());
-            let mount_ns = live.mount_ns.try_clone()?;
-            let root = live.root.try_clone()?;
-            let install_target = target.clone();
-            let mounting = home.clone();
-            namespace_thread("rho-fs-view-claude-home", move || {
-                use crate::layout::{capture_mount, detach_mount, install_captured_mount};
-                crate::layout::unshare_mount_namespace()?;
-                let account = capture_mount(&mounting.account)?;
-                let projects = capture_mount(&mounting.shared_projects)?;
-                let prompt = capture_mount(&mounting.prompt)?;
-                let settings = mounting
-                    .settings
-                    .as_deref()
-                    .map(capture_mount)
-                    .transpose()?;
-                enter(&mount_ns, &root)?;
-                if let Some(previous) = previous {
-                    detach_mount(&previous)?;
-                }
-                std::fs::create_dir_all(&install_target)
-                    .with_context(|| format!("create {}", install_target.display()))?;
-                install_captured_mount(&account, &install_target)?;
-                let inner = (|| {
-                    install_captured_mount(&projects, &install_target.join("projects"))?;
-                    install_captured_mount(&prompt, &install_target.join("CLAUDE.md"))?;
-                    if let Some(settings) = &settings {
-                        install_captured_mount(settings, &install_target.join("settings.json"))?;
-                    }
-                    anyhow::Ok(())
-                })();
-                if inner.is_err() {
-                    // Leave no half-assembled home behind; the caller sees
-                    // the original error.
-                    let _ = detach_mount(&install_target);
-                }
-                inner
-            })
-            .await?;
-            live.mounted_claude = Some((home, target));
-        }
-        Ok(live)
-    }
-
-    /// Mounts `home` over the agent's `~/.claude` inside the namespace:
-    /// now when it exists, otherwise when it is built. Setting the same
-    /// home again is a no-op; a different one replaces the previous mount
-    /// stack. Every mount is a bind of a host path, so the agent's writes
-    /// land in the account and shared-projects directories.
-    pub async fn set_claude_home(&self, home: ClaudeHome) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let previous = state.claude_home.replace(home);
-        if state.live.is_some()
-            && let Err(error) = self.live(&mut state).await
-        {
-            state.claude_home = previous;
-            return Err(error);
-        }
-        Ok(())
     }
 
     /// Reads a file below the workset directory, refusing symlinks that
@@ -371,19 +333,6 @@ impl Namespace {
             .to_owned())
     }
 
-    /// Where a host path appears inside the namespace: view mode relocates
-    /// the host home to `/home/agent`, exposed mode keeps host paths.
-    fn visible_path_for(&self, host_path: &Path) -> PathBuf {
-        if matches!(&self.mode, Mode::View { .. })
-            && let Some(relative) = dirs::home_dir()
-                .as_deref()
-                .and_then(|home| host_path.strip_prefix(home).ok())
-        {
-            return Path::new("/home/agent").join(relative);
-        }
-        host_path.to_owned()
-    }
-
     /// Configures `command` to run in the namespace. `cwd` is a visible
     /// path or relative to the agent's working directory, which is the
     /// default. View mode replaces the environment with an allowlist;
@@ -394,6 +343,16 @@ impl Namespace {
         command: &mut tokio::process::Command,
         cwd: Option<&Utf8Path>,
     ) -> anyhow::Result<()> {
+        self.configure_environment(command);
+        // Syscall-only; preopened provider mount sources remain usable until exec.
+        unsafe {
+            command.pre_exec(close_inherited_fds_on_exec);
+        }
+        command.current_dir(namespace_cwd(self.visible_root(), &self.cwd, cwd)?);
+        Ok(())
+    }
+
+    fn configure_environment(&self, command: &mut tokio::process::Command) {
         // What the caller set explicitly wins over the mode's environment.
         let overrides = command
             .as_std()
@@ -462,63 +421,17 @@ impl Namespace {
                 None => command.env_remove(name),
             };
         }
-        let cwd = namespace_cwd(self.visible_root(), &self.cwd, cwd)?;
-        let mut state = self.state.lock().await;
-        let live = self.live(&mut state).await?;
-        let cwd = CString::new(cwd).context("namespace cwd contains NUL")?;
-        let mount_ns = live.mount_ns.as_raw_fd();
-        let root = live.root.as_raw_fd();
-        unsafe {
-            command.pre_exec(move || {
-                // Whatever the daemon holds open without CLOEXEC must not
-                // reach the agent; stdio is the only deliberate channel.
-                if libc::syscall(
-                    libc::SYS_close_range,
-                    3_u32,
-                    u32::MAX,
-                    libc::CLOSE_RANGE_CLOEXEC,
-                ) < 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                setns(mount_ns)?;
-                if libc::fchdir(root) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::chroot(c".".as_ptr()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Establish the requested cwd after setns and chroot; never
-                // inherit the launcher thread's cwd.
-                if libc::chdir(cwd.as_ptr()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        Ok(())
     }
 
-    /// Enters this namespace on a dedicated, long-lived interpreter thread
-    /// and moves it to the agent's working directory. This installs the
-    /// view, not a sandbox.
+    /// Give the dedicated interpreter thread a private cwd, retaining the
+    /// workset process's mount namespace.
     ///
     /// # Safety
-    /// The caller must never return this thread to a reusable thread pool:
-    /// its cwd, root and mount namespace change here. This future must be
-    /// polled on that same thread throughout.
+    /// This thread must not return to a reusable thread pool.
     pub async unsafe fn enter_interpreter_thread(&self) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        let live = self.live(&mut state).await?;
-        let mount_ns = live.mount_ns.try_clone()?;
-        let root = live.root.try_clone()?;
-        // Building the namespace may have started blocking threads from this
-        // one, sharing its fs_struct again; setns needs it private now.
         crate::layout::unshare_fs_attributes()?;
-        enter(&mount_ns, &root)?;
         std::env::set_current_dir(&self.cwd)
-            .with_context(|| format!("enter working directory {}", self.cwd))?;
-        Ok(())
+            .with_context(|| format!("enter working directory {}", self.cwd))
     }
 
     /// The host path behind a visible path, or a path relative to the
@@ -527,27 +440,6 @@ impl Namespace {
     pub fn resolve_host_path_checked(&self, path: &Path) -> anyhow::Result<PathBuf> {
         Ok(self.src.as_std_path().join(self.src_relative(path)?))
     }
-}
-
-/// Namespace-mutating work must run on a dedicated thread that exits. No
-/// runtime pool thread may ever call `unshare` or `setns`: both the mount
-/// namespace and the detached fs_struct would otherwise survive into an
-/// unrelated task when that pool thread is reused.
-async fn namespace_thread<T, F>(name: &str, work: F) -> anyhow::Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-{
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let _ = sender.send(work());
-        })
-        .with_context(|| format!("start {name} thread"))?;
-    receiver
-        .await
-        .with_context(|| format!("{name} thread panicked"))?
 }
 
 /// `PATH` with `bin` first (and not repeated later).
@@ -626,40 +518,6 @@ fn open_beneath(root: &Path, path: &Path) -> anyhow::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn open_root() -> anyhow::Result<OwnedFd> {
-    let fd = unsafe {
-        libc::open(
-            c"/".as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("open namespace root");
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn enter(mount_ns: &OwnedFd, root: &OwnedFd) -> anyhow::Result<()> {
-    setns(mount_ns.as_raw_fd()).context("enter workset mount namespace")?;
-    let result = unsafe { libc::fchdir(root.as_raw_fd()) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("enter namespace root");
-    }
-    let result = unsafe { libc::chroot(c".".as_ptr()) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("chroot namespace root");
-    }
-    Ok(())
-}
-
-fn setns(fd: i32) -> std::io::Result<()> {
-    if unsafe { libc::setns(fd, 0) } != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use camino::Utf8Path;
@@ -687,4 +545,11 @@ mod tests {
             "/ws/other"
         );
     }
+}
+
+fn close_inherited_fds_on_exec() -> std::io::Result<()> {
+    if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }

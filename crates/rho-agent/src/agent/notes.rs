@@ -10,8 +10,8 @@ const MAX_DEPTH: usize = 16;
 const MAX_FILES: usize = 5;
 const MAX_READ: u64 = 1024 * 1024;
 
-pub(super) fn directory(workset: &rho_fs_view::Workset) -> anyhow::Result<PathBuf> {
-    let root = workset.state_dir()?.join("notes").into_std_path_buf();
+pub(super) fn directory(view: &crate::View) -> anyhow::Result<PathBuf> {
+    let root = view.state_dir().join("notes").into_std_path_buf();
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -169,12 +169,20 @@ mod tests {
                 camino::Utf8Path::new("/src"),
             )
             .unwrap();
-        let notes = directory(parent.workset()).unwrap();
+        let notes = directory(&parent).unwrap();
         std::fs::write(notes.join("progress.md"), "parent's progress").unwrap();
-        assert_eq!(directory(child.workset()).unwrap(), notes);
-        assert!(inventory(&directory(child.workset()).unwrap()).contains("progress.md"));
+        assert_eq!(directory(&child).unwrap(), notes);
+        assert!(inventory(&directory(&child).unwrap()).contains("progress.md"));
         let other = worksets.create().await.unwrap();
-        assert_ne!(directory(&other).unwrap(), notes);
+        assert_ne!(
+            directory(
+                &other
+                    .enter(rho_fs_view::Mode::Exposed, camino::Utf8Path::new("/src"))
+                    .unwrap()
+            )
+            .unwrap(),
+            notes
+        );
         worksets.discard_workset(workset.id()).await.unwrap();
         assert!(!notes.exists());
     }

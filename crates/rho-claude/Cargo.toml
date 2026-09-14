@@ -8,11 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
 base64.workspace = true
 bytes.workspace = true
 camino.workspace = true
 rho-fs-view.workspace = true
 rho-core.workspace = true
+rustix = { version = "1", features = ["process"] }
 senax-encoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,3 +23,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "namespace"
+harness = false

@@ -507,7 +507,7 @@ mod tests {
     use rho_inference::OpenAiResponsesProviderData as Data;
 
     use super::*;
-    use crate::db::AgentReadTxnExt as _;
+    use crate::db::{AgentReadTxnExt as _, AgentWriteTxnExt as _};
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode)]
     struct FutureData {

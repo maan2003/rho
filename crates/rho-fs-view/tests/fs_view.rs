@@ -59,13 +59,16 @@ fn workset_and_generated_root_work_in_the_view() {
     std::fs::write(skeleton.join("seeded"), "seed\n").unwrap();
     std::os::unix::fs::symlink("/nix/store", skeleton.join("store-link")).unwrap();
 
-    let shell = Path::new("/bin/sh").canonicalize().unwrap();
-    let git_bin = Path::new("/run/current-system/sw/bin/git")
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new("/usr/bin/git").canonicalize().unwrap());
-    let unshare = Path::new("/run/current-system/sw/bin/unshare")
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new("/usr/bin/unshare").canonicalize().unwrap());
+    let [shell, git_bin, unshare] = ["sh", "git", "unshare"].map(|name| {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .find_map(|dir| {
+                dir.join(name)
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| path.is_file())
+            })
+            .unwrap_or_else(|| panic!("{name} is required on PATH"))
+    });
     let script = format!(
         r#"
 set -eu

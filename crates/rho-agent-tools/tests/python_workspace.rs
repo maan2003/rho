@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use rho_agent_tools::{PythonNotebook, SourceWaker};
 use rho_core::ExecCall;
-use rho_fs_view::{Mode, PathOverrides, StoreService, UserEnvironment, Worksets};
+#[path = "../../rho-fs-view/tests/common/workset.rs"]
+mod common;
 use rho_tool_shell::ShellTools;
 
 fn main() {
@@ -15,23 +16,16 @@ fn main() {
         eprintln!("skipping python_workspace: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    common::run("", |base| async move {
         let daemon_cwd = std::env::current_dir().unwrap();
-        let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let work = temp.path().join("work");
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let work = std::path::Path::new("/src");
         std::fs::create_dir_all(work.join("project")).unwrap();
         std::fs::write(work.join("project/value"), "host").unwrap();
-        let environment = UserEnvironment::new(std::env::vars_os().collect());
-        let worksets = Worksets::open(temp.path().join("state"), environment, PathOverrides::default(), StoreService::None)
-            .await
-            .unwrap();
-        let workset = worksets.adopt(&work).unwrap();
-        let view = workset
-            .enter(Mode::View { home_skeleton: None }, camino::Utf8Path::new("/src/project"))
-            .unwrap();
-        let tool = PythonNotebook::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
+        let view = base.for_cwd(camino::Utf8Path::new("/src/project")).unwrap();
+        let tool =
+            PythonNotebook::new(ShellTools::new(Duration::from_secs(5), view), vec![]).unwrap();
         let wake = Arc::new(tokio::sync::Notify::new());
         let mut cell = tool.exec(ExecCall {
             id: "view".try_into().unwrap(),
@@ -41,18 +35,33 @@ fn main() {
             while !cell.execution().quiescent() {
                 wake.notified().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let output = cell.first_output();
         cell.acknowledge_output();
-        assert_eq!(output.status, rho_core::ToolOutputStatus::Success, "{output:?}");
+        assert_eq!(
+            output.status,
+            rho_core::ToolOutputStatus::Success,
+            "{output:?}"
+        );
         assert!(output.output.contains("/src/project"), "{output:?}");
-        assert_eq!(std::fs::read_to_string(work.join("project/value")).unwrap(), "python");
+        assert_eq!(
+            std::fs::read_to_string(work.join("project/value")).unwrap(),
+            "python"
+        );
         assert_eq!(std::env::current_dir().unwrap(), daemon_cwd);
 
-        assert!(std::process::Command::new("kill")
-            .args(["-INT", &std::process::id().to_string()])
-            .status().unwrap().success());
-        tokio::time::timeout(Duration::from_secs(2), interrupt.recv()).await
-            .expect("Python import replaced the host SIGINT handler").unwrap();
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-INT", &std::process::id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(2), interrupt.recv())
+            .await
+            .expect("Python import replaced the host SIGINT handler")
+            .unwrap();
     });
 }

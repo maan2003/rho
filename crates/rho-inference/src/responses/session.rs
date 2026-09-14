@@ -904,9 +904,12 @@ impl SessionTask {
         };
 
         let auth = selected.auth.clone();
-        let resolved = tokio::task::spawn_blocking(move || auth.resolve())
-            .await?
-            .map_err(|error| AuthFailure(error.into()))?;
+        let resolved = self
+            .config
+            .inference
+            .resolve_auth(auth)
+            .await
+            .map_err(AuthFailure)?;
         selected.account_id = resolved.account_id.clone();
         self.selected_auth = Some(selected.clone());
 

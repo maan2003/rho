@@ -31,10 +31,11 @@ pub const DEFAULT_ACCOUNT: &str = "default";
 /// pointed at a rig's state directory, but started by hand rather than by
 /// `rho-qa rig up`, read the user's own `~/.claude/projects` and rebuilt
 /// agent rows from the user's transcripts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, senax_encoder::Encode, senax_encoder::Decode)]
 pub struct ClaudePaths {
     config_home: Utf8PathBuf,
     accounts_root: Utf8PathBuf,
+    projects_root: Utf8PathBuf,
 }
 
 impl ClaudePaths {
@@ -49,6 +50,7 @@ impl ClaudePaths {
             Err(_) => home.join(".claude"),
         };
         Ok(Self {
+            projects_root: config_home.join("projects"),
             accounts_root: home.join(format!(".claude{ACCOUNTS_DIR_SUFFIX}")),
             config_home,
         })
@@ -62,9 +64,27 @@ impl ClaudePaths {
         let name = config_home.file_name().unwrap_or("claude").to_owned();
         let accounts_root = config_home.with_file_name(format!("{name}{ACCOUNTS_DIR_SUFFIX}"));
         Self {
+            projects_root: config_home.join("projects"),
             config_home,
             accounts_root,
         }
+    }
+
+    pub(crate) fn with_sources(
+        &self,
+        config_home: Utf8PathBuf,
+        accounts_root: Utf8PathBuf,
+        projects_root: Utf8PathBuf,
+    ) -> Self {
+        Self {
+            config_home,
+            accounts_root,
+            projects_root,
+        }
+    }
+
+    pub(crate) fn accounts_root(&self) -> &Utf8Path {
+        &self.accounts_root
     }
 
     /// The single path an agent's Claude sees as its config directory, and
@@ -76,7 +96,7 @@ impl ClaudePaths {
     /// Where the daemon reads transcripts from, since `projects/` is shared
     /// across accounts.
     pub fn projects(&self) -> Utf8PathBuf {
-        self.config_home.join("projects")
+        self.projects_root.clone()
     }
 
     /// The account directory for `name`, whether or not it exists yet.

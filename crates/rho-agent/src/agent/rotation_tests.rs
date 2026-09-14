@@ -4,7 +4,7 @@ use super::streaming::tests::agent as standard_agent;
 use super::*;
 use crate::{ContextChange, WakeTrigger};
 
-async fn agent(directory: &std::path::Path) -> Agent {
+async fn agent(directory: &std::path::Path) -> super::streaming::tests::TestAgent {
     let agent = standard_agent(directory).await;
     agent.head.write().unwrap().config.role = AgentRole::Engineer {
         intelligence: EngineerIntelligence::HighNotes,
@@ -58,7 +58,8 @@ async fn reply(agent: &mut Agent, items: Vec<InferenceResponseItem>, used: u64) 
             }),
             UnixMs::now(),
         )
-        .await;
+        .await
+        .unwrap();
 }
 
 async fn cell_returned(agent: &Agent) {
@@ -82,7 +83,9 @@ async fn cell_returned(agent: &Agent) {
     .unwrap();
 }
 
-fn latest_send(agent: &Agent) -> (Option<crate::ContextChange>, Vec<ContextBlock>) {
+fn latest_send(
+    agent: &super::streaming::tests::TestAgent,
+) -> (Option<crate::ContextChange>, Vec<ContextBlock>) {
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     events
         .into_iter()
@@ -111,8 +114,9 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     agent.context_used = Some(limit - context::RETAIN_TOKENS);
     agent
         .handle_control(Control::User(input("original task", 1), None), UnixMs(1))
-        .await;
-    agent.start_request(UnixMs(2), None).await;
+        .await
+        .unwrap();
+    agent.start_request(UnixMs(2), None).await.unwrap();
     let (change, _) = latest_send(&agent);
     assert_eq!(change, Some(ContextChange::Marked { retain_from: 1 }));
     let marker = agent.context.marker.unwrap();
@@ -123,8 +127,9 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
             Control::User(input("new task held during preparation", 3), None),
             UnixMs(3),
         )
-        .await;
-    agent.start_request(UnixMs(4), None).await;
+        .await
+        .unwrap();
+    agent.start_request(UnixMs(4), None).await.unwrap();
     let (change, blocks) = latest_send(&agent);
     assert_eq!(
         change,
@@ -140,7 +145,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     );
     assert_eq!(agent.user.len(), 1);
     assert_eq!(
-        rho_core::context_window_start(&agent.provider_input()),
+        rho_core::context_window_start(&agent.provider_input().await.unwrap()),
         0,
         "preparation still sees the old context"
     );
@@ -160,9 +165,9 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     assert!(
         matches!(agent.decide(UnixMs::now()), Boundary::Now { wake } if wake.trigger == WakeTrigger::ContextRotation)
     );
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     assert_eq!(
-        rho_core::context_window_start(&agent.provider_input()),
+        rho_core::context_window_start(&agent.provider_input().await.unwrap()),
         marker
     );
     assert!(agent.context.marker.is_none());
@@ -176,7 +181,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     );
     assert!(
         matches!(
-            &*agent.provider_input()[0],
+            &*agent.provider_input().await.unwrap()[0],
             ContextBlock::UserMessage { .. }
         ),
         "full history is untouched"
@@ -184,7 +189,7 @@ async fn marker_preparation_rotation_and_replay_preserve_queued_input() {
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     let replayed = replay::replay(events);
     assert_eq!(rho_core::context_window_start(&replayed.history), marker);
-    assert_eq!(replayed.history, agent.provider_input());
+    assert_eq!(replayed.history, agent.provider_input().await.unwrap());
     assert_eq!(replayed.context_used, None);
     assert!(replayed.user.is_empty());
 }
@@ -199,7 +204,7 @@ async fn preparation_waits_for_python_and_allows_only_one_repair() {
     };
     let limit = agent.session.auto_compact_token_limit().unwrap();
     agent.context_used = Some(limit);
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     reply(
         &mut agent,
         vec![exec(
@@ -220,11 +225,12 @@ async fn preparation_waits_for_python_and_allows_only_one_repair() {
             ),
             UnixMs(5),
         )
-        .await;
+        .await
+        .unwrap();
     assert!(matches!(agent.decide(UnixMs::now()), Boundary::No { .. }));
     cell_returned(&agent).await;
     assert!(matches!(agent.decide(UnixMs::now()), Boundary::Now { .. }));
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(matches!(
         latest_send(&agent).0,
         Some(ContextChange::Preparing { repair: true, .. })
@@ -240,7 +246,7 @@ async fn preparation_waits_for_python_and_allows_only_one_repair() {
     )
     .await;
     cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
             .1
@@ -265,10 +271,10 @@ async fn preparation_preserves_python_state_and_does_not_wait_for_old_jobs() {
     )
     .await;
     cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     reply(&mut agent, vec![message("continue")], limit).await;
     agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     reply(
         &mut agent,
         vec![exec("prepare", "assert remembered == 41\nremembered += 1")],
@@ -276,7 +282,7 @@ async fn preparation_preserves_python_state_and_does_not_wait_for_old_jobs() {
     )
     .await;
     cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
             .1
@@ -306,7 +312,7 @@ async fn cancellation_stops_preparation_even_with_buffered_input() {
         standing: Standing::Asked,
     };
     agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     reply(
         &mut agent,
         vec![exec("prepare", "import asyncio\nawait asyncio.sleep(60)")],
@@ -315,8 +321,12 @@ async fn cancellation_stops_preparation_even_with_buffered_input() {
     .await;
     agent
         .handle_control(Control::User(input("held", 0), None), UnixMs(0))
-        .await;
-    agent.handle_control(Control::Cancel, UnixMs::now()).await;
+        .await
+        .unwrap();
+    agent
+        .handle_control(Control::Cancel, UnixMs::now())
+        .await
+        .unwrap();
     assert!(agent.context.preparation.is_none());
     assert!(agent.user.is_empty());
     assert!(matches!(
@@ -355,28 +365,33 @@ async fn terminal_preparation_failure_allows_fresh_input_and_explicit_retry() {
             standing: Standing::Asked,
         };
         agent.context_used = agent.session.auto_compact_token_limit();
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         agent
             .fail(
                 UnixMs(10),
                 PendingInferenceResponse::default(),
                 "terminal error".into(),
             )
-            .await;
+            .await
+            .unwrap();
         assert!(agent.context.preparation.is_none());
         assert!(matches!(
             agent.decide(UnixMs(11)),
             Boundary::No { recheck: None }
         ));
         if retry {
-            agent.handle_control(Control::Retry, UnixMs(12)).await;
+            agent
+                .handle_control(Control::Retry, UnixMs(12))
+                .await
+                .unwrap();
         } else {
             agent
                 .handle_control(Control::User(input("try again", 12), None), UnixMs(12))
-                .await;
+                .await
+                .unwrap();
         }
         assert!(matches!(agent.decide(UnixMs(13)), Boundary::Now { .. }));
-        agent.start_request(UnixMs(13), None).await;
+        agent.start_request(UnixMs(13), None).await.unwrap();
         assert!(matches!(
             latest_send(&agent).0,
             Some(ContextChange::Preparing { repair: false, .. })
@@ -410,7 +425,8 @@ async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
                     wake: None,
                 },
             ))
-            .await;
+            .await
+            .unwrap();
         agent.context.sent(&change);
         agent.context_used = agent.session.auto_compact_token_limit();
         agent
@@ -424,8 +440,9 @@ async fn manual_compaction_in_notes_role_uses_provider_and_cancels_rotation() {
                 ),
                 UnixMs(2),
             )
-            .await;
-        agent.start_request(UnixMs(3), None).await;
+            .await
+            .unwrap();
+        agent.start_request(UnixMs(3), None).await.unwrap();
         let (change, blocks) = latest_send(&agent);
         assert!(change.is_none());
         assert!(matches!(
@@ -457,7 +474,7 @@ async fn failed_preparation_without_headroom_rotates_without_repair() {
         standing: Standing::Asked,
     };
     agent.context_used = agent.session.auto_compact_token_limit();
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     let used = agent.session.context_window().unwrap() - context::REPAIR_HEADROOM + 1;
     reply(
         &mut agent,
@@ -466,7 +483,7 @@ async fn failed_preparation_without_headroom_rotates_without_repair() {
     )
     .await;
     cell_returned(&agent).await;
-    agent.start_request(UnixMs::now(), None).await;
+    agent.start_request(UnixMs::now(), None).await.unwrap();
     assert!(
         latest_send(&agent)
             .1
@@ -508,9 +525,9 @@ async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
                 at: UnixMs::now(),
             });
         }
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         assert!(matches!(
-            &**agent.provider_input().last().unwrap(),
+            &**agent.provider_input().await.unwrap().last().unwrap(),
             ContextBlock::CompactionTrigger
         ));
         assert!(agent.context.marker.is_none());
@@ -518,6 +535,8 @@ async fn ordinary_roles_keep_standard_manual_and_automatic_compaction() {
         assert!(
             !agent
                 .provider_input()
+                .await
+                .unwrap()
                 .iter()
                 .any(|block| matches!(&**block, ContextBlock::DeveloperMessage { .. }))
         );
@@ -565,7 +584,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
         // Drain tool output, then settle the synthetic provider response.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                agent.start_request(UnixMs::now(), None).await;
+                agent.start_request(UnixMs::now(), None).await.unwrap();
                 agent.session.abort();
                 reply(&mut agent, vec![message("done")], 100).await;
                 if agent.execs.is_empty() {
@@ -599,7 +618,7 @@ async fn role_switches_preserve_python_and_refresh_instructions() {
             role.session_profile().unwrap().deep_model().unwrap()
         );
 
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         reply(
             &mut agent,
             vec![exec(
@@ -630,7 +649,7 @@ async fn role_switches_cancel_pending_rotation_durably() {
 
     // Model the marker and an interrupted preparation.
     let change = ContextChange::Preparing {
-        retain_from: agent.provider_input().len() as u64,
+        retain_from: agent.provider_input().await.unwrap().len() as u64,
         repair: false,
     };
     let blocks = vec![ContextBlock::DeveloperMessage {
@@ -645,7 +664,8 @@ async fn role_switches_cancel_pending_rotation_durably() {
                 wake: None,
             },
         ))
-        .await;
+        .await
+        .unwrap();
     agent.context.sent(&change);
     agent
         .change_role(AgentRole::Engineer {
@@ -658,7 +678,10 @@ async fn role_switches_cancel_pending_rotation_durably() {
 
     let (_, events) = agent.db.read().agent_events(agent.agent_id);
     let restored = replay::replay(events);
-    assert_eq!(restored.history.len(), agent.provider_input().len());
+    assert_eq!(
+        restored.history.len(),
+        agent.provider_input().await.unwrap().len()
+    );
     assert!(restored.context.marker.is_none());
     assert!(restored.context.preparation.is_none());
     assert!(restored.recovery_notes.is_empty());
@@ -685,14 +708,15 @@ async fn compaction_retries_preserve_task_obligations_and_manual_override() {
                 ..input("", 1)
             });
         }
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::TemporaryFailure {
                 error: Arc::new(anyhow::anyhow!("disconnected")),
                 retrying_at: std::time::Instant::now(),
             }))
-            .await;
-        agent.start_request(UnixMs::now(), None).await;
+            .await
+            .unwrap();
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         assert!(agent.context.preparation.is_none());
         assert!(
             matches!(&agent.phase, Phase::Requesting(request) if request.compaction_owes_reply == !manual)
@@ -723,7 +747,7 @@ async fn compaction_retries_preserve_task_obligations_and_manual_override() {
         if manual {
             // The fulfilled manual override must not disable future automatic rotation.
             agent.context_used = agent.session.auto_compact_token_limit();
-            agent.start_request(UnixMs::now(), None).await;
+            agent.start_request(UnixMs::now(), None).await.unwrap();
             assert!(agent.context.preparation.is_some());
             agent.session.abort();
         }

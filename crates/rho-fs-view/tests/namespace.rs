@@ -3,23 +3,37 @@
 //! stack. Runs without the libtest harness because the identity user
 //! namespace must be created while the process is still single-threaded.
 
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use camino::Utf8Path;
-use rho_fs_view::{ClaudeHome, MAX_BOUNDED_READ, Mode};
+use rho_fs_view::{MAX_BOUNDED_READ, Mode};
 
 mod common;
 use common::{GitDaemon, only_store, open_worksets, setup_remote};
 
 fn main() {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).is_some_and(|arg| arg == "--inside") {
+        let bytes = std::fs::read(&args[2]).unwrap();
+        let layout: rho_fs_view::WorksetLayout =
+            senax_encoder::decode(&mut bytes.as_slice()).unwrap();
+        unsafe {
+            layout.build().unwrap();
+            layout.enter().unwrap();
+        }
+        std::env::set_current_dir(&args[3]).unwrap();
+        panic!(
+            "exec workset command: {}",
+            Command::new(&args[4]).args(&args[5..]).exec()
+        );
+    }
     let unshare = Command::new("unshare").args(["-U", "true"]).status();
     if !unshare.map(|status| status.success()).unwrap_or(false) {
         eprintln!("skipping namespace test: kernel forbids unshare(CLONE_NEWUSER)");
         return;
     }
-    // SAFETY: no threads exist yet.
-    unsafe { rho_fs_view::init_daemon_namespace() }.unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -60,6 +74,16 @@ async fn run() {
             Utf8Path::new("/src"),
         )
         .unwrap();
+    let mount_root = temp.path().join("view-root");
+    std::fs::create_dir(&mount_root).unwrap();
+    let layout_path = temp.path().join("layout");
+    let layout = rho_fs_view::WorksetLayout::new(
+        &workset,
+        ns.mode().clone(),
+        mount_root.try_into().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&layout_path, senax_encoder::encode(&layout).unwrap()).unwrap();
     assert_eq!(ns.visible_root(), "/src");
     assert_eq!(ns.cwd(), "/src");
     assert!(
@@ -200,7 +224,9 @@ test ! -e /src/.stores
     );
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg(&script);
-    ns.prepare_command(&mut command, None).await.unwrap();
+    prepare(&ns, &layout_path, &mut command, None)
+        .await
+        .unwrap();
     let output = command.output().await.unwrap();
     assert!(
         output.status.success(),
@@ -224,7 +250,9 @@ test ! -e /src/.stores
     command.arg("-c").arg(format!(
         "test \"$(cat {notes}/progress.md)\" = \"after rotation\" && printf child > {notes}/child.md"
     ));
-    child.prepare_command(&mut command, None).await.unwrap();
+    prepare(&child, &layout_path, &mut command, None)
+        .await
+        .unwrap();
     assert!(command.status().await.unwrap().success());
     assert_eq!(
         std::fs::read_to_string(notes.join("child.md")).unwrap(),
@@ -245,113 +273,52 @@ test ! -e /src/.stores
     // cwd is a visible path below /src.
     let mut command = tokio::process::Command::new(&sh);
     command.arg("-c").arg("pwd");
-    ns.prepare_command(&mut command, Some(Utf8Path::new("second")))
-        .await
-        .unwrap();
+    prepare(
+        &ns,
+        &layout_path,
+        &mut command,
+        Some(Utf8Path::new("second")),
+    )
+    .await
+    .unwrap();
     let output = command.output().await.unwrap();
     assert_eq!(String::from_utf8_lossy(&output.stdout), "/src/second\n");
     let mut command = tokio::process::Command::new(&sh);
     assert!(
-        ns.prepare_command(&mut command, Some(Utf8Path::new("/tmp")))
+        prepare(&ns, &layout_path, &mut command, Some(Utf8Path::new("/tmp")))
             .await
             .is_err()
     );
 
-    // Claude home: mounted into the live namespace, replaceable.
-    let host_home = dirs::home_dir().unwrap();
-    let account = |name: &str, prompt: &str, settings: &str| {
-        let account = temp.path().join(name);
-        std::fs::create_dir_all(account.join("projects")).unwrap();
-        std::fs::write(account.join("CLAUDE.md"), "").unwrap();
-        std::fs::write(account.join("settings.json"), "").unwrap();
-        std::fs::write(account.join("marker"), format!("{name}\n")).unwrap();
-        std::fs::write(temp.path().join(format!("{name}-prompt.md")), prompt).unwrap();
-        std::fs::write(temp.path().join(format!("{name}-settings.json")), settings).unwrap();
-        account
-    };
-    let shared = temp.path().join("shared-projects");
-    std::fs::create_dir_all(shared.join("shared-marker")).unwrap();
-    let account_one = account("account-one", "PROMPT ONE\n", "{\"one\":true}\n");
-    let account_two = account("account-two", "PROMPT TWO\n", "{\"two\":true}\n");
-    let home_one = ClaudeHome {
-        account: account_one,
-        config_home: host_home.join(".claude"),
-        shared_projects: shared.clone(),
-        prompt: temp.path().join("account-one-prompt.md"),
-        settings: Some(temp.path().join("account-one-settings.json")),
-    };
-    let home_two = ClaudeHome {
-        account: account_two,
-        config_home: host_home.join(".claude"),
-        shared_projects: shared.clone(),
-        prompt: temp.path().join("account-two-prompt.md"),
-        settings: None,
-    };
-
-    let script = r#"
-        read -r line < "$HOME/.claude/CLAUDE.md"; echo "prompt=$line"
-        read -r line < "$HOME/.claude/settings.json" || true; echo "settings=$line"
-        read -r line < "$HOME/.claude/marker"; echo "marker=$line"
-        for entry in "$HOME"/.claude/projects/*; do echo "project=${entry##*/}"; done
-        echo "home=$HOME"
-    "#;
-    let observe = async |ns: &rho_fs_view::Namespace| {
-        let mut command = tokio::process::Command::new(&sh);
-        command.arg("-c").arg(script);
-        ns.prepare_command(&mut command, None).await.unwrap();
-        let output = command.output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    };
-
-    ns.set_claude_home(home_one.clone()).await.unwrap();
-    let seen = observe(&ns).await;
-    assert!(seen.contains("prompt=PROMPT ONE\n"), "{seen}");
-    assert!(seen.contains("settings={\"one\":true}\n"), "{seen}");
-    assert!(seen.contains("marker=account-one\n"), "{seen}");
-    assert!(seen.contains("project=shared-marker\n"), "{seen}");
-    assert!(seen.contains("home=/home/agent\n"), "{seen}");
-
-    // Same home again is a no-op; a different one replaces the stack.
-    ns.set_claude_home(home_one.clone()).await.unwrap();
-    ns.set_claude_home(home_two.clone()).await.unwrap();
-    let seen = observe(&ns).await;
-    assert!(seen.contains("prompt=PROMPT TWO\n"), "{seen}");
-    assert!(seen.contains("settings=\n"), "{seen}");
-    assert!(seen.contains("marker=account-two\n"), "{seen}");
-    assert!(seen.contains("project=shared-marker\n"), "{seen}");
-
-    // Writes through the mount land in the host account directory.
-    let mut command = tokio::process::Command::new(&sh);
-    command
-        .arg("-c")
-        .arg("echo written > \"$HOME/.claude/projects/from-agent\"");
-    ns.prepare_command(&mut command, None).await.unwrap();
-    assert!(command.status().await.unwrap().success());
-    assert_eq!(
-        std::fs::read_to_string(shared.join("from-agent")).unwrap(),
-        "written\n"
-    );
-
-    // A missing account fails cleanly and leaves the previous home mounted.
-    let broken = ClaudeHome {
-        account: temp.path().join("missing"),
-        ..home_two.clone()
-    };
-    assert!(ns.set_claude_home(broken).await.is_err());
-    let seen = observe(&ns).await;
-    assert!(seen.contains("prompt=PROMPT TWO\n"), "{seen}");
-    // The host home was never touched.
-    assert!(
-        !host_home.join(".claude/marker").exists() || {
-            std::fs::read_to_string(host_home.join(".claude/marker"))
-                .map(|marker| !marker.starts_with("account-"))
-                .unwrap_or(true)
-        }
-    );
     println!("namespace test passed");
+}
+
+// Exercise command inheritance in a fresh, single-threaded execution process.
+// Mount roots remain owned and cleaned in this test's parent frame.
+async fn prepare(
+    view: &rho_fs_view::Namespace,
+    layout: &Path,
+    command: &mut tokio::process::Command,
+    cwd: Option<&Utf8Path>,
+) -> anyhow::Result<()> {
+    view.prepare_command(command, cwd).await?;
+    let mut inside = tokio::process::Command::new(std::env::current_exe()?);
+    inside
+        .arg("--inside")
+        .arg(layout)
+        .arg(command.as_std().get_current_dir().unwrap())
+        .arg(command.as_std().get_program())
+        .args(command.as_std().get_args());
+    for (key, value) in command.as_std().get_envs() {
+        match value {
+            Some(value) => {
+                inside.env(key, value);
+            }
+            None => {
+                inside.env_remove(key);
+            }
+        }
+    }
+    *command = inside;
+    Ok(())
 }

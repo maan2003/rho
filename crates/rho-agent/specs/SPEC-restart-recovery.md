@@ -8,16 +8,20 @@ interrupted executions are represented.
 
 ## Contract
 
-A restart is anything that stopped the process. A crash and a clean shutdown are
-indistinguishable from the log and are treated alike, which is why the note
-below says "restarted" rather than "crashed".
+A restart tears down and reloads an agent runtime, whether through idle eviction
+or workset-process death. Other agents and retained sessions can survive an
+individual runtime's eviction.
+Crashes and clean shutdowns have the same conversation-recovery rules. A daemon
+may record a coarse worker-failure event, but that is not an execution journal
+or evidence of which unrecorded statements ran.
 
 Restarting is not a state of its own. A loaded agent and a fresh one are both
 `Phase::Idle`; loading supplies `owed` and a restart notice, not live execution state.
 
 ### `owed`: what the next request must open with
 
-No tool or Python namespace survives a restart. Only coherent conversation
+No notebook or managed job handle survives a restart. OS descendants may survive
+an unexpected worker death and continue external effects. Only coherent conversation
 boundaries are persisted; streaming source, unit admission, and settlement are
 in memory. Recent execution, source, and output may be absent from the saved
 conversation. External effects are not rolled back, and recovery must not claim
@@ -45,8 +49,8 @@ It emits, ahead of everything the sources drain:
    many calls were owed, because the restart happened once, and prose belongs in a message rather than dressed up as
    output some tool never produced.
 
-Settling at the first request rather than at load means an agent that is only
-opened and read is never written to, and it puts the note beside the request it
+Settling at the first request rather than at load means reading history never
+writes placeholder tool answers, and it puts the note beside the request it
 explains. It also makes recovery idempotent: those call ids appear in a
 `ToolResults` block of the resulting `NativeEvent::RequestStarted`, so a second restart
 derives an `owed` without them.

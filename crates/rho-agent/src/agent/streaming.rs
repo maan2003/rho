@@ -43,23 +43,29 @@ pub(super) fn progress_note(
 }
 
 impl Agent {
-    pub(super) async fn update_stream(&mut self, now: UnixMs) -> Result<(), String> {
+    pub(super) async fn update_stream(&mut self, now: UnixMs) -> anyhow::Result<()> {
         let Phase::Requesting(in_flight) = &self.phase else {
             return Ok(());
         };
-        let Some((index, item, incoming)) = rho_inference::exec::stream(&in_flight.pending)? else {
+        let Some((index, item, incoming)) =
+            rho_inference::exec::stream(&in_flight.pending).map_err(anyhow::Error::msg)?
+        else {
             return if in_flight.stream.is_some() {
-                Err("Provider removed an active streaming exec call".into())
+                Err(anyhow::anyhow!(
+                    "Provider removed an active streaming exec call"
+                ))
             } else {
                 Ok(())
             };
         };
         if incoming.source.len() > 1024 * 1024 {
-            return Err("Streaming Python source exceeds 1 MiB".into());
+            return Err(anyhow::anyhow!("Streaming Python source exceeds 1 MiB"));
         }
         if let Some(id) = &in_flight.stream {
             if id != &incoming.id {
-                return Err("Provider changed the streaming exec identity".into());
+                return Err(anyhow::anyhow!(
+                    "Provider changed the streaming exec identity"
+                ));
             }
             let stream = self.streams.get_mut(id).unwrap();
             let mut identity = item.clone();
@@ -68,25 +74,27 @@ impl Agent {
                 || identity != stream.item
                 || !incoming.source.starts_with(&stream.source)
             {
-                return Err(
-                    "Provider changed previously received Python source or call metadata".into(),
-                );
+                return Err(anyhow::anyhow!(
+                    "Provider changed previously received Python source or call metadata"
+                ));
             }
             let fragment = incoming.source[stream.source.len()..].to_owned();
             stream.source = incoming.source;
             self.execs.get_mut(id).unwrap().call.source = stream.source.clone();
             if !stream.stopped && !stream.closed && !fragment.is_empty() {
-                stream.exec.feed(fragment, false)?;
+                stream
+                    .exec
+                    .feed(fragment, false)
+                    .map_err(anyhow::Error::msg)?;
             }
             return Ok(());
         }
         if self.execs.contains_key(&incoming.id)
-            || self
-                .db
-                .read()
-                .agent_exec_was_admitted(self.agent_id, &incoming.id)
+            || self.host.exec_was_admitted(incoming.id.clone()).await?
         {
-            return Err("Provider reused an earlier tool call identity".into());
+            return Err(anyhow::anyhow!(
+                "Provider reused an earlier tool call identity"
+            ));
         }
         let tool = &self.surface.get_if_ready().unwrap().notebook;
         let session = tool.start_stream(incoming.id.clone(), SourceWaker::new(self.wake.clone()));
@@ -98,7 +106,7 @@ impl Agent {
             milestone: rho_core::ExecMilestone::FirstBlock,
             at: now,
         })
-        .await;
+        .await?;
         self.execs.insert(
             incoming.id.clone(),
             RunningExec {
@@ -134,6 +142,7 @@ impl Agent {
         };
         in_flight.stream = Some(incoming.id);
         exec.feed(incoming.source, false)
+            .map_err(anyhow::Error::msg)
     }
 
     pub(super) fn advance_streams(&mut self, admit: bool) {
@@ -204,12 +213,12 @@ impl Agent {
         Ok(())
     }
 
-    pub(super) async fn abandon_stream(&mut self, now: UnixMs) -> bool {
+    pub(super) async fn abandon_stream(&mut self, now: UnixMs) -> anyhow::Result<bool> {
         let Phase::Requesting(in_flight) = &mut self.phase else {
-            return false;
+            return Ok(false);
         };
         let Some(id) = in_flight.stream.take() else {
-            return false;
+            return Ok(false);
         };
         let stream = self.streams.get_mut(&id).unwrap();
         stream.stopped = true;
@@ -219,7 +228,7 @@ impl Agent {
             self.streams.remove(&id);
             self.execs.remove(&id);
             self.latest_python_exec = None;
-            return false;
+            return Ok(false);
         }
         let mut item = stream.item.clone();
         set_source(&mut item, stream.source[..stream.admitted].to_owned());
@@ -236,8 +245,8 @@ impl Agent {
             usage: None,
             at: now,
         }))
-        .await;
-        true
+        .await?;
+        Ok(true)
     }
 
     /// Retire live stream state after the boundary has accepted its output.
@@ -294,7 +303,24 @@ pub(in crate::agent) mod tests {
 
     use super::*;
 
-    pub(in crate::agent) async fn agent(directory: &std::path::Path) -> Agent {
+    pub(in crate::agent) struct TestAgent {
+        pub agent: Agent,
+        pub db: RhoDb,
+        pub agent_id: AgentId,
+    }
+    impl std::ops::Deref for TestAgent {
+        type Target = Agent;
+        fn deref(&self) -> &Agent {
+            &self.agent
+        }
+    }
+    impl std::ops::DerefMut for TestAgent {
+        fn deref_mut(&mut self) -> &mut Agent {
+            &mut self.agent
+        }
+    }
+
+    pub(in crate::agent) async fn agent(directory: &std::path::Path) -> TestAgent {
         let db = RhoDb::open(directory.join("agent.redb"));
         let inference = Inference::new_with_config(
             db.clone(),
@@ -358,43 +384,47 @@ pub(in crate::agent) mod tests {
         let surface = Surface {
             prompt: PromptInputs {
                 view,
-                multi_agent: None,
+                host: None,
                 host_specs: Vec::new(),
                 notes: Some(Lazy::ready(directory.join("notes"))),
             },
             notebook,
         };
-        let (control, control_rx) = mpsc::unbounded_channel();
-        Agent {
+        let (_control, control_rx) = mpsc::unbounded_channel();
+        let host =
+            crate::worker::local_services(db.clone(), inference.clone(), id, Default::default());
+        let status = Arc::new(RwLock::new(AgentStatus {
+            kind: AgentStateKind::Idle,
+            queued: 0,
+        }));
+        host.observe(&status);
+        TestAgent {
             db,
             agent_id: id,
-            pool: Default::default(),
-            surface: Arc::new(Lazy::ready(surface)),
-            model,
-            context: Default::default(),
-            session: inference.deep_session(profile, model, key),
-            phase: Phase::Requesting(InFlight::default()),
-            user: Vec::new(),
-            mail: Vec::new(),
-            execs: BTreeMap::new(),
-            observations: Observations::default(),
-            streams: BTreeMap::new(),
-            recovery_notes: Vec::new(),
-            context_used: None,
-            turn: None,
-            latest_python_exec: None,
-            total_usage: Default::default(),
-            title: crate::title::Task::new(inference),
-            working: false,
-            wake: Arc::new(Notify::new()),
-            status: Arc::new(RwLock::new(AgentStatus {
-                kind: AgentStateKind::Idle,
-                queued: 0,
-            })),
-            head: Arc::new(RwLock::new(head)),
-            teller: Default::default(),
-            control: control.downgrade(),
-            control_rx,
+            agent: Agent {
+                name_updates: host.names(),
+                host,
+                surface: Arc::new(Lazy::ready(surface)),
+                model,
+                context: Default::default(),
+                session: inference.deep_session(profile, model, key),
+                phase: Phase::Requesting(InFlight::default()),
+                user: Vec::new(),
+                mail: Vec::new(),
+                execs: BTreeMap::new(),
+                observations: Observations::default(),
+                streams: BTreeMap::new(),
+                recovery_notes: Vec::new(),
+                context_used: None,
+                turn: None,
+                latest_python_exec: None,
+                total_usage: Default::default(),
+                working: false,
+                wake: Arc::new(Notify::new()),
+                status,
+                head: Arc::new(RwLock::new(head)),
+                control_rx,
+            },
         }
     }
 
@@ -430,11 +460,35 @@ pub(in crate::agent) mod tests {
     }
 
     #[tokio::test]
+    async fn store_disconnect_is_fatal_before_stream_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut agent = agent(directory.path()).await;
+        let before = agent.db.read().agent_event_records(agent.agent_id);
+        let (client, server) = crate::worker::testing::pair();
+        agent.host = client.host();
+        drop(server);
+        agent.host.closed().await;
+        let error = agent
+            .handle(update("disconnected", "open('wrong', 'w').write('x')\n"))
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::worker::StoreError>());
+        assert!(
+            matches!(agent.phase, Phase::Requesting(_)),
+            "no provider retry or failure transition"
+        );
+        assert!(agent.execs.is_empty());
+        assert!(agent.streams.is_empty());
+        assert!(!directory.path().join("wrong").exists());
+        assert_eq!(agent.db.read().agent_event_records(agent.agent_id), before);
+    }
+
+    #[tokio::test]
     async fn units_execute_without_database_access_and_restart_drops_unsaved_source() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
         let source = "Path('marker').write_text('first')\nPath('marker').write_text('second')\n";
-        agent.handle(update("one", source)).await;
+        agent.handle(update("one", source)).await.unwrap();
         let db = agent.db.clone();
         let (_, before) = db.read().agent_events(agent.agent_id);
         // The first-block observation is coarse metadata; unit admission and
@@ -479,7 +533,8 @@ pub(in crate::agent) mod tests {
                 "one",
                 "job = command(\"printf x >> marker; printf fresh-output\")\n",
             ))
-            .await;
+            .await
+            .unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().completed > 0
         })
@@ -502,13 +557,15 @@ pub(in crate::agent) mod tests {
                 index: 0,
                 event: ContextItemEvent::Finish,
             }))
-            .await;
+            .await
+            .unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::Finished {
                 usage: None,
                 provider_response_id: None,
             }))
-            .await;
+            .await
+            .unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().closed
         })
@@ -525,9 +582,9 @@ pub(in crate::agent) mod tests {
         let recovered = replay::replay(events);
         assert_eq!(recovered.owed.len(), 1);
         assert!(recovered.recovery_notes.is_empty());
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         agent.session.abort();
-        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         assert!(replay::replay(events).owed.is_empty());
@@ -543,7 +600,8 @@ pub(in crate::agent) mod tests {
                 "one",
                 &format!("{prefix}if True:\n    command('touch wrong')\n"),
             ))
-            .await;
+            .await
+            .unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().completed == prefix.len()
         })
@@ -553,7 +611,8 @@ pub(in crate::agent) mod tests {
                 error: Arc::new(anyhow::anyhow!("stream disconnected")),
                 retrying_at: std::time::Instant::now(),
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(
             agent.phase,
             Phase::Idle {
@@ -569,20 +628,20 @@ pub(in crate::agent) mod tests {
         let recovered = replay::replay(events);
         assert_eq!(recovered.owed.len(), 1);
         assert!(recovered.recovery_notes.is_empty());
-        agent.start_request(UnixMs::now(), None).await;
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         agent.session.abort();
         assert!(!directory.path().join("wrong").exists());
         assert_eq!(
             std::fs::read_to_string(directory.path().join("marker")).unwrap(),
             "x"
         );
-        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result| result.body.output.contains("fresh-output")))));
-        assert!(agent.provider_input().iter().any(|block| matches!(&**block,
+        assert!(agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::ToolResults { results } if results.iter().any(|result|
                 result.body.output.contains("Your response was interrupted while generating this tool call.")
                 && result.body.output.contains("fresh-output")))));
-        assert!(!agent.provider_input().iter().any(|block| matches!(&**block,
+        assert!(!agent.provider_input().await.unwrap().iter().any(|block| matches!(&**block,
             ContextBlock::UserMessage { content, .. } if rho_core::text_content(content).contains("stream disconnected"))));
         assert!(agent.recovery_notes.is_empty());
         assert!(matches!(&agent.phase, Phase::Requesting(in_flight) if in_flight.retry.is_none()));
@@ -593,7 +652,7 @@ pub(in crate::agent) mod tests {
             let directory = tempfile::tempdir().unwrap();
             let mut agent = agent(directory.path()).await;
             let prefix = "Path('marker').write_text('x')\n";
-            agent.handle(update("one", prefix)).await;
+            agent.handle(update("one", prefix)).await.unwrap();
             until(&mut agent, |agent| {
                 agent.streams.values().next().unwrap().completed == prefix.len()
             })
@@ -611,7 +670,7 @@ pub(in crate::agent) mod tests {
                 }
                 _ => update("one", &format!("{prefix}{}", "x".repeat(1024 * 1024))),
             };
-            agent.handle(bad).await;
+            agent.handle(bad).await.unwrap();
             assert!(matches!(
                 agent.phase,
                 Phase::Idle {
@@ -638,7 +697,8 @@ pub(in crate::agent) mod tests {
         let mut agent = agent(directory.path()).await;
         agent
             .handle(update("one", "Path('wrong').write_text('x')\n"))
-            .await;
+            .await
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             while agent
                 .streams
@@ -670,7 +730,7 @@ pub(in crate::agent) mod tests {
         agent.advance_streams(decision != Boundary::AbortAndResend);
         assert_eq!(agent.streams.values().next().unwrap().admitted, 0);
         let exec = agent.streams.values().next().unwrap().exec.clone();
-        agent.abandon_stream(UnixMs::now()).await;
+        agent.abandon_stream(UnixMs::now()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(15), async {
             while !exec.stream_progress().returned {
                 agent.wake.notified().await;
@@ -680,7 +740,7 @@ pub(in crate::agent) mod tests {
         .unwrap();
         assert!(agent.streams.is_empty());
         assert!(agent.execs.is_empty());
-        assert!(agent.provider_input().is_empty());
+        assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(!directory.path().join("wrong").exists());
     }
 
@@ -689,7 +749,7 @@ pub(in crate::agent) mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
         let source = "import asyncio\ngate = asyncio.Event()\nawait gate.wait()\n";
-        agent.handle(update("one", source)).await;
+        agent.handle(update("one", source)).await.unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().admitted == source.len()
         })
@@ -699,14 +759,16 @@ pub(in crate::agent) mod tests {
                 index: 0,
                 event: ContextItemEvent::Finish,
             }))
-            .await;
+            .await
+            .unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::Finished {
                 usage: None,
                 provider_response_id: None,
             }))
-            .await;
-        agent.start_request(UnixMs::now(), None).await;
+            .await
+            .unwrap();
+        agent.start_request(UnixMs::now(), None).await.unwrap();
         agent.session.abort();
         assert_eq!(
             agent.streams.len(),
@@ -723,7 +785,7 @@ pub(in crate::agent) mod tests {
         // Another notebook cell can release it; the original execution still
         // carries the eventual settlement in memory.
         agent.phase = Phase::Requesting(InFlight::default());
-        agent.handle(update("two", "gate.set()\n")).await;
+        agent.handle(update("two", "gate.set()\n")).await.unwrap();
         until(&mut agent, |agent| {
             agent
                 .streams
@@ -755,26 +817,31 @@ pub(in crate::agent) mod tests {
     async fn rewind_rebuilds_recovery_state_instead_of_carrying_abandoned_notes() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
-        agent.handle(update("one", "survives_rewind = 42\n")).await;
+        agent
+            .handle(update("one", "survives_rewind = 42\n"))
+            .await
+            .unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::ContextItem {
                 index: 0,
                 event: ContextItemEvent::Finish,
             }))
-            .await;
+            .await
+            .unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::Finished {
                 usage: None,
                 provider_response_id: None,
             }))
-            .await;
+            .await
+            .unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().closed
         })
         .await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while !agent.execs.is_empty() {
-                agent.start_request(UnixMs::now(), None).await;
+                agent.start_request(UnixMs::now(), None).await.unwrap();
                 agent.session.abort();
                 agent.phase = Phase::Idle {
                     owed: Vec::new(),
@@ -796,17 +863,18 @@ pub(in crate::agent) mod tests {
                 delivery: MessageDelivery::NextRequest,
                 at: UnixMs::now(),
             }))
-            .await;
+            .await
+            .unwrap();
         agent.recovery_notes.push("old failed attempt".into());
         agent.rewind(1).await.unwrap();
         assert!(agent.recovery_notes.is_empty());
         assert!(
-            !agent.provider_input().is_empty(),
+            !agent.provider_input().await.unwrap().is_empty(),
             "rewind retained the earlier conversation"
         );
         agent.phase = Phase::Requesting(InFlight::default());
         let source = "assert survives_rewind == 42\nPath('survived').write_text('yes')\n";
-        agent.handle(update("two", source)).await;
+        agent.handle(update("two", source)).await.unwrap();
         until(&mut agent, |agent| {
             agent.streams.values().next().unwrap().completed == source.len()
         })
@@ -829,7 +897,8 @@ pub(in crate::agent) mod tests {
                 );
                 agent
                     .handle(update("one", &format!("{prefix}unfinished = (")))
-                    .await;
+                    .await
+                    .unwrap();
                 until(&mut agent, |agent| {
                     agent.streams.values().next().unwrap().admitted == prefix.len()
                 })
@@ -839,7 +908,8 @@ pub(in crate::agent) mod tests {
                         error: Arc::new(anyhow::anyhow!("stream disconnected")),
                         retrying_at: std::time::Instant::now(),
                     }))
-                    .await;
+                    .await
+                    .unwrap();
                 let turn = agent.turn.unwrap();
                 assert_eq!(turn.asked, ModelAsked::Calls);
                 assert!(matches!(
@@ -849,7 +919,7 @@ pub(in crate::agent) mod tests {
                         ..
                     }
                 ));
-                let history = agent.provider_input();
+                let history = agent.provider_input().await.unwrap();
                 let ContextBlock::InferenceResponse { items, .. } = &**history.last().unwrap()
                 else {
                     unreachable!()
@@ -914,13 +984,14 @@ pub(in crate::agent) mod tests {
     async fn a_stream_failure_before_admission_keeps_transport_backoff() {
         let directory = tempfile::tempdir().unwrap();
         let mut agent = agent(directory.path()).await;
-        agent.handle(update("one", "unfinished = (")).await;
+        agent.handle(update("one", "unfinished = (")).await.unwrap();
         agent
             .handle(Event::Inference(InferenceEvent::TemporaryFailure {
                 error: Arc::new(anyhow::anyhow!("stream disconnected")),
                 retrying_at: std::time::Instant::now(),
             }))
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(
             agent.phase,
             Phase::Idle {
@@ -930,7 +1001,7 @@ pub(in crate::agent) mod tests {
         ));
         assert!(agent.streams.is_empty());
         assert!(agent.execs.is_empty());
-        assert!(agent.provider_input().is_empty());
+        assert!(agent.provider_input().await.unwrap().is_empty());
         assert!(agent.recovery_notes.is_empty());
         let (_, events) = agent.db.read().agent_events(agent.agent_id);
         let recovered = replay::replay(events);

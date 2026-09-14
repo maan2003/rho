@@ -16,14 +16,12 @@ use rho_core::{
     ToolCall, ToolCallId, ToolResult, ToolSpec, UnixMs,
 };
 pub use rho_core::{MessageDelivery, MessageSender};
-use rho_db::RhoDb;
 pub use rho_fs_view::{Place, WorksetMode, WorkspaceInfo};
 use senax_encoder::{Decode, Encode};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, AgentWant,
-    AgentWriteTxnExt as _, ClaudeRewind, PresentationField, SessionBinding, TurnEdge, TurnOutcome,
-    UnixMillis,
+    AgentEventPos, AgentId, AgentRole, AgentRuntime, AgentSpawnedBy, AgentWant, ClaudeRewind,
+    PresentationField, SessionBinding, TurnEdge, TurnOutcome,
 };
 
 pub mod agent;
@@ -42,7 +40,14 @@ pub mod multi_agent_tools;
 mod papercut;
 pub mod pool;
 pub mod prompt;
+pub mod shell;
+pub mod terminal;
 mod title;
+mod worker;
+pub use worker::{
+    Process as WorksetProcess, WorksetAction, WorksetAttach, WorksetClient, WorksetReply,
+    worker_main,
+};
 
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic
 /// agent identity/team text and stateful integration hosts are omitted.
@@ -370,7 +375,7 @@ pub struct TranscriptCall {
 
 /// What a loop publishes about itself: its phase, and how much input
 /// waits. Everything else a reader wants is in the log.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct AgentStatus {
     pub kind: AgentStateKind,
     /// Inputs waiting to enter model context.
@@ -378,7 +383,9 @@ pub struct AgentStatus {
 }
 
 impl AgentStatus {
-    /// Nothing running and nothing waiting: safe to drop the loop.
+    /// Snapshot says nothing is running or queued. Remote snapshots may be
+    /// stale; retiring a runtime additionally requires its serialized
+    /// admission fence.
     pub fn settled(&self) -> bool {
         !self.kind.is_working() && self.queued == 0
     }
@@ -474,29 +481,23 @@ pub enum AgentStateKind {
 /// Tells the log that a turn started or stopped. Both runtimes cross the
 /// same edge (working, then not working), and a head's `turn_running` is
 /// the fold of the two events.
-pub(crate) async fn tell_turn_boundary(
-    db: &RhoDb,
-    agent_id: AgentId,
+pub(crate) fn turn_edge(
     previous: &AgentStateKind,
     current: &AgentStateKind,
     attempt_started: bool,
-) {
-    let now = UnixMillis::now();
-    let edge = if !previous.is_working() && current.is_working() {
-        TurnEdge::Started
+) -> Option<TurnEdge> {
+    if !previous.is_working() && current.is_working() {
+        Some(TurnEdge::Started)
     } else if execution_settled(previous, current, attempt_started) {
-        TurnEdge::Ended(match current {
+        Some(TurnEdge::Ended(match current {
             AgentStateKind::Error(failed) => TurnOutcome::Errored {
                 message: failed.error.to_string(),
             },
             _ => TurnOutcome::Completed,
-        })
+        }))
     } else {
-        return;
-    };
-    let mut write = db.write().await;
-    write.tell_turn(now, agent_id, edge);
-    write.commit();
+        None
+    }
 }
 
 /// A reliable state-machine transition that returns execution to the user's
@@ -560,7 +561,7 @@ impl StartPlace {
     /// when this creation cloned it.
     pub fn new(view: Arc<View>, origin: Option<camino::Utf8PathBuf>) -> Self {
         let place = Place {
-            workset: view.workset().id().to_owned(),
+            workset: view.workset_id().to_owned(),
             cwd: view.cwd().to_owned(),
             mode: view.workset_mode(),
             origin,

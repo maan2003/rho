@@ -1,12 +1,12 @@
-//! Daemon-owned Comint-style shell sessions.
+//! Workset-owned Comint-style shell sessions.
 //!
 //! Each agent has at most one `rho-shell` process. A sideband protocol carries
 //! complete commands and authoritative execution/output boundaries. Each
 //! execution uses a fresh PTY; programs requiring a persistent controlling
-//! terminal belong in the raw terminal. The daemon owns the bounded canonical
+//! terminal belong in the raw terminal. The workset owns the bounded canonical
 //! structured state. Attached clients keep editable pending input locally.
 //! Closing a client only detaches it; the shell remains alive until explicitly
-//! closed, it exits, or the daemon stops.
+//! closed, it exits, or the workset stops.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -29,7 +29,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 const CLIENT_QUEUE: usize = 32;
-pub(crate) const SUBMIT_QUEUE: usize = 8;
+pub const SUBMIT_QUEUE: usize = 8;
 const CONTROL_QUEUE: usize = 8;
 const SIDECAR_QUEUE: usize = 64;
 const TICK: std::time::Duration = std::time::Duration::from_millis(16);
@@ -273,6 +273,17 @@ impl ShellRegistry {
         reply_rx
             .await
             .map_err(|_| anyhow::anyhow!("shell exited while closing"))
+    }
+
+    pub async fn shutdown(&self) {
+        let agents = self
+            .sessions
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        futures::future::join_all(agents.into_iter().map(|agent| self.close(agent))).await;
     }
 
     async fn forget(&self, agent_id: AgentId, cmds: &mpsc::UnboundedSender<SessionCmd>) {
@@ -1067,7 +1078,7 @@ impl Session {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
         // Enter the workspace namespace first, then make the child a session
-        // leader. rho-shell remains isolated as a session leader; the daemon retains
+        // leader. rho-shell remains isolated as a session leader; the workset retains
         // the session id for generic process cleanup.
         unsafe {
             command.pre_exec(|| {

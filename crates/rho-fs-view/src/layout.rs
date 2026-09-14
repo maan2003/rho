@@ -7,7 +7,6 @@
 //! and no security boundary is claimed.
 
 use std::ffi::{CString, OsStr};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
@@ -282,11 +281,6 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     // PATH comes from the base and the agent's profile.
     symlink(config.base.join("bin/sh"), root.join("bin/sh")).context("link /bin/sh")?;
     symlink(config.base.join("bin/env"), root.join("usr/bin/env")).context("link /usr/bin/env")?;
-    if let Some(dir) = &config.own_binaries {
-        let target = host_path_in(root, dir);
-        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
-        bind(dir, &target, true)?;
-    }
     // The pid namespace is the host's, so a fresh procfs mount is not
     // permitted here; the host's proc view is the correct one anyway.
     bind(Path::new("/proc"), &root.join("proc"), false)?;
@@ -309,6 +303,13 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         let target = host_path_in(root, state);
         fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
         bind(state, &target, false)?;
+    }
+    // A development executable may live below ~/.cache. Install it after
+    // the cache/state mounts so those mounts cannot cover its executable.
+    if let Some(dir) = &config.own_binaries {
+        let target = host_path_in(root, dir);
+        fs::create_dir_all(&target).with_context(|| format!("create {}", target.display()))?;
+        bind(dir, &target, true)?;
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
@@ -426,88 +427,6 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Captures one host directory or file as a detached mount tree that can be
-/// installed into another mount namespace with [`install_captured_mount`].
-/// Must run in a private mount namespace: it stages a bind mount in a
-/// temporary location while cloning it.
-pub fn capture_mount(source: &Path) -> anyhow::Result<OwnedFd> {
-    clone_mount(source)
-}
-
-/// Installs a tree captured by [`capture_mount`] over `target`, read-write.
-pub fn install_captured_mount(source: &OwnedFd, target: &Path) -> anyhow::Result<()> {
-    install_mount(source, target, false)
-}
-
-/// Lazily detaches the mount at `target` together with everything mounted
-/// below it.
-pub fn detach_mount(target: &Path) -> anyhow::Result<()> {
-    let path = cstring(target)?;
-    if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } < 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("detach mount at {}", target.display()));
-    }
-    Ok(())
-}
-
-fn clone_mount(source: &Path) -> anyhow::Result<OwnedFd> {
-    // A bind mount needs a target of the same kind, so files stage over a
-    // temporary file and directories over a temporary directory.
-    let is_dir = fs::metadata(source)
-        .with_context(|| format!("stat mount source {}", source.display()))?
-        .is_dir();
-    let staging_dir;
-    let staging_file;
-    let staging: &Path = if is_dir {
-        staging_dir = tempfile::tempdir().context("create mount staging directory")?;
-        staging_dir.path()
-    } else {
-        staging_file = tempfile::NamedTempFile::new().context("create mount staging file")?;
-        staging_file.path()
-    };
-    bind(source, staging, false)?;
-    let path = cstring(staging)?;
-    const OPEN_TREE_CLONE: libc::c_uint = 1;
-    const AT_RECURSIVE: libc::c_uint = 0x8000;
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_open_tree,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
-        ) as i32
-    };
-    let open_result = if fd < 0 {
-        Err(io::Error::last_os_error()).context("clone staged mount")
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    };
-    let unmounted = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
-    if unmounted < 0 {
-        return Err(io::Error::last_os_error()).context("unmount staged source");
-    }
-    open_result
-}
-
-fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Result<()> {
-    let target = cstring(target)?;
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            source.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error()).context("install prepared mount");
-    }
-    set_mount_attributes(Path::new(OsStr::from_bytes(target.as_bytes())), readonly)
-}
-
 /// Mounts a validated workset below `root` in the current mount namespace:
 /// the workset directory at [`MOUNT_ROOT`], the store root read-only at its
 /// host path, and the socket at its host path.
@@ -536,7 +455,7 @@ fn host_path_in(root: &Path, path: &Path) -> PathBuf {
     root.join(path.strip_prefix("/").unwrap_or(path))
 }
 
-fn pivot_into(root: &Path) -> anyhow::Result<()> {
+pub(crate) fn pivot_into(root: &Path) -> anyhow::Result<()> {
     let root_c = cstring(root)?;
     let old = cstring(&root.join("old-root"))?;
     cvt(unsafe { libc::syscall(libc::SYS_pivot_root, root_c.as_ptr(), old.as_ptr()) as i32 })

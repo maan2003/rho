@@ -4,7 +4,12 @@
 
 The native `Agent` and `ClaudeLoop` are separate concrete runtimes. There is no
 universal runtime trait and Claude Code is not a raw inference provider.
-Each runtime serializes its controls, persistence, scheduling, and publication.
+One workset process contains its agents' runtimes, notebooks, local tools,
+jobs, provider transports, retained terminals, and interactive shells. The daemon alone owns the shared
+database, account and route policy, naming tasks, workset allocation, pool,
+subscriptions, and UI projection. Each runtime serializes its own controls and
+scheduling and commits domain operations through acknowledged daemon services.
+There is no in-daemon runtime fallback.
 
 Native conversation authority is the append-only `NativeEvent` log. Provider
 input, restart recovery, and presentation are disposable projections, not another
@@ -13,11 +18,33 @@ inference. A temporary atomic database migration rewrites historical raw rows
 at their original positions, preserving response boundaries, IDs, provider data,
 and context-window offsets; normal replay does not normalize legacy events. Claude Code instead owns its session, history, and compaction; Rho
 records bounded transcript observations, execution admission, output ownership,
-and timing, and controls its in-process MCP server.
+and timing, and controls its worker-local MCP server.
 
 `rho-inference` owns native wire adaptation and validates the model action as
 prose or one custom Python `exec`. `rho-claude` owns CLI transport and MCP protocol
 adaptation. Neither adapter owns Rho's scheduling or persistence.
+
+One private Senax Unix connection multiplexes agent services and controls with
+workset control and terminal/shell traffic. Bounded fragments preserve per-port
+order; routing and fair writes do not await runtime work. Completion publication
+does not await recipient acceptance, keeping reciprocal subscriptions outside
+serialized actor-loop dependencies. Lost persistence acknowledgements stop the
+runtime; uncertain mutations are not retried.
+
+The workset process builds one filesystem namespace before starting threads.
+Normal execution inherits it. Claude launcher children alone clone it to install
+private provider overlays; no generic agent namespace or setup thread is needed.
+Mode changes exclude new admission, require settled agents and no live sessions,
+then drain and replace the whole workset execution.
+
+Agent retirement requires the runtime's serialized permission and fences new
+admission; coalesced observations are not authority. Activation and retirement
+serialize per agent even across caller cancellation. The ID is reused only after
+runtime and daemon-handler drain, without incarnation IDs or extra sockets.
+Unloading an agent or detaching a GUI leaves workset terminals and shells alive.
+Workset failure loses all local ephemeral execution. Normal shutdown drains
+owned work; crashes may leave descendants and external effects behind. Recovery
+reconstructs conversation, never interpreters, jobs, or automatic execution.
 
 ## Shared mechanisms, not shared runtime ownership
 

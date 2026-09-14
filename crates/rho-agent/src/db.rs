@@ -323,7 +323,7 @@ pub type UnixMillis = UnixMs;
 /// What the agent is, folded from `Created` and the config events that
 /// follow it. Nothing here is written directly: a change is an event
 /// first and reaches the head through the fold.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentConfig {
     pub role: AgentRole,
     pub(crate) binding: SessionBinding,
@@ -344,7 +344,7 @@ pub struct AgentConfig {
 /// What an agent is now: the fold of its whole log, hidden rows included
 /// (a rewind takes back history, not configuration). Made on read, never
 /// stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentHead {
     pub config: AgentConfig,
     /// Naming is attempted at most once, including across rewind and restart.

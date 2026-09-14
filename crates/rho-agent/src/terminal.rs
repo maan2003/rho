@@ -1,11 +1,11 @@
-//! Daemon-owned terminal sessions.
+//! Workset-owned terminal sessions.
 //!
 //! Each session owns a PTY whose child runs inside an agent's view, plus the
 //! only terminal emulator in the system (an alacritty [`Term`]). Clients are
 //! dumb: they receive display state ([`rho_ui_proto::term`] rows/cursor) and
-//! send input bytes; the daemon answers all terminal queries itself, so an
+//! send input bytes; the workset answers all terminal queries itself, so an
 //! unattached terminal behaves exactly like an attached one. Sessions survive
-//! client detach and die with their child process or the daemon.
+//! client detach and die with their child process or the workset.
 //!
 //! Output is synced per frame tick as row diffs against a per-client record
 //! of what that client last displayed, so bandwidth is bounded by grid size ×
@@ -107,6 +107,9 @@ struct SessionHandle {
 }
 
 enum SessionCmd {
+    Close {
+        reply: oneshot::Sender<()>,
+    },
     Attach {
         cols: u16,
         rows: u16,
@@ -212,6 +215,26 @@ impl TerminalRegistry {
             }
         }
         entries
+    }
+
+    pub async fn shutdown(&self) {
+        let handles = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut replies = Vec::new();
+        for handle in handles {
+            let (reply, closed) = oneshot::channel();
+            if handle.cmds.send(SessionCmd::Close { reply }).is_ok() {
+                replies.push(closed);
+            }
+        }
+        for reply in replies {
+            let _ = reply.await;
+        }
     }
 
     async fn forget(
@@ -394,10 +417,16 @@ async fn run_session(
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pty_eof = false;
+    let mut close_reply = None;
     let status = loop {
         tokio::select! {
             biased;
             Some(cmd) = cmds.recv() => match cmd {
+                SessionCmd::Close { reply } => {
+                    close_reply = Some(reply);
+                    let _ = child.start_kill();
+                    break child.wait().await.ok();
+                }
                 SessionCmd::Attach { cols, rows, reply } => {
                     let client = state.attach(&master, cols, rows);
                     let _ = reply.send(client);
@@ -476,6 +505,9 @@ async fn run_session(
     registry
         .forget(agent_id, terminal_id, &_cmds_keepalive)
         .await;
+    if let Some(reply) = close_reply {
+        let _ = reply.send(());
+    }
 }
 
 /// Reads the PTY until it would block; false means EOF/EIO (child side gone).

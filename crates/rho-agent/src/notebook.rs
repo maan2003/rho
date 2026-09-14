@@ -11,21 +11,21 @@ use rho_web_search::WebSearchTools;
 
 use crate::View;
 use crate::db::AgentRole;
-use crate::multi_agent_tools::{self, MultiAgentTools};
-use crate::pool::AgentPool;
+use crate::multi_agent_tools::{self, Team};
+use crate::worker::Host;
 
 /// What every runtime's tools are built from: the shell, and the host
 /// functions Rho answers itself (images, collaboration, web search,
 /// papercuts). Both runtimes expose them only inside the Python notebook.
-/// `inference` and `pool` may be absent for a rendering, which gets specs that
+/// `inference` and `host` may be absent for a rendering, which gets specs that
 /// cannot be called.
 pub(crate) fn host_tools(
     view: &Arc<View>,
     role: AgentRole,
     agent_id: AgentId,
     inference: Option<&Inference>,
-    multi_agent: Option<&MultiAgentTools>,
-    pool: &std::sync::Weak<AgentPool>,
+    multi_agent: Option<&Team>,
+    host: Option<&Arc<Host>>,
 ) -> (ShellTools, Vec<Arc<dyn FutureTool>>) {
     let shell = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -35,13 +35,13 @@ pub(crate) fn host_tools(
     let mut others: Vec<Arc<dyn FutureTool>> = vec![Arc::new(ImageTool(
         crate::image_tool::ImageTools::new(Arc::clone(view)),
     ))];
-    if let Some(multi_agent) = multi_agent {
+    if let Some(host) = host.filter(|_| multi_agent.is_some()) {
         others.extend(
             multi_agent_tools::agent_tool_specs(role)
                 .into_iter()
                 .map(|spec| {
-                    Arc::new(AgentTool {
-                        tools: multi_agent.clone(),
+                    Arc::new(SharedTool {
+                        host: host.clone(),
                         spec,
                     }) as Arc<dyn FutureTool>
                 }),
@@ -55,10 +55,10 @@ pub(crate) fn host_tools(
         // A rendering has no provider behind it; the spec is what it is for.
         None => Arc::new(SpecOnly(rho_web_search::web_search_spec())),
     });
-    others.push(match pool.upgrade() {
-        Some(pool) => Arc::new(crate::papercut::PapercutTool {
-            db: pool.db().clone(),
-            agent_id,
+    others.push(match host {
+        Some(host) => Arc::new(SharedTool {
+            host: host.clone(),
+            spec: crate::papercut::PapercutTool::spec(),
         }),
         None => Arc::new(SpecOnly(crate::papercut::PapercutTool::spec())),
     });
@@ -99,19 +99,19 @@ impl FutureTool for ImageTool {
     }
 }
 
-/// One of the collaboration tools, answered by the pool.
-struct AgentTool {
-    tools: MultiAgentTools,
+/// A collaboration or report tool, answered by the daemon.
+struct SharedTool {
+    host: Arc<Host>,
     spec: ToolSpec,
 }
 
-impl FutureTool for AgentTool {
+impl FutureTool for SharedTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
 
     fn call(&self, call: ToolCall) -> BoxFuture<'static, ToolOutput> {
-        let tools = self.tools.clone();
-        Box::pin(async move { multi_agent_tools::call_agent_tool(tools, call).await })
+        let host = self.host.clone();
+        Box::pin(async move { host.shared_tool(call).await })
     }
 }

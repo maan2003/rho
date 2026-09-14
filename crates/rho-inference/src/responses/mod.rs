@@ -13,7 +13,7 @@ mod tests;
 mod wire;
 mod ws;
 
-pub use oauth::{InferenceAuth, ResolvedOAuth};
+pub use oauth::{InferenceAuth, ResolvedAuth, ResolvedOAuth};
 pub(crate) use route::RouteSelector;
 pub use route::{DialRoute, InferenceRouteProbe, RouteSelection};
 pub use session::{InferenceSession, PromptCacheKey};

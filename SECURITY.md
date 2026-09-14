@@ -625,7 +625,7 @@ inside the Claude process's private workspace mount namespace. If the bind
 target does not exist, Rho creates an empty `~/.claude/CLAUDE.md` file first.
 Rho does not write the generated prompt into the origin checkout or workspace
 checkout. The mode-0600 generated source file remains alive while the agent loop
-owns its persistent mount namespace, is rewritten in place before a cold Claude
+owns the Claude child, is rewritten in place before a cold Claude
 respawn, and is removed when that loop is dropped. A successful soft turn
 cancellation keeps the process and its private prompt mount alive for later
 turns; a failed cancellation terminates the process while retaining the prompt
@@ -639,7 +639,7 @@ not included in model context. Treat descriptions as prompt input rather than
 trusted instructions.
 
 Claude Code reaches Rho only through the in-process Python notebook server
-that the daemon serves over Claude's control channel; every built-in Claude
+that the workset runtime serves over Claude's control channel; every built-in Claude
 tool is denied in the generated settings. The multi-agent host functions it
 gets there are the same ones native roles use, with the same handle
 validation, spawn-depth and live-child limits, and tool errors returned as
@@ -704,25 +704,50 @@ own tools denied.
 - Exec timing describes provider and handoff milestones, not Python execution
   completion or proof of external effects.
 
-- Model-authored Python runs in-process on a dedicated RustPython thread, with
-  persistent globals and cooperative top-level-await cells. The crate boundary
-  carries serialized messages, not interpreter objects, so a future worker can
-  replace the thread without moving tool or scheduling policy.
+- One workset process owns its agents, notebooks, jobs, terminals, shells, and
+  provider transports. The daemon alone opens the shared database and owns
+  account/quota/route policy, credential refresh, naming, and cross-agent mail.
+  Tokens and provider-local credential backing can be present in workers;
+  same-user execution is not a privilege boundary.
+- Exactly one private Unix socketpair multiplexes all workset traffic. Startup
+  separates its close-on-exec control descriptor from stdin before threads.
+  Stdout/stderr are diagnostics. Logical Senax messages use bounded fragments,
+  are reassembled before mutation, and retain per-port FIFO with fair writes.
+  Memory bounds are not host-resource isolation. Readers never await runtime
+  progress; disconnect rejects pending calls, and uncertain mutations are fatal
+  rather than retried. Completion publication queues recipient delivery instead
+  of awaiting reciprocal runtime acceptance.
+- The workset creates its identity user namespace and mount view before Tokio
+  or notebook threads. Normal execution inherits this view. No namespace
+  descriptors or mount-change RPCs cross the daemon channel. Claude child
+  launchers privately clone the workset mount namespace and apply preopened
+  account/projects and generated prompt/settings overlays with syscall-only
+  pre-exec operations. These mounts isolate topology, not shared backing data.
+- Agent retirement requires serialized runtime permission, closes admission,
+  drains jobs and owned children, and waits for daemon handlers before reusing
+  the ID. A cancellation-safe lock spans retirement. A stuck retirement kills
+  and reaps the whole workset. Agent unload and GUI detach do not terminate
+  retained terminals or shells. Workset mode changes require settled agents
+  and no live sessions and replace the whole execution process.
+  Unexpected death loses all workset interpreters and sessions and has weaker
+  descendant cleanup: parent-death signals are best effort. Neither process
+  death nor recovery rolls back external effects or resumes code automatically.
+  There are no cgroups or process-tree rollback guarantees.
 - Ordinary RustPython host access is enabled: `pathlib`, `open`, `os`, and
   other supported standard-library modules work directly. `pathlib` and `Path`
   are prebound; imports remain ordinary Python imports. The dedicated VM thread
-  unshares its filesystem state before entering the agent's View mount namespace
-  and setting its initial cwd. Python `chdir` therefore affects that notebook,
+  unshares its filesystem attributes and sets its initial cwd, while retaining
+  the inherited workset mount namespace. Python `chdir` therefore affects that notebook,
   not the daemon or sibling notebooks; it remains shared between its live cells.
 - Python is explicitly **not a sandbox**. Workspace mount mapping provides path
   correctness, not capability isolation. Unlike managed shell commands, native
   Python file operations are not Landlock-restricted. Process-global environment
   mutations, signals, descriptor operations, and process exit retain their normal
-  in-process behavior and can affect the daemon. Python code must be trusted to
-  the same extent as daemon code. Automatic Python signal-handler installation
+  behavior inside the worker. Ordinary interpreter exit or failure no longer
+  exits the daemon, but same-user hostile operations and host resource exhaustion
+  are not contained. Python code must still be trusted. Automatic Python signal-handler installation
   is disabled so imports do not replace the host's Ctrl-C handler; explicit
   Python signal changes still retain their normal semantics.
-  A worker process is required before promising fault or resource isolation.
   Commands should use `command()` when Rust-managed
   lifetime and automatic output are wanted; ordinary Python subprocesses do not
   acquire that managed lifecycle automatically.
@@ -754,7 +779,7 @@ own tools denied.
   retains its first 8 MiB with explicit overflow counts. At most 64 job records
   are retained, evicting oldest completed, delivered records; temporary files
   disappear with their records. Up to 32 image references are retained.
-- Runtime payloads are capped at 1 MiB and the completion/input queue at 256 entries,
+- Notebook bridge payloads are capped at 1 MiB and the completion/input queue at 256 entries,
   live cells at 128, and pending host requests and registered tasks at 1,024 each.
   Reliable asynchronous completion delivery applies backpressure without blocking
   the interpreter. Python-to-Rust callbacks commit synchronously and have no
